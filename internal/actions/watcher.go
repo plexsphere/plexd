@@ -40,6 +40,12 @@ type HookWatcher struct {
 	onIntegrity    IntegrityAlertCallback
 	debouncePeriod time.Duration
 
+	// source is the Source every hook this watcher reports carries:
+	// api.HookSourceLocal for hooks_dir, api.HookSourceRollout for the
+	// directory plexd installs rolled-out hooks into. It is fixed per watcher
+	// because the directory, not the file, says where a hook came from.
+	source string
+
 	// changeMu serializes every change to hooks with the onChange call that
 	// reports it, so the last onChange always carries the newest list. It is
 	// held across onChange, which therefore must not block. It is taken before
@@ -55,10 +61,27 @@ type HookWatcher struct {
 	hashFile func(path string) (string, error)
 }
 
-// NewHookWatcher creates a new HookWatcher.
+// NewHookWatcher creates a HookWatcher for hooksDir, the directory of
+// hand-placed hooks. Every hook it reports has Source api.HookSourceLocal.
 func NewHookWatcher(hooksDir string, onChange HookChangeCallback, onIntegrity IntegrityAlertCallback, logger *slog.Logger) *HookWatcher {
+	return newHookWatcher(hooksDir, api.HookSourceLocal, onChange, onIntegrity, logger)
+}
+
+// NewRolloutHookWatcher creates a HookWatcher for dir, the directory plexd
+// installs rolled-out hooks into. Every hook it reports has Source
+// api.HookSourceRollout. It works like the watcher NewHookWatcher builds for
+// hooks_dir, so a write in the rollout directory reaches the executor and the
+// capability manifest the way a write in hooks_dir does.
+func NewRolloutHookWatcher(dir string, onChange HookChangeCallback, onIntegrity IntegrityAlertCallback, logger *slog.Logger) *HookWatcher {
+	return newHookWatcher(dir, api.HookSourceRollout, onChange, onIntegrity, logger)
+}
+
+// newHookWatcher is the constructor both exported ones share; source is what
+// every reported hook carries.
+func newHookWatcher(hooksDir, source string, onChange HookChangeCallback, onIntegrity IntegrityAlertCallback, logger *slog.Logger) *HookWatcher {
 	return &HookWatcher{
 		hooksDir:       hooksDir,
+		source:         source,
 		logger:         logger.With("component", "actions"),
 		onChange:       onChange,
 		onIntegrity:    onIntegrity,
@@ -179,7 +202,7 @@ func (w *HookWatcher) Reload() ([]api.HookInfo, error) {
 
 // rescan is Reload's body. The caller holds changeMu.
 func (w *HookWatcher) rescan() ([]api.HookInfo, error) {
-	scanned, failed, err := scanHooks(w.hooksDir, w.logger, w.hashFile)
+	scanned, failed, err := scanHooks(w.hooksDir, w.source, w.logger, w.hashFile)
 	if err != nil {
 		return nil, fmt.Errorf("actions: watcher: scan %s: %w", w.hooksDir, err)
 	}
@@ -296,7 +319,7 @@ func (w *HookWatcher) processFile(name string) {
 
 	h := api.HookInfo{
 		Name:     name,
-		Source:   "local",
+		Source:   w.source,
 		Checksum: checksum,
 	}
 

@@ -277,7 +277,7 @@ func TestScanHooks_ReportsAFileThatFailsToHash(t *testing.T) {
 		return integrity.HashFile(path)
 	}
 
-	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), hash)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, slog.New(slog.NewTextHandler(logs, nil)), hash)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -300,7 +300,7 @@ func TestScanHooks_FileGoneBeforeTheHashIsNoFailure(t *testing.T) {
 		return "", fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 	}
 
-	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), hash)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, slog.New(slog.NewTextHandler(logs, nil)), hash)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -334,7 +334,7 @@ func TestScanHooks_SkipsWhatIsNotARegularFile(t *testing.T) {
 		return "digest", nil
 	}
 
-	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), hash)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, slog.New(slog.NewTextHandler(logs, nil)), hash)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -364,7 +364,7 @@ func TestScanHooks_SymlinkToARegularFileStaysAHook(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hooks, failed, err := scanHooks(dir, testLogger(), integrity.HashFile)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, testLogger(), integrity.HashFile)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -389,7 +389,7 @@ func TestScanHooks_SymlinkToANonExecutableFileIsNoHook(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hooks, failed, err := scanHooks(dir, testLogger(), integrity.HashFile)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, testLogger(), integrity.HashFile)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -406,7 +406,7 @@ func TestScanHooks_DanglingSymlinkIsNoFailure(t *testing.T) {
 	}
 
 	logs := &syncBuffer{}
-	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), integrity.HashFile)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, slog.New(slog.NewTextHandler(logs, nil)), integrity.HashFile)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -427,7 +427,7 @@ func TestScanHooks_ReportsAFileThatFailsToStat(t *testing.T) {
 	}
 
 	logs := &syncBuffer{}
-	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), integrity.HashFile)
+	hooks, failed, err := scanHooks(dir, api.HookSourceLocal, slog.New(slog.NewTextHandler(logs, nil)), integrity.HashFile)
 	if err != nil {
 		t.Fatalf("scanHooks() error = %v", err)
 	}
@@ -444,11 +444,41 @@ func TestScanHooks_ReportsAFileThatFailsToStat(t *testing.T) {
 func TestScanHooks_ReturnsADirectoryReadError(t *testing.T) {
 	file := writeExecutable(t, t.TempDir(), "not-a-directory", "#!/bin/sh\n")
 
-	hooks, failed, err := scanHooks(file, testLogger(), integrity.HashFile)
+	hooks, failed, err := scanHooks(file, api.HookSourceLocal, testLogger(), integrity.HashFile)
 	if !errors.Is(err, syscall.ENOTDIR) {
 		t.Fatalf("scanHooks() error = %v, want ENOTDIR", err)
 	}
 	if hooks != nil || failed != nil {
 		t.Errorf("scanHooks() = %v, %v, want nil results alongside the error", hooks, failed)
+	}
+}
+
+// The directory decides where a hook came from, so every hook a scan returns
+// carries the source it was given, whatever else the file holds.
+func TestScanHooks_StampsTheSource(t *testing.T) {
+	for _, source := range []string{api.HookSourceLocal, api.HookSourceRollout} {
+		t.Run(source, func(t *testing.T) {
+			dir := t.TempDir()
+			writeExecutable(t, dir, "alpha", "#!/bin/sh\necho alpha\n")
+			writeExecutable(t, dir, "beta", "#!/bin/sh\necho beta\n")
+			writeSidecar(t, dir, "beta", hookMetadata{Description: "with a sidecar", Timeout: "30s"})
+
+			hooks, failed, err := scanHooks(dir, source, testLogger(), integrity.HashFile)
+			if err != nil {
+				t.Fatalf("scanHooks() error = %v", err)
+			}
+			wantHooks(t, "hooks", hooks, "alpha", "beta")
+			for _, h := range hooks {
+				if h.Source != source {
+					t.Errorf("%s: Source = %q, want %q", h.Name, h.Source, source)
+				}
+			}
+			if hooks[1].Description != "with a sidecar" {
+				t.Errorf("beta: Description = %q, want the sidecar's", hooks[1].Description)
+			}
+			if len(failed) != 0 {
+				t.Errorf("failed = %v, want none", failed)
+			}
+		})
 	}
 }

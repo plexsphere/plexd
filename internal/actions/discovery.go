@@ -23,20 +23,24 @@ type hookMetadata struct {
 	Sandbox     string            `json:"sandbox"`
 }
 
-// DiscoverHooks scans hooksDir for executable files and returns their metadata.
+// DiscoverHooks scans hooksDir for executable files and returns their metadata,
+// each with Source api.HookSourceLocal.
 // Returns an empty slice (not nil) and no error if the directory does not exist.
 // Individual file errors (hash failures, unreadable sidecars) are logged at warn
 // level but do not prevent discovery of other hooks.
 func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error) {
-	hooks, _, err := scanHooks(hooksDir, logger, integrity.HashFile)
+	hooks, _, err := scanHooks(hooksDir, api.HookSourceLocal, logger, integrity.HashFile)
 	return hooks, err
 }
 
-// scanHooks is DiscoverHooks with the hash as a parameter. It also returns the
-// names of the executable files it could not read, so a caller that already
-// lists one of them can keep its entry: a transient read error says nothing
-// about whether the hook is still there. A file that is gone is not a failure.
-func scanHooks(hooksDir string, logger *slog.Logger, hash func(string) (string, error)) (hooks []api.HookInfo, failed []string, err error) {
+// scanHooks is DiscoverHooks with the source and the hash as parameters. Every
+// hook it returns carries source, because the directory decides where a hook
+// came from: hooks_dir holds hand-placed hooks and the rollout directory holds
+// the ones plexd installed. It also returns the names of the executable files
+// it could not read, so a caller that already lists one of them can keep its
+// entry: a transient read error says nothing about whether the hook is still
+// there. A file that is gone is not a failure.
+func scanHooks(hooksDir, source string, logger *slog.Logger, hash func(string) (string, error)) (hooks []api.HookInfo, failed []string, err error) {
 	if hooksDir == "" {
 		return []api.HookInfo{}, nil, nil
 	}
@@ -109,7 +113,7 @@ func scanHooks(hooksDir string, logger *slog.Logger, hash func(string) (string, 
 
 		h := api.HookInfo{
 			Name:     name,
-			Source:   "local",
+			Source:   source,
 			Checksum: checksum,
 		}
 
