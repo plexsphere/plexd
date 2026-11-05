@@ -382,21 +382,41 @@ func (r *CapabilityReporter) clearRetry() {
 	r.backoff = r.retryMin
 }
 
-// carriesHookMetadata reports whether any entry of manifest holds more than a
-// name and a checksum.
+// carriesHookMetadata reports whether manifest holds anything a control plane
+// that predates hook metadata refuses: an entry with more than a name and a
+// checksum, which includes the source and version of a rolled-out hook, or a
+// hook_rollout_errors list. Each of those keys is refused alike, so any one of
+// them alone must send the short form on a refusal.
 func carriesHookMetadata(manifest api.CapabilityManifestRequest) bool {
+	if len(manifest.HookRolloutErrors) > 0 {
+		return true
+	}
 	for _, h := range manifest.DeclaredHooks {
 		if h.Description != "" || h.SandboxLevel != "" || h.TimeoutSeconds != 0 || len(h.Parameters) > 0 {
+			return true
+		}
+		if h.Source != "" || h.Version != 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// withoutHookMetadata returns the short form of manifest. It builds a new
-// DeclaredHooks slice, so the manifest refused points at stays whole. It keeps
-// a nil slice nil, so a manifest with no hooks equals its short form.
+// withoutHookMetadata returns the short form of manifest: entries of a name and
+// a checksum, and no hook_rollout_errors. It builds a new DeclaredHooks slice,
+// so the manifest refused points at stays whole. It keeps a nil slice nil, so a
+// manifest with no hooks equals its short form.
+//
+// A rolled-out entry in the short form has no source and reads as local at the
+// control plane. A control plane that serves rollouts gets the short form too,
+// after a 413 for a manifest over its 1 MiB budget or a 400 with a code
+// api.IsHookMetadataRefused names. hook_rollout_errors_too_many and
+// hook_rollout_error_invalid come only from such a control plane. Until it
+// accepts a wide form, which plexd tries again on a change and once an hour, it
+// reads each of the Node's rolled-out hooks as local, so its rollout status for
+// the hook reads collision, and it holds none of the Node's rollout errors.
 func withoutHookMetadata(manifest api.CapabilityManifestRequest) api.CapabilityManifestRequest {
+	manifest.HookRolloutErrors = nil
 	if manifest.DeclaredHooks == nil {
 		return manifest
 	}

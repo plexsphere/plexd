@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -1244,6 +1245,97 @@ func TestCapabilityReporter_RefusalFallsBackToShort(t *testing.T) {
 	}
 }
 
+// A control plane that predates rollouts refuses source, version, and
+// hook_rollout_errors as it refuses the sidecar fields, so each of them alone
+// must bring the short form at once, and that form must carry none of them.
+func TestCapabilityReporter_RolloutFieldsAloneFallBackToShort(t *testing.T) {
+	// wideRetry and the rig's retryMin outlive the test, so only the fallback
+	// can bring the second PUT.
+	const wideRetry = 2 * capabilityNeverFires
+	tests := []struct {
+		name string
+		wide func() api.CapabilityManifestRequest
+		// key is what the wide PUT carries and the short PUT must not.
+		key string
+	}{
+		{
+			name: "source and version",
+			wide: func() api.CapabilityManifestRequest {
+				m := capabilityManifest("digest-a")
+				m.DeclaredHooks[0].Source = api.HookSourceRollout
+				m.DeclaredHooks[0].Version = 2
+				return m
+			},
+			key: "source",
+		},
+		{
+			name: "hook_rollout_errors",
+			wide: func() api.CapabilityManifestRequest {
+				m := capabilityManifest("digest-a")
+				m.HookRolloutErrors = []api.HookRolloutError{{
+					Name: "backup-db", Version: 3, Code: api.HookRolloutCodeFetchFailed, Detail: "503 signing_unavailable",
+				}}
+				return m
+			},
+			key: "hook_rollout_errors",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newCapabilityRig(errCapabilityMalformed)
+			rig.reporter.wideRetry = wideRetry
+			rig.source.set(tt.wide())
+			stop := rig.run(t)
+
+			rig.waitPuts(t, 2)
+			stop()
+
+			rig.assertPuts(t, tt.wide(), manifestA)
+			if got, want := rig.delays.recorded(), []time.Duration{wideRetry}; !slices.Equal(got, want) {
+				t.Errorf("nominal delays = %v, want %v", got, want)
+			}
+
+			manifests, _ := rig.client.recorded()
+			if len(manifests) != 2 {
+				t.Fatalf("PUTs = %d, want 2", len(manifests))
+			}
+			if wide := string(mustMarshalManifest(t, manifests[0])); !strings.Contains(wide, `"`+tt.key+`"`) {
+				t.Fatalf("wide PUT %s lacks %q, so the checks below prove nothing", wide, tt.key)
+			}
+			body := mustMarshalManifest(t, manifests[1])
+			var short struct {
+				DeclaredHooks []map[string]json.RawMessage `json:"declared_hooks"`
+			}
+			if err := json.Unmarshal(body, &short); err != nil {
+				t.Fatalf("unmarshal short PUT: %v", err)
+			}
+			if len(short.DeclaredHooks) != 1 {
+				t.Fatalf("short PUT %s has %d entries, want 1", body, len(short.DeclaredHooks))
+			}
+			got := slices.Sorted(maps.Keys(short.DeclaredHooks[0]))
+			if want := []string{"checksum", "name"}; !slices.Equal(got, want) {
+				t.Errorf("short PUT entry keys = %v, want %v", got, want)
+			}
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(body, &top); err != nil {
+				t.Fatalf("unmarshal short PUT: %v", err)
+			}
+			if raw, ok := top["hook_rollout_errors"]; ok {
+				t.Errorf("short PUT carries hook_rollout_errors = %s, want no key", raw)
+			}
+		})
+	}
+}
+
+func mustMarshalManifest(t *testing.T, m api.CapabilityManifestRequest) []byte {
+	t.Helper()
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	return body
+}
+
 func TestCapabilityReporter_FallbackLogs(t *testing.T) {
 	rig := newCapabilityRig(errCapabilityMalformed)
 	rig.reporter.wideRetry = 2 * capabilityNeverFires
@@ -1655,9 +1747,10 @@ func TestCapabilityReporter_MetadataRemovedAfterFallback(t *testing.T) {
 func TestCapabilityReporter_CarriesHookMetadata(t *testing.T) {
 	plain := api.DeclaredHook{Name: "a", Checksum: "x"}
 	tests := []struct {
-		name  string
-		hooks []api.DeclaredHook
-		want  bool
+		name   string
+		hooks  []api.DeclaredHook
+		errors []api.HookRolloutError
+		want   bool
 	}{
 		{name: "no hooks", hooks: nil, want: false},
 		{name: "name and checksum", hooks: []api.DeclaredHook{plain}, want: false},
@@ -1667,12 +1760,16 @@ func TestCapabilityReporter_CarriesHookMetadata(t *testing.T) {
 		{name: "timeout", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", TimeoutSeconds: 1}}, want: true},
 		{name: "sandbox level", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", SandboxLevel: "none"}}, want: true},
 		{name: "a later entry", hooks: []api.DeclaredHook{plain, {Name: "b", Checksum: "y", Description: "d"}}, want: true},
+		{name: "source", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", Source: api.HookSourceRollout}}, want: true},
+		{name: "version", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", Version: 2}}, want: true},
+		{name: "rollout errors and no hooks", errors: []api.HookRolloutError{{Name: "a", Version: 1, Code: api.HookRolloutCodeCollision}}, want: true},
+		{name: "empty rollout errors", hooks: []api.DeclaredHook{plain}, errors: []api.HookRolloutError{}, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := carriesHookMetadata(api.CapabilityManifestRequest{DeclaredHooks: tt.hooks})
+			got := carriesHookMetadata(api.CapabilityManifestRequest{DeclaredHooks: tt.hooks, HookRolloutErrors: tt.errors})
 			if got != tt.want {
-				t.Errorf("carriesHookMetadata(%+v) = %v, want %v", tt.hooks, got, tt.want)
+				t.Errorf("carriesHookMetadata(%+v, %+v) = %v, want %v", tt.hooks, tt.errors, got, tt.want)
 			}
 		})
 	}
@@ -1694,6 +1791,26 @@ func TestCapabilityReporter_WithoutHookMetadataLeavesTheOriginalWhole(t *testing
 		t.Errorf("withoutHookMetadata() = %+v, want %+v", got, want)
 	}
 	if whole := withTheRest(wideManifest("digest-a", "one")); !reflect.DeepEqual(wide, whole) {
+		t.Errorf("the original became %+v, want %+v", wide, whole)
+	}
+}
+
+func TestCapabilityReporter_WithoutHookMetadataDropsTheRolloutFields(t *testing.T) {
+	rolledOut := func() api.CapabilityManifestRequest {
+		m := capabilityManifest("digest-a")
+		m.DeclaredHooks[0].Source = api.HookSourceRollout
+		m.DeclaredHooks[0].Version = 2
+		m.HookRolloutErrors = []api.HookRolloutError{{Name: "b", Version: 1, Code: api.HookRolloutCodeCollision}}
+		return m
+	}
+	wide := rolledOut()
+
+	got := withoutHookMetadata(wide)
+
+	if !reflect.DeepEqual(got, manifestA) {
+		t.Errorf("withoutHookMetadata() = %+v, want %+v", got, manifestA)
+	}
+	if whole := rolledOut(); !reflect.DeepEqual(wide, whole) {
 		t.Errorf("the original became %+v, want %+v", wide, whole)
 	}
 }
