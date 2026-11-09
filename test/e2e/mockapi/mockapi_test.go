@@ -1180,6 +1180,61 @@ func TestState_CarriesTheSigningKey(t *testing.T) {
 	}
 }
 
+// TestState_CarriesTheDNSBlock pins the dns block a fresh mock serves, which
+// the e2e suites resolve against, and that a state configured without a dns
+// key is served with null, the "keep the names held" signal of the contract.
+func TestState_CarriesTheDNSBlock(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	raw, ok := stateEnvelope(t, ts.URL)["dns"]
+	if !ok {
+		t.Fatal("envelope missing key \"dns\"")
+	}
+	var got api.NodeStateDNS
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("decode dns %s: %v", raw, err)
+	}
+	want := api.NodeStateDNS{
+		SearchDomain: "app.e2e.internal",
+		Zones:        []string{"app.e2e.internal", "e2e.internal"},
+		Hosts: []api.NodeStateDNSHost{
+			{NodeID: testMockNodeID, FQDN: "node-1.app.e2e.internal", MeshIP: "10.99.0.1"},
+			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FQDN: "peer-1.app.e2e.internal", MeshIP: "10.99.0.2"},
+			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", FQDN: "peer-2.app.e2e.internal", MeshIP: "10.99.0.3"},
+		},
+		ReverseZones: []string{"0.99.10.in-addr.arpa"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dns = %+v, want %+v", got, want)
+	}
+	if !sort.SliceIsSorted(got.Hosts, func(i, j int) bool { return got.Hosts[i].FQDN < got.Hosts[j].FQDN }) {
+		t.Errorf("dns hosts = %+v, want ordered by fqdn", got.Hosts)
+	}
+
+	// Configure the served state with its dns key removed, the way a suite
+	// splices a state together, and read the raw answer back.
+	configured := stateEnvelope(t, ts.URL)
+	delete(configured, "dns")
+	body, err := json.Marshal(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	raw, ok = stateEnvelope(t, ts.URL)["dns"]
+	if !ok {
+		t.Fatal("envelope after configure-state missing key \"dns\", want it present as null")
+	}
+	if string(raw) != "null" {
+		t.Errorf("dns after configure-state without a dns key = %s, want null", raw)
+	}
+}
+
 // TestRotateSigningKey_RoundTrip walks the path a node enrolled before its
 // Domain had a key of its own takes: the mock switches keys, the node refuses
 // the next envelope until a pull hands it the new key, and then accepts both
