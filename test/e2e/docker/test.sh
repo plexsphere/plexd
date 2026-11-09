@@ -25,6 +25,9 @@
 #   - tcp tunnel traffic reported as session_active rows
 #   - Secret index fed from the state pull's secrets block, with
 #     node_secrets_updated as a pull trigger
+#   - Mesh DNS without systemd-resolved: the listener and the missing resolver
+#     logged once per start, mesh names answered on the mesh IP, and kept by a
+#     null dns block
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -4816,6 +4819,184 @@ configure_secrets "seclist-c" '[]' node_state_updated
 wait_secret_index "seclist-c" '[]' 30
 
 echo "=== Phase 12c PASSED: secret index from the inventory ==="
+
+# ===================================================================
+# Phase 12d: mesh DNS without systemd-resolved
+# ===================================================================
+# The distroless plexd image has no system bus and no systemd-resolved, so
+# plexd answers the dns block of its pull on its own mesh IP and logs where,
+# and registers nothing. It runs before Phase 13, which replaces the fixture
+# with a state that has no dns key: every start of plexd so far pulled the
+# fixture's block first, so each logged the listener once and the missing
+# resolver once, however many pulls followed. The queries run inside the
+# plexd container, whose own mesh IP is the only source besides loopback the
+# resolver answers.
+echo "=== Testing mesh DNS without systemd-resolved ==="
+
+MESH_DNS_LISTEN="10.99.0.1:5354"
+
+# mesh_nslookup <name> asks the resolver for the A record of name from inside
+# the plexd container, and leaves the output, stderr included, in
+# NSLOOKUP_OUT and the exit status in NSLOOKUP_RC. busybox 1.37 takes the port
+# on the server argument.
+mesh_nslookup() {
+    NSLOOKUP_RC=0
+    NSLOOKUP_OUT=$(dc exec -T plexd /bin/busybox nslookup -type=a "$1" "${MESH_DNS_LISTEN}" 2>&1) || NSLOOKUP_RC=$?
+}
+
+# nslookup_answers <output> <name> <address> succeeds when an nslookup output
+# has the line "Name:<tab><name>" followed by the answer line
+# "Address: <address>". The server's own address is printed as
+# "Address:<tab>10.99.0.1:5354", above the name, so it cannot pass for the
+# answer.
+nslookup_answers() {
+    local out=$1 name=$2 addr=$3 line named=0
+    while IFS= read -r line; do
+        if [ "${line}" = "Name:"$'\t'"${name}" ]; then
+            named=1
+        elif [ "${named}" -eq 1 ] && [ "${line}" = "Address: ${addr}" ]; then
+            return 0
+        fi
+    done <<< "${out}"
+    return 1
+}
+
+# configure_dns <tag> <dns-json-or-null> splices the dns block into the live
+# snapshot the way configure_hooks splices the hooks block, posts it back, and
+# nudges the agent. Reading the live snapshot is a real GET on the state
+# endpoint and INCREMENTS state_count, so a check gating on state_count takes
+# its baseline AFTER calling this helper.
+configure_dns() {
+    local tag=$1 block=$2 snapshot spliced status payload
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson d "${block}" '.dns = $d') \
+        || fail "[${tag}] could not splice the dns block ${block} into the live snapshot"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    payload=$(cat <<DNSNUDGEEOF
+{
+    "id": "evt-e2e-dns-nudge-${tag}",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+DNSNUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] dns nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# (a) One listener line and one missing-resolver line per start, both naming
+# the listen address. dc logs spans every run of the container, so the starts
+# are counted from the same log.
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+PLEXD_STARTS=$(count_log_lines "${PLEXD_LOGS}" 'msg="starting plexd"')
+DNS_LISTENING=$(count_log_lines "${PLEXD_LOGS}" 'msg="mesh dns listening"' "listen=${MESH_DNS_LISTEN}")
+DNS_UNREGISTERED=$(count_log_lines "${PLEXD_LOGS}" 'msg="mesh dns not registered, systemd-resolved is not usable"' "listen=${MESH_DNS_LISTEN}")
+DNS_WG_DOWN=$(count_log_lines "${PLEXD_LOGS}" 'msg="wireguard unavailable, mesh dns not started"')
+if [ "${DNS_WG_DOWN}" -ne 0 ]; then
+    fail "plexd logged 'wireguard unavailable, mesh dns not started' ${DNS_WG_DOWN} time(s): the resolver listens on the WireGuard interface's mesh IP, so this phase needs kernel WireGuard in the container"
+fi
+if [ "${PLEXD_STARTS}" -lt 1 ]; then
+    fail "the plexd log has no 'starting plexd' line to count the starts by"
+fi
+if [ "${DNS_LISTENING}" -ne "${PLEXD_STARTS}" ]; then
+    fail "the plexd log has ${DNS_LISTENING} 'mesh dns listening' line(s) with listen=${MESH_DNS_LISTEN} for ${PLEXD_STARTS} start(s), want one per start"
+fi
+echo "  PASS: 'mesh dns listening' with listen=${MESH_DNS_LISTEN} logged ${DNS_LISTENING} time(s), once per start of plexd (${PLEXD_STARTS})"
+if [ "${DNS_UNREGISTERED}" -ne "${PLEXD_STARTS}" ]; then
+    fail "the plexd log has ${DNS_UNREGISTERED} 'mesh dns not registered, systemd-resolved is not usable' line(s) with listen=${MESH_DNS_LISTEN} for ${PLEXD_STARTS} start(s), want one per start"
+fi
+echo "  PASS: 'mesh dns not registered, systemd-resolved is not usable' with listen=${MESH_DNS_LISTEN} logged ${DNS_UNREGISTERED} time(s), once per start of plexd (${PLEXD_STARTS})"
+
+# (b) The resolver answers a host of the block and denies a name it lacks.
+mesh_nslookup peer-1.app.e2e.internal
+if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" peer-1.app.e2e.internal 10.99.0.2; then
+    echo "  PASS: nslookup -type=a peer-1.app.e2e.internal ${MESH_DNS_LISTEN} answers 10.99.0.2"
+else
+    fail "nslookup -type=a peer-1.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and 10.99.0.2 (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup nope.app.e2e.internal
+case "${NSLOOKUP_OUT}" in
+    *"server can't find nope.app.e2e.internal: NXDOMAIN"*) NOPE_NXDOMAIN=1 ;;
+    *) NOPE_NXDOMAIN=0 ;;
+esac
+if [ "${NSLOOKUP_RC}" -ne 0 ] && [ "${NOPE_NXDOMAIN}" -eq 1 ]; then
+    echo "  PASS: nslookup -type=a nope.app.e2e.internal ${MESH_DNS_LISTEN} answers NXDOMAIN"
+else
+    fail "nslookup -type=a nope.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want a failure with NXDOMAIN (output: ${NSLOOKUP_OUT})"
+fi
+
+# (c) A null block keeps the names held. The fixture's block is saved first,
+# so the phase can serve it again. Two pulls past the baseline mean at least
+# one of them ran its dispatch handlers to the end: the nudge's pull may land
+# ahead of the baseline, and the heartbeat asks for a pull about every 30 s, so
+# the wait covers two heartbeats.
+FIXTURE_DNS=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null | jq -c '.dns' 2>&1 || true)
+FIXTURE_PEER1=$(printf '%s' "${FIXTURE_DNS}" | jq '[.hosts[]? | select(.fqdn == "peer-1.app.e2e.internal" and .mesh_ip == "10.99.0.2")] | length' 2>&1 || true)
+if [ "${FIXTURE_PEER1}" != "1" ]; then
+    fail "[dns null block] the served dns block '${FIXTURE_DNS}' does not carry peer-1.app.e2e.internal at 10.99.0.2 once (got '${FIXTURE_PEER1}')"
+fi
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+NO_BLOCK_BEFORE=$(count_log_lines "${PLEXD_LOGS}" 'msg="state pull carries no dns block, keeping the names held"')
+configure_dns "dns-null" null
+STATE_BEFORE_DNS_NULL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+case "${STATE_BEFORE_DNS_NULL}" in
+    '' | *[!0-9]*) fail "[dns null block] no state_count baseline (got '${STATE_BEFORE_DNS_NULL}')" ;;
+esac
+DNS_NULL_ELAPSED=0
+while :; do
+    STATE_AFTER_DNS_NULL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    if [ "${STATE_AFTER_DNS_NULL}" -ge $((STATE_BEFORE_DNS_NULL + 2)) ] 2>/dev/null; then
+        echo "  PASS: [dns null block] state_count grew from ${STATE_BEFORE_DNS_NULL} to ${STATE_AFTER_DNS_NULL} after ${DNS_NULL_ELAPSED}s"
+        break
+    fi
+    if [ "${DNS_NULL_ELAPSED}" -ge 65 ]; then
+        fail "[dns null block] state_count went from ${STATE_BEFORE_DNS_NULL} to '${STATE_AFTER_DNS_NULL}' in 65s, want two pulls of the null block"
+    fi
+    sleep 1
+    DNS_NULL_ELAPSED=$((DNS_NULL_ELAPSED + 1))
+done
+# The first pull without a block since the last one with a block logs the
+# line once, and the next one logs nothing.
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+NO_BLOCK_AFTER=$(count_log_lines "${PLEXD_LOGS}" 'msg="state pull carries no dns block, keeping the names held"')
+if [ "${NO_BLOCK_AFTER}" -ne $((NO_BLOCK_BEFORE + 1)) ]; then
+    fail "[dns null block] 'state pull carries no dns block, keeping the names held' went from ${NO_BLOCK_BEFORE} to ${NO_BLOCK_AFTER} line(s) over two pulls of the null block, want +1"
+fi
+echo "  PASS: [dns null block] plexd logged 'state pull carries no dns block, keeping the names held' once"
+mesh_nslookup peer-1.app.e2e.internal
+if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" peer-1.app.e2e.internal 10.99.0.2; then
+    echo "  PASS: [dns null block] nslookup -type=a peer-1.app.e2e.internal ${MESH_DNS_LISTEN} still answers 10.99.0.2"
+else
+    fail "[dns null block] nslookup -type=a peer-1.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and 10.99.0.2 (output: ${NSLOOKUP_OUT})"
+fi
+
+# (d) The fixture's block is served again before the phase ends.
+configure_dns "dns-restore" "${FIXTURE_DNS}"
+SERVED_DNS=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null | jq -c '.dns' 2>&1 || true)
+if [ "$(jq -n --argjson a "${SERVED_DNS:-null}" --argjson b "${FIXTURE_DNS}" '$a == $b' 2>&1)" = "true" ]; then
+    echo "  PASS: the mock serves the fixture's dns block again"
+else
+    fail "the mock serves the dns block '${SERVED_DNS}' after the restore, want '${FIXTURE_DNS}'"
+fi
+
+echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 
 # ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)

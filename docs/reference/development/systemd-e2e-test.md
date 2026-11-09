@@ -6,7 +6,7 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved and answers through it, then verifies clean shutdown.
 
 ## Container Topology
 
@@ -26,6 +26,8 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 |-----------|-------|--------|---------|
 | `plexd-e2e-mockapi` | `mockapi:e2e-systemd` | `test/e2e/mockapi/Dockerfile` | Fixture-based mock Central API, tracks call counters |
 | `plexd-e2e-systemd` | `plexd-systemd:e2e` | `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 with systemd as PID 1, runs plexd as a real service |
+
+The systemd image installs `dbus` and `systemd-resolved` next to `systemd`, `systemd-sysv`, `curl`, `ca-certificates`, `jq`, `openssh-client`, and `sshpass`. Both install enabled, so the container boots with a system bus and its own systemd-resolved, which plexd registers its mesh DNS resolver with. Docker mounts its own `/etc/resolv.conf` (`nameserver 127.0.0.11`) over the one the package would link, so systemd-resolved runs in foreign mode with Docker's DNS as its global server, `nsswitch.conf` keeps `hosts: files dns`, and the mesh DNS phases ask systemd-resolved directly with `resolvectl`. Every `resolvectl` call runs inside the container through `docker exec` and reaches the container's systemd-resolved, never the host's.
 
 ## Test Phases
 
@@ -91,17 +93,34 @@ Drives a mediated ssh session through the sessions block, the socket-activated s
 6. Drains the block, waits up to 60 s for `session_activity_count` to rise by 2, and requires `session_activity_rejected_count` unchanged: both `session_ended` rows post for sessions the mock already holds as revoked, and the mock, like the control plane, records the ending row of such a session once, so both are accepted, as the tcp drain is in the docker suite. The last body is an ssh `session_ended` row with `terminated_by` `plexd_close`.
 7. Opens a connection for the drained `sess-e2e-ssh-root`. plexd finds no live session and opens nothing, so the `ssh` attempt exits `255`, `session_connection_timeout_count` rises by 1, `session_connection_count` does not move, and `journalctl -u plexd` contains `session_connect names no live ssh session; not connecting`.
 
-### 13. Start after a reboot
+### 13. Mesh DNS through systemd-resolved
+
+plexd answers the `dns` block of its state pull on its own mesh IP, `10.99.0.1:5354`, and registers that server with the container's systemd-resolved for the mesh zones on `plexd0`. The mock's fixture block has the search domain `app.e2e.internal`, the zones `app.e2e.internal` and `e2e.internal`, the reverse zone `0.99.10.in-addr.arpa`, and the hosts `node-1`, `peer-1` and `peer-2` under `app.e2e.internal` at `10.99.0.1` to `10.99.0.3` (see [the mock's fixture](mock-api-server.md)). Every query runs `resolvectl query <name>` inside the container. An answer counts only when its line reads `<name>: <value>` and ends in `-- link: plexd0`. A failure counts as an NXDOMAIN only when it reads `'<name>' not found`. `resolvectl` wraps a long domain list onto the next line, so the phase compares domain lists word by word. Every check fails the suite.
+
+1. **Interface.** `/sys/class/net/plexd0` must exist. No earlier phase depends on the WireGuard interface, and the resolver listens on its mesh IP.
+2. **Registration.** It polls `resolvectl status plexd0` every 2 seconds for up to 30 seconds until its `DNS Servers:` line is exactly `10.99.0.1:5354`. plexd registers on the first pull after a start, and the last start was the audit phase's restart, so the registration is normally in place already. The output must then hold the words `app.e2e.internal`, `~e2e.internal`, `~0.99.10.in-addr.arpa` and `-DefaultRoute`, and `resolvectl domain plexd0` must list exactly `app.e2e.internal`, `~0.99.10.in-addr.arpa` and `~e2e.internal`: the search domain once, and no routing domain for `app.e2e.internal`, which `~e2e.internal` covers. The journal must hold a `mesh dns registered with systemd-resolved` line of the running process (`plexd[<MainPID>]:`) with `interface=plexd0` and `server=10.99.0.1:5354`.
+3. **Names.** `peer-1.app.e2e.internal` must answer `10.99.0.2` on `plexd0`. The bare `peer-1` must answer `10.99.0.2` on `plexd0` as `(peer-1.app.e2e.internal)`, through the search domain. `10.99.0.3` must answer `peer-2.app.e2e.internal` on `plexd0`, through the reverse zone. `nope.app.e2e.internal` must fail with `not found`.
+4. **Other names.** The mock API's container name, qualified with the network's name, `plexd-e2e-mockapi.plexd-systemd-e2e`, must answer the address `docker inspect` gives for the container on `plexd-systemd-e2e`, and the output must not name `plexd0`: Docker's DNS answers it as systemd-resolved's global server. The bare container name cannot be used, because systemd-resolved sends no single-label name to a DNS server.
+5. **A changed block.** It reads the live snapshot, requires its `dns.hosts` to carry `peer-1.app.e2e.internal` at `10.99.0.2` once, renames that host to `db-1.app.e2e.internal`, adds the zone `ops.e2e.test` and the host `gw.ops.e2e.test` at `10.99.0.4`, and posts the result to `POST /test/configure-state`, so every other block travels back verbatim. No event nudges plexd: the heartbeat answers `reconcile: true`, so a pull comes about every 30 seconds. The phase polls every 3 seconds for up to 90 seconds until `resolvectl domain plexd0` lists `~ops.e2e.test`, `db-1.app.e2e.internal` answers `10.99.0.2` on `plexd0`, `gw.ops.e2e.test` answers `10.99.0.4` on `plexd0`, and `peer-1.app.e2e.internal` fails with `not found`. `gw.ops.e2e.test` is asked for only once `plexd0` routes its zone, so no query for it leaves through the global server. The domain list must then be exactly `app.e2e.internal`, `~0.99.10.in-addr.arpa`, `~e2e.internal` and `~ops.e2e.test`, and `systemctl show -p MainPID --value plexd` must print the PID it printed before the post.
+6. **A paused control plane.** It runs `docker pause plexd-e2e-mockapi` for 20 seconds. After 10 seconds it runs `resolvectl flush-caches` in the container, and `db-1.app.e2e.internal` must then answer `10.99.0.2` on `plexd0` with the line `-- Data from: network`, so the answer came from plexd and not from systemd-resolved's cache. After `docker unpause` it waits 2 seconds, so a request plexd sent into the paused mock and that completes once it runs again is not counted, reads `heartbeat_count` and `state_count`, and polls for up to 60 seconds until both have grown: plexd sent a heartbeat and the pull its `reconcile: true` answer asks for. While the mock is paused, `MOCK_PAUSED` is set, and `fail` and the `EXIT` trap both run `docker unpause` first.
+
+### 14. Start after a reboot
 
 A reboot empties `/run`, which takes `/run/plexd` with it. The phase stops plexd, removes `/run/plexd` and starts plexd again, then waits up to 30 s for `/var/run/plexd/api.sock` and expects `systemctl is-active plexd` to print `active`. Every `ReadWritePaths` entry of the unit is optional, so systemd skips the missing directory instead of failing with `226/NAMESPACE`, and plexd recreates it for the node API socket.
 
-### 14. Shutdown verification
+The stop also takes the mesh DNS registration with it. Right after `systemctl stop plexd`, `resolvectl query db-1.app.e2e.internal` must fail without naming `10.99.0.2` or `plexd0`, `resolvectl domain` must list no domain that contains `e2e.internal`, and the journal of the stopped process must hold `mesh dns registration reverted` with `interface=plexd0`. These checks sit here and not in the shutdown phase because the opt-out phase leaves nothing registered for the final stop to remove. After the start, the phase polls `db-1.app.e2e.internal` every second until it answers `10.99.0.2` on `plexd0` again, and fails if that takes more than 30 seconds from the phase's start, the stop included. The first pull of the new process serves the block step 5 of the mesh DNS phase configured.
 
-Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged.
+### 15. Mesh DNS opt-out
 
-### 15. Cleanup
+The phase reads `/etc/plexd/config.yaml`, fails if a line already starts with `dns:`, appends `dns: {enabled: false}` as a block, and runs `systemctl restart plexd`. The journal of the new process must hold `mesh dns disabled by dns.enabled` within 30 seconds, and must not hold `mesh dns listening`. The phase then waits for `state_count` to grow past its value after the restart, for up to 60 seconds from the restart, so a pull carrying the `dns` block reached the new process. `resolvectl status plexd0` must then exit 0 and show no DNS server, and `resolvectl domain plexd0` must list no domain. The restart's stop reverted the registration of the run before, and a disabled resolver registers nothing.
 
-The `cleanup` function runs on `EXIT` trap (both success and failure). It prints diagnostics on failure, then removes both containers and the Docker network.
+### 16. Shutdown verification
+
+Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. It runs with the opt-out of phase 15 in place.
+
+### 17. Cleanup
+
+The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes both containers and the Docker network.
 
 ## Assertion Logic
 
@@ -180,6 +199,13 @@ audit_fwd:
 
 The bootstrap token is written to `/etc/plexd/bootstrap-token` (mode 0600) before the service starts; no environment file is written.
 
+The config sets no `dns` key, so the mesh DNS resolver runs with its defaults, enabled on port 5354, until phase 15 appends:
+
+```yaml
+dns:
+  enabled: false
+```
+
 ## Configuration Variables
 
 | Variable | Default | Description |
@@ -208,6 +234,7 @@ TIMEOUT=120 make test-e2e-systemd
 
 - Docker
 - `curl` and `jq` on the host
+- Kernel WireGuard on the host: the mesh DNS phase needs `plexd0`, which plexd creates in the container's network namespace
 
 ## Debugging Failures
 
@@ -242,6 +269,20 @@ Common causes:
 - Network connectivity — both containers must be on the `plexd-systemd-e2e` bridge network.
 - mock-api not ready — the script polls `/v1/health` for readiness but the health timeout may be too short.
 
+**A mesh name does not resolve:**
+
+```bash
+docker exec plexd-e2e-systemd resolvectl status plexd0
+docker exec plexd-e2e-systemd resolvectl query peer-1.app.e2e.internal
+docker exec plexd-e2e-systemd journalctl -u plexd --no-pager | grep -E 'mesh dns|component=meshdns|dns block|PLEXD_DNS_ENABLED'
+```
+
+Run these in the container only. On a host that is itself a Node, `resolvectl` without `docker exec` talks to the host's systemd-resolved.
+
+Common causes:
+- No `plexd0`: WireGuard did not come up, and plexd logs `wireguard unavailable, mesh dns not started`.
+- No `DNS Servers:` line on `plexd0`: look for `mesh dns not registered, systemd-resolved is not usable` or `mesh dns registration failed` in the journal; `systemctl status systemd-resolved dbus` shows whether both run.
+
 **Leftover containers from previous run:**
 
 The script performs pre-cleanup, but if issues persist:
@@ -266,12 +307,13 @@ On any failure, the `print_diagnostics` function outputs:
 | `ps aux` | Process list inside systemd container |
 | `ls -la /etc/plexd/` | Configuration files |
 | `ls -la /usr/local/bin/plexd` | Binary presence and permissions |
+| `resolvectl status --no-pager` | The container's systemd-resolved: global and per-link DNS servers and domains |
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 systemd container image |
+| `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 systemd container image, with `dbus` and `systemd-resolved` |
 | `test/e2e/systemd/test.sh` | Orchestration script (build, install, assert, shutdown, cleanup) |
 | `test/e2e/systemd/.dockerignore` | Prevents unnecessary files in Docker context |
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
