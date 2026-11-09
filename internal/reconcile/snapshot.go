@@ -13,7 +13,9 @@ import (
 // own health projection, not desired state, so it is never stored. Neither is
 // the signing key: a dispatch handler installs it on every pull, and there is
 // nothing for the differ to converge on. Nor is the secret inventory: the node
-// API's dispatch handler hands it to the secret index on every pull.
+// API's dispatch handler hands it to the secret index on every pull. Nor are the
+// mesh DNS names of the dns block: the mesh resolver's dispatch handler takes
+// them on every pull.
 type stateSnapshot struct {
 	mu      sync.RWMutex
 	peers   []api.SnapshotPeer

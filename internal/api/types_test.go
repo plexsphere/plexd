@@ -535,19 +535,27 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 		Hooks: &[]NodeStateHook{
 			{Name: "backup-db", Version: 2, Checksum: "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg="},
 		},
+		DNS: &NodeStateDNS{
+			SearchDomain: "openstack.lab.internal",
+			Zones:        []string{"lab.internal", "openstack.lab.internal"},
+			Hosts: []NodeStateDNSHost{
+				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", FQDN: "db-1.openstack.lab.internal", MeshIP: "10.42.0.3"},
+			},
+			ReverseZones: []string{"42.10.in-addr.arpa"},
+		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the eleven contract keys must appear.
+	// Exactly the twelve contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 11 {
-		t.Errorf("expected exactly 11 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 12 {
+		t.Errorf("expected exactly 12 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -585,7 +593,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all eleven keys PRESENT.
+	// Marshalling nil blocks emits literal null with all twelve keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -594,10 +602,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 11 {
-		t.Errorf("expected exactly 11 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 12 {
+		t.Errorf("expected exactly 12 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -727,6 +735,49 @@ func TestNodeStateSnapshot_HooksBlock(t *testing.T) {
 				t.Errorf("hooks = %#v, want a non-nil pointer to an empty slice", snap.Hooks)
 			}
 		})
+	}
+}
+
+// TestNodeStateSnapshot_DNSBlock pins the shapes the dns block arrives in. null
+// and an absent key both decode to a nil pointer, which the mesh resolver reads
+// as "keep the names you hold". A block with four empty lists decodes to a
+// non-nil pointer: the Domain has no names, and the node answers none. None of
+// them is a decode error.
+func TestNodeStateSnapshot_DNSBlock(t *testing.T) {
+	const others = `"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]`
+	for _, src := range []string{`{` + others + `,"dns":null}`, `{` + others + `}`} {
+		var snap NodeStateSnapshot
+		if err := json.Unmarshal([]byte(src), &snap); err != nil {
+			t.Fatalf("unmarshal %s: %v", src, err)
+		}
+		if snap.DNS != nil {
+			t.Errorf("dns from %s = %+v, want a nil pointer", src, snap.DNS)
+		}
+	}
+
+	var empty NodeStateSnapshot
+	if err := json.Unmarshal([]byte(`{`+others+`,"dns":{"search_domain":"","zones":[],"hosts":[],"reverse_zones":[]}}`), &empty); err != nil {
+		t.Fatalf("unmarshal empty block: %v", err)
+	}
+	if empty.DNS == nil {
+		t.Fatal("dns with four empty lists = nil, want a non-nil block")
+	}
+	if empty.DNS.SearchDomain != "" || len(empty.DNS.Zones) != 0 || len(empty.DNS.Hosts) != 0 || len(empty.DNS.ReverseZones) != 0 {
+		t.Errorf("dns = %+v, want an empty search domain and three empty lists", empty.DNS)
+	}
+
+	var populated NodeStateSnapshot
+	src := `{` + others + `,"dns":{"search_domain":"openstack.lab.internal","zones":["lab.internal"],` +
+		`"hosts":[{"node_id":"n-1","fqdn":"web.openstack.lab.internal","mesh_ip":"10.42.0.2"}],"reverse_zones":["42.10.in-addr.arpa"]}}`
+	if err := json.Unmarshal([]byte(src), &populated); err != nil {
+		t.Fatalf("unmarshal populated: %v", err)
+	}
+	wantHosts := []NodeStateDNSHost{{NodeID: "n-1", FQDN: "web.openstack.lab.internal", MeshIP: "10.42.0.2"}}
+	if populated.DNS == nil || populated.DNS.SearchDomain != "openstack.lab.internal" ||
+		!slices.Equal(populated.DNS.Zones, []string{"lab.internal"}) ||
+		!slices.Equal(populated.DNS.Hosts, wantHosts) ||
+		!slices.Equal(populated.DNS.ReverseZones, []string{"42.10.in-addr.arpa"}) {
+		t.Errorf("dns = %+v, want the populated block", populated.DNS)
 	}
 }
 

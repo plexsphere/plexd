@@ -86,7 +86,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// eleven fields carry omitempty.
+// twelve fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -120,6 +120,37 @@ type NodeStateSnapshot struct {
 	// never wrote, means the control plane could not compute the set this
 	// time, and every rolled-out hook is kept.
 	Hooks *[]NodeStateHook `json:"hooks"`
+	// DNS is the mesh DNS names of the node's Domain. A block is the full set,
+	// never a delta: it replaces the names the node answers. A nil value, the
+	// wire's null or a key a control plane predating the block never wrote,
+	// means the control plane did not say this time, and the node keeps the
+	// names it holds.
+	DNS *NodeStateDNS `json:"dns"`
+}
+
+// NodeStateDNS is the dns block of the state pull, as the "Mesh DNS names"
+// section of plexsphere's agent contract (docs/reference/api/plexd-agent-contract.md)
+// describes it. SearchDomain is the zone of the node's own Project. Zones are
+// the Domain's default domain and every Project zone, ascending. Hosts are
+// every node of the Domain, the pulling node included, ordered by FQDN.
+// ReverseZones are the in-addr.arpa or ip6.arpa zones that cover the Domain's
+// mesh CIDR and nothing wider. The control plane sends every name in lower
+// case without a trailing dot, and an empty list as [].
+type NodeStateDNS struct {
+	SearchDomain string             `json:"search_domain"`
+	Zones        []string           `json:"zones"`
+	Hosts        []NodeStateDNSHost `json:"hosts"`
+	ReverseZones []string           `json:"reverse_zones"`
+}
+
+// NodeStateDNSHost is one entry of the dns block's hosts, as the "Mesh DNS
+// names" section of plexsphere's agent contract describes it: a node of the
+// Domain, its fully qualified name, and its mesh IP, IPv4 or IPv6 by the family
+// of the Domain's mesh CIDR.
+type NodeStateDNSHost struct {
+	NodeID string `json:"node_id"`
+	FQDN   string `json:"fqdn"`
+	MeshIP string `json:"mesh_ip"`
 }
 
 // NodeStateHook is one entry of the hooks block of the state pull, a published
