@@ -921,7 +921,17 @@ absence.
   "hooks": [
     { "name": "backup-db", "version": 2, "checksum": "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=" },
     { "name": "rotate-logs", "version": 1, "checksum": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" }
-  ]
+  ],
+  "dns": {
+    "search_domain": "openstack.lab.internal",
+    "zones": ["lab.internal", "openstack.lab.internal"],
+    "hosts": [
+      { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "fqdn": "db-1.openstack.lab.internal", "mesh_ip": "10.99.0.2" },
+      { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "fqdn": "db-2.openstack.lab.internal", "mesh_ip": "10.99.0.3" },
+      { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", "fqdn": "web-1.openstack.lab.internal", "mesh_ip": "10.99.0.1" }
+    ],
+    "reverse_zones": ["0.99.10.in-addr.arpa"]
+  }
 }
 ```
 
@@ -1155,6 +1165,29 @@ No event announces a change, so a new rollout reaches the node within one
 reconcile interval, or sooner on a triggered pull. The block is not desired state
 for the differ: the reconcile snapshot neither stores nor compares it. See
 [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
+
+`dns` carries the mesh DNS names of the node's Domain, as the "Mesh DNS names"
+section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. `search_domain` is the zone of the node's own Project. `zones`
+lists the Domain's default domain and every Project zone, ascending. `hosts`
+lists every node of the Domain, the pulling node included, each with its
+`node_id`, its `fqdn` and its `mesh_ip`, ordered by `fqdn`. `reverse_zones`
+lists the `in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR
+and nothing wider. Every name is in lower case without a trailing dot, and an
+empty list is `[]`. The block is the full set, not a delta: it replaces the
+names the node answers. `null`, or a key missing because the control plane
+predates the block, means the control plane did not say, and plexd keeps the
+names it holds. On Linux, a plexd whose mesh resolver listens reads the block
+on every successful pull, drift or not. The resolver answers `A`, `AAAA` and
+`PTR` queries for the names on the node's own mesh IP, port 5354 by default,
+and plexd registers the zones and the search domain with systemd-resolved on
+the mesh interface. macOS and Windows do not read the block yet. A pull that
+changes only hosts issues no call to systemd-resolved. plexd skips an entry that
+breaks a rule of the contract, such as a zone under `arpa`, `local` or
+`localhost`, and logs `mesh dns skipped invalid entries` at Warn. The block is
+not desired state for the differ: the reconcile snapshot neither stores nor
+compares it. See [Mesh DNS](../networking/mesh-dns.md).
 
 ## Secrets
 

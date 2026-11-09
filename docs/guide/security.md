@@ -226,6 +226,7 @@ plexd requires the following network connectivity. All control plane communicati
 | Outbound | TCP/443 | - | Control plane SSE | Real-time event stream (persistent connection) |
 | Outbound | UDP/3478, UDP/19302 | - | STUN servers | NAT type discovery, public endpoint detection |
 | Inbound/Outbound | UDP/51820 | 51820 | Mesh peers | WireGuard encrypted mesh traffic (P2P) |
+| Local only | UDP/5354, TCP/5354 | `dns.listen_port` | The Node itself | Mesh DNS resolver on the Node's own mesh IP (Linux). It answers queries from the mesh IP itself and from loopback only, and drops every other source, so nothing needs to be opened in a firewall. See [Mesh DNS](../reference/networking/mesh-dns.md#source-rule) |
 
 ### Bridge Mode (additional)
 

@@ -107,6 +107,7 @@ export default withMermaid(defineConfig({
               { text: 'nftables Firewall', link: '/reference/networking/nftables-firewall' },
               { text: 'pf & WFP Firewall Controllers', link: '/reference/networking/pf-wfp-firewall' },
               { text: 'Secure Access Tunneling', link: '/reference/networking/secure-access-tunneling' },
+              { text: 'Mesh DNS', link: '/reference/networking/mesh-dns' },
             ],
           },
           {
