@@ -12,6 +12,7 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/packaging"
 	"github.com/plexsphere/plexd/internal/policy"
@@ -39,6 +40,13 @@ func newSystemLogSource(hostname string, logger *slog.Logger) logfwd.LogSource {
 // It needs root: creating a utun device is a privileged operation.
 func newWGController(logger *slog.Logger) wireguard.WGController {
 	return wireguard.NewDarwinController(logger)
+}
+
+// newMeshDNSRegistrar returns nil on macOS, which skips the mesh DNS resolver
+// without a log line. The resolver only runs where plexd can tell the host's
+// resolver to ask it, and no registrar for the macOS resolver exists yet.
+func newMeshDNSRegistrar(_ *slog.Logger) meshdns.Registrar {
+	return nil
 }
 
 // policyCapabilityHint is carried by both firewall-baseline failures. Every

@@ -34,6 +34,7 @@ import (
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/kubernetes"
 	"github.com/plexsphere/plexd/internal/logfwd"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
@@ -55,6 +56,12 @@ const drainTimeout = 30 * time.Second
 // teardown can hold up the drain.
 const sessionEndedReportTimeout = 2 * time.Second
 
+// meshDNSRegistrarTimeout bounds each call runAgent makes to the mesh DNS
+// registrar itself: the revert of a run that starts no resolver, and the
+// shutdown in the drain. A system bus that hangs would otherwise hold up
+// startup, or spend the drain's budget before WireGuard is torn down.
+const meshDNSRegistrarTimeout = 5 * time.Second
+
 // firewallController indirects the platform-specific constructor so tests can
 // drive the pre-flight path without depending on the host's netfilter state.
 var firewallController = newFirewallController
@@ -64,6 +71,13 @@ var firewallController = newFirewallController
 // Windows runner is elevated, and Wintun creates an adapter under any name a
 // test configures, the loopback's included.
 var wgController = newWGController
+
+// meshDNSRegistrar indirects the platform-specific constructor so tests can
+// record what runUp registers without reaching the host's resolver: on Linux
+// the registrar talks to systemd-resolved on the system bus, and a revert from
+// a test would drop the live registration of a developer machine that runs
+// plexd.
+var meshDNSRegistrar = newMeshDNSRegistrar
 
 var upCmd = &cobra.Command{
 	Use:   "up",
@@ -308,6 +322,58 @@ func runAgent(ctx context.Context) error {
 			}
 			return nat.EligiblePrefixes(ifaces, candidateFilter), nil
 		})
+	}
+
+	// 5a-3. Mesh DNS. The resolver answers the Domain's mesh names on the
+	// node's own mesh IP, and the registrar tells the host's resolver to send
+	// the mesh zones there through the mesh interface. A query to a per-link
+	// server leaves through that link, so only a listener on the mesh IP is
+	// reached, and the address exists only once WireGuard is up. The sockets
+	// are bound here so a bind failure is known before the dns block's
+	// dispatch handler is registered: a node that cannot answer must not
+	// register a server nothing listens on. Step 25a serves them; a startup
+	// that aborts before then ends the process, which closes them. Nothing here
+	// stops startup or touches readiness, because the mesh works without names.
+	// A platform without a registrar runs no resolver and logs nothing about it.
+	//
+	// A start that runs no resolver reverts the mesh link, whatever the reason,
+	// and a start that runs one applies on the first pull. A crash or a kill
+	// skips the drain and leaves plexd0 with its registration behind. The next
+	// start's WireGuard setup then fails on that device (EEXIST, see step 5c),
+	// and without the revert the host would send the mesh zones and the search
+	// domain to a port nothing listens on for the whole run. Revert does nothing
+	// when the link does not exist.
+	var dnsMgr *meshdns.Manager
+	if dnsRegistrar := meshDNSRegistrar(logger); dnsRegistrar != nil {
+		dnsIface := wgMgr.OSInterfaceName()
+		dnsMeshIP, dnsMeshIPErr := netip.ParseAddr(identity.MeshIP)
+		switch {
+		case !cfg.DNS.IsEnabled():
+			logger.Info("mesh dns disabled by dns.enabled")
+			revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
+		case !wgReady:
+			logger.Warn("wireguard unavailable, mesh dns not started")
+			revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
+		case dnsMeshIPErr != nil:
+			logger.Warn("mesh dns not started, the mesh ip does not parse",
+				"mesh_ip", identity.MeshIP,
+				"error", dnsMeshIPErr,
+			)
+			revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
+		default:
+			mgr := meshdns.NewManager(cfg.DNS, dnsIface, dnsMeshIP, dnsRegistrar, logger)
+			if err := mgr.Start(); err != nil {
+				logger.Warn("mesh dns listener cannot bind, mesh names are not answered",
+					"listen", mgr.Addr().String(),
+					"error", err,
+					"hint", "set dns.listen_port to a free port",
+				)
+				revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
+			} else {
+				logger.Info("mesh dns listening", "listen", mgr.Addr().String())
+				dnsMgr = mgr
+			}
+		}
 	}
 
 	// 5b. Initialize NAT traversal and peer exchange.
@@ -954,6 +1020,14 @@ func runAgent(ctx context.Context) error {
 	// while its state pulls keep succeeding has no other way to learn that.
 	reconciler.RegisterDispatchHandler(reconcile.NewReachabilityObserver(logger).Handle)
 
+	// The dns block names the hosts the mesh resolver answers for. It is taken
+	// on every successful pull, drift or not: the differ does not track it, and
+	// a pull that changed no name must still retry a registration that failed.
+	// Only a resolver that listens takes it (step 5a-3).
+	if dnsMgr != nil {
+		reconciler.RegisterDispatchHandler(dnsMgr.Handle)
+	}
+
 	// Edge PSKs are fetched on every successful pull, drift or not: a failed
 	// fetch must retry without failing the WireGuard reconcile handler, which
 	// would hold the snapshot back on every control plane that does not serve
@@ -1317,9 +1391,37 @@ func runAgent(ctx context.Context) error {
 		}
 	}()
 
+	// 25a. Serve the mesh DNS resolver on the sockets step 5a-3 bound. Run
+	// returns nil once ctx ends; an error before that means no mesh name is
+	// answered for the rest of this run, and the registration stays until the
+	// drain reverts it.
+	if dnsMgr != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := dnsMgr.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("mesh dns stopped", "error", err)
+			}
+		}()
+	}
+
 	// Wait for shutdown signal.
 	<-ctx.Done()
 	logger.Info("shutting down", "reason", ctx.Err())
+
+	// The mesh DNS registration goes first. The resolver stopped answering
+	// when ctx ended, because step 25a's Run closes its sockets then, so until
+	// the revert the host sends the mesh zones and the search domain to a port
+	// nothing listens on. Going first also reverts while the mesh interface
+	// still exists, before WireGuard deletes it. ctx is already done, so the
+	// revert gets a fresh, bounded one.
+	if dnsMgr != nil {
+		dnsCtx, cancelDNS := context.WithTimeout(context.Background(), meshDNSRegistrarTimeout)
+		if err := dnsMgr.Shutdown(dnsCtx); err != nil {
+			logger.Error("mesh dns shutdown error", "error", err)
+		}
+		cancelDNS()
+	}
 
 	// Graceful drain: stop subsystems in reverse dependency order.
 	sseMgr.Shutdown()
@@ -1432,6 +1534,19 @@ func meshMTUProbe(natCfg nat.Config) func(context.Context) (int, error) {
 	servers := natCfg.STUNServers
 	return func(ctx context.Context) (int, error) {
 		return nat.ProbePathMTU(ctx, servers, nat.MTUProbeTimeout)
+	}
+}
+
+// revertMeshDNS removes the resolver settings of the mesh interface for a run
+// that starts no resolver. A registration a killed run left behind would
+// otherwise keep sending the mesh zones to a port nothing listens on, which
+// fails every mesh name the host looks up. A failure is logged and startup
+// goes on: the host resolves every other name either way.
+func revertMeshDNS(ctx context.Context, registrar meshdns.Registrar, iface string, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, meshDNSRegistrarTimeout)
+	defer cancel()
+	if err := registrar.Revert(ctx, iface); err != nil {
+		logger.Warn("mesh dns revert failed", "interface", iface, "error", err)
 	}
 }
 
@@ -2404,6 +2519,18 @@ func applyEnvOverrides(cfg *agent.AgentConfig) {
 		// address and the likely cause, rather than through a second syntax
 		// check here that would only restate it earlier.
 		cfg.Health.Listen = v
+	}
+	if v := os.Getenv("PLEXD_DNS_ENABLED"); v != "" {
+		// Parsed like PLEXD_POLICY_ENABLED: a "False" rendered from a values
+		// file is a node operator opting out of the resolver and its
+		// registration, and must not read as consent. An unparseable value
+		// leaves the file's setting alone and says so.
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Warn("invalid PLEXD_DNS_ENABLED, leaving dns.enabled unchanged", "value", v)
+		} else {
+			cfg.DNS.Enabled = &enabled
+		}
 	}
 }
 

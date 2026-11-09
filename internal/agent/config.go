@@ -16,6 +16,7 @@ import (
 	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/logfwd"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
@@ -65,6 +66,7 @@ type AgentConfig struct {
 	Actions      actions.Config      `yaml:"actions"`
 	Policy       policy.Config       `yaml:"policy"`
 	WireGuard    wireguard.Config    `yaml:"wireguard"`
+	DNS          meshdns.Config      `yaml:"dns"`
 	Metrics      metrics.Config      `yaml:"metrics"`
 	LogFwd       logfwd.Config       `yaml:"log_fwd"`
 	AuditFwd     auditfwd.Config     `yaml:"audit_fwd"`
@@ -96,6 +98,7 @@ func (c *AgentConfig) ApplyDefaults() {
 	c.Actions.ApplyDefaults()
 	c.Policy.ApplyDefaults()
 	c.WireGuard.ApplyDefaults()
+	c.DNS.ApplyDefaults()
 	c.Metrics.ApplyDefaults()
 	c.LogFwd.ApplyDefaults()
 	c.AuditFwd.ApplyDefaults()
@@ -145,6 +148,9 @@ func (c *AgentConfig) Validate() error {
 		return err
 	}
 	if err := c.WireGuard.Validate(); err != nil {
+		return err
+	}
+	if err := c.DNS.Validate(); err != nil {
 		return err
 	}
 	if err := c.Metrics.Validate(); err != nil {
