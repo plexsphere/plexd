@@ -460,3 +460,38 @@ func TestStateDiff_Summary(t *testing.T) {
 		t.Errorf("Summary = %q, want %q", got, want)
 	}
 }
+
+// The dns block is consumed on the dispatch seam, every pull, by the mesh
+// resolver. It is not desired state the differ converges on, so a pull that
+// changes only the names is no drift and runs no reconcile handler.
+func TestComputeDiff_DNSIsNoDrift(t *testing.T) {
+	block := &api.NodeStateDNS{
+		SearchDomain: "openstack.lab.internal",
+		Zones:        []string{"lab.internal", "openstack.lab.internal"},
+		Hosts:        []api.NodeStateDNSHost{{NodeID: "n-1", FQDN: "web.openstack.lab.internal", MeshIP: "10.42.0.2"}},
+		ReverseZones: []string{"42.10.in-addr.arpa"},
+	}
+	renamed := &api.NodeStateDNS{
+		SearchDomain: "openstack.lab.internal",
+		Zones:        []string{"lab.internal", "openstack.lab.internal"},
+		Hosts:        []api.NodeStateDNSHost{{NodeID: "n-1", FQDN: "db-1.openstack.lab.internal", MeshIP: "10.42.0.2"}},
+		ReverseZones: []string{"42.10.in-addr.arpa"},
+	}
+
+	tests := []struct {
+		name             string
+		desired, current *api.NodeStateDNS
+	}{
+		{"nil to populated", block, nil},
+		{"populated to nil", nil, block},
+		{"renamed host", renamed, block},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{DNS: tt.desired}, &api.NodeStateSnapshot{DNS: tt.current})
+			if !diff.IsEmpty() {
+				t.Errorf("diff = %s, want none for a change of the dns block alone", diff.Summary())
+			}
+		})
+	}
+}
