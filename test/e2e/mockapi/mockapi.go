@@ -355,7 +355,10 @@ func (s *Server) Assertions() AssertionCounters {
 // Docker e2e run asserts that switch. The merged
 // policy fingerprint is derived with policyFingerprint; the bridge subtree
 // carries the four child configs; and both state and reports mirror one another
-// (the contract splits them for forward compatibility).
+// (the contract splits them for forward compatibility). The dns block names the
+// node at the mesh IP register assigns it and each peer at the mesh IP of its
+// peers entry, so every name a suite resolves points at an address of the
+// agent's mesh.
 func newStateFixture() api.NodeStateSnapshot {
 	rules := []api.PolicyRule{
 		{Action: "allow", Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"},
@@ -453,6 +456,22 @@ func newStateFixture() api.NodeStateSnapshot {
 		},
 		State:   block(),
 		Reports: block(),
+		// The search domain is the node's Project zone, and e2e.internal is
+		// its Domain's default domain above it, so the agent registers
+		// app.e2e.internal as its search domain and routes ~e2e.internal,
+		// which covers it. The one reverse zone covers the Domain's
+		// 10.99.0.0/24 and nothing wider. Hosts are ordered by fqdn, as the
+		// control plane serves them.
+		DNS: &api.NodeStateDNS{
+			SearchDomain: "app.e2e.internal",
+			Zones:        []string{"app.e2e.internal", "e2e.internal"},
+			Hosts: []api.NodeStateDNSHost{
+				{NodeID: mockNodeID, FQDN: "node-1.app.e2e.internal", MeshIP: "10.99.0.1"},
+				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FQDN: "peer-1.app.e2e.internal", MeshIP: "10.99.0.2"},
+				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", FQDN: "peer-2.app.e2e.internal", MeshIP: "10.99.0.3"},
+			},
+			ReverseZones: []string{"0.99.10.in-addr.arpa"},
+		},
 	}
 }
 
@@ -3308,14 +3327,15 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 
 // GetState returns the current state fixture with the peers, executions,
 // sessions, and secrets slices normalized to non-nil so they always serialize
-// as [] rather than null. The eleven envelope blocks carry no omitempty, so all
+// as [] rather than null. The twelve envelope blocks carry no omitempty, so all
 // keys are emitted (null for unpopulated blocks). The hooks block is left as
 // configured: a fixture without one serves null, which keeps every hook a
-// rollout installed.
+// rollout installed. The dns block is left as configured too: a fixture
+// without one serves null, which keeps the names the node holds.
 //
-// The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
-// and the peers, executions, sessions, and secrets backing arrays alias the
-// live fixture.
+// The result is a SHALLOW copy: the policy, bridge, state, reports, and dns
+// pointers and the peers, executions, sessions, and secrets backing arrays
+// alias the live fixture.
 // Reading is safe — SetState replaces the whole struct under the mutex, so no
 // caller observes a half-written fixture — but callers must NOT mutate through
 // the returned pointers or slices, which would race the state handler serving a
