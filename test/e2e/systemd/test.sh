@@ -16,7 +16,12 @@
 #   - Heartbeat-triggered reconcile via RotateKeys flag
 #   - Deeper body validation (metrics, capabilities fields)
 #   - Mediated ssh session through the socket-activated session helper
-#   - Start after a reboot cleared /run/plexd
+#   - Mesh DNS through systemd-resolved: the registration, names, a bare host
+#     name and a PTR answered on plexd0, a renamed host and a new zone without
+#     a restart, answers while the control plane is paused
+#   - Start after a reboot cleared /run/plexd, with the registration gone
+#     while plexd is stopped and back after the start
+#   - Mesh DNS opt-out with dns.enabled: false
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -29,6 +34,9 @@ MOCKAPI_IMAGE="mockapi:e2e-systemd"
 SYSTEMD_IMAGE="plexd-systemd:e2e"
 TIMEOUT="${TIMEOUT:-60}"
 TEST_FAILED=1
+# Set while the mesh DNS phase holds the mock API container paused, so a
+# failure and the EXIT trap unpause it first.
+MOCK_PAUSED=0
 
 # --- Helper: fetch a single counter value from a JSON response ---
 get_counter() {
@@ -103,12 +111,24 @@ print_diagnostics() {
     docker exec "${SYSTEMD_CONTAINER}" ls -la /etc/plexd/ 2>/dev/null || true
     echo "==> Systemd container /usr/local/bin/plexd:"
     docker exec "${SYSTEMD_CONTAINER}" ls -la /usr/local/bin/plexd 2>/dev/null || true
+    # The container's own systemd-resolved, never the host's.
+    echo "==> Systemd container resolvectl status:"
+    docker exec "${SYSTEMD_CONTAINER}" resolvectl status --no-pager 2>&1 || true
     echo "--- End diagnostics ---"
+}
+
+# --- Helper: unpause the mock API if the mesh DNS phase paused it ---
+unpause_mock() {
+    if [ "${MOCK_PAUSED}" -eq 1 ]; then
+        docker unpause "${MOCKAPI_CONTAINER}" >/dev/null 2>&1 || true
+        MOCK_PAUSED=0
+    fi
 }
 
 # --- Helper: print message, dump diagnostics, and exit 1 ---
 fail() {
     echo "FAIL: $1"
+    unpause_mock
     print_diagnostics
     exit 1
 }
@@ -116,6 +136,7 @@ fail() {
 # --- Cleanup trap ---
 cleanup() {
     echo "--- Cleaning up ---"
+    unpause_mock
     if [ "${TEST_FAILED}" -ne 0 ]; then
         print_diagnostics
     fi
@@ -1145,13 +1166,414 @@ rm -f "${SSH_ERR}"
 
 echo "=== Mediated ssh session PASSED ==="
 
+# --- Mesh DNS through systemd-resolved ---
+# plexd answers the dns block of its pull on its own mesh IP, 10.99.0.1:5354,
+# and registers that server with the container's systemd-resolved for the
+# mesh zones on plexd0 only. /etc/resolv.conf stays Docker's, so every query
+# here asks systemd-resolved directly with resolvectl, inside the container.
+# The fixture's block has the search domain app.e2e.internal, the zones
+# app.e2e.internal and e2e.internal, the reverse zone 0.99.10.in-addr.arpa,
+# and the hosts node-1, peer-1 and peer-2 at 10.99.0.1 to 10.99.0.3.
+echo "=== Testing mesh DNS through systemd-resolved ==="
+
+MESH_IFACE="plexd0"
+MESH_DNS_SERVER="10.99.0.1:5354"
+
+# has_word <text> <word> succeeds when word is one of the whitespace-separated
+# words of text. resolvectl wraps a long list onto the next line, so a list is
+# matched word by word rather than line by line.
+has_word() {
+    local text=$1 want=$2 line word
+    local -a words
+    while IFS= read -r line; do
+        read -ra words <<< "${line}"
+        for word in "${words[@]}"; do
+            if [ "${word}" = "${want}" ]; then
+                return 0
+            fi
+        done
+    done <<< "${text}"
+    return 1
+}
+
+# journal_has <journal> <needle>... succeeds when one line of journal carries
+# every needle. The journal is matched line by line rather than piped into
+# grep -q, which under pipefail can fail the writer of a long journal.
+journal_has() {
+    local journal=$1 line needle
+    shift
+    while IFS= read -r line; do
+        for needle in "$@"; do
+            case "${line}" in
+                *"${needle}"*) ;;
+                *) continue 2 ;;
+            esac
+        done
+        return 0
+    done <<< "${journal}"
+    return 1
+}
+
+# mesh_query <name> runs resolvectl query inside the container and leaves its
+# output, stderr included, in QUERY_OUT and its exit status in QUERY_RC.
+mesh_query() {
+    QUERY_RC=0
+    QUERY_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl query "$1" 2>&1) || QUERY_RC=$?
+}
+
+# answers_on_mesh <output> <name> <value> succeeds when a resolvectl query
+# output has the answer line "<name>: <value>" naming link plexd0.
+answers_on_mesh() {
+    local out=$1 name=$2 value=$3 line
+    while IFS= read -r line; do
+        case "${line}" in
+            "${name}: ${value} "*"-- link: ${MESH_IFACE}") return 0 ;;
+        esac
+    done <<< "${out}"
+    return 1
+}
+
+# not_found <output> <name> succeeds when a resolvectl query output reports
+# the name as not found, the answer to an NXDOMAIN.
+not_found() {
+    case "$1" in
+        *"'$2' not found"*) return 0 ;;
+    esac
+    return 1
+}
+
+# read_link_domains sets LINK_DOMAINS to the domains resolvectl domain lists
+# for plexd0, sorted and joined by one space, so a check compares the whole
+# set. Every word after the "Link N (plexd0):" label counts, the wrapped ones
+# too. LINK_DOMAINS_RAW keeps the output and LINK_DOMAINS_RC the exit status.
+read_link_domains() {
+    local -a parts
+    LINK_DOMAINS_RC=0
+    LINK_DOMAINS_RAW=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl domain "${MESH_IFACE}" 2>&1) || LINK_DOMAINS_RC=$?
+    read -ra parts <<< "$(printf '%s' "${LINK_DOMAINS_RAW#*:}" | tr '\n' ' ')"
+    if [ "${#parts[@]}" -eq 0 ]; then
+        LINK_DOMAINS=""
+        return 0
+    fi
+    LINK_DOMAINS=$(printf '%s\n' "${parts[@]}" | LC_ALL=C sort | tr '\n' ' ')
+    LINK_DOMAINS=${LINK_DOMAINS% }
+}
+
+# Step 1: no earlier phase depends on the WireGuard interface, and the
+# resolver listens on the mesh IP that interface carries.
+if docker exec "${SYSTEMD_CONTAINER}" test -e "/sys/class/net/${MESH_IFACE}"; then
+    echo "  PASS: /sys/class/net/${MESH_IFACE} exists"
+else
+    fail "/sys/class/net/${MESH_IFACE} does not exist in the container: WireGuard did not come up, and the resolver listens on that interface's mesh IP"
+fi
+
+# Step 2: the registration. plexd registers on the first pull after a start;
+# the last start was the audit phase's restart, so it is normally in place by
+# now, and the 30 s cover a first pull that came late.
+DNS_REG_TIMEOUT=30
+DNS_REG_START=${SECONDS}
+while :; do
+    DNS_STATUS_RC=0
+    DNS_STATUS=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl status "${MESH_IFACE}" 2>&1) || DNS_STATUS_RC=$?
+    DNS_STATUS_SERVERS=""
+    while IFS= read -r line; do
+        case "${line}" in
+            *"DNS Servers: "*) DNS_STATUS_SERVERS=${line#*DNS Servers: } ;;
+        esac
+    done <<< "${DNS_STATUS}"
+    if [ "${DNS_STATUS_RC}" -eq 0 ] && [ "${DNS_STATUS_SERVERS}" = "${MESH_DNS_SERVER}" ]; then
+        break
+    fi
+    if [ $((SECONDS - DNS_REG_START)) -ge "${DNS_REG_TIMEOUT}" ]; then
+        echo "${DNS_STATUS}"
+        fail "resolvectl status ${MESH_IFACE} (exit ${DNS_STATUS_RC}) lists DNS servers '${DNS_STATUS_SERVERS}' after ${DNS_REG_TIMEOUT}s, want '${MESH_DNS_SERVER}'"
+    fi
+    sleep 2
+done
+echo "  PASS: resolvectl status ${MESH_IFACE} shows the DNS server ${MESH_DNS_SERVER}"
+for want in app.e2e.internal "~e2e.internal" "~0.99.10.in-addr.arpa" "-DefaultRoute"; do
+    if ! has_word "${DNS_STATUS}" "${want}"; then
+        echo "${DNS_STATUS}"
+        fail "resolvectl status ${MESH_IFACE} does not show '${want}'"
+    fi
+done
+echo "  PASS: resolvectl status ${MESH_IFACE} shows app.e2e.internal, ~e2e.internal, ~0.99.10.in-addr.arpa and -DefaultRoute"
+# The search domain is listed once, and app.e2e.internal is no routing domain
+# of its own because ~e2e.internal covers it.
+read_link_domains
+if [ "${LINK_DOMAINS_RC}" -ne 0 ] || [ "${LINK_DOMAINS}" != "app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal" ]; then
+    echo "${LINK_DOMAINS_RAW}"
+    fail "resolvectl domain ${MESH_IFACE} (exit ${LINK_DOMAINS_RC}) lists '${LINK_DOMAINS}', want exactly 'app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal'"
+fi
+echo "  PASS: resolvectl domain ${MESH_IFACE} lists exactly ${LINK_DOMAINS}"
+DNS_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+DNS_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${DNS_JOURNAL}"
+if journal_has "${DNS_JOURNAL}" "plexd[${DNS_PID}]:" 'msg="mesh dns registered with systemd-resolved"' "interface=${MESH_IFACE}" "server=${MESH_DNS_SERVER}"; then
+    echo "  PASS: the journal of plexd[${DNS_PID}] holds 'mesh dns registered with systemd-resolved' for ${MESH_IFACE} and ${MESH_DNS_SERVER}"
+else
+    echo "${DNS_JOURNAL}"
+    fail "the journal of plexd[${DNS_PID}] has no 'mesh dns registered with systemd-resolved' line with interface=${MESH_IFACE} server=${MESH_DNS_SERVER}"
+fi
+
+# Step 3: a fully qualified name, a bare host name through the search domain,
+# and a mesh IP through the reverse zone are answered on plexd0, and a name
+# plexd denies is not found.
+mesh_query peer-1.app.e2e.internal
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" peer-1.app.e2e.internal 10.99.0.2; then
+    echo "  PASS: resolvectl query peer-1.app.e2e.internal answers 10.99.0.2 on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query peer-1.app.e2e.internal exited ${QUERY_RC}, want 0 and 10.99.0.2 on link ${MESH_IFACE}"
+fi
+mesh_query peer-1
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" peer-1 10.99.0.2 && has_word "${QUERY_OUT}" "(peer-1.app.e2e.internal)"; then
+    echo "  PASS: resolvectl query peer-1 answers 10.99.0.2 on link ${MESH_IFACE} as peer-1.app.e2e.internal"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query peer-1 exited ${QUERY_RC}, want 0 and 10.99.0.2 on link ${MESH_IFACE} through the search domain"
+fi
+mesh_query 10.99.0.3
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" 10.99.0.3 peer-2.app.e2e.internal; then
+    echo "  PASS: resolvectl query 10.99.0.3 answers peer-2.app.e2e.internal on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query 10.99.0.3 exited ${QUERY_RC}, want 0 and peer-2.app.e2e.internal on link ${MESH_IFACE}"
+fi
+mesh_query nope.app.e2e.internal
+if [ "${QUERY_RC}" -ne 0 ] && not_found "${QUERY_OUT}" nope.app.e2e.internal; then
+    echo "  PASS: resolvectl query nope.app.e2e.internal fails with not found"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query nope.app.e2e.internal exited ${QUERY_RC}, want a failure with 'not found'"
+fi
+
+# Step 4: a name outside the mesh zones still resolves the way it did, through
+# Docker's DNS as systemd-resolved's global server, and not through plexd0.
+# systemd-resolved sends no single-label name to a DNS server, so the mock API
+# is asked for by its container name qualified with the network's name, which
+# Docker's DNS answers too.
+MOCK_FQDN="${MOCKAPI_CONTAINER}.${NETWORK_NAME}"
+MOCK_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"${NETWORK_NAME}\").IPAddress}}" "${MOCKAPI_CONTAINER}")
+if [ -z "${MOCK_IP}" ]; then
+    fail "docker inspect gave no address of ${MOCKAPI_CONTAINER} on ${NETWORK_NAME}"
+fi
+mesh_query "${MOCK_FQDN}"
+MOCK_ANSWERED=0
+while IFS= read -r line; do
+    case "${line}" in
+        "${MOCK_FQDN}: ${MOCK_IP}" | "${MOCK_FQDN}: ${MOCK_IP} "*) MOCK_ANSWERED=1 ;;
+    esac
+done <<< "${QUERY_OUT}"
+case "${QUERY_OUT}" in
+    *"${MESH_IFACE}"*) MOCK_ON_MESH=1 ;;
+    *) MOCK_ON_MESH=0 ;;
+esac
+if [ "${QUERY_RC}" -eq 0 ] && [ "${MOCK_ANSWERED}" -eq 1 ] && [ "${MOCK_ON_MESH}" -eq 0 ]; then
+    echo "  PASS: resolvectl query ${MOCK_FQDN} answers ${MOCK_IP} and does not name link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query ${MOCK_FQDN} exited ${QUERY_RC}, want 0 and ${MOCK_IP} without link ${MESH_IFACE}"
+fi
+
+# Step 5: a changed block takes effect with the pull that carries it, without
+# a restart. peer-1 becomes db-1 at the same address, and the zone
+# ops.e2e.test arrives with the host gw.ops.e2e.test, which plexd routes as a
+# domain of its own because no other zone is above it. The block is spliced
+# into the state the mock serves, so every other block travels back verbatim.
+# No event nudges the agent: the heartbeat answers reconcile:true, so a pull
+# comes about every 30 s, and the 90 s cover three of them.
+DNS_SNAPSHOT=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+if [ -z "${DNS_SNAPSHOT}" ]; then
+    fail "could not read the live node state snapshot"
+fi
+DNS_PEER1=$(printf '%s' "${DNS_SNAPSHOT}" | jq '[.dns.hosts[]? | select(.fqdn == "peer-1.app.e2e.internal" and .mesh_ip == "10.99.0.2")] | length')
+if [ "${DNS_PEER1}" != "1" ]; then
+    fail "the served dns block carries ${DNS_PEER1} host(s) peer-1.app.e2e.internal at 10.99.0.2, want 1 (block: $(printf '%s' "${DNS_SNAPSHOT}" | jq -c '.dns'))"
+fi
+DNS_GW_HOST='{"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b4", "fqdn": "gw.ops.e2e.test", "mesh_ip": "10.99.0.4"}'
+# printf, not echo: the fixture carries backslash escapes (an embedded newline
+# in the certs/ca data entry) that must travel back byte for byte.
+DNS_CHANGED=$(printf '%s' "${DNS_SNAPSHOT}" | jq --argjson gw "${DNS_GW_HOST}" '
+    .dns.zones += ["ops.e2e.test"]
+    | .dns.hosts = ([.dns.hosts[] | if .fqdn == "peer-1.app.e2e.internal" then .fqdn = "db-1.app.e2e.internal" else . end] + [$gw] | sort_by(.fqdn))')
+MAIN_PID_BEFORE=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+DNS_CHANGE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${DNS_CHANGED}" \
+    "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+if [ "${DNS_CHANGE_STATUS}" != "204" ]; then
+    fail "configure-state with the renamed host returned status ${DNS_CHANGE_STATUS}, want 204"
+fi
+echo "  dns block configured: peer-1 renamed to db-1, zone ops.e2e.test with gw.ops.e2e.test added"
+DNS_CHANGE_TIMEOUT=90
+DNS_CHANGE_START=${SECONDS}
+while :; do
+    read_link_domains
+    DB1_OK=0
+    GW_OK=0
+    PEER1_GONE=0
+    # gw.ops.e2e.test is asked for only once plexd0 routes its zone, so no
+    # query for it leaves through the global server.
+    if has_word "${LINK_DOMAINS}" "~ops.e2e.test"; then
+        mesh_query db-1.app.e2e.internal
+        DB1_RC=${QUERY_RC}
+        DB1_OUT=${QUERY_OUT}
+        if [ "${DB1_RC}" -eq 0 ] && answers_on_mesh "${DB1_OUT}" db-1.app.e2e.internal 10.99.0.2; then
+            DB1_OK=1
+        fi
+        mesh_query gw.ops.e2e.test
+        GW_RC=${QUERY_RC}
+        GW_OUT=${QUERY_OUT}
+        if [ "${GW_RC}" -eq 0 ] && answers_on_mesh "${GW_OUT}" gw.ops.e2e.test 10.99.0.4; then
+            GW_OK=1
+        fi
+        mesh_query peer-1.app.e2e.internal
+        PEER1_RC=${QUERY_RC}
+        PEER1_OUT=${QUERY_OUT}
+        if [ "${PEER1_RC}" -ne 0 ] && not_found "${PEER1_OUT}" peer-1.app.e2e.internal; then
+            PEER1_GONE=1
+        fi
+    fi
+    if [ "${DB1_OK}" -eq 1 ] && [ "${GW_OK}" -eq 1 ] && [ "${PEER1_GONE}" -eq 1 ]; then
+        break
+    fi
+    if [ $((SECONDS - DNS_CHANGE_START)) -ge "${DNS_CHANGE_TIMEOUT}" ]; then
+        echo "resolvectl domain ${MESH_IFACE} (exit ${LINK_DOMAINS_RC}):"
+        echo "${LINK_DOMAINS_RAW}"
+        echo "resolvectl query db-1.app.e2e.internal (exit ${DB1_RC:-not run}): ${DB1_OUT:-}"
+        echo "resolvectl query gw.ops.e2e.test (exit ${GW_RC:-not run}): ${GW_OUT:-}"
+        echo "resolvectl query peer-1.app.e2e.internal (exit ${PEER1_RC:-not run}): ${PEER1_OUT:-}"
+        fail "the renamed host and the new zone did not take effect within ${DNS_CHANGE_TIMEOUT}s (db-1 ${DB1_OK}, gw ${GW_OK}, peer-1 gone ${PEER1_GONE})"
+    fi
+    sleep 3
+done
+echo "  PASS: after $((SECONDS - DNS_CHANGE_START))s db-1.app.e2e.internal answers 10.99.0.2 on link ${MESH_IFACE}"
+echo "  PASS: gw.ops.e2e.test answers 10.99.0.4 on link ${MESH_IFACE}"
+echo "  PASS: peer-1.app.e2e.internal fails with not found"
+if [ "${LINK_DOMAINS}" != "app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal ~ops.e2e.test" ]; then
+    echo "${LINK_DOMAINS_RAW}"
+    fail "resolvectl domain ${MESH_IFACE} lists '${LINK_DOMAINS}', want exactly 'app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal ~ops.e2e.test'"
+fi
+echo "  PASS: resolvectl domain ${MESH_IFACE} lists ~ops.e2e.test (exactly ${LINK_DOMAINS})"
+MAIN_PID_AFTER=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+if [ -n "${MAIN_PID_BEFORE}" ] && [ "${MAIN_PID_BEFORE}" != "0" ] && [ "${MAIN_PID_AFTER}" = "${MAIN_PID_BEFORE}" ]; then
+    echo "  PASS: the MainPID of plexd.service is still ${MAIN_PID_AFTER}"
+else
+    fail "the MainPID of plexd.service went from '${MAIN_PID_BEFORE}' to '${MAIN_PID_AFTER}', want it unchanged and nonzero"
+fi
+
+# Step 6: the names keep answering while the control plane is away. The mock
+# API container is paused for 20 s. Halfway in, systemd-resolved's cache is
+# flushed, so the answer that follows comes from plexd over the network and
+# not from the cache. fail and the EXIT trap unpause the mock.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+if [ -z "${RESPONSE}" ]; then
+    fail "assert endpoint unreachable before pausing the mock API"
+fi
+docker pause "${MOCKAPI_CONTAINER}" >/dev/null || fail "docker pause ${MOCKAPI_CONTAINER} failed"
+MOCK_PAUSED=1
+PAUSE_START=${SECONDS}
+echo "  mock API container paused"
+sleep 10
+FLUSH_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl flush-caches 2>&1) \
+    || fail "resolvectl flush-caches inside the container failed: ${FLUSH_OUT}"
+mesh_query db-1.app.e2e.internal
+PAUSE_FROM_NETWORK=0
+while IFS= read -r line; do
+    if [ "${line}" = "-- Data from: network" ]; then
+        PAUSE_FROM_NETWORK=1
+    fi
+done <<< "${QUERY_OUT}"
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" db-1.app.e2e.internal 10.99.0.2 && [ "${PAUSE_FROM_NETWORK}" -eq 1 ]; then
+    echo "  PASS: with the mock API paused for $((SECONDS - PAUSE_START))s and the cache flushed, db-1.app.e2e.internal answers 10.99.0.2 from the network"
+else
+    echo "${QUERY_OUT}"
+    fail "with the mock API paused, resolvectl query db-1.app.e2e.internal exited ${QUERY_RC}, want 0, 10.99.0.2 on link ${MESH_IFACE} and '-- Data from: network'"
+fi
+PAUSE_LEFT=$((20 - (SECONDS - PAUSE_START)))
+if [ "${PAUSE_LEFT}" -gt 0 ]; then
+    sleep "${PAUSE_LEFT}"
+fi
+docker unpause "${MOCKAPI_CONTAINER}" >/dev/null || fail "docker unpause ${MOCKAPI_CONTAINER} failed"
+MOCK_PAUSED=0
+echo "  mock API container unpaused after $((SECONDS - PAUSE_START))s"
+# plexd recovers: a heartbeat and the pull its reconcile:true answer asks for
+# both land after the unpause. The baseline is read 2 s after the unpause, so a
+# request plexd sent into the paused mock, which completes as soon as the mock
+# runs again, is not counted as a fresh one. A heartbeat goes out every 30 s,
+# and 60 s cover two of them.
+sleep 2
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+if [ -z "${RESPONSE}" ]; then
+    fail "assert endpoint unreachable after unpausing the mock API"
+fi
+HB_AFTER_UNPAUSE=$(get_counter "${RESPONSE}" "heartbeat_count")
+STATE_AFTER_UNPAUSE=$(get_counter "${RESPONSE}" "state_count")
+RECOVER_START=${SECONDS}
+while :; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    HB_NOW=$(get_counter "${RESPONSE}" "heartbeat_count")
+    STATE_NOW=$(get_counter "${RESPONSE}" "state_count")
+    if [ "${HB_NOW}" -gt "${HB_AFTER_UNPAUSE}" ] && [ "${STATE_NOW}" -gt "${STATE_AFTER_UNPAUSE}" ]; then
+        break
+    fi
+    if [ $((SECONDS - RECOVER_START)) -ge 60 ]; then
+        fail "plexd did not recover within 60s of the unpause: heartbeat_count ${HB_AFTER_UNPAUSE} -> ${HB_NOW}, state_count ${STATE_AFTER_UNPAUSE} -> ${STATE_NOW}"
+    fi
+    sleep 3
+done
+echo "  PASS: plexd recovered after the unpause: heartbeat_count ${HB_AFTER_UNPAUSE} -> ${HB_NOW}, state_count ${STATE_AFTER_UNPAUSE} -> ${STATE_NOW} within $((SECONDS - RECOVER_START))s"
+
+echo "=== Mesh DNS through systemd-resolved PASSED ==="
+
 # --- Start after a reboot ---
 # /run is tmpfs, so a reboot takes /run/plexd with it. Every ReadWritePaths
 # entry is optional, so the unit still sets up its namespace instead of
 # failing with 226/NAMESPACE, and plexd recreates the directory for the node
 # API socket.
+#
+# The stop also takes plexd's mesh DNS registration with it, and the start
+# brings it back with the first pull. The opt-out step after this phase
+# leaves nothing registered for the final stop to remove, so the stop's
+# revert is checked here.
 echo "=== Starting plexd after a simulated reboot (no /run/plexd) ==="
+REBOOT_START=${SECONDS}
+STOPPED_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
 docker exec "${SYSTEMD_CONTAINER}" systemctl stop plexd
+mesh_query db-1.app.e2e.internal
+case "${QUERY_OUT}" in
+    *"10.99.0.2"* | *"${MESH_IFACE}"*) STOPPED_ANSWER=1 ;;
+    *) STOPPED_ANSWER=0 ;;
+esac
+if [ "${QUERY_RC}" -ne 0 ] && [ "${STOPPED_ANSWER}" -eq 0 ]; then
+    echo "  PASS: with plexd stopped, resolvectl query db-1.app.e2e.internal fails (${QUERY_OUT%%$'\n'*})"
+else
+    echo "${QUERY_OUT}"
+    fail "with plexd stopped, resolvectl query db-1.app.e2e.internal exited ${QUERY_RC}, want a failure that names neither 10.99.0.2 nor ${MESH_IFACE}"
+fi
+STOPPED_DOMAINS_RC=0
+STOPPED_DOMAINS=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl domain 2>&1) || STOPPED_DOMAINS_RC=$?
+STOPPED_MESH_DOMAIN=""
+while IFS= read -r line; do
+    read -ra words <<< "${line}"
+    for word in "${words[@]}"; do
+        case "${word}" in
+            *e2e.internal*) STOPPED_MESH_DOMAIN=${word} ;;
+        esac
+    done
+done <<< "${STOPPED_DOMAINS}"
+if [ "${STOPPED_DOMAINS_RC}" -eq 0 ] && [ -z "${STOPPED_MESH_DOMAIN}" ]; then
+    echo "  PASS: with plexd stopped, resolvectl domain lists no e2e.internal domain"
+else
+    echo "${STOPPED_DOMAINS}"
+    fail "with plexd stopped, resolvectl domain exited ${STOPPED_DOMAINS_RC} and lists '${STOPPED_MESH_DOMAIN}', want exit 0 and no e2e.internal domain"
+fi
+STOP_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${STOP_JOURNAL}"
+if journal_has "${STOP_JOURNAL}" "plexd[${STOPPED_PID}]:" 'msg="mesh dns registration reverted"' "interface=${MESH_IFACE}"; then
+    echo "  PASS: the stopped plexd[${STOPPED_PID}] logged 'mesh dns registration reverted' for ${MESH_IFACE}"
+else
+    fail "the stopped plexd[${STOPPED_PID}] logged no 'mesh dns registration reverted' line for ${MESH_IFACE}"
+fi
 docker exec "${SYSTEMD_CONTAINER}" rm -rf /run/plexd
 if ! docker exec "${SYSTEMD_CONTAINER}" systemctl start plexd; then
     fail "plexd did not start without /run/plexd"
@@ -1172,6 +1594,90 @@ if [ "${REBOOT_STATE}" = "active" ]; then
 else
     fail "plexd state after the simulated reboot is '${REBOOT_STATE}', want 'active'"
 fi
+# The started plexd registers again on its first pull, which serves the block
+# the mesh DNS phase configured, and the name answers within 30 s of the
+# phase's start, the stop included.
+while :; do
+    mesh_query db-1.app.e2e.internal
+    if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" db-1.app.e2e.internal 10.99.0.2; then
+        break
+    fi
+    if [ $((SECONDS - REBOOT_START)) -ge 30 ]; then
+        echo "${QUERY_OUT}"
+        fail "resolvectl query db-1.app.e2e.internal exited ${QUERY_RC} $((SECONDS - REBOOT_START))s after the phase's start, want 0 and 10.99.0.2 on link ${MESH_IFACE} within 30s"
+    fi
+    sleep 1
+done
+echo "  PASS: resolvectl query db-1.app.e2e.internal answers 10.99.0.2 on link ${MESH_IFACE} again, $((SECONDS - REBOOT_START))s after the phase's start"
+
+# --- Mesh DNS opt-out ---
+# dns.enabled: false keeps the resolver off, and plexd reverts whatever a
+# killed run may have left on its link. The restart's stop reverts the
+# registration of the run before it, and the fresh run must register nothing,
+# not even once a pull carrying the dns block has arrived.
+echo "=== Testing the mesh DNS opt-out (dns.enabled: false) ==="
+OPTOUT_CONFIG=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/config.yaml 2>&1) || fail "could not read /etc/plexd/config.yaml: ${OPTOUT_CONFIG}"
+while IFS= read -r line; do
+    case "${line}" in
+        dns:*) fail "/etc/plexd/config.yaml already has a dns key ('${line}'), so the opt-out cannot be appended" ;;
+    esac
+done <<< "${OPTOUT_CONFIG}"
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf "dns:\n  enabled: false\n" >> /etc/plexd/config.yaml' \
+    || fail "could not append the dns block to /etc/plexd/config.yaml"
+echo "  dns: {enabled: false} appended to /etc/plexd/config.yaml"
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+OPTOUT_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+# Read after the restart, so every pull it counts is one of the new run's.
+STATE_BEFORE_OPTOUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+OPTOUT_START=${SECONDS}
+while :; do
+    OPTOUT_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${OPTOUT_JOURNAL}"
+    if journal_has "${OPTOUT_JOURNAL}" "plexd[${OPTOUT_PID}]:" 'msg="mesh dns disabled by dns.enabled"'; then
+        break
+    fi
+    if [ $((SECONDS - OPTOUT_START)) -ge 30 ]; then
+        fail "plexd[${OPTOUT_PID}] did not log 'mesh dns disabled by dns.enabled' within 30s of the restart"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${OPTOUT_PID}] logged 'mesh dns disabled by dns.enabled' after the restart"
+if journal_has "${OPTOUT_JOURNAL}" "plexd[${OPTOUT_PID}]:" 'msg="mesh dns listening"'; then
+    fail "plexd[${OPTOUT_PID}] logged 'mesh dns listening' although dns.enabled is false"
+fi
+echo "  PASS: plexd[${OPTOUT_PID}] did not start the resolver"
+# The heartbeat answers reconcile:true, so a pull comes within 30 s, and 60 s
+# cover two.
+while :; do
+    STATE_NOW=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    if [ "${STATE_NOW}" -gt "${STATE_BEFORE_OPTOUT}" ]; then
+        break
+    fi
+    if [ $((SECONDS - OPTOUT_START)) -ge 60 ]; then
+        fail "state_count stayed at ${STATE_BEFORE_OPTOUT} for 60s after the opt-out restart, want a pull of the dns block"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd pulled the state again (state_count ${STATE_BEFORE_OPTOUT} -> ${STATE_NOW})"
+OPTOUT_STATUS_RC=0
+OPTOUT_STATUS=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl status "${MESH_IFACE}" 2>&1) || OPTOUT_STATUS_RC=$?
+case "${OPTOUT_STATUS}" in
+    *"DNS Server"*) OPTOUT_HAS_SERVER=1 ;;
+    *) OPTOUT_HAS_SERVER=0 ;;
+esac
+if [ "${OPTOUT_STATUS_RC}" -eq 0 ] && [ "${OPTOUT_HAS_SERVER}" -eq 0 ]; then
+    echo "  PASS: resolvectl status ${MESH_IFACE} shows no DNS server"
+else
+    echo "${OPTOUT_STATUS}"
+    fail "resolvectl status ${MESH_IFACE} exited ${OPTOUT_STATUS_RC} with DNS server lines ${OPTOUT_HAS_SERVER}, want exit 0 and no DNS server"
+fi
+read_link_domains
+if [ "${LINK_DOMAINS_RC}" -eq 0 ] && [ -z "${LINK_DOMAINS}" ]; then
+    echo "  PASS: resolvectl domain ${MESH_IFACE} lists no domain"
+else
+    echo "${LINK_DOMAINS_RAW}"
+    fail "resolvectl domain ${MESH_IFACE} exited ${LINK_DOMAINS_RC} and lists '${LINK_DOMAINS}', want exit 0 and no domain"
+fi
+echo "=== Mesh DNS opt-out PASSED ==="
 
 # --- Clean shutdown verification ---
 echo "=== Stopping plexd service ==="

@@ -10,12 +10,18 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install systemd and curl (needed for the install script and health checks),
-# and the ssh client plus sshpass the mediated ssh session phase logs in with.
+# the ssh client plus sshpass the mediated ssh session phase logs in with, and
+# the system bus and systemd-resolved, with which plexd registers its mesh DNS
+# resolver. Both install enabled. /etc/resolv.conf stays the one Docker mounts,
+# so systemd-resolved runs in foreign mode with Docker's DNS as its global
+# server, and the mesh DNS phase asks it directly with resolvectl.
 # Clean up apt caches to keep the image small.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         systemd \
         systemd-sysv \
+        dbus \
+        systemd-resolved \
         curl \
         ca-certificates \
         jq \
