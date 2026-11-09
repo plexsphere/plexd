@@ -32,6 +32,7 @@ The tables below say what each operating system does, feature by feature. Every 
 | Policy enforcement | nftables, forward hook only | a pf anchor; also governs traffic to the node itself, and only TCP keeps state | WFP filters; also govern traffic to the node itself, permits are soft, and a port-scoped allow reaches no forward filter | [What the rules govern](../reference/networking/pf-wfp-firewall.md#what-the-rules-govern) |
 | Secure access tunneling (SSH, Kubernetes API proxy) | yes | yes | yes | [Secure access tunneling](../reference/networking/secure-access-tunneling.md) |
 | Mediated ssh sessions (the `ssh` session kind) | yes; processes start through the session helper | yes; processes start through a child session helper with plexd's own privileges | no; entries are settled as unsupported | [SSH Sessions](../reference/networking/secure-access-tunneling.md#ssh-sessions) |
+| Mesh DNS | yes; registered with systemd-resolved 246 or newer, and without one the resolver still answers on `<mesh IP>:5354` for a local resolver to forward to | no; no resolver runs | no; no resolver runs | [Mesh DNS](../reference/networking/mesh-dns.md) |
 
 ## Bridge mode
 

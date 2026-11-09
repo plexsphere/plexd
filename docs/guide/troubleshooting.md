@@ -98,6 +98,28 @@ level=INFO msg="wireguard interface configured" component=wireguard interface=pl
 
 The probe measures only the outbound IPv4 path to the STUN servers. It cannot see a bottleneck on a path to a peer that the STUN traffic does not cross, and it gets no answer where UDP to the STUN servers is blocked. In those cases set `wireguard.mtu` to the path MTU minus 80, for example `1372` for a 1452-byte path, and restart plexd. A positive value pins the MTU and turns detection off. See [MTU detection](../reference/networking/wireguard.md#mtu-detection).
 
+## A mesh name does not resolve
+
+```bash
+resolvectl status plexd0                      # The link's server and domains
+resolvectl query db-1.openstack.lab.internal  # Ask systemd-resolved directly
+plexd logs | grep -E 'mesh dns|component=meshdns|dns block|PLEXD_DNS_ENABLED'  # The resolver's log lines
+```
+
+On Linux, plexd answers the mesh names of its Domain on the Node's own mesh IP, port 5354 by default, and registers the Domain's zones with systemd-resolved on the mesh interface (`wireguard.interface_name`, `plexd0` by default). `resolvectl status plexd0` should list the server `<mesh IP>:5354`, the search domain, each routing domain with a leading `~` (every other zone that no zone above it covers, and every reverse zone), and `-DefaultRoute`. A link without that server has no registration. `resolvectl query` names the link an answer came from, so a mesh name answered through the mesh interface shows `plexd0`. A bare host name resolves through the search domain, and a mesh IP resolves to its name when the Domain's reverse zones cover it.
+
+The log lines say why a name is missing:
+
+- No `mesh dns listening` line means the resolver did not start. `mesh dns disabled by dns.enabled` means `dns.enabled` is `false`. `wireguard unavailable, mesh dns not started` means the WireGuard interface did not come up. After a crash or a kill, the setup fails on the `plexd0` the killed run left behind, and the stop of this run deletes it, so restart plexd once more. `mesh dns not started, the mesh ip does not parse` means the mesh IP that registration assigned is not an IP address; its `mesh_ip` key shows it. `mesh dns listener cannot bind, mesh names are not answered` means another program holds the port; set `dns.listen_port` to a free one and restart plexd. macOS and Windows run no resolver and log none of these.
+- `mesh dns not registered, systemd-resolved is not usable` means the host has no systemd-resolved, one older than 246, or no reachable system bus. Its `reason` says which. A stopped systemd-resolved counts as none, because plexd does not start it. The resolver still answers on the `listen` address; see [Hosts without systemd-resolved](../reference/networking/mesh-dns.md#hosts-without-systemd-resolved).
+- `mesh dns registration failed` carries the error systemd-resolved returned. `org.freedesktop.resolve1.LinkBusy` means systemd-networkd manages the link, which then cannot take settings over D-Bus. plexd tries again on every pull.
+- `state pull carries no dns block, keeping the names held` means the control plane sent no names. A control plane that predates the block never sends one.
+- `mesh dns skipped invalid entries` names the entries of the block plexd refused, up to five.
+
+A program resolves through systemd-resolved only when `/etc/resolv.conf` or `nsswitch.conf` sends it there: `/etc/resolv.conf` names the stub listener `127.0.0.53`, or the `hosts` line of `/etc/nsswitch.conf` lists `resolve`. `resolvectl query` always asks systemd-resolved, so a name that `resolvectl query` answers and a program does not points at the program's resolver configuration. On the Node itself, `dig @<mesh IP> -p 5354 <name>` asks plexd's resolver directly. A query from any other address gets no answer, so the same command run in a container or Pod network fails by design.
+
+systemd-resolved caches every answer for its TTL of 10 seconds, so a renamed host answers under its new name at most 10 seconds after the pull that carried the change. See [Mesh DNS](../reference/networking/mesh-dns.md).
+
 ## Hook execution fails with integrity violation
 
 ```bash

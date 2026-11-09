@@ -600,6 +600,7 @@ default it is an enriched envelope containing two peers, a merged policy with tw
 rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions`,
 `sessions`, and `secrets` blocks.
+It also carries a `dns` block that names the node and both peers.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
 The `signing_key` block is not read from the fixture: every response sets it to
 the mock's current signing key, the key `POST /v1/register` hands out, whatever
@@ -623,6 +624,15 @@ therefore hands the node the new key.
 | `secrets` | `[]` (no inventory; phases configure entries explicitly) |
 | `hooks` | `null`, which keeps every hook a rollout installed and lets the [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serve nothing; phases configure entries explicitly |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
+| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `reverse_zones` `0.99.10.in-addr.arpa` |
+
+The `dns` block names the node at the mesh IP `POST /v1/register` assigns it and
+each peer at the mesh IP of its `peers` entry, so every name a suite resolves
+points at an address of the agent's mesh. `app.e2e.internal` is the node's
+Project zone and `e2e.internal` its Domain's default domain above it, so the
+agent registers `app.e2e.internal` as its search domain and routes
+`~e2e.internal`, which covers it, and `~0.99.10.in-addr.arpa`, which covers the
+Domain's `10.99.0.0/24` and nothing wider. See [Mesh DNS](../networking/mesh-dns.md).
 
 The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
 its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node
@@ -756,7 +766,17 @@ comparison key and never re-derives it from the rules.
   "sessions": [],
   "secrets": [],
   "signing_key": {"key_id": "did:web:plexsphere.com#key-e2e", "public_key": "<base64 Ed25519 public key, generated per server start>"},
-  "hooks": null
+  "hooks": null,
+  "dns": {
+    "search_domain": "app.e2e.internal",
+    "zones": ["app.e2e.internal", "e2e.internal"],
+    "hosts": [
+      {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", "fqdn": "node-1.app.e2e.internal", "mesh_ip": "10.99.0.1"},
+      {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "fqdn": "peer-1.app.e2e.internal", "mesh_ip": "10.99.0.2"},
+      {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "fqdn": "peer-2.app.e2e.internal", "mesh_ip": "10.99.0.3"}
+    ],
+    "reverse_zones": ["0.99.10.in-addr.arpa"]
+  }
 }
 ```
 
@@ -1298,6 +1318,12 @@ result back — that is what the e2e helper `configure_executions` does. The
 the `hooks` key, spliced by `configure_hooks`. The `hooks` block is served as
 configured, and it also decides which configured versions the
 [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serves.
+
+The `dns` block travels the same way: the helpers splice into the live
+snapshot, so the fixture's block stays unless a phase replaces it. A body
+without a `dns` key stores a nil block, which the state endpoint serves as
+`"dns": null`, the contract's signal that the node keeps the names it holds.
+Splicing `"dns": null` does the same.
 
 **Response:** `204 No Content`
 

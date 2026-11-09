@@ -111,7 +111,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the eleven fields
+distinguishes a nil pointer from a populated block. None of the twelve fields
 carry `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -127,8 +127,9 @@ carry `omitempty`.
 | `Secrets`      | `*[]NodeStateSecret`   | `"secrets"`      | The node's secret inventory, ordered by name ascending; `[]` when the node may read nothing, never `null` on the wire. A pointer, like `Sessions`: a `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the node API's secret index, and `[]` empties it |
 | `SigningKey`   | `*NodeStateSigningKey` | `"signing_key"`  | The key the node's Domain signs envelopes and session tokens with. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) means "keep the key you hold", never "drop it" |
 | `Hooks`        | `*[]NodeStateHook`     | `"hooks"`        | The published hook versions a rollout assigns the node, ordered by name ascending: the node's full desired set. A pointer, like `Secrets`: `[]` removes every rolled-out hook, and a `nil` value (the wire's `null`, which the control plane sends when it could not compute the set, or a pull from a control plane that predates the block and omits it) keeps every one |
+| `DNS`          | `*NodeStateDNS`        | `"dns"`          | The mesh DNS names of the node's Domain: the full set, never a delta, which replaces the names the node answers. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the names the node holds |
 
-Six members are consumed on the dispatch seam rather than by the differ.
+Seven members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
@@ -140,6 +141,8 @@ installs and persists it (see `NodeStateSigningKey` below).
 the secret index from it on every successful pull (see `NodeStateSecret` below).
 `hooks` is never diffed either: the rollout installer's dispatch handler hands it
 to the installer on every successful pull (see `NodeStateHook` below).
+`dns` is never diffed either: the mesh resolver's dispatch handler builds the
+names it answers from it on every successful pull (see `NodeStateDNS` below).
 `peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
 
@@ -339,6 +342,36 @@ See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
 | `Name`     | `string` | `"name"`     | The hook's name, matching `^[a-z0-9][a-z0-9_-]{0,62}$`, so it never carries a dot and never shares a name with a built-in action |
 | `Version`  | `int`    | `"version"`  | The published version, at least 1                   |
 | `Checksum` | `string` | `"checksum"` | SHA-256 of the version's script: 32 bytes, standard-padded base64, the encoding of `DeclaredHook.Checksum`. The installed hook is pinned to it |
+
+**NodeStateDNS**
+
+The interior of the `dns` block: the mesh DNS names of the node's Domain, as the
+"Mesh DNS names" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. The control plane sends every name in lower case without a
+trailing dot, and an empty list as `[]`. `meshdns.BuildRecords` validates every
+entry and skips the ones that break a rule, such as a zone under `arpa`, `local`
+or `localhost`, a host outside every accepted zone, or a repeated `fqdn`, and the
+manager logs them at Warn as `mesh dns skipped invalid entries`. See
+[Mesh DNS](../networking/mesh-dns.md#records).
+
+| Field          | Type                 | JSON Tag          | Description                                         |
+|----------------|----------------------|-------------------|-----------------------------------------------------|
+| `SearchDomain` | `string`             | `"search_domain"` | The zone of the node's own Project, which bare host names resolve under. Kept only when it is an accepted zone |
+| `Zones`        | `[]string`           | `"zones"`         | The Domain's default domain and every Project zone, ascending |
+| `Hosts`        | `[]NodeStateDNSHost` | `"hosts"`         | Every node of the Domain, the pulling node included, ordered by `fqdn` |
+| `ReverseZones` | `[]string`           | `"reverse_zones"` | The `in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR and nothing wider |
+
+**NodeStateDNSHost**
+
+One entry of the `hosts` list: a node of the Domain, as the "Mesh DNS names"
+section of plexsphere's agent contract describes it.
+
+| Field    | Type     | JSON Tag    | Description                                         |
+|----------|----------|-------------|-----------------------------------------------------|
+| `NodeID` | `string` | `"node_id"` | The node's id. Carried, never answered              |
+| `FQDN`   | `string` | `"fqdn"`    | The node's fully qualified name, at least one label below one of `zones` |
+| `MeshIP` | `string` | `"mesh_ip"` | The node's mesh IP, IPv4 or IPv6 by the family of the Domain's mesh CIDR. The `A` or `AAAA` answer for `fqdn`. Its reverse name answers `PTR` with `fqdn` when it lies under one of `reverse_zones` |
 
 ### Supporting types
 
