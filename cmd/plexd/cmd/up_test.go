@@ -31,12 +31,14 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/kubernetes"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
@@ -1209,6 +1211,71 @@ func TestApplyEnvOverrides_Health(t *testing.T) {
 			t.Errorf("Health = %+v, want zero value", cfg.Health)
 		}
 	})
+}
+
+// TestApplyEnvOverrides_DNSEnabled covers the mesh DNS switch from the
+// environment, applied over what the config file says. A spelling ParseBool
+// accepts must win over the file either way, and a value it does not accept
+// must leave the file's setting alone, with a warning, rather than turn the
+// resolver on or off.
+//
+// The test swaps the process-global default logger, which applyEnvOverrides
+// logs through; t.Setenv already forbids t.Parallel.
+func TestApplyEnvOverrides_DNSEnabled(t *testing.T) {
+	const (
+		fileEnables  = "dns:\n  enabled: true\n"
+		fileDisables = "dns:\n  enabled: false\n"
+		warning      = "invalid PLEXD_DNS_ENABLED, leaving dns.enabled unchanged"
+	)
+	tests := []struct {
+		name  string
+		file  string
+		value string
+		want  bool
+		// warns is whether the value is reported as unparseable.
+		warns bool
+	}{
+		{name: "false over a file that enables", file: fileEnables, value: "false", want: false},
+		{name: "True over a file that disables", file: fileDisables, value: "True", want: true},
+		{name: "0 over a file without a dns key", file: "mode: node\n", value: "0", want: false},
+		{name: "maybe keeps a file that enables", file: fileEnables, value: "maybe", want: true, warns: true},
+		{name: "maybe keeps a file that disables", file: fileDisables, value: "maybe", want: false, warns: true},
+		{name: "empty value is inert", file: fileDisables, value: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLEXD_DNS_ENABLED", tt.value)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tt.file), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			logs := newRecordingHandler()
+			prev := slog.Default()
+			slog.SetDefault(slog.New(logs))
+			defer slog.SetDefault(prev)
+
+			cfg, _, err := loadMergedConfig(path)
+			if err != nil {
+				t.Fatalf("loadMergedConfig: %v", err)
+			}
+			if got := cfg.DNS.IsEnabled(); got != tt.want {
+				t.Errorf("DNS.IsEnabled() for %q = %v, want %v", tt.value, got, tt.want)
+			}
+			wantWarnings := 0
+			if tt.warns {
+				wantWarnings = 1
+			}
+			if n := logs.count(slog.LevelWarn, warning); n != wantWarnings {
+				t.Fatalf("warnings %q = %d, want %d", warning, n, wantWarnings)
+			}
+			if tt.warns {
+				if got := logs.attrsOf(slog.LevelWarn, warning)["value"]; got != tt.value {
+					t.Errorf("warning value = %q, want %q", got, tt.value)
+				}
+			}
+		})
+	}
 }
 
 // failingFirewallController fails its pre-flight probe. Every other method
@@ -4665,6 +4732,10 @@ type loggedRecord struct {
 type recordingHandler struct {
 	mu      sync.Mutex
 	records []loggedRecord
+	// mirror receives the message of every record whose message is in
+	// mirrored; mirrorTo sets both.
+	mirror   *callLog
+	mirrored map[string]bool
 }
 
 func newRecordingHandler() *recordingHandler { return &recordingHandler{} }
@@ -4680,12 +4751,28 @@ func (h *recordingHandler) Handle(_ context.Context, rec slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.records = append(h.records, loggedRecord{level: rec.Level, msg: rec.Message, attrs: attrs})
+	if h.mirrored[rec.Message] {
+		h.mirror.add(rec.Message)
+	}
 	return nil
 }
 
 func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 
 func (h *recordingHandler) WithGroup(string) slog.Handler { return h }
+
+// mirrorTo adds the message of every later record that says one of msgs to
+// order, so a test can place those log lines among the calls other doubles
+// add to the same callLog.
+func (h *recordingHandler) mirrorTo(order *callLog, msgs ...string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.mirror = order
+	h.mirrored = make(map[string]bool, len(msgs))
+	for _, msg := range msgs {
+		h.mirrored[msg] = true
+	}
+}
 
 // count returns how many records carry exactly this level and message.
 func (h *recordingHandler) count(level slog.Level, msg string) int {
@@ -4725,6 +4812,20 @@ func (h *recordingHandler) countAt(level slog.Level) int {
 		}
 	}
 	return n
+}
+
+// messagesContaining returns every message that contains sub, whatever its
+// level, so a test can pin that a whole family of lines stayed silent.
+func (h *recordingHandler) messagesContaining(sub string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var msgs []string
+	for _, rec := range h.records {
+		if strings.Contains(rec.msg, sub) {
+			msgs = append(msgs, rec.msg)
+		}
+	}
+	return msgs
 }
 
 const (
@@ -5293,4 +5394,568 @@ func TestPeerSnapshot_UpdateReportsProgrammedEndpoint(t *testing.T) {
 			t.Errorf("peer %s Endpoint = %q, want %q", status.ID, status.Endpoint, want[status.ID])
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Mesh DNS
+// ---------------------------------------------------------------------------
+
+// meshDNSTestInterface is the mesh interface name the mesh DNS wiring tests
+// configure. The WireGuard doubles create nothing under it, and a registrar
+// call that names it is told apart from one that names the default plexd0,
+// which may be a live mesh interface on the machine running the tests.
+const meshDNSTestInterface = "plexdtest0"
+
+// meshDNSZone is the zone the test control plane's dns block names the node
+// under, and meshDNSHost the node's own name in it.
+const (
+	meshDNSZone = "app.test.internal"
+	meshDNSHost = "node-1.app.test.internal"
+)
+
+// useMeshDNSRegistrar points runUp's mesh DNS seam at r for one test, in place
+// of the nil TestMain installs for every test of the package.
+func useMeshDNSRegistrar(t *testing.T, r meshdns.Registrar) {
+	t.Helper()
+	old := meshDNSRegistrar
+	t.Cleanup(func() { meshDNSRegistrar = old })
+	meshDNSRegistrar = func(*slog.Logger) meshdns.Registrar { return r }
+}
+
+// callLog is an ordered record of calls that several doubles share, so a test
+// can pin the order between calls that reach different seams.
+type callLog struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (l *callLog) add(call string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, call)
+}
+
+func (l *callLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.calls...)
+}
+
+// meshDNSCall is one call a recordingMeshDNSRegistrar received.
+type meshDNSCall struct {
+	method string
+	// reg is what Apply was asked to register.
+	reg meshdns.Registration
+	// iface is the interface Revert was asked to clear.
+	iface string
+	// ctxErr is the error of the call's context when the call came in, and
+	// budget is how long that context had left then, or 0 without a deadline.
+	ctxErr error
+	budget time.Duration
+}
+
+// recordingMeshDNSRegistrar is a meshdns.Registrar that succeeds without
+// touching the host. It keeps every call, and adds each method name to a
+// callLog it may share with other doubles.
+type recordingMeshDNSRegistrar struct {
+	order *callLog
+
+	mu    sync.Mutex
+	calls []meshDNSCall
+}
+
+var _ meshdns.Registrar = (*recordingMeshDNSRegistrar)(nil)
+
+func newRecordingMeshDNSRegistrar(order *callLog) *recordingMeshDNSRegistrar {
+	return &recordingMeshDNSRegistrar{order: order}
+}
+
+func (r *recordingMeshDNSRegistrar) Apply(ctx context.Context, reg meshdns.Registration) error {
+	r.record(ctx, meshDNSCall{method: "Apply", reg: reg})
+	return nil
+}
+
+func (r *recordingMeshDNSRegistrar) Revert(ctx context.Context, iface string) error {
+	r.record(ctx, meshDNSCall{method: "Revert", iface: iface})
+	return nil
+}
+
+func (r *recordingMeshDNSRegistrar) record(ctx context.Context, call meshDNSCall) {
+	call.ctxErr = ctx.Err()
+	if deadline, ok := ctx.Deadline(); ok {
+		call.budget = time.Until(deadline)
+	}
+	r.mu.Lock()
+	r.calls = append(r.calls, call)
+	r.mu.Unlock()
+	r.order.add(call.method)
+}
+
+// callsOf returns the calls of one method, in the order they came in.
+func (r *recordingMeshDNSRegistrar) callsOf(method string) []meshDNSCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var calls []meshDNSCall
+	for _, call := range r.calls {
+		if call.method == method {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+// teardownRecordingWGController brings the interface "up" as statsWGController
+// does, and adds DeleteInterface to a callLog it shares with a recording
+// registrar, so a test can pin the drain's order between the two.
+type teardownRecordingWGController struct {
+	statsWGController
+	order *callLog
+}
+
+func (c *teardownRecordingWGController) DeleteInterface(string) error {
+	c.order.add("DeleteInterface")
+	return nil
+}
+
+// meshDNSControlPlane answers every state pull with a dns block that names the
+// node under one zone, and counts state pulls and heartbeats, which is how a
+// test sees the daemon reach steady state past the mesh DNS step. Every other
+// route answers an empty JSON object.
+type meshDNSControlPlane struct {
+	state []byte
+
+	mu         sync.Mutex
+	statePulls int
+	heartbeats int
+}
+
+func newMeshDNSControlPlane(t *testing.T, meshIP string) (*meshDNSControlPlane, string) {
+	t.Helper()
+	state, err := json.Marshal(api.NodeStateSnapshot{DNS: &api.NodeStateDNS{
+		SearchDomain: meshDNSZone,
+		Zones:        []string{meshDNSZone},
+		Hosts:        []api.NodeStateDNSHost{{NodeID: upResumedNodeID, FQDN: meshDNSHost, MeshIP: meshIP}},
+		ReverseZones: []string{},
+	}})
+	if err != nil {
+		t.Fatalf("encode the state pull: %v", err)
+	}
+	cp := &meshDNSControlPlane{state: state}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/state"):
+			cp.mu.Lock()
+			cp.statePulls++
+			cp.mu.Unlock()
+			_, _ = w.Write(cp.state)
+			return
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			cp.mu.Lock()
+			cp.heartbeats++
+			cp.mu.Unlock()
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+// waitForSteadyState blocks until the daemon has sent a heartbeat and pulled
+// its state twice. Pulls run one cycle at a time, so the second pull also
+// shows that every dispatch handler of the first one has returned.
+func (cp *meshDNSControlPlane) waitForSteadyState(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		pulls, heartbeats := cp.statePulls, cp.heartbeats
+		cp.mu.Unlock()
+		if pulls >= 2 && heartbeats >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon did not reach steady state: %d state pulls and %d heartbeats within 30s, want at least 2 and 1", pulls, heartbeats)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// meshDNSDaemon is a daemon run a mesh DNS wiring test observes.
+type meshDNSDaemon struct {
+	cp   *meshDNSControlPlane
+	logs *recordingHandler
+	// stop cancels the run and waits for the drain. It runs once, whether the
+	// test calls it to look at what the drain did or the cleanup does.
+	stop func()
+}
+
+// startMeshDNSDaemon runs the whole daemon with ctrl as its WireGuard
+// controller and dnsBlock appended to its config. The node resumes an identity
+// whose mesh IP is meshIP, an IPv4 address of the loopback, so the resolver
+// binds an address this process may use without creating a device. Pulls and
+// heartbeats run every second, and the MTU is pinned so WireGuard setup sends
+// no STUN probe. The caller installs the registrar, or leaves TestMain's nil.
+func startMeshDNSDaemon(t *testing.T, meshIP string, ctrl wireguard.WGController, dnsBlock string) *meshDNSDaemon {
+	t.Helper()
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	cp, apiBase := newMeshDNSControlPlane(t, meshIP)
+	useWGController(t, ctrl)
+	logs := useRecordingDaemonLog(t)
+	dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t)+
+		"reconcile:\n  interval: 1s\n"+
+		"heartbeat:\n  interval: 1s\n"+
+		"wireguard:\n  interface_name: "+meshDNSTestInterface+"\n  mtu: 1420\n"+
+		dnsBlock)
+	// The file decides what the mesh DNS step does; an ambient
+	// PLEXD_DNS_ENABLED must not.
+	t.Setenv("PLEXD_DNS_ENABLED", "")
+	seedIdentityWithMeshIP(t, dataDir, upResumedNodeID, upResumedNSK, meshIP)
+
+	var once sync.Once
+	shutdown := startRunUp(t)
+	stop := func() { once.Do(shutdown) }
+	t.Cleanup(stop)
+	return &meshDNSDaemon{cp: cp, logs: logs, stop: stop}
+}
+
+// assertNothingListens fails the test when a UDP or a TCP socket holds addr.
+// The probe binds exactly what the resolver would have, so a free address
+// shows that runUp bound no resolver there.
+func assertNothingListens(t *testing.T, addr string) {
+	t.Helper()
+	udp, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Errorf("bind udp %s: %v, want the address free: a resolver listens there", addr, err)
+	} else {
+		_ = udp.Close()
+	}
+	tcp, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Errorf("bind tcp %s: %v, want the address free: a resolver listens there", addr, err)
+	} else {
+		_ = tcp.Close()
+	}
+}
+
+// assertBoundedRevert checks that a Revert named the configured mesh interface
+// and came in under a live context that ends within 5 seconds, so a system bus
+// that hangs cannot hold up startup or the drain.
+func assertBoundedRevert(t *testing.T, call meshDNSCall) {
+	t.Helper()
+	if call.iface != meshDNSTestInterface {
+		t.Errorf("Revert interface = %q, want %q", call.iface, meshDNSTestInterface)
+	}
+	if call.ctxErr != nil {
+		t.Errorf("Revert context error = %v, want a live context", call.ctxErr)
+	}
+	if call.budget <= 0 || call.budget > 5*time.Second {
+		t.Errorf("Revert context deadline in %v, want one within 5s", call.budget)
+	}
+}
+
+// lookupMeshA asks the resolver at addr for the A records of name over UDP and
+// returns the addresses it answered with.
+func lookupMeshA(t *testing.T, addr, name string) []netip.Addr {
+	t.Helper()
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 0x6d64, RecursionDesired: true})
+	if err := b.StartQuestions(); err != nil {
+		t.Fatalf("build the query: %v", err)
+	}
+	if err := b.Question(dnsmessage.Question{
+		Name:  dnsmessage.MustNewName(name + "."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}); err != nil {
+		t.Fatalf("build the query: %v", err)
+	}
+	query, err := b.Finish()
+	if err != nil {
+		t.Fatalf("build the query: %v", err)
+	}
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatalf("dial the resolver at %s: %v", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set the query deadline: %v", err)
+	}
+	if _, err := conn.Write(query); err != nil {
+		t.Fatalf("send the query to %s: %v", addr, err)
+	}
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read the answer from %s: %v", addr, err)
+	}
+
+	var p dnsmessage.Parser
+	if _, err := p.Start(buf[:n]); err != nil {
+		t.Fatalf("parse the answer header: %v", err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("parse the answer's question: %v", err)
+	}
+	answers, err := p.AllAnswers()
+	if err != nil {
+		t.Fatalf("parse the answers: %v", err)
+	}
+	var addrs []netip.Addr
+	for _, answer := range answers {
+		if a, ok := answer.Body.(*dnsmessage.AResource); ok {
+			addrs = append(addrs, netip.AddrFrom4(a.A))
+		}
+	}
+	return addrs
+}
+
+// Only Linux has a registrar so far. Every other build returns nil, which
+// keeps the resolver off there (see TestRunUp_MeshDNSNilRegistrarStartsNothing).
+// Building the Linux one opens no connection, so this test stays off the bus.
+// The type is named as a string because it exists in the Linux build only.
+func TestNewMeshDNSRegistrar(t *testing.T) {
+	r := newMeshDNSRegistrar(slog.Default())
+	if runtime.GOOS == "linux" {
+		if got := fmt.Sprintf("%T", r); got != "*meshdns.ResolvedRegistrar" {
+			t.Errorf("newMeshDNSRegistrar() = %s, want *meshdns.ResolvedRegistrar on linux", got)
+		}
+		return
+	}
+	if r != nil {
+		t.Errorf("newMeshDNSRegistrar() = %T, want nil on %s", r, runtime.GOOS)
+	}
+}
+
+// dns.enabled: false is the Node operator's way out, so the run binds nothing
+// and registers nothing. It still reverts the mesh interface once, under a
+// bounded context, because a registration a killed run left behind would keep
+// sending the mesh zones to a port nothing listens on.
+func TestRunUp_MeshDNSDisabledRevertsAndBindsNothing(t *testing.T) {
+	_, meshIP := loopbackInterface(t)
+	port := freePort(t)
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	useMeshDNSRegistrar(t, reg)
+	d := startMeshDNSDaemon(t, meshIP, &statsWGController{},
+		fmt.Sprintf("dns:\n  enabled: false\n  listen_port: %d\n", port))
+
+	d.cp.waitForSteadyState(t)
+	assertNothingListens(t, net.JoinHostPort(meshIP, strconv.Itoa(port)))
+	d.stop()
+
+	const msg = "mesh dns disabled by dns.enabled"
+	if n := d.logs.count(slog.LevelInfo, msg); n != 1 {
+		t.Errorf("info %q = %d, want 1", msg, n)
+	}
+	if n := d.logs.count(slog.LevelInfo, "mesh dns listening"); n != 0 {
+		t.Errorf("info %q = %d, want 0 for a disabled resolver", "mesh dns listening", n)
+	}
+	if applies := reg.callsOf("Apply"); len(applies) != 0 {
+		t.Errorf("Apply calls = %d, want 0 for a disabled resolver", len(applies))
+	}
+	reverts := reg.callsOf("Revert")
+	if len(reverts) != 1 {
+		t.Fatalf("Revert calls = %d, want 1 over the whole run", len(reverts))
+	}
+	assertBoundedRevert(t, reverts[0])
+}
+
+// The resolver listens on the mesh IP, which exists only once WireGuard is up,
+// so a run whose WireGuard setup fails starts no resolver and registers
+// nothing. It says why and still reaches steady state: the node keeps its
+// control plane loops without the mesh names. It reverts the mesh interface
+// once at startup, under a bounded context: a killed run leaves plexd0 behind
+// with its registration, and that device is what fails this run's setup, so
+// without the revert the host would send the mesh zones to a port nothing
+// listens on for the whole run.
+func TestRunUp_MeshDNSWithoutWireGuard(t *testing.T) {
+	_, meshIP := loopbackInterface(t)
+	port := freePort(t)
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	useMeshDNSRegistrar(t, reg)
+	d := startMeshDNSDaemon(t, meshIP, setupRefusingWGController{},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
+
+	d.cp.waitForSteadyState(t)
+	assertNothingListens(t, net.JoinHostPort(meshIP, strconv.Itoa(port)))
+	if n := len(reg.callsOf("Revert")); n != 1 {
+		t.Errorf("Revert calls before the drain = %d, want 1: the start itself must revert", n)
+	}
+	d.stop()
+
+	const msg = "wireguard unavailable, mesh dns not started"
+	if n := d.logs.count(slog.LevelWarn, msg); n != 1 {
+		t.Errorf("warnings %q = %d, want 1", msg, n)
+	}
+	if applies := reg.callsOf("Apply"); len(applies) != 0 {
+		t.Errorf("Apply calls = %d, want 0 without WireGuard", len(applies))
+	}
+	reverts := reg.callsOf("Revert")
+	if len(reverts) != 1 {
+		t.Fatalf("Revert calls = %d, want 1 over the whole run", len(reverts))
+	}
+	assertBoundedRevert(t, reverts[0])
+}
+
+// A mesh IP that does not parse gives the resolver no address to bind, even
+// with WireGuard up, so the run starts no resolver and registers nothing. Like
+// every start that runs no resolver, it reverts the mesh interface once at
+// startup, so a registration an earlier run left behind does not keep sending
+// the mesh zones to a port nothing listens on.
+func TestRunUp_MeshDNSUnparsableMeshIPReverts(t *testing.T) {
+	const meshIP = "not-an-ip"
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	useMeshDNSRegistrar(t, reg)
+	d := startMeshDNSDaemon(t, meshIP, &statsWGController{},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", freePort(t)))
+
+	d.cp.waitForSteadyState(t)
+	if n := len(reg.callsOf("Revert")); n != 1 {
+		t.Errorf("Revert calls before the drain = %d, want 1: the start itself must revert", n)
+	}
+	d.stop()
+
+	// WireGuard came up, so the run reached the mesh IP check and not the
+	// branch for a missing interface.
+	if n := d.logs.count(slog.LevelWarn, "wireguard unavailable, mesh dns not started"); n != 0 {
+		t.Errorf("warnings %q = %d, want 0: WireGuard setup must succeed here", "wireguard unavailable, mesh dns not started", n)
+	}
+	const msg = "mesh dns not started, the mesh ip does not parse"
+	if n := d.logs.count(slog.LevelWarn, msg); n != 1 {
+		t.Fatalf("warnings %q = %d, want 1", msg, n)
+	}
+	if got := d.logs.attrsOf(slog.LevelWarn, msg)["mesh_ip"]; got != meshIP {
+		t.Errorf("warning mesh_ip = %q, want %q", got, meshIP)
+	}
+	if n := d.logs.count(slog.LevelInfo, "mesh dns listening"); n != 0 {
+		t.Errorf("info %q = %d, want 0 for a resolver without an address", "mesh dns listening", n)
+	}
+	if applies := reg.callsOf("Apply"); len(applies) != 0 {
+		t.Errorf("Apply calls = %d, want 0 for a resolver without an address", len(applies))
+	}
+	reverts := reg.callsOf("Revert")
+	if len(reverts) != 1 {
+		t.Fatalf("Revert calls = %d, want 1 over the whole run", len(reverts))
+	}
+	assertBoundedRevert(t, reverts[0])
+}
+
+// macOS and Windows have no registrar yet, and their builds hand runUp a nil
+// one, as TestMain does here. That skips the whole subsystem without a word:
+// no listener, no dispatch handler and no log line about mesh DNS, even with
+// WireGuard up and a dns block in every pull.
+func TestRunUp_MeshDNSNilRegistrarStartsNothing(t *testing.T) {
+	if r := meshDNSRegistrar(slog.Default()); r != nil {
+		t.Fatalf("meshDNSRegistrar() = %T, want the nil TestMain installs", r)
+	}
+	_, meshIP := loopbackInterface(t)
+	port := freePort(t)
+	d := startMeshDNSDaemon(t, meshIP, &statsWGController{},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
+
+	d.cp.waitForSteadyState(t)
+	assertNothingListens(t, net.JoinHostPort(meshIP, strconv.Itoa(port)))
+	d.stop()
+
+	if msgs := d.logs.messagesContaining("mesh dns"); len(msgs) != 0 {
+		t.Errorf("log lines about mesh dns = %q, want none with a nil registrar", msgs)
+	}
+}
+
+// A port another program holds must not cost the node its startup. The run
+// names the address it could not bind and how to fix it, reverts what an
+// earlier run may have registered, and goes on without the resolver. No pull
+// registers a server then, because nothing would answer it.
+func TestRunUp_MeshDNSListenPortOccupied(t *testing.T) {
+	_, meshIP := loopbackInterface(t)
+	holder, err := net.ListenPacket("udp", net.JoinHostPort(meshIP, "0"))
+	if err != nil {
+		t.Fatalf("occupy a udp port on %s: %v", meshIP, err)
+	}
+	defer func() { _ = holder.Close() }()
+	port := holder.LocalAddr().(*net.UDPAddr).Port
+	listen := net.JoinHostPort(meshIP, strconv.Itoa(port))
+
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	useMeshDNSRegistrar(t, reg)
+	d := startMeshDNSDaemon(t, meshIP, &statsWGController{},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
+
+	d.cp.waitForSteadyState(t)
+	d.stop()
+
+	const msg = "mesh dns listener cannot bind, mesh names are not answered"
+	if n := d.logs.count(slog.LevelWarn, msg); n != 1 {
+		t.Fatalf("warnings %q = %d, want 1", msg, n)
+	}
+	attrs := d.logs.attrsOf(slog.LevelWarn, msg)
+	if attrs["listen"] != listen {
+		t.Errorf("warning listen = %q, want %q", attrs["listen"], listen)
+	}
+	if want := "set dns.listen_port to a free port"; attrs["hint"] != want {
+		t.Errorf("warning hint = %q, want %q", attrs["hint"], want)
+	}
+	if !strings.Contains(attrs["error"], listen) {
+		t.Errorf("warning error = %q, want it to name %s", attrs["error"], listen)
+	}
+	if n := d.logs.count(slog.LevelInfo, "mesh dns listening"); n != 0 {
+		t.Errorf("info %q = %d, want 0 for a resolver that could not bind", "mesh dns listening", n)
+	}
+	if applies := reg.callsOf("Apply"); len(applies) != 0 {
+		t.Errorf("Apply calls = %d, want 0: no pull may register a resolver that does not listen", len(applies))
+	}
+	reverts := reg.callsOf("Revert")
+	if len(reverts) != 1 {
+		t.Fatalf("Revert calls = %d, want 1 over the whole run", len(reverts))
+	}
+	assertBoundedRevert(t, reverts[0])
+}
+
+// A run that registered reverts the registration first in the drain, under a
+// context of its own, because the run's context is done by then. The resolver
+// stops answering the moment that context ends, so the revert comes before the
+// other subsystems stop (the mesh server's shutdown line stands for them), and
+// with that before WireGuard deletes the mesh interface. Before the drain, the
+// resolver answers the node's own name from the pull's dns block on the
+// address it logged.
+func TestRunUp_MeshDNSRevertsBeforeWireGuardTeardown(t *testing.T) {
+	_, meshIP := loopbackInterface(t)
+	port := freePort(t)
+	listen := net.JoinHostPort(meshIP, strconv.Itoa(port))
+	order := &callLog{}
+	reg := newRecordingMeshDNSRegistrar(order)
+	useMeshDNSRegistrar(t, reg)
+	d := startMeshDNSDaemon(t, meshIP, &teardownRecordingWGController{order: order},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
+	const drainStart, meshServerStopped = "shutting down", "mesh server shutdown complete"
+	d.logs.mirrorTo(order, drainStart, meshServerStopped)
+
+	d.cp.waitForSteadyState(t)
+	if got := d.logs.attrsOf(slog.LevelInfo, "mesh dns listening")["listen"]; got != listen {
+		t.Errorf("info %q listen = %q, want %q", "mesh dns listening", got, listen)
+	}
+	if got := lookupMeshA(t, listen, meshDNSHost); len(got) != 1 || got[0].String() != meshIP {
+		t.Errorf("A %s at %s = %v, want [%s]", meshDNSHost, listen, got, meshIP)
+	}
+	d.stop()
+
+	want := []string{"Apply", drainStart, "Revert", meshServerStopped, "DeleteInterface"}
+	if got := order.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %q, want %q: the drain must revert the registration first, before the other subsystems stop and WireGuard deletes the interface", got, want)
+	}
+	apply := reg.callsOf("Apply")[0]
+	if apply.reg.Interface != meshDNSTestInterface {
+		t.Errorf("Apply interface = %q, want %q", apply.reg.Interface, meshDNSTestInterface)
+	}
+	if got := apply.reg.Server.String(); got != listen {
+		t.Errorf("Apply server = %q, want %q", got, listen)
+	}
+	if apply.reg.SearchDomain != meshDNSZone {
+		t.Errorf("Apply search domain = %q, want %q", apply.reg.SearchDomain, meshDNSZone)
+	}
+	assertBoundedRevert(t, reg.callsOf("Revert")[0])
 }

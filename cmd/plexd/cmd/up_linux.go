@@ -11,6 +11,7 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/tunnel"
@@ -36,6 +37,14 @@ func newSystemLogSource(hostname string, logger *slog.Logger) logfwd.LogSource {
 // newWGController creates a NetlinkController for WireGuard on Linux.
 func newWGController(logger *slog.Logger) wireguard.WGController {
 	return wireguard.NewNetlinkController(logger)
+}
+
+// newMeshDNSRegistrar returns the registrar that registers the mesh resolver
+// with systemd-resolved over D-Bus. It opens no connection here: each Apply and
+// Revert opens its own, so a host without the bus or without systemd-resolved
+// still runs the resolver and learns that on the first pull.
+func newMeshDNSRegistrar(logger *slog.Logger) meshdns.Registrar {
+	return meshdns.NewResolvedRegistrar(logger)
 }
 
 // policyCapabilityHint is carried by both firewall-baseline failures. The

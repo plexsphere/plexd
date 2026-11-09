@@ -340,6 +340,77 @@ func TestParseConfig_RolloutsDisabledByFile(t *testing.T) {
 	}
 }
 
+// TestParseConfig_DNS pins the mesh DNS resolver's switch through the whole
+// load. An existing deployment sets no dns key and must get the resolver on
+// the default port, and `enabled: false` is the Node operator's only way out,
+// so it must survive defaulting exactly as written.
+func TestParseConfig_DNS(t *testing.T) {
+	tests := []struct {
+		name        string
+		yaml        string
+		wantEnabled bool
+		wantPort    int
+	}{
+		{name: "no dns key", yaml: "mode: node\n", wantEnabled: true, wantPort: 5354},
+		{name: "enabled false", yaml: "dns:\n  enabled: false\n", wantEnabled: false, wantPort: 5354},
+		{name: "listen_port set", yaml: "dns:\n  listen_port: 5300\n", wantEnabled: true, wantPort: 5300},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, found, err := ParseConfig(writeTemp(t, tt.yaml))
+			if err != nil {
+				t.Fatalf("ParseConfig: %v", err)
+			}
+			if !found {
+				t.Error("found = false, want true for an existing file")
+			}
+			if got := cfg.DNS.IsEnabled(); got != tt.wantEnabled {
+				t.Errorf("DNS.IsEnabled() = %v, want %v", got, tt.wantEnabled)
+			}
+			if cfg.DNS.ListenPort != tt.wantPort {
+				t.Errorf("DNS.ListenPort = %d, want %d", cfg.DNS.ListenPort, tt.wantPort)
+			}
+		})
+	}
+}
+
+// TestAgentConfig_Validate_DNS pins that the agent validates its dns block, so
+// a port the resolver can never bind fails the load rather than turning into a
+// bind warning at every start, while a disabled resolver's port is not checked.
+func TestAgentConfig_Validate_DNS(t *testing.T) {
+	disabled := false
+	tests := []struct {
+		name    string
+		enabled *bool
+		port    int
+		wantErr string
+	}{
+		{name: "default port", port: 0},
+		{name: "port too large", port: 70000, wantErr: "meshdns: config: ListenPort must be between 1 and 65535"},
+		{name: "port negative", port: -1, wantErr: "meshdns: config: ListenPort must be between 1 and 65535"},
+		{name: "port too large while disabled", enabled: &disabled, port: 70000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg AgentConfig
+			cfg.API.BaseURL = "https://example.com"
+			cfg.DNS.Enabled = tt.enabled
+			cfg.DNS.ListenPort = tt.port
+			cfg.ApplyDefaults()
+
+			err := cfg.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tt.wantErr != "" && err == nil:
+				t.Errorf("Validate() = nil, want %q", tt.wantErr)
+			case tt.wantErr != "" && err.Error() != tt.wantErr:
+				t.Errorf("Validate() = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestParseConfig_RolloutHooksDirIsNoYAMLKey pins that the rollout directory
 // cannot be moved from the file. plexd owns that directory and removes what it
 // did not install there, so a key that pointed it at hooks_dir or any other

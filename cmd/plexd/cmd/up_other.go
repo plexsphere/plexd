@@ -8,6 +8,7 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/tunnel"
@@ -26,6 +27,12 @@ func newSystemLogSource(_ string, _ *slog.Logger) logfwd.LogSource {
 
 // newWGController returns nil on platforms without an implementation.
 func newWGController(_ *slog.Logger) wireguard.WGController {
+	return nil
+}
+
+// newMeshDNSRegistrar returns nil on platforms without an implementation,
+// which skips the mesh DNS resolver without a log line.
+func newMeshDNSRegistrar(_ *slog.Logger) meshdns.Registrar {
 	return nil
 }
 
