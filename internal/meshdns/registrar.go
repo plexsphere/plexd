@@ -69,4 +69,7 @@ type Registrar interface {
 	// interface or a system resolver that is gone, so a shutdown on a host
 	// without one does not report a failure.
 	Revert(ctx context.Context, iface string) error
+	// Name names the system resolver the registrar writes to, as the
+	// manager's log lines name it: systemd-resolved on Linux.
+	Name() string
 }

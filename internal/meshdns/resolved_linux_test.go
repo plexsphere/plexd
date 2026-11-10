@@ -214,6 +214,9 @@ func TestNewResolvedRegistrar(t *testing.T) {
 		t.Errorf("got logger set %t, connect set %t, interfaces set %t, want all set",
 			r.logger != nil, r.connect != nil, r.interfaces != nil)
 	}
+	if got := r.Name(); got != "systemd-resolved" {
+		t.Errorf("Name() = %q, want %q", got, "systemd-resolved")
+	}
 }
 
 func TestResolvedApplyCalls(t *testing.T) {

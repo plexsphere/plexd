@@ -36,6 +36,10 @@ type Manager struct {
 	registrar Registrar
 	logger    *slog.Logger
 	server    *Server
+	// msgRegistered and msgUnavailable are the two log lines that name the
+	// system resolver, built once from the registrar's Name.
+	msgRegistered  string
+	msgUnavailable string
 
 	mu sync.Mutex
 	// records is the set the server answers from, nil until the first block.
@@ -80,17 +84,21 @@ type Manager struct {
 // Start's error. cfg must have passed Validate; Enabled is not consulted,
 // because the caller decides whether to build a manager at all. A ListenPort
 // of 0 lets the kernel pick the port, which tests use. Every line the manager
-// and its server log carries "component" "meshdns".
+// and its server log carries "component" "meshdns". registrar must not be
+// nil: its Name goes into the registration log lines here.
 func NewManager(cfg Config, iface string, meshIP netip.Addr, registrar Registrar, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	logger = logger.With("component", "meshdns")
+	name := registrar.Name()
 	return &Manager{
-		iface:     iface,
-		registrar: registrar,
-		logger:    logger,
-		server:    NewServer(netip.AddrPortFrom(meshIP, uint16(cfg.ListenPort)), logger),
+		iface:          iface,
+		registrar:      registrar,
+		logger:         logger,
+		server:         NewServer(netip.AddrPortFrom(meshIP, uint16(cfg.ListenPort)), logger),
+		msgRegistered:  "mesh dns registered with " + name,
+		msgUnavailable: "mesh dns not registered, " + name + " is not usable",
 	}
 }
 
@@ -244,7 +252,7 @@ func (m *Manager) register(ctx context.Context, want Registration) {
 	if err == nil {
 		m.applied = &want
 		m.resetTrackers()
-		m.logger.Info("mesh dns registered with systemd-resolved",
+		m.logger.Info(m.msgRegistered,
 			"interface", want.Interface,
 			"server", want.Server.String(),
 			"search_domain", want.SearchDomain,
@@ -263,7 +271,7 @@ func (m *Manager) register(ctx context.Context, want Registration) {
 		m.failureLogged = ""
 		if !m.unavailableLogged {
 			m.unavailableLogged = true
-			m.logger.Info("mesh dns not registered, systemd-resolved is not usable",
+			m.logger.Info(m.msgUnavailable,
 				"listen", m.server.Addr().String(),
 				"reason", err.Error(),
 			)

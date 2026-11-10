@@ -54,10 +54,21 @@ type registrarCall struct {
 // method. It is safe for concurrent use, so a test can race Handle against
 // Shutdown.
 type fakeRegistrar struct {
+	// name is what Name returns; empty means systemd-resolved, so the log
+	// lines read as on Linux.
+	name string
+
 	mu        sync.Mutex
 	calls     []registrarCall
 	applyErr  error
 	revertErr error
+}
+
+func (r *fakeRegistrar) Name() string {
+	if r.name == "" {
+		return "systemd-resolved"
+	}
+	return r.name
 }
 
 func (r *fakeRegistrar) Apply(ctx context.Context, reg Registration) error {
@@ -673,6 +684,33 @@ func TestManager_ApplyUnavailable(t *testing.T) {
 	changed.SearchDomain = "lab.internal"
 	m.Handle(ctx, snapshot(changed))
 	wantCount(t, logs, msgUnavailable, 2)
+}
+
+// The two lines that name the system resolver take the name from the
+// registrar, so a macOS Node says configd where a Linux Node says
+// systemd-resolved, with the same level and keys.
+func TestManager_LogLinesNameTheRegistrar(t *testing.T) {
+	reg := &fakeRegistrar{name: "configd", applyErr: errUnavailableTest}
+	m, logs := startManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(exampleBlock()))
+	wantLine(t, logs, slog.LevelInfo, "mesh dns not registered, configd is not usable", map[string]string{
+		"listen": m.Addr().String(),
+		"reason": errUnavailableTest.Error(),
+	})
+
+	reg.setApplyErr(nil)
+	m.Handle(ctx, snapshot(exampleBlock()))
+	wantLine(t, logs, slog.LevelInfo, "mesh dns registered with configd", map[string]string{
+		"interface":       testIface,
+		"server":          m.Addr().String(),
+		"search_domain":   "openstack.lab.internal",
+		"routing_domains": "3",
+		"default_route":   "false",
+	})
+	wantCount(t, logs, msgRegistered, 0)
+	wantCount(t, logs, msgUnavailable, 0)
 }
 
 func TestManager_ApplyFailure(t *testing.T) {
