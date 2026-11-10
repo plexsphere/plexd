@@ -26,8 +26,8 @@
 #   - Secret index fed from the state pull's secrets block, with
 #     node_secrets_updated as a pull trigger
 #   - Mesh DNS without systemd-resolved: the listener and the missing resolver
-#     logged once per start, mesh names answered on the mesh IP, and kept by a
-#     null dns block
+#     logged once per start, mesh names and the dns block's A, CNAME, SRV, MX
+#     and TXT records answered on the mesh IP, and kept by a null dns block
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -4830,18 +4830,21 @@ echo "=== Phase 12c PASSED: secret index from the inventory ==="
 # fixture's block first, so each logged the listener once and the missing
 # resolver once, however many pulls followed. The queries run inside the
 # plexd container, whose own mesh IP is the only source besides loopback the
-# resolver answers.
+# resolver answers. The block's records answer next to its hosts. plexd
+# follows a CNAME whose target lies in its zones and ends the answer at one
+# that leaves them, which busybox nslookup does not follow, so such a name
+# answers no address here.
 echo "=== Testing mesh DNS without systemd-resolved ==="
 
 MESH_DNS_LISTEN="10.99.0.1:5354"
 
-# mesh_nslookup <name> asks the resolver for the A record of name from inside
-# the plexd container, and leaves the output, stderr included, in
-# NSLOOKUP_OUT and the exit status in NSLOOKUP_RC. busybox 1.37 takes the port
-# on the server argument.
+# mesh_nslookup <name> [<type>] asks the resolver for the records of type
+# (a when left out) of name from inside the plexd container, and leaves the
+# output, stderr included, in NSLOOKUP_OUT and the exit status in NSLOOKUP_RC.
+# busybox 1.37 takes the port on the server argument.
 mesh_nslookup() {
     NSLOOKUP_RC=0
-    NSLOOKUP_OUT=$(dc exec -T plexd /bin/busybox nslookup -type=a "$1" "${MESH_DNS_LISTEN}" 2>&1) || NSLOOKUP_RC=$?
+    NSLOOKUP_OUT=$(dc exec -T plexd /bin/busybox nslookup -type="${2:-a}" "$1" "${MESH_DNS_LISTEN}" 2>&1) || NSLOOKUP_RC=$?
 }
 
 # nslookup_answers <output> <name> <address> succeeds when an nslookup output
@@ -4855,6 +4858,19 @@ nslookup_answers() {
         if [ "${line}" = "Name:"$'\t'"${name}" ]; then
             named=1
         elif [ "${named}" -eq 1 ] && [ "${line}" = "Address: ${addr}" ]; then
+            return 0
+        fi
+    done <<< "${out}"
+    return 1
+}
+
+# nslookup_line <output> <line> succeeds when one line of an nslookup output
+# equals line exactly, such as a CNAME's
+# "<name><tab>canonical name = <target>".
+nslookup_line() {
+    local out=$1 want=$2 line
+    while IFS= read -r line; do
+        if [ "${line}" = "${want}" ]; then
             return 0
         fi
     done <<< "${out}"
@@ -4942,6 +4958,56 @@ else
     fail "nslookup -type=a nope.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want a failure with NXDOMAIN (output: ${NSLOOKUP_OUT})"
 fi
 
+# The fixture's records. busybox prints a CNAME on a line of its own, and
+# only the first string of a TXT record.
+mesh_nslookup db.e2e.internal
+if [ "${NSLOOKUP_RC}" -eq 0 ] \
+    && nslookup_answers "${NSLOOKUP_OUT}" db.e2e.internal 192.0.2.10 \
+    && nslookup_answers "${NSLOOKUP_OUT}" db.e2e.internal 192.0.2.11; then
+    echo "  PASS: nslookup -type=a db.e2e.internal ${MESH_DNS_LISTEN} answers 192.0.2.10 and 192.0.2.11"
+else
+    fail "nslookup -type=a db.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0, 192.0.2.10 and 192.0.2.11 (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup alias.app.e2e.internal
+if [ "${NSLOOKUP_RC}" -eq 0 ] \
+    && nslookup_line "${NSLOOKUP_OUT}" "alias.app.e2e.internal"$'\t'"canonical name = peer-2.app.e2e.internal" \
+    && nslookup_answers "${NSLOOKUP_OUT}" peer-2.app.e2e.internal 10.99.0.3; then
+    echo "  PASS: nslookup -type=a alias.app.e2e.internal ${MESH_DNS_LISTEN} answers the CNAME to peer-2.app.e2e.internal and 10.99.0.3"
+else
+    fail "nslookup -type=a alias.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0, the line 'alias.app.e2e.internal<tab>canonical name = peer-2.app.e2e.internal' and 10.99.0.3 under peer-2.app.e2e.internal (output: ${NSLOOKUP_OUT})"
+fi
+# The server's own "Address:<tab>10.99.0.1:5354" line does not start with
+# "Address: ", so only an answered address does.
+mesh_nslookup ext.e2e.internal
+case $'\n'"${NSLOOKUP_OUT}" in
+    *$'\n'"Address: "*) EXT_ADDRESS=1 ;;
+    *) EXT_ADDRESS=0 ;;
+esac
+if [ "${NSLOOKUP_RC}" -eq 0 ] && [ "${EXT_ADDRESS}" -eq 0 ] \
+    && nslookup_line "${NSLOOKUP_OUT}" "ext.e2e.internal"$'\t'"canonical name = ext.example.com"; then
+    echo "  PASS: nslookup -type=a ext.e2e.internal ${MESH_DNS_LISTEN} answers the CNAME to ext.example.com and no address"
+else
+    fail "nslookup -type=a ext.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0, the line 'ext.e2e.internal<tab>canonical name = ext.example.com' and no address (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup _db._tcp.app.e2e.internal srv
+if nslookup_line "${NSLOOKUP_OUT}" "_db._tcp.app.e2e.internal"$'\t'"service = 0 5 5432 db.e2e.internal"; then
+    echo "  PASS: nslookup -type=srv _db._tcp.app.e2e.internal ${MESH_DNS_LISTEN} answers 0 5 5432 db.e2e.internal"
+else
+    fail "nslookup -type=srv _db._tcp.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want the line '_db._tcp.app.e2e.internal<tab>service = 0 5 5432 db.e2e.internal' (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup e2e.internal mx
+if nslookup_line "${NSLOOKUP_OUT}" "e2e.internal"$'\t'"mail exchanger = 10 mail.example.com"; then
+    echo "  PASS: nslookup -type=mx e2e.internal ${MESH_DNS_LISTEN} answers 10 mail.example.com"
+else
+    fail "nslookup -type=mx e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want the line 'e2e.internal<tab>mail exchanger = 10 mail.example.com' (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup e2e.internal txt
+if nslookup_line "${NSLOOKUP_OUT}" "e2e.internal"$'\t''text = "v=e2e"'; then
+    echo "  PASS: nslookup -type=txt e2e.internal ${MESH_DNS_LISTEN} answers \"v=e2e\""
+else
+    fail "nslookup -type=txt e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want the line 'e2e.internal<tab>text = \"v=e2e\"' (output: ${NSLOOKUP_OUT})"
+fi
+
 # (c) A null block keeps the names held. The fixture's block is saved first,
 # so the phase can serve it again. Two pulls past the baseline mean at least
 # one of them ran its dispatch handlers to the end: the nudge's pull may land
@@ -4951,6 +5017,12 @@ FIXTURE_DNS=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8
 FIXTURE_PEER1=$(printf '%s' "${FIXTURE_DNS}" | jq '[.hosts[]? | select(.fqdn == "peer-1.app.e2e.internal" and .mesh_ip == "10.99.0.2")] | length' 2>&1 || true)
 if [ "${FIXTURE_PEER1}" != "1" ]; then
     fail "[dns null block] the served dns block '${FIXTURE_DNS}' does not carry peer-1.app.e2e.internal at 10.99.0.2 once (got '${FIXTURE_PEER1}')"
+fi
+# The saved block must hold the fixture's eight records, so the restore in (d)
+# serves them again.
+FIXTURE_RECORDS=$(printf '%s' "${FIXTURE_DNS}" | jq '[.records[]?] | length' 2>&1 || true)
+if [ "${FIXTURE_RECORDS}" != "8" ]; then
+    fail "[dns null block] the served dns block '${FIXTURE_DNS}' holds '${FIXTURE_RECORDS}' records, want the fixture's 8"
 fi
 PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
 NO_BLOCK_BEFORE=$(count_log_lines "${PLEXD_LOGS}" 'msg="state pull carries no dns block, keeping the names held"')
@@ -4985,6 +5057,12 @@ if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" peer-1.app.e
     echo "  PASS: [dns null block] nslookup -type=a peer-1.app.e2e.internal ${MESH_DNS_LISTEN} still answers 10.99.0.2"
 else
     fail "[dns null block] nslookup -type=a peer-1.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and 10.99.0.2 (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup db.e2e.internal
+if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" db.e2e.internal 192.0.2.10; then
+    echo "  PASS: [dns null block] nslookup -type=a db.e2e.internal ${MESH_DNS_LISTEN} still answers 192.0.2.10"
+else
+    fail "[dns null block] nslookup -type=a db.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and 192.0.2.10 (output: ${NSLOOKUP_OUT})"
 fi
 
 # (d) The fixture's block is served again before the phase ends.
