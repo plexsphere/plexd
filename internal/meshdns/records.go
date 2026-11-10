@@ -18,9 +18,11 @@ type Result int
 
 const (
 	// ResultRefused means the name lies outside every accepted zone and
-	// reverse zone, or no block arrived yet. The server answers REFUSED, so
-	// the system resolver treats the name as not plexd's to answer. It is the
-	// zero value, so an Answer nobody filled in denies nothing it should not.
+	// reverse zone, or no block arrived yet. The server forwards a query for
+	// such a name when its forwarding table routes the name, and otherwise
+	// answers REFUSED, so the system resolver treats the name as not plexd's
+	// to answer. It is the zero value, so an Answer nobody filled in denies
+	// nothing it should not.
 	ResultRefused Result = iota
 	// ResultNXDomain means the name lies under Zone and does not exist.
 	ResultNXDomain
