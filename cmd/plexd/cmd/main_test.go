@@ -10,10 +10,11 @@ import (
 
 // TestMain turns the mesh DNS subsystem off for every test of the package
 // before any of them runs. No test may reach the real system bus: on Linux the
-// registrar talks to systemd-resolved, and a run that starts no resolver, as
-// well as every drain, reverts the mesh interface's resolver settings. On a
-// developer machine that runs plexd, a RevertLink from a test would drop the
-// live registration of that node's mesh interface. A test that exercises the
+// registrar talks to systemd-resolved, on macOS it writes configd's dynamic
+// store with scutil, and a run that starts no resolver, as well as every
+// drain, reverts the mesh interface's resolver settings. On a developer
+// machine that runs plexd, a revert from a test would drop the live
+// registration of that node. A test that exercises the
 // wiring installs a recording fake with useMeshDNSRegistrar.
 func TestMain(m *testing.M) {
 	meshDNSRegistrar = func(*slog.Logger) meshdns.Registrar { return nil }

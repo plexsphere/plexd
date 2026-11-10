@@ -44,6 +44,12 @@ func newMeshDNSRegistrar(_ *slog.Logger) meshdns.Registrar {
 	return nil
 }
 
+// meshDNSLeftoversOutliveTheRun is false on Windows, which registers nothing.
+const meshDNSLeftoversOutliveTheRun = false
+
+// meshDNSListensOnLoopback is false on Windows, which runs no resolver.
+const meshDNSListensOnLoopback = false
+
 // policyCapabilityHint is carried by both firewall-baseline failures. The
 // filter engine answers an unprivileged caller with ERROR_ACCESS_DENIED, whose
 // message is a bare "Access is denied" that names neither the privilege the

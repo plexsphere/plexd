@@ -42,12 +42,32 @@ func newWGController(logger *slog.Logger) wireguard.WGController {
 	return wireguard.NewDarwinController(logger)
 }
 
-// newMeshDNSRegistrar returns nil on macOS, which skips the mesh DNS resolver
-// without a log line. The resolver only runs where plexd can tell the host's
-// resolver to ask it, and no registrar for the macOS resolver exists yet.
-func newMeshDNSRegistrar(_ *slog.Logger) meshdns.Registrar {
-	return nil
+// newMeshDNSRegistrar returns the registrar that registers the mesh resolver
+// with the macOS resolver: it writes the resolver's entries for the search
+// domain, the zones, the reverse zones and the forward zones, and with a
+// catch-all a default-resolver entry, into configd's dynamic store with
+// scutil, under keys plexd owns. It needs root, as plexd on macOS does
+// already for its utun.
+func newMeshDNSRegistrar(logger *slog.Logger) meshdns.Registrar {
+	return meshdns.NewScutilRegistrar(logger)
 }
+
+// meshDNSLeftoversOutliveTheRun is true on macOS: the registrar's keys live in
+// configd's dynamic store, bound to no interface, so a killed run leaves them
+// behind although its utun went with the process. Until the next run's first
+// pull they would send the mesh zones, and with a catch-all every other name
+// the host looks up, the control plane's own name included, to a resolver
+// that holds no names yet and refuses them all.
+const meshDNSLeftoversOutliveTheRun = true
+
+// meshDNSListensOnLoopback is true on macOS: a Mac cannot reach its own utun
+// mesh IP, because the mesh address's alias makes the route to that IP lead
+// into the utun, where wireguard-go drops what the host sends itself
+// (measured on the CI macOS runner: route -n get <mesh IP> names the utun,
+// and a capture shows mDNSResponder's queries leave through it). The
+// resolver therefore listens on 127.0.0.1, which mDNSResponder reaches, and
+// the dynamic-store entries name that address.
+const meshDNSListensOnLoopback = true
 
 // policyCapabilityHint is carried by both firewall-baseline failures. Every
 // pfctl call that opens /dev/pf answers an unprivileged caller with a bare

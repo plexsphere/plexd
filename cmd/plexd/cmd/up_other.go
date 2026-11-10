@@ -36,6 +36,12 @@ func newMeshDNSRegistrar(_ *slog.Logger) meshdns.Registrar {
 	return nil
 }
 
+// meshDNSLeftoversOutliveTheRun is false on platforms that register nothing.
+const meshDNSLeftoversOutliveTheRun = false
+
+// meshDNSListensOnLoopback is false on platforms that run no resolver.
+const meshDNSListensOnLoopback = false
+
 // policyCapabilityHint exists because up.go references it on every platform.
 // Without a backend Preflight and ApplyFirewallRules are both no-ops, so
 // neither failure path can reach this text: the node comes up unenforced with

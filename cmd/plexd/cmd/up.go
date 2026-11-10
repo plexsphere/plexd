@@ -75,10 +75,17 @@ var wgController = newWGController
 
 // meshDNSRegistrar indirects the platform-specific constructor so tests can
 // record what runUp registers without reaching the host's resolver: on Linux
-// the registrar talks to systemd-resolved on the system bus, and a revert from
-// a test would drop the live registration of a developer machine that runs
-// plexd.
+// the registrar talks to systemd-resolved on the system bus, and on macOS it
+// writes configd's dynamic store with scutil, so a revert from a test would
+// drop the live registration of a developer machine that runs plexd.
 var meshDNSRegistrar = newMeshDNSRegistrar
+
+// meshDNSRevertAtStart makes a start whose resolver listens revert once, before
+// a run that resumes its identity first dials the control plane, where the
+// platform's registration outlives a killed run
+// (meshDNSLeftoversOutliveTheRun). It is a variable so tests pin either start
+// on every platform.
+var meshDNSRevertAtStart = meshDNSLeftoversOutliveTheRun
 
 var upCmd = &cobra.Command{
 	Use:   "up",
@@ -325,17 +332,20 @@ func runAgent(ctx context.Context) error {
 		})
 	}
 
-	// 5a-3. Mesh DNS. The resolver answers the Domain's mesh names on the
-	// node's own mesh IP, and the registrar tells the host's resolver to send
-	// the mesh zones there through the mesh interface. A query to a per-link
-	// server leaves through that link, so only a listener on the mesh IP is
-	// reached, and the address exists only once WireGuard is up. The sockets
-	// are bound here so a bind failure is known before the dns block's
-	// dispatch handler is registered: a node that cannot answer must not
-	// register a server nothing listens on. Step 25a serves them; a startup
-	// that aborts before then ends the process, which closes them. Nothing here
-	// stops startup or touches readiness, because the mesh works without names.
-	// A platform without a registrar runs no resolver and logs nothing about it.
+	// 5a-3. Mesh DNS. The resolver answers the Domain's mesh names, and the
+	// registrar tells the host's resolver to send the mesh zones to it. On
+	// Linux it listens on the node's own mesh IP, because a query to a
+	// per-link server leaves through the mesh interface, so only a listener
+	// on the mesh IP is reached. On macOS it listens on 127.0.0.1, which the
+	// dynamic-store entries name, because a Mac cannot reach its own utun
+	// mesh IP (meshDNSListensOnLoopback). The resolver starts only once
+	// WireGuard is up. The sockets are bound here so a bind failure is known
+	// before the dns block's dispatch handler is registered: a node that
+	// cannot answer must not register a server nothing listens on. Step 25a
+	// serves them; a startup that aborts before then ends the process, which
+	// closes them. Nothing here stops startup or touches readiness, because
+	// the mesh works without names. A platform without a registrar runs no
+	// resolver and logs nothing about it.
 	//
 	// A start that runs no resolver reverts the mesh link, whatever the reason,
 	// and a start that runs one applies on the first pull. A crash or a kill
@@ -343,7 +353,14 @@ func runAgent(ctx context.Context) error {
 	// start's WireGuard setup then fails on that device (EEXIST, see step 5c),
 	// and without the revert the host would send the mesh zones and the search
 	// domain to a port nothing listens on for the whole run. Revert does nothing
-	// when the link does not exist.
+	// when the link does not exist. On macOS the utun goes with the process, but
+	// the registrar's keys stay in configd's dynamic store, bound to no
+	// interface. A start that runs no resolver removes them here, and so does
+	// a start whose resolver listens (meshDNSRevertAtStart), before a run that
+	// resumed its identity first dials the control plane: with a catch-all the
+	// killed run's default-resolver entry would send the control plane's own
+	// name to this run's resolver, which refuses every name until the first
+	// pull, so that pull might never arrive. A reboot clears the keys as well.
 	var dnsMgr *meshdns.Manager
 	if dnsRegistrar := meshDNSRegistrar(logger); dnsRegistrar != nil {
 		dnsIface := wgMgr.OSInterfaceName()
@@ -362,7 +379,7 @@ func runAgent(ctx context.Context) error {
 			)
 			revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
 		default:
-			mgr := meshdns.NewManager(cfg.DNS, dnsIface, dnsMeshIP, dnsRegistrar, logger)
+			mgr := meshdns.NewManager(cfg.DNS, dnsIface, meshDNSListenIP(dnsMeshIP, meshDNSListensOnLoopback), dnsRegistrar, logger)
 			if err := mgr.Start(); err != nil {
 				logger.Warn("mesh dns listener cannot bind, mesh names are not answered",
 					"listen", mgr.Addr().String(),
@@ -371,6 +388,9 @@ func runAgent(ctx context.Context) error {
 				)
 				revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
 			} else {
+				if meshDNSRevertAtStart {
+					revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
+				}
 				logger.Info("mesh dns listening", "listen", mgr.Addr().String())
 				dnsMgr = mgr
 			}
@@ -1539,11 +1559,23 @@ func meshMTUProbe(natCfg nat.Config) func(context.Context) (int, error) {
 	}
 }
 
-// revertMeshDNS removes the resolver settings of the mesh interface for a run
-// that starts no resolver. A registration a killed run left behind would
-// otherwise keep sending the mesh zones to a port nothing listens on, which
-// fails every mesh name the host looks up. A failure is logged and startup
-// goes on: the host resolves every other name either way.
+// meshDNSListenIP returns the address the mesh resolver listens on: the
+// node's own mesh IP, or 127.0.0.1 where the platform's resolver cannot reach
+// that IP from the host itself (meshDNSListensOnLoopback).
+func meshDNSListenIP(meshIP netip.Addr, loopback bool) netip.Addr {
+	if loopback {
+		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	}
+	return meshIP
+}
+
+// revertMeshDNS removes the resolver settings plexd made for the mesh
+// interface, for a run that starts no resolver and, where the registration
+// outlives a killed run, for a run whose resolver listens. A registration a
+// killed run left behind would otherwise keep sending the mesh zones to a port
+// nothing listens on, or to a resolver that holds no names yet, which fails
+// every mesh name the host looks up. A failure is logged and startup goes on:
+// the host resolves every other name either way.
 func revertMeshDNS(ctx context.Context, registrar meshdns.Registrar, iface string, logger *slog.Logger) {
 	ctx, cancel := context.WithTimeout(ctx, meshDNSRegistrarTimeout)
 	defer cancel()

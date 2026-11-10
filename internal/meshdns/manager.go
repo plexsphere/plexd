@@ -78,15 +78,17 @@ type Manager struct {
 	closed bool
 }
 
-// NewManager returns a manager whose resolver listens on meshIP and
-// cfg.ListenPort and registers with registrar for the interface iface. It
+// NewManager returns a manager whose resolver listens on listenIP and
+// cfg.ListenPort and registers with registrar for the interface iface.
+// plexd up passes the node's own mesh IP on Linux and 127.0.0.1 on macOS,
+// where the host cannot reach its own utun mesh IP. It
 // binds nothing until Start, so the caller learns about an occupied port from
 // Start's error. cfg must have passed Validate; Enabled is not consulted,
 // because the caller decides whether to build a manager at all. A ListenPort
 // of 0 lets the kernel pick the port, which tests use. Every line the manager
 // and its server log carries "component" "meshdns". registrar must not be
 // nil: its Name goes into the registration log lines here.
-func NewManager(cfg Config, iface string, meshIP netip.Addr, registrar Registrar, logger *slog.Logger) *Manager {
+func NewManager(cfg Config, iface string, listenIP netip.Addr, registrar Registrar, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -96,7 +98,7 @@ func NewManager(cfg Config, iface string, meshIP netip.Addr, registrar Registrar
 		iface:          iface,
 		registrar:      registrar,
 		logger:         logger,
-		server:         NewServer(netip.AddrPortFrom(meshIP, uint16(cfg.ListenPort)), logger),
+		server:         NewServer(netip.AddrPortFrom(listenIP, uint16(cfg.ListenPort)), logger),
 		msgRegistered:  "mesh dns registered with " + name,
 		msgUnavailable: "mesh dns not registered, " + name + " is not usable",
 	}
