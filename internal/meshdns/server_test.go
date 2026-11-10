@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -821,7 +822,7 @@ func TestServer_DropsPacketFromDisallowedSource(t *testing.T) {
 	for _, tc := range tests {
 		w := &recordingWriter{}
 		src := netip.MustParseAddrPort(tc.src)
-		s.handlePacket(w, msg, src)
+		s.handlePacket(w, msg, src, newForwards(context.Background(), maxForwards))
 		var want []netip.AddrPort
 		if tc.reply {
 			want = []netip.AddrPort{src}
@@ -857,7 +858,7 @@ func TestServer_ClosesConnectionFromDisallowedSource(t *testing.T) {
 			defer conns.closeAll()
 			defer func() { _ = client.Close() }()
 
-			s.accept(&conns, server, netip.MustParseAddr(tc.src))
+			s.accept(newForwards(context.Background(), maxForwards), &conns, server, netip.MustParseAddr(tc.src))
 			err := writeFrame(client, msg)
 			if !tc.served {
 				if !errors.Is(err, io.ErrClosedPipe) {
@@ -1361,6 +1362,9 @@ var errListenerClosed = &net.OpError{Op: "accept", Net: "tcp", Err: net.ErrClose
 type debugLog struct {
 	mu      sync.Mutex
 	records []slog.Record
+	// logged is closed with the next record, so a test waits for a line
+	// rather than for a while. It is nil while no test waits.
+	logged chan struct{}
 }
 
 func (l *debugLog) Enabled(context.Context, slog.Level) bool { return true }
@@ -1369,7 +1373,37 @@ func (l *debugLog) Handle(_ context.Context, r slog.Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.records = append(l.records, r.Clone())
+	if l.logged != nil {
+		close(l.logged)
+		l.logged = nil
+	}
 	return nil
+}
+
+// wait returns the records that say msg once there are at least n of them,
+// and reports false when there are fewer within ioTimeout.
+func (l *debugLog) wait(msg string, n int) ([]slog.Record, bool) {
+	timeout := time.After(ioTimeout)
+	for {
+		// The count and the channel are taken under one lock, so a record
+		// logged between them still closes the channel.
+		l.mu.Lock()
+		found := l.findLocked(msg)
+		if len(found) >= n {
+			l.mu.Unlock()
+			return found, true
+		}
+		if l.logged == nil {
+			l.logged = make(chan struct{})
+		}
+		logged := l.logged
+		l.mu.Unlock()
+		select {
+		case <-logged:
+		case <-timeout:
+			return l.find(msg), false
+		}
+	}
 }
 
 func (l *debugLog) WithAttrs([]slog.Attr) slog.Handler { return l }
@@ -1380,6 +1414,11 @@ func (l *debugLog) WithGroup(string) slog.Handler { return l }
 func (l *debugLog) find(msg string) []slog.Record {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.findLocked(msg)
+}
+
+// findLocked is find for a caller that holds l.mu.
+func (l *debugLog) findLocked(msg string) []slog.Record {
 	var out []slog.Record
 	for _, r := range l.records {
 		if r.Message == msg {
@@ -1425,7 +1464,7 @@ func TestServer_TCPAcceptRetriesAfterError(t *testing.T) {
 	var conns connSet
 	defer conns.closeAll()
 
-	err := s.serveTCP(ln, &conns, make(chan struct{}))
+	err := s.serveTCP(newForwards(context.Background(), maxForwards), ln, &conns, make(chan struct{}))
 	if !errors.Is(err, net.ErrClosed) || !strings.HasPrefix(err.Error(), "meshdns: serve tcp: ") {
 		t.Errorf("serveTCP() = %v, want a meshdns: serve tcp: error wrapping %v", err, net.ErrClosed)
 	}
@@ -1473,7 +1512,7 @@ func TestServer_TCPAcceptStopsDuringRetries(t *testing.T) {
 	var conns connSet
 	stop := make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- s.serveTCP(ln, &conns, stop) }()
+	go func() { done <- s.serveTCP(newForwards(context.Background(), maxForwards), ln, &conns, stop) }()
 
 	deadline := time.Now().Add(ioTimeout)
 	for ln.callCount() < 3 {
@@ -1826,7 +1865,8 @@ func TestServer_DropsAnswerItCannotPack(t *testing.T) {
 	s.SetRecords(&broken)
 
 	w := &recordingWriter{}
-	s.handlePacket(w, newQuery(t, 1, "db.lab.internal.", dnsmessage.TypeTXT), netip.MustParseAddrPort("127.0.0.1:5300"))
+	s.handlePacket(w, newQuery(t, 1, "db.lab.internal.", dnsmessage.TypeTXT), netip.MustParseAddrPort("127.0.0.1:5300"),
+		newForwards(context.Background(), maxForwards))
 	if got := len(w.to); got != 0 {
 		t.Errorf("%d replies sent, want none", got)
 	}
@@ -1840,4 +1880,1155 @@ func TestServer_DropsAnswerItCannotPack(t *testing.T) {
 	if got := recordAttr(found[0], "error").String(); !strings.Contains(got, "character string exceeds maximum length (255)") {
 		t.Errorf("error = %q, want the string-length refusal of dnsmessage", got)
 	}
+}
+
+// startForwarder serves records and table on a new test server whose
+// upstream sends the queries for each address of fakes to that fake, and
+// returns the server with the log it writes. configure runs before Listen.
+func startForwarder(t *testing.T, records *Records, table *Forwarding, fakes map[string]*fakeResolver, configure ...func(*Server)) (*Server, *debugLog) {
+	t.Helper()
+	logs := &debugLog{}
+	s := NewServer(netip.MustParseAddrPort("127.0.0.1:0"), slog.New(logs))
+	s.upstream.target = routeFakes(t, fakes)
+	for _, f := range configure {
+		f(s)
+	}
+	if records != nil {
+		s.SetRecords(records)
+	}
+	s.SetForwarding(table)
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	t.Cleanup(serve(t, s))
+	return s, logs
+}
+
+// catchAllTable is a forwarding table with the forward zone corp.example.com
+// and the catch-all, both on the resolver 192.0.2.1.
+func catchAllTable(t *testing.T) *Forwarding {
+	t.Helper()
+	return mustForward(t, api.NodeStateDNSForwarding{
+		ForwardZones: []api.NodeStateDNSForwardZone{fwdZone("corp.example.com", "192.0.2.1")},
+		CatchAll:     []string{"192.0.2.1"},
+	}, nil)
+}
+
+// exchangeOver returns the exchange function of network, udp or tcp.
+func exchangeOver(network string) func(*testing.T, net.Conn, []byte) []byte {
+	if network == "tcp" {
+		return exchangeTCP
+	}
+	return exchangeUDP
+}
+
+func TestServer_Forwards(t *testing.T) {
+	corp := newFakeResolver(t, answerA("198.51.100.1"))
+	example := newFakeResolver(t, answerA("198.51.100.2"))
+	other := newFakeResolver(t, answerA("198.51.100.3"))
+	records := mustBuild(t, serverBlock())
+	table := mustForward(t, api.NodeStateDNSForwarding{
+		ForwardZones: []api.NodeStateDNSForwardZone{
+			fwdZone("corp.example.com", "192.0.2.1"),
+			// Above the mesh zone edge.example.com, which keeps its names.
+			fwdZone("example.com", "192.0.2.2"),
+		},
+		CatchAll: []string{"192.0.2.3"},
+	}, records)
+	s, _ := startForwarder(t, records, table, map[string]*fakeResolver{"192.0.2.1": corp, "192.0.2.2": example, "192.0.2.3": other})
+	asked := func() int { return corp.count() + example.count() + other.count() }
+
+	for _, network := range []string{"udp", "tcp"} {
+		t.Run(network, func(t *testing.T) {
+			exchange := exchangeOver(network)
+			conn := dial(t, network, s)
+
+			forwarded := []struct {
+				qname string
+				fake  *fakeResolver
+			}{
+				{"host.corp.example.com.", corp},
+				{"Host.CORP.example.com.", corp},
+				{"www.example.com.", example},
+				// Under no forward zone: the catch-all.
+				{"example.org.", other},
+				{"1.2.0.192.in-addr.arpa.", other},
+			}
+			for i, tc := range forwarded {
+				before := tc.fake.count()
+				query := newQuery(t, uint16(0x7300+i), tc.qname, dnsmessage.TypeA)
+				resp := exchange(t, conn, query)
+				got := tc.fake.received()
+				if len(got) != before+1 {
+					t.Fatalf("%s: the resolver received %d queries, want %d", tc.qname, len(got), before+1)
+				}
+				wantSentAsQuery(t, got[before], network, query)
+				wantRelayed(t, resp, got[before].replies[0], query)
+			}
+
+			// The mesh zones answer from the records, below a forward zone
+			// too, and a name missing from one is not forwarded either.
+			before := asked()
+			for i, tc := range []struct {
+				qname string
+				rcode dnsmessage.RCode
+				want  []string
+			}{
+				{"db-1.openstack.lab.internal.", dnsmessage.RCodeSuccess, []string{"db-1.openstack.lab.internal. 10 ClassINET TypeA 10.42.0.3"}},
+				{"gw.edge.example.com.", dnsmessage.RCodeSuccess, []string{"gw.edge.example.com. 10 ClassINET TypeA 10.42.0.9"}},
+				{"nope.edge.example.com.", dnsmessage.RCodeNameError, nil},
+				{"9.9.42.10.in-addr.arpa.", dnsmessage.RCodeNameError, nil},
+			} {
+				m := parseResponse(t, exchange(t, conn, newQuery(t, uint16(0x7400+i), tc.qname, dnsmessage.TypeA)))
+				if m.RCode != tc.rcode || !m.Authoritative {
+					t.Errorf("%s: RCode %v AA %v, want %v true", tc.qname, m.RCode, m.Authoritative, tc.rcode)
+				}
+				if got := describeAll(m.Answers); !slices.Equal(got, tc.want) {
+					t.Errorf("%s: answers = %q, want %q", tc.qname, got, tc.want)
+				}
+			}
+			if got := asked(); got != before {
+				t.Errorf("the resolvers received %d queries for mesh names, want none", got-before)
+			}
+		})
+	}
+}
+
+func TestServer_RefusesWithoutRoute(t *testing.T) {
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	records := mustBuild(t, serverBlock())
+	zonesOnly := mustForward(t, api.NodeStateDNSForwarding{
+		ForwardZones: []api.NodeStateDNSForwardZone{fwdZone("corp.example.com", "192.0.2.1")},
+		CatchAll:     []string{},
+	}, records)
+	empty := mustForward(t, api.NodeStateDNSForwarding{ForwardZones: []api.NodeStateDNSForwardZone{}, CatchAll: []string{}}, records)
+
+	tests := []struct {
+		name    string
+		records *Records
+		table   *Forwarding
+		refused []string
+	}{
+		{"forward zones without a catch-all", records, zonesOnly, []string{"example.org."}},
+		{"empty table", records, empty, []string{"example.org.", "host.corp.example.com."}},
+		{"nil table", records, nil, []string{"example.org.", "host.corp.example.com."}},
+		{"before SetRecords", nil, zonesOnly, []string{"example.org.", "db-1.openstack.lab.internal."}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := startForwarder(t, tc.records, tc.table, map[string]*fakeResolver{"192.0.2.1": fake})
+			for _, network := range []string{"udp", "tcp"} {
+				conn := dial(t, network, s)
+				for i, qname := range tc.refused {
+					q := question(qname, dnsmessage.TypeA)
+					m := parseResponse(t, exchangeOver(network)(t, conn, newQuery(t, uint16(i+1), qname, dnsmessage.TypeA)))
+					if m.RCode != dnsmessage.RCodeRefused || m.Authoritative {
+						t.Errorf("%s %s: RCode %v AA %v, want %v false", network, qname, m.RCode, m.Authoritative, dnsmessage.RCodeRefused)
+					}
+					if !slices.Equal(m.Questions, []dnsmessage.Question{q}) || len(m.Answers) != 0 {
+						t.Errorf("%s %s: questions %v answers %q, want the question and no answer", network, qname, m.Questions, describeAll(m.Answers))
+					}
+				}
+			}
+			if got := fake.count(); got != 0 {
+				t.Errorf("the resolver received %d queries, want none", got)
+			}
+		})
+	}
+}
+
+// A query that is no standard query for one name of class IN is answered as
+// it was before forwarding, for a name the table routes too, and a zone
+// transfer is never relayed.
+func TestServer_NeverForwards(t *testing.T) {
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	s, _ := startForwarder(t, mustBuild(t, serverBlock()), catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake})
+
+	host := question("host.corp.example.com.", dnsmessage.TypeA)
+	chaos := host
+	chaos.Class = dnsmessage.ClassCHAOS
+	axfr := question("corp.example.com.", dnsmessage.TypeAXFR)
+	ixfr := question("corp.example.com.", typeIXFR)
+	other := question("example.org.", dnsmessage.TypeA)
+	rd := func(id uint16) dnsmessage.Header { return dnsmessage.Header{ID: id, RecursionDesired: true} }
+
+	tests := []struct {
+		name  string
+		msg   []byte
+		rcode dnsmessage.RCode
+	}{
+		{"class CH", packQuery(t, rd(1), false, chaos), dnsmessage.RCodeRefused},
+		{"AXFR", packQuery(t, rd(2), false, axfr), dnsmessage.RCodeRefused},
+		{"IXFR", packQuery(t, rd(3), false, ixfr), dnsmessage.RCodeRefused},
+		{"opcode 2", packQuery(t, dnsmessage.Header{ID: 4, OpCode: 2, RecursionDesired: true}, false, host), dnsmessage.RCodeNotImplemented},
+		{"two questions", packQuery(t, rd(5), false, host, other), dnsmessage.RCodeFormatError},
+		{"two OPT records", packQueryOPTs(t, rd(6), 2, host), dnsmessage.RCodeFormatError},
+	}
+	for _, network := range []string{"udp", "tcp"} {
+		conn := dial(t, network, s)
+		for _, tc := range tests {
+			t.Run(network+" "+tc.name, func(t *testing.T) {
+				m := parseResponse(t, exchangeOver(network)(t, conn, tc.msg))
+				if m.RCode != tc.rcode || m.Authoritative || m.RecursionAvailable {
+					t.Errorf("RCode %v AA %v RA %v, want %v false false", m.RCode, m.Authoritative, m.RecursionAvailable, tc.rcode)
+				}
+				if len(m.Answers) != 0 {
+					t.Errorf("answers = %q, want none", describeAll(m.Answers))
+				}
+			})
+		}
+	}
+	if got := fake.count(); got != 0 {
+		t.Errorf("the resolver received %d queries, want none", got)
+	}
+
+	// The same name asked for A is forwarded.
+	exchangeUDP(t, dial(t, "udp", s), packQuery(t, rd(7), false, host))
+	if got := fake.count(); got != 1 {
+		t.Errorf("the resolver received %d queries for host.corp.example.com A, want 1", got)
+	}
+}
+
+// As for the answers, the drop is proven at the handlers the loops call,
+// with the source a socket would report.
+func TestServer_DropsForwardFromDisallowedSource(t *testing.T) {
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	s := NewServer(netip.MustParseAddrPort("10.99.0.1:5354"), slog.New(slog.DiscardHandler))
+	s.upstream.target = routeFakes(t, map[string]*fakeResolver{"192.0.2.1": fake})
+	s.SetForwarding(catchAllTable(t))
+	msg := newQuery(t, 13, "example.org.", dnsmessage.TypeA)
+	fw := newForwards(context.Background(), maxForwards)
+
+	for _, src := range []string{"192.0.2.7:40000", "10.99.0.2:40000"} {
+		w := &recordingWriter{}
+		s.handlePacket(w, msg, netip.MustParseAddrPort(src), fw)
+		fw.wg.Wait()
+		if len(w.to) != 0 {
+			t.Errorf("replies to a query from %s went to %v, want none", src, w.to)
+		}
+	}
+	t.Run("tcp", func(t *testing.T) {
+		var conns connSet
+		server, client := net.Pipe()
+		defer conns.closeAll()
+		defer func() { _ = client.Close() }()
+		s.accept(fw, &conns, server, netip.MustParseAddr("192.0.2.7"))
+		if err := writeFrame(client, msg); !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("write to a connection from 192.0.2.7 = %v, want %v", err, io.ErrClosedPipe)
+		}
+	})
+	if got := fake.count(); got != 0 {
+		t.Errorf("the resolver received %d queries, want none", got)
+	}
+
+	// The node itself is forwarded for.
+	w := &recordingWriter{}
+	src := netip.MustParseAddrPort("10.99.0.1:40000")
+	s.handlePacket(w, msg, src, fw)
+	fw.wg.Wait()
+	if !slices.Equal(w.to, []netip.AddrPort{src}) || fake.count() != 1 {
+		t.Errorf("a query from %s: replies to %v and %d queries to the resolver, want one each", src, w.to, fake.count())
+	}
+}
+
+func TestServer_ForwardFailsWithServfail(t *testing.T) {
+	fake := newFakeResolver(t, silent)
+	table := mustForward(t, api.NodeStateDNSForwarding{
+		ForwardZones: []api.NodeStateDNSForwardZone{fwdZone("corp.example.com", "192.0.2.1")},
+	}, nil)
+	s, logs := startForwarder(t, nil, table, map[string]*fakeResolver{"192.0.2.1": fake}, func(s *Server) {
+		// The resolver stays silent; nothing here is about the length of
+		// the wait, so an exchange gives up sooner.
+		s.upstream.timeout = 300 * time.Millisecond
+	})
+	q := question("host.corp.example.com.", dnsmessage.TypeA)
+
+	i := 0
+	for _, network := range []string{"udp", "tcp"} {
+		for _, edns := range []bool{false, true} {
+			i++
+			t.Run(fmt.Sprintf("%s edns %v", network, edns), func(t *testing.T) {
+				id := uint16(0x7500 + i)
+				msg := packQuery(t, dnsmessage.Header{ID: id, RecursionDesired: true}, edns, q)
+				m := parseResponse(t, exchangeOver(network)(t, dial(t, network, s), msg))
+				if m.ID != id || m.RCode != dnsmessage.RCodeServerFailure {
+					t.Errorf("ID %#x RCode %v, want %#x %v", m.ID, m.RCode, id, dnsmessage.RCodeServerFailure)
+				}
+				if !m.Response || m.Authoritative || m.RecursionAvailable || !m.RecursionDesired || m.Truncated {
+					t.Errorf("QR, AA, RA, RD, TC = %v, %v, %v, %v, %v, want true, false, false, true, false",
+						m.Response, m.Authoritative, m.RecursionAvailable, m.RecursionDesired, m.Truncated)
+				}
+				if !slices.Equal(m.Questions, []dnsmessage.Question{q}) {
+					t.Errorf("questions = %v, want %v", m.Questions, q)
+				}
+				if len(m.Answers) != 0 || len(m.Authorities) != 0 {
+					t.Errorf("answers, authorities = %q, %q, want none", describeAll(m.Answers), describeAll(m.Authorities))
+				}
+				checkOPT(t, m, edns)
+			})
+		}
+	}
+
+	found := logs.find("mesh dns forwarded query failed")
+	if len(found) != 4 {
+		t.Fatalf("%d lines say the forwarded query failed, want 4", len(found))
+	}
+	for _, r := range found {
+		if r.Level != slog.LevelDebug {
+			t.Errorf("forwarded query failed logged at %v, want %v", r.Level, slog.LevelDebug)
+		}
+		for k, want := range map[string]string{
+			"name":  "host.corp.example.com.",
+			"type":  "TypeA",
+			"zone":  "corp.example.com",
+			"error": "meshdns: forward to corp.example.com: context deadline exceeded",
+		} {
+			if got := recordAttr(r, k).String(); got != want {
+				t.Errorf("forwarded query failed has %s=%q, want %q", k, got, want)
+			}
+		}
+	}
+}
+
+func TestServer_AnswersMeshNamesWhileForwarding(t *testing.T) {
+	fake := newFakeResolver(t, silent)
+	s, _ := startForwarder(t, mustBuild(t, serverBlock()), catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake})
+
+	// The forward waits for a resolver that does not answer, the whole 4
+	// seconds of its exchange.
+	if _, err := dial(t, "udp", s).Write(newQuery(t, 1, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+	fake.waitQueries(t, 1)
+
+	start := time.Now()
+	addr, err := firstA(exchangeUDP(t, dial(t, "udp", s), newQuery(t, 2, "db-1.openstack.lab.internal.", dnsmessage.TypeA)))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("mesh name answered after %v while a forward is in flight, want within 1s", elapsed)
+	}
+	if err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("reply = %v, %v, want 10.42.0.3", addr, err)
+	}
+}
+
+func TestServer_ForwardLimit(t *testing.T) {
+	const limit = 2
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	fake.hold()
+	s, logs := startForwarder(t, nil, catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake}, func(s *Server) { s.forwardLimit = limit })
+
+	held := make([]net.Conn, limit)
+	for i := range held {
+		held[i] = dial(t, "udp", s)
+		if _, err := held[i].Write(newQuery(t, uint16(i+1), "example.org.", dnsmessage.TypeA)); err != nil {
+			t.Fatalf("write query %d: %v", i+1, err)
+		}
+	}
+	fake.waitQueries(t, limit)
+
+	// The forwards in flight wait for the resolver, which holds its
+	// replies, so a SERVFAIL within a second is not one that waited for it.
+	start := time.Now()
+	m := parseResponse(t, exchangeUDP(t, dial(t, "udp", s), newQuery(t, 3, "example.org.", dnsmessage.TypeA)))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("query over the limit answered after %v, want at once", elapsed)
+	}
+	if m.ID != 3 || m.RCode != dnsmessage.RCodeServerFailure || len(m.Answers) != 0 {
+		t.Errorf("query over the limit: ID %#x RCode %v answers %q, want 0x3 %v and none", m.ID, m.RCode, describeAll(m.Answers), dnsmessage.RCodeServerFailure)
+	}
+	if got := fake.count(); got != limit {
+		t.Errorf("the resolver received %d queries, want %d: the query over the limit reached it", got, limit)
+	}
+	found := logs.find("mesh dns dropped a forwarded query, too many are in flight")
+	if len(found) != 1 {
+		t.Fatalf("%d lines say a forwarded query was dropped, want 1", len(found))
+	}
+	if found[0].Level != slog.LevelDebug || recordAttr(found[0], "limit").Int64() != limit {
+		t.Errorf("dropped a forwarded query logged at %v with limit=%v, want %v and %d", found[0].Level, recordAttr(found[0], "limit"), slog.LevelDebug, limit)
+	}
+
+	fake.release()
+	for i, conn := range held {
+		if err := conn.SetReadDeadline(time.Now().Add(ioTimeout)); err != nil {
+			t.Fatalf("SetReadDeadline() = %v, want nil", err)
+		}
+		buf := make([]byte, maxMessageSize)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("read reply %d: %v", i+1, err)
+		}
+		if addr, err := firstA(buf[:n]); err != nil || addr != netip.MustParseAddr("198.51.100.1") || binary.BigEndian.Uint16(buf) != uint16(i+1) {
+			t.Errorf("reply %d = ID %#x %v, %v, want ID %#x 198.51.100.1", i+1, binary.BigEndian.Uint16(buf), addr, err, i+1)
+		}
+	}
+
+	// Each slot frees before its reply goes out, so the next query is
+	// forwarded again.
+	if addr, err := firstA(exchangeUDP(t, dial(t, "udp", s), newQuery(t, 4, "example.org.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("198.51.100.1") {
+		t.Errorf("query after the slots freed = %v, %v, want 198.51.100.1", addr, err)
+	}
+	if got := fake.count(); got != limit+1 {
+		t.Errorf("the resolver received %d queries, want %d", got, limit+1)
+	}
+}
+
+func TestServer_TruncatesRelayedReply(t *testing.T) {
+	// Six TXT records of 200 bytes each make a reply of about 1300 bytes.
+	fake := newFakeResolver(t, func(query []byte) [][]byte {
+		return [][]byte{packReply(query, nil, func(b *dnsmessage.Builder, q dnsmessage.Question) error {
+			for i := range 6 {
+				rh := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
+				txt := fmt.Sprintf("%03d-%s", i, strings.Repeat("x", 196))
+				if err := b.TXTResource(rh, dnsmessage.TXTResource{TXT: []string{txt}}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})}
+	})
+	s, _ := startForwarder(t, nil, catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake})
+	q := question("big.example.org.", dnsmessage.TypeTXT)
+
+	resp := exchangeUDP(t, dial(t, "udp", s), packQueryPayload(t, 1, "big.example.org.", dnsmessage.TypeTXT, 1472))
+	if sent := fake.received()[0].replies[0]; len(sent) < 1300 || len(sent) > 1472 {
+		t.Fatalf("the resolver's reply has %d bytes, want 1300 to 1472 for this check", len(sent))
+	}
+	if len(resp) > 1232 {
+		t.Errorf("reply of %d bytes over UDP, want at most 1232", len(resp))
+	}
+	m := parseResponse(t, resp)
+	wantTruncated(t, m, q, true)
+	if m.ID != 1 {
+		t.Errorf("ID = %#x, want 0x1", m.ID)
+	}
+
+	query := packQueryPayload(t, 2, "big.example.org.", dnsmessage.TypeTXT, 1472)
+	resp = exchangeTCP(t, dial(t, "tcp", s), query)
+	wantRelayed(t, resp, fake.received()[1].replies[0], query)
+	if m := parseResponse(t, resp); m.Truncated || len(m.Answers) != 6 {
+		t.Errorf("over TCP: TC %v with %d answers, want false and 6", m.Truncated, len(m.Answers))
+	}
+}
+
+// A forward whose resolver answers only after the deadline in force when the
+// query arrived has passed still gets its reply, under a write deadline of
+// its own, without which the reply would never leave. The connection answers
+// on after it: the forward restarted the deadline when it took its slot, so
+// the loop read on while it waited, and the reply restarted it again. The
+// sleeps are the idle time under test.
+func TestServer_TCPForwardOutlastsIdleDeadline(t *testing.T) {
+	const idle = time.Second
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	fake.hold()
+	s, _ := startForwarder(t, mustBuild(t, serverBlock()), catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake},
+		func(s *Server) { s.tcpIdle = idle })
+	conn := dial(t, "tcp", s)
+
+	sent := time.Now()
+	if addr, err := firstA(exchangeTCP(t, conn, newQuery(t, 1, "db-1.openstack.lab.internal.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Fatalf("first reply = %v, %v, want 10.42.0.3", addr, err)
+	}
+	// The server wrote the reply after the query left and before the reply
+	// arrived, so the deadline it set, for the read and for a write, passes
+	// between idle after sent and idle after answered.
+	answered := time.Now()
+
+	time.Sleep(time.Until(sent.Add(idle / 2)))
+	if err := writeFrame(conn, newQuery(t, 2, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write forwarded query: %v", err)
+	}
+	fake.waitQueries(t, 1)
+	// Past the deadline the first reply set, and before the one the forward
+	// set when it took its slot, idle after the write above.
+	time.Sleep(time.Until(answered.Add(idle + idle/4)))
+	fake.release()
+
+	resp, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read the forward's reply: %v", err)
+	}
+	if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("198.51.100.1") || binary.BigEndian.Uint16(resp) != 2 {
+		t.Errorf("forward's reply = ID %#x %v, %v, want ID 0x2 198.51.100.1", binary.BigEndian.Uint16(resp), addr, err)
+	}
+	// The reply set a fresh deadline, so the connection answers on.
+	if addr, err := firstA(exchangeTCP(t, conn, newQuery(t, 3, "db-1.openstack.lab.internal.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("reply after the forward = %v, %v, want 10.42.0.3", addr, err)
+	}
+}
+
+// A forwarded query restarts the deadline of its connection when it takes
+// its slot, as a reply does, because it gets one. Without that, the deadline
+// of the reply before it passes while the forward waits for its resolver,
+// the loop stops reading, and a mesh name asked behind the forward after that
+// deadline is never read: the connection sends the forward's reply and
+// closes with the query unread, which the client sees as a reset. The sleeps
+// are the idle time under test.
+func TestServer_TCPForwardKeepsConnectionReading(t *testing.T) {
+	const idle = 1500 * time.Millisecond
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	fake.hold()
+	s, _ := startForwarder(t, mustBuild(t, serverBlock()), catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake},
+		func(s *Server) { s.tcpIdle = idle })
+	conn := dial(t, "tcp", s)
+
+	sent := time.Now()
+	if addr, err := firstA(exchangeTCP(t, conn, newQuery(t, 1, "db-1.openstack.lab.internal.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Fatalf("first reply = %v, %v, want 10.42.0.3", addr, err)
+	}
+	// The server wrote the reply after the query left and before the reply
+	// arrived, so the deadline it set passes between idle after sent and
+	// idle after answered.
+	answered := time.Now()
+
+	// Before that deadline, so the loop reads the forwarded query.
+	time.Sleep(time.Until(sent.Add(time.Second)))
+	if err := writeFrame(conn, newQuery(t, 2, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write forwarded query: %v", err)
+	}
+	fake.waitQueries(t, 1)
+	// Past that deadline, while the forward waits for its resolver.
+	time.Sleep(time.Until(answered.Add(1800 * time.Millisecond)))
+	if err := writeFrame(conn, newQuery(t, 3, "web.openstack.lab.internal.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write mesh query: %v", err)
+	}
+	time.Sleep(time.Until(answered.Add(2500 * time.Millisecond)))
+	fake.release()
+
+	// The mesh name was answered when it arrived, before the resolver
+	// answered the forward.
+	resp, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("10.42.0.2") || binary.BigEndian.Uint16(resp) != 3 {
+		t.Errorf("reply 1 = ID %#x %v, %v, want the mesh name's ID 0x3 10.42.0.2", binary.BigEndian.Uint16(resp), addr, err)
+	}
+	if resp, err = readFrame(conn); err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("198.51.100.1") || binary.BigEndian.Uint16(resp) != 2 {
+		t.Errorf("reply 2 = ID %#x %v, %v, want the forward's ID 0x2 198.51.100.1", binary.BigEndian.Uint16(resp), addr, err)
+	}
+	if addr, err := firstA(exchangeTCP(t, conn, newQuery(t, 4, "db-1.openstack.lab.internal.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("reply after the forward = %v, %v, want 10.42.0.3", addr, err)
+	}
+}
+
+// A forwarded reply restarts the deadline as a mesh answer does, for the read
+// that already waits too, so a client whose query was forwarded has the full
+// time for its next one. The sleeps are the idle time under test.
+func TestServer_TCPForwardedReplyRestartsDeadline(t *testing.T) {
+	const (
+		idle = 1500 * time.Millisecond
+		gap  = 900 * time.Millisecond
+	)
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	fake.hold()
+	s, _ := startForwarder(t, mustBuild(t, serverBlock()), catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake},
+		func(s *Server) { s.tcpIdle = idle })
+	conn := dial(t, "tcp", s)
+
+	if err := writeFrame(conn, newQuery(t, 1, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+	fake.waitQueries(t, 1)
+	// The server accepted the connection, and the forward took its slot,
+	// before the query reached the resolver, so the deadlines both set pass
+	// no later than idle from now.
+	queried := time.Now()
+	time.Sleep(gap)
+	fake.release()
+	resp, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("198.51.100.1") {
+		t.Errorf("reply = %v, %v, want 198.51.100.1", addr, err)
+	}
+
+	// Past the deadlines the accept and the forward's slot set, and before
+	// the one the reply set.
+	time.Sleep(time.Until(queried.Add(idle + gap/2)))
+	if addr, err := firstA(exchangeTCP(t, conn, newQuery(t, 2, "db-1.openstack.lab.internal.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("reply after the forward = %v, %v, want 10.42.0.3", addr, err)
+	}
+}
+
+// systemd-resolved sends the queries of concurrent lookups over one TCP
+// connection to plexd's server without waiting for each reply, so a forward
+// that waits for its resolver must not hold up a mesh name asked behind it.
+func TestServer_TCPAnswersMeshNamesWhileForwarding(t *testing.T) {
+	fake := newFakeResolver(t, silent)
+	records := mustBuild(t, serverBlock())
+	table := mustForward(t, api.NodeStateDNSForwarding{
+		ForwardZones: []api.NodeStateDNSForwardZone{fwdZone("corp.example.com", "192.0.2.1")},
+	}, records)
+	s, _ := startForwarder(t, records, table, map[string]*fakeResolver{"192.0.2.1": fake}, func(s *Server) {
+		// The resolver stays silent, so the forward ends at the timeout. A
+		// shorter one keeps the test short and still outlasts the second
+		// the mesh name has.
+		s.upstream.timeout = 2 * time.Second
+	})
+	conn := dial(t, "tcp", s)
+	q := question("host.corp.example.com.", dnsmessage.TypeA)
+
+	if err := writeFrame(conn, packQuery(t, dnsmessage.Header{ID: 1, RecursionDesired: true}, false, q)); err != nil {
+		t.Fatalf("write forwarded query: %v", err)
+	}
+	fake.waitQueries(t, 1)
+	start := time.Now()
+	if err := writeFrame(conn, newQuery(t, 2, "db-1.openstack.lab.internal.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write mesh query: %v", err)
+	}
+
+	resp, err := readFrame(conn)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("read first reply: %v", err)
+	}
+	if id := binary.BigEndian.Uint16(resp); id != 2 {
+		t.Fatalf("first reply has ID %#x after %v, want the mesh name's 0x2 before the forward's", id, elapsed)
+	}
+	if elapsed > time.Second {
+		t.Errorf("mesh name answered after %v while a forward is in flight on its connection, want within 1s", elapsed)
+	}
+	if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("mesh reply = %v, %v, want 10.42.0.3", addr, err)
+	}
+
+	resp, err = readFrame(conn)
+	if err != nil {
+		t.Fatalf("read the forward's reply: %v", err)
+	}
+	m := parseResponse(t, resp)
+	if m.ID != 1 || m.RCode != dnsmessage.RCodeServerFailure || !slices.Equal(m.Questions, []dnsmessage.Question{q}) {
+		t.Errorf("forward's reply: ID %#x RCode %v questions %v, want 0x1 %v %v", m.ID, m.RCode, m.Questions, dnsmessage.RCodeServerFailure, q)
+	}
+}
+
+// Two forwards on one connection whose resolvers answer in the opposite
+// order: each reply goes out once its resolver answered, whole and behind
+// its own length, and the stream stays in step for the query after them.
+func TestServer_TCPRepliesInCompletionOrder(t *testing.T) {
+	slow := newFakeResolver(t, answerA("198.51.100.1"))
+	fast := newFakeResolver(t, answerA("198.51.100.2"))
+	slow.hold()
+	fast.hold()
+	table := mustForward(t, api.NodeStateDNSForwarding{
+		ForwardZones: []api.NodeStateDNSForwardZone{
+			fwdZone("corp.example.com", "192.0.2.1"),
+			fwdZone("example.org", "192.0.2.2"),
+		},
+	}, nil)
+	s, _ := startForwarder(t, nil, table, map[string]*fakeResolver{"192.0.2.1": slow, "192.0.2.2": fast})
+	conn := dial(t, "tcp", s)
+
+	first := newQuery(t, 1, "host.corp.example.com.", dnsmessage.TypeA)
+	second := newQuery(t, 2, "www.example.org.", dnsmessage.TypeA)
+	// One write carries both, as a client that pipelines sends them.
+	frames := binary.BigEndian.AppendUint16(nil, uint16(len(first)))
+	frames = append(frames, first...)
+	frames = binary.BigEndian.AppendUint16(frames, uint16(len(second)))
+	frames = append(frames, second...)
+	if _, err := conn.Write(frames); err != nil {
+		t.Fatalf("write queries: %v", err)
+	}
+	slow.waitQueries(t, 1)
+	fast.waitQueries(t, 1)
+
+	fast.release()
+	resp, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read first reply: %v", err)
+	}
+	wantRelayed(t, resp, fast.received()[0].replies[0], second)
+
+	slow.release()
+	if resp, err = readFrame(conn); err != nil {
+		t.Fatalf("read second reply: %v", err)
+	}
+	wantRelayed(t, resp, slow.received()[0].replies[0], first)
+
+	// No name of the table: the next frame is this query's REFUSED.
+	if m := parseResponse(t, exchangeTCP(t, conn, newQuery(t, 3, "example.net.", dnsmessage.TypeA))); m.ID != 3 || m.RCode != dnsmessage.RCodeRefused {
+		t.Errorf("reply after the forwards: ID %#x RCode %v, want 0x3 %v", m.ID, m.RCode, dnsmessage.RCodeRefused)
+	}
+}
+
+// The slots are shared: forwards over UDP and TCP count against one limit,
+// and a TCP forward over it gets SERVFAIL at once, on a connection that has a
+// forward in flight too.
+func TestServer_TCPForwardLimit(t *testing.T) {
+	const limit = 2
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	fake.hold()
+	s, logs := startForwarder(t, nil, catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake}, func(s *Server) { s.forwardLimit = limit })
+
+	udp := dial(t, "udp", s)
+	if _, err := udp.Write(newQuery(t, 1, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query over UDP: %v", err)
+	}
+	held := dial(t, "tcp", s)
+	if err := writeFrame(held, newQuery(t, 2, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query over TCP: %v", err)
+	}
+	fake.waitQueries(t, limit)
+
+	// The forwards in flight wait for the resolver, which holds its
+	// replies, so a SERVFAIL within a second is not one that waited for it.
+	over := []struct {
+		network string
+		conn    net.Conn
+	}{
+		{"tcp", held},
+		{"tcp", dial(t, "tcp", s)},
+		{"udp", dial(t, "udp", s)},
+	}
+	for i, tc := range over {
+		id := uint16(3 + i)
+		start := time.Now()
+		m := parseResponse(t, exchangeOver(tc.network)(t, tc.conn, newQuery(t, id, "example.org.", dnsmessage.TypeA)))
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("%s query %#x over the limit answered after %v, want at once", tc.network, id, elapsed)
+		}
+		if m.ID != id || m.RCode != dnsmessage.RCodeServerFailure || len(m.Answers) != 0 {
+			t.Errorf("%s query over the limit: ID %#x RCode %v answers %q, want %#x %v and none",
+				tc.network, m.ID, m.RCode, describeAll(m.Answers), id, dnsmessage.RCodeServerFailure)
+		}
+	}
+	if got := fake.count(); got != limit {
+		t.Errorf("the resolver received %d queries, want %d: a query over the limit reached it", got, limit)
+	}
+	found := logs.find("mesh dns dropped a forwarded query, too many are in flight")
+	if len(found) != len(over) {
+		t.Fatalf("%d lines say a forwarded query was dropped, want %d", len(found), len(over))
+	}
+	for _, r := range found {
+		if r.Level != slog.LevelDebug || recordAttr(r, "limit").Int64() != limit {
+			t.Errorf("dropped a forwarded query logged at %v with limit=%v, want %v and %d", r.Level, recordAttr(r, "limit"), slog.LevelDebug, limit)
+		}
+	}
+
+	fake.release()
+	if err := udp.SetReadDeadline(time.Now().Add(ioTimeout)); err != nil {
+		t.Fatalf("SetReadDeadline() = %v, want nil", err)
+	}
+	buf := make([]byte, maxMessageSize)
+	n, err := udp.Read(buf)
+	if err != nil {
+		t.Fatalf("read UDP reply: %v", err)
+	}
+	if addr, err := firstA(buf[:n]); err != nil || addr != netip.MustParseAddr("198.51.100.1") || binary.BigEndian.Uint16(buf) != 1 {
+		t.Errorf("UDP reply = ID %#x %v, %v, want ID 0x1 198.51.100.1", binary.BigEndian.Uint16(buf), addr, err)
+	}
+	resp, err := readFrame(held)
+	if err != nil {
+		t.Fatalf("read TCP reply: %v", err)
+	}
+	if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("198.51.100.1") || binary.BigEndian.Uint16(resp) != 2 {
+		t.Errorf("TCP reply = ID %#x %v, %v, want ID 0x2 198.51.100.1", binary.BigEndian.Uint16(resp), addr, err)
+	}
+
+	// Each slot frees before its reply goes out, so the next TCP query is
+	// forwarded again.
+	if addr, err := firstA(exchangeTCP(t, held, newQuery(t, 6, "example.org.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("198.51.100.1") {
+		t.Errorf("TCP query after the slots freed = %v, %v, want 198.51.100.1", addr, err)
+	}
+	if got := fake.count(); got != limit+1 {
+		t.Errorf("the resolver received %d queries, want %d", got, limit+1)
+	}
+}
+
+// One TCP connection holds at most 16 forwards, each from the slot it takes
+// until its reply is written. A client that pipelines more of them while the
+// resolver holds its replies gets SERVFAIL at once for the queries over that
+// limit, though the server's 256 slots are far from taken.
+func TestServer_TCPConnectionForwardLimit(t *testing.T) {
+	// The limit is spelled out rather than taken from maxConnForwards, so the
+	// test pins the documented 16.
+	const (
+		limit = 16
+		over  = 3
+	)
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	fake.hold()
+	s, logs := startForwarder(t, nil, catchAllTable(t), map[string]*fakeResolver{"192.0.2.1": fake})
+	conn := dial(t, "tcp", s)
+
+	// One write carries them all, as a client that pipelines sends them.
+	var frames []byte
+	for i := range limit + over {
+		q := newQuery(t, uint16(i+1), "example.org.", dnsmessage.TypeA)
+		frames = binary.BigEndian.AppendUint16(frames, uint16(len(q)))
+		frames = append(frames, q...)
+	}
+	if _, err := conn.Write(frames); err != nil {
+		t.Fatalf("write queries: %v", err)
+	}
+	fake.waitQueries(t, limit)
+
+	// The forwards wait for the resolver, which holds its replies, so the
+	// first replies are the SERVFAILs of the queries over the limit, in
+	// their order, and a SERVFAIL within a second is not one that waited.
+	start := time.Now()
+	for i := range over {
+		id := uint16(limit + 1 + i)
+		resp, err := readFrame(conn)
+		if err != nil {
+			t.Fatalf("read the reply to query %#x: %v", id, err)
+		}
+		if m := parseResponse(t, resp); m.ID != id || m.RCode != dnsmessage.RCodeServerFailure || len(m.Answers) != 0 {
+			t.Errorf("reply %d: ID %#x RCode %v answers %q, want %#x %v and none", i+1, m.ID, m.RCode, describeAll(m.Answers), id, dnsmessage.RCodeServerFailure)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("queries over the limit answered after %v, want at once", elapsed)
+	}
+	if got := fake.count(); got != limit {
+		t.Errorf("the resolver received %d queries, want %d: a query over the limit reached it", got, limit)
+	}
+	found := logs.find("mesh dns dropped a forwarded query, too many are in flight")
+	if len(found) != over {
+		t.Fatalf("%d lines say a forwarded query was dropped, want %d", len(found), over)
+	}
+	for _, r := range found {
+		if r.Level != slog.LevelDebug || recordAttr(r, "limit").Int64() != limit {
+			t.Errorf("dropped a forwarded query logged at %v with limit=%v, want %v and %d", r.Level, recordAttr(r, "limit"), slog.LevelDebug, limit)
+		}
+	}
+
+	fake.release()
+	ids := make(map[uint16]bool, limit)
+	for i := range limit {
+		resp, err := readFrame(conn)
+		if err != nil {
+			t.Fatalf("read relayed reply %d: %v", i+1, err)
+		}
+		id := binary.BigEndian.Uint16(resp)
+		if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("198.51.100.1") || id < 1 || id > limit || ids[id] {
+			t.Errorf("relayed reply %d = ID %#x %v, %v, want 198.51.100.1 under a forwarded ID not seen before", i+1, id, addr, err)
+		}
+		ids[id] = true
+	}
+
+	// A forward gives its place back with its reply's write, before the next
+	// reply goes out, so the client that read them all finds room again.
+	if addr, err := firstA(exchangeTCP(t, conn, newQuery(t, 0x100, "example.org.", dnsmessage.TypeA))); err != nil || addr != netip.MustParseAddr("198.51.100.1") {
+		t.Errorf("forwarded query after the replies = %v, %v, want 198.51.100.1", addr, err)
+	}
+	if got := fake.count(); got != limit+1 {
+		t.Errorf("the resolver received %d queries, want %d", got, limit+1)
+	}
+}
+
+// goroutinesIn returns how many goroutines have a frame of fn on their stack,
+// fn named as a traceback prints it, such as "meshdns.(*tcpConn).write".
+func goroutinesIn(fn string) int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for g := range strings.SplitSeq(string(buf), "\n\n") {
+		if strings.Contains(g, fn+"(") {
+			count++
+		}
+	}
+	return count
+}
+
+// A client that sends forwarded queries and reads none of the replies keeps
+// each forward, with its goroutine and its reply, waiting for the write that
+// waits for the client. The connection holds 16 of them at most: the
+// forwarded query after them gets SERVFAIL from the read loop, whose write
+// waits behind theirs, so the loop reads nothing more until the client reads.
+// net.Pipe has no buffer, so every write waits for the client from the first
+// reply on, as writes do once a client that stopped reading has let the
+// socket buffers fill up.
+func TestServer_TCPUnreadRepliesStopReading(t *testing.T) {
+	// The limit is spelled out rather than taken from maxConnForwards.
+	const (
+		limit = 16
+		sent  = 4 * limit
+	)
+	fake := newFakeResolver(t, answerA("198.51.100.1"))
+	logs := &debugLog{}
+	s := NewServer(netip.MustParseAddrPort("127.0.0.1:0"), slog.New(logs))
+	s.upstream.target = routeFakes(t, map[string]*fakeResolver{"192.0.2.1": fake})
+	s.SetForwarding(catchAllTable(t))
+	fw := newForwards(context.Background(), maxForwards)
+
+	queries := make([][]byte, sent)
+	for i := range queries {
+		queries[i] = newQuery(t, uint16(i+1), "example.org.", dnsmessage.TypeA)
+	}
+	server, client := net.Pipe()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		s.serveConn(fw, server)
+	}()
+	// read gets the number of each query the server has read whole: a write
+	// to a net.Pipe returns once the other end has read all of it.
+	read := make(chan int, sent)
+	stop := make(chan struct{})
+	go func() {
+		for i, q := range queries {
+			if err := writeFrame(client, q); err != nil {
+				return
+			}
+			read <- i + 1
+			if i >= limit {
+				continue
+			}
+			// The first 16 queries go out one at a time: the next one only
+			// once this one's forward has reached the resolver and given
+			// its slot of fw back, which it does with the resolver's reply
+			// in hand, right before it writes that reply. So each of them
+			// has a reply waiting for the client before the next arrives,
+			// and the queries after them come as fast as the loop reads.
+			for {
+				fake.mu.Lock()
+				got, arrived := len(fake.queries), fake.arrived
+				fake.mu.Unlock()
+				if got > i {
+					break
+				}
+				select {
+				case <-arrived:
+				case <-stop:
+					return
+				}
+			}
+			for range cap(fw.slots) {
+				select {
+				case fw.slots <- struct{}{}:
+				case <-stop:
+					return
+				}
+			}
+			for range cap(fw.slots) {
+				<-fw.slots
+			}
+		}
+	}()
+	defer func() {
+		// Closing the client fails every write that waits for it, so the
+		// connection's goroutines end.
+		close(stop)
+		_ = client.Close()
+		select {
+		case <-served:
+		case <-time.After(ioTimeout):
+			t.Errorf("serveConn did not return within %v of the client closing", ioTimeout)
+		}
+		fw.wg.Wait()
+	}()
+
+	found, ok := logs.wait("mesh dns dropped a forwarded query, too many are in flight", 1)
+	if !ok {
+		t.Fatalf("no forwarded query was dropped within %v: the resolver received %d of the %d queries and %d goroutines wait in tcpConn.write, want %d and at most %d",
+			ioTimeout, fake.count(), sent, goroutinesIn("meshdns.(*tcpConn).write"), limit, limit+1)
+	}
+	if len(found) != 1 || found[0].Level != slog.LevelDebug || recordAttr(found[0], "limit").Int64() != limit {
+		t.Errorf("%d drop lines, the first at %v with limit=%v, want one at %v with %d", len(found), found[0].Level, recordAttr(found[0], "limit"), slog.LevelDebug, limit)
+	}
+
+	// Each of the 16 forwards had its resolver's reply before the next query
+	// went out, and the loop dropped the query after them and waits to write
+	// its SERVFAIL. So the 16 are all there will be, each with a reply that
+	// waits for the client, and none of them ends while it waits.
+	if got := goroutinesIn("meshdns.(*Server).relayTCP"); got != limit {
+		t.Errorf("%d forwards hold the connection, want %d", got, limit)
+	}
+	if got := fake.count(); got != limit {
+		t.Errorf("the resolver received %d queries, want %d", got, limit)
+	}
+	for want := 1; want <= limit+1; want++ {
+		select {
+		case got := <-read:
+			if got != want {
+				t.Fatalf("the server read query %d, want %d", got, want)
+			}
+		case <-time.After(ioTimeout):
+			t.Fatalf("the server did not read query %d within %v", want, ioTimeout)
+		}
+	}
+	select {
+	case got := <-read:
+		t.Errorf("the server read query %d while its SERVFAIL for query %d waits, want it to read nothing more", got, limit+1)
+	default:
+	}
+}
+
+// A forwarded query restarts the deadline of its connection when it takes
+// its slot, and it ends within forwardTimeout, so the read of its connection
+// does not run out while it waits for its resolvers. That holds only while
+// forwardTimeout stays below tcpIdleTimeout.
+func TestTCPIdleOutlastsForward(t *testing.T) {
+	if forward, idle := forwardTimeout, tcpIdleTimeout; forward >= idle {
+		t.Errorf("forwardTimeout = %v, want below tcpIdleTimeout = %v", forward, idle)
+	}
+}
+
+func TestServer_ServeEndsForwardsInFlight(t *testing.T) {
+	fake := newFakeResolver(t, silent)
+	// The fake runs on until the test ends; every goroutine the server
+	// starts must be gone once Serve returns.
+	ignore := goleak.IgnoreCurrent()
+	s := newTestServer()
+	s.upstream.target = routeFakes(t, map[string]*fakeResolver{"192.0.2.1": fake})
+	s.SetForwarding(catchAllTable(t))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+
+	if _, err := dial(t, "udp", s).Write(newQuery(t, 1, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query over UDP: %v", err)
+	}
+	tcp := dial(t, "tcp", s)
+	if err := writeFrame(tcp, newQuery(t, 2, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query over TCP: %v", err)
+	}
+	fake.waitQueries(t, 2)
+
+	cancel()
+	cancelled := time.Now()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve() = %v, want nil after the cancel", err)
+		}
+		// Both forwards had about 4 seconds left, so a return within one
+		// second is the cancel ending them.
+		if waited := time.Since(cancelled); waited > time.Second {
+			t.Errorf("Serve returned %v after the cancel, want at once", waited)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatalf("Serve did not return within %v of the cancel", ioTimeout)
+	}
+	waitClosed(t, tcp)
+	goleak.VerifyNone(t, ignore)
+}
+
+// Each TCP forward runs in a goroutine of its own, several on one connection,
+// and Serve ends every one of them: none writes a reply, and none outlives
+// Serve.
+func TestServer_ServeEndsTCPForwardsInFlight(t *testing.T) {
+	fake := newFakeResolver(t, silent)
+	ignore := goleak.IgnoreCurrent()
+	s := newTestServer()
+	s.upstream.target = routeFakes(t, map[string]*fakeResolver{"192.0.2.1": fake})
+	s.SetForwarding(catchAllTable(t))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+
+	pipelined := dial(t, "tcp", s)
+	for id := range uint16(2) {
+		if err := writeFrame(pipelined, newQuery(t, id+1, "example.org.", dnsmessage.TypeA)); err != nil {
+			t.Fatalf("write query %d: %v", id+1, err)
+		}
+	}
+	single := dial(t, "tcp", s)
+	if err := writeFrame(single, newQuery(t, 3, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query 3: %v", err)
+	}
+	fake.waitQueries(t, 3)
+
+	cancel()
+	cancelled := time.Now()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve() = %v, want nil after the cancel", err)
+		}
+		if waited := time.Since(cancelled); waited > time.Second {
+			t.Errorf("Serve returned %v after the cancel, want at once", waited)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatalf("Serve did not return within %v of the cancel", ioTimeout)
+	}
+	// A clean EOF as the first read: no reply went out before the close.
+	waitClosed(t, pipelined)
+	waitClosed(t, single)
+	goleak.VerifyNone(t, ignore)
+}
+
+// A socket that fails stops Serve while its context is live, so Serve ends
+// the forwards itself rather than wait out their resolvers.
+func TestServer_SocketErrorEndsForwardsInFlight(t *testing.T) {
+	fake := newFakeResolver(t, silent)
+	ignore := goleak.IgnoreCurrent()
+	s := newTestServer()
+	s.upstream.target = routeFakes(t, map[string]*fakeResolver{"192.0.2.1": fake})
+	s.SetForwarding(catchAllTable(t))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	udp := s.udp
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+
+	if _, err := dial(t, "udp", s).Write(newQuery(t, 1, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query over UDP: %v", err)
+	}
+	if err := writeFrame(dial(t, "tcp", s), newQuery(t, 2, "example.org.", dnsmessage.TypeA)); err != nil {
+		t.Fatalf("write query over TCP: %v", err)
+	}
+	fake.waitQueries(t, 2)
+
+	_ = udp.Close()
+	closed := time.Now()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("Serve() = %v, want an error wrapping %v", err, net.ErrClosed)
+		}
+		if waited := time.Since(closed); waited > time.Second {
+			t.Errorf("Serve returned %v after its socket closed, want at once", waited)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatalf("Serve did not return within %v of its UDP socket closing", ioTimeout)
+	}
+	goleak.VerifyNone(t, ignore)
+}
+
+func TestNewServer_ForwardDefaults(t *testing.T) {
+	s := NewServer(netip.MustParseAddrPort("127.0.0.1:5354"), nil)
+	if s.forwardLimit != 256 {
+		t.Errorf("forwardLimit = %d, want 256", s.forwardLimit)
+	}
+	if s.upstream == nil || s.upstream.timeout != forwardTimeout {
+		t.Errorf("upstream = %+v, want one with the default timeout", s.upstream)
+	}
+	if f := s.forwarding.Load(); f != nil {
+		t.Errorf("forwarding = %+v, want nil before SetForwarding", f)
+	}
+}
+
+func TestServer_SetForwardingPrunesMarks(t *testing.T) {
+	s := newTestServer()
+	for _, r := range []string{"192.0.2.1", "192.0.2.2"} {
+		s.upstream.down[netip.MustParseAddr(r)] = time.Now().Add(resolverRetry)
+	}
+	s.SetForwarding(catchAllTable(t))
+	wantDown(t, s.upstream, "192.0.2.1")
+	s.SetForwarding(nil)
+	wantDown(t, s.upstream)
 }

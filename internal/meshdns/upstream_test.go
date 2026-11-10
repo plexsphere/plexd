@@ -31,7 +31,9 @@ type fakeQuery struct {
 // fakeResolver stands in for a forward resolver: a DNS server on UDP and TCP
 // of one port of 127.0.0.1 that the kernel picked. It sends back what its
 // answer function returns for each query, in order, and records every query.
-// It runs until the test ends, and the cleanup waits for its goroutines.
+// While it holds, it keeps the replies back until release, so a test decides
+// when a resolver answers. It runs until the test ends, and the cleanup waits
+// for its goroutines.
 type fakeResolver struct {
 	addr netip.AddrPort
 	udp  *net.UDPConn
@@ -41,6 +43,9 @@ type fakeResolver struct {
 	mu      sync.Mutex
 	answer  func(query []byte) [][]byte
 	queries []fakeQuery
+	// holding keeps the replies back; held sends each one kept.
+	holding bool
+	held    []func()
 	conns   map[net.Conn]struct{}
 	// closed is set by close, so a connection accepted while the fake
 	// closes is closed at once rather than served.
@@ -86,9 +91,12 @@ func (f *fakeResolver) serveUDP() {
 		if err != nil {
 			return
 		}
-		for _, r := range f.receive("udp", slices.Clone(buf[:n])) {
-			_, _ = f.udp.WriteToUDPAddrPort(r, src)
-		}
+		replies := f.receive("udp", slices.Clone(buf[:n]))
+		f.deliver(func() {
+			for _, r := range replies {
+				_, _ = f.udp.WriteToUDPAddrPort(r, src)
+			}
+		})
 	}
 }
 
@@ -119,11 +127,14 @@ func (f *fakeResolver) serveTCP() {
 				if err != nil {
 					return
 				}
-				for _, r := range f.receive("tcp", msg) {
-					if err := writeFrame(conn, r); err != nil {
-						return
+				replies := f.receive("tcp", msg)
+				f.deliver(func() {
+					for _, r := range replies {
+						if err := writeFrame(conn, r); err != nil {
+							return
+						}
 					}
-				}
+				})
 			}
 		})
 	}
@@ -156,6 +167,38 @@ func (f *fakeResolver) receive(network string, msg []byte) [][]byte {
 	close(f.arrived)
 	f.arrived = make(chan struct{})
 	return replies
+}
+
+// deliver sends the replies of one query, or keeps them back while the fake
+// holds.
+func (f *fakeResolver) deliver(send func()) {
+	f.mu.Lock()
+	if f.holding {
+		f.held = append(f.held, send)
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
+	send()
+}
+
+// hold keeps the replies to the queries to come back until release.
+func (f *fakeResolver) hold() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.holding = true
+}
+
+// release sends every reply kept back, in the order the queries arrived, and
+// stops holding.
+func (f *fakeResolver) release() {
+	f.mu.Lock()
+	held := f.held
+	f.held, f.holding = nil, false
+	f.mu.Unlock()
+	for _, send := range held {
+		send()
+	}
 }
 
 // close stops the fake and waits for its goroutines.
