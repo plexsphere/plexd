@@ -1181,8 +1181,9 @@ func TestState_CarriesTheSigningKey(t *testing.T) {
 }
 
 // TestState_CarriesTheDNSBlock pins the dns block a fresh mock serves, which
-// the e2e suites resolve against, and that a state configured without a dns
-// key is served with null, the "keep the names held" signal of the contract.
+// the e2e suites resolve against, its records in the wire form the contract
+// gives them, and that a state configured without a dns key is served with
+// null, the "keep the names held" signal of the contract.
 func TestState_CarriesTheDNSBlock(t *testing.T) {
 	_, ts := newTestServer(t)
 
@@ -1204,6 +1205,16 @@ func TestState_CarriesTheDNSBlock(t *testing.T) {
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FQDN: "peer-1.app.e2e.internal", MeshIP: "10.99.0.2"},
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", FQDN: "peer-2.app.e2e.internal", MeshIP: "10.99.0.3"},
 		},
+		Records: []api.NodeStateDNSRecord{
+			{FQDN: "_db._tcp.app.e2e.internal", Type: "SRV", Priority: new(0), Weight: new(5), Port: new(5432), Target: "db.e2e.internal"},
+			{FQDN: "alias.app.e2e.internal", Type: "CNAME", Target: "peer-2.app.e2e.internal"},
+			{FQDN: "db.e2e.internal", Type: "A", Address: "192.0.2.10"},
+			{FQDN: "db.e2e.internal", Type: "A", Address: "192.0.2.11"},
+			{FQDN: "db.e2e.internal", Type: "AAAA", Address: "2001:db8::10"},
+			{FQDN: "e2e.internal", Type: "MX", Priority: new(10), Target: "mail.example.com"},
+			{FQDN: "e2e.internal", Type: "TXT", Text: []string{"v=e2e", "owner=plexd"}},
+			{FQDN: "ext.e2e.internal", Type: "CNAME", Target: "ext.example.com"},
+		},
 		ReverseZones: []string{"0.99.10.in-addr.arpa"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -1211,6 +1222,35 @@ func TestState_CarriesTheDNSBlock(t *testing.T) {
 	}
 	if !sort.SliceIsSorted(got.Hosts, func(i, j int) bool { return got.Hosts[i].FQDN < got.Hosts[j].FQDN }) {
 		t.Errorf("dns hosts = %+v, want ordered by fqdn", got.Hosts)
+	}
+	if !sort.SliceIsSorted(got.Records, func(i, j int) bool {
+		a, b := got.Records[i], got.Records[j]
+		return a.FQDN < b.FQDN || a.FQDN == b.FQDN && a.Type < b.Type
+	}) {
+		t.Errorf("dns records = %+v, want ordered by fqdn, then type", got.Records)
+	}
+
+	// The wire form: a priority of 0 is sent as 0, and an A record carries
+	// no member its type does not take.
+	var wire struct {
+		Records []map[string]json.RawMessage `json:"records"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode records %s: %v", raw, err)
+	}
+	for _, r := range wire.Records {
+		switch string(r["type"]) {
+		case `"SRV"`:
+			if string(r["priority"]) != "0" {
+				t.Errorf("SRV record %s has priority %s, want 0", r["fqdn"], r["priority"])
+			}
+		case `"A"`:
+			for _, key := range []string{"target", "priority", "weight", "port", "text"} {
+				if v, ok := r[key]; ok {
+					t.Errorf("A record %s carries %s=%s, want no such key", r["fqdn"], key, v)
+				}
+			}
+		}
 	}
 
 	// Configure the served state with its dns key removed, the way a suite
