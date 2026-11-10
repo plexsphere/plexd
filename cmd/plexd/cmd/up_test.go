@@ -5959,3 +5959,134 @@ func TestRunUp_MeshDNSRevertsBeforeWireGuardTeardown(t *testing.T) {
 	}
 	assertBoundedRevert(t, reg.callsOf("Revert")[0])
 }
+
+// serveMeshDNSTestIP is the mesh IP of the managers the serveMeshDNS tests
+// build. They never start the manager, so nothing binds it.
+var serveMeshDNSTestIP = netip.MustParseAddr("127.0.0.1")
+
+// newStoppedMeshDNSManager returns a manager for meshDNSTestInterface that
+// registers with reg and logs to the returned handler. It is never started,
+// so its Run fails at once with "meshdns: serve: not listening", as it would
+// after a socket failure while the run is live.
+func newStoppedMeshDNSManager(reg meshdns.Registrar) (*meshdns.Manager, *recordingHandler, *slog.Logger) {
+	logs := newRecordingHandler()
+	logger := slog.New(logs)
+	return meshdns.NewManager(meshdns.Config{}, meshDNSTestInterface, serveMeshDNSTestIP, reg, logger), logs, logger
+}
+
+// meshDNSBlockSnapshot is a state pull whose dns block names the node under
+// meshDNSZone, which an open manager registers with an Apply.
+func meshDNSBlockSnapshot() *api.NodeStateSnapshot {
+	return &api.NodeStateSnapshot{DNS: &api.NodeStateDNS{
+		SearchDomain: meshDNSZone,
+		Zones:        []string{meshDNSZone},
+		Hosts:        []api.NodeStateDNSHost{{NodeID: upResumedNodeID, FQDN: meshDNSHost, MeshIP: serveMeshDNSTestIP.String()}},
+		ReverseZones: []string{},
+	}}
+}
+
+// revertRefusingMeshDNSRegistrar records every call as the recording double
+// does and fails every Revert with err.
+type revertRefusingMeshDNSRegistrar struct {
+	*recordingMeshDNSRegistrar
+	err error
+}
+
+func (r *revertRefusingMeshDNSRegistrar) Revert(ctx context.Context, iface string) error {
+	_ = r.recordingMeshDNSRegistrar.Revert(ctx, iface)
+	return r.err
+}
+
+// A resolver that stops while the run is live answers no name for the rest of
+// it. serveMeshDNS reverts the link at once, under a bounded context of its
+// own, and does not leave the registration to the drain: with a catch-all the
+// registration would fail every lookup of the host until the run ends. The
+// revert closes the manager, so a later pull registers nothing.
+func TestServeMeshDNS_RevertsWhenTheResolverStops(t *testing.T) {
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	mgr, logs, logger := newStoppedMeshDNSManager(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveMeshDNS(ctx, mgr, logger)
+
+	const msg = "mesh dns stopped"
+	if n := logs.count(slog.LevelError, msg); n != 1 {
+		t.Fatalf("errors %q = %d, want 1", msg, n)
+	}
+	if got, want := logs.attrsOf(slog.LevelError, msg)["error"], "meshdns: serve: not listening"; got != want {
+		t.Errorf("error %q error = %q, want %q", msg, got, want)
+	}
+	reverts := reg.callsOf("Revert")
+	if len(reverts) != 1 {
+		t.Fatalf("Revert calls while the run is live = %d, want 1: the link must be reverted when the resolver stops", len(reverts))
+	}
+	assertBoundedRevert(t, reverts[0])
+	if n := logs.count(slog.LevelError, "mesh dns shutdown error"); n != 0 {
+		t.Errorf("errors %q = %d, want 0 for a revert that succeeded", "mesh dns shutdown error", n)
+	}
+
+	mgr.Handle(ctx, meshDNSBlockSnapshot())
+	if applies := reg.callsOf("Apply"); len(applies) != 0 {
+		t.Errorf("Apply calls after the resolver stopped = %d, want 0: a pull must not register a resolver that does not answer", len(applies))
+	}
+}
+
+// A revert that fails is logged as the drain logs its own, and the manager is
+// closed all the same, so a later pull registers nothing. The drain's Shutdown
+// tries the revert again.
+func TestServeMeshDNS_LogsAFailedRevert(t *testing.T) {
+	revertErr := errors.New("bus unreachable")
+	reg := &revertRefusingMeshDNSRegistrar{recordingMeshDNSRegistrar: newRecordingMeshDNSRegistrar(&callLog{}), err: revertErr}
+	mgr, logs, logger := newStoppedMeshDNSManager(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveMeshDNS(ctx, mgr, logger)
+
+	if n := logs.count(slog.LevelError, "mesh dns stopped"); n != 1 {
+		t.Errorf("errors %q = %d, want 1", "mesh dns stopped", n)
+	}
+	const msg = "mesh dns shutdown error"
+	if n := logs.count(slog.LevelError, msg); n != 1 {
+		t.Fatalf("errors %q = %d, want 1", msg, n)
+	}
+	if got := logs.attrsOf(slog.LevelError, msg)["error"]; !strings.Contains(got, revertErr.Error()) {
+		t.Errorf("error %q error = %q, want it to carry %q", msg, got, revertErr.Error())
+	}
+	reverts := reg.callsOf("Revert")
+	if len(reverts) != 1 {
+		t.Fatalf("Revert calls = %d, want 1", len(reverts))
+	}
+	assertBoundedRevert(t, reverts[0])
+
+	mgr.Handle(ctx, meshDNSBlockSnapshot())
+	if applies := reg.callsOf("Apply"); len(applies) != 0 {
+		t.Errorf("Apply calls after the resolver stopped = %d, want 0 even though the revert failed", len(applies))
+	}
+}
+
+// An error that comes after the run's context ended belongs to the drain,
+// which reverts the link itself. serveMeshDNS neither logs it nor reverts, and
+// leaves the manager open: the same pull that a stopped resolver ignores is
+// registered here.
+func TestServeMeshDNS_LeavesAnEndedRunToTheDrain(t *testing.T) {
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	mgr, logs, logger := newStoppedMeshDNSManager(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	serveMeshDNS(ctx, mgr, logger)
+
+	if n := logs.count(slog.LevelError, "mesh dns stopped"); n != 0 {
+		t.Errorf("errors %q = %d, want 0 once the run's context ended", "mesh dns stopped", n)
+	}
+	if reverts := reg.callsOf("Revert"); len(reverts) != 0 {
+		t.Errorf("Revert calls = %d, want 0: the drain reverts an ended run", len(reverts))
+	}
+
+	mgr.Handle(context.Background(), meshDNSBlockSnapshot())
+	if applies := reg.callsOf("Apply"); len(applies) != 1 {
+		t.Errorf("Apply calls = %d, want 1: the manager must stay open for the drain", len(applies))
+	}
+}
