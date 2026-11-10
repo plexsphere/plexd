@@ -459,10 +459,10 @@ Mesh DNS resolver. See [Mesh DNS](../networking/mesh-dns.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Run the mesh DNS resolver and register it with systemd-resolved. An omitted key means enabled; an explicit `false` is preserved and is the Node operator's way out: plexd then answers no mesh name and reverts the resolver settings of the mesh interface at start. Also settable as [`PLEXD_DNS_ENABLED`](environment-variables.md#plexd-up-variables). Only Linux runs the resolver, so macOS and Windows ignore the setting. See [Stop, Crash and Opt-Out](../networking/mesh-dns.md#stop-crash-and-opt-out). |
+| `enabled` | bool | `true` | Run the mesh DNS resolver, its forwarding and its registration with systemd-resolved. An omitted key means enabled; an explicit `false` is preserved and is the Node operator's way out: plexd then answers no mesh name, forwards nothing and reverts the resolver settings of the mesh interface at start. Also settable as [`PLEXD_DNS_ENABLED`](environment-variables.md#plexd-up-variables). Only Linux runs the resolver, so macOS and Windows ignore the setting. See [Stop, Crash and Opt-Out](../networking/mesh-dns.md#stop-crash-and-opt-out). |
 | `listen_port` | int | `5354` | UDP and TCP port the resolver listens on, on the Node's own mesh IP. `0` reads as `5354`. Must be between `1` and `65535` while `enabled` is true, on every platform. |
 
-The resolver answers the mesh names of the Node's Domain, which the `dns` block of the state pull carries, and only to the Node itself. It also answers the DNS records the Domain and its Projects define, which the same block carries. No key controls the records on their own: `dns.enabled: false` turns the names and the records off together. On a Linux host with systemd-resolved 246 or newer, plexd registers the Domain's zones and its search domain on the mesh interface, so the host asks plexd for the mesh zones and resolves every other name as before. Without a usable systemd-resolved the resolver still answers on `<mesh IP>:<listen_port>`, and plexd logs that address; see [Hosts without systemd-resolved](../networking/mesh-dns.md#hosts-without-systemd-resolved). A port that another program holds logs `mesh dns listener cannot bind, mesh names are not answered` at start, and plexd runs on without the resolver.
+The resolver answers the mesh names of the Node's Domain, which the `dns` block of the state pull carries, and only to the Node itself. It also answers the DNS records the Domain and its Projects define, which the same block carries. It forwards the names of the forward zones that the block's `forwarding` member names to the resolvers listed with them, and with a catch-all every other name outside the mesh zones to the catch-all resolvers, and relays their reply. The Node's Domain or Project chooses the forward zones and the resolvers. No key controls the records or the forwarding on their own: `dns.enabled: false` turns the names, the records and the forwarding off together. On a Linux host with systemd-resolved 246 or newer, plexd registers the Domain's zones, its search domain and the forward zones on the mesh interface, so the host asks plexd for those zones and resolves every other name as before. With a catch-all, plexd also makes the mesh interface the host's default DNS route, so the host asks plexd for every name no other link's domain matches; see [Forwarding](../networking/mesh-dns.md#forwarding). Without a usable systemd-resolved the resolver still answers on `<mesh IP>:<listen_port>`, and plexd logs that address; see [Hosts without systemd-resolved](../networking/mesh-dns.md#hosts-without-systemd-resolved). A port that another program holds logs `mesh dns listener cannot bind, mesh names are not answered` at start, and plexd runs on without the resolver.
 
 > **Migration:** plexd answered no mesh name before this release. After the upgrade a Linux
 > Node listens on `<mesh IP>:5354`, UDP and TCP, and registers its Domain's zones with
@@ -474,6 +474,12 @@ The resolver answers the mesh names of the Node's Domain, which the `dns` block 
 > A Node starts answering the Domain's records with the upgrade too, as soon as its control
 > plane serves them in the `dns` block, with no config change. A block without `records`
 > leaves the resolver with the names alone.
+> A Node whose Domain or Project already holds a forwarding setting starts forwarding with
+> the upgrade, with no config change: it registers the forward zones on the mesh interface,
+> and with a catch-all it becomes the host's default DNS route, so every name no other
+> link's domain matches goes to the catch-all resolvers. A control plane that does not send
+> the `forwarding` member leaves the Node without forwarding. Set `dns.enabled: false` before
+> rolling the binary forward to turn the forwarding off; that turns the mesh names off with it.
 
 Source: `internal/meshdns/config.go`
 
@@ -621,7 +627,7 @@ tunnel:
   # session_signing_public_key: ""     # empty = the session helper pins identity.json's key (Linux socket-activated helper only; unused on macOS)
 
 dns:
-  enabled: true              # mesh DNS resolver (Linux); false answers no mesh name and registers nothing
+  enabled: true              # mesh DNS resolver (Linux); false answers no mesh name, forwards nothing and registers nothing
   listen_port: 5354          # UDP and TCP on the node's mesh IP
 
 # bridge:                    # uncomment for bridge mode

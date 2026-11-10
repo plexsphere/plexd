@@ -32,7 +32,7 @@ The tables below say what each operating system does, feature by feature. Every 
 | Policy enforcement | nftables, forward hook only | a pf anchor; also governs traffic to the node itself, and only TCP keeps state | WFP filters; also govern traffic to the node itself, permits are soft, and a port-scoped allow reaches no forward filter | [What the rules govern](../reference/networking/pf-wfp-firewall.md#what-the-rules-govern) |
 | Secure access tunneling (SSH, Kubernetes API proxy) | yes | yes | yes | [Secure access tunneling](../reference/networking/secure-access-tunneling.md) |
 | Mediated ssh sessions (the `ssh` session kind) | yes; processes start through the session helper | yes; processes start through a child session helper with plexd's own privileges | no; entries are settled as unsupported | [SSH Sessions](../reference/networking/secure-access-tunneling.md#ssh-sessions) |
-| Mesh DNS | yes; registered with systemd-resolved 246 or newer, and without one the resolver still answers on `<mesh IP>:5354` for a local resolver to forward to | no; no resolver runs | no; no resolver runs | [Mesh DNS](../reference/networking/mesh-dns.md) |
+| Mesh DNS | yes; answers the mesh names and forwards the forward zones and a catch-all to the resolvers the Domain or Project names. Registered with systemd-resolved 246 or newer, the forward zones as routing domains and a catch-all as the host's default DNS route, and without one the resolver still answers and forwards on `<mesh IP>:5354` for a local resolver to forward to | no; no resolver runs, and nothing is forwarded | no; no resolver runs, and nothing is forwarded | [Mesh DNS](../reference/networking/mesh-dns.md), [Forwarding](../reference/networking/mesh-dns.md#forwarding) |
 
 ## Bridge mode
 

@@ -934,7 +934,15 @@ absence.
       { "fqdn": "_postgres._tcp.openstack.lab.internal", "type": "SRV", "target": "db.lab.internal", "priority": 0, "weight": 5, "port": 5432 },
       { "fqdn": "db.lab.internal", "type": "A", "address": "10.20.0.5" }
     ],
-    "reverse_zones": ["0.99.10.in-addr.arpa"]
+    "reverse_zones": ["0.99.10.in-addr.arpa"],
+    "forwarding": {
+      "forward_zones": [
+        { "zone": "2.0.192.in-addr.arpa", "resolvers": ["10.1.2.3"] },
+        { "zone": "corp.example.com", "resolvers": ["10.1.2.3", "10.1.2.4"] },
+        { "zone": "corp.local", "resolvers": ["10.1.2.5"] }
+      ],
+      "catch_all": ["10.1.2.53"]
+    }
   }
 }
 ```
@@ -1170,7 +1178,8 @@ reconcile interval, or sooner on a triggered pull. The block is not desired stat
 for the differ: the reconcile snapshot neither stores nor compares it. See
 [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
 
-`dns` carries the mesh DNS names and records of the node's Domain, as the
+`dns` carries the mesh DNS names and records of the node's Domain, and the
+node's DNS forwarding setting, as the
 "Mesh DNS names" section of plexsphere's agent contract
 (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
 describes it. `search_domain` is the zone of the node's own Project. `zones`
@@ -1185,24 +1194,42 @@ and `port` for `SRV`, and `text` for `TXT`. A member the type does not take is
 absent, and a `priority` or `weight` of 0 is sent as `0`. A `records` key that
 is `null` or missing means the Domain has no records. `reverse_zones` lists the
 `in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR and
-nothing wider. Every name is in lower case without a trailing dot, and an empty
-list is `[]`. The block is the full set, not a delta: it replaces the names and
-the records the node answers. `null`, or a key missing because the control
-plane predates the block, means the control plane did not say, and plexd keeps
-the names and the records it holds. On Linux, a plexd whose mesh resolver
+nothing wider. `forwarding` carries the DNS forwarding setting that applies to
+the node: its Project's when the Project holds one, otherwise its Domain's,
+otherwise two empty lists. `forward_zones` lists zones outside the mesh,
+ascending, each with 1 to 3 `resolvers`, and `catch_all` lists 0 to 3
+resolvers, which answer every name outside the mesh zones, the reverse zones
+and the forward zones. A resolver is an IPv4 or IPv6 address, asked in list
+order on port 53 over plain DNS. Every name is in lower case without a trailing
+dot, and an empty list is `[]`. The block is the full set, not a delta: it
+replaces the names and the records the node answers, and its `forwarding`
+replaces the forwarding. `null`, or a key missing because the control plane
+predates the block, means the control plane did not say, and plexd keeps the
+names, the records and the forwarding it holds. A `forwarding` member that is
+`null` or missing in a block keeps the forwarding alone, and two empty lists
+end it. On Linux, a plexd whose mesh resolver
 listens reads the block on every successful pull, drift or not. The resolver
 answers `A`, `AAAA` and `PTR` queries for the names, and queries for the
 records of all six types, on
 the node's own mesh IP, port 5354 by default, and plexd registers the zones and
 the search domain with systemd-resolved on the mesh interface. The resolver
+forwards a query for a name under a forward zone to the zone's resolvers, and
+with a catch-all a query for any other name outside the mesh zones to the
+catch-all resolvers, and relays the reply without caching it. plexd registers
+the forward zones with systemd-resolved beside the mesh zones, and with a
+catch-all it makes the mesh interface the host's default DNS route. A forward
+zone that equals a zone or reverse zone of the block, or lies under one, is
+skipped, so the mesh names always win. The resolver
 follows a CNAME while its target lies under one of `zones` or `reverse_zones`,
 and answers one whose target lies outside them with the CNAME alone, which
 systemd-resolved follows. An answer too large for UDP is sent with TC set and
 no records, so the client asks again over TCP. macOS and Windows do not read
-the block yet. A pull that changes only hosts or records issues no call to
-systemd-resolved. plexd skips an entry that breaks a rule of the contract, such
-as a zone under `arpa`, `local` or `localhost`, or a record of a type it does
-not answer, and logs `mesh dns skipped invalid entries` at Warn. The block is
+the block yet. A pull that changes only hosts, records or resolvers issues no
+call to systemd-resolved, as long as the accepted forward zones stay the same
+and an accepted catch-all resolver neither appears nor goes. plexd skips an
+entry that breaks a rule of the contract, such as a zone under `arpa`, `local`
+or `localhost`, a record of a type it does not answer, or a loopback resolver,
+and logs `mesh dns skipped invalid entries` at Warn. The block is
 not desired state for the differ: the reconcile snapshot neither stores nor
 compares it. See [Mesh DNS](../networking/mesh-dns.md).
 
