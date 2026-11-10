@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -23,13 +24,13 @@ const registrarTimeout = 5 * time.Second
 // would.
 const maxSkippedLogged = 5
 
-// Manager follows the dns block of the state pull: it builds the records of
-// each block, swaps them into its server, and keeps the registration with the
-// system resolver in step with them. A mutex guards the state Handle and
-// Shutdown share, so a pull racing the drain either finishes before the revert
-// or does nothing at all. The manager never touches health or readiness: a
-// node whose resolver cannot register still serves its mesh, and the log lines
-// are the operator's view of it.
+// Manager follows the dns block of the state pull: it builds the records and
+// the forwarding table of each block, swaps them into its server, and keeps
+// the registration with the system resolver in step with them. A mutex guards
+// the state Handle and Shutdown share, so a pull racing the drain either
+// finishes before the revert or does nothing at all. The manager never
+// touches health or readiness: a node whose resolver cannot register still
+// serves its mesh, and the log lines are the operator's view of it.
 type Manager struct {
 	iface     string
 	registrar Registrar
@@ -39,6 +40,13 @@ type Manager struct {
 	mu sync.Mutex
 	// records is the set the server answers from, nil until the first block.
 	records *Records
+	// member is the forwarding member of the last block that carried one,
+	// nil until the first. A block without the member keeps it.
+	member *api.NodeStateDNSForwarding
+	// forwarding is the table the server forwards with, built from member
+	// against the records of the last block, and nil while no member is
+	// kept.
+	forwarding *Forwarding
 	// applied is the registration the system resolver accepted last, or nil
 	// when none counts as applied: before the first success, after a revert,
 	// and after any failure, so the next pull applies again. Nil does not mean
@@ -52,6 +60,9 @@ type Manager struct {
 	// noBlockLogged is set once a pull without a dns block was logged, and
 	// cleared when a block arrives.
 	noBlockLogged bool
+	// noMemberLogged is set once a block without a forwarding member was
+	// logged while a member is kept, and cleared when a member arrives.
+	noMemberLogged bool
 	// unavailableLogged is set once the missing system resolver was logged,
 	// and cleared when the state changes: by a success or another failure.
 	unavailableLogged bool
@@ -108,9 +119,15 @@ func (m *Manager) Run(ctx context.Context) error {
 // reconcile.DispatchHandler and runs on every successful pull, drift or not:
 // the block is not desired state the differ tracks, and a pull that changed
 // no name must still retry a registration that failed. A snapshot without a
-// block keeps the names and the registration held, because the block is
-// missing when the control plane predates it or said nothing this time, not
-// when the Domain lost its names.
+// block keeps the names, the forwarding and the registration held, because
+// the block is missing when the control plane predates it or said nothing
+// this time, not when the Domain lost its names.
+//
+// A block without a forwarding member keeps the member held for the same
+// reason, while two empty lists end the forwarding. The kept member is built
+// into a table against the records of each block, so a forward zone that a
+// new mesh zone shadows goes with the pull that brings the mesh zone, and
+// comes back with the pull that removes it.
 func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot) {
 	if desired == nil {
 		return
@@ -131,6 +148,22 @@ func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot) {
 
 	records, skipped := BuildRecords(*desired.DNS)
 	m.server.SetRecords(records)
+
+	if member := desired.DNS.Forwarding; member != nil {
+		m.member = cloneForwarding(member)
+		m.noMemberLogged = false
+	} else if m.member != nil && !m.noMemberLogged {
+		m.noMemberLogged = true
+		m.logger.Info("dns block carries no forwarding member, keeping the forwarding held")
+	}
+	var fwd *Forwarding
+	if m.member != nil {
+		var fwdSkipped []string
+		fwd, fwdSkipped = BuildForwarding(*m.member, records, m.server.Addr().Addr())
+		skipped = append(skipped, fwdSkipped...)
+	}
+	m.server.SetForwarding(fwd)
+
 	if len(skipped) > 0 {
 		m.logger.Warn("mesh dns skipped invalid entries",
 			"count", len(skipped),
@@ -147,8 +180,28 @@ func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot) {
 		)
 	}
 	m.records = records
+	// Equal counts a nil table as an empty one, so a node that never
+	// forwards logs nothing.
+	if !fwd.Equal(m.forwarding) {
+		m.logger.Info("mesh dns forwarding updated",
+			"forward_zones", fwd.ZoneCount(),
+			"catch_all", fwd.CatchAllCount(),
+		)
+	}
+	m.forwarding = fwd
 
-	m.register(ctx, records.Registration(m.iface, m.server.Addr(), nil))
+	m.register(ctx, records.Registration(m.iface, m.server.Addr(), fwd))
+}
+
+// cloneForwarding returns a copy of member that shares no slice with it, so
+// nothing the snapshot's owner does later reaches the member the manager
+// keeps.
+func cloneForwarding(member *api.NodeStateDNSForwarding) *api.NodeStateDNSForwarding {
+	c := &api.NodeStateDNSForwarding{CatchAll: slices.Clone(member.CatchAll)}
+	for _, z := range member.ForwardZones {
+		c.ForwardZones = append(c.ForwardZones, api.NodeStateDNSForwardZone{Zone: z.Zone, Resolvers: slices.Clone(z.Resolvers)})
+	}
+	return c
 }
 
 // register brings the system resolver in step with want. The caller holds
@@ -196,6 +249,7 @@ func (m *Manager) register(ctx context.Context, want Registration) {
 			"server", want.Server.String(),
 			"search_domain", want.SearchDomain,
 			"routing_domains", len(want.RoutingDomains),
+			"default_route", want.DefaultRoute,
 		)
 		return
 	}
