@@ -67,15 +67,19 @@ jobs:
       # rather than passing as a bare ok. The two session helper tests start a
       # shell as uid 65534 and hand it the pty, which needs root as well; they
       # skip on every other runner, so this is where the switch of users is
-      # exercised.
+      # exercised. The mesh DNS registrar test writes configd's dynamic store
+      # and resolves through mDNSResponder over a real utun, which changes the
+      # host's resolver configuration while it runs; it also asks for
+      # PLEXD_TEST_REAL_RESOLVER, so sudo go test ./... on a developer's Mac
+      # leaves their resolver alone.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
-            PLEXD_TEST_REAL_PF=1 \
+            PLEXD_TEST_REAL_PF=1 PLEXD_TEST_REAL_RESOLVER=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestWGControllers_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner)$' \
-            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestWGControllers_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
+            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/ ./internal/meshdns/
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
