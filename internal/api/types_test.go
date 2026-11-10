@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -846,6 +847,61 @@ func TestNodeStateDNS_Records(t *testing.T) {
 	}
 	if empty.Records == nil || len(empty.Records) != 0 {
 		t.Errorf("records from [] = %#v, want an empty non-nil slice", empty.Records)
+	}
+}
+
+// TestNodeStateDNS_Forwarding pins how the forwarding member of the dns block
+// decodes and encodes. The contract's example decodes into its three forward
+// zones and its catch-all. An absent key and null both give a nil Forwarding,
+// which the resolver reads as "keep the forwarding you hold", and a nil
+// Forwarding is marshaled without the key, so the mock control plane can serve
+// a block without the member.
+func TestNodeStateDNS_Forwarding(t *testing.T) {
+	const others = `"search_domain":"","zones":[],"hosts":[],"records":[],"reverse_zones":[]`
+	var example NodeStateDNS
+	src := `{` + others + `,"forwarding":{"forward_zones":[` +
+		`{"zone":"2.0.192.in-addr.arpa","resolvers":["10.1.2.3"]},` +
+		`{"zone":"corp.example.com","resolvers":["10.1.2.3","10.1.2.4"]},` +
+		`{"zone":"corp.local","resolvers":["10.1.2.5"]}],` +
+		`"catch_all":["10.1.2.53"]}}`
+	if err := json.Unmarshal([]byte(src), &example); err != nil {
+		t.Fatalf("unmarshal the contract's example: %v", err)
+	}
+	want := &NodeStateDNSForwarding{
+		ForwardZones: []NodeStateDNSForwardZone{
+			{Zone: "2.0.192.in-addr.arpa", Resolvers: []string{"10.1.2.3"}},
+			{Zone: "corp.example.com", Resolvers: []string{"10.1.2.3", "10.1.2.4"}},
+			{Zone: "corp.local", Resolvers: []string{"10.1.2.5"}},
+		},
+		CatchAll: []string{"10.1.2.53"},
+	}
+	if !reflect.DeepEqual(example.Forwarding, want) {
+		t.Errorf("forwarding = %+v, want %+v", example.Forwarding, want)
+	}
+
+	for _, src := range []string{`{` + others + `}`, `{` + others + `,"forwarding":null}`} {
+		var block NodeStateDNS
+		if err := json.Unmarshal([]byte(src), &block); err != nil {
+			t.Fatalf("unmarshal %s: %v", src, err)
+		}
+		if block.Forwarding != nil {
+			t.Errorf("forwarding from %s = %+v, want a nil pointer", src, block.Forwarding)
+		}
+	}
+
+	out, err := json.Marshal(NodeStateDNS{})
+	if err != nil {
+		t.Fatalf("marshal a block without forwarding: %v", err)
+	}
+	if strings.Contains(string(out), "forwarding") {
+		t.Errorf("marshaled block %s carries a forwarding key, want none for a nil Forwarding", out)
+	}
+	out, err = json.Marshal(NodeStateDNS{Forwarding: &NodeStateDNSForwarding{ForwardZones: []NodeStateDNSForwardZone{}, CatchAll: []string{}}})
+	if err != nil {
+		t.Fatalf("marshal a block with an empty forwarding: %v", err)
+	}
+	if !strings.Contains(string(out), `"forwarding":{"forward_zones":[],"catch_all":[]}`) {
+		t.Errorf("marshaled block %s, want the forwarding member with two empty lists", out)
 	}
 }
 
