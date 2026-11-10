@@ -930,6 +930,10 @@ absence.
       { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "fqdn": "db-2.openstack.lab.internal", "mesh_ip": "10.99.0.3" },
       { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", "fqdn": "web-1.openstack.lab.internal", "mesh_ip": "10.99.0.1" }
     ],
+    "records": [
+      { "fqdn": "_postgres._tcp.openstack.lab.internal", "type": "SRV", "target": "db.lab.internal", "priority": 0, "weight": 5, "port": 5432 },
+      { "fqdn": "db.lab.internal", "type": "A", "address": "10.20.0.5" }
+    ],
     "reverse_zones": ["0.99.10.in-addr.arpa"]
   }
 }
@@ -1166,26 +1170,39 @@ reconcile interval, or sooner on a triggered pull. The block is not desired stat
 for the differ: the reconcile snapshot neither stores nor compares it. See
 [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
 
-`dns` carries the mesh DNS names of the node's Domain, as the "Mesh DNS names"
-section of plexsphere's agent contract
+`dns` carries the mesh DNS names and records of the node's Domain, as the
+"Mesh DNS names" section of plexsphere's agent contract
 (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
 describes it. `search_domain` is the zone of the node's own Project. `zones`
 lists the Domain's default domain and every Project zone, ascending. `hosts`
 lists every node of the Domain, the pulling node included, each with its
-`node_id`, its `fqdn` and its `mesh_ip`, ordered by `fqdn`. `reverse_zones`
-lists the `in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR
-and nothing wider. Every name is in lower case without a trailing dot, and an
-empty list is `[]`. The block is the full set, not a delta: it replaces the
-names the node answers. `null`, or a key missing because the control plane
-predates the block, means the control plane did not say, and plexd keeps the
-names it holds. On Linux, a plexd whose mesh resolver listens reads the block
-on every successful pull, drift or not. The resolver answers `A`, `AAAA` and
-`PTR` queries for the names on the node's own mesh IP, port 5354 by default,
-and plexd registers the zones and the search domain with systemd-resolved on
-the mesh interface. macOS and Windows do not read the block yet. A pull that
-changes only hosts issues no call to systemd-resolved. plexd skips an entry that
-breaks a rule of the contract, such as a zone under `arpa`, `local` or
-`localhost`, and logs `mesh dns skipped invalid entries` at Warn. The block is
+`node_id`, its `fqdn` and its `mesh_ip`, ordered by `fqdn`. `records` lists
+the DNS records of the Domain and of every Project, ordered by `fqdn`, then by
+`type`. Each carries its `fqdn`, its `type`, one of `A`, `AAAA`, `CNAME`, `TXT`,
+`SRV` and `MX`, and the members of that type: `address` for `A` and `AAAA`,
+`target` for `CNAME`, `SRV` and `MX`, `priority` for `SRV` and `MX`, `weight`
+and `port` for `SRV`, and `text` for `TXT`. A member the type does not take is
+absent, and a `priority` or `weight` of 0 is sent as `0`. A `records` key that
+is `null` or missing means the Domain has no records. `reverse_zones` lists the
+`in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR and
+nothing wider. Every name is in lower case without a trailing dot, and an empty
+list is `[]`. The block is the full set, not a delta: it replaces the names and
+the records the node answers. `null`, or a key missing because the control
+plane predates the block, means the control plane did not say, and plexd keeps
+the names and the records it holds. On Linux, a plexd whose mesh resolver
+listens reads the block on every successful pull, drift or not. The resolver
+answers `A`, `AAAA` and `PTR` queries for the names, and queries for the
+records of all six types, on
+the node's own mesh IP, port 5354 by default, and plexd registers the zones and
+the search domain with systemd-resolved on the mesh interface. The resolver
+follows a CNAME while its target lies under one of `zones` or `reverse_zones`,
+and answers one whose target lies outside them with the CNAME alone, which
+systemd-resolved follows. An answer too large for UDP is sent with TC set and
+no records, so the client asks again over TCP. macOS and Windows do not read
+the block yet. A pull that changes only hosts or records issues no call to
+systemd-resolved. plexd skips an entry that breaks a rule of the contract, such
+as a zone under `arpa`, `local` or `localhost`, or a record of a type it does
+not answer, and logs `mesh dns skipped invalid entries` at Warn. The block is
 not desired state for the differ: the reconcile snapshot neither stores nor
 compares it. See [Mesh DNS](../networking/mesh-dns.md).
 

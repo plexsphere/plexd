@@ -600,7 +600,7 @@ default it is an enriched envelope containing two peers, a merged policy with tw
 rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions`,
 `sessions`, and `secrets` blocks.
-It also carries a `dns` block that names the node and both peers.
+It also carries a `dns` block that names the node and both peers and holds eight records.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
 The `signing_key` block is not read from the fixture: every response sets it to
 the mock's current signing key, the key `POST /v1/register` hands out, whatever
@@ -624,7 +624,7 @@ therefore hands the node the new key.
 | `secrets` | `[]` (no inventory; phases configure entries explicitly) |
 | `hooks` | `null`, which keeps every hook a rollout installed and lets the [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serve nothing; phases configure entries explicitly |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
-| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `reverse_zones` `0.99.10.in-addr.arpa` |
+| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa` |
 
 The `dns` block names the node at the mesh IP `POST /v1/register` assigns it and
 each peer at the mesh IP of its `peers` entry, so every name a suite resolves
@@ -632,7 +632,11 @@ points at an address of the agent's mesh. `app.e2e.internal` is the node's
 Project zone and `e2e.internal` its Domain's default domain above it, so the
 agent registers `app.e2e.internal` as its search domain and routes
 `~e2e.internal`, which covers it, and `~0.99.10.in-addr.arpa`, which covers the
-Domain's `10.99.0.0/24` and nothing wider. See [Mesh DNS](../networking/mesh-dns.md).
+Domain's `10.99.0.0/24` and nothing wider. The records hold one of each type:
+two `A` records and an `AAAA` at one name, an `SRV` and an `MX` whose targets
+are that name and a name outside the mesh, a `TXT` of two strings, a CNAME to a
+peer and one to a name outside the mesh. Their addresses come from the
+documentation ranges, so nothing answers them. See [Mesh DNS](../networking/mesh-dns.md).
 
 The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
 its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node
@@ -774,6 +778,16 @@ comparison key and never re-derives it from the rules.
       {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", "fqdn": "node-1.app.e2e.internal", "mesh_ip": "10.99.0.1"},
       {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "fqdn": "peer-1.app.e2e.internal", "mesh_ip": "10.99.0.2"},
       {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "fqdn": "peer-2.app.e2e.internal", "mesh_ip": "10.99.0.3"}
+    ],
+    "records": [
+      {"fqdn": "_db._tcp.app.e2e.internal", "type": "SRV", "target": "db.e2e.internal", "priority": 0, "weight": 5, "port": 5432},
+      {"fqdn": "alias.app.e2e.internal", "type": "CNAME", "target": "peer-2.app.e2e.internal"},
+      {"fqdn": "db.e2e.internal", "type": "A", "address": "192.0.2.10"},
+      {"fqdn": "db.e2e.internal", "type": "A", "address": "192.0.2.11"},
+      {"fqdn": "db.e2e.internal", "type": "AAAA", "address": "2001:db8::10"},
+      {"fqdn": "e2e.internal", "type": "MX", "target": "mail.example.com", "priority": 10},
+      {"fqdn": "e2e.internal", "type": "TXT", "text": ["v=e2e", "owner=plexd"]},
+      {"fqdn": "ext.e2e.internal", "type": "CNAME", "target": "ext.example.com"}
     ],
     "reverse_zones": ["0.99.10.in-addr.arpa"]
   }
@@ -1323,7 +1337,9 @@ The `dns` block travels the same way: the helpers splice into the live
 snapshot, so the fixture's block stays unless a phase replaces it. A body
 without a `dns` key stores a nil block, which the state endpoint serves as
 `"dns": null`, the contract's signal that the node keeps the names it holds.
-Splicing `"dns": null` does the same.
+Splicing `"dns": null` does the same. A configured `dns` block without a
+`records` key is served with `"records": null`, which plexd reads as no records:
+the block is the full set, so the node drops the records it held.
 
 **Response:** `204 No Content`
 

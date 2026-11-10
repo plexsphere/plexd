@@ -345,14 +345,20 @@ See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
 
 **NodeStateDNS**
 
-The interior of the `dns` block: the mesh DNS names of the node's Domain, as the
+The interior of the `dns` block: the mesh DNS names of the node's Domain and the
+DNS records the Domain and its Projects define, as the
 "Mesh DNS names" section of plexsphere's agent contract
 (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
 describes it. The control plane sends every name in lower case without a
 trailing dot, and an empty list as `[]`. `meshdns.BuildRecords` validates every
 entry and skips the ones that break a rule, such as a zone under `arpa`, `local`
-or `localhost`, a host outside every accepted zone, or a repeated `fqdn`, and the
-manager logs them at Warn as `mesh dns skipped invalid entries`. See
+or `localhost`, a host outside every accepted zone, or a repeated `fqdn`. It
+skips a record whose `type` is not one of the six, whose `fqdn` is not a valid
+name, lies under no accepted zone or is a host's `fqdn`, whose data breaks the
+rule of its type, which shares its name with a CNAME, or which repeats an
+earlier record. The manager logs them at Warn as
+`mesh dns skipped invalid entries`, with the count and the first five
+sentences. See
 [Mesh DNS](../networking/mesh-dns.md#records).
 
 | Field          | Type                 | JSON Tag          | Description                                         |
@@ -360,6 +366,7 @@ manager logs them at Warn as `mesh dns skipped invalid entries`. See
 | `SearchDomain` | `string`             | `"search_domain"` | The zone of the node's own Project, which bare host names resolve under. Kept only when it is an accepted zone |
 | `Zones`        | `[]string`           | `"zones"`         | The Domain's default domain and every Project zone, ascending |
 | `Hosts`        | `[]NodeStateDNSHost` | `"hosts"`         | Every node of the Domain, the pulling node included, ordered by `fqdn` |
+| `Records`      | `[]NodeStateDNSRecord` | `"records"`     | The DNS records of the Domain and of every Project, ordered by `fqdn`, then by `type`. A `nil` value (the wire's `null`, or a key a control plane that predates records never wrote) means the Domain has no records: the block is the full set, so it is no signal to keep the records held |
 | `ReverseZones` | `[]string`           | `"reverse_zones"` | The `in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR and nothing wider |
 
 **NodeStateDNSHost**
@@ -372,6 +379,29 @@ section of plexsphere's agent contract describes it.
 | `NodeID` | `string` | `"node_id"` | The node's id. Carried, never answered              |
 | `FQDN`   | `string` | `"fqdn"`    | The node's fully qualified name, at least one label below one of `zones` |
 | `MeshIP` | `string` | `"mesh_ip"` | The node's mesh IP, IPv4 or IPv6 by the family of the Domain's mesh CIDR. The `A` or `AAAA` answer for `fqdn`. Its reverse name answers `PTR` with `fqdn` when it lies under one of `reverse_zones` |
+
+**NodeStateDNSRecord**
+
+One entry of the `records` list: a DNS record the Domain or one of its Projects
+defines, as the "Mesh DNS names" section of plexsphere's agent contract
+describes it. An entry carries `fqdn`, `type` and the data members of its type,
+and no other member. The three numbers are `*int`, so a `priority` or `weight`
+of `0` is sent as `0`, and a member the type does not take stays absent when
+the mock control plane marshals the type. They are `int` rather than `uint16`,
+so a number out of range costs only its record, which the resolver skips, and
+not the decode of the whole snapshot. The resolver ignores a member the
+record's type does not take.
+
+| Field      | Type       | JSON Tag                | Description                                         |
+|------------|------------|-------------------------|-----------------------------------------------------|
+| `FQDN`     | `string`   | `"fqdn"`                | The record's fully qualified name: one of `zones` or a name under one, and never a host's `fqdn`. A label may carry `_`, as in `_postgres._tcp.openstack.lab.internal` |
+| `Type`     | `string`   | `"type"`                | `A`, `AAAA`, `CNAME`, `TXT`, `SRV` or `MX`, in upper case |
+| `Address`  | `string`   | `"address,omitempty"`   | `A` and `AAAA`: the IPv4 or the IPv6 address. An IPv4-mapped IPv6 address is neither |
+| `Target`   | `string`   | `"target,omitempty"`    | `CNAME`, `SRV` and `MX`: the name the record points at, inside or outside the mesh zones |
+| `Priority` | `*int`     | `"priority,omitempty"`  | `SRV` and `MX`: 0 to 65535. The preference of an `MX` |
+| `Weight`   | `*int`     | `"weight,omitempty"`    | `SRV`: 0 to 65535 |
+| `Port`     | `*int`     | `"port,omitempty"`      | `SRV`: 0 to 65535 |
+| `Text`     | `[]string` | `"text,omitempty"`      | `TXT`: at least one string, each of at most 255 bytes, answered in order |
 
 ### Supporting types
 
