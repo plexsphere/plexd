@@ -119,6 +119,61 @@ jobs:
           go test -race -count=1 -v
           -run '^TestWFPController_Real(NAT)?$' ./internal/policy/
 
+      # The mesh DNS registrar test writes Name Resolution Policy Table rules,
+      # the search list of a Wintun adapter and the Group Policy key, refreshes
+      # machine policy and binds 127.0.0.1:53, which changes the runner's
+      # resolver configuration while it runs. The runner has Administrator, so
+      # the gate is this variable for the same reason as above: without one the
+      # test would do all that inside the ordinary step. It waits up to 180
+      # seconds each time the Group Policy store decides, so its timeout is
+      # above go test's default of 10 minutes. It runs as LocalSystem, as
+      # plexd's service does, through a scheduled task, because the DNS Client
+      # reads the Group Policy store only after GenerateGPNotification, which
+      # is measured to work for LocalSystem; the task does not inherit this
+      # step's environment, so the variable is set in the script it runs. The
+      # step prints the test's output as it grows and fails unless the test
+      # passed: a skip would pass as well otherwise.
+      - name: Run real resolver tests
+        if: runner.os == 'Windows'
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'meshdns.test.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'real-resolver.txt'
+          $bat = Join-Path $env:RUNNER_TEMP 'real-resolver.cmd'
+          go test -c -race -o $exe ./internal/meshdns/
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Content -LiteralPath $bat -Encoding ascii -Value @(
+            '@echo off',
+            'set PLEXD_TEST_REAL_RESOLVER=1',
+            "`"$exe`" -test.run=TestNRPTRegistrar_Real -test.v -test.timeout=15m > `"$out`" 2>&1",
+            "echo TEST-EXIT %ERRORLEVEL% >> `"$out`""
+          )
+          $task = 'plexd-real-resolver-test'
+          $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$bat`""
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          Register-ScheduledTask -TaskName $task -Action $action -Principal $principal | Out-Null
+          Start-ScheduledTask -TaskName $task
+          $printed = 0
+          $exit = $null
+          $deadline = (Get-Date).AddMinutes(17)
+          while ($null -eq $exit -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            $lines = @()
+            try { $lines = @(Get-Content -LiteralPath $out -ErrorAction Stop) } catch { }
+            if ($lines.Count -gt $printed) {
+              $lines[$printed..($lines.Count - 1)] | ForEach-Object { Write-Host $_ }
+              $printed = $lines.Count
+            }
+            $last = $lines | Where-Object { $_ -like 'TEST-EXIT *' } | Select-Object -Last 1
+            if ($last) { $exit = [int](($last -replace '^TEST-EXIT', '').Trim()) }
+          }
+          Unregister-ScheduledTask -TaskName $task -Confirm:$false
+          if ($null -eq $exit) { Write-Host 'the test did not finish within 17 minutes'; exit 1 }
+          if ($exit -ne 0) { exit $exit }
+          if (-not (Select-String -LiteralPath $out -SimpleMatch -Quiet -Pattern '--- PASS: TestNRPTRegistrar_Real')) {
+            Write-Host 'TestNRPTRegistrar_Real did not pass'
+            exit 1
+          }
+
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
