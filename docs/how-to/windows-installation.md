@@ -141,7 +141,7 @@ A `plexd up` started by hand in a console logs to stderr rather than to the Even
 plexd uninstall
 ```
 
-This stops the service, deletes it from the SCM, removes the Event Log source, and keeps `%ProgramData%\plexd\`.
+This stops the service, whose stop removes plexd's mesh DNS rules from the Name Resolution Policy Table and clears the mesh adapter's search list, deletes it from the SCM, removes the Event Log source, and keeps `%ProgramData%\plexd\`.
 
 ```powershell
 plexd uninstall --purge
@@ -184,6 +184,20 @@ Restart-Service plexd
 ### `wg show` reports no device
 
 `wgctrl` and `wg.exe` reach a WireGuard device only through a LocalSystem-owned UAPI pipe. A plexd started from a console owns its own pipe, so those tools find nothing; against the service, which is how plexd normally runs, `wg show plexd0` works.
+
+### A mesh name does not resolve
+
+plexd answers the mesh names on `127.0.0.1`, port 53, and registers its resolver as rules of the Name Resolution Policy Table, from which the DNS Client takes the server for the names under each rule. Check which rules the DNS Client applies, and how a name resolves:
+
+```powershell
+Get-DnsClientNrptPolicy
+Resolve-DnsName <name>
+Resolve-DnsName -Server 127.0.0.1 <name>
+```
+
+`Get-DnsClientNrptPolicy` should list the mesh domains, each with a leading dot and the name server `127.0.0.1`, and with a catch-all also `.local` and `.`. It lists none of them when plexd registered nothing. `Resolve-DnsName <name>` resolves through the DNS Client as other programs do, and with `-Server 127.0.0.1` asks plexd directly. `nslookup` asks the adapter's DNS server itself and bypasses the table, so a name it does not resolve says nothing about plexd.
+
+The log line `mesh dns registered with Dnscache` shows a registration. `mesh dns listener cannot bind, mesh names are not answered` means another program holds port 53 on `127.0.0.1`, `mesh dns not registered, Dnscache is not usable` means `dns.listen_port` is not 53, and `mesh dns registration failed` carries the error of the registry or of the search list. plexd removes its rules and the search list when it stops. After a crash or a kill the rules stay until the next start of plexd removes them or a reboot clears them. See [Registration on Windows](../reference/networking/mesh-dns.md#registration-on-windows) and [A mesh name does not resolve](../guide/troubleshooting.md#a-mesh-name-does-not-resolve).
 
 ## See also
 

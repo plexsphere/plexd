@@ -1207,11 +1207,12 @@ replaces the forwarding. `null`, or a key missing because the control plane
 predates the block, means the control plane did not say, and plexd keeps the
 names, the records and the forwarding it holds. A `forwarding` member that is
 `null` or missing in a block keeps the forwarding alone, and two empty lists
-end it. On Linux and macOS, a plexd whose mesh resolver
+end it. On Linux, macOS and Windows, a plexd whose mesh resolver
 listens reads the block on every successful pull, drift or not. The resolver
 answers `A`, `AAAA` and `PTR` queries for the names, and queries for the
 records of all six types, on
-the node's own mesh IP, port 5354 by default (on macOS on `127.0.0.1`), and
+the node's own mesh IP, port 5354 by default (on macOS on `127.0.0.1`, and on
+Windows on `127.0.0.1`, port 53), and
 plexd registers the zones and the search domain with systemd-resolved on the
 mesh interface. The resolver
 forwards a query for a name under a forward zone to the zone's resolvers, and
@@ -1222,13 +1223,18 @@ catch-all it makes the mesh interface the host's default DNS route. On macOS
 plexd writes the same zones, the search domain and the forward zones into
 configd's dynamic store instead, and with a catch-all a default-resolver entry
 (see [Registration on macOS](../networking/mesh-dns.md#registration-on-macos)).
+On Windows plexd writes them as rules of the Name Resolution Policy Table,
+from which the DNS Client (`Dnscache`) takes the server for those names, with
+the search domain also on the mesh adapter's search list, and with a catch-all a
+rule for every name
+(see [Registration on Windows](../networking/mesh-dns.md#registration-on-windows)).
 A forward zone that equals a zone or reverse zone of the block, or lies
 under one, is skipped, so the mesh names always win. The resolver
 follows a CNAME while its target lies under one of `zones` or `reverse_zones`,
 and answers one whose target lies outside them with the CNAME alone, which
 systemd-resolved follows. An answer too large for UDP is sent with TC set and
-no records, so the client asks again over TCP. Windows does not read the block
-yet. A pull that changes only hosts, records or resolvers issues no call to
+no records, so the client asks again over TCP. A pull that changes only hosts,
+records or resolvers issues no call to
 the system resolver, as long as the accepted forward zones stay the same
 and an accepted catch-all resolver neither appears nor goes. plexd skips an
 entry that breaks a rule of the contract, such as a zone under `arpa`, `local`
