@@ -552,10 +552,13 @@ func countOPT(p *dnsmessage.Parser) int {
 }
 
 // buildResponse packs the response with header h, the question q as it was
-// received when it is not nil, the records ans calls for, and an OPT record
-// when edns is set. The records are owned by the question's own spelling, so
-// a pointer to it compresses them, and the SOA by the question's own
-// spelling of the zone, for the same reason.
+// received when it is not nil, the records of ans in its answer section, the
+// SOA of ans.Zone in the authority section of a negative answer, and an OPT
+// record when edns is set. A record whose owner is the question's name is
+// owned by the question's own spelling, so a pointer to it compresses the
+// owner, and the SOA by the question's own spelling of the zone, for the same
+// reason. Any other owner, such as the target of a CNAME the answer follows,
+// is the folded name.
 func buildResponse(dst []byte, h dnsmessage.Header, q *dnsmessage.Question, ans Answer, edns bool) ([]byte, error) {
 	b := dnsmessage.NewBuilder(dst, h)
 	b.EnableCompression()
@@ -571,23 +574,8 @@ func buildResponse(dst []byte, h dnsmessage.Header, q *dnsmessage.Question, ans 
 	if err := b.StartAnswers(); err != nil {
 		return nil, err
 	}
-	if ans.Result == ResultFound {
-		rh := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: recordTTL}
-		var err error
-		switch {
-		case ans.Addr.Is4():
-			err = b.AResource(rh, dnsmessage.AResource{A: ans.Addr.As4()})
-		case ans.Addr.Is6():
-			err = b.AAAAResource(rh, dnsmessage.AAAAResource{AAAA: ans.Addr.As16()})
-		case ans.Target != "":
-			var target dnsmessage.Name
-			if target, err = dnsmessage.NewName(ans.Target + "."); err == nil {
-				err = b.PTRResource(rh, dnsmessage.PTRResource{PTR: target})
-			}
-		default:
-			err = addSOA(&b, q, ans.Zone)
-		}
-		if err != nil {
+	for _, rr := range ans.RRs {
+		if err := addRR(&b, q, rr); err != nil {
 			return nil, err
 		}
 	}
@@ -616,6 +604,47 @@ func buildResponse(dst []byte, h dnsmessage.Header, q *dnsmessage.Question, ans 
 		}
 	}
 	return b.Finish()
+}
+
+// addRR adds rr, in a response to q, to the current section of b, with the
+// TTL every record of the server carries.
+func addRR(b *dnsmessage.Builder, q *dnsmessage.Question, rr RR) error {
+	if rr.Type == dnsmessage.TypeSOA {
+		return addSOA(b, q, rr.Name)
+	}
+	var owner dnsmessage.Name
+	if q != nil && foldName(strings.TrimSuffix(q.Name.String(), ".")) == rr.Name {
+		owner = q.Name
+	} else {
+		var err error
+		if owner, err = dnsmessage.NewName(rr.Name + "."); err != nil {
+			return err
+		}
+	}
+	rh := dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: recordTTL}
+	switch rr.Type {
+	case dnsmessage.TypeA:
+		return b.AResource(rh, dnsmessage.AResource{A: rr.Addr.As4()})
+	case dnsmessage.TypeAAAA:
+		return b.AAAAResource(rh, dnsmessage.AAAAResource{AAAA: rr.Addr.As16()})
+	case dnsmessage.TypeTXT:
+		return b.TXTResource(rh, dnsmessage.TXTResource{TXT: rr.Text})
+	}
+	target, err := dnsmessage.NewName(rr.Target + ".")
+	if err != nil {
+		return err
+	}
+	switch rr.Type {
+	case dnsmessage.TypePTR:
+		return b.PTRResource(rh, dnsmessage.PTRResource{PTR: target})
+	case dnsmessage.TypeCNAME:
+		return b.CNAMEResource(rh, dnsmessage.CNAMEResource{CNAME: target})
+	case dnsmessage.TypeMX:
+		return b.MXResource(rh, dnsmessage.MXResource{Pref: rr.Priority, MX: target})
+	case dnsmessage.TypeSRV:
+		return b.SRVResource(rh, dnsmessage.SRVResource{Priority: rr.Priority, Weight: rr.Weight, Port: rr.Port, Target: target})
+	}
+	return fmt.Errorf("meshdns: no packing for record type %v", rr.Type)
 }
 
 // addSOA adds the SOA the server synthesizes for zone, in a response to q, to

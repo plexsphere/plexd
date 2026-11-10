@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -186,6 +187,18 @@ func describe(r dnsmessage.Resource) string {
 		data = b.PTR.String()
 	case *dnsmessage.SOAResource:
 		data = fmt.Sprintf("%s %s %d %d %d %d %d", b.NS, b.MBox, b.Serial, b.Refresh, b.Retry, b.Expire, b.MinTTL)
+	case *dnsmessage.CNAMEResource:
+		data = b.CNAME.String()
+	case *dnsmessage.MXResource:
+		data = fmt.Sprintf("%d %s", b.Pref, b.MX)
+	case *dnsmessage.SRVResource:
+		data = fmt.Sprintf("%d %d %d %s", b.Priority, b.Weight, b.Port, b.Target)
+	case *dnsmessage.TXTResource:
+		quoted := make([]string, 0, len(b.TXT))
+		for _, t := range b.TXT {
+			quoted = append(quoted, strconv.Quote(t))
+		}
+		data = strings.Join(quoted, " ")
 	default:
 		data = fmt.Sprintf("%#v", b)
 	}
@@ -1515,5 +1528,133 @@ func TestWaitAcceptEndsOnStop(t *testing.T) {
 	}
 	if !waitAccept(time.Millisecond, make(chan struct{})) {
 		t.Errorf("waitAccept() = false with stop open, want true once the wait is over")
+	}
+}
+
+// TestServer_AnswersEveryRecordType asks for a record of each of the six
+// types over UDP and over TCP and checks the records whole.
+func TestServer_AnswersEveryRecordType(t *testing.T) {
+	block := serverBlock()
+	block.Records = append(block.Records,
+		rec("txt.lab.internal", "TXT", text("v=spf1 -all", "", "second")),
+	)
+	s := startServer(t, mustBuild(t, block))
+
+	tests := []struct {
+		qname string
+		qtype dnsmessage.Type
+		want  []string
+	}{
+		{"db.lab.internal.", dnsmessage.TypeA, []string{"db.lab.internal. 10 ClassINET TypeA 10.20.0.5"}},
+		{"db.lab.internal.", dnsmessage.TypeAAAA, []string{"db.lab.internal. 10 ClassINET TypeAAAA fd00:20::5"}},
+		{"wiki.openstack.lab.internal.", dnsmessage.TypeCNAME, []string{"wiki.openstack.lab.internal. 10 ClassINET TypeCNAME wiki.example.com."}},
+		{"edge.example.com.", dnsmessage.TypeTXT, []string{`edge.example.com. 10 ClassINET TypeTXT "owner=edge-team"`}},
+		{"txt.lab.internal.", dnsmessage.TypeTXT, []string{`txt.lab.internal. 10 ClassINET TypeTXT "v=spf1 -all" "" "second"`}},
+		{"_postgres._tcp.openstack.lab.internal.", dnsmessage.TypeSRV, []string{"_postgres._tcp.openstack.lab.internal. 10 ClassINET TypeSRV 0 5 5432 db.lab.internal."}},
+		{"lab.internal.", dnsmessage.TypeMX, []string{"lab.internal. 10 ClassINET TypeMX 10 relay.example.com."}},
+	}
+	for _, network := range []string{"udp", "tcp"} {
+		exchange := exchangeUDP
+		if network == "tcp" {
+			exchange = exchangeTCP
+		}
+		conn := dial(t, network, s)
+		for i, tc := range tests {
+			t.Run(fmt.Sprintf("%s %s %v", network, tc.qname, tc.qtype), func(t *testing.T) {
+				id := uint16(0x7100 + i)
+				m := parseResponse(t, exchange(t, conn, newQuery(t, id, tc.qname, tc.qtype)))
+				if m.ID != id || m.RCode != dnsmessage.RCodeSuccess || !m.Authoritative || m.RecursionAvailable || m.Truncated {
+					t.Errorf("header ID %#x RCode %v AA %v RA %v TC %v, want %#x %v true false false",
+						m.ID, m.RCode, m.Authoritative, m.RecursionAvailable, m.Truncated, id, dnsmessage.RCodeSuccess)
+				}
+				if got := describeAll(m.Answers); !slices.Equal(got, tc.want) {
+					t.Errorf("answers = %q, want %q", got, tc.want)
+				}
+				if len(m.Authorities) != 0 {
+					t.Errorf("authorities = %q, want none", describeAll(m.Authorities))
+				}
+			})
+		}
+	}
+}
+
+// TestServer_RecordOwners checks who owns each record of an answer: the
+// question's spelling for its own name, and the folded name for the records
+// of a CNAME target, whose zone owns the SOA of a negative answer.
+func TestServer_RecordOwners(t *testing.T) {
+	s := startServer(t, mustBuild(t, cnameBlock()))
+	conn := dial(t, "udp", s)
+
+	tests := []struct {
+		name        string
+		qname       string
+		rcode       dnsmessage.RCode
+		answers     []string
+		authorities []string
+	}{
+		{
+			"records of the question's name", "DB.Lab.Internal.", dnsmessage.RCodeSuccess,
+			[]string{"DB.Lab.Internal. 10 ClassINET TypeA 10.20.0.5"},
+			nil,
+		},
+		{
+			"two records of the question's name", "Multi.LAB.internal.", dnsmessage.RCodeSuccess,
+			[]string{"Multi.LAB.internal. 10 ClassINET TypeA 192.0.2.1", "Multi.LAB.internal. 10 ClassINET TypeA 192.0.2.2"},
+			nil,
+		},
+		{
+			"CNAME to a host", "Alias.Lab.Internal.", dnsmessage.RCodeSuccess,
+			[]string{
+				"Alias.Lab.Internal. 10 ClassINET TypeCNAME db-1.openstack.lab.internal.",
+				"db-1.openstack.lab.internal. 10 ClassINET TypeA 10.42.0.3",
+			},
+			nil,
+		},
+		{
+			"CNAME to a missing name in another zone", "Dangling.Lab.Internal.", dnsmessage.RCodeNameError,
+			[]string{"Dangling.Lab.Internal. 10 ClassINET TypeCNAME nope.openstack.lab.internal."},
+			[]string{wantSOA("openstack.lab.internal")},
+		},
+		{
+			"CNAME out of the zones", "wiki.openstack.lab.internal.", dnsmessage.RCodeSuccess,
+			[]string{"wiki.openstack.lab.internal. 10 ClassINET TypeCNAME wiki.example.com."},
+			nil,
+		},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uint16(0x7200 + i)
+			m := parseResponse(t, exchangeUDP(t, conn, newQuery(t, id, tc.qname, dnsmessage.TypeA)))
+			if m.RCode != tc.rcode || !m.Authoritative {
+				t.Errorf("RCode %v AA %v, want %v true", m.RCode, m.Authoritative, tc.rcode)
+			}
+			if got := describeAll(m.Answers); !slices.Equal(got, tc.answers) {
+				t.Errorf("answers = %q, want %q", got, tc.answers)
+			}
+			if got := describeAll(m.Authorities); !slices.Equal(got, tc.authorities) {
+				t.Errorf("authorities = %q, want %q", got, tc.authorities)
+			}
+		})
+	}
+}
+
+// TestServer_SetRecordsDropsARecord checks that a block without a record
+// takes its answer away with the next query.
+func TestServer_SetRecordsDropsARecord(t *testing.T) {
+	s := startServer(t, mustBuild(t, serverBlock()))
+	conn := dial(t, "udp", s)
+
+	m := parseResponse(t, exchangeUDP(t, conn, newQuery(t, 1, "db.lab.internal.", dnsmessage.TypeA)))
+	if got, want := describeAll(m.Answers), []string{"db.lab.internal. 10 ClassINET TypeA 10.20.0.5"}; !slices.Equal(got, want) {
+		t.Fatalf("answers before = %q, want %q", got, want)
+	}
+
+	block := serverBlock()
+	block.Records = slices.DeleteFunc(block.Records, func(r api.NodeStateDNSRecord) bool { return r.FQDN == "db.lab.internal" })
+	s.SetRecords(mustBuild(t, block))
+
+	m = parseResponse(t, exchangeUDP(t, conn, newQuery(t, 2, "db.lab.internal.", dnsmessage.TypeA)))
+	if m.RCode != dnsmessage.RCodeNameError || len(m.Answers) != 0 {
+		t.Errorf("after the record left: RCode %v answers %q, want %v and none", m.RCode, describeAll(m.Answers), dnsmessage.RCodeNameError)
 	}
 }
