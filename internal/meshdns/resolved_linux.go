@@ -35,12 +35,6 @@ const (
 	propertyDNSEx       = "DNSEx"
 )
 
-// revertShare divides the time left on Apply's context to give the share the
-// steps hold back for the revert after a failure. With 5 the steps end a
-// fifth of that time early, a second of the manager's five, so a step that
-// runs out its budget still leaves the revert time to reach systemd-resolved.
-const revertShare = 5
-
 // The D-Bus error names the registrar tells apart. The first three say that
 // nothing answers for systemd-resolved: the bus daemon answers ServiceUnknown
 // or NameHasNoOwner when no process owns the name, and systemd answers
