@@ -4,15 +4,25 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"regexp"
 	"slices"
 )
 
 // ErrUnavailable reports that the host has no system resolver plexd can
 // register with, such as a Linux host without systemd-resolved or with one
-// older than 246, or a macOS host without /usr/sbin/scutil. The resolver
-// still answers on its listen address, and the manager logs that once
-// instead of warning on every pull.
+// older than 246, a macOS host without /usr/sbin/scutil, or a Windows host
+// whose resolver listens on a port other than 53, the only port the Name
+// Resolution Policy Table sends to. The resolver still answers on its listen
+// address, and the manager logs that once instead of warning on every pull.
 var ErrUnavailable = errors.New("meshdns: no usable system resolver")
+
+// registrarDomainRE matches a domain a registrar writes into the system
+// resolver's configuration. BuildRecords and BuildForwarding accept nothing
+// else, but the registrars check again, because the configuration is written
+// with the system's rights: a newline in a domain would run a command of its
+// own in a scutil script on macOS, and a comma would split a search list on
+// Windows.
+var registrarDomainRE = regexp.MustCompile(`^[a-z0-9_.-]{1,253}$`)
 
 // revertShare divides the time left on Apply's context to give the share the
 // steps hold back for the revert after a failure. With 5 the steps end a
@@ -30,7 +40,9 @@ type Registration struct {
 	// Interface is the name of the mesh interface the registration is bound
 	// to, so the system resolver sends the queries through that link. On
 	// macOS a dynamic-store entry is bound to no interface, and the name
-	// serves the log lines only.
+	// serves the log lines only. On Windows the Name Resolution Policy Table
+	// rules are bound to no interface either, and the name selects the
+	// adapter whose search list carries SearchDomain.
 	Interface string
 	// Server is the address and port the mesh resolver listens on.
 	Server netip.AddrPort
@@ -43,9 +55,10 @@ type Registration struct {
 	RoutingDomains []string
 	// DefaultRoute makes Server the host's default resolver, so the system
 	// resolver sends it every name that no other domain matches: on Linux
-	// the link becomes the host's default DNS route, and on macOS a
-	// default-resolver entry joins the others. It is set while the
-	// forwarding table has a catch-all resolver.
+	// the link becomes the host's default DNS route, on macOS a
+	// default-resolver entry joins the others, and on Windows a rule for
+	// every name. It is set while the forwarding table has a catch-all
+	// resolver.
 	DefaultRoute bool
 }
 
@@ -78,13 +91,14 @@ type Registrar interface {
 	Apply(ctx context.Context, reg Registration) error
 	// Revert removes every resolver setting plexd made for the interface
 	// named iface; a registrar whose settings are bound to no interface, as
-	// on macOS, removes all of them whatever iface is. It returns nil when
-	// there is nothing to remove, which includes an interface or a system
-	// resolver that is gone, so a shutdown on a host without one does not
-	// report a failure.
+	// on macOS, removes all of them whatever iface is. On Windows every plexd
+	// rule goes whatever iface is, and iface names the adapter whose search
+	// list is cleared. It returns nil when there is nothing to remove, which
+	// includes an interface or a system resolver that is gone, so a shutdown
+	// on a host without one does not report a failure.
 	Revert(ctx context.Context, iface string) error
 	// Name names the system resolver the registrar writes to, as the
 	// manager's log lines name it: systemd-resolved on Linux, configd on
-	// macOS.
+	// macOS, Dnscache on Windows.
 	Name() string
 }

@@ -42,14 +42,8 @@ const (
 // service's resolver, as Tailscale's macOS configurator does.
 const defaultResolverOrder = 100000
 
-var (
-	// scutilKeyRE matches a key a list line names that plexd owns.
-	scutilKeyRE = regexp.MustCompile(`^` + regexp.QuoteMeta(scutilKeyPrefix) + `[a-z0-9-]+/DNS$`)
-	// scutilDomainRE matches a domain the registrar writes into a script.
-	// BuildRecords and BuildForwarding accept nothing else, but the script
-	// runs as root, so a newline in a domain would run a command of its own.
-	scutilDomainRE = regexp.MustCompile(`^[a-z0-9_.-]{1,253}$`)
-)
+// scutilKeyRE matches a key a list line names that plexd owns.
+var scutilKeyRE = regexp.MustCompile(`^` + regexp.QuoteMeta(scutilKeyPrefix) + `[a-z0-9-]+/DNS$`)
 
 // ScutilRegistrar registers the mesh resolver with the macOS resolver. It
 // writes DNS entries into configd's dynamic store, from which mDNSResponder
@@ -100,7 +94,7 @@ func (r *ScutilRegistrar) Apply(ctx context.Context, reg Registration) error {
 		domains = append([]string{reg.SearchDomain}, domains...)
 	}
 	for _, d := range domains {
-		if !scutilDomainRE.MatchString(d) {
+		if !registrarDomainRE.MatchString(d) {
 			return fmt.Errorf("meshdns: scutil: domain %q cannot be written to the dynamic store", d)
 		}
 	}
