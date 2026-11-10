@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/health"
+	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/upgrade"
 )
 
@@ -351,8 +352,8 @@ func TestParseConfig_DNS(t *testing.T) {
 		wantEnabled bool
 		wantPort    int
 	}{
-		{name: "no dns key", yaml: "mode: node\n", wantEnabled: true, wantPort: 5354},
-		{name: "enabled false", yaml: "dns:\n  enabled: false\n", wantEnabled: false, wantPort: 5354},
+		{name: "no dns key", yaml: "mode: node\n", wantEnabled: true, wantPort: meshdns.DefaultListenPort},
+		{name: "enabled false", yaml: "dns:\n  enabled: false\n", wantEnabled: false, wantPort: meshdns.DefaultListenPort},
 		{name: "listen_port set", yaml: "dns:\n  listen_port: 5300\n", wantEnabled: true, wantPort: 5300},
 	}
 	for _, tt := range tests {

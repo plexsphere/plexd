@@ -2,12 +2,6 @@ package meshdns
 
 import "errors"
 
-// DefaultListenPort is the port the resolver listens on when listen_port is
-// not set. It is unprivileged, so plexd.service needs no
-// CAP_NET_BIND_SERVICE, and systemd-resolved 246 and newer accept a port
-// beside the server address of a link.
-const DefaultListenPort = 5354
-
 // Config holds the configuration of the mesh DNS resolver.
 type Config struct {
 	// Enabled controls whether the resolver runs. A pointer, so an unset key
@@ -19,8 +13,8 @@ type Config struct {
 	Enabled *bool `yaml:"enabled"`
 
 	// ListenPort is the UDP and TCP port the resolver listens on, on the
-	// node's own mesh IP on Linux and on 127.0.0.1 on macOS.
-	// Default: 5354.
+	// node's own mesh IP on Linux and on 127.0.0.1 on macOS and Windows.
+	// Default: DefaultListenPort, 53 on Windows and 5354 elsewhere.
 	ListenPort int `yaml:"listen_port"`
 }
 

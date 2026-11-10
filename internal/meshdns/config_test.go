@@ -1,6 +1,7 @@
 package meshdns
 
 import (
+	"runtime"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -22,8 +23,14 @@ func TestConfig_Defaults(t *testing.T) {
 	if cfg.ListenPort != DefaultListenPort {
 		t.Errorf("ListenPort = %d, want %d", cfg.ListenPort, DefaultListenPort)
 	}
-	if DefaultListenPort != 5354 {
-		t.Errorf("DefaultListenPort = %d, want 5354", DefaultListenPort)
+	// The Name Resolution Policy Table sends to port 53 only, so Windows
+	// listens there; every other platform keeps an unprivileged port.
+	want := 5354
+	if runtime.GOOS == "windows" {
+		want = 53
+	}
+	if DefaultListenPort != want {
+		t.Errorf("DefaultListenPort = %d on %s, want %d", DefaultListenPort, runtime.GOOS, want)
 	}
 }
 
@@ -38,9 +45,9 @@ func TestConfig_YAML(t *testing.T) {
 		wantEnabled bool
 		wantPort    int
 	}{
-		{"no dns key", "log_level: info\n", true, 5354},
-		{"enabled false", "dns: {enabled: false}\n", false, 5354},
-		{"enabled true", "dns: {enabled: true}\n", true, 5354},
+		{"no dns key", "log_level: info\n", true, DefaultListenPort},
+		{"enabled false", "dns: {enabled: false}\n", false, DefaultListenPort},
+		{"enabled true", "dns: {enabled: true}\n", true, DefaultListenPort},
 		{"listen port only", "dns:\n  listen_port: 5300\n", true, 5300},
 		{"disabled with port", "dns:\n  enabled: false\n  listen_port: 5300\n", false, 5300},
 	}
