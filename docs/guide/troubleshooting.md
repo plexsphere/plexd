@@ -103,10 +103,13 @@ The probe measures only the outbound IPv4 path to the STUN servers. It cannot se
 ```bash
 resolvectl status plexd0                      # The link's server and domains
 resolvectl query db-1.openstack.lab.internal  # Ask systemd-resolved directly
+resolvectl query --type=SRV _postgres._tcp.openstack.lab.internal  # A record of another type
 plexd logs | grep -E 'mesh dns|component=meshdns|dns block|PLEXD_DNS_ENABLED'  # The resolver's log lines
 ```
 
 On Linux, plexd answers the mesh names of its Domain on the Node's own mesh IP, port 5354 by default, and registers the Domain's zones with systemd-resolved on the mesh interface (`wireguard.interface_name`, `plexd0` by default). `resolvectl status plexd0` should list the server `<mesh IP>:5354`, the search domain, each routing domain with a leading `~` (every other zone that no zone above it covers, and every reverse zone), and `-DefaultRoute`. A link without that server has no registration. `resolvectl query` names the link an answer came from, so a mesh name answered through the mesh interface shows `plexd0`. A bare host name resolves through the search domain, and a mesh IP resolves to its name when the Domain's reverse zones cover it.
+
+plexd also answers the records the Domain and its Projects define. `resolvectl query` asks for addresses unless `--type` names another type, such as `--type=SRV`, `--type=MX` or `--type=TXT`. With `--type` it prints each record as `<name> IN <type> <data>`, followed by `-- link: plexd0`. A name that exists without a record of the type prints `does not have any RR of the requested type`. A CNAME whose target lies outside the mesh zones is answered as the CNAME alone, for the system resolver to follow. systemd-resolved follows it through its other servers, so `resolvectl query` shows the address without the link `plexd0`, and the target in parentheses. See [Answer Table](../reference/networking/mesh-dns.md#answer-table).
 
 The log lines say why a name is missing:
 
@@ -114,7 +117,7 @@ The log lines say why a name is missing:
 - `mesh dns not registered, systemd-resolved is not usable` means the host has no systemd-resolved, one older than 246, or no reachable system bus. Its `reason` says which. A stopped systemd-resolved counts as none, because plexd does not start it. The resolver still answers on the `listen` address; see [Hosts without systemd-resolved](../reference/networking/mesh-dns.md#hosts-without-systemd-resolved).
 - `mesh dns registration failed` carries the error systemd-resolved returned. `org.freedesktop.resolve1.LinkBusy` means systemd-networkd manages the link, which then cannot take settings over D-Bus. plexd tries again on every pull.
 - `state pull carries no dns block, keeping the names held` means the control plane sent no names. A control plane that predates the block never sends one.
-- `mesh dns skipped invalid entries` names the entries of the block plexd refused, up to five.
+- `mesh dns skipped invalid entries` names the entries of the block plexd refused, up to five. A skipped record reads `record "<fqdn>" of type "<type>" <reason>`, and the other names and records keep answering. See [Records](../reference/networking/mesh-dns.md#records) for the checks.
 
 A program resolves through systemd-resolved only when `/etc/resolv.conf` or `nsswitch.conf` sends it there: `/etc/resolv.conf` names the stub listener `127.0.0.53`, or the `hosts` line of `/etc/nsswitch.conf` lists `resolve`. `resolvectl query` always asks systemd-resolved, so a name that `resolvectl query` answers and a program does not points at the program's resolver configuration. On the Node itself, `dig @<mesh IP> -p 5354 <name>` asks plexd's resolver directly. A query from any other address gets no answer, so the same command run in a container or Pod network fails by design.
 

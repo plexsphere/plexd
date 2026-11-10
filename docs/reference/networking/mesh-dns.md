@@ -5,9 +5,9 @@ package: internal/meshdns
 
 # Mesh DNS
 
-The `internal/meshdns` package answers the mesh names of the Node's Domain from a resolver on the Node itself. The names come from the `dns` block of the state pull (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)), which the "Mesh DNS names" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes. On Linux, plexd registers the resolver with systemd-resolved for the mesh zones only, on the mesh interface. The host then asks plexd for the mesh zones and resolves every other name as before.
+The `internal/meshdns` package answers the mesh names of the Node's Domain, and the DNS records the Domain and its Projects define, from a resolver on the Node itself. The names and the records come from the `dns` block of the state pull (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)), which the "Mesh DNS names" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes. On Linux, plexd registers the resolver with systemd-resolved for the mesh zones only, on the mesh interface. The host then asks plexd for the mesh zones and resolves every other name as before.
 
-plexd is not recursive. It answers `A`, `AAAA` and `PTR` queries for the mesh names, denies every other name in the mesh zones, and refuses every name outside them. It writes no file and changes no resolver setting of the host outside the mesh interface's link.
+plexd is not recursive. It answers `A`, `AAAA` and `PTR` queries for the Nodes' names and mesh IPs, and queries for the records of the six types `A`, `AAAA`, `CNAME`, `TXT`, `SRV` and `MX`. It denies every other name in the mesh zones and refuses every name outside them. It follows a CNAME while its target lies in the mesh zones, and answers one whose target lies outside them with the CNAME alone, for the system resolver to follow. It writes no file and changes no resolver setting of the host outside the mesh interface's link.
 
 Only Linux runs the resolver, in node mode and in bridge mode. On macOS and Windows `plexd up` starts no resolver and logs nothing about it. The `dns` keys are still parsed and validated there.
 
@@ -34,7 +34,7 @@ Control Plane
                systemd-resolved
 ```
 
-A pull with a `dns` block replaces the names the server answers. It replaces the registration only when the one the block implies differs from the one applied, so a pull that changes only hosts issues no call to systemd-resolved. A pull without a block changes nothing. plexd keeps the names in memory only. A restart starts without names, as it starts without peers, and both come back with the first pull.
+A pull with a `dns` block replaces the names the server answers. It replaces the registration only when the one the block implies differs from the one applied, so a pull that changes only hosts or records issues no call to systemd-resolved. A pull without a block changes nothing. plexd keeps the names in memory only. A restart starts without names, as it starts without peers, and both come back with the first pull.
 
 ## Config
 
@@ -90,22 +90,64 @@ An accept that fails on a listener that is still open, for example with `EMFILE`
 
 `BuildRecords(block api.NodeStateDNS) (*Records, []string)` turns a `dns` block into the immutable `Records` the server answers from, and returns one sentence for each entry it skipped. The control plane is trusted, but a bug there must not hand the Node a zone that swallows the host's own resolution, so every entry is checked where it enters.
 
-Every name is folded to ASCII lower case first. A name is valid when it has 1 to 253 characters, no trailing dot, and labels of 1 to 63 characters from `a-z`, `0-9` and `-` that neither start nor end with `-`. The root zone is never valid, because the empty name is not.
+Every name is folded to ASCII lower case first. A name is valid when it has 1 to 253 characters, no trailing dot, and labels of 1 to 63 characters from `a-z`, `0-9` and `-` that neither start nor end with `-`. The `fqdn` and the `target` of a record may also carry `_` at any position of a label, as `_postgres._tcp.openstack.lab.internal` does. The root zone is never valid, because the empty name is not.
 
 | Entry | Skipped when |
 |-------|--------------|
 | `zones` | The name is invalid, or it is `arpa`, `local` or `localhost`, or lies under one of them. A zone listed twice is kept once, without a sentence |
 | `reverse_zones` | The name is invalid, or it does not end in `.in-addr.arpa` or `.ip6.arpa`. A reverse zone listed twice is kept once, without a sentence |
 | `hosts` | The `fqdn` is invalid, lies under no accepted zone, or is an accepted zone itself, because a host lies at least one label below its zone; the `mesh_ip` does not parse as an IP address, an empty one included; or an earlier entry holds the same `fqdn`, so the first one is kept. The checks run in this order, and the sentence names the first one that failed |
+| `records` | One of the record checks below fails. The checks run in their order, and the sentence, `record "<fqdn>" of type "<type>" <reason>`, names the first one that failed, with `fqdn` and `type` as the block spelled them |
 | `search_domain` | It is not an accepted zone. The Node then has no search domain |
 
 An accepted host's mesh IP is unmapped when it is an IPv4-mapped IPv6 address, and an IPv6 zone is dropped. The reverse name of the address, `<octets reversed>.in-addr.arpa` for IPv4 and `<32 nibbles reversed>.ip6.arpa` for IPv6, maps to the host's FQDN when it lies under an accepted reverse zone. When two hosts share an address, the first one holds the reverse name. Node IDs are carried but never answered.
+
+The records are checked after the hosts. The checks run in this order:
+
+| Check | The record is skipped when | Reason |
+|-------|----------------------------|--------|
+| Type | `type` is not exactly `A`, `AAAA`, `CNAME`, `TXT`, `SRV` or `MX`, in upper case | `has a type plexd does not answer` |
+| Name | `fqdn` is not a valid name | `is not a valid name because it <reason>` |
+| Zone | The name is no accepted zone and lies under none. A reverse zone does not count | `lies under no accepted zone` |
+| Host | An accepted host holds the name | `is the name of node "<node id>", which is answered from hosts only` |
+| Data | The data breaks the rule of its type in the table below | The rule's reason |
+| CNAME | The name already holds an accepted CNAME, or the record is a CNAME and the name already holds an accepted record | `shares its name with a CNAME, which is the only record at its name` |
+| Repeat | An accepted record of the same name and type has equal data, `text` compared in order | `repeats an earlier record` |
+
+The reason of an invalid name is one of `is empty`, `has more than 253 characters`, `ends in a dot`, `has an empty label`, `has a label of more than 63 characters`, `has a label that starts or ends with -` and `has a character outside a-z, 0-9, - and _`. The data rules:
+
+| Type | Rule | Reason |
+|------|------|--------|
+| `A` | `address` parses as an IP address without a zone, and it is an IPv4 address | `has address "<address>", which is not an IPv4 address` |
+| `AAAA` | `address` parses as an IP address without a zone, and it is an IPv6 address that is not IPv4-mapped | `has address "<address>", which is not an IPv6 address` |
+| `CNAME` | `target` is a valid name | `has target "<target>", which is not a valid name because it <reason>` |
+| `TXT` | `text` holds at least one string, and none is longer than 255 bytes | `has no text`, or `has a text string of more than 255 bytes` |
+| `SRV` | `priority`, `weight` and `port` are present and 0 to 65535, checked in this order, and `target` is a valid name | `has no <member>`, `has a <member> outside 0 to 65535`, or the target reason of a `CNAME` |
+| `MX` | `priority` is present and 0 to 65535, and `target` is a valid name | The same reasons as an `SRV` |
+
+A member the record's type does not take is ignored, so an `A` record that also carries a `target` is accepted, and a member a later contract adds costs no record. An empty `TXT` string is valid on the wire and accepted. An IPv4-mapped address is refused by both `A` and `AAAA`, while a host's mesh IP is unmapped. A target may lie inside or outside the mesh zones. plexd checks only what a DNS message needs, not the limits the control plane sets, such as 8 strings and 1,024 bytes per `TXT` or a port of at least 1, so a port of 0 is accepted and a change of those limits needs no new plexd.
+
+The first record at a name decides the CNAME check, so of a CNAME and another record at one name, the one the block lists first stays. The block is ordered by `fqdn`, then `type`, so an `A` or `AAAA` record keeps its name against a CNAME that follows it. The records of one name and type are answered in the block's order, on every query.
+
+An accepted record's name exists, and so does every name between it and its zone, so `_tcp.openstack.lab.internal` answers NODATA when `_postgres._tcp.openstack.lab.internal` holds a record. A record adds no reverse name: the reverse name of a record's `address` answers `NXDOMAIN` when it lies in an accepted reverse zone and no host holds it. A block without a `records` member, or with `null`, has no records. Because the block is the full set, that is no signal to keep the records held.
 
 ### Answer Table
 
 Every lookup is case-insensitive. The zone of a name is the accepted zone or reverse zone that is the name itself or its nearest ancestor, label by label. With the zones `lab.internal` and `openstack.lab.internal`, the zone of `x.openstack.lab.internal` is `openstack.lab.internal`.
 
-A name exists when it is a host's FQDN, a reverse name that maps to a host, a zone or reverse zone, or a name between a zone and an existing name below it. `0.42.10.in-addr.arpa` exists between the reverse zone `42.10.in-addr.arpa` and the reverse name `3.0.42.10.in-addr.arpa`.
+A name exists when it is a host's FQDN, a reverse name that maps to a host, a record's name, a zone or reverse zone, or a name between a zone and an existing name below it. `0.42.10.in-addr.arpa` exists between the reverse zone `42.10.in-addr.arpa` and the reverse name `3.0.42.10.in-addr.arpa`.
+
+Any query before the first `dns` block, and any name outside every accepted zone and reverse zone, gets `REFUSED`. Any other name is looked up by these steps, in this order, and the first step that applies gives the answer:
+
+1. A host of the queried family: the host's `A` record for an `A` query and an IPv4 mesh IP, or its `AAAA` record for an `AAAA` query and an IPv6 one.
+2. A `PTR` query for a reverse name that maps to a host: the `PTR` record naming the host's FQDN.
+3. A name that holds a CNAME: the CNAME, whatever the query type. A `CNAME` or `ANY` query gets the CNAME alone. Any other query follows the CNAME to its target and starts again at step 1 there, unless the CNAME ends the answer (see below).
+4. The records of the queried type at the name, in the block's order.
+5. An `SOA` query at an accepted zone or reverse zone itself: the synthesized `SOA`.
+6. A name that exists: NODATA.
+7. Any other name: `NXDOMAIN`.
+
+The CNAME step comes before the `SOA` step, so a CNAME at a zone itself answers an `SOA` query too. An `ANY` query gets no treatment of its own: it gets the CNAME at a name that holds one, and NODATA at any other name that exists.
 
 | Query | Response code | Records |
 |-------|---------------|---------|
@@ -114,17 +156,22 @@ A name exists when it is a host's FQDN, a reverse name that maps to a host, a zo
 | A host's FQDN, type `A`, IPv4 mesh IP | `NOERROR` | One `A` record |
 | A host's FQDN, type `AAAA`, IPv6 mesh IP | `NOERROR` | One `AAAA` record |
 | The reverse name of a host's mesh IP, type `PTR` | `NOERROR` | One `PTR` record naming the FQDN |
-| A zone or reverse zone itself, type `SOA` | `NOERROR` | The synthesized `SOA` as the answer |
-| A name that exists, asked for a type it has no record of: a host or a reverse name asked for another type, a zone or reverse zone asked for anything but `SOA`, or a name between a zone and a name below it (NODATA) | `NOERROR` | No answer; the `SOA` of the zone in the authority section |
+| A name that holds a CNAME, type `CNAME` or `ANY` | `NOERROR` | The CNAME |
+| A name that holds a CNAME, any other type | The target's response code while the target lies in the zones, `NOERROR` otherwise | The CNAME, then the answer at its target; see the paragraph below the table |
+| A record's name, asked for a type it holds records of | `NOERROR` | Every record of that type at the name, in the block's order |
+| A zone or reverse zone itself that holds no CNAME, type `SOA` | `NOERROR` | The synthesized `SOA` as the answer |
+| A name that exists, asked for a type it has no record of: a host or a reverse name asked for another type, a record's name asked for a type it holds none of, a zone or reverse zone asked for anything but `SOA` and the types of its records, or a name between a zone and a name below it (NODATA) | `NOERROR` | No answer; the `SOA` of the zone in the authority section |
 | Any other name in an accepted zone or reverse zone | `NXDOMAIN` | No answer; the `SOA` of the zone in the authority section |
 
-Every record carries a TTL of 10 seconds. systemd-resolved caches an answer for its TTL, so it serves a changed name for at most 10 seconds after the pull that changed it, and plexd never flushes its cache. A record in the answer section is owned by the question's name as the query spelled it. The `SOA` is owned by the zone as the query spelled it: the question name's last labels, as many as the zone has. A query for `NOPE.OpenStack.Lab.Internal` gets an `SOA` owned by `OpenStack.Lab.Internal`. Both owners therefore compress to a pointer into the question, which keeps every reply within 512 bytes.
+A CNAME is followed while its target lies under an accepted zone or reverse zone. The answer section then holds the CNAME first and the target's answer after it, and the response code is that of the last name (RFC 6604). A target name that does not exist gets `NXDOMAIN` with the CNAME in the answer section and the `SOA` of the target's zone in the authority section. A target that exists without a record of the queried type gets NODATA with the CNAME. A target outside every accepted zone and reverse zone ends the answer: the response is `NOERROR` with the CNAME alone, and the system resolver follows the target through its own servers, as systemd-resolved does. One answer holds at most 8 CNAME records, and a chain that comes back to a name it passed stops at the CNAME that points back. Both end the answer like a target outside the zones, so the client follows on from the last CNAME, and a loop fails at the client's own limit.
+
+Every record carries a TTL of 10 seconds. systemd-resolved caches an answer for its TTL, so it serves a changed name or record for at most 10 seconds after the pull that changed it, and plexd never flushes its cache. A record in the answer section whose owner is the question's name is owned by that name as the query spelled it. Any other record, such as the target's records after a CNAME, is owned by its folded name. The `SOA` is owned by the zone as the query spelled it: the question name's last labels, as many as the zone has. A query for `NOPE.OpenStack.Lab.Internal` gets an `SOA` owned by `OpenStack.Lab.Internal`. When the question's name does not end in the zone, as after a CNAME into another zone, the `SOA` is owned by the folded zone. An owner spelled like the question compresses to a pointer into it. An answer too large for its transport is handled as [Response Header](#response-header) describes.
 
 The synthesized `SOA`:
 
 | Field | Value |
 |-------|-------|
-| Owner | The zone, spelled as in the question |
+| Owner | The zone, spelled as in the question, or folded when the question's name does not end in it |
 | TTL | `10` |
 | MNAME | `ns.plexd.invalid.` |
 | RNAME | `hostmaster.plexd.invalid.` |
@@ -138,7 +185,11 @@ Nothing transfers these zones, so only the minimum matters. RFC 2308 makes a res
 
 ### Response Header
 
-The response echoes the query's ID, its opcode, its RD bit and its question exactly as received, upper case included. It sets QR, clears RA and never sets TC. AA is set on every `NOERROR` and `NXDOMAIN` answer from the records, and clear on `REFUSED`, `FORMERR` and `NOTIMP`.
+The response echoes the query's ID, its opcode, its RD bit and its question exactly as received, upper case included. It sets QR and clears RA. AA is set on every `NOERROR` and `NXDOMAIN` answer from the records, and clear on `REFUSED`, `FORMERR`, `NOTIMP` and `SERVFAIL`.
+
+A response over UDP carries at most 512 bytes when the query has no OPT record. With one, it carries at most the UDP payload size the client offers, but never less than 512 and never more than 1232 bytes. A response over that limit is sent with TC set and otherwise the same header, the question, no record in the answer and authority sections, and an OPT record when the query had one. The client then asks again over TCP. systemd-resolved offers 1472 bytes, so it gets up to 1232, and it repeats a truncated query over TCP. busybox `nslookup` sends no OPT record and ignores TC, so for an answer of more than 512 bytes it prints nothing and exits 0.
+
+A response over TCP carries up to 65,535 bytes, the most the two-byte length of a TCP message can count. A response over that limit, which takes more than 64 KiB of records at one name and type, is sent as `SERVFAIL` with AA clear, the question, no record, and an OPT record when the query had one. The server then logs `mesh dns answer does not fit a message` at Debug. The limit counts the message alone, not the two-byte length in front of it.
 
 When the query carries an OPT record, the response carries one with a UDP payload size of 1232 bytes, EDNS version 0, the DO bit clear and no options. plexd does not negotiate the EDNS version: a query with a higher version gets the same answer. A query with more than one OPT record gets `FORMERR` (RFC 6891), with one OPT record. A `FORMERR` response has no question section. It carries an OPT record when the query had one and the query's questions parse. A query with a question that does not parse gets a `FORMERR` without one, because plexd cannot find where its additional section begins.
 
@@ -241,7 +292,7 @@ func (m *Manager) Shutdown(ctx context.Context) error
 1. A nil snapshot returns at once.
 2. A snapshot without a `dns` block, the wire's `null` or a pull from a control plane that predates the block, keeps the names and the registration. The first such pull logs `state pull carries no dns block, keeping the names held`. Later ones log nothing until a block arrived in between.
 3. A block is built into records, which the server takes with an atomic swap, so a pull never blocks a query. Skipped entries log `mesh dns skipped invalid entries` with the count and the first five sentences, on every pull that carries them. Records that differ from the previous ones log `mesh dns records updated`, and the first block always counts as a change.
-4. The wanted registration is compared with the one systemd-resolved accepted last. When they are equal, nothing is called, so a pull that changes only hosts issues no bus call. When the wanted registration is empty, `Revert` is called, bounded by 5 seconds, if this run called `Apply` since its last successful revert, whether that `Apply` succeeded or failed. Otherwise `Apply` is called, bounded by 5 seconds.
+4. The wanted registration is compared with the one systemd-resolved accepted last. When they are equal, nothing is called, so a pull that changes only hosts or records issues no bus call. When the wanted registration is empty, `Revert` is called, bounded by 5 seconds, if this run called `Apply` since its last successful revert, whether that `Apply` succeeded or failed. Otherwise `Apply` is called, bounded by 5 seconds.
 5. After a failed `Apply` nothing counts as applied, so the next pull calls `Apply` again. A systemd-resolved that starts later, or a link that frees up, is picked up within one reconcile interval. On a host without a usable systemd-resolved each retry costs at most one bus call, the read of `DNSEx`, and changes nothing. A failed `Apply` can leave settings on the link, the earlier registration's or those of the steps that succeeded, so an empty registration on a later pull still reverts it. A failed revert counts as nothing reverted, so the next pull whose registration is empty reverts again.
 
 A pull whose context is already done, because plexd is stopping, still swaps the records but calls no registrar method. The drain's revert is the last word on the link.
@@ -252,7 +303,9 @@ A resolver failure never changes readiness. The health endpoints do not report t
 
 ## Every Zone on Every Node
 
-The block lists every zone of the Domain: its default domain and the zone of every Project. Every Node of the Domain answers and registers all of them, not only its own Project's. A Project whose zone is overridden to a name such as `edge.example.com` therefore takes that zone on this Node. The host sends every name under `edge.example.com` to plexd, which answers the mesh hosts there and `NXDOMAIN` for any other name, so the host no longer resolves the rest of that zone through its own DNS servers.
+The block lists every zone of the Domain: its default domain and the zone of every Project. Every Node of the Domain answers and registers all of them, not only its own Project's. A Project whose zone is overridden to a name such as `edge.example.com` therefore takes that zone on this Node. The host sends every name under `edge.example.com` to plexd, which answers the mesh hosts and the records there and `NXDOMAIN` for any other name, so the host no longer resolves the rest of that zone through its own DNS servers.
+
+The block also carries the records of the Domain and of every Project, and every Node answers all of them. A record a Project defines therefore resolves on every Node of the Domain, not only on the Nodes of that Project.
 
 `dns.enabled: false` is the Node operator's way out. It turns the resolver and its registration off on this Node, and plexd reverts the link at start.
 
@@ -308,6 +361,7 @@ rev-server=10.99.0.0/24,10.99.0.1#5354
 
 - The resolver answers the Node itself only. dnsmasq on the Node sends its queries to the Node's own mesh IP, and the kernel sends a packet for a local address from that address, so the [source rule](#source-rule) accepts them. A resolver in a Pod or container network sends from an address of its own, so the resolver drops its queries, and it cannot use the names this way.
 - The zone list of such a hand-written rule follows the Domain's zones by hand. When the Domain gains a zone that the lines do not cover, such as a Project's zone override, or its mesh CIDR changes, change the lines yourself: nothing updates them.
+- A CNAME whose target lies outside the mesh zones resolves only when the local resolver follows it, as systemd-resolved does. plexd answers such a name with the CNAME alone. A forwarder that passes the answer on as it is leaves the target to the program that asked.
 
 ## Log Lines
 
@@ -331,7 +385,7 @@ The manager logs these with `component=meshdns`:
 |--------|---------|------|
 | `Info` | `state pull carries no dns block, keeping the names held` | none. Once, and again only after a block arrived in between |
 | `Warn` | `mesh dns skipped invalid entries` | `count`, `skipped` (the first five sentences). On every pull whose block has skipped entries |
-| `Info` | `mesh dns records updated` | `hosts`, `zones`, `reverse_zones`, `search_domain` (empty when the Node has none) |
+| `Info` | `mesh dns records updated` | `hosts`, `records` (the number of accepted records), `zones`, `reverse_zones`, `search_domain` (empty when the Node has none) |
 | `Info` | `mesh dns registered with systemd-resolved` | `interface`, `server`, `search_domain`, `routing_domains` (the count) |
 | `Info` | `mesh dns not registered, systemd-resolved is not usable` | `listen`, `reason`. Once per change into that state |
 | `Warn` | `mesh dns registration failed` | `error`. Once per distinct error text |
@@ -348,6 +402,7 @@ The server and the registrar log at Debug only, with `component=meshdns`:
 | `mesh dns dropped a packet that gets no reply` | `source`, `bytes` |
 | `mesh dns dropped a message that gets no reply` | `bytes` (TCP) |
 | `mesh dns could not send a reply` | `source`, `error` |
+| `mesh dns answer does not fit a message` | `name`, `type`, `bytes` (the size of the full response). TCP; the response goes out as `SERVFAIL` |
 | `mesh dns could not pack a reply` | `error` |
 | `system bus unreachable` | `error` |
 | `systemd-resolved not usable` | `method`, or `property` (`DNSEx`) for the read before step 1; `error` |
@@ -357,7 +412,7 @@ A registered Node logs, for the [mock control plane's](../development/mock-api-s
 
 ```text
 level=INFO msg="mesh dns listening" listen=10.99.0.1:5354
-level=INFO msg="mesh dns records updated" component=meshdns hosts=3 zones=2 reverse_zones=1 search_domain=app.e2e.internal
+level=INFO msg="mesh dns records updated" component=meshdns hosts=3 records=8 zones=2 reverse_zones=1 search_domain=app.e2e.internal
 level=INFO msg="mesh dns registered with systemd-resolved" component=meshdns interface=plexd0 server=10.99.0.1:5354 search_domain=app.e2e.internal routing_domains=2
 ```
 
