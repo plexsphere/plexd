@@ -311,7 +311,7 @@ func TestRecords_SixteenReverseZones(t *testing.T) {
 		{"64.10.in-addr.arpa", dnsmessage.TypeSOA, refused},
 	})
 
-	reg := r.Registration("plexd0", netip.MustParseAddrPort("10.64.0.1:5354"))
+	reg := r.Registration("plexd0", netip.MustParseAddrPort("10.64.0.1:5354"), nil)
 	want := slices.Sorted(slices.Values(reverse))
 	if !slices.Equal(reg.RoutingDomains, want) {
 		t.Errorf("RoutingDomains = %q, want %q", reg.RoutingDomains, want)
@@ -338,7 +338,7 @@ func TestBuildRecords_EmptyBlock(t *testing.T) {
 	}
 	assertAnswersNothing(t, r)
 
-	reg := r.Registration("plexd0", netip.MustParseAddrPort("10.42.0.3:5354"))
+	reg := r.Registration("plexd0", netip.MustParseAddrPort("10.42.0.3:5354"), nil)
 	if !reg.Empty() {
 		t.Errorf("Registration() = %+v, want an empty registration", reg)
 	}
@@ -357,7 +357,7 @@ func TestRecords_NilAnswersRefused(t *testing.T) {
 	var r *Records
 	assertAnswersNothing(t, r)
 
-	reg := r.Registration("plexd0", netip.MustParseAddrPort("10.42.0.3:5354"))
+	reg := r.Registration("plexd0", netip.MustParseAddrPort("10.42.0.3:5354"), nil)
 	if !reg.Empty() {
 		t.Errorf("Registration() = %+v, want an empty registration", reg)
 	}
@@ -610,7 +610,7 @@ func TestRecords_SearchDomain(t *testing.T) {
 			if got := r.SearchDomain(); got != tt.want {
 				t.Errorf("SearchDomain() = %q, want %q", got, tt.want)
 			}
-			reg := r.Registration("plexd0", netip.MustParseAddrPort("10.42.0.3:5354"))
+			reg := r.Registration("plexd0", netip.MustParseAddrPort("10.42.0.3:5354"), nil)
 			if reg.SearchDomain != tt.want {
 				t.Errorf("Registration().SearchDomain = %q, want %q", reg.SearchDomain, tt.want)
 			}
@@ -716,7 +716,7 @@ func TestRecords_Registration(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := mustBuild(t, tt.block)
-			got := r.Registration("plexd0", server)
+			got := r.Registration("plexd0", server, nil)
 			if got.Interface != tt.want.Interface {
 				t.Errorf("Interface = %q, want %q", got.Interface, tt.want.Interface)
 			}
@@ -729,10 +729,77 @@ func TestRecords_Registration(t *testing.T) {
 			if !slices.Equal(got.RoutingDomains, tt.want.RoutingDomains) {
 				t.Errorf("RoutingDomains = %q, want %q", got.RoutingDomains, tt.want.RoutingDomains)
 			}
+			if got.DefaultRoute {
+				t.Errorf("DefaultRoute = true, want false without a forwarding table")
+			}
 			if got.Empty() {
 				t.Errorf("Empty() = true, want false for %+v", got)
 			}
 		})
+	}
+}
+
+func TestRecords_RegistrationForwarding(t *testing.T) {
+	server := netip.MustParseAddrPort("10.42.0.3:5354")
+	records := mustBuild(t, exampleBlock())
+	meshDomains := []string{"edge.example.com", "lab.internal", "42.10.in-addr.arpa"}
+	zones := []api.NodeStateDNSForwardZone{
+		fwdZone("corp.example.com", "192.0.2.1"),
+		// Under another forward zone, and above the mesh zone
+		// edge.example.com: neither is left out.
+		fwdZone("_msdcs.corp.example.com", "192.0.2.2"),
+		fwdZone("example.com", "192.0.2.3"),
+		fwdZone("2.0.192.in-addr.arpa", "192.0.2.4"),
+	}
+	forwardDomains := []string{"2.0.192.in-addr.arpa", "_msdcs.corp.example.com", "corp.example.com", "example.com"}
+	table := func(zones []api.NodeStateDNSForwardZone, catchAll ...string) *Forwarding {
+		return mustForward(t, api.NodeStateDNSForwarding{ForwardZones: zones, CatchAll: catchAll}, records)
+	}
+
+	tests := []struct {
+		name         string
+		records      *Records
+		fwd          *Forwarding
+		searchDomain string
+		routing      []string
+		defaultRoute bool
+	}{
+		{"nil table", records, nil, "openstack.lab.internal", meshDomains, false},
+		{"empty table", records, table(nil), "openstack.lab.internal", meshDomains, false},
+		{"forward zones", records, table(zones), "openstack.lab.internal", append(slices.Clone(meshDomains), forwardDomains...), false},
+		{"forward zones and a catch-all", records, table(zones, "198.51.100.1"), "openstack.lab.internal", append(slices.Clone(meshDomains), forwardDomains...), true},
+		{"catch-all only", records, table(nil, "198.51.100.1"), "openstack.lab.internal", meshDomains, true},
+		{"nil records", nil, table(zones, "198.51.100.1"), "", forwardDomains, true},
+		{"nil records, catch-all only", nil, table(nil, "198.51.100.1"), "", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.records.Registration("plexd0", server, tt.fwd)
+			want := Registration{
+				Interface:      "plexd0",
+				Server:         server,
+				SearchDomain:   tt.searchDomain,
+				RoutingDomains: tt.routing,
+				DefaultRoute:   tt.defaultRoute,
+			}
+			if !got.Equal(want) {
+				t.Errorf("Registration() = %+v, want %+v", got, want)
+			}
+			if got.Empty() {
+				t.Errorf("Empty() = true, want false for %+v", got)
+			}
+		})
+	}
+
+	// Without a table, or with one that forwards nothing, the registration
+	// is the one the records alone give.
+	alone := records.Registration("plexd0", server, nil)
+	if got := records.Registration("plexd0", server, table(nil)); !got.Equal(alone) {
+		t.Errorf("Registration() with an empty table = %+v, want %+v", got, alone)
+	}
+	var none *Records
+	if got := none.Registration("plexd0", server, nil); !got.Empty() {
+		t.Errorf("Registration() of nil records and a nil table = %+v, want an empty one", got)
 	}
 }
 
@@ -748,6 +815,8 @@ func TestRegistration_Empty(t *testing.T) {
 		{"empty routing slice", Registration{Interface: "plexd0", Server: server, RoutingDomains: []string{}}, true},
 		{"search domain only", Registration{SearchDomain: "lab.internal"}, false},
 		{"routing domain only", Registration{RoutingDomains: []string{"42.10.in-addr.arpa"}}, false},
+		// A catch-all without any zone still routes every other name.
+		{"default route only", Registration{Interface: "plexd0", Server: server, DefaultRoute: true}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -784,6 +853,7 @@ func TestRegistration_Equal(t *testing.T) {
 		{"routing domain added", with(func(r *Registration) { r.RoutingDomains = append(r.RoutingDomains, "43.10.in-addr.arpa") }), false},
 		{"routing domain order", with(func(r *Registration) { slices.Reverse(r.RoutingDomains) }), false},
 		{"routing domains nil", with(func(r *Registration) { r.RoutingDomains = nil }), false},
+		{"default route", with(func(r *Registration) { r.DefaultRoute = true }), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

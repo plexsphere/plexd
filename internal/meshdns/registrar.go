@@ -15,7 +15,8 @@ var ErrUnavailable = errors.New("meshdns: no usable system resolver")
 
 // Registration is what plexd asks the system resolver to send to the mesh
 // resolver: the queries for RoutingDomains and, through the search domain,
-// the bare host names of the node's own Project, on the mesh interface only.
+// the bare host names of the node's own Project, on the mesh interface only,
+// and with DefaultRoute every name no other link claims.
 type Registration struct {
 	// Interface is the name of the mesh interface the registration is bound
 	// to, so the system resolver sends the queries through that link.
@@ -26,16 +27,21 @@ type Registration struct {
 	// node has none. A search domain is also a routing domain, so it is not
 	// listed again in RoutingDomains.
 	SearchDomain string
-	// RoutingDomains are the zones and reverse zones the system resolver
-	// sends to Server, without the search domain.
+	// RoutingDomains are the zones, reverse zones and forward zones the
+	// system resolver sends to Server, without the search domain.
 	RoutingDomains []string
+	// DefaultRoute makes the link the host's default DNS route, so the
+	// system resolver sends Server every name that no domain of another link
+	// matches. It is set while the forwarding table has a catch-all
+	// resolver.
+	DefaultRoute bool
 }
 
-// Empty reports whether the registration names no domain at all. Applying
-// one would route nothing to the mesh resolver, so the manager reverts the
-// link instead.
+// Empty reports whether the registration names no domain at all and does
+// not make the link the default route. Applying one would route nothing to
+// the mesh resolver, so the manager reverts the link instead.
 func (r Registration) Empty() bool {
-	return r.SearchDomain == "" && len(r.RoutingDomains) == 0
+	return r.SearchDomain == "" && len(r.RoutingDomains) == 0 && !r.DefaultRoute
 }
 
 // Equal reports whether r and o register the same thing, comparing every
@@ -46,7 +52,8 @@ func (r Registration) Equal(o Registration) bool {
 	return r.Interface == o.Interface &&
 		r.Server == o.Server &&
 		r.SearchDomain == o.SearchDomain &&
-		slices.Equal(r.RoutingDomains, o.RoutingDomains)
+		slices.Equal(r.RoutingDomains, o.RoutingDomains) &&
+		r.DefaultRoute == o.DefaultRoute
 }
 
 // Registrar is the seam to the operating system's resolver. Each platform

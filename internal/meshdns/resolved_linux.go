@@ -174,11 +174,13 @@ func NewResolvedRegistrar(logger *slog.Logger) *ResolvedRegistrar {
 // Apply registers reg on its interface. It first reads the Manager property
 // DNSEx, so a systemd-resolved older than 246 is told apart before anything on
 // the link changes; a failed read is followed by no other call. Then it makes
-// seven calls. The default-route flag goes first, so the link never answers
-// names outside its domains, and the server goes last, so a failure halfway
-// leaves a link without a server, which systemd-resolved never asks. A
-// failure after the first step reverts the link, ignoring the result, so the
-// next Apply starts from a clean link.
+// seven calls. The default-route flag goes first, so a link that is to answer
+// its domains only stops answering other names before anything else changes,
+// and the server goes last, so a failure halfway leaves a link without a
+// server, which systemd-resolved never asks. A failure after the first step
+// reverts the link, ignoring the result, so the next Apply starts from a
+// clean link. With reg.DefaultRoute the flag is set and the routing domain
+// "." ends the domains, so the link answers every name no other link claims.
 //
 // When ctx has a deadline, the probe and the steps run under one that is a
 // fifth of the remaining time earlier, and the revert runs under ctx. godbus
@@ -248,14 +250,21 @@ func (r *ResolvedRegistrar) probeError(err error) error {
 
 // applySteps returns the calls of Apply in their order. The search domain is
 // listed once, as a search domain, because it routes the names under it as
-// well and systemd-resolved keeps one entry for a domain listed twice.
+// well and systemd-resolved keeps one entry for a domain listed twice. With
+// reg.DefaultRoute the link becomes the default route, and the routing domain
+// "." goes last: systemd-resolved then sends every name that no other link's
+// domain matches to this link only, where the flag alone would have it ask
+// this link and every other default-route link alike.
 func applySteps(index int32, reg Registration) []resolvedStep {
-	domains := make([]linkDomain, 0, len(reg.RoutingDomains)+1)
+	domains := make([]linkDomain, 0, len(reg.RoutingDomains)+2)
 	if reg.SearchDomain != "" {
 		domains = append(domains, linkDomain{Domain: reg.SearchDomain, RoutingOnly: false})
 	}
 	for _, d := range reg.RoutingDomains {
 		domains = append(domains, linkDomain{Domain: d, RoutingOnly: true})
+	}
+	if reg.DefaultRoute {
+		domains = append(domains, linkDomain{Domain: ".", RoutingOnly: true})
 	}
 
 	addr := reg.Server.Addr().Unmap()
@@ -272,9 +281,11 @@ func applySteps(index int32, reg Registration) []resolvedStep {
 
 	// DNSSEC is off because a private zone such as lab.internal has no chain
 	// of trust, and the other transports are off because the resolver speaks
-	// plain DNS on the mesh only.
+	// plain DNS on the mesh only. Both hold for every name the link answers,
+	// so with a catch-all no name the host resolves through it is validated
+	// or sent over TLS.
 	return []resolvedStep{
-		{method: "SetLinkDefaultRoute", args: []any{index, false}, tellsVersion: true},
+		{method: "SetLinkDefaultRoute", args: []any{index, reg.DefaultRoute}, tellsVersion: true},
 		{method: "SetLinkDomains", args: []any{index, domains}},
 		{method: "SetLinkDNSSEC", args: []any{index, "no"}},
 		{method: "SetLinkDNSOverTLS", args: []any{index, "no"}},
