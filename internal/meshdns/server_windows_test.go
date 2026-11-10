@@ -8,3 +8,8 @@ import "golang.org/x/sys/windows"
 // address and port. Winsock reports WSAEADDRINUSE, which Go returns as a
 // plain syscall.Errno that does not match syscall.EADDRINUSE.
 var errAddrInUse error = windows.WSAEADDRINUSE
+
+// errConnRefused is the errno a TCP dial fails with when nothing listens on
+// the port. Winsock reports WSAECONNREFUSED, which Go returns as a plain
+// syscall.Errno that does not match syscall.ECONNREFUSED.
+var errConnRefused error = windows.WSAECONNREFUSED
