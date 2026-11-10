@@ -495,7 +495,7 @@ func TestManager_AppliesOnlyWhenRegistrationChanges(t *testing.T) {
 				return
 			}
 			wantMethods(t, reg, "Apply", "Apply")
-			want := mustBuild(t, changed).Registration(testIface, m.Addr())
+			want := mustBuild(t, changed).Registration(testIface, m.Addr(), nil)
 			if got := reg.recorded()[1].reg; !got.Equal(want) {
 				t.Errorf("second Apply(%+v), want Apply(%+v)", got, want)
 			}

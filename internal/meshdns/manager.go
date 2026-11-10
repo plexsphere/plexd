@@ -148,7 +148,7 @@ func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot) {
 	}
 	m.records = records
 
-	m.register(ctx, records.Registration(m.iface, m.server.Addr()))
+	m.register(ctx, records.Registration(m.iface, m.server.Addr(), nil))
 }
 
 // register brings the system resolver in step with want. The caller holds

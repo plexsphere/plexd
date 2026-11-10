@@ -481,23 +481,29 @@ func (r *Records) Lookup(name string, qtype dnsmessage.Type) Answer {
 // when every Project has a zone under the Domain's default domain. The search
 // domain is a routing domain too, so it is left out as well. Reverse zones
 // are never merged: a wider zone would make plexd deny the addresses outside
-// the mesh. Each group is in ascending byte order, so equal records give equal
-// registrations.
-func (r *Records) Registration(iface string, server netip.AddrPort) Registration {
+// the mesh. The accepted forward zones of fwd follow, every one of them, so
+// the link lists each zone the node forwards. Each group is in ascending byte
+// order, so equal records and tables give equal registrations. DefaultRoute is
+// set when fwd has a catch-all resolver. A nil r adds no zone and no search
+// domain, and a nil fwd no forward zone and no default route.
+func (r *Records) Registration(iface string, server netip.AddrPort, fwd *Forwarding) Registration {
 	reg := Registration{Interface: iface, Server: server}
-	if r == nil {
-		return reg
-	}
-	reg.SearchDomain = r.searchDomain
-	for _, z := range r.zones {
-		// apexes holds the reverse zones too, but no zone lies under arpa, so
-		// only an accepted zone can be found above z.
-		if z == r.searchDomain || hasProperAncestor(z, r.apexes) {
-			continue
+	if r != nil {
+		reg.SearchDomain = r.searchDomain
+		for _, z := range r.zones {
+			// apexes holds the reverse zones too, but no zone lies under
+			// arpa, so only an accepted zone can be found above z.
+			if z == r.searchDomain || hasProperAncestor(z, r.apexes) {
+				continue
+			}
+			reg.RoutingDomains = append(reg.RoutingDomains, z)
 		}
-		reg.RoutingDomains = append(reg.RoutingDomains, z)
+		reg.RoutingDomains = append(reg.RoutingDomains, r.reverseZones...)
 	}
-	reg.RoutingDomains = append(reg.RoutingDomains, r.reverseZones...)
+	if fwd != nil {
+		reg.RoutingDomains = append(reg.RoutingDomains, fwd.zones...)
+	}
+	reg.DefaultRoute = fwd.CatchAllCount() > 0
 	return reg
 }
 

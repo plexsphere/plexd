@@ -217,11 +217,14 @@ func TestNewResolvedRegistrar(t *testing.T) {
 }
 
 func TestResolvedApplyCalls(t *testing.T) {
+	// defaultRoute is the flag SetLinkDefaultRoute must get. Every case
+	// without it has no "." among its domains.
 	tests := []struct {
-		name    string
-		reg     Registration
-		domains []linkDomain
-		server  linkDNSServer
+		name         string
+		reg          Registration
+		defaultRoute bool
+		domains      []linkDomain
+		server       linkDNSServer
 	}{
 		{
 			name: "IPv4 server with search domain",
@@ -280,6 +283,38 @@ func TestResolvedApplyCalls(t *testing.T) {
 			domains: []linkDomain{{Domain: "e2e.internal", RoutingOnly: true}},
 			server:  linkDNSServer{Family: unix.AF_INET, Address: []byte{10, 99, 0, 1}, Port: 5354, Name: ""},
 		},
+		{
+			// A catch-all makes the link the default route, and "." routes
+			// every name no other link claims to it alone.
+			name: "default route",
+			reg: Registration{
+				Interface:      "plexd0",
+				Server:         netip.MustParseAddrPort("10.99.0.1:5354"),
+				SearchDomain:   "app.e2e.internal",
+				RoutingDomains: []string{"e2e.internal", "0.99.10.in-addr.arpa", "corp.example.com"},
+				DefaultRoute:   true,
+			},
+			defaultRoute: true,
+			domains: []linkDomain{
+				{Domain: "app.e2e.internal", RoutingOnly: false},
+				{Domain: "e2e.internal", RoutingOnly: true},
+				{Domain: "0.99.10.in-addr.arpa", RoutingOnly: true},
+				{Domain: "corp.example.com", RoutingOnly: true},
+				{Domain: ".", RoutingOnly: true},
+			},
+			server: linkDNSServer{Family: unix.AF_INET, Address: []byte{10, 99, 0, 1}, Port: 5354, Name: ""},
+		},
+		{
+			name: "default route without a domain",
+			reg: Registration{
+				Interface:    "plexd0",
+				Server:       netip.MustParseAddrPort("10.99.0.1:5354"),
+				DefaultRoute: true,
+			},
+			defaultRoute: true,
+			domains:      []linkDomain{{Domain: ".", RoutingOnly: true}},
+			server:       linkDNSServer{Family: unix.AF_INET, Address: []byte{10, 99, 0, 1}, Port: 5354, Name: ""},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -290,7 +325,7 @@ func TestResolvedApplyCalls(t *testing.T) {
 			index := int32(testLinkIndex)
 			want := []recordedBusCall{
 				{method: probeMethod, args: probeArgs},
-				{method: "SetLinkDefaultRoute", args: []any{index, false}},
+				{method: "SetLinkDefaultRoute", args: []any{index, tc.defaultRoute}},
 				{method: "SetLinkDomains", args: []any{index, tc.domains}},
 				{method: "SetLinkDNSSEC", args: []any{index, "no"}},
 				{method: "SetLinkDNSOverTLS", args: []any{index, "no"}},
