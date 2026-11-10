@@ -16,7 +16,7 @@ The `internal/api` package provides the Go client for communicating with the Ple
 |-------------------------|-----------------|---------|------------------------------------------------|
 | `BaseURL`               | `string`        | —       | Control plane API base URL (required)          |
 | `TLSInsecureSkipVerify` | `bool`          | `false` | Disable TLS certificate verification           |
-| `ConnectTimeout`        | `time.Duration` | `10s`   | TCP connection timeout                         |
+| `ConnectTimeout`        | `time.Duration` | `10s`   | TCP connection timeout. Bounds the ordinary dial and the [dial fallback](#dial-fallback) each |
 | `RequestTimeout`        | `time.Duration` | `30s`   | Full HTTP request/response timeout; bounds only the setup of the SSE stream |
 | `SSEIdleTimeout`        | `time.Duration` | `90s`   | Max idle time before SSE reconnect; the only bound on an open stream. Must not be negative |
 | `SSEReprobeInterval`    | `time.Duration` | `10m`   | How often pull-only delivery re-probes a descoped SSE endpoint |
@@ -43,10 +43,33 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 ```
 
 - Applies config defaults and validates
+- Installs the [dial fallback](#dial-fallback) as the transport's dialer
 - Configures TLS, connect timeout, request timeout (`ConnectSSE` and `OpenSessionConnection` send through a copy without the request timeout, see [SSE Stream](#sse-stream))
 - Sets `User-Agent: plexd/{version}` on all requests
 - Gzip-compresses request bodies larger than 1 KiB **on the three observability ingest operations only** — they are the ones whose contract accepts `Content-Encoding: gzip`. Every other handler decodes the body as it arrives, so a compressed one is read as JSON and refused with `400`, naming the gzip magic byte as `invalid character '\x1f'`.
 - Transparently decompresses gzip responses
+
+### Dial Fallback
+
+The transport dials through `fallbackDialer`, which keeps plexd reaching the control plane while the control plane's name does not resolve on the Node. That happens when the Node's [mesh DNS catch-all](../networking/mesh-dns.md#the-catch-all-as-default-route) sends every name to resolvers that do not answer: the pull that corrects the setting still arrives, and the setting is corrected from the control plane rather than on every Node by hand.
+
+| Case | What the dialer does |
+|------|----------------------|
+| A dial succeeds, and the address's host is a name | Returns the connection and keeps its remote IP, an IPv4-mapped address unmapped, under the name. One address per name, in memory only; a later success replaces it |
+| A dial succeeds, and the host is an IP literal | Returns the connection and keeps nothing |
+| A dial fails with an error that holds a `*net.DNSError` (`errors.As`), the request's context is live, and an address is kept for the name | Dials the kept address once, with the port of the request, and returns that connection or that dial's error |
+| A dial fails with a `*net.DNSError` for a name without a kept address | Returns the error unchanged, with no second dial |
+| A dial fails with any other error, such as a refused connection | Returns the error unchanged, with no second dial |
+| A dial fails after the request's context ended | Returns the error unchanged, with no second dial. A lookup that the context cuts short fails with a `*net.DNSError` too, although the name may resolve |
+
+Each dial is a `net.Dialer` dial bounded by `ConnectTimeout`. TLS still verifies the certificate against the host name of the URL, because the transport takes the server name from the request and not from the dialed address. Every request of the client goes through the same transport, so the SSE stream, the session WebSocket and the upload of execution output fall back too. Nothing persists across a restart. A restart that resumes its identity dials the control plane for the first time after `plexd up` has set up mesh DNS, and by then the mesh interface's link holds no setting plexd made (see [Stop, Crash and Opt-Out](../networking/mesh-dns.md#stop-crash-and-opt-out)), so the name resolves through the host's own servers then and the address is kept from the first dial.
+
+| Level  | Message | Keys |
+|--------|---------|------|
+| `Warn` | `control plane name does not resolve, dialing its last address` | `host`, `address` (the kept address with the request's port, such as `203.0.113.10:443`), `error` (the original dial error). Logged on the first fallback of a name, before the fallback dial, and again only after the name resolved in between |
+| `Info` | `control plane name resolves again` | `host`. The first ordinary dial of the name that succeeds after a logged fallback |
+
+The lines go to the logger passed to `NewControlPlane`, without a `component` key.
 
 ### Authentication
 

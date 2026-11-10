@@ -5,9 +5,9 @@ package: internal/meshdns
 
 # Mesh DNS
 
-The `internal/meshdns` package answers the mesh names of the Node's Domain, and the DNS records the Domain and its Projects define, from a resolver on the Node itself. The names and the records come from the `dns` block of the state pull (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)), which the "Mesh DNS names" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes. On Linux, plexd registers the resolver with systemd-resolved for the mesh zones only, on the mesh interface. The host then asks plexd for the mesh zones and resolves every other name as before.
+The `internal/meshdns` package answers the mesh names of the Node's Domain, and the DNS records the Domain and its Projects define, from a resolver on the Node itself. The same resolver forwards the names of the forward zones the Node's forwarding setting names to the resolvers listed with them, and with a catch-all every other name to the catch-all resolvers. The names, the records and the forwarding setting come from the `dns` block of the state pull (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)), which the "Mesh DNS names" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes. On Linux, plexd registers the resolver with systemd-resolved for the mesh zones and the forward zones, on the mesh interface, and with a catch-all it makes that link the host's default DNS route. The host then asks plexd for those zones, and with a catch-all for every name no other link's domain matches, and resolves every other name as before.
 
-plexd is not recursive. It answers `A`, `AAAA` and `PTR` queries for the Nodes' names and mesh IPs, and queries for the records of the six types `A`, `AAAA`, `CNAME`, `TXT`, `SRV` and `MX`. It denies every other name in the mesh zones and refuses every name outside them. It follows a CNAME while its target lies in the mesh zones, and answers one whose target lies outside them with the CNAME alone, for the system resolver to follow. It writes no file and changes no resolver setting of the host outside the mesh interface's link.
+plexd is not recursive. It answers `A`, `AAAA` and `PTR` queries for the Nodes' names and mesh IPs, and queries for the records of the six types `A`, `AAAA`, `CNAME`, `TXT`, `SRV` and `MX`. It denies every other name in the mesh zones. A name outside them goes to the resolvers of the forwarding setting when a forward zone covers it or a catch-all is set: plexd passes the query on and relays the reply, and keeps no cache (see [Forwarding](#forwarding)). It refuses every other name outside the mesh zones. It follows a CNAME while its target lies in the mesh zones, and answers one whose target lies outside them with the CNAME alone, for the system resolver to follow. It answers the Node itself only, forwarded names included. It writes no file and changes no resolver setting of the host outside the mesh interface's link, although a catch-all makes that link the host's default DNS route.
 
 Only Linux runs the resolver, in node mode and in bridge mode. On macOS and Windows `plexd up` starts no resolver and logs nothing about it. The `dns` keys are still parsed and validated there.
 
@@ -18,23 +18,30 @@ Control Plane
       │
       │ GET /v1/nodes/{id}/state  →  dns block
       ▼
-┌──────────────┐    ┌────────────────────┐
-│  Reconciler  │───▶│   meshdns.Manager  │
-│              │    │       Handle       │
-└──────────────┘    └──┬──────────────┬──┘
-                       │ SetRecords   │ Apply / Revert
-                       ▼              ▼
-               ┌────────────────┐  ┌───────────────────┐
-               │     Server     │  │ ResolvedRegistrar │─ D-Bus ─▶ systemd-resolved
-               │ mesh IP : 5354 │  └───────────────────┘
+┌──────────────┐    ┌──────────────────────────┐
+│  Reconciler  │───▶│     meshdns.Manager      │
+│              │    │          Handle          │
+└──────────────┘    └──┬────────────────────┬──┘
+                       │ SetRecords         │ Apply / Revert
+                       │ SetForwarding      │
+                       ▼                    ▼
+               ┌────────────────┐       ┌───────────────────┐
+               │     Server     │       │ ResolvedRegistrar │─ D-Bus ─▶ systemd-resolved
+               │ mesh IP : 5354 │       └───────────────────┘
                └────────────────┘
-                       ▲
-                       │ queries for the mesh zones, through the mesh interface
-                       │
-               systemd-resolved
+                   ▲          │
+                   │          │ forwarded queries over UDP or TCP, port 53
+                   │          ▼
+                   │    forward zone and catch-all resolvers
+                   │
+                   │ queries for the mesh zones and the forward zones, and with a
+                   │ catch-all every name no other link's domain matches, through
+                   │ the mesh interface
+                   │
+           systemd-resolved
 ```
 
-A pull with a `dns` block replaces the names the server answers. It replaces the registration only when the one the block implies differs from the one applied, so a pull that changes only hosts or records issues no call to systemd-resolved. A pull without a block changes nothing. plexd keeps the names in memory only. A restart starts without names, as it starts without peers, and both come back with the first pull.
+A pull with a `dns` block replaces the names the server answers and the forwarding table it forwards with. It replaces the registration only when the one the block implies differs from the one applied, so a pull that changes only hosts, records or resolvers issues no call to systemd-resolved, as long as the accepted forward zones stay the same and an accepted catch-all resolver neither appears nor goes. A pull without a block changes nothing. plexd keeps the names and the forwarding table in memory only. A restart starts without names and forwards nothing, as it starts without peers, and all of them come back with the first pull.
 
 ## Config
 
@@ -80,7 +87,11 @@ A program on the Node that queries the mesh IP directly, such as `dig @10.99.0.1
 
 ### TCP
 
-TCP frames each message with a two-byte length (RFC 7766). A connection may carry several queries in a row. Each complete query must arrive within 10 seconds, counted from the accept or from the answer before it, or the connection is closed. At most 32 connections are open at a time, and a further one is closed at accept. A message on a connection that gets no reply (see [Malformed and Refused Queries](#malformed-and-refused-queries)) is skipped, and the connection stays open. A skipped message does not restart the 10 seconds: only a reply does.
+TCP frames each message with a two-byte length (RFC 7766). A connection may carry several queries, and a client may send the next one before the reply to the one before has arrived, as systemd-resolved does for lookups that run at the same time. plexd reads the queries in order and answers every query it does not forward at once, a mesh name included. A forwarded query gets its reply once its resolvers answered or failed, so the replies can go out in another order than the queries, as RFC 7766 section 7 allows, and the client matches them by message ID (see [The Reply](#the-reply)). Each reply goes out whole, behind its own length.
+
+plexd reads a connection for 10 seconds after the accept, and for 10 seconds again after each reply it sends and after each query it forwards. A forwarded query gets its reply within 4 seconds (see [Asking the Resolvers](#asking-the-resolvers)), so the 10 seconds do not pass while it waits for its resolvers, and plexd reads on meanwhile. When the 10 seconds pass, or the client closes its side, plexd reads no further query from the connection, waits for its forwarded queries still in flight, sends their replies, and closes it. Each reply has 10 seconds to be written, and a write that fails closes the connection. At most 32 connections are open at a time, and a further one is closed at accept. A message on a connection that gets no reply (see [Malformed and Refused Queries](#malformed-and-refused-queries)) is skipped, and the connection stays open. A skipped message does not restart the 10 seconds: only a reply or a forwarded query does.
+
+A connection holds at most 16 forwarded queries whose replies are not written yet (see [The Reply](#the-reply)). A client that stops reading its replies therefore stops plexd reading its queries once 16 replies to its forwarded queries wait for it, until it reads again or the 10 seconds of the waiting write pass, which closes the connection.
 
 An accept that fails on a listener that is still open, for example with `EMFILE` while the process is out of file descriptors, is retried. It logs `mesh dns could not accept a connection` at Debug and waits before the next accept: 5 milliseconds at first, doubled after each further failure up to 1 second, and back to 5 milliseconds after an accept that succeeds. The wait ends at once when plexd stops. Such a failure stops neither TCP nor UDP serving.
 
@@ -137,7 +148,7 @@ Every lookup is case-insensitive. The zone of a name is the accepted zone or rev
 
 A name exists when it is a host's FQDN, a reverse name that maps to a host, a record's name, a zone or reverse zone, or a name between a zone and an existing name below it. `0.42.10.in-addr.arpa` exists between the reverse zone `42.10.in-addr.arpa` and the reverse name `3.0.42.10.in-addr.arpa`.
 
-Any query before the first `dns` block, and any name outside every accepted zone and reverse zone, gets `REFUSED`. Any other name is looked up by these steps, in this order, and the first step that applies gives the answer:
+Any query before the first `dns` block gets `REFUSED`, and so does any name outside every accepted zone and reverse zone that the forwarding table does not route. A name outside them that the table routes goes to its resolvers instead (see [Forwarding](#forwarding)). Any other name is looked up by these steps, in this order, and the first step that applies gives the answer:
 
 1. A host of the queried family: the host's `A` record for an `A` query and an IPv4 mesh IP, or its `AAAA` record for an `AAAA` query and an IPv6 one.
 2. A `PTR` query for a reverse name that maps to a host: the `PTR` record naming the host's FQDN.
@@ -152,7 +163,8 @@ The CNAME step comes before the `SOA` step, so a CNAME at a zone itself answers 
 | Query | Response code | Records |
 |-------|---------------|---------|
 | Any query before the first `dns` block | `REFUSED` | none |
-| A name outside every accepted zone and reverse zone | `REFUSED` | none |
+| A name outside every accepted zone and reverse zone that `Route` does not route: no forward zone covers it and no catch-all resolver is accepted | `REFUSED` | none |
+| A name outside every accepted zone and reverse zone that `Route` routes, in a query plexd forwards (see [What Is Forwarded](#what-is-forwarded)) | The resolver's, or `SERVFAIL` when no resolver answers | The resolver's reply; see [Forwarding](#forwarding) |
 | A host's FQDN, type `A`, IPv4 mesh IP | `NOERROR` | One `A` record |
 | A host's FQDN, type `AAAA`, IPv6 mesh IP | `NOERROR` | One `AAAA` record |
 | The reverse name of a host's mesh IP, type `PTR` | `NOERROR` | One `PTR` record naming the FQDN |
@@ -185,9 +197,9 @@ Nothing transfers these zones, so only the minimum matters. RFC 2308 makes a res
 
 ### Response Header
 
-The response echoes the query's ID, its opcode, its RD bit and its question exactly as received, upper case included. It sets QR and clears RA. AA is set on every `NOERROR` and `NXDOMAIN` answer from the records, and clear on `REFUSED`, `FORMERR`, `NOTIMP` and `SERVFAIL`.
+The response echoes the query's ID, its opcode, its RD bit and its question exactly as received, upper case included. It sets QR and clears RA. AA is set on every `NOERROR` and `NXDOMAIN` answer from the records, and clear on `REFUSED`, `FORMERR`, `NOTIMP` and `SERVFAIL`. A relayed reply is the resolver's own message with the query's ID written back, so it keeps the resolver's header, its flags and its response code (see [The Reply](#the-reply)).
 
-A response over UDP carries at most 512 bytes when the query has no OPT record. With one, it carries at most the UDP payload size the client offers, but never less than 512 and never more than 1232 bytes. A response over that limit is sent with TC set and otherwise the same header, the question, no record in the answer and authority sections, and an OPT record when the query had one. The client then asks again over TCP. systemd-resolved offers 1472 bytes, so it gets up to 1232, and it repeats a truncated query over TCP. busybox `nslookup` sends no OPT record and ignores TC, so for an answer of more than 512 bytes it prints nothing and exits 0.
+A response over UDP carries at most 512 bytes when the query has no OPT record. With one, it carries at most the UDP payload size the client offers, but never less than 512 and never more than 1232 bytes. A response over that limit is sent with TC set and otherwise the same header, the question, no record in the answer and authority sections, and an OPT record when the query had one. The client then asks again over TCP. The limit holds for a relayed reply too. systemd-resolved offers 1472 bytes, so it gets up to 1232, and it repeats a truncated query over TCP. busybox `nslookup` sends no OPT record and ignores TC, so for an answer of more than 512 bytes it prints nothing and exits 0.
 
 A response over TCP carries up to 65,535 bytes, the most the two-byte length of a TCP message can count. A response over that limit, which takes more than 64 KiB of records at one name and type, is sent as `SERVFAIL` with AA clear, the question, no record, and an OPT record when the query had one. The server then logs `mesh dns answer does not fit a message` at Debug. The limit counts the message alone, not the two-byte length in front of it.
 
@@ -205,7 +217,111 @@ When the query carries an OPT record, the response carries one with a UDP payloa
 | A class other than `IN` | `REFUSED` |
 | A source that is neither the listen address nor a loopback address | No reply over UDP; the TCP connection is closed at accept |
 
-The opcode is checked before the questions and the OPT records, so a query with another opcode gets `NOTIMP` however many OPT records it carries.
+The opcode is checked before the questions and the OPT records, so a query with another opcode gets `NOTIMP` however many OPT records it carries. None of these messages is forwarded, whatever its name.
+
+## Forwarding
+
+The `forwarding` member of the `dns` block says where the names outside the mesh go: each forward zone with the resolvers that answer the names under it, and the catch-all resolvers that answer every name outside the mesh zones, the reverse zones and the forward zones. The control plane sends the setting that applies to the Node: its Project's when the Project holds one, otherwise its Domain's, otherwise two empty lists. Forward zones come ascending by zone, each with 1 to 3 resolvers, and the catch-all holds 0 to 3. A resolver is an IPv4 or IPv6 address in text form, asked in list order on port 53 over plain DNS. The contract's example:
+
+```json
+"forwarding": {
+  "forward_zones": [
+    { "zone": "2.0.192.in-addr.arpa", "resolvers": ["10.1.2.3"] },
+    { "zone": "corp.example.com", "resolvers": ["10.1.2.3", "10.1.2.4"] },
+    { "zone": "corp.local", "resolvers": ["10.1.2.5"] }
+  ],
+  "catch_all": ["10.1.2.53"]
+}
+```
+
+A block without the member, or with `"forwarding": null`, keeps the forwarding the Node holds (see [Following the State Pull](#following-the-state-pull)). Two empty lists end it. A `null` or missing list inside the member is an empty one.
+
+plexd forwards on its listen address, for the Node itself only, as it answers the mesh names (see [Source Rule](#source-rule)). It is still not recursive: it passes the client's query on to the resolvers and relays their reply, and it keeps no cache.
+
+### Forward Zones and Resolvers
+
+`BuildForwarding(setting api.NodeStateDNSForwarding, records *Records, self netip.Addr) (*Forwarding, []string)` turns the member into the immutable `Forwarding` table the server forwards with, and returns one sentence for each entry it skipped. `records` supplies the accepted zones and reverse zones, and a nil `records` has none. `self` is the resolver's listen address. As with the records, the control plane is trusted, but every entry is checked where it enters for what would break the host: a zone that takes the host's own names, or a resolver that sends the query back to the host. plexd does not check the limits the control plane sets on the number of forward zones and resolvers, so a change of those limits needs no new plexd.
+
+A forward zone is folded to ASCII lower case and checked in this order, and the first check it fails skips it with its sentence. `<zone>` is the zone as the member spelled it, and `<name>` the folded name:
+
+| Check | The forward zone is skipped when | Sentence |
+|-------|----------------------------------|----------|
+| Name | The name is not valid by the rule of [Records](#records), with `_` allowed at any position of a label, as in `_msdcs.corp.example.com` | `forward zone "<zone>" is not a valid name because it <reason>` |
+| Reserved | The name is `local`, `localhost`, `arpa`, `in-addr.arpa` or `ip6.arpa` | `forward zone "<zone>" is <name> itself, which the contract rules out` |
+| Reserved | The name lies under `localhost`, or under `arpa` but not under `in-addr.arpa` or `ip6.arpa` | `forward zone "<zone>" is under localhost, which the contract rules out`, or the same with `arpa` |
+| Shadow | The name is an accepted zone or reverse zone, or lies under one. The sentence names the nearest one, a reverse zone included | `forward zone "<zone>" is shadowed by the mesh zone "<mesh zone>", which answers its names` |
+| Repeat | An accepted forward zone has the same folded name | `forward zone "<zone>" repeats an earlier forward zone` |
+| Resolvers | No resolver of the zone is accepted, an empty `resolvers` list included | `forward zone "<zone>" has no usable resolver` |
+
+The reason of an invalid name is one of those listed under [Records](#records), so a zone with a trailing dot is skipped too. A name under `local`, such as the Active Directory zone `corp.local`, is accepted, and so are a reverse zone under `in-addr.arpa` or `ip6.arpa`, such as `2.0.192.in-addr.arpa`, a single label such as `corp`, a forward zone above a mesh zone, such as `example.com` while `edge.example.com` is a zone of the Domain, and a forward zone under another forward zone. The mesh zone below a forward zone keeps its names, because the records answer first, and of two nested forward zones the longer one takes the names under it (see [Route](#route)).
+
+The resolvers of an accepted zone, and then those of the catch-all, are checked in this order. A skipped resolver costs only itself: the other resolvers of the same owner stay, in their order. `<owner>` is `forward zone "<zone>"` or `the catch-all`, and `<value>` is the resolver as the member spelled it:
+
+| Check | The resolver is skipped when | Sentence |
+|-------|------------------------------|----------|
+| Address | It does not parse as an IP address | `resolver "<value>" of <owner> is not an IP address` |
+| Forwardable | It carries an IPv6 zone such as `%eth0`, or it is an IPv4-mapped IPv6 address, the unspecified address, a loopback, multicast or link-local unicast address, or `255.255.255.255` | `resolver "<value>" of <owner> is not an address plexd forwards to` |
+| Self | It is the resolver's own listen address, an IPv4-mapped listen address compared as the IPv4 address it carries | `resolver "<value>" of <owner> is the resolver's own listen address` |
+| Repeat | An accepted resolver of the same owner has the same address | `resolver "<value>" of <owner> repeats an earlier resolver` |
+
+A loopback resolver is refused because `127.0.0.53` is systemd-resolved's stub listener, which would send the query back to plexd, and the listen address would loop the same way. The resolvers of a zone that an earlier check skipped are not checked. The sentences come in the member's order: each zone in turn, a zone's resolver sentences before its `has no usable resolver`, and the catch-all last. The manager logs them after the sentences of the records, in the one `mesh dns skipped invalid entries` line (see [Following the State Pull](#following-the-state-pull)).
+
+### Route
+
+```go
+func (f *Forwarding) Route(name string) (resolvers []netip.Addr, zone string, ok bool)
+func (f *Forwarding) Equal(o *Forwarding) bool
+func (f *Forwarding) ZoneCount() int
+func (f *Forwarding) CatchAllCount() int
+```
+
+`Route` folds the name to ASCII lower case and drops one trailing dot. It returns the resolvers of the longest accepted forward zone that is the name itself or lies above it, label by label, together with that zone. Otherwise it returns the catch-all resolvers with the zone `.`, when the table has any. Otherwise `ok` is false. With the forward zones `corp.example.com` and `eu.corp.example.com`, `db.eu.corp.example.com` goes to the resolvers of `eu.corp.example.com`, `www.corp.example.com` to those of `corp.example.com`, and `xcorp.example.com` to neither, because the match is by labels. A nil `*Forwarding` routes nothing.
+
+`Equal` compares the zones, the resolvers of each zone and the catch-all, in order, and counts a nil table as one without zones and without a catch-all. `ZoneCount` returns the number of accepted forward zones and `CatchAllCount` the number of accepted catch-all resolvers, both 0 on a nil table.
+
+### What Is Forwarded
+
+The server forwards a query only when all of this holds:
+
+1. The source passes the [source rule](#source-rule).
+2. The opcode is `QUERY`, the message has exactly one question and at most one OPT record, and the class is `IN`.
+3. The records answer `REFUSED`: the name lies outside every accepted zone and reverse zone.
+4. The type is neither `AXFR` nor `IXFR`.
+5. `Route` returns resolvers for the name.
+
+Every other query is answered as [What the Resolver Answers](#what-the-resolver-answers) describes, so the mesh zones always win. A name in a mesh zone that does not exist gets `NXDOMAIN` from the records, even under a forward zone above the mesh zone. A zone transfer, another class, another opcode, two questions or two OPT records get the answer they get without forwarding. A name outside every zone that `Route` does not route gets `REFUSED`, and so does every query before the first `dns` block, because the manager swaps a table in only together with the records of a block.
+
+plexd never follows a CNAME of a mesh zone into a forward zone itself. It answers the CNAME alone, as for any target outside the mesh zones, and the system resolver asks for the target. systemd-resolved sends that query to plexd again when the target lies under a forward zone, or, with a catch-all, under no domain of another link.
+
+### Asking the Resolvers
+
+| Rule | Behavior |
+|------|----------|
+| Transport | A query that arrived over UDP goes to the resolvers over UDP, and one that arrived over TCP over TCP, with the two-byte length frame. Every resolver is asked on port 53 (`resolverPort`) over plain DNS. Each attempt uses a socket of its own, a connected UDP socket or a TCP connection, which it closes when it ends |
+| Message ID | The query goes out as the client sent it, but with a message ID of two random bytes from `crypto/rand`, drawn again when they equal the client's ID. A reply matches when it has at least the 12-byte header, carries that ID, has QR set, and its question has the query's name, compared without regard to case, and the query's type and class. Any other datagram or message is dropped, and the attempt reads on |
+| Time | One forwarded query has 4 seconds (`forwardTimeout`) for all its resolvers together. That stays below the 5 seconds systemd-resolved and glibc wait for a server, so the client gets `SERVFAIL` from plexd rather than count plexd as a server that does not answer, which would cost it the mesh names as well. systemd-resolved 255 asks again after a `SERVFAIL`, first at the same feature level and after a second `SERVFAIL` at the next lower one. With DNSSEC and DNS over TLS off on the mesh link, a lookup therefore asks plexd three times, with EDNS0, with EDNS0 again and over plain UDP, before it fails with `SERVFAIL`. Under a zone whose resolvers send nothing back, each round waits the 4 seconds, so the lookup fails only after about 12 seconds. Resolvers that refuse the query, with an ICMP port unreachable or a TCP reset, fail each round as soon as the refusal arrives: plexd answers `SERVFAIL` after one round trip to each resolver it asks, well under a millisecond for a resolver on the same host, and the lookup fails just as quickly. The mesh names keep answering meanwhile: in the systemd e2e suite, with systemd-resolved 255, a mesh name asked during a lookup under a resolver that sends nothing back answered in 59 milliseconds |
+| Order | The resolvers that are not marked down are asked first, then the marked ones, each group in list order. Each attempt gets the time left divided by the resolvers not yet asked, so with three resolvers that never answer each one waits about 1.3 seconds. A resolver that refuses the connection at once leaves its time to the next. When the time runs out, the resolvers not yet asked are neither asked nor marked |
+| Response code | A matching reply with any response code but `SERVFAIL` or `REFUSED` ends the query. A `SERVFAIL` or `REFUSED` is kept while the next resolver is asked, and when no resolver gives another code, the last one kept goes to the client, so the client sees the resolver's own code. Such a reply counts as an answer and marks no resolver down |
+| Down mark | An attempt that ends without a matching reply marks its resolver down for 30 seconds (`resolverRetry`): its time ran out, the resolver refused the connection (`ECONNREFUSED`, from an ICMP port unreachable over UDP or a refused TCP connection), or the socket failed in any other way. A query whose resolvers include a marked one asks it after the others. After the 30 seconds it is asked in its turn again, and a further failure marks it for another 30 seconds. The first matching reply of any code clears the mark |
+
+A mark belongs to the resolver's address, so it holds for every forward zone and the catch-all that list it. The marks live in memory only, and a table that no longer names a resolver drops its mark. `mesh dns resolver does not answer` is logged at Warn when a resolver without a mark gets one, with the zone of the query that marked it, and nothing more is logged while it stays down, even when it is asked first again and fails. `mesh dns resolver answers again` is logged at Info when a marked resolver gives a matching reply. A resolver that answers `SERVFAIL` to every query is never marked, so it logs neither line.
+
+### The Reply
+
+The reply goes to the client as the resolver sent it, with the client's ID written back: its response code, its flags, TC included, its records and their TTLs. A reply with TC set stays truncated, so the client asks again over TCP. plexd keeps no cache, because systemd-resolved caches every reply for its TTL, and a second cache would be a second place where a changed name stays stale.
+
+A reply relayed over UDP is held to the limit of [Response Header](#response-header): 512 bytes without an OPT record, otherwise the client's offer clamped to 512 to 1232 bytes. A larger reply is replaced by a response with TC set, the resolver's response code and its AA and RA bits, the question, no record, and an OPT record when the query had one. The client then asks again over TCP and gets the full reply there.
+
+When no resolver answered, plexd answers `SERVFAIL` itself, with the query's ID, opcode, RD bit and question, AA and RA clear, no record, and an OPT record when the query had one. It logs `mesh dns forwarded query failed` at Debug with the error, which reads `meshdns: forward to <zone>: <cause>`, such as `meshdns: forward to corp.example.com: context deadline exceeded`.
+
+A forwarded query waits for its resolvers in a goroutine of its own, over UDP and TCP alike, off the loop that reads the socket or the connection, so a resolver that is slow to answer never holds up a mesh answer, not even one asked on the same TCP connection. Two caps bound the forwarded queries. A query over either gets `SERVFAIL` at once and logs `mesh dns dropped a forwarded query, too many are in flight` at Debug, with the cap it hit as `limit`:
+
+- At most 256 (`maxForwards`) forwarded queries wait for their resolvers at a time, UDP and TCP together. A slot frees as soon as its resolvers answered or failed, before the reply goes out.
+- One TCP connection holds at most 16 (`maxConnForwards`) forwarded queries, each from the time plexd reads it until its reply is written. A reply waits to be written while the client does not read it, so without this cap a client that sends queries and stops reading the replies would keep a goroutine and a reply waiting for every query it sent. At the cap, plexd answers the next forwarded query with `SERVFAIL` from the connection's read loop. When the client has stopped reading, that reply waits behind the others, so plexd reads nothing more from the connection until the client reads again or the 10 seconds of the waiting write pass. A forward gives its place back when its reply is written, before the next reply goes out, so a client that has read a reply finds free the place of every forward whose reply went out before it.
+
+On a TCP connection the replies go out in the order they are ready, not in the order of the queries: a mesh name asked after a forwarded query is answered first, and of two forwarded queries the one whose resolvers answer first gets its reply first. Each reply goes out whole, behind its two-byte length, and starts the connection's 10 seconds again, and so does each forwarded query when plexd reads it (see [TCP](#tcp)). A forward ends within its 4 seconds, so the 10 seconds do not pass while it waits, and plexd keeps reading the queries sent behind it. When the connection ends with forwarded queries still in flight, because the client closed its side or a read failed, plexd waits for them and sends their replies before it closes it.
+
+When plexd stops, the forwarded queries in flight end without a reply: a UDP client gets none, and a TCP connection is closed. Nothing is logged for them, and no resolver is marked.
 
 ## Registration with systemd-resolved
 
@@ -217,6 +333,7 @@ type Registration struct {
     Server         netip.AddrPort
     SearchDomain   string
     RoutingDomains []string
+    DefaultRoute   bool
 }
 
 type Registrar interface {
@@ -227,9 +344,9 @@ type Registrar interface {
 var ErrUnavailable = errors.New("meshdns: no usable system resolver")
 ```
 
-`(*Records).Registration(iface, server)` builds what the Node registers. `Interface` is the mesh interface and `Server` the listen address. `SearchDomain` is the accepted search domain, or empty. `RoutingDomains` holds every accepted zone that has no other accepted zone above it, without the search domain, followed by every accepted reverse zone, each group in ascending byte order. Routing a domain routes every name under it, so a Project zone below the Domain's default domain adds no entry, and the search domain routes the names under it as well. Reverse zones are never merged: a wider zone would make plexd answer `NXDOMAIN` for addresses outside the mesh. A registration is empty when it names no search domain and no routing domain.
+`(*Records).Registration(iface string, server netip.AddrPort, fwd *Forwarding) Registration` builds what the Node registers. `Interface` is the mesh interface and `Server` the listen address. `SearchDomain` is the accepted search domain, or empty. `RoutingDomains` holds every accepted zone that has no other accepted zone above it, without the search domain, followed by every accepted reverse zone, and then every accepted forward zone of `fwd`, each group in ascending byte order. Routing a domain routes every name under it, so a Project zone below the Domain's default domain adds no entry, and the search domain routes the names under it as well. Reverse zones are never merged: a wider zone would make plexd answer `NXDOMAIN` for addresses outside the mesh. Forward zones are not merged either, neither with each other nor with the mesh zones, so the link lists every zone the Node forwards. `DefaultRoute` makes the link the host's default DNS route, and it is set when `fwd` has an accepted catch-all resolver. A nil `*Records` adds no zone and no search domain, and a nil `fwd` no forward zone and no default route. A registration is empty when it names no search domain and no routing domain and `DefaultRoute` is false.
 
-The contract's example is a Node of the Project `openstack` in the Domain `lab`, whose mesh CIDR is `10.42.0.0/16`. Its block carries the search domain `openstack.lab.internal`, the zones `edge.example.com`, `lab.internal` and `openstack.lab.internal`, and the reverse zone `42.10.in-addr.arpa`. The Node registers the search domain `openstack.lab.internal` and the routing domains `edge.example.com`, `lab.internal` and `42.10.in-addr.arpa`. `resolvectl domain` shows each routing domain with a leading `~`.
+The contract's example is a Node of the Project `openstack` in the Domain `lab`, whose mesh CIDR is `10.42.0.0/16`. Its block carries the search domain `openstack.lab.internal`, the zones `edge.example.com`, `lab.internal` and `openstack.lab.internal`, and the reverse zone `42.10.in-addr.arpa`. The Node registers the search domain `openstack.lab.internal` and the routing domains `edge.example.com`, `lab.internal` and `42.10.in-addr.arpa`. With the forwarding of the example in [Forwarding](#forwarding), it adds the routing domains `2.0.192.in-addr.arpa`, `corp.example.com` and `corp.local`, and `DefaultRoute` for the catch-all. `resolvectl domain` shows each routing domain with a leading `~`, and the catch-all as `~.`.
 
 ### ResolvedRegistrar
 
@@ -241,15 +358,15 @@ Every call the registrar makes carries the D-Bus flag `NO_AUTO_START`, so the bu
 
 | Step | Method (signature) | Arguments |
 |------|--------------------|-----------|
-| 1 | `SetLinkDefaultRoute` (`ib`) | The interface index, `false` |
-| 2 | `SetLinkDomains` (`ia(sb)`) | The index; the search domain with `false` when there is one, then each routing domain with `true` |
+| 1 | `SetLinkDefaultRoute` (`ib`) | The interface index; `DefaultRoute`, so `true` with a catch-all and `false` without one |
+| 2 | `SetLinkDomains` (`ia(sb)`) | The index; the search domain with `false` when there is one, then each routing domain with `true`, and with `DefaultRoute` the root domain `.` with `true` last |
 | 3 | `SetLinkDNSSEC` (`is`) | The index, `no` |
 | 4 | `SetLinkDNSOverTLS` (`is`) | The index, `no` |
 | 5 | `SetLinkLLMNR` (`is`) | The index, `no` |
 | 6 | `SetLinkMulticastDNS` (`is`) | The index, `no` |
 | 7 | `SetLinkDNSEx` (`ia(iayqs)`) | The index; one entry: `AF_INET` with the 4 address bytes or `AF_INET6` with the 16, the port, and an empty server name |
 
-The `true` flag of `SetLinkDomains` marks a routing-only domain, which systemd-resolved sends to the link but never appends to a bare host name. The default-route flag goes first, so the link never answers names outside its domains. The server goes last, so a failure halfway leaves a link without a server, which systemd-resolved never asks. DNSSEC is off because a private zone such as `lab.internal` has no chain of trust. DNS over TLS, LLMNR and mDNS are off because the resolver speaks plain DNS on the mesh only. A failure in steps 2 to 7 is followed by one `RevertLink`, whose result is ignored, so the next `Apply` starts from a clean link.
+The `true` flag of `SetLinkDomains` marks a routing-only domain, which systemd-resolved sends to the link but never appends to a bare host name. The default-route flag goes first, so a registration without a catch-all turns it off before anything else changes, and the link never answers names outside its domains. The server goes last, so a failure halfway leaves a link without a server, which systemd-resolved never asks. DNSSEC is off because a private zone such as `lab.internal` has no chain of trust. DNS over TLS, LLMNR and mDNS are off because the resolver speaks plain DNS on the mesh only. These settings hold for every name the link resolves, so the forward zones, and with a catch-all every name the host resolves through the link, are resolved without DNSSEC validation and without DNS over TLS. A failure in steps 2 to 7 is followed by one `RevertLink`, whose result is ignored, so the next `Apply` starts from a clean link.
 
 When the context of `Apply` has a deadline, the read and the steps run under one a fifth of the remaining time earlier, about 4 seconds of the manager's 5. A step that runs out of time then fails with `context deadline exceeded`. When it is one of steps 2 to 7, its `RevertLink` is still sent, under the full deadline, in the fifth held back for it. A context that is cancelled during a step, which happens only while plexd stops, sends no `RevertLink`: the drain's revert clears the link then.
 
@@ -270,13 +387,29 @@ The manager logs an error that wraps `ErrUnavailable` once at Info, and the reso
 
 `Revert` calls `RevertLink` (`i`) with the interface index. It returns `nil` when there is nothing to clear: the interface does not exist, the bus connection fails, systemd-resolved answers `ServiceUnknown`, `NameHasNoOwner` or `NoSuchUnit`, or it answers `org.freedesktop.resolve1.NoSuchLink`. An interface list that cannot be read returns `meshdns: resolved: interface <name>: list interfaces: <cause>`, and any other error, such as `org.freedesktop.DBus.Error.AccessDenied`, returns `meshdns: resolved: RevertLink: <cause>`.
 
+### The Catch-All as Default Route
+
+A catch-all sets both the default-route flag and the routing domain `~.`, because the flag alone does not make the link the only one asked. Measured on 2026-11-10 with systemd-resolved 255.4, on a link whose server is `10.99.0.1:5354`:
+
+- `~.` sends every name that no other link's domain matches to this link only. Neither a second link with its own DNS server and `DefaultRoute` on nor a global DNS server sees the query. `SetLinkDefaultRoute(true)` without `~.` does not do that: both links are asked.
+- A `SERVFAIL` from the link's server, or a port nothing listens on, fails the lookup at once. systemd-resolved does not fall back to another server.
+- A name under a domain another link holds, such as a search domain the DHCP client of `eth0` set, still goes to that link.
+- A routing domain such as `~corp.local` or `~2.0.192.in-addr.arpa` sends its names to the link's server, as `~lab.internal` does.
+
+The catch-all therefore has these limits:
+
+- It takes only the names no other link claims. A name under another link's domain, a DHCP search domain included, goes to that link and not to the catch-all resolvers.
+- Another link that also holds `~.`, such as one a VPN client set up, shares the default route with the mesh interface, so the names no domain matches go to both links.
+- A catch-all whose resolvers do not answer fails every lookup that the catch-all takes, because systemd-resolved does not fall back, as a forward zone whose resolvers do not answer fails the lookups of its names. plexd answers each query of such a lookup with `SERVFAIL`, and systemd-resolved asks three times before it gives up. Under resolvers that send nothing back, each round waits the 4 seconds, so the lookup fails after about 12 seconds; resolvers that refuse the query fail it at once (see [Asking the Resolvers](#asking-the-resolvers)). The mesh names keep answering. plexd keeps reaching its control plane through the last address of its name (see [Dial Fallback](../core/control-plane-client.md#dial-fallback)), so the pull that corrects the setting still arrives.
+- A program that does not resolve through systemd-resolved never asks plexd, for example one that reads an `/etc/resolv.conf` naming other servers, or a container with a resolver configuration of its own.
+
 ### plexd Owns the Link
 
 plexd owns the per-link resolver settings of its mesh interface. Each `Apply` replaces the link's default-route flag, domains, DNSSEC, DNS over TLS, LLMNR and mDNS settings and its DNS servers. `RevertLink` clears all of them, including any an operator set there by hand. plexd does not read the link back: a setting changed by hand after a registration stays until the registration changes, the next start applies it again or reverts the link, or a stop reverts it. Set nothing by hand on that link.
 
 ## Following the State Pull
 
-`Manager` ties the records, the server and the registrar together. Every line it and its server log carries `component=meshdns`.
+`Manager` ties the records, the forwarding table, the server and the registrar together. Every line it and its server log carries `component=meshdns`.
 
 ```go
 func NewManager(cfg Config, iface string, meshIP netip.Addr, registrar Registrar, logger *slog.Logger) *Manager
@@ -290,14 +423,16 @@ func (m *Manager) Shutdown(ctx context.Context) error
 `Start` binds the sockets on `meshIP` and `cfg.ListenPort`, and `Run` serves them until its context ends. `Addr` is the listen address the log lines name. `Handle` has the signature of a [dispatch handler](../core/reconciliation.md#dispatchhandler) and runs on every successful pull, drift or not. A mutex guards the state `Handle` and `Shutdown` share.
 
 1. A nil snapshot returns at once.
-2. A snapshot without a `dns` block, the wire's `null` or a pull from a control plane that predates the block, keeps the names and the registration. The first such pull logs `state pull carries no dns block, keeping the names held`. Later ones log nothing until a block arrived in between.
-3. A block is built into records, which the server takes with an atomic swap, so a pull never blocks a query. Skipped entries log `mesh dns skipped invalid entries` with the count and the first five sentences, on every pull that carries them. Records that differ from the previous ones log `mesh dns records updated`, and the first block always counts as a change.
-4. The wanted registration is compared with the one systemd-resolved accepted last. When they are equal, nothing is called, so a pull that changes only hosts or records issues no bus call. When the wanted registration is empty, `Revert` is called, bounded by 5 seconds, if this run called `Apply` since its last successful revert, whether that `Apply` succeeded or failed. Otherwise `Apply` is called, bounded by 5 seconds.
-5. After a failed `Apply` nothing counts as applied, so the next pull calls `Apply` again. A systemd-resolved that starts later, or a link that frees up, is picked up within one reconcile interval. On a host without a usable systemd-resolved each retry costs at most one bus call, the read of `DNSEx`, and changes nothing. A failed `Apply` can leave settings on the link, the earlier registration's or those of the steps that succeeded, so an empty registration on a later pull still reverts it. A failed revert counts as nothing reverted, so the next pull whose registration is empty reverts again.
+2. A snapshot without a `dns` block, the wire's `null` or a pull from a control plane that predates the block, keeps the names, the forwarding and the registration. The first such pull logs `state pull carries no dns block, keeping the names held`. Later ones log nothing until a block arrived in between.
+3. A block is built into records, which the server takes with an atomic swap, so a pull never blocks a query.
+4. A block that carries the `forwarding` member replaces the member the manager keeps, as a copy. A block without it, or with `null`, keeps the member held. When one is held, the first such block logs `dns block carries no forwarding member, keeping the forwarding held`, and later ones log nothing until a member arrived in between. The kept member is built with `BuildForwarding` against the records of this pull and the listen address, and the server takes the table with an atomic swap, which also drops the down marks of the resolvers the table no longer names. Without a kept member the table is nil and forwards nothing. Because the kept member is built anew on every pull, a forward zone that a new mesh zone shadows goes with the pull that brings the mesh zone, and comes back with the pull that removes it.
+5. Skipped entries log `mesh dns skipped invalid entries` with the count and the first five sentences, those of `BuildRecords` before those of `BuildForwarding`, on every pull that carries them. Records that differ from the previous ones log `mesh dns records updated`, and the first block always counts as a change. A table that differs from the previous one by `Equal` logs `mesh dns forwarding updated`. A nil table equals an empty one, so a Node that never forwards logs nothing.
+6. The wanted registration, built from the records and the table, is compared with the one systemd-resolved accepted last. When they are equal, nothing is called, so a pull that changes only hosts, records or resolvers issues no bus call, as long as the accepted forward zones stay the same and an accepted catch-all resolver neither appears nor goes. When the wanted registration is empty, `Revert` is called, bounded by 5 seconds, if this run called `Apply` since its last successful revert, whether that `Apply` succeeded or failed. Otherwise `Apply` is called, bounded by 5 seconds.
+7. After a failed `Apply` nothing counts as applied, so the next pull calls `Apply` again, while the server already forwards with the new table. A systemd-resolved that starts later, or a link that frees up, is picked up within one reconcile interval. On a host without a usable systemd-resolved each retry costs at most one bus call, the read of `DNSEx`, and changes nothing. A failed `Apply` can leave settings on the link, the earlier registration's or those of the steps that succeeded, so an empty registration on a later pull still reverts it. A failed revert counts as nothing reverted, so the next pull whose registration is empty reverts again.
 
-A pull whose context is already done, because plexd is stopping, still swaps the records but calls no registrar method. The drain's revert is the last word on the link.
+A pull whose context is already done, because plexd is stopping, still swaps the records and the table but calls no registrar method. The drain's revert is the last word on the link.
 
-A successful `Apply` logs `mesh dns registered with systemd-resolved`. A revert from `Handle` logs nothing when it succeeds. An error wrapping `ErrUnavailable` logs `mesh dns not registered, systemd-resolved is not usable` at Info, once per change into that state: a success or another failure in between makes it log again. Any other error, from `Apply` or from the revert, logs `mesh dns registration failed` at Warn, unless its text is the one this line logged last. A success or an unavailable answer in between makes the same text log again.
+A successful `Apply` logs `mesh dns registered with systemd-resolved`, whose `default_route` key says whether the link is the host's default DNS route. A revert from `Handle` logs nothing when it succeeds. An error wrapping `ErrUnavailable` logs `mesh dns not registered, systemd-resolved is not usable` at Info, once per change into that state: a success or another failure in between makes it log again. Any other error, from `Apply` or from the revert, logs `mesh dns registration failed` at Warn, unless its text is the one this line logged last. A success or an unavailable answer in between makes the same text log again.
 
 A resolver failure never changes readiness. The health endpoints do not report the resolver, and the log lines are the operator's view of it.
 
@@ -307,7 +442,9 @@ The block lists every zone of the Domain: its default domain and the zone of eve
 
 The block also carries the records of the Domain and of every Project, and every Node answers all of them. A record a Project defines therefore resolves on every Node of the Domain, not only on the Nodes of that Project.
 
-`dns.enabled: false` is the Node operator's way out. It turns the resolver and its registration off on this Node, and plexd reverts the link at start.
+The forwarding member is different: it carries one setting, the one that applies to this Node, which is its Project's when the Project holds one and its Domain's otherwise. A forward zone and a catch-all therefore apply to the Nodes of one Project only when that Project sets them, and to every Node of the Domain whose Project sets nothing when the Domain sets them. Whoever manages the Domain or the Project chooses the resolvers, and with them where the Node's queries for the forward zones go. With a catch-all they also choose where every name goes that the host resolves through systemd-resolved and that no other link's domain matches, and those names are resolved without DNSSEC validation and without DNS over TLS (see [ResolvedRegistrar](#resolvedregistrar)).
+
+`dns.enabled: false` is the Node operator's way out. It turns the resolver, the forwarding and the registration off on this Node, and plexd reverts the link at start. No key turns the forwarding off on its own.
 
 ## Startup in plexd up
 
@@ -322,9 +459,9 @@ The block also carries the records of the Domain and of every Project, and every
 | A bind fails, or the mesh IP is unspecified | Logs `mesh dns listener cannot bind, mesh names are not answered` with the hint `set dns.listen_port to a free port`, reverts the link the same way, and goes on without the resolver |
 | Both binds succeed | Logs `mesh dns listening` with the listen address |
 
-Every start that runs no resolver reverts the link, whatever the reason, and a start whose resolver listens applies on the first pull. A registration a killed run left behind would otherwise keep sending the mesh zones to a port nothing listens on: a kill leaves `plexd0` behind, and the next start's WireGuard setup fails on it (see [Stop, Crash and Opt-Out](#stop-crash-and-opt-out)). The revert does nothing when the link does not exist.
+Every start that runs no resolver reverts the link, whatever the reason, and a start whose resolver listens applies on the first pull. A registration a killed run left behind would otherwise keep sending the mesh zones and the forward zones, and with a catch-all every other name, to a port nothing listens on: a kill leaves `plexd0` behind, and the next start's WireGuard setup fails on it (see [Stop, Crash and Opt-Out](#stop-crash-and-opt-out)). The revert does nothing when the link does not exist.
 
-The sockets are bound before the dispatch handler is registered, so a Node that cannot answer never registers a server. Only a resolver that listens gets the dispatch handler, registered after the reachability observer, and a goroutine that serves its sockets. `Run` returns once plexd stops. Only a failed UDP read, or a TCP listener that something other than the stop closed, ends it before that. plexd then logs `mesh dns stopped`, and no mesh name is answered for the rest of the run, while the registration stays until the drain reverts it. A failed accept is retried and stops nothing (see [TCP](#tcp)). Nothing here stops startup: the mesh works without names.
+The sockets are bound before the dispatch handler is registered, so a Node that cannot answer never registers a server. Only a resolver that listens gets the dispatch handler, registered after the reachability observer, and a goroutine that serves its sockets. `Run` returns once plexd stops. Only a failed UDP read, or a TCP listener that something other than the stop closed, ends it before that. plexd then logs `mesh dns stopped`, and no mesh name is answered and nothing is forwarded for the rest of the run. It shuts the manager down at once, with a fresh context bounded by 5 seconds, as the drain does: `Shutdown` reverts the link and logs `mesh dns registration reverted`, or `mesh dns shutdown error` when the revert fails, and every later pull registers nothing. Otherwise the registration would keep sending the zones, and with a catch-all every other name, to a port nothing answers on for the rest of the run. A failed accept is retried and stops nothing (see [TCP](#tcp)). Nothing here stops startup: the mesh works without names.
 
 ## Stop, Crash and Opt-Out
 
@@ -332,16 +469,17 @@ The sockets are bound before the dispatch handler is registered, so a Node that 
 |-------|-----------------|--------------------------------|
 | A stop of a run whose resolver listens, such as `systemctl stop plexd` | The drain calls `Shutdown` first, right after `shutting down` and before any other subsystem stops, with a fresh context bounded by 5 seconds. It goes first because the resolver stopped answering when the stop began. The interface still exists then, because WireGuard is torn down last. `Shutdown` reverts the link on every run, registered or not, and logs `mesh dns registration reverted`. An error logs `mesh dns shutdown error` | Nothing plexd set |
 | A stop of a run that runs no resolver | Nothing for mesh DNS: the start reverted the link already | Nothing plexd set |
-| A crash or a kill | No drain runs, so `plexd0` stays, and so does its registration | The last registration, until the next start reverts it. The link's default-route flag stays off, so only the mesh zones go to the mesh IP, where nothing answers |
+| The resolver stops while plexd runs, which logs `mesh dns stopped` | `Shutdown` right away, with a fresh context bounded by 5 seconds: it reverts the link, logs `mesh dns registration reverted` or `mesh dns shutdown error`, and stops every later `Handle`. The drain's `Shutdown` still runs at the stop, reverts again and logs `mesh dns registration reverted` again | Nothing plexd set |
+| A crash or a kill | No drain runs, so `plexd0` stays, and so does its registration | The last registration, until the next start reverts it. Without a catch-all the link's default-route flag stays off, so only the mesh zones and the forward zones go to the mesh IP, where nothing answers. With a catch-all the link keeps `~.` and the flag, so every lookup through systemd-resolved that no other link's domain matches fails as well, until the next start reverts the link |
 | The next start after a crash or a kill | WireGuard setup fails on the leftover `plexd0` (`EEXIST`), so the run logs `wireguard unavailable, mesh dns not started`, starts no resolver and reverts the link at start. The drain of that run deletes the leftover `plexd0`, so the start after it creates a fresh one | Nothing plexd set |
-| A start whose resolver listens | WireGuard has just created `plexd0`, so the link holds no settings. The first pull whose block names an accepted zone or reverse zone applies its registration | The new registration |
+| A start whose resolver listens | WireGuard has just created `plexd0`, so the link holds no settings. The first pull whose block names an accepted zone, reverse zone or forward zone, or an accepted catch-all resolver, applies its registration | The new registration |
 | A start with `dns.enabled: false`, without WireGuard, with a mesh IP that does not parse, or with a listener that cannot bind | Starts no resolver and reverts the link at start | Nothing plexd set |
 
 To turn the resolver off, set `dns.enabled: false` in the config file, or set `PLEXD_DNS_ENABLED=false`, for example in `/etc/plexd/environment` under the shipped `plexd.service`, and restart plexd. plexd reads the setting once, when it starts.
 
 ## Hosts without systemd-resolved
 
-On a Linux host without systemd-resolved, with one older than 246, or without a reachable system bus, the resolver still runs and answers on its listen address. plexd sets no DNS setting of the host: on an older systemd-resolved the read of `DNSEx` fails before the first setter. Only `RevertLink` reaches an older one: at a stop, at a start that runs no resolver, and on a pull whose registration is empty. It clears whatever the mesh interface's link holds. plexd names the address in `mesh dns listening` when it binds, and again in `mesh dns not registered, systemd-resolved is not usable` on the first pull whose block names an accepted zone or reverse zone:
+On a Linux host without systemd-resolved, with one older than 246, or without a reachable system bus, the resolver still runs and answers on its listen address. plexd sets no DNS setting of the host: on an older systemd-resolved the read of `DNSEx` fails before the first setter. Only `RevertLink` reaches an older one: at a stop, at a start that runs no resolver, and on a pull whose registration is empty. It clears whatever the mesh interface's link holds. plexd names the address in `mesh dns listening` when it binds, and again in `mesh dns not registered, systemd-resolved is not usable` on the first pull whose block names an accepted zone, reverse zone or forward zone, or an accepted catch-all resolver:
 
 ```text
 level=INFO msg="mesh dns listening" listen=10.99.0.1:5354
@@ -359,8 +497,17 @@ rev-server=10.99.0.0/24,10.99.0.1#5354
 
 `server=` sends every name under `e2e.internal` to the resolver, and `rev-server=` sends the reverse names of `10.99.0.0/24`.
 
+plexd forwards on its listen address on such a host too, so the same resolver can carry the forwarding setting. For the forward zone `corp.example.com`, and for a catch-all:
+
+```text
+server=/corp.example.com/10.99.0.1#5354
+server=10.99.0.1#5354
+```
+
+The first line sends every name under `corp.example.com` to plexd, which passes it on to the zone's resolvers. The second makes plexd an upstream server for every other name, which plexd passes on to the catch-all resolvers. plexd answers `REFUSED` for a name outside the mesh zones that its forwarding table does not route, so point a line at it only for what the setting covers.
+
 - The resolver answers the Node itself only. dnsmasq on the Node sends its queries to the Node's own mesh IP, and the kernel sends a packet for a local address from that address, so the [source rule](#source-rule) accepts them. A resolver in a Pod or container network sends from an address of its own, so the resolver drops its queries, and it cannot use the names this way.
-- The zone list of such a hand-written rule follows the Domain's zones by hand. When the Domain gains a zone that the lines do not cover, such as a Project's zone override, or its mesh CIDR changes, change the lines yourself: nothing updates them.
+- The zone list of such a hand-written rule follows the Domain's zones by hand. When the Domain gains a zone that the lines do not cover, such as a Project's zone override, or its mesh CIDR changes, change the lines yourself: nothing updates them. The same holds for the forward zones and the catch-all.
 - A CNAME whose target lies outside the mesh zones resolves only when the local resolver follows it, as systemd-resolved does. plexd answers such a name with the CNAME alone. A forwarder that passes the answer on as it is leaves the target to the program that asked.
 
 ## Log Lines
@@ -376,22 +523,33 @@ rev-server=10.99.0.0/24,10.99.0.1#5354
 | `Warn`  | `mesh dns not started, the mesh ip does not parse` | `mesh_ip`, `error` |
 | `Warn`  | `mesh dns listener cannot bind, mesh names are not answered` | `listen`, `error`, `hint` (`set dns.listen_port to a free port`) |
 | `Info`  | `mesh dns listening` | `listen` |
-| `Error` | `mesh dns stopped` | `error`. The resolver stopped while plexd was running |
-| `Error` | `mesh dns shutdown error` | `error`. The drain's revert failed |
+| `Error` | `mesh dns stopped` | `error`. The resolver stopped while plexd was running. plexd reverts the link right after it |
+| `Error` | `mesh dns shutdown error` | `error`. The revert after `mesh dns stopped`, or the drain's revert, failed |
 
-The manager logs these with `component=meshdns`:
+The control-plane client logs these without a `component` key when the control plane's name stops resolving, as it does on a Node whose catch-all resolvers do not answer (see [Dial Fallback](../core/control-plane-client.md#dial-fallback)):
+
+| Level  | Message | Keys |
+|--------|---------|------|
+| `Warn` | `control plane name does not resolve, dialing its last address` | `host`, `address` (the last address with the request's port), `error`. Once, and again only after the name resolved in between |
+| `Info` | `control plane name resolves again` | `host`. The first ordinary dial that succeeds after the line above |
+
+The manager, and the server for the forward resolvers, log these with `component=meshdns`:
 
 | Level  | Message | Keys |
 |--------|---------|------|
 | `Info` | `state pull carries no dns block, keeping the names held` | none. Once, and again only after a block arrived in between |
 | `Warn` | `mesh dns skipped invalid entries` | `count`, `skipped` (the first five sentences). On every pull whose block has skipped entries |
+| `Info` | `dns block carries no forwarding member, keeping the forwarding held` | none. Once while a member is held, and again only after a member arrived in between |
 | `Info` | `mesh dns records updated` | `hosts`, `records` (the number of accepted records), `zones`, `reverse_zones`, `search_domain` (empty when the Node has none) |
-| `Info` | `mesh dns registered with systemd-resolved` | `interface`, `server`, `search_domain`, `routing_domains` (the count) |
+| `Info` | `mesh dns forwarding updated` | `forward_zones` (the number of accepted forward zones), `catch_all` (the number of accepted catch-all resolvers). On every pull whose table differs from the previous one |
+| `Info` | `mesh dns registered with systemd-resolved` | `interface`, `server`, `search_domain`, `routing_domains` (the count, the forward zones included), `default_route` (`true` with a catch-all) |
 | `Info` | `mesh dns not registered, systemd-resolved is not usable` | `listen`, `reason`. Once per change into that state |
 | `Warn` | `mesh dns registration failed` | `error`. Once per distinct error text |
-| `Info` | `mesh dns registration reverted` | `interface`. The drain's revert returned no error. It also logs where there was nothing to revert, such as on a host without systemd-resolved or a system bus |
+| `Info` | `mesh dns registration reverted` | `interface`. The drain's revert, or the revert after `mesh dns stopped`, returned no error. It also logs where there was nothing to revert, such as on a host without systemd-resolved or a system bus |
+| `Warn` | `mesh dns resolver does not answer` | `resolver`, `zone` (the forward zone, or `.` for the catch-all), `error` (`context deadline exceeded`, or the socket error, such as a refused connection). Once when a resolver gets a down mark, and not again while it stays down |
+| `Info` | `mesh dns resolver answers again` | `resolver`. Once when a marked resolver gives a matching reply |
 
-The server and the registrar log at Debug only, with `component=meshdns`:
+The server and the registrar log these at Debug, with `component=meshdns`:
 
 | Message | Keys |
 |---------|------|
@@ -404,6 +562,8 @@ The server and the registrar log at Debug only, with `component=meshdns`:
 | `mesh dns could not send a reply` | `source`, `error` |
 | `mesh dns answer does not fit a message` | `name`, `type`, `bytes` (the size of the full response). TCP; the response goes out as `SERVFAIL` |
 | `mesh dns could not pack a reply` | `error` |
+| `mesh dns forwarded query failed` | `name` (as the question spells it, with the trailing dot), `type`, `zone`, `error`. No resolver answered, and the query gets `SERVFAIL` |
+| `mesh dns dropped a forwarded query, too many are in flight` | `limit`: `256` when the forwarded queries in flight over UDP and TCP together are at their cap, `16` when the query's TCP connection already holds that many forwarded queries whose replies are not written yet. The query gets `SERVFAIL` |
 | `system bus unreachable` | `error` |
 | `systemd-resolved not usable` | `method`, or `property` (`DNSEx`) for the read before step 1; `error` |
 | `revert after a failed registration failed` | `interface`, `error` |
@@ -413,7 +573,15 @@ A registered Node logs, for the [mock control plane's](../development/mock-api-s
 ```text
 level=INFO msg="mesh dns listening" listen=10.99.0.1:5354
 level=INFO msg="mesh dns records updated" component=meshdns hosts=3 records=8 zones=2 reverse_zones=1 search_domain=app.e2e.internal
-level=INFO msg="mesh dns registered with systemd-resolved" component=meshdns interface=plexd0 server=10.99.0.1:5354 search_domain=app.e2e.internal routing_domains=2
+level=INFO msg="mesh dns registered with systemd-resolved" component=meshdns interface=plexd0 server=10.99.0.1:5354 search_domain=app.e2e.internal routing_domains=2 default_route=false
+```
+
+The block's `forwarding` member holds two empty lists, so no `mesh dns forwarding updated` line follows. The same Node after a pull that adds the forward zone `corp.example.com` with a resolver that does not answer, and a catch-all:
+
+```text
+level=INFO msg="mesh dns forwarding updated" component=meshdns forward_zones=1 catch_all=1
+level=INFO msg="mesh dns registered with systemd-resolved" component=meshdns interface=plexd0 server=10.99.0.1:5354 search_domain=app.e2e.internal routing_domains=3 default_route=true
+level=WARN msg="mesh dns resolver does not answer" component=meshdns resolver=192.0.2.1 zone=corp.example.com error="context deadline exceeded"
 ```
 
 See [A mesh name does not resolve](../../guide/troubleshooting.md#a-mesh-name-does-not-resolve) for how to read them on a Node.

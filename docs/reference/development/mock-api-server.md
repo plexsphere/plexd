@@ -14,6 +14,7 @@ A fixture-based mock of the Central API for end-to-end testing. Returns static r
 |--------|------|---------------------|---------|-------------|
 | Listen address | `-addr` | — | `:0` | TCP address (`host:port`) to listen on |
 | TLS listen address | `-tls-addr` | — | `:8443` | TLS address (`host:port`) for local endpoint handlers |
+| DNS stub listen address | `-dns-addr` | none | empty | UDP and TCP address (`host:port`) of the [DNS stub](#dns-stub). Empty runs no stub and binds no DNS socket |
 
 The binary prints `MOCKAPI_ADDR=<address>` to stdout on startup, which allows test scripts to discover the dynamically assigned port when using `:0`.
 
@@ -600,7 +601,7 @@ default it is an enriched envelope containing two peers, a merged policy with tw
 rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions`,
 `sessions`, and `secrets` blocks.
-It also carries a `dns` block that names the node and both peers and holds eight records.
+It also carries a `dns` block that names the node and both peers, holds eight records, and carries a `forwarding` member with two empty lists.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
 The `signing_key` block is not read from the fixture: every response sets it to
 the mock's current signing key, the key `POST /v1/register` hands out, whatever
@@ -624,7 +625,7 @@ therefore hands the node the new key.
 | `secrets` | `[]` (no inventory; phases configure entries explicitly) |
 | `hooks` | `null`, which keeps every hook a rollout installed and lets the [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serve nothing; phases configure entries explicitly |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
-| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa` |
+| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa`; `forwarding` with `forward_zones` `[]` and `catch_all` `[]` |
 
 The `dns` block names the node at the mesh IP `POST /v1/register` assigns it and
 each peer at the mesh IP of its `peers` entry, so every name a suite resolves
@@ -636,7 +637,12 @@ Domain's `10.99.0.0/24` and nothing wider. The records hold one of each type:
 two `A` records and an `AAAA` at one name, an `SRV` and an `MX` whose targets
 are that name and a name outside the mesh, a `TXT` of two strings, a CNAME to a
 peer and one to a name outside the mesh. Their addresses come from the
-documentation ranges, so nothing answers them. See [Mesh DNS](../networking/mesh-dns.md).
+documentation ranges, so nothing answers them. The `forwarding` member holds two
+empty lists, as the control plane serves it for a Domain and a Project without a
+forwarding setting, so the agent forwards nothing until a suite configures a
+forward zone or a catch-all, for example one whose resolver is the mock's own
+[DNS stub](#dns-stub). See [Mesh DNS](../networking/mesh-dns.md) and
+[Forwarding](../networking/mesh-dns.md#forwarding).
 
 The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
 its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node
@@ -789,7 +795,8 @@ comparison key and never re-derives it from the rules.
       {"fqdn": "e2e.internal", "type": "TXT", "text": ["v=e2e", "owner=plexd"]},
       {"fqdn": "ext.e2e.internal", "type": "CNAME", "target": "ext.example.com"}
     ],
-    "reverse_zones": ["0.99.10.in-addr.arpa"]
+    "reverse_zones": ["0.99.10.in-addr.arpa"],
+    "forwarding": {"forward_zones": [], "catch_all": []}
   }
 }
 ```
@@ -1339,7 +1346,11 @@ without a `dns` key stores a nil block, which the state endpoint serves as
 `"dns": null`, the contract's signal that the node keeps the names it holds.
 Splicing `"dns": null` does the same. A configured `dns` block without a
 `records` key is served with `"records": null`, which plexd reads as no records:
-the block is the full set, so the node drops the records it held.
+the block is the full set, so the node drops the records it held. A configured
+`dns` block without a `forwarding` key is served without the key, because
+`api.NodeStateDNS.Forwarding` is `nil` and `omitempty` drops it. That is the
+contract's signal that the node keeps the forwarding it holds. A block whose
+`forwarding` holds two empty lists ends the forwarding.
 
 **Response:** `204 No Content`
 
@@ -1711,6 +1722,56 @@ The expected bearer token (`e2e-local-bearer-token`) is provisioned through the 
 3. **Decryption** — plexd opens the envelope with `nodeapi.DecryptSecret(nsk, envelope)` to recover the bearer token
 4. **Authentication** — plexd sends `Authorization: Bearer e2e-local-bearer-token` on each request to the local endpoint
 
+## DNS Stub
+
+With `-dns-addr`, the server also runs a DNS server on that address, over UDP
+and TCP, that stands in for the resolvers a forwarding setting names. A suite
+configures a forward zone or a catch-all whose resolver is the mock's address,
+and a name that resolves to `198.51.100.53` (`DNSStubAddress`, from TEST-NET-2)
+has passed through the agent's resolver to the stub. The stub answers queries
+from any source:
+
+| Query | Reply |
+|-------|-------|
+| A name whose first label is `nx`, in any case | `NXDOMAIN`, no record |
+| A name whose first label is `drop`, in any case | No reply at all, over UDP or TCP |
+| Any other `A` query | `NOERROR`, one `A` record `198.51.100.53` with a TTL of 10, owned by the question's name |
+| Any other type | `NOERROR`, no record |
+| A message that does not parse, has no question, or has QR set | No reply |
+
+Every reply carries the query's ID, opcode, RD bit and question as received,
+sets QR and RA, and leaves AA clear. It carries an OPT record with a UDP payload
+size of 1232 when the query carried one, as a real resolver does, so a client
+that sent EDNS keeps using it. TCP frames each message with a two-byte length,
+takes several queries per connection, and closes a connection that sends no
+complete query within 10 seconds. The stub logs nothing itself.
+
+```go
+func ListenDNS(addr string) (*DNSStub, error)
+func (s *DNSStub) Addr() netip.AddrPort
+func (s *DNSStub) Serve(ctx context.Context) error
+```
+
+`ListenDNS` binds UDP first and TCP on the port UDP got. With port 0 it tries a
+fresh port, up to ten times, when that port is taken for TCP. A failure of
+either bind closes the socket that did bind and returns
+`mockapi: listen dns <addr>: <cause>`. `Addr` returns the bound address,
+unmapped. `Serve` answers until its context ends, then closes both sockets and
+every open connection and returns `nil`; a UDP read or a TCP accept that fails
+before that is returned.
+
+The binary binds the stub after the HTTP and the TLS listener and logs
+`DNS stub started` with `addr`, the bound address, which reads `[::]:53` for
+`-dns-addr :53` on a dual-stack host. A failed bind logs `DNS stub listen failed`
+with `addr` and `error` and exits 1. A `Serve` that fails later logs
+`DNS stub serve failed` with `error`, and the HTTP servers keep running.
+
+The image runs as uid 65534, which binds port 53 in a Docker container because
+Docker sets `net.ipv4.ip_unprivileged_port_start` to 0 there. The Docker and
+systemd e2e suites start the mock with `-dns-addr :53`. The image's default CMD
+and the Kubernetes manifest (`test/e2e/kubernetes/mock-api-manifests.yaml`) run
+no stub, because a kind Pod does not get that sysctl.
+
 ## Call Counters
 
 The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint increments its counter atomically before writing the response, ensuring accurate counts under concurrent access.
@@ -1814,6 +1875,12 @@ Override the listen address:
 docker run -p 9090:9090 mockapi:latest -addr :9090
 ```
 
+Run the [DNS stub](#dns-stub) as well:
+
+```bash
+docker run mockapi:latest -addr :8080 -dns-addr :53
+```
+
 ### Build Optimizations
 
 - **Module cache layer**: `go.mod` and `go.sum` are copied and downloaded before the full source, so source-only changes reuse the cached module layer.
@@ -1848,5 +1915,6 @@ defer ts.Close()
 
 - Server: `test/e2e/mockapi/mockapi.go`
 - CLI entry point: `test/e2e/mockapi/cmd/mockapi/main.go`
-- Tests: `test/e2e/mockapi/mockapi_test.go`
+- DNS stub: `test/e2e/mockapi/dnsstub.go`
+- Tests: `test/e2e/mockapi/mockapi_test.go`, `test/e2e/mockapi/dnsstub_test.go`, `test/e2e/mockapi/cmd/mockapi/main_test.go`
 - Dockerfile: `test/e2e/mockapi/Dockerfile`

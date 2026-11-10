@@ -127,7 +127,7 @@ carry `omitempty`.
 | `Secrets`      | `*[]NodeStateSecret`   | `"secrets"`      | The node's secret inventory, ordered by name ascending; `[]` when the node may read nothing, never `null` on the wire. A pointer, like `Sessions`: a `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the node API's secret index, and `[]` empties it |
 | `SigningKey`   | `*NodeStateSigningKey` | `"signing_key"`  | The key the node's Domain signs envelopes and session tokens with. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) means "keep the key you hold", never "drop it" |
 | `Hooks`        | `*[]NodeStateHook`     | `"hooks"`        | The published hook versions a rollout assigns the node, ordered by name ascending: the node's full desired set. A pointer, like `Secrets`: `[]` removes every rolled-out hook, and a `nil` value (the wire's `null`, which the control plane sends when it could not compute the set, or a pull from a control plane that predates the block and omits it) keeps every one |
-| `DNS`          | `*NodeStateDNS`        | `"dns"`          | The mesh DNS names of the node's Domain: the full set, never a delta, which replaces the names the node answers. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the names the node holds |
+| `DNS`          | `*NodeStateDNS`        | `"dns"`          | The mesh DNS names of the node's Domain and the node's DNS forwarding setting: the full set, never a delta, which replaces the names the node answers. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the names and the forwarding the node holds |
 
 Seven members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
@@ -142,7 +142,8 @@ the secret index from it on every successful pull (see `NodeStateSecret` below).
 `hooks` is never diffed either: the rollout installer's dispatch handler hands it
 to the installer on every successful pull (see `NodeStateHook` below).
 `dns` is never diffed either: the mesh resolver's dispatch handler builds the
-names it answers from it on every successful pull (see `NodeStateDNS` below).
+names it answers and the table it forwards with from it on every successful
+pull (see `NodeStateDNS` below).
 `peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
 
@@ -345,8 +346,9 @@ See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
 
 **NodeStateDNS**
 
-The interior of the `dns` block: the mesh DNS names of the node's Domain and the
-DNS records the Domain and its Projects define, as the
+The interior of the `dns` block: the mesh DNS names of the node's Domain, the
+DNS records the Domain and its Projects define, and the DNS forwarding setting
+that applies to the node, as the
 "Mesh DNS names" section of plexsphere's agent contract
 (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
 describes it. The control plane sends every name in lower case without a
@@ -356,10 +358,16 @@ or `localhost`, a host outside every accepted zone, or a repeated `fqdn`. It
 skips a record whose `type` is not one of the six, whose `fqdn` is not a valid
 name, lies under no accepted zone or is a host's `fqdn`, whose data breaks the
 rule of its type, which shares its name with a CNAME, or which repeats an
-earlier record. The manager logs them at Warn as
+earlier record. `meshdns.BuildForwarding` checks the `forwarding` member the
+same way and skips a forward zone that is no valid name, is reserved, lies
+under an accepted zone or reverse zone, repeats an earlier forward zone or has
+no usable resolver, and a resolver that is no IP address, is no address plexd
+forwards to, is the resolver's own listen address or repeats an earlier one.
+The manager logs them at Warn as
 `mesh dns skipped invalid entries`, with the count and the first five
 sentences. See
-[Mesh DNS](../networking/mesh-dns.md#records).
+[Mesh DNS](../networking/mesh-dns.md#records) and
+[Forward Zones and Resolvers](../networking/mesh-dns.md#forward-zones-and-resolvers).
 
 | Field          | Type                 | JSON Tag          | Description                                         |
 |----------------|----------------------|-------------------|-----------------------------------------------------|
@@ -368,6 +376,32 @@ sentences. See
 | `Hosts`        | `[]NodeStateDNSHost` | `"hosts"`         | Every node of the Domain, the pulling node included, ordered by `fqdn` |
 | `Records`      | `[]NodeStateDNSRecord` | `"records"`     | The DNS records of the Domain and of every Project, ordered by `fqdn`, then by `type`. A `nil` value (the wire's `null`, or a key a control plane that predates records never wrote) means the Domain has no records: the block is the full set, so it is no signal to keep the records held |
 | `ReverseZones` | `[]string`           | `"reverse_zones"` | The `in-addr.arpa` or `ip6.arpa` zones that cover the Domain's mesh CIDR and nothing wider |
+| `Forwarding`   | `*NodeStateDNSForwarding` | `"forwarding,omitempty"` | The DNS forwarding setting that applies to the pulling node. A pointer, because the member is the full setting and its absence says something else: a `nil` value (the wire's `null`, or a key a control plane that predates forwarding never wrote) means the control plane did not say this time, and the node keeps the forwarding it holds. Two empty lists end it. `omitempty` lets the mock control plane, which marshals this type, serve a block without the member |
+
+**NodeStateDNSForwarding**
+
+The `forwarding` member of the `dns` block, as the "Mesh DNS names" section of
+plexsphere's agent contract describes it: the Project's setting when the node's
+Project holds one, otherwise its Domain's, otherwise two empty lists. A resolver
+is an IPv4 or IPv6 address in text form, asked in list order on port 53 over
+plain DNS. A `nil` list (the wire's `null`, or a missing key) is an empty one.
+See [Forwarding](../networking/mesh-dns.md#forwarding).
+
+| Field          | Type                        | JSON Tag          | Description                                         |
+|----------------|-----------------------------|-------------------|-----------------------------------------------------|
+| `ForwardZones` | `[]NodeStateDNSForwardZone` | `"forward_zones"` | The forward zones, ascending by `zone`, each with 1 to 3 resolvers |
+| `CatchAll`     | `[]string`                  | `"catch_all"`     | 0 to 3 resolvers, which answer every name outside the mesh zones, the reverse zones and the forward zones. With an accepted one, plexd on Linux makes the mesh interface the host's default DNS route |
+
+**NodeStateDNSForwardZone**
+
+One entry of the `forward_zones` list: a zone outside the mesh and the resolvers
+that answer the names under it, as the "Mesh DNS names" section of plexsphere's
+agent contract describes it.
+
+| Field       | Type       | JSON Tag      | Description                                         |
+|-------------|------------|---------------|-----------------------------------------------------|
+| `Zone`      | `string`   | `"zone"`      | The zone, in lower case without a trailing dot. A label may carry `_`, as in `_msdcs.corp.example.com`. A zone that equals an accepted zone or reverse zone of the block, or lies under one, is skipped |
+| `Resolvers` | `[]string` | `"resolvers"` | The resolvers of the zone, in the order they are asked |
 
 **NodeStateDNSHost**
 
