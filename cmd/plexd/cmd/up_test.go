@@ -5480,6 +5480,8 @@ func (r *recordingMeshDNSRegistrar) Revert(ctx context.Context, iface string) er
 	return nil
 }
 
+func (r *recordingMeshDNSRegistrar) Name() string { return "fake" }
+
 func (r *recordingMeshDNSRegistrar) record(ctx context.Context, call meshDNSCall) {
 	call.ctxErr = ctx.Err()
 	if deadline, ok := ctx.Deadline(); ok {

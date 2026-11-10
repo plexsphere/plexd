@@ -171,6 +171,10 @@ func NewResolvedRegistrar(logger *slog.Logger) *ResolvedRegistrar {
 	}
 }
 
+// Name returns "systemd-resolved", the system resolver the registrar writes
+// to, for the manager's log lines.
+func (r *ResolvedRegistrar) Name() string { return "systemd-resolved" }
+
 // Apply registers reg on its interface. It first reads the Manager property
 // DNSEx, so a systemd-resolved older than 246 is told apart before anything on
 // the link changes; a failed read is followed by no other call. Then it makes
