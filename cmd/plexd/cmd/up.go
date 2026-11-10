@@ -57,9 +57,10 @@ const drainTimeout = 30 * time.Second
 const sessionEndedReportTimeout = 2 * time.Second
 
 // meshDNSRegistrarTimeout bounds each call runAgent makes to the mesh DNS
-// registrar itself: the revert of a run that starts no resolver, and the
-// shutdown in the drain. A system bus that hangs would otherwise hold up
-// startup, or spend the drain's budget before WireGuard is torn down.
+// registrar itself: the revert of a run that starts no resolver, the shutdown
+// after the resolver stops, and the shutdown in the drain. A system bus that
+// hangs would otherwise hold up startup, or spend the drain's budget before
+// WireGuard is torn down.
 const meshDNSRegistrarTimeout = 5 * time.Second
 
 // firewallController indirects the platform-specific constructor so tests can
@@ -1393,15 +1394,16 @@ func runAgent(ctx context.Context) error {
 
 	// 25a. Serve the mesh DNS resolver on the sockets step 5a-3 bound. Run
 	// returns nil once ctx ends; an error before that means no mesh name is
-	// answered for the rest of this run, and the registration stays until the
-	// drain reverts it.
+	// answered for the rest of this run. serveMeshDNS then reverts the link at
+	// once instead of leaving the registration to the drain: with a catch-all
+	// the stale registration would fail every lookup of the host until the
+	// run ends. The drain's own Shutdown still runs and finds nothing to
+	// revert.
 	if dnsMgr != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := dnsMgr.Run(ctx); err != nil && ctx.Err() == nil {
-				logger.Error("mesh dns stopped", "error", err)
-			}
+			serveMeshDNS(ctx, dnsMgr, logger)
 		}()
 	}
 
@@ -1547,6 +1549,28 @@ func revertMeshDNS(ctx context.Context, registrar meshdns.Registrar, iface strin
 	defer cancel()
 	if err := registrar.Revert(ctx, iface); err != nil {
 		logger.Warn("mesh dns revert failed", "interface", iface, "error", err)
+	}
+}
+
+// serveMeshDNS answers mesh DNS queries until ctx ends. An error from Run
+// while ctx is live means the resolver stopped answering for the rest of the
+// run, but the registration still sends the mesh zones, and with a catch-all
+// every name the host looks up, to a port nothing listens on. serveMeshDNS
+// therefore shuts the manager down at once: Shutdown reverts the link and
+// closes the manager, so a later pull registers nothing. The revert gets a
+// fresh context bounded by meshDNSRegistrarTimeout, as the drain's does,
+// because ctx may end while it runs. An error that comes after ctx ended is
+// the drain's to handle and is not logged.
+func serveMeshDNS(ctx context.Context, mgr *meshdns.Manager, logger *slog.Logger) {
+	err := mgr.Run(ctx)
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	logger.Error("mesh dns stopped", "error", err)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), meshDNSRegistrarTimeout)
+	defer cancel()
+	if err := mgr.Shutdown(shutdownCtx); err != nil {
+		logger.Error("mesh dns shutdown error", "error", err)
 	}
 }
 
