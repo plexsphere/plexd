@@ -140,6 +140,7 @@ func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot) {
 	if !records.Equal(m.records) {
 		m.logger.Info("mesh dns records updated",
 			"hosts", records.HostCount(),
+			"records", records.RecordCount(),
 			"zones", records.ZoneCount(),
 			"reverse_zones", records.ReverseZoneCount(),
 			"search_domain", records.SearchDomain(),
