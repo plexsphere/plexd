@@ -466,9 +466,12 @@ func TestManager_AppliesOnlyWhenRegistrationChanges(t *testing.T) {
 		// lab.internal already routes every name below it.
 		{"zone added below a routed zone", func(b *api.NodeStateDNS) { b.Zones = append(b.Zones, "rack.lab.internal") }, false},
 		{"zone added", func(b *api.NodeStateDNS) { b.Zones = append(b.Zones, "ops.example.net") }, true},
+		// The zone goes with its host and its record, as the control plane
+		// removes them, so the block stays one without skipped entries.
 		{"zone removed", func(b *api.NodeStateDNS) {
 			b.Zones = b.Zones[1:]
 			b.Hosts = slices.DeleteFunc(b.Hosts, func(h api.NodeStateDNSHost) bool { return h.FQDN == "gw.edge.example.com" })
+			b.Records = slices.DeleteFunc(b.Records, func(r api.NodeStateDNSRecord) bool { return r.FQDN == "edge.example.com" })
 		}, true},
 		{"reverse zone added", func(b *api.NodeStateDNS) { b.ReverseZones = append(b.ReverseZones, "43.10.in-addr.arpa") }, true},
 		{"search domain changed", func(b *api.NodeStateDNS) { b.SearchDomain = "lab.internal" }, true},

@@ -27,11 +27,16 @@ const (
 	// ResultNoData means the name exists under Zone but has no record of the
 	// asked type, so the server answers NOERROR with an empty answer section.
 	ResultNoData
-	// ResultFound means the name has a record of the asked type: an address
-	// in Addr, a PTR target in Target, or, at a zone itself, the SOA the
-	// server synthesizes for Zone.
+	// ResultFound means the name has a record of the asked type, or is a
+	// CNAME the system resolver follows on: the records are in RRs.
 	ResultFound
 )
+
+// maxCNAMEChain is how many CNAME records one answer holds at most. A chain
+// that reaches the limit ends with its last CNAME, as one that leaves the
+// zones plexd answers does, so the client follows on from there, and a chain
+// longer than any real one fails at the client's own limit.
+const maxCNAMEChain = 8
 
 // String returns the name of the result, for log lines and test failures.
 func (r Result) String() string {
@@ -54,16 +59,56 @@ type Answer struct {
 	// Result is the kind of answer.
 	Result Result
 	// Zone is the accepted zone or reverse zone with the longest label-wise
-	// suffix match, set for every result but ResultRefused. It owns the SOA
-	// the server synthesizes for a negative answer and for an SOA query at a
-	// zone itself.
+	// suffix match of the name the lookup ended at, set for every result but
+	// ResultRefused. It owns the SOA the server synthesizes for a negative
+	// answer. After a CNAME into another zone it is the target's zone.
 	Zone string
-	// Addr is the mesh IP of an A or AAAA answer.
-	Addr netip.Addr
-	// Target is the fully qualified name of a PTR answer, without a
-	// trailing dot.
-	Target string
+	// RRs are the records of the answer section in order: the CNAME records
+	// a lookup followed, then the records of the asked type. A negative
+	// answer carries the CNAME records that led to it, and none otherwise.
+	// The records share their Text with the Records they came from, which
+	// nothing changes.
+	RRs []RR
 }
+
+// RR is one resource record of an answer. Name and Target are folded to
+// lower case and carry no trailing dot. Only the members of Type are set: Addr
+// for A and AAAA, Target for PTR and CNAME, Priority and Target for MX, whose
+// preference Priority holds, Priority, Weight, Port and Target for SRV, and
+// Text for TXT. An SOA record carries Name alone, because the server
+// synthesizes its data.
+type RR struct {
+	Name     string
+	Type     dnsmessage.Type
+	Addr     netip.Addr
+	Target   string
+	Priority uint16
+	Weight   uint16
+	Port     uint16
+	Text     []string
+}
+
+// equal reports whether rr and o are the same record, Text compared in order.
+func (rr RR) equal(o RR) bool {
+	return rr.Name == o.Name && rr.Type == o.Type && rr.Addr == o.Addr &&
+		rr.Target == o.Target && rr.Priority == o.Priority && rr.Weight == o.Weight &&
+		rr.Port == o.Port && slices.Equal(rr.Text, o.Text)
+}
+
+// recordTypes maps the record types the contract defines to their DNS types.
+// A record of any other type is skipped.
+var recordTypes = map[string]dnsmessage.Type{
+	"A":     dnsmessage.TypeA,
+	"AAAA":  dnsmessage.TypeAAAA,
+	"CNAME": dnsmessage.TypeCNAME,
+	"TXT":   dnsmessage.TypeTXT,
+	"SRV":   dnsmessage.TypeSRV,
+	"MX":    dnsmessage.TypeMX,
+}
+
+// maxTextLen is the longest TXT string a DNS message carries, RFC 1035's
+// limit on one character-string.
+const maxTextLen = 255
 
 // reservedZones are the names the contract rules out as zones, with every
 // name under them. arpa holds the reverse zones, which have their own list,
@@ -91,9 +136,15 @@ type Records struct {
 	// ptrs maps the reverse name of a mesh IP to the FQDN of the first host
 	// that holds it.
 	ptrs map[string]string
+	// records maps each accepted record name to its records, in the order
+	// of the block. A CNAME is the only record at its name.
+	records map[string][]RR
+	// recordCount is the number of accepted records.
+	recordCount int
 	// names holds every name that exists: the hosts, the reverse names, the
-	// zones and reverse zones themselves, and every name above one of them,
-	// which makes the empty non-terminals answer NODATA rather than NXDOMAIN.
+	// record names, the zones and reverse zones themselves, and every name
+	// above one of them, which makes the empty non-terminals answer NODATA
+	// rather than NXDOMAIN.
 	names map[string]struct{}
 }
 
@@ -102,20 +153,23 @@ type Records struct {
 // zone that swallows the host's own resolution, so every entry is checked
 // where it enters. The second result names each entry that was skipped, one
 // sentence per entry, for the manager to log. A zone or reverse zone listed
-// twice is kept once without a sentence.
+// twice is kept once without a sentence. Records are checked against what a
+// DNS message needs, not against the limits the control plane sets on them,
+// so a change of those limits needs no new plexd.
 func BuildRecords(block api.NodeStateDNS) (*Records, []string) {
 	var skipped []string
 	r := &Records{
-		apexes: make(map[string]struct{}),
-		hosts:  make(map[string]netip.Addr),
-		ptrs:   make(map[string]string),
-		names:  make(map[string]struct{}),
+		apexes:  make(map[string]struct{}),
+		hosts:   make(map[string]netip.Addr),
+		ptrs:    make(map[string]string),
+		records: make(map[string][]RR),
+		names:   make(map[string]struct{}),
 	}
 
 	zones := make(map[string]struct{})
 	for _, z := range block.Zones {
 		name := foldName(z)
-		if reason := invalidName(name); reason != "" {
+		if reason := invalidName(name, false); reason != "" {
 			skipped = append(skipped, fmt.Sprintf("zone %q is not a valid name because it %s", z, reason))
 			continue
 		}
@@ -133,7 +187,7 @@ func BuildRecords(block api.NodeStateDNS) (*Records, []string) {
 	reverseZones := make(map[string]struct{})
 	for _, z := range block.ReverseZones {
 		name := foldName(z)
-		if reason := invalidName(name); reason != "" {
+		if reason := invalidName(name, false); reason != "" {
 			skipped = append(skipped, fmt.Sprintf("reverse zone %q is not a valid name because it %s", z, reason))
 			continue
 		}
@@ -149,7 +203,7 @@ func BuildRecords(block api.NodeStateDNS) (*Records, []string) {
 	owners := make(map[string]string)
 	for _, h := range block.Hosts {
 		name := foldName(h.FQDN)
-		if reason := invalidName(name); reason != "" {
+		if reason := invalidName(name, false); reason != "" {
 			skipped = append(skipped, fmt.Sprintf("host %q of node %q is not a valid name because it %s", h.FQDN, h.NodeID, reason))
 			continue
 		}
@@ -186,6 +240,12 @@ func BuildRecords(block api.NodeStateDNS) (*Records, []string) {
 		}
 	}
 
+	for _, rec := range block.Records {
+		if reason := r.addRecord(rec, zones, owners); reason != "" {
+			skipped = append(skipped, fmt.Sprintf("record %q of type %q %s", rec.FQDN, rec.Type, reason))
+		}
+	}
+
 	if block.SearchDomain != "" {
 		name := foldName(block.SearchDomain)
 		if _, ok := zones[name]; ok {
@@ -211,12 +271,147 @@ func BuildRecords(block api.NodeStateDNS) (*Records, []string) {
 	for name := range r.ptrs {
 		addWithAncestors(r.names, name)
 	}
+	for name := range r.records {
+		addWithAncestors(r.names, name)
+	}
 	return r, skipped
+}
+
+// addRecord validates rec and adds it to r, or returns why it is skipped,
+// naming the first check it failed. zones are the accepted zones and owners
+// the accepted hosts by FQDN, with the node that holds each. The checks run in
+// this order: the type, the name, the zone the name lies under, a host at the
+// name, the data, a CNAME beside another record, and a repeat. The first
+// record at a name decides the CNAME check, so of a CNAME and an address
+// record at one name, the one the block lists first stays.
+func (r *Records) addRecord(rec api.NodeStateDNSRecord, zones map[string]struct{}, owners map[string]string) string {
+	t, ok := recordTypes[rec.Type]
+	if !ok {
+		return "has a type plexd does not answer"
+	}
+	name := foldName(rec.FQDN)
+	if reason := invalidName(name, true); reason != "" {
+		return "is not a valid name because it " + reason
+	}
+	if _, ok := longestMatch(name, zones); !ok {
+		return "lies under no accepted zone"
+	}
+	if node, ok := owners[name]; ok {
+		return fmt.Sprintf("is the name of node %q, which is answered from hosts only", node)
+	}
+	rr, reason := recordData(name, t, rec)
+	if reason != "" {
+		return reason
+	}
+	set := r.records[name]
+	if len(set) > 0 && (set[0].Type == dnsmessage.TypeCNAME || t == dnsmessage.TypeCNAME) {
+		return "shares its name with a CNAME, which is the only record at its name"
+	}
+	for _, o := range set {
+		if o.equal(rr) {
+			return "repeats an earlier record"
+		}
+	}
+	r.records[name] = append(set, rr)
+	r.recordCount++
+	return ""
+}
+
+// recordData returns the record of type t at name with the data of rec, or
+// why the data breaks the rule of t. A member t does not take is ignored, so
+// a member a later contract adds costs no record.
+func recordData(name string, t dnsmessage.Type, rec api.NodeStateDNSRecord) (RR, string) {
+	rr := RR{Name: name, Type: t}
+	var reason string
+	switch t {
+	case dnsmessage.TypeA:
+		addr, err := netip.ParseAddr(rec.Address)
+		if err != nil || addr.Zone() != "" || !addr.Is4() {
+			return RR{}, fmt.Sprintf("has address %q, which is not an IPv4 address", rec.Address)
+		}
+		rr.Addr = addr
+	case dnsmessage.TypeAAAA:
+		// An IPv4-mapped address is an IPv4 address in an AAAA record's
+		// clothes, which no client asking for AAAA wants.
+		addr, err := netip.ParseAddr(rec.Address)
+		if err != nil || addr.Zone() != "" || !addr.Is6() || addr.Is4In6() {
+			return RR{}, fmt.Sprintf("has address %q, which is not an IPv6 address", rec.Address)
+		}
+		rr.Addr = addr
+	case dnsmessage.TypeCNAME:
+		if rr.Target, reason = recordTarget(rec.Target); reason != "" {
+			return RR{}, reason
+		}
+	case dnsmessage.TypeTXT:
+		if len(rec.Text) == 0 {
+			return RR{}, "has no text"
+		}
+		for _, s := range rec.Text {
+			if len(s) > maxTextLen {
+				return RR{}, fmt.Sprintf("has a text string of more than %d bytes", maxTextLen)
+			}
+		}
+		// A copy, so nothing the block's owner does later reaches the
+		// records the server answers from.
+		rr.Text = slices.Clone(rec.Text)
+	case dnsmessage.TypeSRV:
+		if rr.Priority, reason = recordNumber("priority", rec.Priority); reason != "" {
+			return RR{}, reason
+		}
+		if rr.Weight, reason = recordNumber("weight", rec.Weight); reason != "" {
+			return RR{}, reason
+		}
+		if rr.Port, reason = recordNumber("port", rec.Port); reason != "" {
+			return RR{}, reason
+		}
+		if rr.Target, reason = recordTarget(rec.Target); reason != "" {
+			return RR{}, reason
+		}
+	case dnsmessage.TypeMX:
+		if rr.Priority, reason = recordNumber("priority", rec.Priority); reason != "" {
+			return RR{}, reason
+		}
+		if rr.Target, reason = recordTarget(rec.Target); reason != "" {
+			return RR{}, reason
+		}
+	}
+	return rr, ""
+}
+
+// recordTarget folds the target of a CNAME, SRV or MX record, or returns why
+// it is not a valid name. A target may lie anywhere, inside or outside the
+// zones plexd answers, and may carry _ in a label.
+func recordTarget(target string) (string, string) {
+	name := foldName(target)
+	if reason := invalidName(name, true); reason != "" {
+		return "", fmt.Sprintf("has target %q, which is not a valid name because it %s", target, reason)
+	}
+	return name, ""
+}
+
+// recordNumber returns the 16-bit value of the member named member, or why it
+// is missing or out of range.
+func recordNumber(member string, v *int) (uint16, string) {
+	switch {
+	case v == nil:
+		return 0, "has no " + member
+	case *v < 0 || *v > 0xffff:
+		return 0, fmt.Sprintf("has a %s outside 0 to 65535", member)
+	}
+	return uint16(*v), ""
 }
 
 // Lookup answers name for the type qtype. The name may carry one trailing
 // dot, as a parsed question does, and is compared in ASCII lower case, so the
 // answer does not depend on the spelling of the query.
+//
+// At each name it tries, in this order: a host of the asked address family; a
+// PTR for a reverse name that maps to a host; a CNAME, which answers every
+// type and is followed, unless the query asks for CNAME or for any type, while
+// its target lies under a zone or reverse zone plexd answers; the records of
+// the asked type; the SOA of a zone itself. A name that exists without any of them answers ResultNoData, and any
+// other name ResultNXDomain, both with the CNAME records that led there. The
+// response code is that of the last name, as RFC 6604 has it.
 func (r *Records) Lookup(name string, qtype dnsmessage.Type) Answer {
 	if r == nil {
 		return Answer{Result: ResultRefused}
@@ -226,25 +421,56 @@ func (r *Records) Lookup(name string, qtype dnsmessage.Type) Answer {
 	if !ok {
 		return Answer{Result: ResultRefused}
 	}
-
-	switch qtype {
-	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
-		if addr, ok := r.hosts[name]; ok && addr.Is4() == (qtype == dnsmessage.TypeA) {
-			return Answer{Result: ResultFound, Zone: zone, Addr: addr}
+	var rrs []RR
+	// visited holds the names a CNAME chain passed, so a chain that comes
+	// back to one of them ends there rather than going round.
+	var visited []string
+	for {
+		if addr, ok := r.hosts[name]; ok &&
+			(qtype == dnsmessage.TypeA && addr.Is4() || qtype == dnsmessage.TypeAAAA && addr.Is6()) {
+			return Answer{Result: ResultFound, Zone: zone, RRs: append(rrs, RR{Name: name, Type: qtype, Addr: addr})}
 		}
-	case dnsmessage.TypePTR:
-		if target, ok := r.ptrs[name]; ok {
-			return Answer{Result: ResultFound, Zone: zone, Target: target}
+		if qtype == dnsmessage.TypePTR {
+			if target, ok := r.ptrs[name]; ok {
+				return Answer{Result: ResultFound, Zone: zone, RRs: append(rrs, RR{Name: name, Type: qtype, Target: target})}
+			}
 		}
-	case dnsmessage.TypeSOA:
-		if name == zone {
-			return Answer{Result: ResultFound, Zone: zone}
+		set := r.records[name]
+		if len(set) == 1 && set[0].Type == dnsmessage.TypeCNAME {
+			cname := set[0]
+			// A query for the CNAME itself, or for any type, which the CNAME
+			// matches (RFC 1034 4.3.2), gets the CNAME and is not followed.
+			if qtype == dnsmessage.TypeCNAME || qtype == dnsmessage.TypeALL {
+				return Answer{Result: ResultFound, Zone: zone, RRs: append(rrs, cname)}
+			}
+			rrs = append(rrs, cname)
+			visited = append(visited, name)
+			// rrs holds CNAME records only while the chain goes on, so its
+			// length is the length of the chain.
+			next, under := longestMatch(cname.Target, r.apexes)
+			if !under || slices.Contains(visited, cname.Target) || len(rrs) == maxCNAMEChain {
+				return Answer{Result: ResultFound, Zone: zone, RRs: rrs}
+			}
+			name, zone = cname.Target, next
+			continue
 		}
+		n := len(rrs)
+		for _, rr := range set {
+			if rr.Type == qtype {
+				rrs = append(rrs, rr)
+			}
+		}
+		if len(rrs) > n {
+			return Answer{Result: ResultFound, Zone: zone, RRs: rrs}
+		}
+		if qtype == dnsmessage.TypeSOA && name == zone {
+			return Answer{Result: ResultFound, Zone: zone, RRs: append(rrs, RR{Name: zone, Type: dnsmessage.TypeSOA})}
+		}
+		if _, ok := r.names[name]; ok {
+			return Answer{Result: ResultNoData, Zone: zone, RRs: rrs}
+		}
+		return Answer{Result: ResultNXDomain, Zone: zone, RRs: rrs}
 	}
-	if _, ok := r.names[name]; ok {
-		return Answer{Result: ResultNoData, Zone: zone}
-	}
-	return Answer{Result: ResultNXDomain, Zone: zone}
 }
 
 // Registration returns what the system resolver should send to server
@@ -274,9 +500,11 @@ func (r *Records) Registration(iface string, server netip.AddrPort) Registration
 }
 
 // Equal reports whether r and o answer every query alike, so the manager logs
-// a change only when a pull changed a name. Node IDs are not answered and are
-// not compared. A nil *Records equals only another nil one, so the first
-// block counts as a change even when it is empty.
+// a change only when a pull changed a name or a record. Node IDs are not
+// answered and are not compared. The records of a name are compared in
+// order, because they are answered in that order. A nil *Records equals only
+// another nil one, so the first block counts as a change even when it is
+// empty.
 func (r *Records) Equal(o *Records) bool {
 	if r == nil || o == nil {
 		return r == o
@@ -285,7 +513,9 @@ func (r *Records) Equal(o *Records) bool {
 		slices.Equal(r.zones, o.zones) &&
 		slices.Equal(r.reverseZones, o.reverseZones) &&
 		maps.Equal(r.hosts, o.hosts) &&
-		maps.Equal(r.ptrs, o.ptrs)
+		maps.Equal(r.ptrs, o.ptrs) &&
+		r.recordCount == o.recordCount &&
+		maps.EqualFunc(r.records, o.records, func(a, b []RR) bool { return slices.EqualFunc(a, b, RR.equal) })
 }
 
 // SearchDomain returns the accepted search domain, or empty when the node has
@@ -303,6 +533,14 @@ func (r *Records) HostCount() int {
 		return 0
 	}
 	return len(r.hosts)
+}
+
+// RecordCount returns the number of accepted records.
+func (r *Records) RecordCount() int {
+	if r == nil {
+		return 0
+	}
+	return r.recordCount
 }
 
 // ZoneCount returns the number of accepted zones.
@@ -344,9 +582,10 @@ func foldName(s string) string {
 // invalidName returns why name, already folded, is not a valid name, or
 // empty when it is valid. A valid name has 1 to 253 characters, no trailing
 // dot, and labels of 1 to 63 characters from a-z, 0-9 and - that neither
-// start nor end with -. The root zone is never valid, because the empty
-// name is not.
-func invalidName(name string) string {
+// start nor end with -. With underscore set a label may also carry _ at any
+// position, as the names and targets of records do (_ldap._tcp). The root
+// zone is never valid, because the empty name is not.
+func invalidName(name string, underscore bool) string {
 	switch {
 	case name == "":
 		return "is empty"
@@ -366,7 +605,10 @@ func invalidName(name string) string {
 		}
 		for i := 0; i < len(label); i++ {
 			c := label[i]
-			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && (!underscore || c != '_') {
+				if underscore {
+					return "has a character outside a-z, 0-9, - and _"
+				}
 				return "has a character outside a-z, 0-9 and -"
 			}
 		}
