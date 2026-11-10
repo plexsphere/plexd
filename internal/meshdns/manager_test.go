@@ -367,6 +367,7 @@ func TestManager_HandleBlock(t *testing.T) {
 	checkBounded(t, calls[0])
 	wantLine(t, logs, slog.LevelInfo, msgUpdated, map[string]string{
 		"hosts":         "3",
+		"records":       "6",
 		"zones":         "3",
 		"reverse_zones": "1",
 		"search_domain": "openstack.lab.internal",
@@ -909,4 +910,58 @@ func TestManager_StartAddressInUse(t *testing.T) {
 	if got := m.Addr(); got != addr {
 		t.Errorf("Addr() = %v, want %v, the address the bind was refused", got, addr)
 	}
+}
+
+func TestManager_HandleChangedRecord(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs := startManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(exampleBlock()))
+	wantAddr(t, m, "db.lab.internal", "10.20.0.5")
+	changed := exampleBlock()
+	i := slices.IndexFunc(changed.Records, func(r api.NodeStateDNSRecord) bool { return r.FQDN == "db.lab.internal" && r.Type == "A" })
+	changed.Records[i].Address = "10.20.0.6"
+	m.Handle(ctx, snapshot(changed))
+
+	// The records changed and the registration did not, so the line logs
+	// again and the system resolver hears nothing.
+	wantAddr(t, m, "db.lab.internal", "10.20.0.6")
+	wantCount(t, logs, msgUpdated, 2)
+	wantMethods(t, reg, "Apply")
+}
+
+func TestManager_RecordsFollowTheBlock(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, _ := startManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(exampleBlock()))
+	// A pull without a dns block keeps the records with the names.
+	m.Handle(ctx, &api.NodeStateSnapshot{})
+	wantAddr(t, m, "db.lab.internal", "10.20.0.5")
+
+	// A block without records has none: the block is the full set.
+	without := exampleBlock()
+	without.Records = nil
+	m.Handle(ctx, snapshot(without))
+	wantRCode(t, m, "db.lab.internal", dnsmessage.RCodeNameError)
+	wantAddr(t, m, "db-1.openstack.lab.internal", "10.42.0.3")
+}
+
+func TestManager_LogsSkippedRecord(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs := newTestManager(t, reg)
+	block := exampleBlock()
+	block.Records = append(block.Records, api.NodeStateDNSRecord{FQDN: "bad.lab.internal", Type: "A", Address: "fd00::1"})
+
+	m.Handle(context.Background(), snapshot(block))
+
+	wantLine(t, logs, slog.LevelWarn, msgSkipped, map[string]string{"count": "1"})
+	got, _ := logs.find(msgSkipped)[0].attrs["skipped"].Any().([]string)
+	want := []string{`record "bad.lab.internal" of type "A" has address "fd00::1", which is not an IPv4 address`}
+	if !slices.Equal(got, want) {
+		t.Errorf("%q has skipped=%q, want %q", msgSkipped, got, want)
+	}
+	wantLine(t, logs, slog.LevelInfo, msgUpdated, map[string]string{"records": "6"})
 }
