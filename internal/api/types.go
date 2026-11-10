@@ -133,14 +133,19 @@ type NodeStateSnapshot struct {
 // describes it. SearchDomain is the zone of the node's own Project. Zones are
 // the Domain's default domain and every Project zone, ascending. Hosts are
 // every node of the Domain, the pulling node included, ordered by FQDN.
+// Records are the DNS records of the Domain and of every Project, ordered by
+// FQDN, then by type. A nil Records, the wire's null or a key a control plane
+// predating records never wrote, means the Domain has no records: the block
+// is the full set, so it is no signal to keep the records held.
 // ReverseZones are the in-addr.arpa or ip6.arpa zones that cover the Domain's
 // mesh CIDR and nothing wider. The control plane sends every name in lower
 // case without a trailing dot, and an empty list as [].
 type NodeStateDNS struct {
-	SearchDomain string             `json:"search_domain"`
-	Zones        []string           `json:"zones"`
-	Hosts        []NodeStateDNSHost `json:"hosts"`
-	ReverseZones []string           `json:"reverse_zones"`
+	SearchDomain string               `json:"search_domain"`
+	Zones        []string             `json:"zones"`
+	Hosts        []NodeStateDNSHost   `json:"hosts"`
+	Records      []NodeStateDNSRecord `json:"records"`
+	ReverseZones []string             `json:"reverse_zones"`
 }
 
 // NodeStateDNSHost is one entry of the dns block's hosts, as the "Mesh DNS
@@ -151,6 +156,29 @@ type NodeStateDNSHost struct {
 	NodeID string `json:"node_id"`
 	FQDN   string `json:"fqdn"`
 	MeshIP string `json:"mesh_ip"`
+}
+
+// NodeStateDNSRecord is one entry of the dns block's records, as the "Mesh DNS
+// names" section of plexsphere's agent contract describes it: a record's fully
+// qualified name, its type (A, AAAA, CNAME, TXT, SRV or MX) and the data
+// members of that type, and no other member. Address belongs to A and AAAA,
+// Target to CNAME, SRV and MX, Priority to SRV and MX (the preference of an
+// MX), Weight and Port to SRV, and Text to TXT.
+//
+// The numbers are pointers because the contract sends a priority or a weight
+// of 0 as 0 and leaves out every member a type does not take, which the mock
+// control plane marshals this type for. They are int rather than uint16, so a
+// number out of range costs the one record it belongs to, which the resolver
+// skips, rather than the decode of the whole snapshot.
+type NodeStateDNSRecord struct {
+	FQDN     string   `json:"fqdn"`
+	Type     string   `json:"type"`
+	Address  string   `json:"address,omitempty"`
+	Target   string   `json:"target,omitempty"`
+	Priority *int     `json:"priority,omitempty"`
+	Weight   *int     `json:"weight,omitempty"`
+	Port     *int     `json:"port,omitempty"`
+	Text     []string `json:"text,omitempty"`
 }
 
 // NodeStateHook is one entry of the hooks block of the state pull, a published

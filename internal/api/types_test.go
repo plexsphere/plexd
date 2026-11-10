@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -541,6 +542,7 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			Hosts: []NodeStateDNSHost{
 				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", FQDN: "db-1.openstack.lab.internal", MeshIP: "10.42.0.3"},
 			},
+			Records:      sixDNSRecords(),
 			ReverseZones: []string{"42.10.in-addr.arpa"},
 		},
 	}
@@ -778,6 +780,72 @@ func TestNodeStateSnapshot_DNSBlock(t *testing.T) {
 		!slices.Equal(populated.DNS.Hosts, wantHosts) ||
 		!slices.Equal(populated.DNS.ReverseZones, []string{"42.10.in-addr.arpa"}) {
 		t.Errorf("dns = %+v, want the populated block", populated.DNS)
+	}
+}
+
+// sixDNSRecords returns one record of each type the contract names, as the
+// "Mesh DNS names" section's example has them.
+func sixDNSRecords() []NodeStateDNSRecord {
+	return []NodeStateDNSRecord{
+		{FQDN: "_postgres._tcp.openstack.lab.internal", Type: "SRV", Priority: new(0), Weight: new(5), Port: new(5432), Target: "db.lab.internal"},
+		{FQDN: "db.lab.internal", Type: "A", Address: "10.20.0.5"},
+		{FQDN: "db.lab.internal", Type: "AAAA", Address: "fd00:20::5"},
+		{FQDN: "edge.example.com", Type: "TXT", Text: []string{"owner=edge-team"}},
+		{FQDN: "lab.internal", Type: "MX", Priority: new(10), Target: "relay.example.com"},
+		{FQDN: "wiki.openstack.lab.internal", Type: "CNAME", Target: "wiki.example.com"},
+	}
+}
+
+// TestNodeStateDNSRecord_Wire pins the wire form of a record: a priority or
+// weight of 0 is sent as 0, and a record carries no member its type does not
+// take.
+func TestNodeStateDNSRecord_Wire(t *testing.T) {
+	recs := sixDNSRecords()
+	wantKeys := map[string][]string{
+		"SRV":   {"fqdn", "port", "priority", "target", "type", "weight"},
+		"A":     {"address", "fqdn", "type"},
+		"AAAA":  {"address", "fqdn", "type"},
+		"TXT":   {"fqdn", "text", "type"},
+		"MX":    {"fqdn", "priority", "target", "type"},
+		"CNAME": {"fqdn", "target", "type"},
+	}
+	for _, rec := range recs {
+		data, got := roundTrip(t, rec)
+		requireEqual(t, rec, got)
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		keys := slices.Sorted(maps.Keys(raw))
+		if !slices.Equal(keys, wantKeys[rec.Type]) {
+			t.Errorf("%s record marshals the keys %q, want %q", rec.Type, keys, wantKeys[rec.Type])
+		}
+		if rec.Type == "SRV" && string(raw["priority"]) != "0" {
+			t.Errorf("SRV record marshals priority %s, want 0", raw["priority"])
+		}
+	}
+}
+
+// TestNodeStateDNS_Records pins how the records member of the dns block
+// decodes: an absent key and null both give a nil Records, which the resolver
+// reads as no records, and [] gives an empty one.
+func TestNodeStateDNS_Records(t *testing.T) {
+	const others = `"search_domain":"","zones":[],"hosts":[],"reverse_zones":[]`
+	for _, src := range []string{`{` + others + `}`, `{` + others + `,"records":null}`} {
+		var block NodeStateDNS
+		if err := json.Unmarshal([]byte(src), &block); err != nil {
+			t.Fatalf("unmarshal %s: %v", src, err)
+		}
+		if block.Records != nil {
+			t.Errorf("records from %s = %+v, want nil", src, block.Records)
+		}
+	}
+	var empty NodeStateDNS
+	if err := json.Unmarshal([]byte(`{`+others+`,"records":[]}`), &empty); err != nil {
+		t.Fatalf("unmarshal empty records: %v", err)
+	}
+	if empty.Records == nil || len(empty.Records) != 0 {
+		t.Errorf("records from [] = %#v, want an empty non-nil slice", empty.Records)
 	}
 }
 
