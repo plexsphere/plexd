@@ -69,6 +69,10 @@ const meshDNSLeftoversOutliveTheRun = true
 // the dynamic-store entries name that address.
 const meshDNSListensOnLoopback = true
 
+// meshDNSBindHint is logged when the resolver cannot bind its port, which the
+// dynamic-store entries name beside the address, so any port works.
+const meshDNSBindHint = "set dns.listen_port to a free port"
+
 // policyCapabilityHint is carried by both firewall-baseline failures. Every
 // pfctl call that opens /dev/pf answers an unprivileged caller with a bare
 // "Permission denied", and an anchor the main ruleset never references loads

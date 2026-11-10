@@ -81,7 +81,8 @@ type Manager struct {
 // NewManager returns a manager whose resolver listens on listenIP and
 // cfg.ListenPort and registers with registrar for the interface iface.
 // plexd up passes the node's own mesh IP on Linux and 127.0.0.1 on macOS,
-// where the host cannot reach its own utun mesh IP. It
+// where the host cannot reach its own utun mesh IP, and on Windows, where the
+// Name Resolution Policy Table names a server by address only. It
 // binds nothing until Start, so the caller learns about an occupied port from
 // Start's error. cfg must have passed Validate; Enabled is not consulted,
 // because the caller decides whether to build a manager at all. A ListenPort

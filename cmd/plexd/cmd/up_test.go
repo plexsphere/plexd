@@ -5605,8 +5605,8 @@ type meshDNSDaemon struct {
 // controller and dnsBlock appended to its config. The node resumes an identity
 // whose mesh IP is meshIP, usually an IPv4 address of the loopback, so the
 // resolver binds an address this process may use without creating a device;
-// on macOS it binds 127.0.0.1 whatever meshIP is (meshDNSListensOnLoopback). Pulls and
-// heartbeats run every second, and the MTU is pinned so WireGuard setup sends
+// on macOS and Windows it binds 127.0.0.1 whatever meshIP is
+// (meshDNSListensOnLoopback). Pulls and heartbeats run every second, and the MTU is pinned so WireGuard setup sends
 // no STUN probe. The caller installs the registrar, or leaves TestMain's nil.
 func startMeshDNSDaemon(t *testing.T, meshIP string, ctrl wireguard.WGController, dnsBlock string) *meshDNSDaemon {
 	t.Helper()
@@ -5726,16 +5726,18 @@ func lookupMeshA(t *testing.T, addr, name string) []netip.Addr {
 	return addrs
 }
 
-// Linux and macOS have a registrar. Every other build returns nil, which
-// keeps the resolver off there (see TestRunUp_MeshDNSNilRegistrarStartsNothing).
-// Building either opens no connection and runs no command, so this test stays
+// Linux, macOS and Windows have a registrar. Every other build returns nil,
+// which keeps the resolver off there (see
+// TestRunUp_MeshDNSNilRegistrarStartsNothing). Building any of them opens no
+// connection, runs no command and writes no registry key, so this test stays
 // off the host's resolver. The types are named as strings because the
 // constructors exist in their own builds only.
 func TestNewMeshDNSRegistrar(t *testing.T) {
 	r := newMeshDNSRegistrar(slog.Default())
 	want := map[string]string{
-		"linux":  "*meshdns.ResolvedRegistrar",
-		"darwin": "*meshdns.ScutilRegistrar",
+		"linux":   "*meshdns.ResolvedRegistrar",
+		"darwin":  "*meshdns.ScutilRegistrar",
+		"windows": "*meshdns.NRPTRegistrar",
 	}[runtime.GOOS]
 	if want == "" {
 		if r != nil {
@@ -5863,10 +5865,10 @@ func TestRunUp_MeshDNSUnparsableMeshIPReverts(t *testing.T) {
 	assertBoundedRevert(t, reverts[0])
 }
 
-// Windows has no registrar yet, and its build hands runUp a nil one, as
-// TestMain does here. That skips the whole subsystem without a word:
-// no listener, no dispatch handler and no log line about mesh DNS, even with
-// WireGuard up and a dns block in every pull.
+// A build other than Linux, macOS and Windows has no registrar and hands
+// runUp a nil one, as TestMain does here. That skips the whole subsystem
+// without a word: no listener, no dispatch handler and no log line about
+// mesh DNS, even with WireGuard up and a dns block in every pull.
 func TestRunUp_MeshDNSNilRegistrarStartsNothing(t *testing.T) {
 	if r := meshDNSRegistrar(slog.Default()); r != nil {
 		t.Fatalf("meshDNSRegistrar() = %T, want the nil TestMain installs", r)
@@ -5915,8 +5917,8 @@ func TestRunUp_MeshDNSListenPortOccupied(t *testing.T) {
 	if attrs["listen"] != listen {
 		t.Errorf("warning listen = %q, want %q", attrs["listen"], listen)
 	}
-	if want := "set dns.listen_port to a free port"; attrs["hint"] != want {
-		t.Errorf("warning hint = %q, want %q", attrs["hint"], want)
+	if attrs["hint"] != meshDNSBindHint {
+		t.Errorf("warning hint = %q, want %q", attrs["hint"], meshDNSBindHint)
 	}
 	if !strings.Contains(attrs["error"], listen) {
 		t.Errorf("warning error = %q, want it to name %s", attrs["error"], listen)
@@ -6020,8 +6022,8 @@ func TestRunUp_MeshDNSRevertsLeftoversAtStart(t *testing.T) {
 
 // plexd up hands the resolver the address the platform's resolver reaches:
 // 127.0.0.1 where meshDNSListensOnLoopback holds, the mesh IP elsewhere. A
-// mesh IP that no interface carries tells the two apart. On macOS the
-// resolver listens on loopback, answers there and registers that address;
+// mesh IP that no interface carries tells the two apart. On macOS and Windows
+// the resolver listens on loopback, answers there and registers that address;
 // elsewhere its bind on the mesh IP fails and names that address.
 func TestRunUp_MeshDNSListenAddress(t *testing.T) {
 	const meshIP = "192.0.2.1"
@@ -6056,8 +6058,9 @@ func TestRunUp_MeshDNSListenAddress(t *testing.T) {
 	}
 }
 
-// Only macOS listens on loopback, because a Mac cannot reach its own utun mesh
-// IP; every other platform listens on the mesh IP.
+// macOS and Windows listen on loopback: a Mac cannot reach its own utun mesh
+// IP, and on Windows no plexd packet filter can match a query to 127.0.0.1.
+// Every other platform listens on the mesh IP.
 func TestMeshDNSListenIP(t *testing.T) {
 	meshIP := netip.MustParseAddr("10.99.0.1")
 	if got := meshDNSListenIP(meshIP, false); got != meshIP {
@@ -6066,20 +6069,34 @@ func TestMeshDNSListenIP(t *testing.T) {
 	if got := meshDNSListenIP(meshIP, true); got != netip.MustParseAddr("127.0.0.1") {
 		t.Errorf("meshDNSListenIP(%v, true) = %v, want 127.0.0.1", meshIP, got)
 	}
-	if want := runtime.GOOS == "darwin"; meshDNSListensOnLoopback != want {
+	if want := runtime.GOOS == "darwin" || runtime.GOOS == "windows"; meshDNSListensOnLoopback != want {
 		t.Errorf("meshDNSListensOnLoopback = %t on %s, want %t", meshDNSListensOnLoopback, runtime.GOOS, want)
 	}
 }
 
-// Only macOS keeps a killed run's registration past its interface, so only a
-// macOS start whose resolver listens reverts first.
+// macOS and Windows keep a killed run's registration past its interface, so
+// only a start whose resolver listens on one of them reverts first.
 func TestMeshDNSRevertAtStart_PerPlatform(t *testing.T) {
-	want := runtime.GOOS == "darwin"
+	want := runtime.GOOS == "darwin" || runtime.GOOS == "windows"
 	if meshDNSLeftoversOutliveTheRun != want {
 		t.Errorf("meshDNSLeftoversOutliveTheRun = %t on %s, want %t", meshDNSLeftoversOutliveTheRun, runtime.GOOS, want)
 	}
 	if meshDNSRevertAtStart != want {
 		t.Errorf("meshDNSRevertAtStart = %t on %s, want %t", meshDNSRevertAtStart, runtime.GOOS, want)
+	}
+}
+
+// The bind failure names the way out. On Windows the port is fixed at 53,
+// because the Name Resolution Policy Table sends nowhere else, so the hint
+// says to free it or turn the resolver off; every other platform takes any
+// port.
+func TestMeshDNSBindHint_PerPlatform(t *testing.T) {
+	want := "set dns.listen_port to a free port"
+	if runtime.GOOS == "windows" {
+		want = "free port 53 on 127.0.0.1, the only port the Name Resolution Policy Table sends to, or set dns.enabled: false"
+	}
+	if meshDNSBindHint != want {
+		t.Errorf("meshDNSBindHint = %q on %s, want %q", meshDNSBindHint, runtime.GOOS, want)
 	}
 }
 

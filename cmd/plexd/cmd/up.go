@@ -75,9 +75,10 @@ var wgController = newWGController
 
 // meshDNSRegistrar indirects the platform-specific constructor so tests can
 // record what runUp registers without reaching the host's resolver: on Linux
-// the registrar talks to systemd-resolved on the system bus, and on macOS it
-// writes configd's dynamic store with scutil, so a revert from a test would
-// drop the live registration of a developer machine that runs plexd.
+// the registrar talks to systemd-resolved on the system bus, on macOS it
+// writes configd's dynamic store with scutil, and on Windows it writes the
+// registry, so a revert from a test would drop the live registration of a
+// developer machine that runs plexd.
 var meshDNSRegistrar = newMeshDNSRegistrar
 
 // meshDNSRevertAtStart makes a start whose resolver listens revert once, before
@@ -338,7 +339,10 @@ func runAgent(ctx context.Context) error {
 	// per-link server leaves through the mesh interface, so only a listener
 	// on the mesh IP is reached. On macOS it listens on 127.0.0.1, which the
 	// dynamic-store entries name, because a Mac cannot reach its own utun
-	// mesh IP (meshDNSListensOnLoopback). The resolver starts only once
+	// mesh IP (meshDNSListensOnLoopback). On Windows it listens on
+	// 127.0.0.1, port 53 by default, which the Name Resolution Policy Table
+	// rules name: the DNS Client sends to port 53 only, and no WFP filter of
+	// plexd matches a query to loopback. The resolver starts only once
 	// WireGuard is up. The sockets are bound here so a bind failure is known
 	// before the dns block's dispatch handler is registered: a node that
 	// cannot answer must not register a server nothing listens on. Step 25a
@@ -361,6 +365,10 @@ func runAgent(ctx context.Context) error {
 	// killed run's default-resolver entry would send the control plane's own
 	// name to this run's resolver, which refuses every name until the first
 	// pull, so that pull might never arrive. A reboot clears the keys as well.
+	// On Windows the adapter goes with the process too, but the registrar's
+	// rule keys stay until a reboot, and the adapter's search list stays in
+	// the registry, where the next run's adapter, whose GUID derives from its
+	// name, inherits it. A start reverts both the same way.
 	var dnsMgr *meshdns.Manager
 	if dnsRegistrar := meshDNSRegistrar(logger); dnsRegistrar != nil {
 		dnsIface := wgMgr.OSInterfaceName()
@@ -384,7 +392,7 @@ func runAgent(ctx context.Context) error {
 				logger.Warn("mesh dns listener cannot bind, mesh names are not answered",
 					"listen", mgr.Addr().String(),
 					"error", err,
-					"hint", "set dns.listen_port to a free port",
+					"hint", meshDNSBindHint,
 				)
 				revertMeshDNS(ctx, dnsRegistrar, dnsIface, logger)
 			} else {
@@ -1561,7 +1569,9 @@ func meshMTUProbe(natCfg nat.Config) func(context.Context) (int, error) {
 
 // meshDNSListenIP returns the address the mesh resolver listens on: the
 // node's own mesh IP, or 127.0.0.1 where the platform's resolver cannot reach
-// that IP from the host itself (meshDNSListensOnLoopback).
+// that IP from the host itself, as on macOS, or where it names its server by
+// address alone and plexd's packet filter may stand between, as on Windows
+// (meshDNSListensOnLoopback).
 func meshDNSListenIP(meshIP netip.Addr, loopback bool) netip.Addr {
 	if loopback {
 		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
