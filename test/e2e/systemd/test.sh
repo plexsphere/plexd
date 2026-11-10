@@ -17,8 +17,10 @@
 #   - Deeper body validation (metrics, capabilities fields)
 #   - Mediated ssh session through the socket-activated session helper
 #   - Mesh DNS through systemd-resolved: the registration, names, a bare host
-#     name and a PTR answered on plexd0, a renamed host and a new zone without
-#     a restart, answers while the control plane is paused
+#     name, a PTR and the A, AAAA, CNAME, SRV, MX and TXT records answered on
+#     plexd0, a renamed host, a new zone and changed records without a
+#     restart, a CNAME out of the mesh zones, a TXT answer over TCP, answers
+#     while the control plane is paused
 #   - Start after a reboot cleared /run/plexd, with the registration gone
 #     while plexd is stopped and back after the start
 #   - Mesh DNS opt-out with dns.enabled: false
@@ -1173,7 +1175,10 @@ echo "=== Mediated ssh session PASSED ==="
 # here asks systemd-resolved directly with resolvectl, inside the container.
 # The fixture's block has the search domain app.e2e.internal, the zones
 # app.e2e.internal and e2e.internal, the reverse zone 0.99.10.in-addr.arpa,
-# and the hosts node-1, peer-1 and peer-2 at 10.99.0.1 to 10.99.0.3.
+# the hosts node-1, peer-1 and peer-2 at 10.99.0.1 to 10.99.0.3, and eight
+# records: two A records and an AAAA at db.e2e.internal, an SRV at
+# _db._tcp.app.e2e.internal, an MX and a TXT at e2e.internal, and the CNAMEs
+# alias.app.e2e.internal to peer-2 and ext.e2e.internal to ext.example.com.
 echo "=== Testing mesh DNS through systemd-resolved ==="
 
 MESH_IFACE="plexd0"
@@ -1214,11 +1219,12 @@ journal_has() {
     return 1
 }
 
-# mesh_query <name> runs resolvectl query inside the container and leaves its
-# output, stderr included, in QUERY_OUT and its exit status in QUERY_RC.
+# mesh_query [--type=<type>] <name> runs resolvectl query inside the container
+# with every argument it gets and leaves its output, stderr included, in
+# QUERY_OUT and its exit status in QUERY_RC.
 mesh_query() {
     QUERY_RC=0
-    QUERY_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl query "$1" 2>&1) || QUERY_RC=$?
+    QUERY_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl query "$@" 2>&1) || QUERY_RC=$?
 }
 
 # answers_on_mesh <output> <name> <value> succeeds when a resolvectl query
@@ -1238,6 +1244,42 @@ answers_on_mesh() {
 not_found() {
     case "$1" in
         *"'$2' not found"*) return 0 ;;
+    esac
+    return 1
+}
+
+# has_answer_on_mesh <output> <value> succeeds when a resolvectl query output
+# has an answer line that holds value and names link plexd0. resolvectl puts
+# the first answer after "<name>: " and every further one on an indented line
+# of its own, so each line is matched with one blank put in front of it.
+has_answer_on_mesh() {
+    local out=$1 value=$2 line
+    while IFS= read -r line; do
+        case " ${line}" in
+            *" ${value} "*"-- link: ${MESH_IFACE}") return 0 ;;
+        esac
+    done <<< "${out}"
+    return 1
+}
+
+# rr_on_mesh <output> <text> succeeds when a resolvectl query --type output
+# has a line that starts with "<text> " and names link plexd0. resolvectl
+# prints such a record as "<name> IN <type> <data>".
+rr_on_mesh() {
+    local out=$1 text=$2 line
+    while IFS= read -r line; do
+        case "${line}" in
+            "${text} "*"-- link: ${MESH_IFACE}") return 0 ;;
+        esac
+    done <<< "${out}"
+    return 1
+}
+
+# no_such_type <output> <name> succeeds when a resolvectl query output reports
+# that the name holds no record of the asked type, the answer to a NODATA.
+no_such_type() {
+    case "$1" in
+        *"'$2' does not have any RR of the requested type"*) return 0 ;;
     esac
     return 1
 }
@@ -1347,6 +1389,58 @@ else
     fail "resolvectl query nope.app.e2e.internal exited ${QUERY_RC}, want a failure with 'not found'"
 fi
 
+# Step 3b: the records of the block are answered on plexd0. resolvectl lists
+# the two A records and the AAAA of db.e2e.internal one per line. plexd
+# follows the CNAME alias.app.e2e.internal to peer-2, which lies in its own
+# zones, and answers the CNAME and peer-2's address together. A query with
+# --type prints the record as "<name> IN <type> <data>", and a type the name
+# does not hold answers NODATA. ext.e2e.internal is not asked for here: its
+# target lies outside the mesh zones, and systemd-resolved would follow it
+# through Docker's DNS.
+mesh_query db.e2e.internal
+for want in 192.0.2.10 192.0.2.11 2001:db8::10; do
+    if [ "${QUERY_RC}" -ne 0 ] || ! has_answer_on_mesh "${QUERY_OUT}" "${want}"; then
+        echo "${QUERY_OUT}"
+        fail "resolvectl query db.e2e.internal exited ${QUERY_RC}, want 0 and ${want} on link ${MESH_IFACE}"
+    fi
+done
+echo "  PASS: resolvectl query db.e2e.internal answers 192.0.2.10, 192.0.2.11 and 2001:db8::10 on link ${MESH_IFACE}"
+mesh_query alias.app.e2e.internal
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" alias.app.e2e.internal 10.99.0.3 && has_word "${QUERY_OUT}" "(peer-2.app.e2e.internal)"; then
+    echo "  PASS: resolvectl query alias.app.e2e.internal answers 10.99.0.3 on link ${MESH_IFACE} as peer-2.app.e2e.internal"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query alias.app.e2e.internal exited ${QUERY_RC}, want 0 and 10.99.0.3 on link ${MESH_IFACE} as (peer-2.app.e2e.internal)"
+fi
+mesh_query --type=SRV _db._tcp.app.e2e.internal
+if [ "${QUERY_RC}" -eq 0 ] && rr_on_mesh "${QUERY_OUT}" "_db._tcp.app.e2e.internal IN SRV 0 5 5432 db.e2e.internal"; then
+    echo "  PASS: resolvectl query --type=SRV _db._tcp.app.e2e.internal answers 0 5 5432 db.e2e.internal on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query --type=SRV _db._tcp.app.e2e.internal exited ${QUERY_RC}, want 0 and '_db._tcp.app.e2e.internal IN SRV 0 5 5432 db.e2e.internal' on link ${MESH_IFACE}"
+fi
+mesh_query --type=MX e2e.internal
+if [ "${QUERY_RC}" -eq 0 ] && rr_on_mesh "${QUERY_OUT}" "e2e.internal IN MX 10 mail.example.com"; then
+    echo "  PASS: resolvectl query --type=MX e2e.internal answers 10 mail.example.com on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query --type=MX e2e.internal exited ${QUERY_RC}, want 0 and 'e2e.internal IN MX 10 mail.example.com' on link ${MESH_IFACE}"
+fi
+mesh_query --type=TXT e2e.internal
+if [ "${QUERY_RC}" -eq 0 ] && rr_on_mesh "${QUERY_OUT}" 'e2e.internal IN TXT "v=e2e" "owner=plexd"'; then
+    echo "  PASS: resolvectl query --type=TXT e2e.internal answers \"v=e2e\" \"owner=plexd\" on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query --type=TXT e2e.internal exited ${QUERY_RC}, want 0 and 'e2e.internal IN TXT \"v=e2e\" \"owner=plexd\"' on link ${MESH_IFACE}"
+fi
+mesh_query --type=MX db.e2e.internal
+if [ "${QUERY_RC}" -ne 0 ] && no_such_type "${QUERY_OUT}" db.e2e.internal; then
+    echo "  PASS: resolvectl query --type=MX db.e2e.internal fails with no RR of the requested type"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query --type=MX db.e2e.internal exited ${QUERY_RC}, want a failure with 'does not have any RR of the requested type'"
+fi
+
 # Step 4: a name outside the mesh zones still resolves the way it did, through
 # Docker's DNS as systemd-resolved's global server, and not through plexd0.
 # systemd-resolved sends no single-label name to a DNS server, so the mock API
@@ -1378,10 +1472,15 @@ fi
 # Step 5: a changed block takes effect with the pull that carries it, without
 # a restart. peer-1 becomes db-1 at the same address, and the zone
 # ops.e2e.test arrives with the host gw.ops.e2e.test, which plexd routes as a
-# domain of its own because no other zone is above it. The block is spliced
-# into the state the mock serves, so every other block travels back verbatim.
-# No event nudges the agent: the heartbeat answers reconcile:true, so a pull
-# comes about every 30 s, and the 90 s cover three of them.
+# domain of its own because no other zone is above it. The records change
+# too: the A record 192.0.2.10 of db.e2e.internal becomes 192.0.2.20,
+# ext.e2e.internal goes, mock.e2e.internal arrives as a CNAME to the name
+# step 4 resolved through Docker's DNS, and big.e2e.internal arrives with
+# eight TXT records of one string each, a digit, "-" and 200 times "x". The
+# list is sorted by fqdn, then type, as the control plane serves it. The block
+# is spliced into the state the mock serves, so every other block travels back
+# verbatim. No event nudges the agent: the heartbeat answers reconcile:true,
+# so a pull comes about every 30 s, and the 90 s cover three of them.
 DNS_SNAPSHOT=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
 if [ -z "${DNS_SNAPSHOT}" ]; then
     fail "could not read the live node state snapshot"
@@ -1393,9 +1492,15 @@ fi
 DNS_GW_HOST='{"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b4", "fqdn": "gw.ops.e2e.test", "mesh_ip": "10.99.0.4"}'
 # printf, not echo: the fixture carries backslash escapes (an embedded newline
 # in the certs/ca data entry) that must travel back byte for byte.
-DNS_CHANGED=$(printf '%s' "${DNS_SNAPSHOT}" | jq --argjson gw "${DNS_GW_HOST}" '
+DNS_CHANGED=$(printf '%s' "${DNS_SNAPSHOT}" | jq --argjson gw "${DNS_GW_HOST}" --arg mock "${MOCK_FQDN}" '
     .dns.zones += ["ops.e2e.test"]
-    | .dns.hosts = ([.dns.hosts[] | if .fqdn == "peer-1.app.e2e.internal" then .fqdn = "db-1.app.e2e.internal" else . end] + [$gw] | sort_by(.fqdn))')
+    | .dns.hosts = ([.dns.hosts[] | if .fqdn == "peer-1.app.e2e.internal" then .fqdn = "db-1.app.e2e.internal" else . end] + [$gw] | sort_by(.fqdn))
+    | .dns.records = ([.dns.records[]
+        | select(.fqdn != "ext.e2e.internal")
+        | if .fqdn == "db.e2e.internal" and .type == "A" and .address == "192.0.2.10" then .address = "192.0.2.20" else . end]
+        + [{fqdn: "mock.e2e.internal", type: "CNAME", target: $mock}]
+        + [range(8) | {fqdn: "big.e2e.internal", type: "TXT", text: ["\(.)-" + ("x" * 200)]}]
+        | sort_by([.fqdn, .type]))')
 MAIN_PID_BEFORE=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
 DNS_CHANGE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST -H "Content-Type: application/json" \
@@ -1404,7 +1509,7 @@ DNS_CHANGE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
 if [ "${DNS_CHANGE_STATUS}" != "204" ]; then
     fail "configure-state with the renamed host returned status ${DNS_CHANGE_STATUS}, want 204"
 fi
-echo "  dns block configured: peer-1 renamed to db-1, zone ops.e2e.test with gw.ops.e2e.test added"
+echo "  dns block configured: peer-1 renamed to db-1, zone ops.e2e.test with gw.ops.e2e.test added, records changed"
 DNS_CHANGE_TIMEOUT=90
 DNS_CHANGE_START=${SECONDS}
 while :; do
@@ -1412,6 +1517,8 @@ while :; do
     DB1_OK=0
     GW_OK=0
     PEER1_GONE=0
+    DBREC_OK=0
+    EXT_GONE=0
     # gw.ops.e2e.test is asked for only once plexd0 routes its zone, so no
     # query for it leaves through the global server.
     if has_word "${LINK_DOMAINS}" "~ops.e2e.test"; then
@@ -1434,7 +1541,25 @@ while :; do
             PEER1_GONE=1
         fi
     fi
-    if [ "${DB1_OK}" -eq 1 ] && [ "${GW_OK}" -eq 1 ] && [ "${PEER1_GONE}" -eq 1 ]; then
+    mesh_query db.e2e.internal
+    DBREC_RC=${QUERY_RC}
+    DBREC_OUT=${QUERY_OUT}
+    if [ "${DBREC_RC}" -eq 0 ] && has_answer_on_mesh "${DBREC_OUT}" 192.0.2.20 && has_answer_on_mesh "${DBREC_OUT}" 192.0.2.11 && ! has_word "${DBREC_OUT}" 192.0.2.10; then
+        DBREC_OK=1
+    fi
+    # ext.e2e.internal is asked for only once db.e2e.internal answers the
+    # changed records. Before that pull plexd still answers the CNAME to
+    # ext.example.com, and systemd-resolved would follow it through Docker's
+    # DNS, which on an offline runner can stall each pass.
+    if [ "${DBREC_OK}" -eq 1 ]; then
+        mesh_query ext.e2e.internal
+        EXT_RC=${QUERY_RC}
+        EXT_OUT=${QUERY_OUT}
+        if [ "${EXT_RC}" -ne 0 ] && not_found "${EXT_OUT}" ext.e2e.internal; then
+            EXT_GONE=1
+        fi
+    fi
+    if [ "${DB1_OK}" -eq 1 ] && [ "${GW_OK}" -eq 1 ] && [ "${PEER1_GONE}" -eq 1 ] && [ "${DBREC_OK}" -eq 1 ] && [ "${EXT_GONE}" -eq 1 ]; then
         break
     fi
     if [ $((SECONDS - DNS_CHANGE_START)) -ge "${DNS_CHANGE_TIMEOUT}" ]; then
@@ -1443,13 +1568,17 @@ while :; do
         echo "resolvectl query db-1.app.e2e.internal (exit ${DB1_RC:-not run}): ${DB1_OUT:-}"
         echo "resolvectl query gw.ops.e2e.test (exit ${GW_RC:-not run}): ${GW_OUT:-}"
         echo "resolvectl query peer-1.app.e2e.internal (exit ${PEER1_RC:-not run}): ${PEER1_OUT:-}"
-        fail "the renamed host and the new zone did not take effect within ${DNS_CHANGE_TIMEOUT}s (db-1 ${DB1_OK}, gw ${GW_OK}, peer-1 gone ${PEER1_GONE})"
+        echo "resolvectl query db.e2e.internal (exit ${DBREC_RC:-not run}): ${DBREC_OUT:-}"
+        echo "resolvectl query ext.e2e.internal (exit ${EXT_RC:-not run}): ${EXT_OUT:-}"
+        fail "the renamed host, the new zone and the changed records did not take effect within ${DNS_CHANGE_TIMEOUT}s (db-1 ${DB1_OK}, gw ${GW_OK}, peer-1 gone ${PEER1_GONE}, db ${DBREC_OK}, ext gone ${EXT_GONE})"
     fi
     sleep 3
 done
 echo "  PASS: after $((SECONDS - DNS_CHANGE_START))s db-1.app.e2e.internal answers 10.99.0.2 on link ${MESH_IFACE}"
 echo "  PASS: gw.ops.e2e.test answers 10.99.0.4 on link ${MESH_IFACE}"
 echo "  PASS: peer-1.app.e2e.internal fails with not found"
+echo "  PASS: db.e2e.internal answers 192.0.2.20 and 192.0.2.11 on link ${MESH_IFACE} and no longer 192.0.2.10"
+echo "  PASS: ext.e2e.internal fails with not found"
 if [ "${LINK_DOMAINS}" != "app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal ~ops.e2e.test" ]; then
     echo "${LINK_DOMAINS_RAW}"
     fail "resolvectl domain ${MESH_IFACE} lists '${LINK_DOMAINS}', want exactly 'app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal ~ops.e2e.test'"
@@ -1460,6 +1589,60 @@ if [ -n "${MAIN_PID_BEFORE}" ] && [ "${MAIN_PID_BEFORE}" != "0" ] && [ "${MAIN_P
     echo "  PASS: the MainPID of plexd.service is still ${MAIN_PID_AFTER}"
 else
     fail "the MainPID of plexd.service went from '${MAIN_PID_BEFORE}' to '${MAIN_PID_AFTER}', want it unchanged and nonzero"
+fi
+# mock.e2e.internal is a CNAME to the name step 4 resolved, which lies outside
+# the mesh zones. plexd answers the CNAME alone, and systemd-resolved follows
+# it through Docker's DNS, so the address line does not name link plexd0.
+mesh_query mock.e2e.internal
+MOCK_CNAME_ANSWERED=0
+while IFS= read -r line; do
+    case "${line}" in
+        *"-- link: ${MESH_IFACE}") ;;
+        "mock.e2e.internal: ${MOCK_IP}" | "mock.e2e.internal: ${MOCK_IP} "*) MOCK_CNAME_ANSWERED=1 ;;
+    esac
+done <<< "${QUERY_OUT}"
+if [ "${QUERY_RC}" -eq 0 ] && [ "${MOCK_CNAME_ANSWERED}" -eq 1 ] && has_word "${QUERY_OUT}" "(${MOCK_FQDN})"; then
+    echo "  PASS: resolvectl query mock.e2e.internal answers ${MOCK_IP} as ${MOCK_FQDN}, not on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query mock.e2e.internal exited ${QUERY_RC}, want 0 and ${MOCK_IP} as (${MOCK_FQDN}) without link ${MESH_IFACE}"
+fi
+# The eight TXT records of big.e2e.internal take more than 1232 bytes, the
+# most plexd sends over UDP, so plexd sends the UDP answer with TC set and no
+# records, and systemd-resolved asks again over TCP. The eight lines alone do
+# not prove that: systemd-resolved 255 also accepts an untruncated UDP reply
+# larger than the 1472 bytes it offers. The container's systemd-resolved logs
+# the repeat at debug level only, so the query runs with its log level raised
+# and its cache flushed, and its journal must show the repeat.
+RESOLVED_LEVEL=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl log-level 2>&1) \
+    || fail "resolvectl log-level inside the container failed: ${RESOLVED_LEVEL}"
+LEVEL_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl log-level debug 2>&1) \
+    || fail "resolvectl log-level debug inside the container failed: ${LEVEL_OUT}"
+TXT_SINCE=$(docker exec "${SYSTEMD_CONTAINER}" date '+%Y-%m-%d %H:%M:%S')
+FLUSH_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl flush-caches 2>&1) \
+    || fail "resolvectl flush-caches inside the container failed: ${FLUSH_OUT}"
+mesh_query --type=TXT big.e2e.internal
+LEVEL_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl log-level "${RESOLVED_LEVEL}" 2>&1) \
+    || fail "resolvectl log-level ${RESOLVED_LEVEL} inside the container failed: ${LEVEL_OUT}"
+RESOLVED_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u systemd-resolved --no-pager --since "${TXT_SINCE}" 2>&1) \
+    || fail "journalctl -u systemd-resolved since ${TXT_SINCE} failed: ${RESOLVED_JOURNAL}"
+BIG_TXT_LINES=0
+while IFS= read -r line; do
+    case "${line}" in
+        'big.e2e.internal IN TXT "'*"-- link: ${MESH_IFACE}") BIG_TXT_LINES=$((BIG_TXT_LINES + 1)) ;;
+    esac
+done <<< "${QUERY_OUT}"
+if [ "${QUERY_RC}" -eq 0 ] && [ "${BIG_TXT_LINES}" -eq 8 ]; then
+    echo "  PASS: resolvectl query --type=TXT big.e2e.internal answers 8 TXT records on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query --type=TXT big.e2e.internal exited ${QUERY_RC} with ${BIG_TXT_LINES} TXT line(s) on link ${MESH_IFACE}, want 0 and 8"
+fi
+if journal_has "${RESOLVED_JOURNAL}" "Reply truncated, retrying via TCP."; then
+    echo "  PASS: systemd-resolved got the big.e2e.internal answer truncated over UDP and asked again over TCP"
+else
+    echo "${RESOLVED_JOURNAL}"
+    fail "journalctl -u systemd-resolved since ${TXT_SINCE} lacks 'Reply truncated, retrying via TCP.': plexd did not truncate the big.e2e.internal answer over UDP"
 fi
 
 # Step 6: the names keep answering while the control plane is away. The mock
@@ -1489,6 +1672,19 @@ if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" db-1.app.e2e.intern
 else
     echo "${QUERY_OUT}"
     fail "with the mock API paused, resolvectl query db-1.app.e2e.internal exited ${QUERY_RC}, want 0, 10.99.0.2 on link ${MESH_IFACE} and '-- Data from: network'"
+fi
+mesh_query db.e2e.internal
+PAUSE_FROM_NETWORK=0
+while IFS= read -r line; do
+    if [ "${line}" = "-- Data from: network" ]; then
+        PAUSE_FROM_NETWORK=1
+    fi
+done <<< "${QUERY_OUT}"
+if [ "${QUERY_RC}" -eq 0 ] && has_answer_on_mesh "${QUERY_OUT}" 192.0.2.20 && [ "${PAUSE_FROM_NETWORK}" -eq 1 ]; then
+    echo "  PASS: with the mock API paused for $((SECONDS - PAUSE_START))s and the cache flushed, db.e2e.internal answers 192.0.2.20 from the network"
+else
+    echo "${QUERY_OUT}"
+    fail "with the mock API paused, resolvectl query db.e2e.internal exited ${QUERY_RC}, want 0, 192.0.2.20 on link ${MESH_IFACE} and '-- Data from: network'"
 fi
 PAUSE_LEFT=$((20 - (SECONDS - PAUSE_START)))
 if [ "${PAUSE_LEFT}" -gt 0 ]; then
