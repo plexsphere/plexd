@@ -37,9 +37,15 @@ const (
 )
 
 // ednsPayloadSize is the UDP payload size the server advertises when a query
-// carries an OPT record. 1232 bytes is the size the DNS flag day 2020 settled
-// on, which fits an IPv6 packet into the minimum MTU without fragmentation.
+// carries an OPT record, and the most it sends over UDP whatever the client
+// offers. 1232 bytes is the size the DNS flag day 2020 settled on, which fits
+// an IPv6 packet into the minimum MTU without fragmentation.
 const ednsPayloadSize = 1232
+
+// udpLimit is the most a response over UDP to a query without an OPT record
+// may carry, RFC 1035's limit. A client that offers less with its OPT record
+// gets this much too, as RFC 6891 has it.
+const udpLimit = 512
 
 // headerLen is the length of a DNS message header. A packet shorter than it
 // cannot even name the query it belongs to, so it gets no reply.
@@ -263,7 +269,7 @@ func (s *Server) handlePacket(w packetWriter, msg []byte, src netip.AddrPort) {
 		s.logger.Debug("mesh dns dropped a packet from a source it does not answer", "source", src)
 		return
 	}
-	resp := s.respond(nil, msg)
+	resp := s.respond(nil, msg, true)
 	if resp == nil {
 		s.logger.Debug("mesh dns dropped a packet that gets no reply", "source", src, "bytes", len(msg))
 		return
@@ -385,7 +391,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		if _, err := io.ReadFull(conn, msg); err != nil {
 			return
 		}
-		resp := s.respond(make([]byte, 2, 2+512), msg)
+		resp := s.respond(make([]byte, 2, 2+udpLimit), msg, false)
 		if resp == nil {
 			s.logger.Debug("mesh dns dropped a message that gets no reply", "bytes", n)
 			continue
@@ -446,8 +452,11 @@ func (c *connSet) closeAll() {
 // respond returns the response to the query msg appended to dst, or nil when
 // msg gets no reply: a packet shorter than the header, or one with QR set,
 // which is a response itself and answering it could start a loop between two
-// servers.
-func (s *Server) respond(dst, msg []byte) []byte {
+// servers. udp says whether the response goes out as a datagram. A response
+// over UDP that does not fit the limit of the query goes out with TC set and
+// no records, so the client asks again over TCP. One over TCP that does not
+// fit a message at all, more than 65,535 bytes, goes out as SERVFAIL.
+func (s *Server) respond(dst, msg []byte, udp bool) []byte {
 	if len(msg) < headerLen {
 		return nil
 	}
@@ -466,7 +475,7 @@ func (s *Server) respond(dst, msg []byte) []byte {
 	q, ok := singleQuestion(&p, msg)
 	// RFC 6891 6.1.1: a response to a query with an OPT record carries one,
 	// a FORMERR included, and a query with more than one gets FORMERR.
-	opts := countOPT(&p)
+	opts, payload := readOPT(&p)
 	edns := opts > 0
 	var question *dnsmessage.Question
 	if ok {
@@ -503,6 +512,29 @@ func (s *Server) respond(dst, msg []byte) []byte {
 		s.logger.Debug("mesh dns could not pack a reply", "error", err)
 		return nil
 	}
+	limit := maxMessageSize
+	if udp {
+		limit = udpLimit
+		if edns {
+			limit = min(max(int(payload), udpLimit), ednsPayloadSize)
+		}
+	}
+	if size := len(resp) - len(dst); size > limit {
+		if udp {
+			// The truncated response carries no record, so a client that does
+			// not ask again over TCP keeps no part of the set.
+			h.Truncated = true
+		} else {
+			// The two-byte length of a TCP message cannot carry more, so the
+			// answer cannot be sent in any form.
+			h.RCode, h.Authoritative = dnsmessage.RCodeServerFailure, false
+			s.logger.Debug("mesh dns answer does not fit a message", "name", q.Name.String(), "type", q.Type.String(), "bytes", size)
+		}
+		if resp, err = buildResponse(dst, h, question, Answer{}, edns); err != nil {
+			s.logger.Debug("mesh dns could not pack a reply", "error", err)
+			return nil
+		}
+	}
 	return resp
 }
 
@@ -520,33 +552,36 @@ func singleQuestion(p *dnsmessage.Parser, msg []byte) (dnsmessage.Question, bool
 	return q, true
 }
 
-// countOPT returns how many OPT records the additional section of the
-// message p parses carries. It first skips the questions p has not parsed
-// yet, so a message with no question or several is counted too. The count
-// stops at the first record that does not parse, and the records before it
-// still count. A question that does not parse hides where the additional
-// section begins, and then nothing counts.
-func countOPT(p *dnsmessage.Parser) int {
+// readOPT returns how many OPT records the additional section of the
+// message p parses carries, and the UDP payload size the first one offers,
+// which an OPT record carries in its class. It first skips the questions p
+// has not parsed yet, so a message with no question or several is counted
+// too. The count stops at the first record that does not parse, and the
+// records before it still count. A question that does not parse hides where
+// the additional section begins, and then nothing counts.
+func readOPT(p *dnsmessage.Parser) (count int, payload uint16) {
 	if err := p.SkipAllQuestions(); err != nil {
-		return 0
+		return 0, 0
 	}
 	if err := p.SkipAllAnswers(); err != nil {
-		return 0
+		return 0, 0
 	}
 	if err := p.SkipAllAuthorities(); err != nil {
-		return 0
+		return 0, 0
 	}
-	n := 0
 	for {
 		rh, err := p.AdditionalHeader()
 		if err != nil {
-			return n
+			return count, payload
 		}
 		if rh.Type == dnsmessage.TypeOPT {
-			n++
+			if count == 0 {
+				payload = uint16(rh.Class)
+			}
+			count++
 		}
 		if err := p.SkipAdditional(); err != nil {
-			return n
+			return count, payload
 		}
 	}
 }

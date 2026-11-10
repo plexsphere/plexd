@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -1656,5 +1657,187 @@ func TestServer_SetRecordsDropsARecord(t *testing.T) {
 	m = parseResponse(t, exchangeUDP(t, conn, newQuery(t, 2, "db.lab.internal.", dnsmessage.TypeA)))
 	if m.RCode != dnsmessage.RCodeNameError || len(m.Answers) != 0 {
 		t.Errorf("after the record left: RCode %v answers %q, want %v and none", m.RCode, describeAll(m.Answers), dnsmessage.RCodeNameError)
+	}
+}
+
+// bigTXT returns n TXT records of one size-byte string each at name, each
+// string distinct, so none repeats another.
+func bigTXT(name string, n, size int) []api.NodeStateDNSRecord {
+	recs := make([]api.NodeStateDNSRecord, 0, n)
+	for i := range n {
+		s := fmt.Sprintf("%03d-", i)
+		recs = append(recs, rec(name, "TXT", text(s+strings.Repeat("x", size-len(s)))))
+	}
+	return recs
+}
+
+// packQueryPayload packs a query for name and qtype with one OPT record that
+// offers payload bytes.
+func packQueryPayload(t *testing.T, id uint16, name string, qtype dnsmessage.Type, payload int) []byte {
+	t.Helper()
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: id, RecursionDesired: true})
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(question(name, qtype)); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StartAdditionals(); err != nil {
+		t.Fatal(err)
+	}
+	var rh dnsmessage.ResourceHeader
+	if err := rh.SetEDNS0(payload, dnsmessage.RCodeSuccess, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.OPTResource(rh, dnsmessage.OPTResource{}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+// wantTruncated fails the test unless m is a truncated response to q: TC set,
+// the question, no record in the answer and authority sections, and one OPT
+// record exactly when the query had one.
+func wantTruncated(t *testing.T, m dnsmessage.Message, q dnsmessage.Question, edns bool) {
+	t.Helper()
+	if !m.Truncated || m.RCode != dnsmessage.RCodeSuccess {
+		t.Errorf("TC %v RCode %v, want true %v", m.Truncated, m.RCode, dnsmessage.RCodeSuccess)
+	}
+	if !slices.Equal(m.Questions, []dnsmessage.Question{q}) {
+		t.Errorf("questions = %v, want %v", m.Questions, q)
+	}
+	if len(m.Answers) != 0 || len(m.Authorities) != 0 {
+		t.Errorf("answers %d authorities %d, want none", len(m.Answers), len(m.Authorities))
+	}
+	checkOPT(t, m, edns)
+}
+
+func TestServer_TruncatesOverUDP(t *testing.T) {
+	block := serverBlock()
+	block.Records = append(block.Records, bigTXT("three.lab.internal", 3, 200)...)
+	block.Records = append(block.Records, bigTXT("eight.lab.internal", 8, 200)...)
+	block.Records = append(block.Records, bigTXT("one.lab.internal", 1, 200)...)
+	s := startServer(t, mustBuild(t, block))
+	udp := dial(t, "udp", s)
+	tcp := dial(t, "tcp", s)
+	three := question("three.lab.internal.", dnsmessage.TypeTXT)
+	eight := question("eight.lab.internal.", dnsmessage.TypeTXT)
+
+	t.Run("no OPT over 512 bytes", func(t *testing.T) {
+		resp := exchangeUDP(t, udp, newQuery(t, 1, "three.lab.internal.", dnsmessage.TypeTXT))
+		if len(resp) > 512 {
+			t.Errorf("reply of %d bytes, want at most 512", len(resp))
+		}
+		wantTruncated(t, parseResponse(t, resp), three, false)
+	})
+	t.Run("the same query over TCP", func(t *testing.T) {
+		m := parseResponse(t, exchangeTCP(t, tcp, newQuery(t, 2, "three.lab.internal.", dnsmessage.TypeTXT)))
+		if m.Truncated || len(m.Answers) != 3 {
+			t.Errorf("TC %v with %d answers, want false and 3", m.Truncated, len(m.Answers))
+		}
+	})
+	t.Run("OPT of 4096 bytes", func(t *testing.T) {
+		m := parseResponse(t, exchangeUDP(t, udp, packQueryPayload(t, 3, "three.lab.internal.", dnsmessage.TypeTXT, 4096)))
+		if m.Truncated || len(m.Answers) != 3 {
+			t.Errorf("TC %v with %d answers, want false and 3", m.Truncated, len(m.Answers))
+		}
+		checkOPT(t, m, true)
+	})
+	t.Run("OPT of 4096 bytes over 1232", func(t *testing.T) {
+		resp := exchangeUDP(t, udp, packQueryPayload(t, 4, "eight.lab.internal.", dnsmessage.TypeTXT, 4096))
+		if len(resp) > 1232 {
+			t.Errorf("reply of %d bytes, want at most 1232", len(resp))
+		}
+		wantTruncated(t, parseResponse(t, resp), eight, true)
+	})
+	t.Run("eight over TCP", func(t *testing.T) {
+		m := parseResponse(t, exchangeTCP(t, tcp, newQuery(t, 5, "eight.lab.internal.", dnsmessage.TypeTXT)))
+		if m.Truncated || len(m.Answers) != 8 {
+			t.Errorf("TC %v with %d answers, want false and 8", m.Truncated, len(m.Answers))
+		}
+	})
+	t.Run("OPT of 100 bytes counts as 512", func(t *testing.T) {
+		wantTruncated(t, parseResponse(t, exchangeUDP(t, udp, packQueryPayload(t, 6, "three.lab.internal.", dnsmessage.TypeTXT, 100))), three, true)
+		// One record of 200 bytes takes more than the 100 the client offers
+		// and less than 512, so it arrives whole only when 100 counts as 512.
+		resp := exchangeUDP(t, udp, packQueryPayload(t, 7, "one.lab.internal.", dnsmessage.TypeTXT, 100))
+		if len(resp) <= 100 || len(resp) > 512 {
+			t.Fatalf("reply of %d bytes, want between 101 and 512 for this check", len(resp))
+		}
+		m := parseResponse(t, resp)
+		if m.Truncated || len(m.Answers) != 1 {
+			t.Errorf("TC %v with %d answers, want false and 1", m.Truncated, len(m.Answers))
+		}
+	})
+}
+
+func TestServer_AnswerTooLargeForTCP(t *testing.T) {
+	block := serverBlock()
+	block.Records = append(block.Records, bigTXT("huge.lab.internal", 300, 255)...)
+	logs := &debugLog{}
+	s := NewServer(netip.MustParseAddrPort("127.0.0.1:0"), slog.New(logs))
+	s.SetRecords(mustBuild(t, block))
+	if err := s.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(serve(t, s))
+	q := question("huge.lab.internal.", dnsmessage.TypeTXT)
+
+	m := parseResponse(t, exchangeTCP(t, dial(t, "tcp", s), newQuery(t, 1, "huge.lab.internal.", dnsmessage.TypeTXT)))
+	if m.RCode != dnsmessage.RCodeServerFailure || m.Authoritative || m.Truncated {
+		t.Errorf("RCode %v AA %v TC %v, want %v false false", m.RCode, m.Authoritative, m.Truncated, dnsmessage.RCodeServerFailure)
+	}
+	if !slices.Equal(m.Questions, []dnsmessage.Question{q}) || len(m.Answers) != 0 || len(m.Authorities) != 0 {
+		t.Errorf("questions %v answers %d authorities %d, want the question and no record", m.Questions, len(m.Answers), len(m.Authorities))
+	}
+	found := logs.find("mesh dns answer does not fit a message")
+	if len(found) != 1 {
+		t.Fatalf("%d lines say the answer does not fit, want 1", len(found))
+	}
+	if found[0].Level != slog.LevelDebug {
+		t.Errorf("the answer that does not fit logged at %v, want %v", found[0].Level, slog.LevelDebug)
+	}
+	if got := recordAttr(found[0], "name").String(); got != "huge.lab.internal." {
+		t.Errorf("name = %q, want %q", got, "huge.lab.internal.")
+	}
+	if got := recordAttr(found[0], "type").String(); got != "TypeTXT" {
+		t.Errorf("type = %q, want %q", got, "TypeTXT")
+	}
+	if got := recordAttr(found[0], "bytes").Int64(); got <= 65535 {
+		t.Errorf("bytes = %d, want more than 65535", got)
+	}
+
+	wantTruncated(t, parseResponse(t, exchangeUDP(t, dial(t, "udp", s), newQuery(t, 2, "huge.lab.internal.", dnsmessage.TypeTXT))), q, false)
+}
+
+// A record BuildRecords would refuse reaches the server only by hand: a TXT
+// string of 256 bytes, which dnsmessage cannot pack.
+func TestServer_DropsAnswerItCannotPack(t *testing.T) {
+	r := mustBuild(t, serverBlock())
+	broken := *r
+	broken.records = maps.Clone(r.records)
+	broken.records["db.lab.internal"] = []RR{{Name: "db.lab.internal", Type: dnsmessage.TypeTXT, Text: []string{strings.Repeat("x", 256)}}}
+	logs := &debugLog{}
+	s := NewServer(netip.MustParseAddrPort("127.0.0.1:0"), slog.New(logs))
+	s.SetRecords(&broken)
+
+	w := &recordingWriter{}
+	s.handlePacket(w, newQuery(t, 1, "db.lab.internal.", dnsmessage.TypeTXT), netip.MustParseAddrPort("127.0.0.1:5300"))
+	if got := len(w.to); got != 0 {
+		t.Errorf("%d replies sent, want none", got)
+	}
+	found := logs.find("mesh dns could not pack a reply")
+	if len(found) != 1 {
+		t.Fatalf("%d lines say the reply could not be packed, want 1", len(found))
+	}
+	if found[0].Level != slog.LevelDebug {
+		t.Errorf("the reply that could not be packed logged at %v, want %v", found[0].Level, slog.LevelDebug)
+	}
+	if got := recordAttr(found[0], "error").String(); !strings.Contains(got, "character string exceeds maximum length (255)") {
+		t.Errorf("error = %q, want the string-length refusal of dnsmessage", got)
 	}
 }
