@@ -466,7 +466,12 @@ func newStateFixture() api.NodeStateSnapshot {
 		// name, an SRV and an MX whose targets are that name and a name
 		// outside the mesh, a TXT of two strings, a CNAME to a peer and one
 		// to a name outside the mesh. Their addresses come from the
-		// documentation ranges, so nothing answers them.
+		// documentation ranges, so nothing answers them. The forwarding
+		// member holds two empty lists, as the control plane serves it for
+		// a Domain and a Project without a forwarding setting, so the agent
+		// forwards nothing until a suite configures a forward zone or a
+		// catch-all. A block configured without the member is served
+		// without it, which tells the agent to keep the forwarding it holds.
 		DNS: &api.NodeStateDNS{
 			SearchDomain: "app.e2e.internal",
 			Zones:        []string{"app.e2e.internal", "e2e.internal"},
@@ -486,6 +491,10 @@ func newStateFixture() api.NodeStateSnapshot {
 				{FQDN: "ext.e2e.internal", Type: "CNAME", Target: "ext.example.com"},
 			},
 			ReverseZones: []string{"0.99.10.in-addr.arpa"},
+			Forwarding: &api.NodeStateDNSForwarding{
+				ForwardZones: []api.NodeStateDNSForwardZone{},
+				CatchAll:     []string{},
+			},
 		},
 	}
 }

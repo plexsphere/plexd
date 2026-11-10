@@ -1182,8 +1182,11 @@ func TestState_CarriesTheSigningKey(t *testing.T) {
 
 // TestState_CarriesTheDNSBlock pins the dns block a fresh mock serves, which
 // the e2e suites resolve against, its records in the wire form the contract
-// gives them, and that a state configured without a dns key is served with
-// null, the "keep the names held" signal of the contract.
+// gives them, its forwarding member as two empty lists, that a block
+// configured without the forwarding member is served without the key, the
+// "keep the forwarding held" signal of the contract, and that a state
+// configured without a dns key is served with null, the "keep the names held"
+// signal.
 func TestState_CarriesTheDNSBlock(t *testing.T) {
 	_, ts := newTestServer(t)
 
@@ -1216,6 +1219,10 @@ func TestState_CarriesTheDNSBlock(t *testing.T) {
 			{FQDN: "ext.e2e.internal", Type: "CNAME", Target: "ext.example.com"},
 		},
 		ReverseZones: []string{"0.99.10.in-addr.arpa"},
+		Forwarding: &api.NodeStateDNSForwarding{
+			ForwardZones: []api.NodeStateDNSForwardZone{},
+			CatchAll:     []string{},
+		},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("dns = %+v, want %+v", got, want)
@@ -1253,6 +1260,54 @@ func TestState_CarriesTheDNSBlock(t *testing.T) {
 		}
 	}
 
+	// The forwarding member's lists are sent as [], never as null or left
+	// out, as the contract has them.
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &block); err != nil {
+		t.Fatalf("decode dns %s: %v", raw, err)
+	}
+	rawForwarding, ok := block["forwarding"]
+	if !ok {
+		t.Fatalf("dns %s missing key \"forwarding\"", raw)
+	}
+	var forwarding map[string]json.RawMessage
+	if err := json.Unmarshal(rawForwarding, &forwarding); err != nil {
+		t.Fatalf("decode forwarding %s: %v", rawForwarding, err)
+	}
+	if len(forwarding) != 2 {
+		t.Errorf("forwarding = %s, want exactly forward_zones and catch_all", rawForwarding)
+	}
+	for _, key := range []string{"forward_zones", "catch_all"} {
+		if v, ok := forwarding[key]; !ok || string(v) != "[]" {
+			t.Errorf("forwarding %s = %s (present %t), want []", key, v, ok)
+		}
+	}
+
+	// Configure the served state with the forwarding member removed from
+	// its dns block, and read the raw block back: the member stays out.
+	withoutForwarding := stateEnvelope(t, ts.URL)
+	delete(block, "forwarding")
+	dnsWithoutForwarding, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutForwarding["dns"] = dnsWithoutForwarding
+	configureStateEnvelope(t, ts.URL, withoutForwarding)
+	raw, ok = stateEnvelope(t, ts.URL)["dns"]
+	if !ok {
+		t.Fatal("envelope after configure-state missing key \"dns\"")
+	}
+	block = nil
+	if err := json.Unmarshal(raw, &block); err != nil {
+		t.Fatalf("decode dns after configure-state %s: %v", raw, err)
+	}
+	if v, ok := block["forwarding"]; ok {
+		t.Errorf("dns after configure-state without forwarding carries forwarding=%s, want no such key", v)
+	}
+	if _, ok := block["zones"]; !ok {
+		t.Errorf("dns after configure-state without forwarding = %s, want the rest of the block", raw)
+	}
+
 	// Configure the served state with its dns key removed, the way a suite
 	// splices a state together, and read the raw answer back.
 	configured := stateEnvelope(t, ts.URL)
@@ -1272,6 +1327,21 @@ func TestState_CarriesTheDNSBlock(t *testing.T) {
 	}
 	if string(raw) != "null" {
 		t.Errorf("dns after configure-state without a dns key = %s, want null", raw)
+	}
+}
+
+// configureStateEnvelope posts envelope, a served state with members changed
+// by key, to /test/configure-state, failing the test on a non-204 answer.
+func configureStateEnvelope(t *testing.T, baseURL string, envelope map[string]json.RawMessage) {
+	t.Helper()
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-state", string(body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 }
 
