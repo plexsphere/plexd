@@ -42,6 +42,9 @@ const meshDNSLeftoversOutliveTheRun = false
 // meshDNSListensOnLoopback is false on platforms that run no resolver.
 const meshDNSListensOnLoopback = false
 
+// meshDNSBindHint exists because up.go references it on every platform.
+const meshDNSBindHint = "set dns.listen_port to a free port"
+
 // policyCapabilityHint exists because up.go references it on every platform.
 // Without a backend Preflight and ApplyFirewallRules are both no-ops, so
 // neither failure path can reach this text: the node comes up unenforced with

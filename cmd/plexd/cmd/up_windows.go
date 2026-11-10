@@ -37,18 +37,43 @@ func newWGController(logger *slog.Logger) wireguard.WGController {
 	return wireguard.NewWindowsController(logger)
 }
 
-// newMeshDNSRegistrar returns nil on Windows, which skips the mesh DNS resolver
-// without a log line. The resolver only runs where plexd can tell the host's
-// resolver to ask it, and no registrar for the Windows resolver exists yet.
-func newMeshDNSRegistrar(_ *slog.Logger) meshdns.Registrar {
-	return nil
+// newMeshDNSRegistrar returns the registrar that registers the mesh resolver
+// with the Windows DNS Client through the Name Resolution Policy Table: it
+// writes rules for the search domain, the zones, the reverse zones and the
+// forward zones, and with a catch-all a rule for every name, into the
+// registry under keys plexd owns, into the Group Policy store too while
+// Group Policy configures the table, and sets the search domain as the mesh
+// adapter's search list. It needs Administrator, which the LocalSystem
+// service satisfies.
+func newMeshDNSRegistrar(logger *slog.Logger) meshdns.Registrar {
+	return meshdns.NewNRPTRegistrar(logger)
 }
 
-// meshDNSLeftoversOutliveTheRun is false on Windows, which registers nothing.
-const meshDNSLeftoversOutliveTheRun = false
+// meshDNSLeftoversOutliveTheRun is true on Windows: the registrar's rule keys
+// are bound to no interface, so a killed run leaves them behind until the
+// next reboot although its adapter went with the process, and the adapter's
+// search list stays in the registry, keyed by the GUID that adapterGUID
+// derives from the interface name, so the next run's adapter inherits it.
+// Until the next run's first pull the rules would send the mesh zones, and
+// with a catch-all every other name the host looks up, the control plane's
+// own name included, to a resolver that holds no names yet and refuses them
+// all.
+const meshDNSLeftoversOutliveTheRun = true
 
-// meshDNSListensOnLoopback is false on Windows, which runs no resolver.
-const meshDNSListensOnLoopback = false
+// meshDNSListensOnLoopback is true on Windows. plexd's WFP filters match the
+// mesh adapter's LUID, and nothing documents whether WFP counts a local query
+// to the mesh IP as arriving on that adapter, where a Domain's default deny
+// would drop it. No plexd filter can match a query to 127.0.0.1, so the
+// resolver listens there and the Name Resolution Policy Table rules name that
+// address, on port 53, the only port the DNS Client sends a rule's queries
+// to.
+const meshDNSListensOnLoopback = true
+
+// meshDNSBindHint is logged when the resolver cannot bind its port. On Windows
+// the port is 53, because the DNS Client sends a rule's queries nowhere else,
+// so the way out is freeing it or turning the resolver off.
+const meshDNSBindHint = "free port 53 on 127.0.0.1, the only port the Name Resolution Policy Table sends to, " +
+	"or set dns.enabled: false"
 
 // policyCapabilityHint is carried by both firewall-baseline failures. The
 // filter engine answers an unprivileged caller with ERROR_ACCESS_DENIED, whose

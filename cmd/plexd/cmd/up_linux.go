@@ -57,6 +57,10 @@ const meshDNSLeftoversOutliveTheRun = false
 // node's own mesh IP is reached, which the kernel delivers locally.
 const meshDNSListensOnLoopback = false
 
+// meshDNSBindHint is logged when the resolver cannot bind its port, which
+// systemd-resolved reaches on any port.
+const meshDNSBindHint = "set dns.listen_port to a free port"
+
 // policyCapabilityHint is carried by both firewall-baseline failures. The
 // kernel reports a dropped capability as a bare EPERM on a netlink call, which
 // names neither what the process is missing nor the setting that turns the
