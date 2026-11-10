@@ -19,7 +19,7 @@ type Config struct {
 	Enabled *bool `yaml:"enabled"`
 
 	// ListenPort is the UDP and TCP port the resolver listens on, on the
-	// node's own mesh IP.
+	// node's own mesh IP on Linux and on 127.0.0.1 on macOS.
 	// Default: 5354.
 	ListenPort int `yaml:"listen_port"`
 }

@@ -5422,6 +5422,15 @@ func useMeshDNSRegistrar(t *testing.T, r meshdns.Registrar) {
 	meshDNSRegistrar = func(*slog.Logger) meshdns.Registrar { return r }
 }
 
+// useMeshDNSRevertAtStart pins, for one test, whether a start whose resolver
+// listens reverts first, whatever the platform's default is.
+func useMeshDNSRevertAtStart(t *testing.T, revert bool) {
+	t.Helper()
+	old := meshDNSRevertAtStart
+	t.Cleanup(func() { meshDNSRevertAtStart = old })
+	meshDNSRevertAtStart = revert
+}
+
 // callLog is an ordered record of calls that several doubles share, so a test
 // can pin the order between calls that reach different seams.
 type callLog struct {
@@ -5594,8 +5603,9 @@ type meshDNSDaemon struct {
 
 // startMeshDNSDaemon runs the whole daemon with ctrl as its WireGuard
 // controller and dnsBlock appended to its config. The node resumes an identity
-// whose mesh IP is meshIP, an IPv4 address of the loopback, so the resolver
-// binds an address this process may use without creating a device. Pulls and
+// whose mesh IP is meshIP, usually an IPv4 address of the loopback, so the
+// resolver binds an address this process may use without creating a device;
+// on macOS it binds 127.0.0.1 whatever meshIP is (meshDNSListensOnLoopback). Pulls and
 // heartbeats run every second, and the MTU is pinned so WireGuard setup sends
 // no STUN probe. The caller installs the registrar, or leaves TestMain's nil.
 func startMeshDNSDaemon(t *testing.T, meshIP string, ctrl wireguard.WGController, dnsBlock string) *meshDNSDaemon {
@@ -5716,20 +5726,25 @@ func lookupMeshA(t *testing.T, addr, name string) []netip.Addr {
 	return addrs
 }
 
-// Only Linux has a registrar so far. Every other build returns nil, which
+// Linux and macOS have a registrar. Every other build returns nil, which
 // keeps the resolver off there (see TestRunUp_MeshDNSNilRegistrarStartsNothing).
-// Building the Linux one opens no connection, so this test stays off the bus.
-// The type is named as a string because it exists in the Linux build only.
+// Building either opens no connection and runs no command, so this test stays
+// off the host's resolver. The types are named as strings because the
+// constructors exist in their own builds only.
 func TestNewMeshDNSRegistrar(t *testing.T) {
 	r := newMeshDNSRegistrar(slog.Default())
-	if runtime.GOOS == "linux" {
-		if got := fmt.Sprintf("%T", r); got != "*meshdns.ResolvedRegistrar" {
-			t.Errorf("newMeshDNSRegistrar() = %s, want *meshdns.ResolvedRegistrar on linux", got)
+	want := map[string]string{
+		"linux":  "*meshdns.ResolvedRegistrar",
+		"darwin": "*meshdns.ScutilRegistrar",
+	}[runtime.GOOS]
+	if want == "" {
+		if r != nil {
+			t.Errorf("newMeshDNSRegistrar() = %T, want nil on %s", r, runtime.GOOS)
 		}
 		return
 	}
-	if r != nil {
-		t.Errorf("newMeshDNSRegistrar() = %T, want nil on %s", r, runtime.GOOS)
+	if got := fmt.Sprintf("%T", r); got != want {
+		t.Errorf("newMeshDNSRegistrar() = %s, want %s on %s", got, want, runtime.GOOS)
 	}
 }
 
@@ -5766,9 +5781,10 @@ func TestRunUp_MeshDNSDisabledRevertsAndBindsNothing(t *testing.T) {
 	assertBoundedRevert(t, reverts[0])
 }
 
-// The resolver listens on the mesh IP, which exists only once WireGuard is up,
-// so a run whose WireGuard setup fails starts no resolver and registers
-// nothing. It says why and still reaches steady state: the node keeps its
+// The resolver starts only once WireGuard is up: on Linux it listens on the
+// mesh IP, which exists only then, and every platform needs the mesh for the
+// names to mean anything. So a run whose WireGuard setup fails starts no
+// resolver and registers nothing. It says why and still reaches steady state: the node keeps its
 // control plane loops without the mesh names. It reverts the mesh interface
 // once at startup, under a bounded context: a killed run leaves plexd0 behind
 // with its registration, and that device is what fails this run's setup, so
@@ -5803,8 +5819,9 @@ func TestRunUp_MeshDNSWithoutWireGuard(t *testing.T) {
 	assertBoundedRevert(t, reverts[0])
 }
 
-// A mesh IP that does not parse gives the resolver no address to bind, even
-// with WireGuard up, so the run starts no resolver and registers nothing. Like
+// A mesh IP that does not parse starts no resolver, even with WireGuard up, so
+// the run registers nothing: on Linux it is the address to bind, and every
+// platform checks it before the resolver starts. Like
 // every start that runs no resolver, it reverts the mesh interface once at
 // startup, so a registration an earlier run left behind does not keep sending
 // the mesh zones to a port nothing listens on.
@@ -5846,8 +5863,8 @@ func TestRunUp_MeshDNSUnparsableMeshIPReverts(t *testing.T) {
 	assertBoundedRevert(t, reverts[0])
 }
 
-// macOS and Windows have no registrar yet, and their builds hand runUp a nil
-// one, as TestMain does here. That skips the whole subsystem without a word:
+// Windows has no registrar yet, and its build hands runUp a nil one, as
+// TestMain does here. That skips the whole subsystem without a word:
 // no listener, no dispatch handler and no log line about mesh DNS, even with
 // WireGuard up and a dns block in every pull.
 func TestRunUp_MeshDNSNilRegistrarStartsNothing(t *testing.T) {
@@ -5931,6 +5948,9 @@ func TestRunUp_MeshDNSRevertsBeforeWireGuardTeardown(t *testing.T) {
 	order := &callLog{}
 	reg := newRecordingMeshDNSRegistrar(order)
 	useMeshDNSRegistrar(t, reg)
+	// The Linux start: the interface WireGuard just created holds nothing, so
+	// the run reverts in the drain only.
+	useMeshDNSRevertAtStart(t, false)
 	d := startMeshDNSDaemon(t, meshIP, &teardownRecordingWGController{order: order},
 		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
 	const drainStart, meshServerStopped = "shutting down", "mesh server shutdown complete"
@@ -5960,6 +5980,107 @@ func TestRunUp_MeshDNSRevertsBeforeWireGuardTeardown(t *testing.T) {
 		t.Errorf("Apply search domain = %q, want %q", apply.reg.SearchDomain, meshDNSZone)
 	}
 	assertBoundedRevert(t, reg.callsOf("Revert")[0])
+}
+
+// Where the registration outlives a killed run, as configd's keys do on
+// macOS, a start whose resolver listens reverts once before its first pull,
+// so a killed run's catch-all entry cannot hold the control plane's own name
+// while this run's resolver still refuses every name. The first Apply comes
+// with the first pull, so the order of the two calls shows it.
+func TestRunUp_MeshDNSRevertsLeftoversAtStart(t *testing.T) {
+	_, meshIP := loopbackInterface(t)
+	port := freePort(t)
+	listen := net.JoinHostPort(meshIP, strconv.Itoa(port))
+	order := &callLog{}
+	reg := newRecordingMeshDNSRegistrar(order)
+	useMeshDNSRegistrar(t, reg)
+	useMeshDNSRevertAtStart(t, true)
+	d := startMeshDNSDaemon(t, meshIP, &teardownRecordingWGController{order: order},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
+	const drainStart, meshServerStopped = "shutting down", "mesh server shutdown complete"
+	d.logs.mirrorTo(order, drainStart, meshServerStopped)
+
+	d.cp.waitForSteadyState(t)
+	if got := lookupMeshA(t, listen, meshDNSHost); len(got) != 1 || got[0].String() != meshIP {
+		t.Errorf("A %s at %s = %v, want [%s]", meshDNSHost, listen, got, meshIP)
+	}
+	d.stop()
+
+	want := []string{"Revert", "Apply", drainStart, "Revert", meshServerStopped, "DeleteInterface"}
+	if got := order.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %q, want %q: the start must revert before the first pull applies", got, want)
+	}
+	reverts := reg.callsOf("Revert")
+	assertBoundedRevert(t, reverts[0])
+	assertBoundedRevert(t, reverts[1])
+	if n := d.logs.count(slog.LevelWarn, "mesh dns revert failed"); n != 0 {
+		t.Errorf("%d lines say %q, want none", n, "mesh dns revert failed")
+	}
+}
+
+// plexd up hands the resolver the address the platform's resolver reaches:
+// 127.0.0.1 where meshDNSListensOnLoopback holds, the mesh IP elsewhere. A
+// mesh IP that no interface carries tells the two apart. On macOS the
+// resolver listens on loopback, answers there and registers that address;
+// elsewhere its bind on the mesh IP fails and names that address.
+func TestRunUp_MeshDNSListenAddress(t *testing.T) {
+	const meshIP = "192.0.2.1"
+	port := freePort(t)
+	reg := newRecordingMeshDNSRegistrar(&callLog{})
+	useMeshDNSRegistrar(t, reg)
+	d := startMeshDNSDaemon(t, meshIP, &statsWGController{},
+		fmt.Sprintf("dns:\n  listen_port: %d\n", port))
+	d.cp.waitForSteadyState(t)
+
+	if !meshDNSListensOnLoopback {
+		want := net.JoinHostPort(meshIP, strconv.Itoa(port))
+		if got := d.logs.attrsOf(slog.LevelWarn, "mesh dns listener cannot bind, mesh names are not answered")["listen"]; got != want {
+			t.Errorf("warn %q listen = %q, want %q", "mesh dns listener cannot bind, mesh names are not answered", got, want)
+		}
+		return
+	}
+	listen := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	if got := d.logs.attrsOf(slog.LevelInfo, "mesh dns listening")["listen"]; got != listen {
+		t.Errorf("info %q listen = %q, want %q", "mesh dns listening", got, listen)
+	}
+	if got := lookupMeshA(t, listen, meshDNSHost); len(got) != 1 || got[0].String() != meshIP {
+		t.Errorf("A %s at %s = %v, want [%s]", meshDNSHost, listen, got, meshIP)
+	}
+	d.stop()
+	applies := reg.callsOf("Apply")
+	if len(applies) == 0 {
+		t.Fatal("no Apply call, want the first pull to register")
+	}
+	if got := applies[0].reg.Server.String(); got != listen {
+		t.Errorf("Apply server = %q, want %q", got, listen)
+	}
+}
+
+// Only macOS listens on loopback, because a Mac cannot reach its own utun mesh
+// IP; every other platform listens on the mesh IP.
+func TestMeshDNSListenIP(t *testing.T) {
+	meshIP := netip.MustParseAddr("10.99.0.1")
+	if got := meshDNSListenIP(meshIP, false); got != meshIP {
+		t.Errorf("meshDNSListenIP(%v, false) = %v, want the mesh IP", meshIP, got)
+	}
+	if got := meshDNSListenIP(meshIP, true); got != netip.MustParseAddr("127.0.0.1") {
+		t.Errorf("meshDNSListenIP(%v, true) = %v, want 127.0.0.1", meshIP, got)
+	}
+	if want := runtime.GOOS == "darwin"; meshDNSListensOnLoopback != want {
+		t.Errorf("meshDNSListensOnLoopback = %t on %s, want %t", meshDNSListensOnLoopback, runtime.GOOS, want)
+	}
+}
+
+// Only macOS keeps a killed run's registration past its interface, so only a
+// macOS start whose resolver listens reverts first.
+func TestMeshDNSRevertAtStart_PerPlatform(t *testing.T) {
+	want := runtime.GOOS == "darwin"
+	if meshDNSLeftoversOutliveTheRun != want {
+		t.Errorf("meshDNSLeftoversOutliveTheRun = %t on %s, want %t", meshDNSLeftoversOutliveTheRun, runtime.GOOS, want)
+	}
+	if meshDNSRevertAtStart != want {
+		t.Errorf("meshDNSRevertAtStart = %t on %s, want %t", meshDNSRevertAtStart, runtime.GOOS, want)
+	}
 }
 
 // serveMeshDNSTestIP is the mesh IP of the managers the serveMeshDNS tests

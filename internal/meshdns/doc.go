@@ -6,9 +6,9 @@
 // go to the resolvers listed with them and whose catch-all resolvers take
 // every other name. The package validates the block into immutable Records
 // and a Forwarding table, answers queries for the mesh names on the node's
-// own mesh IP, relays the forwarded ones to their resolvers without caching
-// them, and registers the mesh zones and forward zones with the operating
-// system's resolver. The host asks plexd for those zones only and resolves
-// every other name as before, unless a catch-all makes plexd the host's
-// default DNS route.
+// own mesh IP, or on 127.0.0.1 on macOS, relays the forwarded ones to their
+// resolvers without caching them, and registers the mesh zones and forward
+// zones with the operating system's resolver. The host asks plexd for those
+// zones only and resolves every other name as before, unless a catch-all
+// makes plexd the host's default DNS route.
 package meshdns

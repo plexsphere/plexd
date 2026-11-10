@@ -47,6 +47,16 @@ func newMeshDNSRegistrar(logger *slog.Logger) meshdns.Registrar {
 	return meshdns.NewResolvedRegistrar(logger)
 }
 
+// meshDNSLeftoversOutliveTheRun is false on Linux: the registration lives on
+// the mesh interface's link, and a start whose resolver listens has just
+// created that link, so nothing a killed run registered is left to remove.
+const meshDNSLeftoversOutliveTheRun = false
+
+// meshDNSListensOnLoopback is false on Linux: systemd-resolved sends a query
+// for a per-link server out through the mesh link, so only a listener on the
+// node's own mesh IP is reached, which the kernel delivers locally.
+const meshDNSListensOnLoopback = false
+
 // policyCapabilityHint is carried by both firewall-baseline failures. The
 // kernel reports a dropped capability as a bare EPERM on a netlink call, which
 // names neither what the process is missing nor the setting that turns the
