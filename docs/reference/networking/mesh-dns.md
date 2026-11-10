@@ -5,11 +5,11 @@ package: internal/meshdns
 
 # Mesh DNS
 
-The `internal/meshdns` package answers the mesh names of the Node's Domain, and the DNS records the Domain and its Projects define, from a resolver on the Node itself. The same resolver forwards the names of the forward zones the Node's forwarding setting names to the resolvers listed with them, and with a catch-all every other name to the catch-all resolvers. The names, the records and the forwarding setting come from the `dns` block of the state pull (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)), which the "Mesh DNS names" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes. On Linux, plexd registers the resolver with systemd-resolved for the mesh zones and the forward zones, on the mesh interface, and with a catch-all it makes that link the host's default DNS route. The host then asks plexd for those zones, and with a catch-all for every name no other link's domain matches, and resolves every other name as before.
+The `internal/meshdns` package answers the mesh names of the Node's Domain, and the DNS records the Domain and its Projects define, from a resolver on the Node itself. The same resolver forwards the names of the forward zones the Node's forwarding setting names to the resolvers listed with them, and with a catch-all every other name to the catch-all resolvers. The names, the records and the forwarding setting come from the `dns` block of the state pull (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)), which the "Mesh DNS names" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes. On Linux, plexd registers the resolver with systemd-resolved for the mesh zones and the forward zones, on the mesh interface, and with a catch-all it makes that link the host's default DNS route. On macOS, plexd writes DNS entries for the same zones into configd's SystemConfiguration dynamic store with `/usr/sbin/scutil`, from which mDNSResponder takes its per-domain resolvers, and with a catch-all it writes a default-resolver entry (see [Registration on macOS](#registration-on-macos)). The host then asks plexd for those zones, and with a catch-all for every name no other domain of the host's resolver configuration matches, and resolves every other name as before.
 
-plexd is not recursive. It answers `A`, `AAAA` and `PTR` queries for the Nodes' names and mesh IPs, and queries for the records of the six types `A`, `AAAA`, `CNAME`, `TXT`, `SRV` and `MX`. It denies every other name in the mesh zones. A name outside them goes to the resolvers of the forwarding setting when a forward zone covers it or a catch-all is set: plexd passes the query on and relays the reply, and keeps no cache (see [Forwarding](#forwarding)). It refuses every other name outside the mesh zones. It follows a CNAME while its target lies in the mesh zones, and answers one whose target lies outside them with the CNAME alone, for the system resolver to follow. It answers the Node itself only, forwarded names included. It writes no file and changes no resolver setting of the host outside the mesh interface's link, although a catch-all makes that link the host's default DNS route.
+plexd is not recursive. It answers `A`, `AAAA` and `PTR` queries for the Nodes' names and mesh IPs, and queries for the records of the six types `A`, `AAAA`, `CNAME`, `TXT`, `SRV` and `MX`. It denies every other name in the mesh zones. A name outside them goes to the resolvers of the forwarding setting when a forward zone covers it or a catch-all is set: plexd passes the query on and relays the reply, and keeps no cache (see [Forwarding](#forwarding)). It refuses every other name outside the mesh zones. It follows a CNAME while its target lies in the mesh zones, and answers one whose target lies outside them with the CNAME alone, for the system resolver to follow. It answers the Node itself only, forwarded names included. It writes no file. On Linux it changes no resolver setting of the host outside the mesh interface's link, although a catch-all makes that link the host's default DNS route. On macOS it changes no resolver setting of the host but the dynamic-store entries it owns, and it empties mDNSResponder's cache whenever it changes them (see [The Cache Flush](#the-cache-flush)), although a catch-all's entry is a default resolver ordered ahead of the primary network service's.
 
-Only Linux runs the resolver, in node mode and in bridge mode. On macOS and Windows `plexd up` starts no resolver and logs nothing about it. The `dns` keys are still parsed and validated there.
+Linux and macOS run the resolver, in node mode and in bridge mode. On Windows `plexd up` starts no resolver and logs nothing about it. The `dns` keys are still parsed and validated there.
 
 ## Data Flow
 
@@ -26,8 +26,11 @@ Control Plane
                        │ SetForwarding      │
                        ▼                    ▼
                ┌────────────────┐       ┌───────────────────┐
-               │     Server     │       │ ResolvedRegistrar │─ D-Bus ─▶ systemd-resolved
-               │ mesh IP : 5354 │       └───────────────────┘
+               │     Server     │       │ ResolvedRegistrar │─ D-Bus ──▶ systemd-resolved (Linux)
+               │ mesh IP : 5354 │       │        or         │
+               │ (Linux), or    │       │  ScutilRegistrar  │─ scutil ─▶ configd (macOS)
+               │ 127.0.0.1:5354 │       └───────────────────┘
+               │ (macOS)        │
                └────────────────┘
                    ▲          │
                    │          │ forwarded queries over UDP or TCP, port 53
@@ -35,13 +38,13 @@ Control Plane
                    │    forward zone and catch-all resolvers
                    │
                    │ queries for the mesh zones and the forward zones, and with a
-                   │ catch-all every name no other link's domain matches, through
-                   │ the mesh interface
+                   │ catch-all every name no other domain matches: on Linux through
+                   │ the mesh interface, on macOS to 127.0.0.1
                    │
-           systemd-resolved
+           systemd-resolved (Linux) or mDNSResponder (macOS)
 ```
 
-A pull with a `dns` block replaces the names the server answers and the forwarding table it forwards with. It replaces the registration only when the one the block implies differs from the one applied, so a pull that changes only hosts, records or resolvers issues no call to systemd-resolved, as long as the accepted forward zones stay the same and an accepted catch-all resolver neither appears nor goes. A pull without a block changes nothing. plexd keeps the names and the forwarding table in memory only. A restart starts without names and forwards nothing, as it starts without peers, and all of them come back with the first pull.
+A pull with a `dns` block replaces the names the server answers and the forwarding table it forwards with. It replaces the registration only when the one the block implies differs from the one applied, so a pull that changes only hosts, records or resolvers issues no call to the system resolver, as long as the accepted forward zones stay the same and an accepted catch-all resolver neither appears nor goes. A pull without a block changes nothing. plexd keeps the names and the forwarding table in memory only. A restart starts without names and forwards nothing, as it starts without peers, and all of them come back with the first pull.
 
 ## Config
 
@@ -50,7 +53,7 @@ A pull with a `dns` block replaces the names the server answers and the forwardi
 | Field        | Type    | Default         | Description |
 |--------------|---------|-----------------|-------------|
 | `Enabled`    | `*bool` | `nil` (enabled) | Run the resolver and its registration (`enabled`) |
-| `ListenPort` | `int`   | `5354`          | UDP and TCP port the resolver listens on, on the Node's own mesh IP (`listen_port`) |
+| `ListenPort` | `int`   | `5354`          | UDP and TCP port the resolver listens on, on the Node's own mesh IP on Linux and on `127.0.0.1` on macOS (`listen_port`) |
 
 `Enabled` is a pointer so that an omitted key stays apart from an explicit `false`. `IsEnabled()` returns true unless the field is set to `false`, and `ApplyDefaults` leaves the field alone. An existing deployment that sets nothing therefore runs the resolver, and a `false` survives defaulting. `ApplyDefaults` sets a zero `ListenPort` to `DefaultListenPort` (5354). [`PLEXD_DNS_ENABLED`](../core/environment-variables.md#plexd-up-variables) overrides `enabled`.
 
@@ -71,9 +74,11 @@ A disabled resolver binds nothing, so its port is not checked. The check runs on
 
 ## Listen Address
 
-The resolver listens on the Node's own mesh IP, the address registration assigned, on `dns.listen_port`, over UDP and TCP. systemd-resolved moves a server to TCP after repeated UDP losses, for example across a plexd restart, so a resolver that answered on UDP only would fail it then. `Start` binds both sockets and fails when either bind fails, closing the socket that did bind. It refuses an unspecified address, `0.0.0.0`, `::` or `::ffff:0.0.0.0`, which would bind every interface of the host, with `meshdns: listen <address>: no address to listen on`. A resolver binds once: every `Start` after one that succeeded fails with `meshdns: listen <address>: already listening`.
+On Linux the resolver listens on the Node's own mesh IP, the address registration assigned, and on macOS on `127.0.0.1`, on `dns.listen_port`, over UDP and TCP. systemd-resolved moves a server to TCP after repeated UDP losses, for example across a plexd restart, so a resolver that answered on UDP only would fail it then. `Start` binds both sockets and fails when either bind fails, closing the socket that did bind. It refuses an unspecified address, `0.0.0.0`, `::` or `::ffff:0.0.0.0`, which would bind every interface of the host, with `meshdns: listen <address>: no address to listen on`. A resolver binds once: every `Start` after one that succeeded fails with `meshdns: listen <address>: already listening`.
 
 The address is the mesh IP and not loopback, because systemd-resolved sends a query for a per-link DNS server out through that link. A listener on `127.0.0.1` is never reached through the mesh interface. The Node's own mesh IP is a local address, so the kernel delivers the query locally, and every query systemd-resolved sends arrives with the mesh IP as its source address.
+
+On macOS the address is `127.0.0.1`, because a Mac cannot reach its own utun mesh IP. The mesh address's alias makes the mesh IP the utun's point-to-point destination too, so the route to it leads into the utun: `route -n get <mesh IP>` names the utun, and a packet the Mac sends to its own mesh IP enters the tunnel, where wireguard-go drops it. That was measured on the CI macOS runner, for mDNSResponder's queries and for a plain UDP socket alike. The dynamic-store entries are bound to no interface and name `127.0.0.1`, so mDNSResponder's queries arrive over `lo0` from a loopback address, which the [source rule](#source-rule) accepts. plexd's [pf anchor](./pf-wfp-firewall.md) does not see them, because every rule of the anchor names the mesh utun.
 
 The port is unprivileged, so `plexd.service` needs no `CAP_NET_BIND_SERVICE` for the resolver.
 
@@ -81,9 +86,9 @@ The port is unprivileged, so `plexd.service` needs no `CAP_NET_BIND_SERVICE` for
 
 The resolver answers the Node itself only. It accepts a query when the source address, with an IPv4-mapped address unmapped, is the listen address itself or a loopback address. It drops every other UDP packet without a reply, and closes every other TCP connection at accept, before reading anything.
 
-This check is what keeps other hosts from using the resolver. plexd's [nftables policy](./nftables-firewall.md) sits on the forward hook only, so it does not filter traffic to the Node itself, and a mesh peer reaches the mesh IP. A mesh peer cannot send from the Node's own address, because WireGuard drops a packet whose source lies outside the sending peer's allowed IPs.
+This check is what keeps other hosts from using the resolver. plexd's [nftables policy](./nftables-firewall.md) sits on the forward hook only, so it does not filter traffic to the Node itself, and a mesh peer reaches the mesh IP. A mesh peer cannot send from the Node's own address, because WireGuard drops a packet whose source lies outside the sending peer's allowed IPs. On macOS the resolver listens on `127.0.0.1`, which no other host reaches at all.
 
-A program on the Node that queries the mesh IP directly, such as `dig @10.99.0.1 -p 5354 peer-1.app.e2e.internal`, sends from the mesh IP and gets an answer. A program in a Pod or container network sends from an address of its own and gets none.
+A program on the Node that queries the mesh IP directly, such as `dig @10.99.0.1 -p 5354 peer-1.app.e2e.internal`, sends from the mesh IP and gets an answer. On macOS it asks `127.0.0.1` instead, such as `dig @127.0.0.1 -p 5354 peer-1.app.e2e.internal`. A program in a Pod or container network sends from an address of its own and gets none.
 
 ### TCP
 
@@ -261,7 +266,7 @@ The resolvers of an accepted zone, and then those of the catch-all, are checked 
 |-------|------------------------------|----------|
 | Address | It does not parse as an IP address | `resolver "<value>" of <owner> is not an IP address` |
 | Forwardable | It carries an IPv6 zone such as `%eth0`, or it is an IPv4-mapped IPv6 address, the unspecified address, a loopback, multicast or link-local unicast address, or `255.255.255.255` | `resolver "<value>" of <owner> is not an address plexd forwards to` |
-| Self | It is the resolver's own listen address, an IPv4-mapped listen address compared as the IPv4 address it carries | `resolver "<value>" of <owner> is the resolver's own listen address` |
+| Self | It is the resolver's own listen address, an IPv4-mapped listen address compared as the IPv4 address it carries. On macOS that address is `127.0.0.1`, which the loopback check above already refuses, so the node's own mesh IP is accepted there; the Mac cannot reach it, so a forward to it fails like one to any resolver that does not answer | `resolver "<value>" of <owner> is the resolver's own listen address` |
 | Repeat | An accepted resolver of the same owner has the same address | `resolver "<value>" of <owner> repeats an earlier resolver` |
 
 A loopback resolver is refused because `127.0.0.53` is systemd-resolved's stub listener, which would send the query back to plexd, and the listen address would loop the same way. The resolvers of a zone that an earlier check skipped are not checked. The sentences come in the member's order: each zone in turn, a zone's resolver sentences before its `has no usable resolver`, and the catch-all last. The manager logs them after the sentences of the records, in the one `mesh dns skipped invalid entries` line (see [Following the State Pull](#following-the-state-pull)).
@@ -325,7 +330,7 @@ When plexd stops, the forwarded queries in flight end without a reply: a UDP cli
 
 ## Registration with systemd-resolved
 
-`Registrar` is the seam to the operating system's resolver. Tests replace it with a recording fake, so no test changes the resolver settings of the host it runs on.
+`Registrar` is the seam to the operating system's resolver. Tests replace it with a recording fake, so no test changes the resolver settings of the host it runs on. `Name` names the system resolver the registrar writes to, as the manager's log lines name it: `systemd-resolved` for `ResolvedRegistrar` and `configd` for `ScutilRegistrar` (see [Registration on macOS](#registration-on-macos)).
 
 ```go
 type Registration struct {
@@ -339,12 +344,13 @@ type Registration struct {
 type Registrar interface {
     Apply(ctx context.Context, reg Registration) error
     Revert(ctx context.Context, iface string) error
+    Name() string
 }
 
 var ErrUnavailable = errors.New("meshdns: no usable system resolver")
 ```
 
-`(*Records).Registration(iface string, server netip.AddrPort, fwd *Forwarding) Registration` builds what the Node registers. `Interface` is the mesh interface and `Server` the listen address. `SearchDomain` is the accepted search domain, or empty. `RoutingDomains` holds every accepted zone that has no other accepted zone above it, without the search domain, followed by every accepted reverse zone, and then every accepted forward zone of `fwd`, each group in ascending byte order. Routing a domain routes every name under it, so a Project zone below the Domain's default domain adds no entry, and the search domain routes the names under it as well. Reverse zones are never merged: a wider zone would make plexd answer `NXDOMAIN` for addresses outside the mesh. Forward zones are not merged either, neither with each other nor with the mesh zones, so the link lists every zone the Node forwards. `DefaultRoute` makes the link the host's default DNS route, and it is set when `fwd` has an accepted catch-all resolver. A nil `*Records` adds no zone and no search domain, and a nil `fwd` no forward zone and no default route. A registration is empty when it names no search domain and no routing domain and `DefaultRoute` is false.
+`(*Records).Registration(iface string, server netip.AddrPort, fwd *Forwarding) Registration` builds what the Node registers. `Interface` is the mesh interface and `Server` the listen address. `SearchDomain` is the accepted search domain, or empty. `RoutingDomains` holds every accepted zone that has no other accepted zone above it, without the search domain, followed by every accepted reverse zone, and then every accepted forward zone of `fwd`, each group in ascending byte order. Routing a domain routes every name under it, so a Project zone below the Domain's default domain adds no entry, and the search domain routes the names under it as well. Reverse zones are never merged: a wider zone would make plexd answer `NXDOMAIN` for addresses outside the mesh. Forward zones are not merged either, neither with each other nor with the mesh zones, so the link lists every zone the Node forwards. `DefaultRoute` makes the link the host's default DNS route, and it is set when `fwd` has an accepted catch-all resolver. On macOS `DefaultRoute` writes a default-resolver entry instead, and `Interface` serves the log lines only, because a dynamic-store entry is bound to no interface. A nil `*Records` adds no zone and no search domain, and a nil `fwd` no forward zone and no default route. A registration is empty when it names no search domain and no routing domain and `DefaultRoute` is false.
 
 The contract's example is a Node of the Project `openstack` in the Domain `lab`, whose mesh CIDR is `10.42.0.0/16`. Its block carries the search domain `openstack.lab.internal`, the zones `edge.example.com`, `lab.internal` and `openstack.lab.internal`, and the reverse zone `42.10.in-addr.arpa`. The Node registers the search domain `openstack.lab.internal` and the routing domains `edge.example.com`, `lab.internal` and `42.10.in-addr.arpa`. With the forwarding of the example in [Forwarding](#forwarding), it adds the routing domains `2.0.192.in-addr.arpa`, `corp.example.com` and `corp.local`, and `DefaultRoute` for the catch-all. `resolvectl domain` shows each routing domain with a leading `~`, and the catch-all as `~.`.
 
@@ -407,12 +413,125 @@ The catch-all therefore has these limits:
 
 plexd owns the per-link resolver settings of its mesh interface. Each `Apply` replaces the link's default-route flag, domains, DNSSEC, DNS over TLS, LLMNR and mDNS settings and its DNS servers. `RevertLink` clears all of them, including any an operator set there by hand. plexd does not read the link back: a setting changed by hand after a registration stays until the registration changes, the next start applies it again or reverts the link, or a stop reverts it. Set nothing by hand on that link.
 
+## Registration on macOS
+
+`NewScutilRegistrar(logger *slog.Logger) *ScutilRegistrar` (`scutil_darwin.go`) is the `Registrar` on macOS. It writes DNS entries into configd's SystemConfiguration dynamic store with `/usr/sbin/scutil`, which reads each script on its stdin, and mDNSResponder takes its per-domain resolvers from that store. `Name` returns `configd`, the daemon that owns the dynamic store and hands mDNSResponder its DNS configuration. Release builds set `CGO_ENABLED=0`, which rules out the SystemConfiguration framework, so plexd drives the store through `scutil`, as it drives `ifconfig`, `route` and `pfctl` on macOS. The logic sits in `scutil.go`, which has no build tag, so its unit tests run on every platform. Only `scutil_darwin.go`, which runs the tools, is built for macOS alone. The registrar runs nothing until the first `Apply` or `Revert`. It needs root, which plexd on macOS has already for its utun.
+
+Every entry names `127.0.0.1` and `dns.listen_port`, where the resolver listens on macOS, and is bound to no interface (see [Listen Address](#listen-address)). The entries live in configd's memory, so a reboot clears whatever a killed run left behind, and so does the next start of plexd (see [Startup in plexd up](#startup-in-plexd-up)). plexd writes no file under `/etc/resolver`: such a file survives a reboot and cannot express a default resolver.
+
+### The Keys
+
+| Key | Written when | Lines after the server's two |
+|-----|--------------|------------------------------|
+| `State:/Network/Service/plexd-meshdns-search/DNS` | The registration has a search domain | `d.add SupplementalMatchDomains * <search domain>`, `d.add SupplementalMatchDomainsNoSearch # 0` |
+| `State:/Network/Service/plexd-meshdns-match-<i>/DNS` | The registration has routing domains. One key per batch, with `i` counting from 0 | `d.add SupplementalMatchDomains * <its domains, space-separated>`, `d.add SupplementalMatchDomainsNoSearch # 1` |
+| `State:/Network/Service/plexd-meshdns-default/DNS` | `DefaultRoute` is set, so the forwarding has an accepted catch-all resolver | `d.add SupplementalMatchDomains * ""`, `d.add SearchOrder # 100000` |
+
+Every key starts with the server's two lines, `d.add ServerAddresses * <listen address>` and `d.add ServerPort # <dns.listen_port>`, which on macOS read `d.add ServerAddresses * 127.0.0.1` and `d.add ServerPort # 5354` by default. The registrar writes whatever address the registration names: an IPv6 address as it is, such as `d.add ServerAddresses * fd00::1`, and an IPv4-mapped one as the IPv4 address it carries.
+
+`SupplementalMatchDomains` sends the names under the entry's domains to its server. `SupplementalMatchDomainsNoSearch` `0` also puts the search domain on the host's search list, so a bare host name of the Node's own Project resolves through it, and `1` keeps the routing domains off that list, as the routing-only domains of systemd-resolved do on Linux. An empty match domain with `SearchOrder` 100000 makes a default resolver, which answers the names no other entry's domain matches and is ordered ahead of the primary network service's resolver (see [The Catch-All as Default Resolver](#the-catch-all-as-default-resolver)). The search and match entries follow NetBird's macOS DNS configurator, and the default entry follows Tailscale's.
+
+The routing domains fill the match keys in order. A key holds at most 50 domains (`maxDomainsPerKey`) and at most 1500 bytes of domain text (`maxDomainBytesPerKey`), counting the domains' lengths and one space between each two, and a domain that would take the key over either limit starts the next key. 120 routing domains of 10 bytes each therefore go into `match-0` and `match-1` with 50 each and into `match-2` with 20, and 10 routing domains of 200 bytes each go into two keys of 7 and 3. The limits leave the margin NetBird's configurator leaves under scutil's cap of 99 values per `d.add` and its value buffer of about 2048 bytes.
+
+### Apply and Revert
+
+`Apply` runs these steps:
+
+1. Every domain of the registration, the search domain and the routing domains, must match `^[a-z0-9_.-]{1,253}$`. Any other domain returns `meshdns: scutil: domain "<d>" cannot be written to the dynamic store` before scutil runs. The domains come from the control plane and land in a script that root runs, so a newline in one would add a command of its own. `BuildRecords` and `BuildForwarding` refuse such names already, so only a test reaches this check.
+2. It lists the plexd keys with the script `open`, `list State:/Network/Service/plexd-meshdns-.*/DNS`, `quit`. scutil prints one `subKey [i] = <key>` line per key, or `no subKey(s).` when none matches. A line that contains ` = ` yields the text after its last ` = `, trimmed, and that text counts when it matches `^State:/Network/Service/plexd-meshdns-[a-z0-9-]+/DNS$`. Every other line is ignored.
+3. It runs one script: `open`, a `remove <key>` for every listed key the registration does not write, then the search key, the match keys in order and the default key last, each as `d.init`, its `d.add` lines and `set <key>`, then `quit`. A listed key that the registration writes again is not removed first: its `set` replaces it.
+4. After that script succeeded, it flushes the DNS cache (see [The Cache Flush](#the-cache-flush)).
+
+Stale keys go first and the default key goes last. A catch-all that ends therefore stops taking every name before anything else changes, and one that starts takes them only after the zones are in place. For the registration of the [mock control plane's](../development/mock-api-server.md#get-v1-nodes-id-state) block, with the server `127.0.0.1:5354`, the search domain `app.e2e.internal` and the routing domains `e2e.internal` and `0.99.10.in-addr.arpa`, with a catch-all, and with `State:/Network/Service/plexd-meshdns-match-1/DNS` listed from an earlier registration, the script is:
+
+```text
+open
+remove State:/Network/Service/plexd-meshdns-match-1/DNS
+d.init
+d.add ServerAddresses * 127.0.0.1
+d.add ServerPort # 5354
+d.add SupplementalMatchDomains * app.e2e.internal
+d.add SupplementalMatchDomainsNoSearch # 0
+set State:/Network/Service/plexd-meshdns-search/DNS
+d.init
+d.add ServerAddresses * 127.0.0.1
+d.add ServerPort # 5354
+d.add SupplementalMatchDomains * e2e.internal 0.99.10.in-addr.arpa
+d.add SupplementalMatchDomainsNoSearch # 1
+set State:/Network/Service/plexd-meshdns-match-0/DNS
+d.init
+d.add ServerAddresses * 127.0.0.1
+d.add ServerPort # 5354
+d.add SupplementalMatchDomains * ""
+d.add SearchOrder # 100000
+set State:/Network/Service/plexd-meshdns-default/DNS
+quit
+```
+
+A registration that writes no key only removes the listed keys. The manager calls `Revert` for such a registration instead, so only a test reaches that case. An `Apply` costs two scutil runs and the flush, and the manager calls it only when the registration changed or the previous call failed (see [Following the State Pull](#following-the-state-pull)), so a Mac whose zones do not change runs scutil only on its first pull that registers.
+
+scutil exits 0 when one of its commands fails, so plexd reads the output of every script that changes the store. A line that is neither empty nor `No such key`, which a `remove` of a key that is already gone prints, counts as a failure. A failed `apply` script is followed by one revert, a list and, when it names a key, a script that removes every listed key, and by no flush. An error of that revert logs `revert after a failed registration failed` at Debug with `interface` and `error`, and `Apply` returns the script's error either way. When the call has a deadline, as the manager's 5 seconds are, the list and the `apply` script end a fifth of the time left early, and the revert runs under the call's own deadline, as on Linux: scutil cannot be started once a context is done, so a script that ran out the whole time would leave the revert none.
+
+`Revert(ctx, iface)` lists the keys as in step 2. With none listed it returns `nil` without another scutil run and without a flush. Otherwise it runs `open`, a `remove <key>` for each listed key and `quit`, then flushes the cache. It does not use `iface`. The keys do not name the interface, because the kernel picks a new `utunN` on every start (see [The utunN name](./wireguard.md#the-utunn-name)), so a revert also finds what a run on another `utunN` wrote, a killed run's keys included. A missing scutil means there is nothing to remove, and `Revert` returns `nil`.
+
+### The Cache Flush
+
+After the `apply` script of `Apply` succeeded, and after the remove script of a `Revert` succeeded, the registrar flushes the macOS DNS cache: it runs `/usr/bin/dscacheutil -flushcache`, then `/usr/bin/killall -HUP mDNSResponder`, which is Apple's documented flush and the one NetBird runs. mDNSResponder keeps one cache for the whole host. Without the flush, a negative answer that the host's own servers gave for a mesh name before plexd registered would outlive the registration. On Linux a new link scope starts with an empty cache, and plexd flushes nothing there. A failed flush logs `mesh dns cache flush failed` at Debug with `error` and changes nothing else: the registration is in place, and a stale answer goes with its TTL. No flush follows a failed `apply` script, nor the removal that follows it.
+
+plexd flushes only when it changes the registration, not when a pull changes only hosts, records or resolvers. mDNSResponder then serves a changed name or record from its cache for up to the TTL of 10 seconds, as systemd-resolved does on Linux.
+
+### scutil Errors
+
+Every scutil run maps its outcome to an error, where `<op>` is `list`, `apply` or `revert`. The rows apply in this order:
+
+| Outcome of the run | `Apply` returns | `Revert` returns |
+|--------------------|-----------------|------------------|
+| scutil is missing: the run fails with an error that is `fs.ErrNotExist` or `exec.ErrNotFound` | `meshdns: scutil: /usr/sbin/scutil is missing: meshdns: no usable system resolver`, which wraps `ErrUnavailable` | `nil` |
+| Any other error while the context is done | `meshdns: scutil: <op>: <context error>`, such as `meshdns: scutil: list: context deadline exceeded` | The same |
+| Any other error, such as `exit status 1` | `meshdns: scutil: <op>: <error>: <output>`, with the output's lines trimmed and joined by `; `, and without `: <output>` when scutil printed nothing | The same |
+| No error, but the output of an `apply` or `revert` script has a line that is neither empty nor `No such key` | `meshdns: scutil: <op>: <output>`, with the output's lines trimmed and joined by `; ` | The same |
+
+A domain outside `^[a-z0-9_.-]{1,253}$` makes `Apply` return `meshdns: scutil: domain "<d>" cannot be written to the dynamic store` before any run. On macOS `ErrUnavailable` therefore means that `/usr/sbin/scutil` is missing. The manager logs it once at Info as `mesh dns not registered, configd is not usable`, and the resolver keeps answering on its listen address. A `Revert` on such a host returns `nil`, so a stop reports no failure.
+
+The registrar logs these at Debug, with `component=meshdns`:
+
+| Message | Keys |
+|---------|------|
+| `scutil not usable` | `op`, `error`. scutil is missing, in `Apply` and in `Revert` alike |
+| `mesh dns cache flush failed` | `error`, which reads `dscacheutil -flushcache: <cause>` or `killall -HUP mDNSResponder: <cause>` |
+| `revert after a failed registration failed` | `interface`, `error`. The revert after a failed `apply` script failed. The Linux registrar logs the same text |
+
+### Seeing the Entries
+
+`scutil --dns` prints the resolver configuration mDNSResponder uses. While plexd is registered, it lists a resolver for each domain of plexd's entries, with the domain as `domain`, `127.0.0.1` as `nameserver[0]`, and a `port` line naming `dns.listen_port` when the port is not 53. The search domain also appears as a `search domain` of the primary resolver. After a revert none of plexd's domains appears any more. The keys themselves are listed by the script of step 2, and `show <key>` in `sudo scutil` prints what one key holds:
+
+```sh
+printf 'open\nlist State:/Network/Service/plexd-meshdns-.*/DNS\nquit\n' | sudo scutil
+```
+
+To resolve a name through the system resolver, as a program on the Mac does, use `dscacheutil -q host -a name <name>`, or `dscacheutil -q host -a ip_address <address>` for a reverse lookup. `dig` and `nslookup` read `/etc/resolv.conf` and never reach a supplemental entry, so they do not resolve the mesh names through plexd.
+
+### plexd Owns Its Keys
+
+plexd owns every key under `State:/Network/Service/plexd-meshdns-`. It counts a listed key as its own when the key matches `^State:/Network/Service/plexd-meshdns-[a-z0-9-]+/DNS$`. Each `Apply` removes those its registration does not write and replaces the others, and `Revert` removes all of them, whichever run wrote them, including a key an operator wrote there by hand. One plexd runs per Mac. plexd never touches the key of another program, such as `State:/Network/Service/NetBird-Match-0/DNS`, nor a key under the prefix that is not a DNS key, such as `State:/Network/Service/plexd-meshdns-match-0/IPv4`. Write nothing by hand under that prefix.
+
+To remove the keys without plexd, for example after a kill when no start follows, run `sudo scutil` with `remove <key>` for each key the list above names, as `Revert` does. A reboot clears them as well.
+
+### The Catch-All as Default Resolver
+
+A catch-all writes plexd's own default-resolver entry, `State:/Network/Service/plexd-meshdns-default/DNS`, with an empty match domain and `SearchOrder` 100000, which orders it ahead of the primary network service's resolver. plexd does not change the primary service's DNS, so removing the entry leaves the host's resolver configuration as it was. The catch-all on macOS has these limits:
+
+- macOS keeps the primary network service's resolver as a second default resolver. Whether mDNSResponder ever asks that resolver for a name the catch-all should take, for example after plexd answers `SERVFAIL` for a catch-all whose resolvers do not answer, was not measured. A catch-all on macOS therefore does not guarantee that the catch-all resolvers see every name.
+- It takes only the names no other entry's domain matches. A name under a domain another entry holds, such as one a VPN client registered, goes to that entry's servers and not to the catch-all resolvers.
+- A catch-all whose resolvers do not answer makes plexd answer `SERVFAIL` for every name the default entry takes, after at most 4 seconds (see [Asking the Resolvers](#asking-the-resolvers)). The mesh names keep answering, and plexd keeps reaching its control plane through the last address of its name (see [Dial Fallback](../core/control-plane-client.md#dial-fallback)), so the pull that corrects the setting still arrives.
+- A program that does not resolve through mDNSResponder never asks plexd, for example `dig` and `nslookup` (see [Seeing the Entries](#seeing-the-entries)).
+
 ## Following the State Pull
 
 `Manager` ties the records, the forwarding table, the server and the registrar together. Every line it and its server log carries `component=meshdns`.
 
 ```go
-func NewManager(cfg Config, iface string, meshIP netip.Addr, registrar Registrar, logger *slog.Logger) *Manager
+func NewManager(cfg Config, iface string, listenIP netip.Addr, registrar Registrar, logger *slog.Logger) *Manager
 func (m *Manager) Start() error
 func (m *Manager) Addr() netip.AddrPort
 func (m *Manager) Run(ctx context.Context) error
@@ -420,19 +539,19 @@ func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 func (m *Manager) Shutdown(ctx context.Context) error
 ```
 
-`Start` binds the sockets on `meshIP` and `cfg.ListenPort`, and `Run` serves them until its context ends. `Addr` is the listen address the log lines name. `Handle` has the signature of a [dispatch handler](../core/reconciliation.md#dispatchhandler) and runs on every successful pull, drift or not. A mutex guards the state `Handle` and `Shutdown` share.
+`Start` binds the sockets on `listenIP` and `cfg.ListenPort`, where `plexd up` passes the mesh IP on Linux and `127.0.0.1` on macOS (see [Listen Address](#listen-address)), and `Run` serves them until its context ends. `Addr` is the listen address the log lines name. `Handle` has the signature of a [dispatch handler](../core/reconciliation.md#dispatchhandler) and runs on every successful pull, drift or not. A mutex guards the state `Handle` and `Shutdown` share.
 
 1. A nil snapshot returns at once.
 2. A snapshot without a `dns` block, the wire's `null` or a pull from a control plane that predates the block, keeps the names, the forwarding and the registration. The first such pull logs `state pull carries no dns block, keeping the names held`. Later ones log nothing until a block arrived in between.
 3. A block is built into records, which the server takes with an atomic swap, so a pull never blocks a query.
 4. A block that carries the `forwarding` member replaces the member the manager keeps, as a copy. A block without it, or with `null`, keeps the member held. When one is held, the first such block logs `dns block carries no forwarding member, keeping the forwarding held`, and later ones log nothing until a member arrived in between. The kept member is built with `BuildForwarding` against the records of this pull and the listen address, and the server takes the table with an atomic swap, which also drops the down marks of the resolvers the table no longer names. Without a kept member the table is nil and forwards nothing. Because the kept member is built anew on every pull, a forward zone that a new mesh zone shadows goes with the pull that brings the mesh zone, and comes back with the pull that removes it.
 5. Skipped entries log `mesh dns skipped invalid entries` with the count and the first five sentences, those of `BuildRecords` before those of `BuildForwarding`, on every pull that carries them. Records that differ from the previous ones log `mesh dns records updated`, and the first block always counts as a change. A table that differs from the previous one by `Equal` logs `mesh dns forwarding updated`. A nil table equals an empty one, so a Node that never forwards logs nothing.
-6. The wanted registration, built from the records and the table, is compared with the one systemd-resolved accepted last. When they are equal, nothing is called, so a pull that changes only hosts, records or resolvers issues no bus call, as long as the accepted forward zones stay the same and an accepted catch-all resolver neither appears nor goes. When the wanted registration is empty, `Revert` is called, bounded by 5 seconds, if this run called `Apply` since its last successful revert, whether that `Apply` succeeded or failed. Otherwise `Apply` is called, bounded by 5 seconds.
-7. After a failed `Apply` nothing counts as applied, so the next pull calls `Apply` again, while the server already forwards with the new table. A systemd-resolved that starts later, or a link that frees up, is picked up within one reconcile interval. On a host without a usable systemd-resolved each retry costs at most one bus call, the read of `DNSEx`, and changes nothing. A failed `Apply` can leave settings on the link, the earlier registration's or those of the steps that succeeded, so an empty registration on a later pull still reverts it. A failed revert counts as nothing reverted, so the next pull whose registration is empty reverts again.
+6. The wanted registration, built from the records and the table, is compared with the one the system resolver accepted last. When they are equal, nothing is called, so a pull that changes only hosts, records or resolvers issues no bus call on Linux and runs no scutil on macOS, as long as the accepted forward zones stay the same and an accepted catch-all resolver neither appears nor goes. When the wanted registration is empty, `Revert` is called, bounded by 5 seconds, if this run called `Apply` since its last successful revert, whether that `Apply` succeeded or failed. Otherwise `Apply` is called, bounded by 5 seconds.
+7. After a failed `Apply` nothing counts as applied, so the next pull calls `Apply` again, while the server already forwards with the new table. A systemd-resolved that starts later, or a link that frees up, is picked up within one reconcile interval. On a host without a usable systemd-resolved each retry costs at most one bus call, the read of `DNSEx`, and changes nothing. On a Mac without `/usr/sbin/scutil` each retry costs one attempt to run it and changes nothing. A failed `Apply` can leave settings on the link, the earlier registration's or those of the steps that succeeded, or on macOS keys in the dynamic store, so an empty registration on a later pull still reverts it. A failed revert counts as nothing reverted, so the next pull whose registration is empty reverts again.
 
 A pull whose context is already done, because plexd is stopping, still swaps the records and the table but calls no registrar method. The drain's revert is the last word on the link.
 
-A successful `Apply` logs `mesh dns registered with systemd-resolved`, whose `default_route` key says whether the link is the host's default DNS route. A revert from `Handle` logs nothing when it succeeds. An error wrapping `ErrUnavailable` logs `mesh dns not registered, systemd-resolved is not usable` at Info, once per change into that state: a success or another failure in between makes it log again. Any other error, from `Apply` or from the revert, logs `mesh dns registration failed` at Warn, unless its text is the one this line logged last. A success or an unavailable answer in between makes the same text log again.
+`NewManager` builds the two log lines that name the system resolver once, from the registrar's `Name`, so the registrar must not be nil. A successful `Apply` logs `mesh dns registered with systemd-resolved` on Linux and `mesh dns registered with configd` on macOS, whose `default_route` key says whether a catch-all made the link the host's default DNS route, or on macOS wrote the default-resolver entry. A revert from `Handle` logs nothing when it succeeds. An error wrapping `ErrUnavailable` logs `mesh dns not registered, systemd-resolved is not usable` on Linux and `mesh dns not registered, configd is not usable` on macOS at Info, once per change into that state: a success or another failure in between makes it log again. Any other error, from `Apply` or from the revert, logs `mesh dns registration failed` at Warn, unless its text is the one this line logged last. A success or an unavailable answer in between makes the same text log again.
 
 A resolver failure never changes readiness. The health endpoints do not report the resolver, and the log lines are the operator's view of it.
 
@@ -442,7 +561,7 @@ The block lists every zone of the Domain: its default domain and the zone of eve
 
 The block also carries the records of the Domain and of every Project, and every Node answers all of them. A record a Project defines therefore resolves on every Node of the Domain, not only on the Nodes of that Project.
 
-The forwarding member is different: it carries one setting, the one that applies to this Node, which is its Project's when the Project holds one and its Domain's otherwise. A forward zone and a catch-all therefore apply to the Nodes of one Project only when that Project sets them, and to every Node of the Domain whose Project sets nothing when the Domain sets them. Whoever manages the Domain or the Project chooses the resolvers, and with them where the Node's queries for the forward zones go. With a catch-all they also choose where every name goes that the host resolves through systemd-resolved and that no other link's domain matches, and those names are resolved without DNSSEC validation and without DNS over TLS (see [ResolvedRegistrar](#resolvedregistrar)).
+The forwarding member is different: it carries one setting, the one that applies to this Node, which is its Project's when the Project holds one and its Domain's otherwise. A forward zone and a catch-all therefore apply to the Nodes of one Project only when that Project sets them, and to every Node of the Domain whose Project sets nothing when the Domain sets them. Whoever manages the Domain or the Project chooses the resolvers, and with them where the Node's queries for the forward zones go. With a catch-all they also choose where every name goes that the host resolves through the system resolver and that no other domain of the host's resolver configuration matches. On Linux those names are resolved without DNSSEC validation and without DNS over TLS (see [ResolvedRegistrar](#resolvedregistrar)). On macOS, whether the primary network service's resolver ever sees one of them was not measured (see [The Catch-All as Default Resolver](#the-catch-all-as-default-resolver)).
 
 `dns.enabled: false` is the Node operator's way out. It turns the resolver, the forwarding and the registration off on this Node, and plexd reverts the link at start. No key turns the forwarding off on its own.
 
@@ -452,27 +571,31 @@ The forwarding member is different: it carries one setting, the one that applies
 
 | Condition | What happens |
 |-----------|--------------|
-| The platform has no registrar (macOS, Windows, any platform but Linux) | Nothing, and no log line |
+| The platform has no registrar (Windows, any platform but Linux and macOS) | Nothing, and no log line |
 | `dns.enabled: false` | Logs `mesh dns disabled by dns.enabled`, then reverts the mesh interface's link within 5 seconds. A failed revert logs `mesh dns revert failed` |
 | The WireGuard interface did not come up | Logs `wireguard unavailable, mesh dns not started`, then reverts the link the same way |
 | The mesh IP does not parse | Logs `mesh dns not started, the mesh ip does not parse`, then reverts the link the same way |
-| A bind fails, or the mesh IP is unspecified | Logs `mesh dns listener cannot bind, mesh names are not answered` with the hint `set dns.listen_port to a free port`, reverts the link the same way, and goes on without the resolver |
-| Both binds succeed | Logs `mesh dns listening` with the listen address |
+| A bind fails, or on Linux the mesh IP is unspecified | Logs `mesh dns listener cannot bind, mesh names are not answered` with the hint `set dns.listen_port to a free port`, reverts the link the same way, and goes on without the resolver |
+| Both binds succeed | On macOS, reverts first the same way, which removes whatever keys a killed run left. Then logs `mesh dns listening` with the listen address |
 
-Every start that runs no resolver reverts the link, whatever the reason, and a start whose resolver listens applies on the first pull. A registration a killed run left behind would otherwise keep sending the mesh zones and the forward zones, and with a catch-all every other name, to a port nothing listens on: a kill leaves `plexd0` behind, and the next start's WireGuard setup fails on it (see [Stop, Crash and Opt-Out](#stop-crash-and-opt-out)). The revert does nothing when the link does not exist.
+Every start that runs no resolver reverts the link, whatever the reason, and a start whose resolver listens applies on the first pull. A registration a killed run left behind would otherwise keep sending the mesh zones and the forward zones, and with a catch-all every other name, to a port nothing listens on: on Linux a kill leaves `plexd0` behind, and the next start's WireGuard setup fails on it (see [Stop, Crash and Opt-Out](#stop-crash-and-opt-out)). On Linux the revert does nothing when the link does not exist. On macOS the utun goes with the process, but the keys stay in the dynamic store, bound to no interface, and the revert removes them whatever interface it is given. A macOS start whose resolver listens therefore reverts too, before a run that resumed its identity first dials the control plane: with a catch-all, the killed run's default-resolver entry would send the control plane's own name to this run's resolver, which refuses every name until the first pull, so that pull might never arrive. A Linux start whose resolver listens does not revert, because WireGuard has just created its `plexd0`, which holds nothing.
 
 The sockets are bound before the dispatch handler is registered, so a Node that cannot answer never registers a server. Only a resolver that listens gets the dispatch handler, registered after the reachability observer, and a goroutine that serves its sockets. `Run` returns once plexd stops. Only a failed UDP read, or a TCP listener that something other than the stop closed, ends it before that. plexd then logs `mesh dns stopped`, and no mesh name is answered and nothing is forwarded for the rest of the run. It shuts the manager down at once, with a fresh context bounded by 5 seconds, as the drain does: `Shutdown` reverts the link and logs `mesh dns registration reverted`, or `mesh dns shutdown error` when the revert fails, and every later pull registers nothing. Otherwise the registration would keep sending the zones, and with a catch-all every other name, to a port nothing answers on for the rest of the run. A failed accept is retried and stops nothing (see [TCP](#tcp)). Nothing here stops startup: the mesh works without names.
 
 ## Stop, Crash and Opt-Out
+
+On macOS, the link in this table stands for plexd's keys in configd's dynamic store, and a revert removes every one of them (see [Registration on macOS](#registration-on-macos)).
 
 | Event | What plexd does | What the link holds afterwards |
 |-------|-----------------|--------------------------------|
 | A stop of a run whose resolver listens, such as `systemctl stop plexd` | The drain calls `Shutdown` first, right after `shutting down` and before any other subsystem stops, with a fresh context bounded by 5 seconds. It goes first because the resolver stopped answering when the stop began. The interface still exists then, because WireGuard is torn down last. `Shutdown` reverts the link on every run, registered or not, and logs `mesh dns registration reverted`. An error logs `mesh dns shutdown error` | Nothing plexd set |
 | A stop of a run that runs no resolver | Nothing for mesh DNS: the start reverted the link already | Nothing plexd set |
 | The resolver stops while plexd runs, which logs `mesh dns stopped` | `Shutdown` right away, with a fresh context bounded by 5 seconds: it reverts the link, logs `mesh dns registration reverted` or `mesh dns shutdown error`, and stops every later `Handle`. The drain's `Shutdown` still runs at the stop, reverts again and logs `mesh dns registration reverted` again | Nothing plexd set |
-| A crash or a kill | No drain runs, so `plexd0` stays, and so does its registration | The last registration, until the next start reverts it. Without a catch-all the link's default-route flag stays off, so only the mesh zones and the forward zones go to the mesh IP, where nothing answers. With a catch-all the link keeps `~.` and the flag, so every lookup through systemd-resolved that no other link's domain matches fails as well, until the next start reverts the link |
-| The next start after a crash or a kill | WireGuard setup fails on the leftover `plexd0` (`EEXIST`), so the run logs `wireguard unavailable, mesh dns not started`, starts no resolver and reverts the link at start. The drain of that run deletes the leftover `plexd0`, so the start after it creates a fresh one | Nothing plexd set |
-| A start whose resolver listens | WireGuard has just created `plexd0`, so the link holds no settings. The first pull whose block names an accepted zone, reverse zone or forward zone, or an accepted catch-all resolver, applies its registration | The new registration |
+| A crash or a kill on Linux | No drain runs, so `plexd0` stays, and so does its registration | The last registration, until the next start reverts it. Without a catch-all the link's default-route flag stays off, so only the mesh zones and the forward zones go to the mesh IP, where nothing answers. With a catch-all the link keeps `~.` and the flag, so every lookup through systemd-resolved that no other link's domain matches fails as well, until the next start reverts the link |
+| A crash or a kill on macOS | No drain runs. The utun goes with the process, but the keys stay in the dynamic store, bound to no interface | The last registration's keys, until the next start removes them or a reboot clears the dynamic store. The mesh zones and the forward zones go to `127.0.0.1`, where nothing answers. With a catch-all, every name the default entry takes fails meanwhile as well |
+| The next start after a crash or a kill on Linux | WireGuard setup fails on the leftover `plexd0` (`EEXIST`), so the run logs `wireguard unavailable, mesh dns not started`, starts no resolver and reverts the link at start. The drain of that run deletes the leftover `plexd0`, so the start after it creates a fresh one | Nothing plexd set |
+| The next start after a crash or a kill on macOS | WireGuard creates a fresh utun. Whether the resolver listens again or not, the start removes every key the killed run left, a start whose resolver listens before it first dials the control plane | Nothing plexd set, until the first pull applies its registration |
+| A start whose resolver listens | WireGuard has just created the mesh interface, so the link holds no settings; on macOS the start removed whatever keys a killed run left (see the row above). The first pull whose block names an accepted zone, reverse zone or forward zone, or an accepted catch-all resolver, applies its registration | The new registration |
 | A start with `dns.enabled: false`, without WireGuard, with a mesh IP that does not parse, or with a listener that cannot bind | Starts no resolver and reverts the link at start | Nothing plexd set |
 
 To turn the resolver off, set `dns.enabled: false` in the config file, or set `PLEXD_DNS_ENABLED=false`, for example in `/etc/plexd/environment` under the shipped `plexd.service`, and restart plexd. plexd reads the setting once, when it starts.
@@ -542,8 +665,8 @@ The manager, and the server for the forward resolvers, log these with `component
 | `Info` | `dns block carries no forwarding member, keeping the forwarding held` | none. Once while a member is held, and again only after a member arrived in between |
 | `Info` | `mesh dns records updated` | `hosts`, `records` (the number of accepted records), `zones`, `reverse_zones`, `search_domain` (empty when the Node has none) |
 | `Info` | `mesh dns forwarding updated` | `forward_zones` (the number of accepted forward zones), `catch_all` (the number of accepted catch-all resolvers). On every pull whose table differs from the previous one |
-| `Info` | `mesh dns registered with systemd-resolved` | `interface`, `server`, `search_domain`, `routing_domains` (the count, the forward zones included), `default_route` (`true` with a catch-all) |
-| `Info` | `mesh dns not registered, systemd-resolved is not usable` | `listen`, `reason`. Once per change into that state |
+| `Info` | `mesh dns registered with systemd-resolved` on Linux, `mesh dns registered with configd` on macOS | `interface` (on macOS the `utunN`, which the entries are not bound to), `server`, `search_domain`, `routing_domains` (the count, the forward zones included), `default_route` (`true` with a catch-all) |
+| `Info` | `mesh dns not registered, systemd-resolved is not usable` on Linux, `mesh dns not registered, configd is not usable` on macOS | `listen`, `reason`. Once per change into that state |
 | `Warn` | `mesh dns registration failed` | `error`. Once per distinct error text |
 | `Info` | `mesh dns registration reverted` | `interface`. The drain's revert, or the revert after `mesh dns stopped`, returned no error. It also logs where there was nothing to revert, such as on a host without systemd-resolved or a system bus |
 | `Warn` | `mesh dns resolver does not answer` | `resolver`, `zone` (the forward zone, or `.` for the catch-all), `error` (`context deadline exceeded`, or the socket error, such as a refused connection). Once when a resolver gets a down mark, and not again while it stays down |
@@ -564,9 +687,11 @@ The server and the registrar log these at Debug, with `component=meshdns`:
 | `mesh dns could not pack a reply` | `error` |
 | `mesh dns forwarded query failed` | `name` (as the question spells it, with the trailing dot), `type`, `zone`, `error`. No resolver answered, and the query gets `SERVFAIL` |
 | `mesh dns dropped a forwarded query, too many are in flight` | `limit`: `256` when the forwarded queries in flight over UDP and TCP together are at their cap, `16` when the query's TCP connection already holds that many forwarded queries whose replies are not written yet. The query gets `SERVFAIL` |
-| `system bus unreachable` | `error` |
-| `systemd-resolved not usable` | `method`, or `property` (`DNSEx`) for the read before step 1; `error` |
-| `revert after a failed registration failed` | `interface`, `error` |
+| `system bus unreachable` | `error`. Linux |
+| `systemd-resolved not usable` | `method`, or `property` (`DNSEx`) for the read before step 1; `error`. Linux |
+| `scutil not usable` | `op` (`list`, `apply` or `revert`), `error`. macOS, when `/usr/sbin/scutil` is missing |
+| `mesh dns cache flush failed` | `error`. macOS, when the flush after a change of the registration failed (see [The Cache Flush](#the-cache-flush)) |
+| `revert after a failed registration failed` | `interface`, `error`. Linux and macOS |
 
 A registered Node logs, for the [mock control plane's](../development/mock-api-server.md#get-v1-nodes-id-state) block:
 
@@ -582,6 +707,13 @@ The block's `forwarding` member holds two empty lists, so no `mesh dns forwardin
 level=INFO msg="mesh dns forwarding updated" component=meshdns forward_zones=1 catch_all=1
 level=INFO msg="mesh dns registered with systemd-resolved" component=meshdns interface=plexd0 server=10.99.0.1:5354 search_domain=app.e2e.internal routing_domains=3 default_route=true
 level=WARN msg="mesh dns resolver does not answer" component=meshdns resolver=192.0.2.1 zone=corp.example.com error="context deadline exceeded"
+```
+
+A macOS Node logs the same lines, except that it listens on `127.0.0.1` (`mesh dns listening` says `listen=127.0.0.1:5354`) and the two registration lines name configd, the `utunN` the kernel picked, such as `utun4`, and that server:
+
+```text
+level=INFO msg="mesh dns registered with configd" component=meshdns interface=utun4 server=127.0.0.1:5354 search_domain=app.e2e.internal routing_domains=2 default_route=false
+level=INFO msg="mesh dns registered with configd" component=meshdns interface=utun4 server=127.0.0.1:5354 search_domain=app.e2e.internal routing_domains=3 default_route=true
 ```
 
 See [A mesh name does not resolve](../../guide/troubleshooting.md#a-mesh-name-does-not-resolve) for how to read them on a Node.
