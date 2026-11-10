@@ -16,7 +16,9 @@ import (
 // plexsphere's agent contract: the Domain lab with the mesh CIDR
 // 10.42.0.0/16, its default domain lab.internal, the Project openstack with
 // the zone openstack.lab.internal, and the Project edge with the zone
-// override edge.example.com, as pulled by a node in openstack.
+// override edge.example.com, as pulled by a node in openstack. The Domain
+// holds the records db (A and AAAA) and @ (MX), openstack holds
+// _postgres._tcp (SRV) and wiki (CNAME), and edge holds @ (TXT).
 func exampleBlock() api.NodeStateDNS {
 	return api.NodeStateDNS{
 		SearchDomain: "openstack.lab.internal",
@@ -25,6 +27,14 @@ func exampleBlock() api.NodeStateDNS {
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", FQDN: "db-1.openstack.lab.internal", MeshIP: "10.42.0.3"},
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d3", FQDN: "gw.edge.example.com", MeshIP: "10.42.0.9"},
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", FQDN: "web.openstack.lab.internal", MeshIP: "10.42.0.2"},
+		},
+		Records: []api.NodeStateDNSRecord{
+			{FQDN: "_postgres._tcp.openstack.lab.internal", Type: "SRV", Priority: new(0), Weight: new(5), Port: new(5432), Target: "db.lab.internal"},
+			{FQDN: "db.lab.internal", Type: "A", Address: "10.20.0.5"},
+			{FQDN: "db.lab.internal", Type: "AAAA", Address: "fd00:20::5"},
+			{FQDN: "edge.example.com", Type: "TXT", Text: []string{"owner=edge-team"}},
+			{FQDN: "lab.internal", Type: "MX", Priority: new(10), Target: "relay.example.com"},
+			{FQDN: "wiki.openstack.lab.internal", Type: "CNAME", Target: "wiki.example.com"},
 		},
 		ReverseZones: []string{"42.10.in-addr.arpa"},
 	}
@@ -48,23 +58,58 @@ type lookupCase struct {
 	want  Answer
 }
 
+// runLookups runs each case against r. A wanted record without a name is
+// owned by the queried name, folded and without its trailing dot, so a case
+// for a host or a PTR names its owner once.
 func runLookups(t *testing.T, r *Records, cases []lookupCase) {
 	t.Helper()
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("%s %v", tc.name, tc.qtype), func(t *testing.T) {
-			if got := r.Lookup(tc.name, tc.qtype); got != tc.want {
-				t.Errorf("Lookup(%q, %v) = %+v, want %+v", tc.name, tc.qtype, got, tc.want)
+			want := tc.want
+			want.RRs = slices.Clone(want.RRs)
+			for i := range want.RRs {
+				if want.RRs[i].Name == "" {
+					want.RRs[i].Name = foldName(strings.TrimSuffix(tc.name, "."))
+				}
+			}
+			if got := r.Lookup(tc.name, tc.qtype); !answerEqual(got, want) {
+				t.Errorf("Lookup(%q, %v) = %+v, want %+v", tc.name, tc.qtype, got, want)
 			}
 		})
 	}
 }
 
-func found(zone, addr string) Answer {
-	return Answer{Result: ResultFound, Zone: zone, Addr: netip.MustParseAddr(addr)}
+// answerEqual compares two answers whole, their records in order.
+func answerEqual(a, b Answer) bool {
+	return a.Result == b.Result && a.Zone == b.Zone && slices.EqualFunc(a.RRs, b.RRs, RR.equal)
 }
 
+// found is the answer of a host: one A or AAAA record of addr, owned by the
+// queried name.
+func found(zone, addr string) Answer {
+	a := netip.MustParseAddr(addr)
+	t := dnsmessage.TypeAAAA
+	if a.Is4() {
+		t = dnsmessage.TypeA
+	}
+	return Answer{Result: ResultFound, Zone: zone, RRs: []RR{{Type: t, Addr: a}}}
+}
+
+// foundPTR is the answer of a reverse name: one PTR record naming target,
+// owned by the queried name.
 func foundPTR(zone, target string) Answer {
-	return Answer{Result: ResultFound, Zone: zone, Target: target}
+	return Answer{Result: ResultFound, Zone: zone, RRs: []RR{{Type: dnsmessage.TypePTR, Target: target}}}
+}
+
+// foundSOA is the answer of an SOA query at zone itself: one SOA record owned
+// by the zone, whose data the server synthesizes.
+func foundSOA(zone string) Answer {
+	return Answer{Result: ResultFound, Zone: zone, RRs: []RR{{Name: zone, Type: dnsmessage.TypeSOA}}}
+}
+
+// foundRRs is a positive answer with exactly rrs.
+func foundRRs(zone string, rrs ...RR) Answer {
+	return Answer{Result: ResultFound, Zone: zone, RRs: rrs}
 }
 
 func noData(zone string) Answer   { return Answer{Result: ResultNoData, Zone: zone} }
@@ -98,6 +143,9 @@ func TestBuildRecords_ContractExample(t *testing.T) {
 	if got := r.ReverseZoneCount(); got != 1 {
 		t.Errorf("ReverseZoneCount() = %d, want 1", got)
 	}
+	if got := r.RecordCount(); got != 6 {
+		t.Errorf("RecordCount() = %d, want 6", got)
+	}
 }
 
 func TestRecords_LookupNegative(t *testing.T) {
@@ -111,14 +159,15 @@ func TestRecords_LookupNegative(t *testing.T) {
 		{"db-1.openstack.lab.internal", dnsmessage.TypePTR, noData("openstack.lab.internal")},
 		{"db-1.openstack.lab.internal", dnsmessage.TypeSOA, noData("openstack.lab.internal")},
 		{"3.0.42.10.in-addr.arpa", dnsmessage.TypeA, noData("42.10.in-addr.arpa")},
-		// A zone or reverse zone itself answers SOA and nothing else.
+		// A zone or reverse zone itself answers SOA, and no data for a type
+		// it holds no record of.
 		{"lab.internal", dnsmessage.TypeA, noData("lab.internal")},
 		{"openstack.lab.internal", dnsmessage.TypeAAAA, noData("openstack.lab.internal")},
 		{"edge.example.com", dnsmessage.TypeMX, noData("edge.example.com")},
 		{"42.10.in-addr.arpa", dnsmessage.TypePTR, noData("42.10.in-addr.arpa")},
-		{"lab.internal", dnsmessage.TypeSOA, Answer{Result: ResultFound, Zone: "lab.internal"}},
-		{"OpenStack.Lab.Internal.", dnsmessage.TypeSOA, Answer{Result: ResultFound, Zone: "openstack.lab.internal"}},
-		{"42.10.in-addr.arpa", dnsmessage.TypeSOA, Answer{Result: ResultFound, Zone: "42.10.in-addr.arpa"}},
+		{"lab.internal", dnsmessage.TypeSOA, foundSOA("lab.internal")},
+		{"OpenStack.Lab.Internal.", dnsmessage.TypeSOA, foundSOA("openstack.lab.internal")},
+		{"42.10.in-addr.arpa", dnsmessage.TypeSOA, foundSOA("42.10.in-addr.arpa")},
 		// An empty non-terminal: a reverse name lies below it.
 		{"0.42.10.in-addr.arpa", dnsmessage.TypePTR, noData("42.10.in-addr.arpa")},
 		// A name nothing holds, under the longest matching zone.
@@ -154,7 +203,7 @@ func TestRecords_LookupNestedZone(t *testing.T) {
 		{"b.lab.internal", dnsmessage.TypeA, noData("lab.internal")},
 		{"b.lab.internal", dnsmessage.TypeSOA, noData("lab.internal")},
 		{"c.b.lab.internal", dnsmessage.TypeA, nxDomain("lab.internal")},
-		{"a.b.lab.internal", dnsmessage.TypeSOA, Answer{Result: ResultFound, Zone: "a.b.lab.internal"}},
+		{"a.b.lab.internal", dnsmessage.TypeSOA, foundSOA("a.b.lab.internal")},
 		{"h.a.b.lab.internal", dnsmessage.TypeA, found("a.b.lab.internal", "10.42.1.1")},
 		{"x.a.b.lab.internal", dnsmessage.TypeA, nxDomain("a.b.lab.internal")},
 	})
@@ -187,7 +236,7 @@ func TestRecords_IPv6(t *testing.T) {
 		{upperPTR, dnsmessage.TypePTR, foundPTR(zone, "v6-upper.lab.internal")},
 		{v6PTR, dnsmessage.TypeAAAA, noData(zone)},
 		{"3.0." + strings.Repeat("0.", 28) + "d.f.ip6.arpa", dnsmessage.TypePTR, nxDomain(zone)},
-		{zone, dnsmessage.TypeSOA, Answer{Result: ResultFound, Zone: zone}},
+		{zone, dnsmessage.TypeSOA, foundSOA(zone)},
 		{outsidePTR, dnsmessage.TypePTR, refused},
 	})
 }
@@ -330,7 +379,7 @@ func assertAnswersNothing(t *testing.T, r *Records) {
 	}
 	for _, name := range names {
 		for _, qtype := range types {
-			if got := r.Lookup(name, qtype); got != refused {
+			if got := r.Lookup(name, qtype); !answerEqual(got, refused) {
 				t.Errorf("Lookup(%q, %v) = %+v, want %+v", name, qtype, got, refused)
 			}
 		}
@@ -458,8 +507,8 @@ func TestInvalidName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := invalidName(tt.name); got != tt.want {
-				t.Errorf("invalidName(%q) = %q, want %q", tt.name, got, tt.want)
+			if got := invalidName(tt.name, false); got != tt.want {
+				t.Errorf("invalidName(%q, false) = %q, want %q", tt.name, got, tt.want)
 			}
 		})
 	}
@@ -817,5 +866,428 @@ func TestResult_String(t *testing.T) {
 		if got := tt.r.String(); got != tt.want {
 			t.Errorf("Result(%d).String() = %q, want %q", int(tt.r), got, tt.want)
 		}
+	}
+}
+
+// rec is a record of the dns block with the data members given.
+func rec(fqdn, typ string, set func(*api.NodeStateDNSRecord)) api.NodeStateDNSRecord {
+	r := api.NodeStateDNSRecord{FQDN: fqdn, Type: typ}
+	if set != nil {
+		set(&r)
+	}
+	return r
+}
+
+func addr(a string) func(*api.NodeStateDNSRecord) {
+	return func(r *api.NodeStateDNSRecord) { r.Address = a }
+}
+
+func target(t string) func(*api.NodeStateDNSRecord) {
+	return func(r *api.NodeStateDNSRecord) { r.Target = t }
+}
+
+func text(ss ...string) func(*api.NodeStateDNSRecord) {
+	return func(r *api.NodeStateDNSRecord) { r.Text = ss }
+}
+
+// wantSkipped fails the test unless skipped holds exactly want, in order,
+// naming each sentence that differs.
+func wantSkipped(t *testing.T, skipped, want []string) {
+	t.Helper()
+	if slices.Equal(skipped, want) {
+		return
+	}
+	t.Errorf("skipped has %d sentences, want %d", len(skipped), len(want))
+	for i := range max(len(skipped), len(want)) {
+		var got, exp string
+		if i < len(skipped) {
+			got = skipped[i]
+		}
+		if i < len(want) {
+			exp = want[i]
+		}
+		if got != exp {
+			t.Errorf("skipped[%d] = %q, want %q", i, got, exp)
+		}
+	}
+}
+
+// A block without records answers what it answered before records existed:
+// a missing member and an empty one alike.
+func TestBuildRecords_NoRecords(t *testing.T) {
+	withoutKey := exampleBlock()
+	withoutKey.Records = nil
+	emptyList := exampleBlock()
+	emptyList.Records = []api.NodeStateDNSRecord{}
+
+	a, skippedA := BuildRecords(withoutKey)
+	b, skippedB := BuildRecords(emptyList)
+	if len(skippedA) != 0 || len(skippedB) != 0 {
+		t.Fatalf("skipped %q and %q, want nothing", skippedA, skippedB)
+	}
+	if !a.Equal(b) {
+		t.Error("a block without records and one with [] build different records, want equal ones")
+	}
+	for _, r := range []*Records{a, b} {
+		if got := r.RecordCount(); got != 0 {
+			t.Errorf("RecordCount() = %d, want 0", got)
+		}
+		runLookups(t, r, []lookupCase{
+			{"db-1.openstack.lab.internal", dnsmessage.TypeA, found("openstack.lab.internal", "10.42.0.3")},
+			{"3.0.42.10.in-addr.arpa", dnsmessage.TypePTR, foundPTR("42.10.in-addr.arpa", "db-1.openstack.lab.internal")},
+			{"db.lab.internal", dnsmessage.TypeA, nxDomain("lab.internal")},
+			{"wiki.openstack.lab.internal", dnsmessage.TypeA, nxDomain("openstack.lab.internal")},
+			{"_tcp.openstack.lab.internal", dnsmessage.TypeSRV, nxDomain("openstack.lab.internal")},
+			{"lab.internal", dnsmessage.TypeMX, noData("lab.internal")},
+			{"lab.internal", dnsmessage.TypeSOA, foundSOA("lab.internal")},
+		})
+	}
+}
+
+func TestBuildRecords_SkipsInvalidRecords(t *testing.T) {
+	long := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." +
+		strings.Repeat("c", 63) + "." + strings.Repeat("d", 49) + ".lab.internal"
+	if len(long) != 254 {
+		t.Fatalf("long name has %d characters, want 254", len(long))
+	}
+	block := exampleBlock()
+	block.Records = append(block.Records,
+		// The type.
+		rec("caa.lab.internal", "CAA", nil),
+		rec("lower.lab.internal", "a", addr("192.0.2.1")),
+		rec("none.lab.internal", "", nil),
+		// The name.
+		rec("", "A", addr("192.0.2.1")),
+		rec("a..lab.internal", "A", addr("192.0.2.1")),
+		rec("-x.lab.internal", "A", addr("192.0.2.1")),
+		rec(long, "A", addr("192.0.2.1")),
+		// The zone.
+		rec("db.example.org", "A", addr("192.0.2.1")),
+		rec("3.0.42.10.in-addr.arpa", "A", addr("192.0.2.1")),
+		// A host's name.
+		rec("db-1.openstack.lab.internal", "TXT", text("taken")),
+		// The data.
+		rec("v6.lab.internal", "A", addr("fd00::1")),
+		rec("mapped.lab.internal", "A", addr("::ffff:10.0.0.1")),
+		rec("bad.lab.internal", "A", addr("not-an-ip")),
+		rec("empty.lab.internal", "A", nil),
+		rec("v4.lab.internal", "AAAA", addr("10.0.0.1")),
+		rec("mapped.lab.internal", "AAAA", addr("::ffff:10.0.0.1")),
+		rec("no-target.lab.internal", "CNAME", nil),
+		rec("bad-target.lab.internal", "CNAME", target("bad..name")),
+		rec("nil-text.lab.internal", "TXT", nil),
+		rec("no-text.lab.internal", "TXT", func(r *api.NodeStateDNSRecord) { r.Text = []string{} }),
+		rec("long-text.lab.internal", "TXT", text(strings.Repeat("x", 256))),
+		rec("_no-port._tcp.lab.internal", "SRV", func(r *api.NodeStateDNSRecord) {
+			r.Priority, r.Weight, r.Target = new(0), new(0), "db.lab.internal"
+		}),
+		rec("_negative._tcp.lab.internal", "SRV", func(r *api.NodeStateDNSRecord) {
+			r.Priority, r.Weight, r.Port, r.Target = new(-1), new(0), new(1), "db.lab.internal"
+		}),
+		rec("_heavy._tcp.lab.internal", "SRV", func(r *api.NodeStateDNSRecord) {
+			r.Priority, r.Weight, r.Port, r.Target = new(0), new(65536), new(1), "db.lab.internal"
+		}),
+		rec("mail.lab.internal", "MX", target("relay.example.com")),
+		// A CNAME beside another record, and repeats.
+		rec("db.lab.internal", "CNAME", target("db.example.com")),
+		rec("alias.lab.internal", "CNAME", target("db.lab.internal")),
+		rec("alias.lab.internal", "A", addr("192.0.2.1")),
+		rec("alias.lab.internal", "CNAME", target("other.lab.internal")),
+		rec("db.lab.internal", "A", addr("10.20.0.5")),
+		rec("edge.example.com", "TXT", text("owner=edge-team")),
+	)
+
+	r, skipped := BuildRecords(block)
+
+	wantSkipped(t, skipped, []string{
+		`record "caa.lab.internal" of type "CAA" has a type plexd does not answer`,
+		`record "lower.lab.internal" of type "a" has a type plexd does not answer`,
+		`record "none.lab.internal" of type "" has a type plexd does not answer`,
+		`record "" of type "A" is not a valid name because it is empty`,
+		`record "a..lab.internal" of type "A" is not a valid name because it has an empty label`,
+		`record "-x.lab.internal" of type "A" is not a valid name because it has a label that starts or ends with -`,
+		fmt.Sprintf(`record %q of type "A" is not a valid name because it has more than 253 characters`, long),
+		`record "db.example.org" of type "A" lies under no accepted zone`,
+		`record "3.0.42.10.in-addr.arpa" of type "A" lies under no accepted zone`,
+		`record "db-1.openstack.lab.internal" of type "TXT" is the name of node "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", which is answered from hosts only`,
+		`record "v6.lab.internal" of type "A" has address "fd00::1", which is not an IPv4 address`,
+		`record "mapped.lab.internal" of type "A" has address "::ffff:10.0.0.1", which is not an IPv4 address`,
+		`record "bad.lab.internal" of type "A" has address "not-an-ip", which is not an IPv4 address`,
+		`record "empty.lab.internal" of type "A" has address "", which is not an IPv4 address`,
+		`record "v4.lab.internal" of type "AAAA" has address "10.0.0.1", which is not an IPv6 address`,
+		`record "mapped.lab.internal" of type "AAAA" has address "::ffff:10.0.0.1", which is not an IPv6 address`,
+		`record "no-target.lab.internal" of type "CNAME" has target "", which is not a valid name because it is empty`,
+		`record "bad-target.lab.internal" of type "CNAME" has target "bad..name", which is not a valid name because it has an empty label`,
+		`record "nil-text.lab.internal" of type "TXT" has no text`,
+		`record "no-text.lab.internal" of type "TXT" has no text`,
+		`record "long-text.lab.internal" of type "TXT" has a text string of more than 255 bytes`,
+		`record "_no-port._tcp.lab.internal" of type "SRV" has no port`,
+		`record "_negative._tcp.lab.internal" of type "SRV" has a priority outside 0 to 65535`,
+		`record "_heavy._tcp.lab.internal" of type "SRV" has a weight outside 0 to 65535`,
+		`record "mail.lab.internal" of type "MX" has no priority`,
+		`record "db.lab.internal" of type "CNAME" shares its name with a CNAME, which is the only record at its name`,
+		`record "alias.lab.internal" of type "A" shares its name with a CNAME, which is the only record at its name`,
+		`record "alias.lab.internal" of type "CNAME" shares its name with a CNAME, which is the only record at its name`,
+		`record "db.lab.internal" of type "A" repeats an earlier record`,
+		`record "edge.example.com" of type "TXT" repeats an earlier record`,
+	})
+
+	// The contract's six records and the one valid CNAME stay.
+	if got := r.RecordCount(); got != 7 {
+		t.Errorf("RecordCount() = %d, want 7", got)
+	}
+	runLookups(t, r, []lookupCase{
+		// The valid hosts and records still answer.
+		{"db-1.openstack.lab.internal", dnsmessage.TypeA, found("openstack.lab.internal", "10.42.0.3")},
+		{"db-1.openstack.lab.internal", dnsmessage.TypeTXT, noData("openstack.lab.internal")},
+		{"db.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", RR{Name: "db.lab.internal", Type: dnsmessage.TypeA, Addr: netip.MustParseAddr("10.20.0.5")})},
+		{"edge.example.com", dnsmessage.TypeTXT, foundRRs("edge.example.com", RR{Name: "edge.example.com", Type: dnsmessage.TypeTXT, Text: []string{"owner=edge-team"}})},
+		{"alias.lab.internal", dnsmessage.TypeCNAME, foundRRs("lab.internal", RR{Name: "alias.lab.internal", Type: dnsmessage.TypeCNAME, Target: "db.lab.internal"})},
+		// The skipped ones do not.
+		{"caa.lab.internal", dnsmessage.TypeA, nxDomain("lab.internal")},
+		{"v6.lab.internal", dnsmessage.TypeA, nxDomain("lab.internal")},
+		{"mail.lab.internal", dnsmessage.TypeMX, nxDomain("lab.internal")},
+		{"_tcp.lab.internal", dnsmessage.TypeSRV, nxDomain("lab.internal")},
+		{"db.example.org", dnsmessage.TypeA, refused},
+	})
+}
+
+func TestBuildRecords_AcceptsRecords(t *testing.T) {
+	block := exampleBlock()
+	block.Records = append(block.Records,
+		rec("_ldap._tcp.lab.internal", "SRV", func(r *api.NodeStateDNSRecord) {
+			r.Priority, r.Weight, r.Port, r.Target = new(0), new(0), new(0), "_ldap-host.Example.COM"
+		}),
+		rec("openstack.lab.internal", "TXT", text("v=1")),
+		rec("DB2.Lab.Internal", "A", addr("192.0.2.20")),
+		rec("blank.lab.internal", "TXT", text("")),
+		rec("pair.lab.internal", "A", addr("192.0.2.1")),
+		rec("pair.lab.internal", "A", addr("192.0.2.2")),
+		rec("pair.lab.internal", "TXT", text("two")),
+		rec("extra.lab.internal", "A", func(r *api.NodeStateDNSRecord) {
+			r.Address, r.Target, r.Port = "192.0.2.3", "ignored.example.com", new(70000)
+		}),
+	)
+
+	r := mustBuild(t, block)
+
+	if got := r.RecordCount(); got != 14 {
+		t.Errorf("RecordCount() = %d, want 14", got)
+	}
+	a := func(name, ip string) RR {
+		return RR{Name: name, Type: dnsmessage.TypeA, Addr: netip.MustParseAddr(ip)}
+	}
+	runLookups(t, r, []lookupCase{
+		{"_ldap._tcp.lab.internal", dnsmessage.TypeSRV, foundRRs("lab.internal",
+			RR{Name: "_ldap._tcp.lab.internal", Type: dnsmessage.TypeSRV, Target: "_ldap-host.example.com"})},
+		{"openstack.lab.internal", dnsmessage.TypeTXT, foundRRs("openstack.lab.internal",
+			RR{Name: "openstack.lab.internal", Type: dnsmessage.TypeTXT, Text: []string{"v=1"}})},
+		{"db2.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", a("db2.lab.internal", "192.0.2.20"))},
+		{"blank.lab.internal", dnsmessage.TypeTXT, foundRRs("lab.internal",
+			RR{Name: "blank.lab.internal", Type: dnsmessage.TypeTXT, Text: []string{""}})},
+		{"pair.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", a("pair.lab.internal", "192.0.2.1"), a("pair.lab.internal", "192.0.2.2"))},
+		{"pair.lab.internal", dnsmessage.TypeTXT, foundRRs("lab.internal",
+			RR{Name: "pair.lab.internal", Type: dnsmessage.TypeTXT, Text: []string{"two"}})},
+		{"extra.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", a("extra.lab.internal", "192.0.2.3"))},
+		// An SOA query at a zone that holds records answers the SOA.
+		{"openstack.lab.internal", dnsmessage.TypeSOA, foundSOA("openstack.lab.internal")},
+	})
+}
+
+func TestInvalidName_Underscore(t *testing.T) {
+	if got := invalidName("_tcp.lab.internal", false); got != "has a character outside a-z, 0-9 and -" {
+		t.Errorf("invalidName(%q, false) = %q, want a refusal", "_tcp.lab.internal", got)
+	}
+	for _, name := range []string{"_tcp.lab.internal", "_ldap._tcp.lab.internal", "a_b.lab.internal", "x_.lab.internal"} {
+		if got := invalidName(name, true); got != "" {
+			t.Errorf("invalidName(%q, true) = %q, want none", name, got)
+		}
+	}
+	for _, name := range []string{"a b.lab.internal", "*.lab.internal"} {
+		if got := invalidName(name, true); got != "has a character outside a-z, 0-9, - and _" {
+			t.Errorf("invalidName(%q, true) = %q, want the character refusal", name, got)
+		}
+	}
+	if got := invalidName("a b.lab.internal", false); got != "has a character outside a-z, 0-9 and -" {
+		t.Errorf("invalidName(%q, false) = %q, want the character refusal", "a b.lab.internal", got)
+	}
+	if got := invalidName("-_tcp.lab.internal", true); got != "has a label that starts or ends with -" {
+		t.Errorf("invalidName(%q, true) = %q, want the dash refusal", "-_tcp.lab.internal", got)
+	}
+}
+
+func TestRecords_LookupRecords(t *testing.T) {
+	block := exampleBlock()
+	block.Records = append(block.Records,
+		rec("multi.lab.internal", "A", addr("192.0.2.2")),
+		rec("multi.lab.internal", "A", addr("192.0.2.1")),
+	)
+	r := mustBuild(t, block)
+	a := func(name, ip string) RR {
+		return RR{Name: name, Type: dnsmessage.TypeA, Addr: netip.MustParseAddr(ip)}
+	}
+
+	runLookups(t, r, []lookupCase{
+		// Every record of the name and type, in the order of the block.
+		{"multi.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", a("multi.lab.internal", "192.0.2.2"), a("multi.lab.internal", "192.0.2.1"))},
+		{"DB.Lab.Internal.", dnsmessage.TypeA, foundRRs("lab.internal", a("db.lab.internal", "10.20.0.5"))},
+		{"db.lab.internal", dnsmessage.TypeAAAA, foundRRs("lab.internal",
+			RR{Name: "db.lab.internal", Type: dnsmessage.TypeAAAA, Addr: netip.MustParseAddr("fd00:20::5")})},
+		{"_postgres._tcp.openstack.lab.internal", dnsmessage.TypeSRV, foundRRs("openstack.lab.internal",
+			RR{Name: "_postgres._tcp.openstack.lab.internal", Type: dnsmessage.TypeSRV, Priority: 0, Weight: 5, Port: 5432, Target: "db.lab.internal"})},
+		{"lab.internal", dnsmessage.TypeMX, foundRRs("lab.internal",
+			RR{Name: "lab.internal", Type: dnsmessage.TypeMX, Priority: 10, Target: "relay.example.com"})},
+		{"edge.example.com", dnsmessage.TypeTXT, foundRRs("edge.example.com",
+			RR{Name: "edge.example.com", Type: dnsmessage.TypeTXT, Text: []string{"owner=edge-team"}})},
+		// A name with records, but none of the asked type, has no data.
+		{"db.lab.internal", dnsmessage.TypeMX, noData("lab.internal")},
+		{"_tcp.openstack.lab.internal", dnsmessage.TypeA, noData("openstack.lab.internal")},
+		{"_tcp.openstack.lab.internal", dnsmessage.TypeSRV, noData("openstack.lab.internal")},
+		{"nope.lab.internal", dnsmessage.TypeA, nxDomain("lab.internal")},
+		// A CNAME target outside every zone is not answered by plexd.
+		{"wiki.example.com", dnsmessage.TypeA, refused},
+		// A record never answers a reverse query, its address included.
+		{"5.0.20.10.in-addr.arpa", dnsmessage.TypePTR, refused},
+	})
+}
+
+// cnameBlock is the contract's example block with CNAME records that point
+// at a host, at a missing name in another zone, along chains and around
+// loops.
+func cnameBlock() api.NodeStateDNS {
+	block := exampleBlock()
+	block.Records = append(block.Records,
+		rec("alias.lab.internal", "CNAME", target("db-1.openstack.lab.internal")),
+		rec("dangling.lab.internal", "CNAME", target("nope.openstack.lab.internal")),
+		rec("two-1.lab.internal", "CNAME", target("two-2.lab.internal")),
+		rec("two-2.lab.internal", "CNAME", target("multi.lab.internal")),
+		rec("multi.lab.internal", "A", addr("192.0.2.1")),
+		rec("multi.lab.internal", "A", addr("192.0.2.2")),
+		rec("loop-a.lab.internal", "CNAME", target("loop-b.lab.internal")),
+		rec("loop-b.lab.internal", "CNAME", target("loop-a.lab.internal")),
+		rec("self.lab.internal", "CNAME", target("self.lab.internal")),
+		rec("rev.lab.internal", "CNAME", target("3.0.42.10.in-addr.arpa")),
+		rec("lab.internal.example.net", "CNAME", target("www.example.org")),
+		rec("50.lab.internal", "A", addr("10.42.0.50")),
+	)
+	block.Zones = append(block.Zones, "lab.internal.example.net")
+	for i := 1; i <= 9; i++ {
+		block.Records = append(block.Records,
+			rec(fmt.Sprintf("n%d.lab.internal", i), "CNAME", target(fmt.Sprintf("n%d.lab.internal", i+1))))
+	}
+	block.Records = append(block.Records, rec("n10.lab.internal", "A", addr("192.0.2.10")))
+	return block
+}
+
+func TestRecords_LookupCNAME(t *testing.T) {
+	r := mustBuild(t, cnameBlock())
+	cname := func(name, to string) RR { return RR{Name: name, Type: dnsmessage.TypeCNAME, Target: to} }
+	a := func(name, ip string) RR {
+		return RR{Name: name, Type: dnsmessage.TypeA, Addr: netip.MustParseAddr(ip)}
+	}
+	wiki := cname("wiki.openstack.lab.internal", "wiki.example.com")
+	chain := make([]RR, 0, 8)
+	for i := 1; i <= 8; i++ {
+		chain = append(chain, cname(fmt.Sprintf("n%d.lab.internal", i), fmt.Sprintf("n%d.lab.internal", i+1)))
+	}
+
+	runLookups(t, r, []lookupCase{
+		// A CNAME out of the zones answers every type with the CNAME alone.
+		{"wiki.openstack.lab.internal", dnsmessage.TypeA, foundRRs("openstack.lab.internal", wiki)},
+		{"wiki.openstack.lab.internal", dnsmessage.TypeAAAA, foundRRs("openstack.lab.internal", wiki)},
+		{"wiki.openstack.lab.internal", dnsmessage.TypeTXT, foundRRs("openstack.lab.internal", wiki)},
+		{"wiki.openstack.lab.internal", dnsmessage.TypeMX, foundRRs("openstack.lab.internal", wiki)},
+		{"wiki.openstack.lab.internal", dnsmessage.TypeCNAME, foundRRs("openstack.lab.internal", wiki)},
+		{"Wiki.OpenStack.Lab.Internal.", dnsmessage.TypeA, foundRRs("openstack.lab.internal", wiki)},
+		// A CNAME to a host is followed.
+		{"alias.lab.internal", dnsmessage.TypeA, foundRRs("openstack.lab.internal",
+			cname("alias.lab.internal", "db-1.openstack.lab.internal"), a("db-1.openstack.lab.internal", "10.42.0.3"))},
+		{"alias.lab.internal", dnsmessage.TypeAAAA, Answer{Result: ResultNoData, Zone: "openstack.lab.internal",
+			RRs: []RR{cname("alias.lab.internal", "db-1.openstack.lab.internal")}}},
+		{"alias.lab.internal", dnsmessage.TypeCNAME, foundRRs("lab.internal", cname("alias.lab.internal", "db-1.openstack.lab.internal"))},
+		// A query for any type gets the CNAME without following it, and a
+		// name without one has no data for it.
+		{"alias.lab.internal", dnsmessage.TypeALL, foundRRs("lab.internal", cname("alias.lab.internal", "db-1.openstack.lab.internal"))},
+		{"dangling.lab.internal", dnsmessage.TypeALL, foundRRs("lab.internal", cname("dangling.lab.internal", "nope.openstack.lab.internal"))},
+		{"db.lab.internal", dnsmessage.TypeALL, noData("lab.internal")},
+		// A CNAME to a name nothing holds answers NXDOMAIN under the target's zone.
+		{"dangling.lab.internal", dnsmessage.TypeA, Answer{Result: ResultNXDomain, Zone: "openstack.lab.internal",
+			RRs: []RR{cname("dangling.lab.internal", "nope.openstack.lab.internal")}}},
+		// A chain of two to a name with two A records.
+		{"two-1.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal",
+			cname("two-1.lab.internal", "two-2.lab.internal"), cname("two-2.lab.internal", "multi.lab.internal"),
+			a("multi.lab.internal", "192.0.2.1"), a("multi.lab.internal", "192.0.2.2"))},
+		// A chain of nine ends after eight.
+		{"n1.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", chain...)},
+		{"n3.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", append(slices.Clone(chain[2:]),
+			cname("n9.lab.internal", "n10.lab.internal"), a("n10.lab.internal", "192.0.2.10"))...)},
+		// Loops end where they come back.
+		{"loop-a.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal",
+			cname("loop-a.lab.internal", "loop-b.lab.internal"), cname("loop-b.lab.internal", "loop-a.lab.internal"))},
+		{"self.lab.internal", dnsmessage.TypeA, foundRRs("lab.internal", cname("self.lab.internal", "self.lab.internal"))},
+		// A CNAME into a reverse zone is followed there.
+		{"rev.lab.internal", dnsmessage.TypePTR, foundRRs("42.10.in-addr.arpa",
+			cname("rev.lab.internal", "3.0.42.10.in-addr.arpa"),
+			RR{Name: "3.0.42.10.in-addr.arpa", Type: dnsmessage.TypePTR, Target: "db-1.openstack.lab.internal"})},
+		// A CNAME at a zone itself answers an SOA query with the CNAME.
+		{"lab.internal.example.net", dnsmessage.TypeSOA, foundRRs("lab.internal.example.net", cname("lab.internal.example.net", "www.example.org"))},
+		// A zone that holds an MX record answers SOA with the SOA.
+		{"lab.internal", dnsmessage.TypeSOA, foundSOA("lab.internal")},
+		// Hosts still answer one record, and a record's address no PTR.
+		{"db-1.openstack.lab.internal", dnsmessage.TypeA, found("openstack.lab.internal", "10.42.0.3")},
+		{"3.0.42.10.in-addr.arpa", dnsmessage.TypePTR, foundPTR("42.10.in-addr.arpa", "db-1.openstack.lab.internal")},
+		{"50.0.42.10.in-addr.arpa", dnsmessage.TypePTR, nxDomain("42.10.in-addr.arpa")},
+	})
+
+	var none *Records
+	if got := none.Lookup("db.lab.internal", dnsmessage.TypeA); !answerEqual(got, refused) {
+		t.Errorf("nil Records Lookup(db.lab.internal, A) = %+v, want %+v", got, refused)
+	}
+}
+
+func TestRecords_EqualRecords(t *testing.T) {
+	base := mustBuild(t, cnameBlock())
+	modified := func(f func(*api.NodeStateDNS)) *Records {
+		block := cnameBlock()
+		f(&block)
+		return mustBuild(t, block)
+	}
+	index := func(b *api.NodeStateDNS, fqdn string, typ string) int {
+		return slices.IndexFunc(b.Records, func(r api.NodeStateDNSRecord) bool { return r.FQDN == fqdn && r.Type == typ })
+	}
+
+	tests := []struct {
+		name  string
+		other *Records
+		want  bool
+	}{
+		{"same block", mustBuild(t, cnameBlock()), true},
+		{"record added", modified(func(b *api.NodeStateDNS) {
+			b.Records = append(b.Records, rec("new.lab.internal", "TXT", text("x")))
+		}), false},
+		{"record removed", modified(func(b *api.NodeStateDNS) {
+			b.Records = slices.Delete(b.Records, 0, 1)
+		}), false},
+		{"record data changed", modified(func(b *api.NodeStateDNS) {
+			b.Records[index(b, "db.lab.internal", "A")].Address = "10.20.0.6"
+		}), false},
+		{"two records of one name and type swap places", modified(func(b *api.NodeStateDNS) {
+			i := index(b, "multi.lab.internal", "A")
+			b.Records[i], b.Records[i+1] = b.Records[i+1], b.Records[i]
+		}), false},
+		{"records of different names swap places", modified(func(b *api.NodeStateDNS) {
+			i, j := index(b, "_postgres._tcp.openstack.lab.internal", "SRV"), index(b, "edge.example.com", "TXT")
+			b.Records[i], b.Records[j] = b.Records[j], b.Records[i]
+		}), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := base.Equal(tt.other); got != tt.want {
+				t.Errorf("Equal() = %v, want %v", got, tt.want)
+			}
+			if got := tt.other.Equal(base); got != tt.want {
+				t.Errorf("Equal() reversed = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
