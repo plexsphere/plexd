@@ -165,6 +165,20 @@ This removes the configuration and data directories as well.
 
 ## Troubleshooting
 
+### A mesh name does not resolve
+
+plexd answers the mesh names on `127.0.0.1`, port 5354 by default, because a Mac cannot reach its own utun mesh IP, and registers its resolver in configd's dynamic store, from which mDNSResponder takes its per-domain resolvers. Check what the Mac uses, which keys plexd holds, and how a name resolves:
+
+```sh
+scutil --dns
+printf 'open\nlist State:/Network/Service/plexd-meshdns-.*/DNS\nquit\n' | sudo scutil
+dscacheutil -q host -a name <name>
+```
+
+`scutil --dns` should list resolvers for the mesh domains with `nameserver[0] : 127.0.0.1` and a `port` line naming 5354. The `list` names plexd's keys, `plexd-meshdns-search`, `plexd-meshdns-match-0` and with a catch-all `plexd-meshdns-default`, and names none when plexd registered nothing. `dscacheutil` resolves through the system resolver as other programs do. `dig` and `nslookup` ask the servers in `/etc/resolv.conf` and never reach plexd's entries, so a name they do not resolve says nothing about plexd.
+
+The log line `mesh dns registered with configd` shows a registration, and `mesh dns not registered, configd is not usable` or `mesh dns registration failed` says why there is none. plexd removes its keys when it stops. After a crash or a kill they stay until the next start of plexd removes them or a reboot clears them. See [Registration on macOS](../reference/networking/mesh-dns.md#registration-on-macos) and [A mesh name does not resolve](../guide/troubleshooting.md#a-mesh-name-does-not-resolve).
+
 ### The daemon restarts every five seconds
 
 launchd has no counterpart to systemd's `StartLimitBurst`, so a daemon that exits on a configuration error is restarted forever. Read `/Library/Logs/plexd/plexd.log` for the reason, fix the configuration, then:
