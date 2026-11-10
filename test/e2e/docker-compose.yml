@@ -3,6 +3,10 @@ services:
     build:
       context: ../..
       dockerfile: test/e2e/mockapi/Dockerfile
+    # -dns-addr :53 starts the DNS stub phase 12d forwards to. The image runs
+    # as uid 65534, and Docker sets net.ipv4.ip_unprivileged_port_start to 0
+    # in the container, so port 53 binds.
+    command: ["-addr", ":8080", "-dns-addr", ":53"]
     ports:
       - "18080:8080"
       - "18443:8443"

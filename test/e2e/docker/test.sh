@@ -27,7 +27,8 @@
 #     node_secrets_updated as a pull trigger
 #   - Mesh DNS without systemd-resolved: the listener and the missing resolver
 #     logged once per start, mesh names and the dns block's A, CNAME, SRV, MX
-#     and TXT records answered on the mesh IP, and kept by a null dns block
+#     and TXT records answered on the mesh IP, a forward zone and a catch-all
+#     forwarded to the mock's DNS stub, and kept by a null dns block
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -5008,7 +5009,108 @@ else
     fail "nslookup -type=txt e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want the line 'e2e.internal<tab>text = \"v=e2e\"' (output: ${NSLOOKUP_OUT})"
 fi
 
-# (c) A null block keeps the names held. The fixture's block is saved first,
+# (c) Forwarding. The mock API runs a DNS stub on port 53 of its container,
+# which answers every A query with 198.51.100.53 and a name whose first label
+# is nx with NXDOMAIN. The fixture's forwarding member holds two empty lists,
+# so plexd refuses a name outside its zones. A forward zone sends the names
+# under it to the stub, and a catch-all every other name. configure_dns nudges
+# the agent, so each change normally lands within seconds, and the 90 s also
+# cover the pulls the heartbeat asks for. The check ends with two empty lists,
+# the fixture's member, so (d) saves the fixture's block.
+#
+# nslookup_fails_with <output> <name> <rcode> succeeds when busybox nslookup
+# reports that the server can't find name, with rcode as the reason.
+nslookup_fails_with() {
+    nslookup_line "$1" "** server can't find $2: $3"
+}
+STUB_ADDRESS="198.51.100.53"
+MOCK_API_ID=$(dc ps -q mock-api 2>&1) || fail "dc ps -q mock-api failed: ${MOCK_API_ID}"
+MOCK_API_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJECT_NAME}_e2e-net\").IPAddress}}" "${MOCK_API_ID}" 2>&1) \
+    || fail "docker inspect of the mock-api container '${MOCK_API_ID}' failed: ${MOCK_API_IP}"
+if [ -z "${MOCK_API_IP}" ]; then
+    fail "docker inspect gave no address of the mock-api container '${MOCK_API_ID}' on ${PROJECT_NAME}_e2e-net"
+fi
+FWD_DNS=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null | jq -c '.dns' 2>&1 || true)
+FWD_MEMBER=$(printf '%s' "${FWD_DNS}" | jq -c '.forwarding' 2>&1 || true)
+if [ "${FWD_MEMBER}" != '{"forward_zones":[],"catch_all":[]}' ]; then
+    fail "[dns forwarding] the served dns block carries the forwarding member '${FWD_MEMBER}', want the fixture's two empty lists"
+fi
+mesh_nslookup host.fwd.e2e.test
+if [ "${NSLOOKUP_RC}" -ne 0 ] && nslookup_fails_with "${NSLOOKUP_OUT}" host.fwd.e2e.test REFUSED; then
+    echo "  PASS: [dns forwarding] under the fixture's block, nslookup -type=a host.fwd.e2e.test ${MESH_DNS_LISTEN} fails with REFUSED"
+else
+    fail "[dns forwarding] under the fixture's block, nslookup -type=a host.fwd.e2e.test ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want a failure with REFUSED (output: ${NSLOOKUP_OUT})"
+fi
+
+# The forward zone fwd.e2e.test sends its names to the stub, and plexd still
+# refuses a name outside it.
+configure_dns "dns-fwd-zone" "$(printf '%s' "${FWD_DNS}" | jq -c --arg mock "${MOCK_API_IP}" \
+    '.forwarding = {forward_zones: [{zone: "fwd.e2e.test", resolvers: [$mock]}], catch_all: []}')"
+FWD_START=${SECONDS}
+while :; do
+    mesh_nslookup host.fwd.e2e.test
+    if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" host.fwd.e2e.test "${STUB_ADDRESS}"; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge 90 ]; then
+        fail "[dns forwarding] 90s after the forward zone fwd.e2e.test to ${MOCK_API_IP} was configured, nslookup -type=a host.fwd.e2e.test ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and ${STUB_ADDRESS} (output: ${NSLOOKUP_OUT})"
+    fi
+    sleep 2
+done
+echo "  PASS: [dns forwarding] after $((SECONDS - FWD_START))s with the forward zone fwd.e2e.test to ${MOCK_API_IP}, nslookup -type=a host.fwd.e2e.test ${MESH_DNS_LISTEN} answers ${STUB_ADDRESS}"
+mesh_nslookup nx.fwd.e2e.test
+if [ "${NSLOOKUP_RC}" -ne 0 ] && nslookup_fails_with "${NSLOOKUP_OUT}" nx.fwd.e2e.test NXDOMAIN; then
+    echo "  PASS: [dns forwarding] nslookup -type=a nx.fwd.e2e.test ${MESH_DNS_LISTEN} answers NXDOMAIN"
+else
+    fail "[dns forwarding] nslookup -type=a nx.fwd.e2e.test ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want a failure with NXDOMAIN (output: ${NSLOOKUP_OUT})"
+fi
+mesh_nslookup host.other.e2e.test
+if [ "${NSLOOKUP_RC}" -ne 0 ] && nslookup_fails_with "${NSLOOKUP_OUT}" host.other.e2e.test REFUSED; then
+    echo "  PASS: [dns forwarding] without a catch-all, nslookup -type=a host.other.e2e.test ${MESH_DNS_LISTEN} fails with REFUSED"
+else
+    fail "[dns forwarding] without a catch-all, nslookup -type=a host.other.e2e.test ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want a failure with REFUSED (output: ${NSLOOKUP_OUT})"
+fi
+
+# A catch-all sends every other name to the stub.
+configure_dns "dns-fwd-catch-all" "$(printf '%s' "${FWD_DNS}" | jq -c --arg mock "${MOCK_API_IP}" \
+    '.forwarding = {forward_zones: [{zone: "fwd.e2e.test", resolvers: [$mock]}], catch_all: [$mock]}')"
+FWD_START=${SECONDS}
+while :; do
+    mesh_nslookup host.other.e2e.test
+    if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" host.other.e2e.test "${STUB_ADDRESS}"; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge 90 ]; then
+        fail "[dns forwarding] 90s after the catch-all ${MOCK_API_IP} was configured, nslookup -type=a host.other.e2e.test ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and ${STUB_ADDRESS} (output: ${NSLOOKUP_OUT})"
+    fi
+    sleep 2
+done
+echo "  PASS: [dns forwarding] after $((SECONDS - FWD_START))s with the catch-all ${MOCK_API_IP}, nslookup -type=a host.other.e2e.test ${MESH_DNS_LISTEN} answers ${STUB_ADDRESS}"
+
+# Two empty lists end the forwarding, and plexd refuses all three names again.
+configure_dns "dns-fwd-empty" "$(printf '%s' "${FWD_DNS}" | jq -c '.forwarding = {forward_zones: [], catch_all: []}')"
+FWD_START=${SECONDS}
+while :; do
+    FWD_REFUSED=0
+    for name in host.fwd.e2e.test nx.fwd.e2e.test host.other.e2e.test; do
+        mesh_nslookup "${name}"
+        if [ "${NSLOOKUP_RC}" -ne 0 ] && nslookup_fails_with "${NSLOOKUP_OUT}" "${name}" REFUSED; then
+            FWD_REFUSED=$((FWD_REFUSED + 1))
+        else
+            break
+        fi
+    done
+    if [ "${FWD_REFUSED}" -eq 3 ]; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge 90 ]; then
+        fail "[dns forwarding] 90s after two empty lists were configured, nslookup -type=a ${name} ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want a failure with REFUSED (output: ${NSLOOKUP_OUT})"
+    fi
+    sleep 2
+done
+echo "  PASS: [dns forwarding] after $((SECONDS - FWD_START))s with two empty lists, host.fwd.e2e.test, nx.fwd.e2e.test and host.other.e2e.test fail with REFUSED again"
+
+# (d) A null block keeps the names held. The fixture's block is saved first,
 # so the phase can serve it again. Two pulls past the baseline mean at least
 # one of them ran its dispatch handlers to the end: the nudge's pull may land
 # ahead of the baseline, and the heartbeat asks for a pull about every 30 s, so
@@ -5018,7 +5120,7 @@ FIXTURE_PEER1=$(printf '%s' "${FIXTURE_DNS}" | jq '[.hosts[]? | select(.fqdn == 
 if [ "${FIXTURE_PEER1}" != "1" ]; then
     fail "[dns null block] the served dns block '${FIXTURE_DNS}' does not carry peer-1.app.e2e.internal at 10.99.0.2 once (got '${FIXTURE_PEER1}')"
 fi
-# The saved block must hold the fixture's eight records, so the restore in (d)
+# The saved block must hold the fixture's eight records, so the restore in (e)
 # serves them again.
 FIXTURE_RECORDS=$(printf '%s' "${FIXTURE_DNS}" | jq '[.records[]?] | length' 2>&1 || true)
 if [ "${FIXTURE_RECORDS}" != "8" ]; then
@@ -5065,7 +5167,7 @@ else
     fail "[dns null block] nslookup -type=a db.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and 192.0.2.10 (output: ${NSLOOKUP_OUT})"
 fi
 
-# (d) The fixture's block is served again before the phase ends.
+# (e) The fixture's block is served again before the phase ends.
 configure_dns "dns-restore" "${FIXTURE_DNS}"
 SERVED_DNS=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null | jq -c '.dns' 2>&1 || true)
 if [ "$(jq -n --argjson a "${SERVED_DNS:-null}" --argjson b "${FIXTURE_DNS}" '$a == $b' 2>&1)" = "true" ]; then

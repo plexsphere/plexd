@@ -19,8 +19,10 @@
 #   - Mesh DNS through systemd-resolved: the registration, names, a bare host
 #     name, a PTR and the A, AAAA, CNAME, SRV, MX and TXT records answered on
 #     plexd0, a renamed host, a new zone and changed records without a
-#     restart, a CNAME out of the mesh zones, a TXT answer over TCP, answers
-#     while the control plane is paused
+#     restart, a CNAME out of the mesh zones, a TXT answer over TCP, forward
+#     zones and a catch-all forwarded to the mock's DNS stub, a dead forward
+#     resolver that costs the mesh names nothing, answers while the control
+#     plane is paused
 #   - Start after a reboot cleared /run/plexd, with the registration gone
 #     while plexd is stopped and back after the start
 #   - Mesh DNS opt-out with dns.enabled: false
@@ -183,13 +185,16 @@ echo "=== Creating Docker network ==="
 docker network create "${NETWORK_NAME}"
 
 # --- Start mock-api container ---
+# -dns-addr :53 starts the mock's DNS stub, which the mesh DNS phase forwards
+# to. The image runs as uid 65534, and Docker sets
+# net.ipv4.ip_unprivileged_port_start to 0 in the container, so port 53 binds.
 echo "=== Starting mock-api container ==="
 docker run -d \
     --name "${MOCKAPI_CONTAINER}" \
     --network "${NETWORK_NAME}" \
     -p 18080:8080 \
     "${MOCKAPI_IMAGE}" \
-    -addr :8080
+    -addr :8080 -dns-addr :53
 
 # Wait for mock-api to be ready (probe via published port).
 echo "=== Waiting for mock-api readiness ==="
@@ -1219,6 +1224,23 @@ journal_has() {
     return 1
 }
 
+# journal_count <journal> <needle>... prints how many lines of journal carry
+# every needle, matched the way journal_has matches them.
+journal_count() {
+    local journal=$1 line needle n=0
+    shift
+    while IFS= read -r line; do
+        for needle in "$@"; do
+            case "${line}" in
+                *"${needle}"*) ;;
+                *) continue 2 ;;
+            esac
+        done
+        n=$((n + 1))
+    done <<< "${journal}"
+    echo "${n}"
+}
+
 # mesh_query [--type=<type>] <name> runs resolvectl query inside the container
 # with every argument it gets and leaves its output, stderr included, in
 # QUERY_OUT and its exit status in QUERY_RC.
@@ -1299,6 +1321,13 @@ read_link_domains() {
     fi
     LINK_DOMAINS=$(printf '%s\n' "${parts[@]}" | LC_ALL=C sort | tr '\n' ' ')
     LINK_DOMAINS=${LINK_DOMAINS% }
+}
+
+# read_link_status sets LINK_STATUS to the output of resolvectl status for
+# plexd0, stderr included, and LINK_STATUS_RC to its exit status.
+read_link_status() {
+    LINK_STATUS_RC=0
+    LINK_STATUS=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl status "${MESH_IFACE}" 2>&1) || LINK_STATUS_RC=$?
 }
 
 # Step 1: no earlier phase depends on the WireGuard interface, and the
@@ -1643,6 +1672,295 @@ if journal_has "${RESOLVED_JOURNAL}" "Reply truncated, retrying via TCP."; then
 else
     echo "${RESOLVED_JOURNAL}"
     fail "journalctl -u systemd-resolved since ${TXT_SINCE} lacks 'Reply truncated, retrying via TCP.': plexd did not truncate the big.e2e.internal answer over UDP"
+fi
+
+# Step 5b: forwarding. A name under a forward zone goes to that zone's
+# resolvers, and with a catch-all every name outside the mesh zones and the
+# forward zones goes to the catch-all's. The mock API runs a DNS stub on port
+# 53 of its container, which answers every A query with 198.51.100.53 and a
+# name whose first label is nx with NXDOMAIN. dead.e2e.test forwards to
+# 192.0.2.1, a TEST-NET-1 address that never answers, and fwd.e2e.test to the
+# stub. Each change splices .dns.forwarding into the live snapshot the way
+# step 5 splices its block, and lands with a pull the heartbeat's
+# reconcile:true asks for about every 30 s, so each wait is 90 s, as in step
+# 5. The step ends with two empty lists, so step 6 and the phases after it
+# find step 5's registration.
+FWD_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+FWD_TIMEOUT=90
+STUB_ADDRESS="198.51.100.53"
+STEP5_DOMAINS="app.e2e.internal ~0.99.10.in-addr.arpa ~e2e.internal ~ops.e2e.test"
+
+# configure_forwarding <what> <member-json-or-null> splices the forwarding
+# member into the dns block of the live snapshot and posts the snapshot back.
+# null removes the member, so the block is served without it. Reading the
+# live snapshot is a GET on the state endpoint, which state_count counts.
+configure_forwarding() {
+    local what=$1 member=$2 snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${what}] could not read the live node state snapshot"
+    fi
+    # printf, not echo, for the reason step 5 gives.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson f "${member}" 'if $f == null then del(.dns.forwarding) else .dns.forwarding = $f end') \
+        || fail "[${what}] could not splice the forwarding member ${member} into the live snapshot"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${what}] configure-state returned status ${status}, want 204"
+    fi
+}
+
+# (a) The forward zones join the routing domains next to step 5's, and the
+# link stays off the default route. A name under fwd.e2e.test is asked for
+# only once plexd0 routes the zone, so no query for it leaves through the
+# global server.
+FWD_ZONES=$(jq -cn --arg mock "${MOCK_IP}" \
+    '{forward_zones: [{zone: "dead.e2e.test", resolvers: ["192.0.2.1"]}, {zone: "fwd.e2e.test", resolvers: [$mock]}], catch_all: []}')
+configure_forwarding "forward zones" "${FWD_ZONES}"
+echo "  forwarding configured: dead.e2e.test to 192.0.2.1 and fwd.e2e.test to ${MOCK_IP}"
+FWD_ZONE_DOMAINS="app.e2e.internal ~0.99.10.in-addr.arpa ~dead.e2e.test ~e2e.internal ~fwd.e2e.test ~ops.e2e.test"
+FWD_START=${SECONDS}
+while :; do
+    read_link_domains
+    if [ "${LINK_DOMAINS_RC}" -eq 0 ] && [ "${LINK_DOMAINS}" = "${FWD_ZONE_DOMAINS}" ]; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge "${FWD_TIMEOUT}" ]; then
+        echo "${LINK_DOMAINS_RAW}"
+        fail "resolvectl domain ${MESH_IFACE} (exit ${LINK_DOMAINS_RC}) lists '${LINK_DOMAINS}' ${FWD_TIMEOUT}s after the forward zones were configured, want exactly '${FWD_ZONE_DOMAINS}'"
+    fi
+    sleep 3
+done
+echo "  PASS: after $((SECONDS - FWD_START))s resolvectl domain ${MESH_IFACE} lists step 5's domains plus ~dead.e2e.test and ~fwd.e2e.test (exactly ${LINK_DOMAINS})"
+read_link_status
+if [ "${LINK_STATUS_RC}" -eq 0 ] && has_word "${LINK_STATUS}" "-DefaultRoute"; then
+    echo "  PASS: resolvectl status ${MESH_IFACE} still shows -DefaultRoute"
+else
+    echo "${LINK_STATUS}"
+    fail "resolvectl status ${MESH_IFACE} exited ${LINK_STATUS_RC} without -DefaultRoute, want the link off the default route while no catch-all is set"
+fi
+mesh_query host.fwd.e2e.test
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" host.fwd.e2e.test "${STUB_ADDRESS}"; then
+    echo "  PASS: resolvectl query host.fwd.e2e.test answers ${STUB_ADDRESS} on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query host.fwd.e2e.test exited ${QUERY_RC}, want 0 and the stub's ${STUB_ADDRESS} on link ${MESH_IFACE}"
+fi
+mesh_query nx.fwd.e2e.test
+if [ "${QUERY_RC}" -ne 0 ] && not_found "${QUERY_OUT}" nx.fwd.e2e.test; then
+    echo "  PASS: resolvectl query nx.fwd.e2e.test fails with not found"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query nx.fwd.e2e.test exited ${QUERY_RC}, want a failure with 'not found'"
+fi
+
+# (b) A dead resolver costs the mesh names nothing. A query under
+# dead.e2e.test waits in the background while plexd asks 192.0.2.1, and a
+# mesh name, with the cache flushed, answers meanwhile. plexd gives the
+# resolvers of a query 4 s, below the 5 s systemd-resolved waits for a server,
+# and answers SERVFAIL then. systemd-resolved asks again after a SERVFAIL,
+# first with the same EDNS features and after a second SERVFAIL with fewer,
+# so the background query takes three such rounds before it fails.
+DEAD_OUT_FILE=$(mktemp)
+DEAD_START=${SECONDS}
+docker exec "${SYSTEMD_CONTAINER}" resolvectl query host.dead.e2e.test > "${DEAD_OUT_FILE}" 2>&1 &
+DEAD_JOB=$!
+sleep 1
+FLUSH_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl flush-caches 2>&1) \
+    || fail "resolvectl flush-caches inside the container failed: ${FLUSH_OUT}"
+MESH_T0=${EPOCHREALTIME//[!0-9]/}
+mesh_query db-1.app.e2e.internal
+MESH_T1=${EPOCHREALTIME//[!0-9]/}
+MESH_MS=$(((MESH_T1 - MESH_T0) / 1000))
+# Read after the mesh answer, so the query under the dead zone was in flight
+# for all of it.
+DEAD_RUNNING=0
+if kill -0 "${DEAD_JOB}" 2>/dev/null; then
+    DEAD_RUNNING=1
+fi
+if [ "${DEAD_RUNNING}" -ne 1 ]; then
+    echo "${QUERY_OUT}"
+    fail "resolvectl query host.dead.e2e.test ended within $((SECONDS - DEAD_START))s, before the mesh name was answered, want it still waiting for 192.0.2.1 (output: $(< "${DEAD_OUT_FILE}"))"
+fi
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" db-1.app.e2e.internal 10.99.0.2 && [ "${MESH_MS}" -lt 2000 ]; then
+    echo "  PASS: while resolvectl query host.dead.e2e.test waits, db-1.app.e2e.internal answers 10.99.0.2 on link ${MESH_IFACE} in ${MESH_MS}ms"
+else
+    echo "${QUERY_OUT}"
+    fail "while resolvectl query host.dead.e2e.test waits, resolvectl query db-1.app.e2e.internal exited ${QUERY_RC} after ${MESH_MS}ms, want 0 and 10.99.0.2 on link ${MESH_IFACE} within 2000ms"
+fi
+DEAD_RC=0
+wait "${DEAD_JOB}" || DEAD_RC=$?
+DEAD_SECS=$((SECONDS - DEAD_START))
+DEAD_OUT=$(< "${DEAD_OUT_FILE}")
+rm -f "${DEAD_OUT_FILE}"
+case "${DEAD_OUT}" in
+    *"server or network returned error SERVFAIL"*) DEAD_SERVFAIL=1 ;;
+    *) DEAD_SERVFAIL=0 ;;
+esac
+if [ "${DEAD_RC}" -ne 0 ] && [ "${DEAD_SERVFAIL}" -eq 1 ]; then
+    echo "  PASS: resolvectl query host.dead.e2e.test fails with SERVFAIL after ${DEAD_SECS}s (${DEAD_OUT%%$'\n'*})"
+else
+    echo "${DEAD_OUT}"
+    fail "resolvectl query host.dead.e2e.test exited ${DEAD_RC} after ${DEAD_SECS}s, want a failure with 'server or network returned error SERVFAIL'"
+fi
+FWD_LOG_START=${SECONDS}
+while :; do
+    FWD_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${FWD_JOURNAL}"
+    if journal_has "${FWD_JOURNAL}" "plexd[${FWD_PID}]:" 'msg="mesh dns resolver does not answer"' "resolver=192.0.2.1" "zone=dead.e2e.test"; then
+        break
+    fi
+    if [ $((SECONDS - FWD_LOG_START)) -ge 10 ]; then
+        echo "${FWD_JOURNAL}"
+        fail "the journal of plexd[${FWD_PID}] has no 'mesh dns resolver does not answer' line with resolver=192.0.2.1 zone=dead.e2e.test"
+    fi
+    sleep 1
+done
+echo "  PASS: the journal of plexd[${FWD_PID}] holds 'mesh dns resolver does not answer' with resolver=192.0.2.1 and zone=dead.e2e.test"
+
+# (c) A catch-all routes every name no other link claims to plexd0, with the
+# routing domain ~. and the default-route flag. The mock's qualified name,
+# which step 4 resolved through Docker's DNS, now goes to the stub.
+FWD_CATCH_ALL=$(jq -cn --arg mock "${MOCK_IP}" \
+    '{forward_zones: [{zone: "dead.e2e.test", resolvers: ["192.0.2.1"]}, {zone: "fwd.e2e.test", resolvers: [$mock]}], catch_all: [$mock]}')
+configure_forwarding "catch-all" "${FWD_CATCH_ALL}"
+echo "  forwarding configured: the two forward zones and the catch-all ${MOCK_IP}"
+FWD_ALL_DOMAINS="app.e2e.internal ~. ~0.99.10.in-addr.arpa ~dead.e2e.test ~e2e.internal ~fwd.e2e.test ~ops.e2e.test"
+FWD_START=${SECONDS}
+while :; do
+    read_link_domains
+    read_link_status
+    if [ "${LINK_DOMAINS_RC}" -eq 0 ] && [ "${LINK_DOMAINS}" = "${FWD_ALL_DOMAINS}" ] \
+        && [ "${LINK_STATUS_RC}" -eq 0 ] && has_word "${LINK_STATUS}" "+DefaultRoute"; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge "${FWD_TIMEOUT}" ]; then
+        echo "${LINK_DOMAINS_RAW}"
+        echo "${LINK_STATUS}"
+        fail "${FWD_TIMEOUT}s after the catch-all was configured, resolvectl domain ${MESH_IFACE} (exit ${LINK_DOMAINS_RC}) lists '${LINK_DOMAINS}' and resolvectl status exited ${LINK_STATUS_RC}, want exactly '${FWD_ALL_DOMAINS}' and +DefaultRoute"
+    fi
+    sleep 3
+done
+echo "  PASS: after $((SECONDS - FWD_START))s resolvectl domain ${MESH_IFACE} lists ~. (exactly ${LINK_DOMAINS})"
+echo "  PASS: resolvectl status ${MESH_IFACE} shows +DefaultRoute"
+FLUSH_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl flush-caches 2>&1) \
+    || fail "resolvectl flush-caches inside the container failed: ${FLUSH_OUT}"
+mesh_query "${MOCK_FQDN}"
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" "${MOCK_FQDN}" "${STUB_ADDRESS}"; then
+    echo "  PASS: resolvectl query ${MOCK_FQDN} answers ${STUB_ADDRESS} on link ${MESH_IFACE}, through the catch-all"
+else
+    echo "${QUERY_OUT}"
+    fail "resolvectl query ${MOCK_FQDN} exited ${QUERY_RC}, want 0 and the stub's ${STUB_ADDRESS} on link ${MESH_IFACE}"
+fi
+mesh_query db-1.app.e2e.internal
+if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" db-1.app.e2e.internal 10.99.0.2; then
+    echo "  PASS: with the catch-all set, db-1.app.e2e.internal still answers 10.99.0.2 on link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "with the catch-all set, resolvectl query db-1.app.e2e.internal exited ${QUERY_RC}, want 0 and 10.99.0.2 on link ${MESH_IFACE}"
+fi
+FWD_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${FWD_JOURNAL}"
+if journal_has "${FWD_JOURNAL}" "plexd[${FWD_PID}]:" 'msg="mesh dns registered with systemd-resolved"' "interface=${MESH_IFACE}" "default_route=true"; then
+    echo "  PASS: the journal of plexd[${FWD_PID}] holds 'mesh dns registered with systemd-resolved' with default_route=true"
+else
+    echo "${FWD_JOURNAL}"
+    fail "the journal of plexd[${FWD_PID}] has no 'mesh dns registered with systemd-resolved' line with interface=${MESH_IFACE} default_route=true"
+fi
+
+# (d) A block without the forwarding member keeps the member plexd holds, so
+# two pulls of it leave the link as it is, and plexd says so once. The
+# state_count baseline is read after the splice, whose GET it counts, so both
+# pulls past it serve the block without the member. plexd handles a pull's dns
+# block right after the fetch, and the 2 s after the second pull let it finish.
+NO_MEMBER_LINE='msg="dns block carries no forwarding member, keeping the forwarding held"'
+NO_MEMBER_BEFORE=$(journal_count "${FWD_JOURNAL}" "plexd[${FWD_PID}]:" "${NO_MEMBER_LINE}")
+configure_forwarding "no forwarding member" null
+SERVED_MEMBER=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null | jq -c '.dns | has("forwarding")' 2>&1 || true)
+if [ "${SERVED_MEMBER}" != "false" ]; then
+    fail "[no forwarding member] the served dns block has the forwarding member ('${SERVED_MEMBER}'), want it gone"
+fi
+echo "  forwarding member removed from the dns block"
+STATE_BEFORE_NO_MEMBER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+case "${STATE_BEFORE_NO_MEMBER}" in
+    '' | *[!0-9]*) fail "[no forwarding member] no state_count baseline (got '${STATE_BEFORE_NO_MEMBER}')" ;;
+esac
+FWD_START=${SECONDS}
+while :; do
+    STATE_NOW=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    if [ "${STATE_NOW}" -ge $((STATE_BEFORE_NO_MEMBER + 2)) ] 2>/dev/null; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge "${FWD_TIMEOUT}" ]; then
+        fail "[no forwarding member] state_count went from ${STATE_BEFORE_NO_MEMBER} to '${STATE_NOW}' in ${FWD_TIMEOUT}s, want two pulls of the block without the member"
+    fi
+    sleep 2
+done
+echo "  PASS: state_count grew from ${STATE_BEFORE_NO_MEMBER} to ${STATE_NOW} after $((SECONDS - FWD_START))s, two pulls of the block without the member"
+sleep 2
+read_link_domains
+if [ "${LINK_DOMAINS_RC}" -eq 0 ] && [ "${LINK_DOMAINS}" = "${FWD_ALL_DOMAINS}" ]; then
+    echo "  PASS: resolvectl domain ${MESH_IFACE} is unchanged, ~. included (exactly ${LINK_DOMAINS})"
+else
+    echo "${LINK_DOMAINS_RAW}"
+    fail "after two pulls without the forwarding member, resolvectl domain ${MESH_IFACE} (exit ${LINK_DOMAINS_RC}) lists '${LINK_DOMAINS}', want exactly '${FWD_ALL_DOMAINS}'"
+fi
+FWD_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${FWD_JOURNAL}"
+NO_MEMBER_AFTER=$(journal_count "${FWD_JOURNAL}" "plexd[${FWD_PID}]:" "${NO_MEMBER_LINE}")
+if [ "${NO_MEMBER_AFTER}" -eq $((NO_MEMBER_BEFORE + 1)) ]; then
+    echo "  PASS: the journal of plexd[${FWD_PID}] gained exactly one 'dns block carries no forwarding member, keeping the forwarding held' line (${NO_MEMBER_BEFORE} -> ${NO_MEMBER_AFTER})"
+else
+    fail "the journal of plexd[${FWD_PID}] went from ${NO_MEMBER_BEFORE} to ${NO_MEMBER_AFTER} 'dns block carries no forwarding member, keeping the forwarding held' line(s) over two pulls without the member, want +1"
+fi
+
+# (e) Two empty lists end the forwarding: the link goes back to step 5's
+# domains and off the default route, the mock's name resolves through Docker's
+# DNS again, and a name under the former forward zone no longer reaches the
+# stub.
+configure_forwarding "two empty lists" '{"forward_zones": [], "catch_all": []}'
+echo "  forwarding configured: two empty lists"
+FWD_START=${SECONDS}
+while :; do
+    read_link_domains
+    read_link_status
+    if [ "${LINK_DOMAINS_RC}" -eq 0 ] && [ "${LINK_DOMAINS}" = "${STEP5_DOMAINS}" ] \
+        && [ "${LINK_STATUS_RC}" -eq 0 ] && has_word "${LINK_STATUS}" "-DefaultRoute"; then
+        break
+    fi
+    if [ $((SECONDS - FWD_START)) -ge "${FWD_TIMEOUT}" ]; then
+        echo "${LINK_DOMAINS_RAW}"
+        echo "${LINK_STATUS}"
+        fail "${FWD_TIMEOUT}s after two empty lists were configured, resolvectl domain ${MESH_IFACE} (exit ${LINK_DOMAINS_RC}) lists '${LINK_DOMAINS}' and resolvectl status exited ${LINK_STATUS_RC}, want exactly '${STEP5_DOMAINS}' and -DefaultRoute"
+    fi
+    sleep 3
+done
+echo "  PASS: after $((SECONDS - FWD_START))s resolvectl domain ${MESH_IFACE} lists exactly step 5's domains (${LINK_DOMAINS})"
+echo "  PASS: resolvectl status ${MESH_IFACE} shows -DefaultRoute again"
+FLUSH_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl flush-caches 2>&1) \
+    || fail "resolvectl flush-caches inside the container failed: ${FLUSH_OUT}"
+mesh_query "${MOCK_FQDN}"
+MOCK_ANSWERED=0
+while IFS= read -r line; do
+    case "${line}" in
+        "${MOCK_FQDN}: ${MOCK_IP}" | "${MOCK_FQDN}: ${MOCK_IP} "*) MOCK_ANSWERED=1 ;;
+    esac
+done <<< "${QUERY_OUT}"
+case "${QUERY_OUT}" in
+    *"${MESH_IFACE}"*) MOCK_ON_MESH=1 ;;
+    *) MOCK_ON_MESH=0 ;;
+esac
+if [ "${QUERY_RC}" -eq 0 ] && [ "${MOCK_ANSWERED}" -eq 1 ] && [ "${MOCK_ON_MESH}" -eq 0 ]; then
+    echo "  PASS: resolvectl query ${MOCK_FQDN} answers ${MOCK_IP} again and does not name link ${MESH_IFACE}"
+else
+    echo "${QUERY_OUT}"
+    fail "after two empty lists, resolvectl query ${MOCK_FQDN} exited ${QUERY_RC}, want 0 and ${MOCK_IP} without link ${MESH_IFACE}"
+fi
+mesh_query host.fwd.e2e.test
+if [ "${QUERY_RC}" -ne 0 ]; then
+    echo "  PASS: resolvectl query host.fwd.e2e.test fails (${QUERY_OUT%%$'\n'*})"
+else
+    echo "${QUERY_OUT}"
+    fail "after two empty lists, resolvectl query host.fwd.e2e.test exited 0, want a failure"
 fi
 
 # Step 6: the names keep answering while the control plane is away. The mock
