@@ -138,7 +138,8 @@ type NodeStateSnapshot struct {
 // predating records never wrote, means the Domain has no records: the block
 // is the full set, so it is no signal to keep the records held.
 // ReverseZones are the in-addr.arpa or ip6.arpa zones that cover the Domain's
-// mesh CIDR and nothing wider. The control plane sends every name in lower
+// mesh CIDR and nothing wider. Forwarding is the DNS forwarding setting that
+// applies to the pulling node. The control plane sends every name in lower
 // case without a trailing dot, and an empty list as [].
 type NodeStateDNS struct {
 	SearchDomain string               `json:"search_domain"`
@@ -146,6 +147,36 @@ type NodeStateDNS struct {
 	Hosts        []NodeStateDNSHost   `json:"hosts"`
 	Records      []NodeStateDNSRecord `json:"records"`
 	ReverseZones []string             `json:"reverse_zones"`
+	// Forwarding is a pointer because the member is the full setting and its
+	// absence says something else: a nil value, the wire's null or a key a
+	// control plane predating forwarding never wrote, means the control plane
+	// did not say this time, and the node keeps the forwarding it holds. Two
+	// empty lists say the node forwards nothing. omitempty lets the mock
+	// control plane, which marshals this type, serve a block without it.
+	Forwarding *NodeStateDNSForwarding `json:"forwarding,omitempty"`
+}
+
+// NodeStateDNSForwarding is the forwarding member of the dns block, as the
+// "Mesh DNS names" section of plexsphere's agent contract describes it: the
+// Project's setting when the node's Project holds one, otherwise its Domain's,
+// otherwise two empty lists. ForwardZones are ascending by zone, each with 1
+// to 3 resolvers. CatchAll holds 0 to 3 resolvers, which answer every name
+// outside the mesh zones, the reverse zones and the forward zones. A resolver
+// is an IPv4 or IPv6 address in text form, asked in list order on port 53
+// over plain DNS. A nil list, the wire's null or a missing key, is an empty
+// one.
+type NodeStateDNSForwarding struct {
+	ForwardZones []NodeStateDNSForwardZone `json:"forward_zones"`
+	CatchAll     []string                  `json:"catch_all"`
+}
+
+// NodeStateDNSForwardZone is one entry of the forwarding member's
+// forward_zones, as the "Mesh DNS names" section of plexsphere's agent
+// contract describes it: a zone outside the mesh and the resolvers that answer
+// the names under it, in the order they are asked.
+type NodeStateDNSForwardZone struct {
+	Zone      string   `json:"zone"`
+	Resolvers []string `json:"resolvers"`
 }
 
 // NodeStateDNSHost is one entry of the dns block's hosts, as the "Mesh DNS
