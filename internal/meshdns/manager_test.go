@@ -266,10 +266,14 @@ func newTestManager(t *testing.T, reg *fakeRegistrar) (*Manager, *logRecorder) {
 }
 
 // startManager returns a test manager that listens and serves until the test
-// ends, so a test can ask its resolver over a real socket.
-func startManager(t *testing.T, reg *fakeRegistrar) (*Manager, *logRecorder) {
+// ends, so a test can ask its resolver over a real socket. configure runs
+// before the resolver starts serving.
+func startManager(t *testing.T, reg *fakeRegistrar, configure ...func(*Manager)) (*Manager, *logRecorder) {
 	t.Helper()
 	m, logs := newTestManager(t, reg)
+	for _, f := range configure {
+		f(m)
+	}
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start() = %v, want nil", err)
 	}
@@ -964,4 +968,305 @@ func TestManager_LogsSkippedRecord(t *testing.T) {
 		t.Errorf("%q has skipped=%q, want %q", msgSkipped, got, want)
 	}
 	wantLine(t, logs, slog.LevelInfo, msgUpdated, map[string]string{"records": "6"})
+}
+
+// The manager's forwarding lines, spelled out as the others are.
+const (
+	msgForwarding = "mesh dns forwarding updated"
+	msgNoMember   = "dns block carries no forwarding member, keeping the forwarding held"
+)
+
+// fwdResolver is the resolver of the manager tests' forward zone and
+// catch-all, and fwdAnswer the address the fake behind it answers.
+const (
+	fwdResolver = "192.0.2.1"
+	fwdAnswer   = "198.51.100.53"
+)
+
+// startForwardingManager returns a started test manager whose resolver sends
+// every query for fwdResolver to a fake that answers fwdAnswer, and that fake.
+func startForwardingManager(t *testing.T, reg *fakeRegistrar) (*Manager, *logRecorder, *fakeResolver) {
+	t.Helper()
+	fake := newFakeResolver(t, answerA(fwdAnswer))
+	m, logs := startManager(t, reg, func(m *Manager) {
+		m.server.upstream.target = routeFakes(t, map[string]*fakeResolver{fwdResolver: fake})
+	})
+	return m, logs, fake
+}
+
+// withForwarding returns block with a forwarding member of zones and
+// catchAll. Nil lists go out as empty ones, as the control plane sends them.
+func withForwarding(block api.NodeStateDNS, zones []api.NodeStateDNSForwardZone, catchAll ...string) api.NodeStateDNS {
+	if zones == nil {
+		zones = []api.NodeStateDNSForwardZone{}
+	}
+	if catchAll == nil {
+		catchAll = []string{}
+	}
+	block.Forwarding = &api.NodeStateDNSForwarding{ForwardZones: zones, CatchAll: catchAll}
+	return block
+}
+
+// corpZone is the forward zone corp.example.com on fwdResolver.
+func corpZone() []api.NodeStateDNSForwardZone {
+	return []api.NodeStateDNSForwardZone{fwdZone("corp.example.com", fwdResolver)}
+}
+
+// exampleDomains are the routing domains of exampleBlock.
+var exampleDomains = []string{"edge.example.com", "lab.internal", "42.10.in-addr.arpa"}
+
+// wantLastLine fails the test unless the last record that says msg carries
+// every attribute of attrs rendered as given.
+func wantLastLine(t *testing.T, logs *logRecorder, msg string, attrs map[string]string) {
+	t.Helper()
+	found := logs.find(msg)
+	if len(found) == 0 {
+		t.Errorf("no line says %q, want one", msg)
+		return
+	}
+	last := found[len(found)-1]
+	for k, want := range attrs {
+		if got := last.attrs[k].String(); got != want {
+			t.Errorf("last %q has %s=%q, want %q", msg, k, got, want)
+		}
+	}
+}
+
+func TestManager_HandleForwarding(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs, fake := startForwardingManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), corpZone())))
+
+	wantAddr(t, m, "host.corp.example.com", fwdAnswer)
+	wantRCode(t, m, "example.org", dnsmessage.RCodeRefused)
+	wantAddr(t, m, "db-1.openstack.lab.internal", "10.42.0.3")
+	if got := fake.count(); got != 1 {
+		t.Errorf("the resolver received %d queries, want 1", got)
+	}
+	wantMethods(t, reg, "Apply")
+	want := Registration{
+		Interface:      testIface,
+		Server:         m.Addr(),
+		SearchDomain:   "openstack.lab.internal",
+		RoutingDomains: append(slices.Clone(exampleDomains), "corp.example.com"),
+	}
+	if got := reg.recorded()[0].reg; !got.Equal(want) {
+		t.Errorf("Apply(%+v), want Apply(%+v)", got, want)
+	}
+	wantLine(t, logs, slog.LevelInfo, msgForwarding, map[string]string{"forward_zones": "1", "catch_all": "0"})
+	wantLine(t, logs, slog.LevelInfo, msgRegistered, map[string]string{"routing_domains": "4", "default_route": "false"})
+
+	// The same block again changes nothing.
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), corpZone())))
+	wantMethods(t, reg, "Apply")
+	wantCount(t, logs, msgForwarding, 1)
+	wantCount(t, logs, msgNoMember, 0)
+}
+
+func TestManager_HandleKeepsForwarding(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs, _ := startForwardingManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), corpZone(), fwdResolver)))
+	wantMethods(t, reg, "Apply")
+
+	// Two blocks without the member and a pull without a block keep the
+	// table and the registration.
+	m.Handle(ctx, snapshot(exampleBlock()))
+	m.Handle(ctx, snapshot(exampleBlock()))
+	m.Handle(ctx, &api.NodeStateSnapshot{})
+
+	wantMethods(t, reg, "Apply")
+	wantLine(t, logs, slog.LevelInfo, msgNoMember, nil)
+	wantCount(t, logs, msgForwarding, 1)
+	wantAddr(t, m, "host.corp.example.com", fwdAnswer)
+	wantAddr(t, m, "example.org", fwdAnswer)
+	wantAddr(t, m, "db-1.openstack.lab.internal", "10.42.0.3")
+
+	// A member in between makes the next block without one log again.
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), corpZone(), fwdResolver)))
+	m.Handle(ctx, snapshot(exampleBlock()))
+	wantCount(t, logs, msgNoMember, 2)
+	wantMethods(t, reg, "Apply")
+}
+
+// Only a kept member is worth the line: a node that never got one has
+// nothing to keep.
+func TestManager_HandleWithoutMemberBeforeFirst(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs, fake := startForwardingManager(t, reg)
+
+	m.Handle(context.Background(), snapshot(exampleBlock()))
+	m.Handle(context.Background(), snapshot(exampleBlock()))
+
+	wantCount(t, logs, msgNoMember, 0)
+	wantCount(t, logs, msgForwarding, 0)
+	wantRCode(t, m, "example.org", dnsmessage.RCodeRefused)
+	if got := fake.count(); got != 0 {
+		t.Errorf("the resolver received %d queries, want none", got)
+	}
+}
+
+func TestManager_HandleForwardingRemoved(t *testing.T) {
+	t.Run("mesh zones left", func(t *testing.T) {
+		reg := &fakeRegistrar{}
+		m, logs, _ := startForwardingManager(t, reg)
+		ctx := context.Background()
+
+		m.Handle(ctx, snapshot(withForwarding(exampleBlock(), corpZone(), fwdResolver)))
+		wantAddr(t, m, "host.corp.example.com", fwdAnswer)
+		if got := reg.recorded()[0].reg; !got.DefaultRoute || !slices.Contains(got.RoutingDomains, "corp.example.com") {
+			t.Errorf("Apply(%+v), want corp.example.com among the routing domains and DefaultRoute", got)
+		}
+
+		m.Handle(ctx, snapshot(withForwarding(exampleBlock(), nil)))
+
+		wantMethods(t, reg, "Apply", "Apply")
+		want := Registration{
+			Interface:      testIface,
+			Server:         m.Addr(),
+			SearchDomain:   "openstack.lab.internal",
+			RoutingDomains: exampleDomains,
+		}
+		if got := reg.recorded()[1].reg; !got.Equal(want) {
+			t.Errorf("second Apply(%+v), want Apply(%+v)", got, want)
+		}
+		wantRCode(t, m, "host.corp.example.com", dnsmessage.RCodeRefused)
+		wantRCode(t, m, "example.org", dnsmessage.RCodeRefused)
+		wantCount(t, logs, msgForwarding, 2)
+		wantLastLine(t, logs, msgForwarding, map[string]string{"forward_zones": "0", "catch_all": "0"})
+		wantLastLine(t, logs, msgRegistered, map[string]string{"default_route": "false"})
+	})
+
+	t.Run("no mesh zone left", func(t *testing.T) {
+		reg := &fakeRegistrar{}
+		m, _, _ := startForwardingManager(t, reg)
+		ctx := context.Background()
+
+		m.Handle(ctx, snapshot(withForwarding(emptyBlock(), corpZone())))
+		wantMethods(t, reg, "Apply")
+		if got, want := reg.recorded()[0].reg.RoutingDomains, []string{"corp.example.com"}; !slices.Equal(got, want) {
+			t.Errorf("Apply with routing domains %q, want %q", got, want)
+		}
+		wantAddr(t, m, "host.corp.example.com", fwdAnswer)
+
+		m.Handle(ctx, snapshot(withForwarding(emptyBlock(), nil)))
+		wantMethods(t, reg, "Apply", "Revert")
+		wantRCode(t, m, "host.corp.example.com", dnsmessage.RCodeRefused)
+	})
+}
+
+func TestManager_MeshZoneShadowsKeptForwardZone(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs, fake := startForwardingManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), corpZone())))
+	wantAddr(t, m, "host.corp.example.com", fwdAnswer)
+	asked := fake.count()
+
+	// The next block makes corp.example.com a mesh zone and says nothing
+	// about forwarding.
+	block := exampleBlock()
+	block.Zones = append(block.Zones, "corp.example.com")
+	block.Hosts = append(block.Hosts, api.NodeStateDNSHost{NodeID: "n-corp", FQDN: "host.corp.example.com", MeshIP: "10.42.0.77"})
+	m.Handle(ctx, snapshot(block))
+
+	wantAddr(t, m, "host.corp.example.com", "10.42.0.77")
+	if got := fake.count(); got != asked {
+		t.Errorf("the resolver received %d more queries, want none", got-asked)
+	}
+	wantLine(t, logs, slog.LevelWarn, msgSkipped, map[string]string{"count": "1"})
+	got, _ := logs.find(msgSkipped)[0].attrs["skipped"].Any().([]string)
+	want := []string{`forward zone "corp.example.com" is shadowed by the mesh zone "corp.example.com", which answers its names`}
+	if !slices.Equal(got, want) {
+		t.Errorf("%q has skipped=%q, want %q", msgSkipped, got, want)
+	}
+	wantCount(t, logs, msgNoMember, 1)
+	wantLastLine(t, logs, msgForwarding, map[string]string{"forward_zones": "0", "catch_all": "0"})
+	// corp.example.com is a mesh zone now, listed with the others and no
+	// longer as a forward zone after them.
+	wantMethods(t, reg, "Apply", "Apply")
+	if got, want := reg.recorded()[1].reg.RoutingDomains, []string{"corp.example.com", "edge.example.com", "lab.internal", "42.10.in-addr.arpa"}; !slices.Equal(got, want) {
+		t.Errorf("second Apply with routing domains %q, want %q", got, want)
+	}
+}
+
+// The sentences of both builds share the one line, the records' first.
+func TestManager_LogsSkippedForwarding(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs := newTestManager(t, reg)
+	block := withForwarding(exampleBlock(), []api.NodeStateDNSForwardZone{
+		fwdZone("corp.example.com", fwdResolver, "127.0.0.53"),
+	}, "not-an-ip")
+	block.Zones = append(block.Zones, "localhost")
+
+	m.Handle(context.Background(), snapshot(block))
+
+	wantLine(t, logs, slog.LevelWarn, msgSkipped, map[string]string{"count": "3"})
+	got, _ := logs.find(msgSkipped)[0].attrs["skipped"].Any().([]string)
+	want := []string{
+		`zone "localhost" is localhost itself, which the contract rules out`,
+		`resolver "127.0.0.53" of forward zone "corp.example.com" is not an address plexd forwards to`,
+		`resolver "not-an-ip" of the catch-all is not an IP address`,
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("%q has skipped=%q, want %q", msgSkipped, got, want)
+	}
+	wantLine(t, logs, slog.LevelInfo, msgForwarding, map[string]string{"forward_zones": "1", "catch_all": "0"})
+}
+
+func TestManager_FirstBlockWithoutForwarding(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs, _ := startForwardingManager(t, reg)
+	ctx := context.Background()
+
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), nil)))
+
+	wantCount(t, logs, msgForwarding, 0)
+	wantLine(t, logs, slog.LevelInfo, msgRegistered, map[string]string{"default_route": "false"})
+
+	// A catch-all makes the link the default route.
+	m.Handle(ctx, snapshot(withForwarding(exampleBlock(), nil, fwdResolver)))
+	wantMethods(t, reg, "Apply", "Apply")
+	if got := reg.recorded()[1].reg; !got.DefaultRoute || !slices.Equal(got.RoutingDomains, exampleDomains) {
+		t.Errorf("second Apply(%+v), want DefaultRoute and the mesh domains only", got)
+	}
+	wantLastLine(t, logs, msgRegistered, map[string]string{"default_route": "true"})
+	wantLine(t, logs, slog.LevelInfo, msgForwarding, map[string]string{"forward_zones": "0", "catch_all": "1"})
+}
+
+func TestManager_ApplyFailsWithCatchAll(t *testing.T) {
+	denied := errors.New("meshdns: resolved: SetLinkDomains: org.freedesktop.DBus.Error.AccessDenied: access denied")
+	reg := &fakeRegistrar{applyErr: denied}
+	m, logs, fake := startForwardingManager(t, reg)
+	ctx := context.Background()
+	block := withForwarding(exampleBlock(), nil, fwdResolver)
+
+	m.Handle(ctx, snapshot(block))
+
+	wantMethods(t, reg, "Apply")
+	if !reg.recorded()[0].reg.DefaultRoute {
+		t.Errorf("Apply(%+v), want DefaultRoute", reg.recorded()[0].reg)
+	}
+	wantLine(t, logs, slog.LevelWarn, msgFailed, map[string]string{"error": denied.Error()})
+	// The resolver forwards meanwhile.
+	wantAddr(t, m, "example.org", fwdAnswer)
+	if got := fake.count(); got != 1 {
+		t.Errorf("the resolver received %d queries, want 1", got)
+	}
+
+	reg.setApplyErr(nil)
+	m.Handle(ctx, snapshot(block))
+	m.Handle(ctx, snapshot(block))
+
+	wantMethods(t, reg, "Apply", "Apply")
+	if !reg.recorded()[1].reg.DefaultRoute {
+		t.Errorf("second Apply(%+v), want DefaultRoute", reg.recorded()[1].reg)
+	}
+	wantLine(t, logs, slog.LevelInfo, msgRegistered, map[string]string{"default_route": "true"})
+	wantCount(t, logs, msgForwarding, 1)
 }
