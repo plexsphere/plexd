@@ -460,8 +460,13 @@ func newStateFixture() api.NodeStateSnapshot {
 		// its Domain's default domain above it, so the agent registers
 		// app.e2e.internal as its search domain and routes ~e2e.internal,
 		// which covers it. The one reverse zone covers the Domain's
-		// 10.99.0.0/24 and nothing wider. Hosts are ordered by fqdn, as the
-		// control plane serves them.
+		// 10.99.0.0/24 and nothing wider. Hosts are ordered by fqdn, and
+		// records by fqdn, then type, as the control plane serves them. The
+		// records hold one of each type: two A records and an AAAA at one
+		// name, an SRV and an MX whose targets are that name and a name
+		// outside the mesh, a TXT of two strings, a CNAME to a peer and one
+		// to a name outside the mesh. Their addresses come from the
+		// documentation ranges, so nothing answers them.
 		DNS: &api.NodeStateDNS{
 			SearchDomain: "app.e2e.internal",
 			Zones:        []string{"app.e2e.internal", "e2e.internal"},
@@ -469,6 +474,16 @@ func newStateFixture() api.NodeStateSnapshot {
 				{NodeID: mockNodeID, FQDN: "node-1.app.e2e.internal", MeshIP: "10.99.0.1"},
 				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FQDN: "peer-1.app.e2e.internal", MeshIP: "10.99.0.2"},
 				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", FQDN: "peer-2.app.e2e.internal", MeshIP: "10.99.0.3"},
+			},
+			Records: []api.NodeStateDNSRecord{
+				{FQDN: "_db._tcp.app.e2e.internal", Type: "SRV", Priority: new(0), Weight: new(5), Port: new(5432), Target: "db.e2e.internal"},
+				{FQDN: "alias.app.e2e.internal", Type: "CNAME", Target: "peer-2.app.e2e.internal"},
+				{FQDN: "db.e2e.internal", Type: "A", Address: "192.0.2.10"},
+				{FQDN: "db.e2e.internal", Type: "A", Address: "192.0.2.11"},
+				{FQDN: "db.e2e.internal", Type: "AAAA", Address: "2001:db8::10"},
+				{FQDN: "e2e.internal", Type: "MX", Priority: new(10), Target: "mail.example.com"},
+				{FQDN: "e2e.internal", Type: "TXT", Text: []string{"v=e2e", "owner=plexd"}},
+				{FQDN: "ext.e2e.internal", Type: "CNAME", Target: "ext.example.com"},
 			},
 			ReverseZones: []string{"0.99.10.in-addr.arpa"},
 		},
