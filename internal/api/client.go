@@ -36,6 +36,10 @@ type ControlPlane struct {
 	version    string
 	logger     *slog.Logger
 
+	// dialer makes the transport's connections and falls back to the last
+	// address of the control plane's name when the name stops resolving.
+	dialer *fallbackDialer
+
 	mu        sync.RWMutex
 	authToken string
 
@@ -51,14 +55,15 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 		return nil, err
 	}
 
+	dialer := newFallbackDialer((&net.Dialer{
+		Timeout: cfg.ConnectTimeout,
+	}).DialContext, logger)
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
 		},
-		DialContext: (&net.Dialer{
-			Timeout: cfg.ConnectTimeout,
-		}).DialContext,
+		DialContext:        dialer.DialContext,
 		DisableCompression: true,
 	}
 
@@ -76,6 +81,7 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		version:    version,
 		logger:     logger,
+		dialer:     dialer,
 		authToken:  "",
 	}, nil
 }
