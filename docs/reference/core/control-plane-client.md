@@ -360,13 +360,13 @@ Manages SSE reconnection with exponential backoff and polling fallback.
 | Error Type                                | Action                                          |
 |-------------------------------------------|-------------------------------------------------|
 | Network / 5xx                             | `RetryTransient` — exponential backoff          |
-| 401 Unauthorized                          | `RetryAuth` — invoke callback, stop             |
+| 401 Unauthorized                          | `RetryAuth` — exponential backoff               |
 | 429 Rate Limited                          | `RespectServer` — use Retry-After header        |
 | 403 / 404                                 | `PermanentFailure` — stop reconnection          |
 | 501 `signed_event_bus_not_provisioned`    | `RetryDescoped` — switch to pull-only delivery  |
-| `ErrCredentialRefused`                    | `RetryAuth` — invoke callback, stop             |
+| `ErrCredentialRefused`                    | `RetryAuth` — exponential backoff               |
 
-`ErrCredentialRefused` is classified ahead of the check for an `*APIError`, which would otherwise read it as a transient network error. It stands for the `401` the heartbeat already saw, so the stream stops on it as on a `401` instead of backing off into the polling fallback.
+`ErrCredentialRefused` is classified ahead of the check for an `*APIError`, which would otherwise read it as a transient network error. It stands for the `401` the heartbeat already saw. Registration stops on `RetryAuth`, while the reconnect engine backs off on it exactly as on `RetryTransient`, polling fallback included: a `401` does not always mean the credential is gone, since a control plane whose credential store is briefly unavailable refuses every node at once. Each backoff step after a `401` logs a Warn `SSE credential refused, backing off`. While the heartbeat is parked (see [Credential Park](heartbeat-service.md#credential-park)), the gate refuses every connect and every poll before any request, so the stream sends nothing; the same line and a refused poll log at Debug then. The stream reconnects at its next attempt once the credential is accepted, at most 75s later while backing off and 60s later in the polling fallback. Only a 403 or 404 ends it.
 
 A 501 carrying `signed_event_bus_not_provisioned` is classified ahead of the generic 5xx match: it is a durable descope of the event stream, not a transient error, so it is answered by pull-only delivery rather than backoff. A 501 with any other code, a 503 `event_stream_unavailable`, and network errors stay on the transient path.
 
@@ -380,7 +380,7 @@ A 501 carrying `signed_event_bus_not_provisioned` is classified ahead of the gen
 | `pull_only`        | The event stream is descoped (`RetryDescoped`). The engine stops polling entirely; the reconciler's own loop is the delivery channel, and SSE is re-probed once per `SSEReprobeInterval` (default 10m). |
 | `degraded_polling` | The legacy transient fallback: after 5 minutes of failing SSE, the engine polls state every 60s while re-probing SSE. |
 
-On a descope the engine enters `pull_only` immediately, with no backoff and no 5-minute polling-fallback window. A successful re-probe returns to `streaming` and resets backoff. During pull-only re-probes, auth failures and 403/404 still propagate as permanent; any other error keeps the engine in pull-only at the re-probe cadence.
+On a descope the engine enters `pull_only` immediately, with no backoff and no 5-minute polling-fallback window. A successful re-probe returns to `streaming` and resets backoff. During pull-only re-probes, 403/404 still propagate as permanent; any other error, a 401 included, keeps the engine in pull-only at the re-probe cadence.
 
 ### Reconnect-Triggered Pull and Cursor Reset
 
@@ -393,7 +393,7 @@ stateDiagram-v2
     [*] --> Disconnected
     Disconnected --> Connecting
     Connecting --> Connected
-    Connecting --> Backoff : transient error
+    Connecting --> Backoff : transient error or 401
     Connecting --> PullOnly : 501 descope
     Connected --> Connecting : connection dropped
     Backoff --> Connecting : delay elapsed
