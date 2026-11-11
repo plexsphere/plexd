@@ -107,8 +107,8 @@ func TestReadyz_Transitions(t *testing.T) {
 		},
 		{
 			// The reconnect engine returns without a mode transition on a
-			// permanent or auth failure, so streaming stays the last recorded
-			// mode while no events arrive at all.
+			// permanent failure (403, 404), so streaming stays the last
+			// recorded mode while no events arrive at all.
 			name:       "delivery stops for good while the mode still reads streaming",
 			transition: srv.SetDeliveryStopped,
 			wantStatus: http.StatusServiceUnavailable,
@@ -269,10 +269,12 @@ func TestReadyz_SubsystemStopped(t *testing.T) {
 }
 
 // TestReadyz_CredentialRefused guards the readiness reason for a node whose
-// credential the control plane refuses. The event stream stops on the same
-// refusal, so the reason has to win over "event delivery stopped", which would
-// otherwise hide the cause; and unlike the delivery stop it clears again once a
-// heartbeat is accepted.
+// credential the control plane refuses. The event stream fails on the same
+// refusal and reports degraded delivery once the polling-fallback window
+// passes, so the reason has to win over "event delivery degraded", and over
+// "event delivery stopped" when a 403 or 404 ended the stream, either of which
+// would otherwise hide the cause. Unlike the delivery stop it clears again once
+// a heartbeat is accepted.
 func TestReadyz_CredentialRefused(t *testing.T) {
 	srv := NewServer(Config{}, testLogger())
 	h := srv.Handler()
@@ -299,7 +301,30 @@ func TestReadyz_CredentialRefused(t *testing.T) {
 			wantBody:   "ok\n",
 		},
 		{
-			name: "credential refused while event delivery stops on the same refusal",
+			// A park that outlasts the polling-fallback window: the stream
+			// keeps retrying behind the gate in degraded polling.
+			name: "credential refused while event delivery is degraded",
+			transition: func() {
+				srv.SetCredentialRefused(true)
+				srv.SetDeliveryMode(api.DeliveryModeDegradedPolling)
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: node credential refused\n",
+		},
+		{
+			name:       "credential accepted again while event delivery is degraded",
+			transition: func() { srv.SetCredentialRefused(false) },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: event delivery degraded\n",
+		},
+		{
+			name:       "event stream reconnected",
+			transition: func() { srv.SetDeliveryMode(api.DeliveryModeStreaming) },
+			wantStatus: http.StatusOK,
+			wantBody:   "ok\n",
+		},
+		{
+			name: "credential refused while event delivery is stopped",
 			transition: func() {
 				srv.SetCredentialRefused(true)
 				srv.SetDeliveryStopped()
@@ -308,8 +333,8 @@ func TestReadyz_CredentialRefused(t *testing.T) {
 			wantBody:   "not ready: node credential refused\n",
 		},
 		{
-			// The event stream is not restarted after a resume, so the delivery
-			// stop outlives the refusal.
+			// A 403 or 404 ends the stream for good, so the delivery stop
+			// outlives the refusal.
 			name:       "credential accepted again after event delivery stopped",
 			transition: func() { srv.SetCredentialRefused(false) },
 			wantStatus: http.StatusServiceUnavailable,
