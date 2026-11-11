@@ -183,7 +183,7 @@ func (s *Server) SetDeliveryMode(m api.DeliveryMode) {
 //
 // The delivery mode cannot express this on its own: the reconnect engine fires
 // its mode-change callback only on an actual transition, and it returns without
-// one on a permanent failure or a rejected node secret. The last recorded mode
+// one on a permanent failure (403, 404). The last recorded mode
 // then stays whatever it was while no events arrive at all, so readiness needs
 // a separate signal for "the delivery goroutine is gone".
 func (s *Server) SetDeliveryStopped() {
@@ -252,8 +252,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // still unmet: an unregistered node has no data plane to bring up yet, and a
 // node without a data plane is not serving regardless of how its event stream
 // is doing. A refused credential comes before event delivery because the event
-// stream stops on the same refusal, and "event delivery stopped" would hide the
-// cause.
+// stream fails on the same refusal and, once the polling-fallback window
+// passes, reports degraded delivery, which would hide the cause.
 func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	registered, dataPlaneReady := s.registered, s.dataPlaneReady
