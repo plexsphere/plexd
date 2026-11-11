@@ -127,13 +127,13 @@ At the default 30s interval the agent parks on the third refused heartbeat, abou
 
 ### Resume and Recovery
 
-A probe answered `200` unparks the service: it calls `onCredentialRefused(false)`, logs one Info line and returns to `heartbeat.interval`. The `reconcile` and `rotate_keys` flags of that response are handled as on any accepted heartbeat. Every other loop resumes on its next cycle without a restart. The SSE stream is the exception: once a connect is refused, by a `401` or by the gate, it stops for good, and readiness answers `not ready: event delivery stopped` until a restart. The reconciler's pull keeps the node converged meanwhile.
+A probe answered `200` unparks the service: it calls `onCredentialRefused(false)`, logs one Info line and returns to `heartbeat.interval`. The `reconcile` and `rotate_keys` flags of that response are handled as on any accepted heartbeat. Every other loop resumes on its next cycle without a restart, the SSE stream included: while parked it retries behind the gate, which refuses each connect before any request, and it reconnects at its next attempt after the resume, within 75s while it backs off, or within 60s once it is in the polling fallback (see [Failure Classification](control-plane-client.md#failure-classification)).
 
 A control-plane fault that refuses every NSK parks the agent the same way, and the next accepted probe clears it with no operator action. The credential of a removed Node is not accepted again. To enrol the machine again, run `plexd deregister`, provide a fresh bootstrap token, and restart plexd (see [Troubleshooting](../../guide/troubleshooting.md#node-removed-from-the-control-plane)).
 
 ### Quiet Failure Logs
 
-While parked, the loops that call the control plane on every cycle fail locally on every cycle. These lines then drop from Warn to Debug, with the same message and attributes, so the park line is the one an operator sees:
+While parked, the loops that call the control plane on every cycle fail locally on every cycle. These lines then drop to Debug, from Warn or, for `poll failed`, from Error, with the same message and attributes, so the park line is the one an operator sees:
 
 | Message | Source |
 |---------|--------|
@@ -150,8 +150,10 @@ While parked, the loops that call the control plane on every cycle fail locally 
 | `buffer overflow, dropping oldest entries` | `internal/logfwd` and `internal/auditfwd`: the forwarder buffer, which repeats the line on every collect cycle once the refused reports have filled it |
 | `using cached credential` | `internal/metrics`, `internal/logfwd` and `internal/auditfwd`: the local endpoint's credential fetch. A decrypt failure still logs at Warn |
 | `report delete failed`, `report put failed` | `internal/nodeapi`: the report sync |
+| `SSE credential refused, backing off` | `internal/api`: the event stream's reconnect engine, which keeps retrying behind the gate on its backoff. A `401` from the control plane logs it at Warn |
+| `poll failed` | `internal/api`: the event stream's polling fallback, which the engine enters after 5 minutes of failed connects |
 
-A failure line drops to Debug only when its error is `api.ErrCredentialRefused`, and the overflow line only while the forwarder's last report failed that way, which happens only while the heartbeat is parked. Every other error at these sites, and every other overflow, keeps its Warn. Nothing else changes: the loops keep their buffers, their dirty report keys and their cadence, and deliver what those buffers still hold on resume. The log and audit forwarders and the metrics manager hold at most twice their batch size and drop the oldest entries beyond that, so a long park leaves only the newest ones to deliver.
+A failure line drops to Debug only when its error is `api.ErrCredentialRefused`, and the overflow line only while the forwarder's last report failed that way, which happens only while the heartbeat is parked. Every other error at these sites, and every other overflow, keeps its Warn, and `poll failed` its Error. Nothing else changes: the loops keep their buffers, their dirty report keys and their cadence, and deliver what those buffers still hold on resume. The log and audit forwarders and the metrics manager hold at most twice their batch size and drop the oldest entries beyond that, so a long park leaves only the newest ones to deliver.
 
 Every other control-plane call keeps its logging, because none fails on every cycle while parked. Edge-PSK fetches, execution callbacks, session reports and integrity-violation reports (filed when a hook delivered for execution fails its pinned checksum) are started by a state pull, which the gate refuses, so nothing new starts while parked. Work a pull started before the park, such as an open session or a running action, logs a refused callback once per event. A secret request through the local node API is answered `503` and logs `secret fetch failed` at Error, once per request. The key-rotation sweep's `agent: key rotation: reusing the staged rotation key` repeats with each resubmit and stays at Info, because it is not a failure line.
 

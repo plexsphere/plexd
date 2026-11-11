@@ -87,6 +87,8 @@ The SSE stream is the primary channel for real-time updates. An open stream stay
 4. After a successful reconnect, plexd triggers an **immediate reconciliation** to catch any updates that may have been missed during the disconnect window.
 5. If the SSE stream cannot be re-established after 5 minutes, plexd falls back to polling the full state at `reconcile.interval` until the SSE stream recovers.
 
+A reconnect the control plane answers `401` is retried on the same schedule. A `401` does not always mean the credential is gone: a control plane whose credential store is briefly unavailable refuses every node at once. While the heartbeat is parked on the refusal (see [Credential Park](../reference/core/heartbeat-service.md#credential-park)), the retries stay local and send nothing. Once the control plane accepts the credential again, the stream reconnects at its next attempt, without a restart.
+
 ## Shutdown and Deregistration
 
 ### Graceful shutdown
