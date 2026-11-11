@@ -1,11 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -76,38 +80,6 @@ func TestReconnect_JitterDistribution(t *testing.T) {
 		if jittered < low || jittered > high {
 			t.Errorf("jitter(%v) = %v, want in [%v, %v]", base, jittered, low, high)
 		}
-	}
-}
-
-func TestReconnect_401TriggersAuthCallback(t *testing.T) {
-	logger := slog.Default()
-	e := fastEngine(logger)
-
-	var authCalled atomic.Bool
-	e.SetOnAuthFailure(func() {
-		authCalled.Store(true)
-	})
-
-	connectFn := func(ctx context.Context) error {
-		return &APIError{StatusCode: 401, Message: "unauthorized"}
-	}
-	pollFn := func(ctx context.Context) error { return nil }
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	err := e.Run(ctx, connectFn, pollFn)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	if !authCalled.Load() {
-		t.Error("expected onAuthFailure callback to be invoked")
-	}
-
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
-		t.Errorf("expected 401 APIError, got %v", err)
 	}
 }
 
@@ -722,38 +694,9 @@ func TestReconnect_PullOnlyExitOnReconnect(t *testing.T) {
 	}
 }
 
-// TestReconnect_PullOnlyReprobePropagates proves an auth or permanent failure
-// surfaced by a re-probe stops the engine and propagates the error.
+// TestReconnect_PullOnlyReprobePropagates proves a permanent failure surfaced
+// by a re-probe stops the engine and propagates the error.
 func TestReconnect_PullOnlyReprobePropagates(t *testing.T) {
-	t.Run("401 invokes auth callback and returns", func(t *testing.T) {
-		e := fastEngine(discardLogger())
-		e.SetClock(newRecordingClock())
-		e.SetReprobeInterval(15 * time.Millisecond)
-
-		var authCalled atomic.Bool
-		e.SetOnAuthFailure(func() { authCalled.Store(true) })
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		var calls atomic.Int32
-		connectFn := func(context.Context) error {
-			if calls.Add(1) == 1 {
-				return descopedErr()
-			}
-			return &APIError{StatusCode: 401, Message: "unauthorized"}
-		}
-
-		err := e.Run(ctx, connectFn, func(context.Context) error { return nil })
-		if !authCalled.Load() {
-			t.Error("expected onAuthFailure callback to be invoked")
-		}
-		var apiErr *APIError
-		if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
-			t.Errorf("Run error = %v, want 401 APIError", err)
-		}
-	})
-
 	t.Run("403 stops and returns", func(t *testing.T) {
 		e := fastEngine(discardLogger())
 		e.SetClock(newRecordingClock())
@@ -854,7 +797,8 @@ func TestReconnect_NilModeChangeCallback(t *testing.T) {
 
 // A refused credential fails before any request, so it is no *APIError; it
 // must still be treated as the 401 it stands for, wrapped or not, rather than
-// as a transient network error that backs off into the polling fallback.
+// as a transient network error: registration stops on it, and the reconnect
+// engine logs its backoff as a refused credential.
 func TestClassifyError_CredentialRefused(t *testing.T) {
 	for _, err := range []error{ErrCredentialRefused, fmt.Errorf("sse: %w", ErrCredentialRefused)} {
 		if action := ClassifyError(err); action != RetryAuth {
@@ -863,41 +807,330 @@ func TestClassifyError_CredentialRefused(t *testing.T) {
 	}
 }
 
-func TestReconnect_CredentialRefusedStopsWithoutBackoffOrPolling(t *testing.T) {
-	e := fastEngine(discardLogger())
+// refusalEngine builds an engine on the production schedule with no jitter and
+// a recording clock, so a test reads the exact waits a refused credential
+// draws: 1s doubling to 60s, the polling fallback once 5 minutes have failed,
+// and a poll every 60s there.
+func refusalEngine(logger *slog.Logger) (*ReconnectEngine, *recordingClock) {
+	e := NewReconnectEngine(logger)
 	clk := newRecordingClock()
 	e.SetClock(clk)
+	e.jitterFraction = 0
+	e.SetIntervals(time.Second, time.Minute)
+	e.SetPollingFallbackConfig(5*time.Minute, time.Minute)
+	return e, clk
+}
 
-	// The engine must stop on the first refusal: a second attempt or a poll
-	// means it backed off instead, and since the fake clock never blocks it
-	// would spin forever. Cancelling there makes Run return and the test fail.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// newJSONLogger returns a logger that writes every record from Debug up into
+// buf as one JSON object per line, for logRecords to decode.
+func newJSONLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// logRecords decodes the records a newJSONLogger wrote into buf, in order.
+func logRecords(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// countRecords counts the records at level ("DEBUG", "INFO", "WARN", "ERROR")
+// whose message is msg.
+func countRecords(recs []map[string]any, level, msg string) int {
+	n := 0
+	for _, rec := range recs {
+		if rec["level"] == level && rec["msg"] == msg {
+			n++
+		}
+	}
+	return n
+}
+
+// The incident this guards against: a control plane whose credential store is
+// briefly unavailable answers the stream's reconnect 401. The stream used to
+// stop for the life of the process; it now backs off on the transient
+// schedule and returns once the credential is accepted again.
+func TestReconnect_401BacksOffAndReconnects(t *testing.T) {
+	var buf bytes.Buffer
+	e, clk := refusalEngine(newJSONLogger(&buf))
+	var rec modeRecorder
+	e.SetOnModeChange(rec.record)
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var connectCalls, pollCalls atomic.Int32
-	connectFn := func(ctx context.Context) error {
-		if connectCalls.Add(1) > 1 {
+	var connects, polls atomic.Int32
+	connectFn := func(context.Context) error {
+		switch n := connects.Add(1); {
+		case n <= 4:
+			return &APIError{StatusCode: 401, Code: "nsk_invalid"}
+		case n == 5:
+			// The stream reached HTTP 200, then closed cleanly.
+			e.notifyConnected()
+			return nil
+		default:
 			cancel()
+			return nil
 		}
-		return ErrCredentialRefused
 	}
-	pollFn := func(ctx context.Context) error {
-		pollCalls.Add(1)
+	pollFn := func(context.Context) error {
+		polls.Add(1)
+		return nil
+	}
+
+	if err := e.Run(ctx, connectFn, pollFn); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context.Canceled", err)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	if got := clk.delays(); !slices.Equal(got, want) {
+		t.Errorf("waits = %v, want %v", got, want)
+	}
+	if n := polls.Load(); n != 0 {
+		t.Errorf("poll calls = %d, want 0", n)
+	}
+	if seq := rec.seq(); len(seq) != 0 {
+		t.Errorf("mode transitions = %v, want none", seq)
+	}
+
+	recs := logRecords(t, &buf)
+	if n := countRecords(recs, "WARN", "SSE credential refused, backing off"); n != 4 {
+		t.Errorf("%d Warn records %q, want 4", n, "SSE credential refused, backing off")
+	}
+	for _, r := range recs {
+		if r["msg"] == "SSE credential refused, backing off" {
+			if _, ok := r["error"]; !ok {
+				t.Errorf("record %v carries no error", r)
+			}
+			if _, ok := r["delay"]; !ok {
+				t.Errorf("record %v carries no delay", r)
+			}
+		}
+		if r["msg"] == "authentication failure" {
+			t.Errorf("record %v: the stream no longer stops on a refused credential", r)
+		}
+	}
+}
+
+// runRefusedThroughFallback answers connects 1 to 13 with refused and every
+// poll with pollErr, reconnects on connect 14 and cancels on connect 15. Ten
+// backoff waits (1s doubling to 60s, 303s in all) carry the engine past the
+// 5-minute window into the polling fallback, which retries SSE twice more,
+// refused, before it reconnects. It checks the waits, the polls, the mode
+// transitions and the result, and returns the log records.
+func runRefusedThroughFallback(t *testing.T, refused, pollErr error) []map[string]any {
+	t.Helper()
+	var buf bytes.Buffer
+	e, clk := refusalEngine(newJSONLogger(&buf))
+	var rec modeRecorder
+	e.SetOnModeChange(rec.record)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connects, polls atomic.Int32
+	connectFn := func(context.Context) error {
+		switch n := connects.Add(1); {
+		case n <= 13:
+			return refused
+		case n == 14:
+			return nil
+		default:
+			cancel()
+			return nil
+		}
+	}
+	pollFn := func(context.Context) error {
+		polls.Add(1)
+		return pollErr
+	}
+
+	if err := e.Run(ctx, connectFn, pollFn); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context.Canceled", err)
+	}
+	s, m := time.Second, time.Minute
+	want := []time.Duration{s, 2 * s, 4 * s, 8 * s, 16 * s, 32 * s, m, m, m, m, m, m, m}
+	if got := clk.delays(); !slices.Equal(got, want) {
+		t.Errorf("waits = %v, want %v", got, want)
+	}
+	if n := polls.Load(); n != 3 {
+		t.Errorf("poll calls = %d, want 3", n)
+	}
+	if seq := rec.seq(); !slices.Equal(seq, []DeliveryMode{DeliveryModeDegradedPolling, DeliveryModeStreaming}) {
+		t.Errorf("mode transitions = %v, want [degraded_polling streaming]", seq)
+	}
+	return logRecords(t, &buf)
+}
+
+// A 401 that outlasts the polling-fallback window degrades delivery like any
+// transient failure, and the stream still returns once it is accepted.
+func TestReconnect_401ThroughPollingFallback(t *testing.T) {
+	recs := runRefusedThroughFallback(t, &APIError{StatusCode: 401}, nil)
+	if n := countRecords(recs, "WARN", "SSE credential refused, backing off"); n != 10 {
+		t.Errorf("%d Warn records %q, want 10", n, "SSE credential refused, backing off")
+	}
+}
+
+// While the heartbeat is parked, the client's gate refuses every connect and
+// every poll before any request. The stream keeps retrying behind it and logs
+// nothing above Debug but the one transition into the fallback, so a park of
+// hours does not fill the log.
+func TestReconnect_CredentialRefusedRetriesQuietlyBehindTheGate(t *testing.T) {
+	recs := runRefusedThroughFallback(t, ErrCredentialRefused, ErrCredentialRefused)
+	if n := countRecords(recs, "DEBUG", "SSE credential refused, backing off"); n != 10 {
+		t.Errorf("%d Debug records %q, want 10", n, "SSE credential refused, backing off")
+	}
+	if n := countRecords(recs, "DEBUG", "poll failed"); n != 3 {
+		t.Errorf("%d Debug records %q, want 3", n, "poll failed")
+	}
+	var loud []map[string]any
+	for _, r := range recs {
+		if r["level"] == "WARN" || r["level"] == "ERROR" {
+			loud = append(loud, r)
+		}
+	}
+	if len(loud) != 1 || loud[0]["msg"] != "SSE unavailable, falling back to polling" {
+		t.Errorf("records at Warn or above = %v, want only %q", loud, "SSE unavailable, falling back to polling")
+	}
+}
+
+// Only the gate's refusal quiets a failed poll: any other poll error stays an
+// Error.
+func TestReconnect_PollFailureStaysAnErrorUnlessRefused(t *testing.T) {
+	recs := runRefusedThroughFallback(t, ErrCredentialRefused, errors.New("boom"))
+	if n := countRecords(recs, "ERROR", "poll failed"); n != 3 {
+		t.Errorf("%d Error records %q, want 3", n, "poll failed")
+	}
+}
+
+func TestReconnect_TransientErrorKeepsItsWarn(t *testing.T) {
+	var buf bytes.Buffer
+	e, _ := refusalEngine(newJSONLogger(&buf))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connects atomic.Int32
+	connectFn := func(context.Context) error {
+		if connects.Add(1) <= 3 {
+			return errors.New("connection refused")
+		}
 		cancel()
 		return nil
 	}
 
-	err := e.Run(ctx, connectFn, pollFn)
-	if !errors.Is(err, ErrCredentialRefused) {
-		t.Fatalf("Run() = %v, want ErrCredentialRefused", err)
+	if err := e.Run(ctx, connectFn, func(context.Context) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context.Canceled", err)
 	}
-	if n := connectCalls.Load(); n != 1 {
-		t.Errorf("connect calls = %d, want 1", n)
+	recs := logRecords(t, &buf)
+	if n := countRecords(recs, "WARN", "transient error, backing off"); n != 3 {
+		t.Errorf("%d Warn records %q, want 3", n, "transient error, backing off")
 	}
-	if n := pollCalls.Load(); n != 0 {
-		t.Errorf("poll calls = %d, want 0", n)
+	for _, r := range recs {
+		if msg, _ := r["msg"].(string); strings.Contains(msg, "credential refused") {
+			t.Errorf("record %v names a refused credential for a network error", r)
+		}
 	}
-	if d := clk.delays(); len(d) != 0 {
-		t.Errorf("engine waited %v, want no wait", d)
+}
+
+// A refused re-probe in pull-only delivery is one more failed re-probe: the
+// engine stays in pull-only at the re-probe cadence.
+func TestReconnect_PullOnlyReprobeRefusedStaysPullOnly(t *testing.T) {
+	var buf bytes.Buffer
+	e, clk := refusalEngine(newJSONLogger(&buf))
+	e.SetReprobeInterval(15 * time.Millisecond)
+	var rec modeRecorder
+	e.SetOnModeChange(rec.record)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connects atomic.Int32
+	connectFn := func(context.Context) error {
+		switch connects.Add(1) {
+		case 1:
+			return descopedErr()
+		case 2:
+			return &APIError{StatusCode: 401}
+		case 3:
+			return ErrCredentialRefused
+		case 4:
+			return descopedErr()
+		default:
+			cancel()
+			return descopedErr()
+		}
+	}
+
+	if err := e.Run(ctx, connectFn, func(context.Context) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context.Canceled", err)
+	}
+	if seq := rec.seq(); !slices.Equal(seq, []DeliveryMode{DeliveryModePullOnly}) {
+		t.Errorf("mode transitions = %v, want [pull_only]", seq)
+	}
+	delays := clk.delays()
+	if len(delays) != 4 {
+		t.Errorf("waits = %v, want four re-probe waits", delays)
+	}
+	for _, d := range delays {
+		if d != 15*time.Millisecond {
+			t.Errorf("waits = %v, want every one 15ms", delays)
+			break
+		}
+	}
+
+	recs := logRecords(t, &buf)
+	entered := false
+	for _, r := range recs {
+		if r["msg"] == "SSE events endpoint descoped, entering pull-only delivery; the reconciler loop owns the pull" {
+			entered = true
+			continue
+		}
+		if entered && r["level"] != "DEBUG" {
+			t.Errorf("record %v after entering pull-only, want nothing above Debug", r)
+		}
+	}
+	if !entered {
+		t.Error("no record of entering pull-only delivery")
+	}
+}
+
+// A refused credential no longer ends the run, but a permanent failure still
+// does: a 403 on an SSE retry from the polling fallback ends it.
+func TestReconnect_PollingFallbackStopsOnPermanentFailure(t *testing.T) {
+	e, _ := refusalEngine(discardLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connects atomic.Int32
+	connectFn := func(context.Context) error {
+		n := connects.Add(1)
+		if n <= 11 {
+			return errors.New("connection refused")
+		}
+		if n > 12 {
+			// The engine kept going past the 403; end the run so the
+			// assertion below reports it instead of the test hanging.
+			cancel()
+		}
+		return &APIError{StatusCode: 403}
+	}
+
+	err := e.Run(ctx, connectFn, func(context.Context) error { return nil })
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("Run() = %v, want ErrForbidden", err)
+	}
+	if n := connects.Load(); n != 12 {
+		t.Errorf("connect calls = %d, want 12: the 403 on the first SSE retry from the fallback ends the run", n)
 	}
 }

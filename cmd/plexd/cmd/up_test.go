@@ -2042,6 +2042,11 @@ func assertEveryCallPresentsEnvelope(t *testing.T, cp *authRecordingControlPlane
 // no credential, so it answers 403 token_consumed instead, as the control plane
 // does for the spent token of a removed Node. It counts the requests on every
 // path.
+//
+// Once accepted, the event stream is answered as a real control plane answers
+// it: 200 text/event-stream, held open until the agent hangs up. An empty JSON
+// object would end each stream at once, and the reconnect engine dials again
+// without a wait after a clean close, so the fixture would draw a tight loop.
 type refusingControlPlane struct {
 	mu       sync.Mutex
 	accepted bool
@@ -2067,6 +2072,14 @@ func (cp *refusingControlPlane) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, `{"title":"Forbidden","code":"token_consumed"}`)
+	case accepted && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/events"):
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, ": ok\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
 	case accepted:
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("{}"))
@@ -2220,7 +2233,8 @@ func TestRunUp_PresentsBearerEnvelopeAfterRegistration(t *testing.T) {
 // heartbeats, the whole daemon has to fall silent toward the control plane, with
 // the heartbeat's backed-off probe as the only call left, and plexd status has
 // to say why. An accepted probe resumes the loops on their next cycle, without a
-// restart.
+// restart. The event stream, refused at startup, comes back too: it used to stop
+// on its first 401 for the life of the process.
 func TestRunUp_ParksOnARefusedCredentialAndResumes(t *testing.T) {
 	// Outside a cluster no PlexdHook list runs; an ambient
 	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
@@ -2283,8 +2297,9 @@ reconcile:
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Parked: the gate stops every loop before it sends, so nothing but the
-	// heartbeat's probe reaches the control plane. The window spans two
+	// Parked: the gate stops every loop before it sends, the event stream's
+	// backed-off retries included, so nothing but the heartbeat's probe
+	// reaches the control plane. The window spans two
 	// reconcile cycles, and with the probes backing off from 200ms at most three
 	// of them fall into it.
 	before := cp.counts()
@@ -2305,7 +2320,8 @@ reconcile:
 	// The next probe is accepted, which lifts the mark, and the reconciler's
 	// next cycle pulls state again.
 	cp.accept()
-	deadline = time.Now().Add(5 * time.Second)
+	acceptedAt := time.Now()
+	deadline = acceptedAt.Add(5 * time.Second)
 	for {
 		_, present, err := credential()
 		cleared := err == nil && !present
@@ -2317,6 +2333,24 @@ reconcile:
 			t.Fatalf("5s after the control plane accepted the credential: control_plane_credential cleared = %v and %d state pulls, want it cleared and a pull", cleared, pulls)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The event stream backs off from 1s and retries behind the gate, so it
+	// reconnects at its first attempt after the probe lifted the mark. The
+	// fixture holds an accepted stream open: further dials in a short window
+	// would mean the stream ends and the agent re-dials it in a loop.
+	eventsPath := "/v1/nodes/" + upResumedNodeID + "/events"
+	deadline = acceptedAt.Add(20 * time.Second)
+	for cp.counts()[eventsPath] == parked[eventsPath] {
+		if time.Now().After(deadline) {
+			t.Fatal("20s after the control plane accepted the credential, no event stream was dialled: the stream did not come back")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	streamed := cp.counts()[eventsPath]
+	time.Sleep(2 * time.Second)
+	if n := cp.counts()[eventsPath] - streamed; n > 2 {
+		t.Errorf("%d more event stream dials in the 2s after it reconnected, want at most 2: the accepted stream is held open", n)
 	}
 }
 
