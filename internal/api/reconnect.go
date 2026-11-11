@@ -16,7 +16,10 @@ type FailureAction int
 const (
 	// RetryTransient means use exponential backoff (network errors, 5xx).
 	RetryTransient FailureAction = iota
-	// RetryAuth means invoke OnAuthFailure callback and pause (401).
+	// RetryAuth means the control plane refused the node credential: a 401,
+	// or ErrCredentialRefused from the client's gate. Registration stops on
+	// it; the reconnect engine backs off as on RetryTransient, so the stream
+	// returns once the credential is accepted again.
 	RetryAuth
 	// RespectServer means use the server-provided Retry-After delay (429).
 	RespectServer
@@ -106,9 +109,8 @@ type ReconnectEngine struct {
 	pollingFallback time.Duration // how long before switching to polling
 	pollInterval    time.Duration // how often to poll during fallback
 
-	onAuthFailure func()
-	logger        *slog.Logger
-	clock         Clock
+	logger *slog.Logger
+	clock  Clock
 
 	mu              sync.Mutex
 	currentInterval time.Duration
@@ -133,13 +135,6 @@ func NewReconnectEngine(logger *slog.Logger) *ReconnectEngine {
 		mode:            DeliveryModeStreaming,
 		reprobeInterval: DefaultSSEReprobeInterval,
 	}
-}
-
-// SetOnAuthFailure sets the callback invoked on authentication failures.
-func (r *ReconnectEngine) SetOnAuthFailure(fn func()) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.onAuthFailure = fn
 }
 
 // SetBaseInterval updates the base backoff interval.
@@ -291,13 +286,14 @@ func (r *ReconnectEngine) handleConnectError(ctx context.Context, err error, con
 		r.logger.Error("permanent failure, stopping reconnection", "error", err)
 		return err
 
-	case RetryAuth:
-		return r.handleAuthFailure(err)
-
 	case RespectServer:
 		return r.handleRateLimit(ctx, err)
 
-	case RetryTransient:
+	case RetryTransient, RetryAuth:
+		// A refused credential is not the end of the stream: a control plane
+		// whose credential store is briefly unavailable refuses every node at
+		// once. While the heartbeat has parked on the refusal, the client's
+		// gate fails each attempt locally, so backing off sends nothing.
 		return r.handleTransientError(ctx, err, connectFn, pollFn)
 
 	case RetryDescoped:
@@ -306,18 +302,6 @@ func (r *ReconnectEngine) handleConnectError(ctx context.Context, err error, con
 	default:
 		return err
 	}
-}
-
-// handleAuthFailure invokes the auth failure callback and returns the error.
-func (r *ReconnectEngine) handleAuthFailure(err error) error {
-	r.mu.Lock()
-	fn := r.onAuthFailure
-	r.mu.Unlock()
-	if fn != nil {
-		fn()
-	}
-	r.logger.Error("authentication failure", "error", err)
-	return err
 }
 
 // handleRateLimit waits for the server-specified retry-after delay.
@@ -358,7 +342,7 @@ func (r *ReconnectEngine) handleTransientError(ctx context.Context, err error, c
 
 	// Exponential backoff with jitter.
 	delay := r.jitter(currentInterval)
-	r.logger.Warn("transient error, backing off", "error", err, "delay", delay)
+	r.logBackoff(err, delay)
 
 	if err := r.wait(ctx, delay); err != nil {
 		return err
@@ -366,6 +350,22 @@ func (r *ReconnectEngine) handleTransientError(ctx context.Context, err error, c
 
 	r.incrementInterval()
 	return nil
+}
+
+// logBackoff logs one backoff step. A 401 names the refused credential, so a
+// search for "credential refused" finds the stream beside the heartbeat. A
+// connect the client's gate refused logs the same line at Debug: the heartbeat
+// has parked and logged the cause once, and the stream keeps retrying for as
+// long as the park lasts.
+func (r *ReconnectEngine) logBackoff(err error, delay time.Duration) {
+	switch {
+	case errors.Is(err, ErrCredentialRefused):
+		r.logger.Debug("SSE credential refused, backing off", "error", err, "delay", delay)
+	case errors.Is(err, ErrUnauthorized):
+		r.logger.Warn("SSE credential refused, backing off", "error", err, "delay", delay)
+	default:
+		r.logger.Warn("transient error, backing off", "error", err, "delay", delay)
+	}
 }
 
 // incrementInterval increases the backoff interval for the next retry.
@@ -401,7 +401,8 @@ func (r *ReconnectEngine) wait(ctx context.Context, d time.Duration) error {
 //
 // It returns nil when a re-probe reconnects — the main Run loop then resumes
 // normal streaming — and an error only on context cancellation or a permanent
-// or auth failure surfaced by a re-probe.
+// failure surfaced by a re-probe. A refused credential is one more failed
+// re-probe: the engine stays in pull-only at the re-probe cadence.
 func (r *ReconnectEngine) runPullOnly(ctx context.Context, connectFn ConnectFunc) error {
 	r.logger.Warn("SSE events endpoint descoped, entering pull-only delivery; the reconciler loop owns the pull")
 	r.setMode(DeliveryModePullOnly)
@@ -438,8 +439,6 @@ func (r *ReconnectEngine) runPullOnly(ctx context.Context, connectFn ConnectFunc
 		switch ClassifyError(err) {
 		case RetryDescoped:
 			// Still descoped — stay in pull-only at the re-probe cadence.
-		case RetryAuth:
-			return r.handleAuthFailure(err)
 		case PermanentFailure:
 			r.logger.Error("permanent failure during pull-only re-probe, stopping", "error", err)
 			return err
@@ -470,7 +469,14 @@ func (r *ReconnectEngine) runPollingFallback(ctx context.Context, connectFn Conn
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.logger.Error("poll failed", "error", err)
+			// The gate refuses the poll while the heartbeat is parked, every
+			// poll interval for as long as the park lasts; the heartbeat has
+			// logged the cause once.
+			if errors.Is(err, ErrCredentialRefused) {
+				r.logger.Debug("poll failed", "error", err)
+			} else {
+				r.logger.Error("poll failed", "error", err)
+			}
 		}
 
 		// Wait for poll interval, then try SSE reconnect
@@ -492,11 +498,12 @@ func (r *ReconnectEngine) runPollingFallback(ctx context.Context, connectFn Conn
 			return ctx.Err()
 		}
 
-		// Check if the SSE error is permanent, auth, or a long-term descope.
-		// On a descope, return so the main loop reconnects, draws the 501
-		// again, and enters pull-only delivery via classification.
+		// Check if the SSE error is permanent or a long-term descope. On a
+		// descope, return so the main loop reconnects, draws the 501 again,
+		// and enters pull-only delivery via classification. A refused
+		// credential keeps polling, like a transient error.
 		action := ClassifyError(sseErr)
-		if action == PermanentFailure || action == RetryAuth {
+		if action == PermanentFailure {
 			return sseErr
 		}
 		if action == RetryDescoped {

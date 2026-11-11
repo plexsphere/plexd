@@ -1186,8 +1186,8 @@ func runAgent(ctx context.Context) error {
 			logger.Error("SSE manager stopped", "error", err)
 		}
 		// Start returning means event delivery is over for this process: the
-		// reconnect engine gives up on a permanent failure or a rejected node
-		// secret without ever transitioning the delivery mode, so readiness
+		// reconnect engine gives up only on a permanent failure (403, 404),
+		// without ever transitioning the delivery mode, so readiness
 		// would otherwise keep reporting the last mode while nothing arrives.
 		// The ctx guard keeps an ordinary shutdown from flapping readiness.
 		if healthSrv != nil && ctx.Err() == nil {

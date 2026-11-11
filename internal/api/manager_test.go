@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -616,4 +617,134 @@ func TestManager_ConnectHookFlipsModeToStreaming(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// refusingEventsServer answers GET /v1/nodes/node-1/events 401 with the
+// nsk_invalid problem code for its first refusals requests, then 200 with one
+// node_state_updated event, holding that stream open until the request ends.
+// It counts every request.
+func refusingEventsServer(t *testing.T, refusals int32) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/nodes/node-1/events" {
+			http.NotFound(w, r)
+			return
+		}
+		if requests.Add(1) <= refusals {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"title":"Unauthorized","code":"nsk_invalid"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, makeEnvelopeSSE("node_state_updated", "evt-1"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requests
+}
+
+// startManagerWithHandler starts mgr on node-1 with a node_state_updated
+// handler and returns the channel the handler signals on and the channel
+// Start's result arrives on.
+func startManagerWithHandler(ctx context.Context, mgr *SSEManager) (<-chan struct{}, <-chan error) {
+	handled := make(chan struct{}, 1)
+	mgr.RegisterHandler("node_state_updated", func(context.Context, Envelope) error {
+		select {
+		case handled <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- mgr.Start(ctx, "node-1") }()
+	return handled, done
+}
+
+// A 401 on the stream used to end Start for the life of the process. Two
+// refused connects now back off, and the third delivers its event while Start
+// keeps running.
+func TestManager_RecoversAfter401(t *testing.T) {
+	srv, requests := refusingEventsServer(t, 2)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := NewSSEManager(newManagerTestClient(t, srv.URL), nil, logger)
+	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handled, done := startManagerWithHandler(ctx, mgr)
+
+	select {
+	case <-handled:
+	case err := <-done:
+		t.Fatalf("Start returned %v after %d requests, want it to keep running", err, requests.Load())
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no event delivered within 5s, %d requests", requests.Load())
+	}
+	if n := requests.Load(); n != 3 {
+		t.Errorf("%d requests, want 3: two refused, then the stream", n)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Start() = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return within 5s of the cancel")
+	}
+}
+
+// While the heartbeat is parked, the client's gate refuses the stream before
+// any request. The stream keeps retrying behind it and connects as soon as the
+// gate lifts.
+func TestManager_RecoversWhenTheGateLifts(t *testing.T) {
+	srv, requests := refusingEventsServer(t, 0)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := newManagerTestClient(t, srv.URL)
+	client.SetCredentialRefused(true)
+	mgr := NewSSEManager(client, nil, logger)
+	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handled, done := startManagerWithHandler(ctx, mgr)
+
+	select {
+	case err := <-done:
+		t.Fatalf("Start returned %v behind the gate, want it to keep retrying", err)
+	case <-handled:
+		t.Fatal("an event arrived through a closed gate")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("%d requests reached the server behind the gate, want 0", n)
+	}
+
+	client.SetCredentialRefused(false)
+	select {
+	case <-handled:
+	case err := <-done:
+		t.Fatalf("Start returned %v after the gate lifted", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no event delivered within 5s of the gate lifting")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Start() = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return within 5s of the cancel")
+	}
 }
