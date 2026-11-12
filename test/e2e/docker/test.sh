@@ -31,9 +31,9 @@
 #     forwarded to the mock's DNS stub, and kept by a null dns block
 #   - Policy enforcement on the mesh interface: a WireGuard peer in the meshpeer
 #     container reaches the ports the served policy allows and no other, plexd's
-#     own connection to it needs no rule, a revision with a legacy deny rule is
-#     rejected, and mesh DNS inside the container still answers under an empty
-#     policy
+#     container reaches meshpeer only where a rule allows it, UDP to the relay
+#     probe port aside, a revision with a legacy deny rule is rejected, and mesh
+#     DNS inside the container still answers under an empty policy
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -5192,25 +5192,33 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # for that peer, and plexd's current public key as its one peer. The phase
 # splices meshpeer's key and address into that peer of the served snapshot and
 # waits for a handshake. It then serves policies of its own, each under a fresh
-# revision id and fingerprint, and checks which connections the chain on
-# plexd's mesh interface lets through:
+# revision id and fingerprint, and checks which traffic the chains on plexd's
+# mesh interface let through in each direction:
 #
-#   A  tcp 7001 over IPv4 and over IPv6, and a logged udp 7004 rule
+#   A  tcp 7001 to plexd over IPv4 and over IPv6, a logged udp 7004 rule, and
+#      tcp 7003 from plexd to meshpeer
 #   B  A's rules, each carrying the legacy "action": "allow"
 #   C  one rule carrying "action": "deny", which rejects the revision
 #   D  A without its 7001 rules
 #   E  no rules
 #
 # meshpeer probes plexd with nc -z, and every probe meets a listener of its
-# own in plexd's container, so a probe that fails was dropped by the chain, not
-# refused at a closed port. plexd's own connection to a listener in meshpeer
-# needs no rule: its replies belong to a connection plexd opened. A query from
-# inside plexd's container reaches the mesh resolver over lo, which the chain
-# does not match, so mesh DNS answers even under E. The mesh carries IPv4 only,
-# so A's IPv6 rule proves that plexd applies such a rule, not that it matches
-# IPv6 traffic. The phase runs before Phase 13, which replaces the fixture, and
-# ends by serving the saved peers and policy again. Like Phase 12d it needs
-# kernel WireGuard and fails without it.
+# own in plexd's container, so a probe that fails was dropped by the input
+# chain, not refused at a closed port. plexd's container probes meshpeer the
+# same way with busybox nc. The output chain matches what plexd's container
+# sends over the mesh interface, so its own connection to meshpeer needs a rule
+# from plexd's mesh IP to meshpeer's port. A probe that fails counts only while
+# meshpeer's listener still listens after it. The replies to meshpeer's
+# connections leave through the output chain too, which passes them as replies
+# to a connection the input chain let in. UDP to port 9, the relay probe port,
+# passes the output chain without a rule, so under E a datagram to meshpeer's
+# port 9 arrives and one to 7006 does not. A query from inside plexd's
+# container reaches the mesh resolver over lo, which no chain matches, so mesh
+# DNS answers even under E. The mesh carries IPv4 only, so A's IPv6 rule proves
+# that plexd applies such a rule, not that it matches IPv6 traffic. The phase
+# runs before Phase 13, which replaces the fixture, and ends by serving the
+# saved peers and policy again. Like Phase 12d it needs kernel WireGuard and
+# fails without it.
 echo "=== Testing policy enforcement on the mesh interface ==="
 
 if [ "${WG_CONFIGURED}" -eq 0 ]; then
@@ -5367,9 +5375,28 @@ meshpeer_listening() {
     [ -n "${out}" ]
 }
 
-# await_listening <tag> <check> <port> <yes|no> runs check (plexd_listening or
-# meshpeer_listening) on port every second for up to 10 s until a listener is
-# there (yes) or gone (no).
+# meshpeer_udp_listening <port> succeeds when an unconnected UDP socket in
+# meshpeer is bound to port <port>. nc -lu connects its socket to the sender of
+# the first datagram it receives, and ss -l then no longer lists it.
+meshpeer_udp_listening() {
+    local out
+    out=$(dc exec -T meshpeer ss -Hlun "sport = :$1" 2>&1) \
+        || fail "[mesh policy] ss -Hlun in meshpeer failed: ${out}"
+    [ -n "${out}" ]
+}
+
+# meshpeer_udp_bound <port> succeeds when a UDP socket in meshpeer, connected
+# or not, is bound to port <port>.
+meshpeer_udp_bound() {
+    local out
+    out=$(dc exec -T meshpeer ss -Haun "sport = :$1" 2>&1) \
+        || fail "[mesh policy] ss -Haun in meshpeer failed: ${out}"
+    [ -n "${out}" ]
+}
+
+# await_listening <tag> <check> <port> <yes|no> runs check (plexd_listening,
+# meshpeer_listening, meshpeer_udp_listening or meshpeer_udp_bound) on port
+# every second for up to 10 s until a listener is there (yes) or gone (no).
 await_listening() {
     local tag=$1 check=$2 port=$3 want=$4 waited=0 now
     while :; do
@@ -5392,8 +5419,10 @@ await_listening() {
 # probe_plexd_port <tag> <port> <open|closed> starts a one-connection listener
 # on port in plexd's container, probes it from meshpeer over the mesh with
 # nc -z, and stops the listener again, so each probe meets a listener of its
-# own. A connection the chain drops times out after 3 s, while one that reached
-# a port without a listener would be refused, so closed wants the time-out.
+# own. A connection the input chain drops times out after 3 s, while one that
+# reached a port without a listener would be refused, so closed wants the
+# time-out. open also needs plexd's answers to leave through the output chain,
+# which passes them as replies to a connection the input chain let in.
 probe_plexd_port() {
     local tag=$1 port=$2 want=$3 rc=0 out
     dc exec -d -T plexd /bin/busybox nc -l -p "${port}" \
@@ -5422,23 +5451,84 @@ probe_plexd_port() {
     echo "  PASS: [${tag}] meshpeer's connection to ${MESH_NODE_IP}:${port} times out while a listener runs there"
 }
 
-# probe_meshpeer_port <tag> <port> starts a one-connection listener on port in
-# meshpeer and connects to it from plexd's container, where busybox nc exits 0
-# once connected. No rule names that direction.
+# probe_meshpeer_port <tag> <port> <open|closed> starts a one-connection
+# listener on port in meshpeer and connects to it from plexd's container with
+# busybox nc -w 3, which exits 0 once connected. The connection leaves through
+# the output chain on plexd's mesh interface, so open needs a rule from plexd's
+# mesh IP to meshpeer's port. closed wants nc to exit non-zero while meshpeer's
+# listener still listens after the probe, so the connection failed with a
+# listener waiting for it, not at a closed port.
 probe_meshpeer_port() {
-    local tag=$1 port=$2 rc=0 out
+    local tag=$1 port=$2 want=$3 rc=0 out listening=no
     dc exec -d -T meshpeer nc -l "${port}" \
         || fail "[${tag}] could not start a listener on port ${port} in meshpeer"
     await_listening "${tag}" meshpeer_listening "${port}" yes
     out=$(dc exec -T plexd /bin/busybox sh -c "/bin/busybox nc -w 3 ${MESH_PEER_IP} ${port} </dev/null" 2>&1) || rc=$?
+    if [ "${want}" = closed ] && meshpeer_listening "${port}"; then
+        listening=yes
+    fi
     # As in probe_plexd_port: the listener exits after its one connection, and
     # one the probe did not reach is stopped here.
     dc exec -T meshpeer pkill -f "nc -l ${port}" >/dev/null 2>&1 || true
     await_listening "${tag}" meshpeer_listening "${port}" no
-    if [ "${rc}" -ne 0 ]; then
-        fail "[${tag}] plexd's container could not connect to meshpeer's listener at ${MESH_PEER_IP}:${port}: busybox nc exited ${rc}, want 0, since the replies to a connection plexd opened need no rule (output: ${out})"
+    if [ "${want}" = open ]; then
+        if [ "${rc}" -ne 0 ]; then
+            fail "[${tag}] plexd's container could not connect to meshpeer's listener at ${MESH_PEER_IP}:${port}: busybox nc exited ${rc}, want 0, since a rule allows plexd's mesh IP to reach that port (output: ${out})"
+        fi
+        echo "  PASS: [${tag}] plexd's container connects to meshpeer's listener at ${MESH_PEER_IP}:${port}, which a rule allows"
+        return 0
     fi
-    echo "  PASS: [${tag}] plexd's container connects to meshpeer's listener at ${MESH_PEER_IP}:${port}, which no rule names"
+    if [ "${rc}" -eq 0 ]; then
+        fail "[${tag}] plexd's container connected to meshpeer's listener at ${MESH_PEER_IP}:${port}, want the output chain on plexd's mesh interface to drop the connection, since no rule allows it (output: ${out})"
+    fi
+    if [ "${listening}" != yes ]; then
+        fail "[${tag}] busybox nc -w 3 ${MESH_PEER_IP} ${port} in plexd's container exited ${rc}, but meshpeer's listener no longer listened after the probe, so the failure does not show that the output chain dropped the connection (output: ${out})"
+    fi
+    echo "  PASS: [${tag}] plexd's container fails to connect to ${MESH_PEER_IP}:${port} while meshpeer's listener still listens there"
+}
+
+# probe_meshpeer_udp <tag> <port> <arrives|dropped> starts a UDP listener on
+# port in meshpeer that writes what it receives to /tmp/udp-<port>.out, sends
+# the datagram "probe" to it from plexd's container with busybox nc -u, and
+# reads the file 3 s later. A send the output chain drops fails with
+# "operation not permitted", so the step ignores nc's exit status and goes by
+# the file. arrives wants it to hold "probe". dropped wants it empty while the
+# listener still waits unconnected, so no datagram reached it.
+probe_meshpeer_udp() {
+    local tag=$1 port=$2 want=$3 file="/tmp/udp-$2.out" sent got rc=0 waiting=no
+    dc exec -d -T meshpeer sh -c "nc -lu ${port} > ${file}" \
+        || fail "[${tag}] could not start a UDP listener on port ${port} in meshpeer"
+    await_listening "${tag}" meshpeer_udp_listening "${port}" yes
+    sent=$(dc exec -T plexd /bin/busybox sh -c "printf probe | /bin/busybox nc -u -w 1 ${MESH_PEER_IP} ${port}" 2>&1) || true
+    sleep 3
+    got=$(dc exec -T meshpeer cat "${file}" 2>&1) || rc=$?
+    if [ "${want}" = dropped ] && meshpeer_udp_listening "${port}"; then
+        waiting=yes
+    fi
+    # The listener runs on either way: connected to the sender once the
+    # datagram arrived, or still waiting for one. pkill stops it, the wait
+    # below proves the port free, and the file goes.
+    dc exec -T meshpeer pkill -f "nc -lu ${port}" >/dev/null 2>&1 || true
+    await_listening "${tag}" meshpeer_udp_bound "${port}" no
+    dc exec -T meshpeer rm -f "${file}" >/dev/null 2>&1 \
+        || fail "[${tag}] could not remove ${file} in meshpeer"
+    if [ "${rc}" -ne 0 ]; then
+        fail "[${tag}] reading ${file} in meshpeer failed: cat exited ${rc} (output: ${got})"
+    fi
+    if [ "${want}" = arrives ]; then
+        if [ "${got}" != probe ]; then
+            fail "[${tag}] 3s after plexd's container sent 'probe' to ${MESH_PEER_IP}:${port} over UDP, meshpeer's listener wrote '${got}', want 'probe' (nc output: ${sent})"
+        fi
+        echo "  PASS: [${tag}] a UDP datagram from plexd's container to ${MESH_PEER_IP}:${port} arrives in meshpeer"
+        return 0
+    fi
+    if [ -n "${got}" ]; then
+        fail "[${tag}] 3s after plexd's container sent 'probe' to ${MESH_PEER_IP}:${port} over UDP, meshpeer's listener wrote '${got}', want nothing, since the output chain on plexd's mesh interface drops the datagram (nc output: ${sent})"
+    fi
+    if [ "${waiting}" != yes ]; then
+        fail "[${tag}] meshpeer's listener on UDP port ${port} wrote nothing, but it no longer waited for a datagram 3s after the send, so the empty file does not show that the output chain dropped it (nc output: ${sent})"
+    fi
+    echo "  PASS: [${tag}] a UDP datagram from plexd's container to ${MESH_PEER_IP}:${port} does not arrive in meshpeer, whose listener still waits there"
 }
 
 # (a) Save the snapshot's peers and policy, which step (h) serves again. The
@@ -5540,20 +5630,23 @@ while :; do
 done
 echo "  PASS: [mesh policy] meshpeer completed a handshake with plexd $((SECONDS - MESH_HS_START))s after the splice"
 
-# (e) Policy A: 7001 is open to meshpeer and 7002 is not, plexd's own
-# connection to meshpeer passes, and the one logged rule is counted in the
-# engine's Info line for the revision.
+# (e) Policy A: 7001 is open to meshpeer and 7002 is not, and plexd's answers
+# on 7001 leave through the output chain as replies. plexd's container connects
+# to meshpeer's 7003, which A's fourth rule allows, and fails on 7005, which no
+# rule names, while meshpeer listens there. The one logged rule is counted in
+# the engine's Info line for the revision.
 MESH_REV_A="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c4"
 MESH_RULES_A=$(jq -c . <<'MESHRULESAEOF'
 [
   {"protocol": "tcp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7001, "to": 7001}},
   {"protocol": "tcp", "source_cidr": "fd00:99::3/128", "destination_cidr": "fd00:99::1/128", "ports": {"from": 7001, "to": 7001}},
-  {"protocol": "udp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7004, "to": 7004}, "log": true}
+  {"protocol": "udp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7004, "to": 7004}, "log": true},
+  {"protocol": "tcp", "source_cidr": "10.99.0.1/32", "destination_cidr": "10.99.0.3/32", "ports": {"from": 7003, "to": 7003}}
 ]
 MESHRULESAEOF
 )
 serve_policy "mesh-policy-a" "${MESH_REV_A}" "${MESH_RULES_A}"
-expect_policy_applied "mesh policy A" "${MESH_REV_A}" 3
+expect_policy_applied "mesh policy A" "${MESH_REV_A}" 4
 MESH_LOGGED_A=$(logged_rule_count "${POLICY_LOG}" "${MESH_REV_A}")
 if [ "${MESH_LOGGED_A}" != "1" ]; then
     fail "[mesh policy A] the 'policy rules ask for logging, which this release does not do' line plexd logged for revision ${MESH_REV_A} carries count='${MESH_LOGGED_A}', want count=1"
@@ -5561,7 +5654,8 @@ fi
 echo "  PASS: [mesh policy A] plexd logged 'policy rules ask for logging, which this release does not do' with count=1 for revision ${MESH_REV_A}"
 probe_plexd_port "mesh policy A" 7001 open
 probe_plexd_port "mesh policy A" 7002 closed
-probe_meshpeer_port "mesh policy A" 7003
+probe_meshpeer_port "mesh policy A" 7003 open
+probe_meshpeer_port "mesh policy A" 7005 closed
 
 # (f) Policy B, A's rules with the legacy "action": "allow", is applied, and
 # policy C, whose one rule carries "action": "deny", is rejected whole, so B's
@@ -5569,7 +5663,7 @@ probe_meshpeer_port "mesh policy A" 7003
 MESH_REV_B="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c5"
 MESH_RULES_B=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(. + {action: "allow"})')
 serve_policy "mesh-policy-b" "${MESH_REV_B}" "${MESH_RULES_B}"
-expect_policy_applied "mesh policy B" "${MESH_REV_B}" 3
+expect_policy_applied "mesh policy B" "${MESH_REV_B}" 4
 
 MESH_REV_C="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c6"
 MESH_RULES_C='[{"action":"deny","protocol":"tcp","source_cidr":"10.99.0.3/32","destination_cidr":"10.99.0.1/32","ports":{"from":7001,"to":7001}}]'
@@ -5586,13 +5680,18 @@ fi
 echo "  PASS: [mesh policy C] plexd logged 'policy revision rejected, keeping previous ruleset' with revision_id=${MESH_REV_C} for its unsupported action"
 probe_plexd_port "mesh policy C" 7001 open
 
-# (g) Policy D, A without its 7001 rules, closes 7001, and so does policy E,
-# which has no rules, while mesh DNS inside plexd's container still answers.
+# (g) Policy D, A without its 7001 rules, closes 7001 and keeps the 7003 rule,
+# so plexd's container still connects to meshpeer's 7003. Policy E, which has
+# no rules, closes 7001 and 7003, while mesh DNS inside plexd's container still
+# answers. Under E a datagram from plexd's container to meshpeer's UDP port 9
+# still arrives, since the output chain passes the relay probe port without a
+# rule, and one to 7006 does not.
 MESH_REV_D="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7"
 MESH_RULES_D=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(select(.ports.from != 7001))')
 serve_policy "mesh-policy-d" "${MESH_REV_D}" "${MESH_RULES_D}"
-expect_policy_applied "mesh policy D" "${MESH_REV_D}" 1
+expect_policy_applied "mesh policy D" "${MESH_REV_D}" 2
 probe_plexd_port "mesh policy D" 7001 closed
+probe_meshpeer_port "mesh policy D" 7003 open
 
 MESH_REV_E="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c8"
 serve_policy "mesh-policy-e" "${MESH_REV_E}" '[]'
@@ -5604,6 +5703,9 @@ else
     fail "[mesh policy E] nslookup -type=a node-1.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and ${MESH_NODE_IP}: the query arrives on lo, which the chain does not match (output: ${NSLOOKUP_OUT})"
 fi
 probe_plexd_port "mesh policy E" 7001 closed
+probe_meshpeer_port "mesh policy E" 7003 closed
+probe_meshpeer_udp "mesh policy E" 9 arrives
+probe_meshpeer_udp "mesh policy E" 7006 dropped
 
 # (h) The saved peers and policy are served again, plexd applies the fixture's
 # revision once more, and meshpeer's wg0 goes, so no later phase meets it.

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -308,6 +309,45 @@ func (n *realNetns) timesOut(t *testing.T, addr string) {
 	}
 }
 
+// blocked checks that a connection from the namespace to addr, where a
+// listener runs, never comes up. A SYN the peer drops times the connection
+// out. A SYN the namespace's own output chain drops times it out too, or
+// fails it with EPERM. A refused connection means the SYN reached the peer,
+// so it fails the check.
+func (n *realNetns) blocked(t *testing.T, addr string) {
+	t.Helper()
+	c, err := n.dial(addr, 2*time.Second)
+	if err == nil {
+		_ = c.Close()
+		t.Errorf("%s connected to %s, want the connection attempt dropped", n.name, addr)
+		return
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return
+	}
+	if !errors.Is(err, syscall.EPERM) {
+		t.Errorf("%s dialing %s: %v, want a timeout or EPERM", n.name, addr, err)
+	}
+}
+
+// listenUDP binds a UDP socket inside the namespace. It closes when the test
+// ends.
+func (n *realNetns) listenUDP(t *testing.T, addr string) net.PacketConn {
+	t.Helper()
+
+	var pc net.PacketConn
+	if err := n.do(func() error {
+		var err error
+		pc, err = net.ListenPacket("udp", addr)
+		return err
+	}); err != nil {
+		t.Fatalf("namespace %s: listen on udp %s: %v", n.name, addr, err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	return pc
+}
+
 // TestNftablesController_Real drives the kernel's nf_tables and connection
 // tracking. It builds three network namespaces: a peer P whose eth0 is joined
 // to the node N's plexd0 by a veth pair, as a mesh peer is joined over
@@ -315,6 +355,10 @@ func (n *realNetns) timesOut(t *testing.T, addr string) {
 // inside those namespaces through netlink handles bound to them, never in the
 // host's namespace, which may run a live plexd0, and the controller runs on
 // a thread inside N.
+//
+// N's chains filter what arrives on plexd0, delivered to N or forwarded
+// through it, and what N's own sockets send over plexd0. What N forwards out
+// of plexd0, from E, is not filtered on its way out.
 func TestNftablesController_Real(t *testing.T) {
 	// The gate is a variable rather than the effective uid alone, as for
 	// TestPFController_Real: sudo go test ./... on a developer's machine
@@ -381,8 +425,11 @@ func TestNftablesController_Real(t *testing.T) {
 	n.listen(t, ":7002")
 	e.listen(t, "192.0.2.2:8001")
 	e.listen(t, "192.0.2.2:8002")
-	p.listen(t, "10.99.0.2:9001")
+	p9001 := p.listen(t, "10.99.0.2:9001")
 	p.listen(t, "10.99.0.2:9002")
+	p.listen(t, "10.99.0.2:9003")
+	pUDP9 := p.listenUDP(t, "10.99.0.2:9")
+	pUDP10 := p.listenUDP(t, "10.99.0.2:10")
 
 	const chain = DefaultChainName
 
@@ -401,7 +448,7 @@ func TestNftablesController_Real(t *testing.T) {
 			Hooknum:  nftables.ChainHookForward,
 			Priority: nftables.ChainPriorityFilter,
 		})
-		exprs := ifaceMatchExprs("plexd0")
+		exprs := ifaceMatchExprs("plexd0", dirIn)
 		exprs = append(exprs, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop})
 		conn.AddRule(&nftables.Rule{Table: table, Chain: legacy, Exprs: exprs})
 		return conn.Flush()
@@ -419,7 +466,7 @@ func TestNftablesController_Real(t *testing.T) {
 		t.Fatalf("EnsureChain() error = %v, want nil", err)
 	}
 
-	t.Log("EnsureChain replaced table ip plexd with table inet plexd and its two chains")
+	t.Log("EnsureChain replaced table ip plexd with table inet plexd and its three chains")
 	var ipTables []*nftables.Table
 	var inetChains []*nftables.Chain
 	if err := n.do(func() error {
@@ -446,19 +493,24 @@ func TestNftablesController_Real(t *testing.T) {
 			hooks[ch.Name] = *ch.Hooknum
 		}
 	}
-	inputName, forwardName := chainNames(chain)
+	inputName, forwardName, outputName := chainNames(chain)
 	if hook, ok := hooks[inputName]; !ok || hook != *nftables.ChainHookInput {
 		t.Errorf("chain inet %s %s: hook %v, present %v; want the input hook", tableName, inputName, hook, ok)
 	}
 	if hook, ok := hooks[forwardName]; !ok || hook != *nftables.ChainHookForward {
 		t.Errorf("chain inet %s %s: hook %v, present %v; want the forward hook", tableName, forwardName, hook, ok)
 	}
+	if hook, ok := hooks[outputName]; !ok || hook != *nftables.ChainHookOutput {
+		t.Errorf("chain inet %s %s: hook %v, present %v; want the output hook", tableName, outputName, hook, ok)
+	}
 
 	// The ruleset the engine builds for these rules on plexd0: allows, then
-	// the address-less default deny.
+	// the address-less default deny. allowOut9001 is N's own copy of a rule
+	// from N to P, the one the control plane compiles for the source node.
 	allow7001v4 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 7001, Protocol: "tcp", Action: "allow"}
 	allow7001v6 := FirewallRule{Interface: "plexd0", SrcIP: "fd00:99::/64", DstIP: "fd00:99::1/128", Port: 7001, Protocol: "tcp", Action: "allow"}
 	allow8001 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "192.0.2.0/24", Port: 8001, Protocol: "tcp", Action: "allow"}
+	allowOut9001 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.1/32", DstIP: "10.99.0.2/32", Port: 9001, Protocol: "tcp", Action: "allow"}
 	deny := FirewallRule{Interface: "plexd0", Action: "deny"}
 	apply := func(rules ...FirewallRule) {
 		t.Helper()
@@ -466,9 +518,9 @@ func TestNftablesController_Real(t *testing.T) {
 			t.Fatalf("ApplyRules() error = %v, want nil", err)
 		}
 	}
-	apply(allow7001v4, allow7001v6, allow8001, deny)
+	apply(allow7001v4, allow7001v6, allow8001, allowOut9001, deny)
 
-	t.Log("P reaches what the rules allow on N over both families, and nothing else")
+	t.Log("P reaches what the rules allow on N over both families, and nothing else; N's replies leave through the output chain")
 	p.connects(t, "10.99.0.1:7001")
 	p.connects(t, "[fd00:99::1]:7001")
 	p.timesOut(t, "10.99.0.1:7002")
@@ -478,9 +530,88 @@ func TestNftablesController_Real(t *testing.T) {
 	p.connects(t, "192.0.2.2:8001")
 	p.timesOut(t, "192.0.2.2:8002")
 
-	t.Log("the replies to connections N opened, and E opened through N, need no rule")
+	t.Log("N reaches what the rules allow on P, and nothing else")
 	n.connects(t, "10.99.0.2:9001")
+	n.blocked(t, "10.99.0.2:9003")
+
+	t.Log("what E opens to P through N is not filtered on its way out of plexd0")
 	e.connects(t, "10.99.0.2:9002")
+
+	// Two kinds of traffic leave plexd0 from N with a source that is not
+	// N's mesh address, and masquerade gives them that address only at
+	// postrouting, after the output chain. kube-proxy DNATs a host-network
+	// connection to a Service onto its endpoint at the output hook's nat
+	// chain; N plays that with 10.96.0.10, routed via lan0, DNATed onto P's
+	// 9003. IPVS sends a Pod's packet through the output hook with the Pod's
+	// address as source; N plays that with a socket bound to its lan0
+	// address 192.0.2.1 that connects to P's 9003 straight through plexd0.
+	// No rule allows 9003, and both connections still come up.
+	t.Log("connections that leave plexd0 with a foreign source and are masqueraded onto N's mesh address are not filtered")
+	n.addRoute(t, "lan0", "10.96.0.0/12", "192.0.2.2")
+	if err := n.do(func() error { return addServiceNAT("10.96.0.10", "10.99.0.2", 9003, "plexd0") }); err != nil {
+		t.Fatalf("namespace N: add the service nat table: %v", err)
+	}
+	n.connects(t, "10.96.0.10:9003")
+	var bound net.Conn
+	if err := n.do(func() error {
+		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1")}, Timeout: 5 * time.Second}
+		var err error
+		bound, err = d.Dial("tcp", "10.99.0.2:9003")
+		return err
+	}); err != nil {
+		t.Errorf("N could not connect from 192.0.2.1 to 10.99.0.2:9003 through plexd0: %v", err)
+	} else {
+		_ = bound.Close()
+	}
+	if err := n.do(func() error {
+		conn, err := nftables.New()
+		if err != nil {
+			return err
+		}
+		conn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: serviceNATTable})
+		return conn.Flush()
+	}); err != nil {
+		t.Fatalf("namespace N: delete the service nat table: %v", err)
+	}
+
+	t.Log("N sends UDP to P's port 9, the relay probe's, without a rule, and nothing to port 10")
+	sendUDP := func(addr string) error {
+		return n.do(func() error {
+			c, err := net.Dial("udp", addr)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = c.Close() }()
+			_, err = c.Write([]byte("u"))
+			return err
+		})
+	}
+	dgram := make([]byte, 16)
+	if err := sendUDP("10.99.0.2:9"); err != nil {
+		t.Errorf("N send to udp 10.99.0.2:9: %v", err)
+	}
+	if err := pUDP9.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, from, err := pUDP9.ReadFrom(dgram); err != nil {
+		t.Errorf("P read on udp port 9: %v, want N's datagram within 2 s", err)
+	} else if string(dgram[:nr]) != "u" {
+		t.Errorf("P read %q from %s on udp port 9, want \"u\"", dgram[:nr], from)
+	}
+	if err := sendUDP("10.99.0.2:10"); err != nil {
+		t.Logf("N send to udp 10.99.0.2:10: %v", err)
+	}
+	if err := pUDP10.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, from, err := pUDP10.ReadFrom(dgram); err == nil {
+		t.Errorf("P read %q from %s on udp port 10, want nothing within 2 s", dgram[:nr], from)
+	} else {
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("P read on udp port 10: %v, want a timeout", err)
+		}
+	}
 
 	t.Log("a revoked rule cuts an established connection at its next packet")
 	client := p.connects(t, "10.99.0.1:7001")
@@ -514,18 +645,66 @@ func TestNftablesController_Real(t *testing.T) {
 		}
 	}
 
+	t.Log("a revoked rule cuts an established connection N opened at its next packet")
+	apply(allow7001v4, allow7001v6, allow8001, allowOut9001, deny)
+	out := n.connects(t, "10.99.0.2:9001")
+	if out == nil {
+		t.FailNow()
+	}
+	peer := p9001.accepted(t, out)
+	if _, err := out.Write([]byte("a")); err != nil {
+		t.Fatalf("N write before the revoke: %v", err)
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Read(buf); err != nil || buf[0] != 'a' {
+		t.Fatalf("P read before the revoke: %q, %v; want \"a\"", buf, err)
+	}
+	apply(allow7001v4, allow7001v6, allow8001, deny)
+	if _, err := out.Write([]byte("b")); err != nil {
+		t.Logf("N write after the revoke: %v", err)
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, err := peer.Read(buf); nr > 0 {
+		t.Errorf("P read %q after the 9001 rule was revoked, want nothing within 2 s", buf[:nr])
+	} else {
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("P read after the revoke: %v, want a timeout", err)
+		}
+	}
+
+	// Every rule add is echoed back on the batch's netlink socket, which the
+	// default buffers cannot hold for a ruleset of a few dozen rules written
+	// into three chains (applyBufferBytes).
+	t.Log("a ruleset of 1000 policy rules applies in one batch and is enforced")
+	large := make([]FirewallRule, 0, 1002)
+	for i := range 1000 {
+		large = append(large, FirewallRule{
+			Interface: "plexd0", SrcIP: fmt.Sprintf("10.98.%d.%d/32", i/250, i%250+1), DstIP: "10.99.0.1/32",
+			Port: 5432, Protocol: "tcp", Action: "allow",
+		})
+	}
+	apply(append(large, allow7001v4, deny)...)
+	p.connects(t, "10.99.0.1:7001")
+	p.timesOut(t, "10.99.0.1:7002")
+
 	t.Log("N reaches its own mesh address under the default deny alone")
 	apply(deny)
 	n.connects(t, "10.99.0.1:7002")
 
-	t.Log("FlushChain empties both chains: input and forward traffic pass again")
+	t.Log("FlushChain empties all three chains: input, forward and output traffic pass again")
 	if err := n.do(func() error { return ctrl.FlushChain(chain) }); err != nil {
 		t.Fatalf("FlushChain() error = %v, want nil", err)
 	}
 	p.connects(t, "10.99.0.1:7002")
 	p.connects(t, "192.0.2.2:8002")
+	n.connects(t, "10.99.0.2:9003")
 
-	t.Log("DeleteChain removes both chains, and a second call is a no-op")
+	t.Log("DeleteChain removes all three chains, and a second call is a no-op")
 	apply(deny)
 	p.timesOut(t, "192.0.2.2:8002")
 	if err := n.do(func() error { return ctrl.DeleteChain(chain) }); err != nil {
@@ -542,13 +721,99 @@ func TestNftablesController_Real(t *testing.T) {
 		t.Fatalf("namespace N: list chains: %v", err)
 	}
 	for _, ch := range inetChains {
-		if ch.Table.Name == tableName && (ch.Name == inputName || ch.Name == forwardName) {
+		if ch.Table.Name == tableName && (ch.Name == inputName || ch.Name == forwardName || ch.Name == outputName) {
 			t.Errorf("chain inet %s %s is still there after DeleteChain", tableName, ch.Name)
 		}
 	}
 	p.connects(t, "10.99.0.1:7002")
 	p.connects(t, "192.0.2.2:8002")
+	n.connects(t, "10.99.0.2:9003")
 	if err := n.do(func() error { return ctrl.DeleteChain(chain) }); err != nil {
 		t.Errorf("second DeleteChain() error = %v, want nil", err)
 	}
+
+	// A plexd before the output chain left its input and forward chains
+	// behind. Teardown flushes before it deletes, so FlushChain has to act on
+	// the two that exist rather than fail on the missing third.
+	t.Log("FlushChain and DeleteChain act on the chains that exist, and FlushChain of an unknown chain is a no-op")
+	if err := n.do(func() error {
+		conn, err := nftables.New()
+		if err != nil {
+			return err
+		}
+		table := conn.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: tableName})
+		input, forward, _ := baseChains(table, chain)
+		conn.AddChain(input)
+		conn.AddChain(forward)
+		return conn.Flush()
+	}); err != nil {
+		t.Fatalf("namespace N: create the input and forward chains alone: %v", err)
+	}
+	if err := n.do(func() error { return ctrl.FlushChain(chain) }); err != nil {
+		t.Errorf("FlushChain() of the input and forward chains alone error = %v, want nil", err)
+	}
+	if err := n.do(func() error { return ctrl.DeleteChain(chain) }); err != nil {
+		t.Errorf("DeleteChain() of the input and forward chains alone error = %v, want nil", err)
+	}
+	if err := n.do(func() error {
+		conn, err := nftables.New()
+		if err != nil {
+			return err
+		}
+		inetChains, err = conn.ListChainsOfTableFamily(nftables.TableFamilyINet)
+		return err
+	}); err != nil {
+		t.Fatalf("namespace N: list chains: %v", err)
+	}
+	for _, ch := range inetChains {
+		if ch.Table.Name == tableName && (ch.Name == inputName || ch.Name == forwardName) {
+			t.Errorf("chain inet %s %s is still there after DeleteChain", tableName, ch.Name)
+		}
+	}
+	if err := n.do(func() error { return ctrl.FlushChain("plexd-test-unknown") }); err != nil {
+		t.Errorf("FlushChain() of an unknown chain error = %v, want nil", err)
+	}
+}
+
+// serviceNATTable is the IPv4 nat table addServiceNAT creates.
+const serviceNATTable = "plexd-test-service-nat"
+
+// addServiceNAT adds what kube-proxy and a masquerading CNI do for a
+// host-network connection to a Service whose endpoint sits behind the mesh:
+// at the output hook, before the filter chains, TCP to service:port is DNATed
+// to endpoint:port, and at postrouting what leaves through meshIface is
+// masqueraded onto that interface's address.
+func addServiceNAT(service, endpoint string, port uint16, meshIface string) error {
+	conn, err := nftables.New()
+	if err != nil {
+		return err
+	}
+	table := conn.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: serviceNATTable})
+	out := conn.AddChain(&nftables.Chain{
+		Name:     "output",
+		Table:    table,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityNATDest,
+	})
+	conn.AddRule(&nftables.Rule{Table: table, Chain: out, Exprs: []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: net.ParseIP(service).To4()},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: portBytes(port)},
+		&expr.Immediate{Register: 1, Data: net.ParseIP(endpoint).To4()},
+		&expr.Immediate{Register: 2, Data: portBytes(port)},
+		&expr.NAT{Type: expr.NATTypeDestNAT, Family: unix.NFPROTO_IPV4, RegAddrMin: 1, RegProtoMin: 2},
+	}})
+	post := conn.AddChain(&nftables.Chain{
+		Name:     "postrouting",
+		Table:    table,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookPostrouting,
+		Priority: nftables.ChainPriorityNATSource,
+	})
+	conn.AddRule(&nftables.Rule{Table: table, Chain: post, Exprs: append(ifaceMatchExprs(meshIface, dirOut), &expr.Masq{})})
+	return conn.Flush()
 }
