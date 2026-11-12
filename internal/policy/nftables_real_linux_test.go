@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"syscall"
@@ -358,7 +359,9 @@ func (n *realNetns) listenUDP(t *testing.T, addr string) net.PacketConn {
 //
 // N's chains filter what arrives on plexd0, delivered to N or forwarded
 // through it, and what N's own sockets send over plexd0. What N forwards out
-// of plexd0, from E, is not filtered on its way out.
+// of plexd0, from E, is not filtered on its way out. The rule that lets P
+// reach E is logged, and its NFLOG reader reports P's connection as one N
+// forwards.
 func TestNftablesController_Real(t *testing.T) {
 	// The gate is a variable rather than the effective uid alone, as for
 	// TestPFController_Real: sudo go test ./... on a developer's machine
@@ -459,6 +462,12 @@ func TestNftablesController_Real(t *testing.T) {
 	p.timesOut(t, "192.0.2.2:8001")
 
 	ctrl := NewNftablesController(testLogger())
+	// The controller reports what allow8001 admits, which P's connections to
+	// E take through N's forward chain. Its NFLOG reader opens in N, where
+	// ApplyRules runs.
+	sink := &nflogSink{}
+	ctrl.SetConnSink(sink)
+	t.Cleanup(ctrl.closeLog)
 	if err := n.do(ctrl.Probe); err != nil {
 		t.Fatalf("Probe() error = %v, want nil", err)
 	}
@@ -507,9 +516,10 @@ func TestNftablesController_Real(t *testing.T) {
 	// The ruleset the engine builds for these rules on plexd0: allows, then
 	// the address-less default deny. allowOut9001 is N's own copy of a rule
 	// from N to P, the one the control plane compiles for the source node.
+	// allow8001 is logged, under tag 9/0.
 	allow7001v4 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 7001, Protocol: "tcp", Action: "allow"}
 	allow7001v6 := FirewallRule{Interface: "plexd0", SrcIP: "fd00:99::/64", DstIP: "fd00:99::1/128", Port: 7001, Protocol: "tcp", Action: "allow"}
-	allow8001 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "192.0.2.0/24", Port: 8001, Protocol: "tcp", Action: "allow"}
+	allow8001 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "192.0.2.0/24", Port: 8001, Protocol: "tcp", Action: "allow", LogTag: "9/0"}
 	allowOut9001 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.1/32", DstIP: "10.99.0.2/32", Port: 9001, Protocol: "tcp", Action: "allow"}
 	deny := FirewallRule{Interface: "plexd0", Action: "deny"}
 	apply := func(rules ...FirewallRule) {
@@ -527,8 +537,30 @@ func TestNftablesController_Real(t *testing.T) {
 	p.timesOut(t, "[fd00:99::1]:7002")
 
 	t.Log("P reaches what the rules allow on E through N, and nothing else")
-	p.connects(t, "192.0.2.2:8001")
+	toE := p.connects(t, "192.0.2.2:8001")
 	p.timesOut(t, "192.0.2.2:8002")
+
+	t.Log("the log rule of allow8001 reports P's connection to E as forwarded")
+	wantForward := ConnEvent{
+		Tag:      "9/0",
+		Dir:      ConnForward,
+		Src:      netip.MustParseAddr("10.99.0.2"),
+		Dst:      netip.MustParseAddr("192.0.2.2"),
+		Protocol: 6,
+		DstPort:  8001,
+	}
+	if toE != nil {
+		wantForward.SrcPort = uint16(toE.LocalAddr().(*net.TCPAddr).Port)
+	}
+	if !sink.waitEvent(5*time.Second, func(ev ConnEvent) bool {
+		if toE == nil {
+			ev.SrcPort = 0
+		}
+		return ev == wantForward
+	}) {
+		_, events := sink.recorded()
+		t.Errorf("no event %+v within 5 s; the sink recorded %+v", wantForward, events)
+	}
 
 	t.Log("N reaches what the rules allow on P, and nothing else")
 	n.connects(t, "10.99.0.2:9001")

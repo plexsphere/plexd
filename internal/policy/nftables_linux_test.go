@@ -3,6 +3,8 @@
 package policy
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
+	"github.com/mdlayher/netlink"
+	"github.com/mdlayher/netlink/nltest"
 	"golang.org/x/sys/unix"
 )
 
@@ -1064,5 +1068,327 @@ func TestChainNames(t *testing.T) {
 	input, forward, output := chainNames("plexd-mesh")
 	if input != "plexd-mesh-input" || forward != "plexd-mesh-forward" || output != "plexd-mesh-output" {
 		t.Errorf("chainNames(plexd-mesh) = %q, %q, %q, want plexd-mesh-input, plexd-mesh-forward, plexd-mesh-output", input, forward, output)
+	}
+}
+
+// nftLoggedRules is a logged allow of TCP to port 7001 on plexd0 with tag
+// "1/0", then the default deny.
+func nftLoggedRules() []FirewallRule {
+	return []FirewallRule{
+		{Interface: "plexd0", Protocol: "tcp", Port: 7001, Action: "allow", LogTag: "1/0"},
+		{Interface: "plexd0", Action: "deny"},
+	}
+}
+
+// pinnedLoggedRules writes out by hand the rules nftLoggedRules become behind a
+// chain's opening rules, with key as the interface match: the log rule, the
+// accept rule and the deny.
+func pinnedLoggedRules(key expr.MetaKey) [][]expr.Any {
+	iface := func() []expr.Any {
+		return []expr.Any{
+			&expr.Meta{Key: key, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("plexd0\x00")},
+		}
+	}
+	match := func() []expr.Any {
+		return append(iface(),
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{6}},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+			// 7001 in network byte order.
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x1b, 0x59}},
+		)
+	}
+	logRule := append(match(),
+		// ct state new, loaded in host byte order.
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           binaryutil.NativeEndian.PutUint32(expr.CtStateBitNEW),
+			Xor:            []byte{0, 0, 0, 0},
+		},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},
+		// log group 28772 prefix "1/0", and no verdict.
+		&expr.Log{Key: 1<<unix.NFTA_LOG_GROUP | 1<<unix.NFTA_LOG_PREFIX, Group: 28772, Data: []byte("1/0")},
+	)
+	accept := append(match(), &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictAccept})
+	deny := append(iface(), &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop})
+	return [][]expr.Any{logRule, accept, deny}
+}
+
+// pinnedRelayProbeExprs is the relay probe rule of the output chain: UDP to
+// port 9 leaving through iface, from and to any address of either family.
+func pinnedRelayProbeExprs(iface string) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{17}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x00, 0x09}},
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}
+}
+
+// pinnedChainOpening is what opens a chain for plexd0 in direction dir: the
+// connection tracking pair and, for dirOut, the foreign-source rule and the
+// relay probe rule.
+func pinnedChainOpening(dir ifaceDir) [][]expr.Any {
+	if dir == dirOut {
+		opening := pinnedConnTrackExprs("plexd0", expr.MetaKeyOIFNAME)
+		return append(opening, pinnedForeignSourceExprs("plexd0"), pinnedRelayProbeExprs("plexd0"))
+	}
+	return pinnedConnTrackExprs("plexd0", expr.MetaKeyIIFNAME)
+}
+
+// nftLogRuleCount counts the rules of list that hold a log expression.
+func nftLogRuleCount(list [][]expr.Any) int {
+	n := 0
+	for _, rule := range list {
+		for _, e := range rule {
+			if _, ok := e.(*expr.Log); ok {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+func assertNftRuleLists(t *testing.T, got, want [][]expr.Any) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d rules, want %d", len(got), len(want))
+	}
+	for i := range want {
+		assertExprs(t, got[i], want[i])
+	}
+}
+
+// A logged rule gets its log rule directly in front of it, in the input and
+// forward list behind the connection tracking pair, and in the output list
+// behind the foreign-source and relay probe rules too.
+func TestChainRuleExprsLogged(t *testing.T) {
+	for _, tc := range []struct {
+		dir ifaceDir
+		key expr.MetaKey
+	}{
+		{dirIn, expr.MetaKeyIIFNAME},
+		{dirOut, expr.MetaKeyOIFNAME},
+	} {
+		got, err := chainRuleExprs(nftLoggedRules(), tc.dir)
+		if err != nil {
+			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", tc.dir, err)
+		}
+		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.dir), pinnedLoggedRules(tc.key)...))
+	}
+}
+
+// Without a log tag the lists are the ones plexd wrote before connection
+// logging: no log rule in either direction.
+func TestChainRuleExprsUntaggedUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		dir ifaceDir
+		key expr.MetaKey
+	}{
+		{dirIn, expr.MetaKeyIIFNAME},
+		{dirOut, expr.MetaKeyOIFNAME},
+	} {
+		got, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), tc.dir)
+		if err != nil {
+			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", tc.dir, err)
+		}
+		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.dir), pinnedLoggedRules(tc.key)[1:]...))
+		if n := nftLogRuleCount(got); n != 0 {
+			t.Errorf("dir %d: %d log rules, want none", tc.dir, n)
+		}
+	}
+}
+
+func TestLogRuleExprsRejectsInvalidRule(t *testing.T) {
+	if _, err := logRuleExprs(FirewallRule{SrcIP: "not-an-ip", Action: "allow", LogTag: "1/0"}, dirIn); err == nil {
+		t.Error("logRuleExprs accepted a rule with an invalid source address")
+	}
+}
+
+// assertNoNftLogRules checks that rules, written into either list, carry no
+// log rule and match the lists of nftLoggedRules without tags.
+func assertNoNftLogRules(t *testing.T, rules []FirewallRule) {
+	t.Helper()
+	for _, dir := range []ifaceDir{dirIn, dirOut} {
+		got, err := chainRuleExprs(rules, dir)
+		if err != nil {
+			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", dir, err)
+		}
+		if n := nftLogRuleCount(got); n != 0 {
+			t.Errorf("dir %d: %d log rules, want none", dir, n)
+		}
+		want, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), dir)
+		if err != nil {
+			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", dir, err)
+		}
+		assertNftRuleLists(t, got, want)
+	}
+}
+
+// When the reader cannot bind the NFLOG group, ApplyRules installs the rules
+// without their log tags and says so once, with the bind error.
+func TestNftablesController_LoggingUnavailable(t *testing.T) {
+	var buf bytes.Buffer
+	ctrl := NewNftablesController(captureLogger(&buf))
+	var groups []uint16
+	ctrl.openLog = func(group uint16, _ ConnSink, _ *slog.Logger) (*nflogReader, error) {
+		groups = append(groups, group)
+		// The kernel refuses the bind.
+		conn := nltest.Dial(func(reqs []netlink.Message) ([]netlink.Message, error) {
+			return nltest.Error(int(unix.EBUSY), reqs)
+		})
+		defer func() { _ = conn.Close() }()
+		return nil, bindNflog(conn, group)
+	}
+	ctrl.SetConnSink(&nflogSink{})
+
+	got := ctrl.prepareLogging(nftLoggedRules())
+	if want := withoutLogTags(nftLoggedRules()); !reflect.DeepEqual(got, want) {
+		t.Errorf("prepareLogging() = %+v, want %+v", got, want)
+	}
+	if !reflect.DeepEqual(groups, []uint16{28772}) {
+		t.Errorf("openLog was called for groups %v, want [28772]", groups)
+	}
+	assertNoNftLogRules(t, got)
+	out := buf.String()
+	for _, want := range []string{
+		"level=WARN",
+		`msg="policy connection logging unavailable, logged rules are enforced without it"`,
+		"component=policy",
+		`error="policy: nftables: nflog: bind group 28772: `,
+		"device or resource busy",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log %q lacks %q", out, want)
+		}
+	}
+	if heldNflogReader(ctrl) != nil {
+		t.Error("the controller kept a reader after the open failed")
+	}
+
+	// ApplyRules takes the same path and logs the Warn once per apply. Its
+	// batch fails without CAP_NET_ADMIN.
+	buf.Reset()
+	inTestNetns(t, func() {
+		const chain = "plexd-test-nflog"
+		err := ctrl.ApplyRules(chain, nftLoggedRules())
+		if err == nil {
+			_ = ctrl.FlushChain(chain)
+			_ = ctrl.DeleteChain(chain)
+		} else if want := "policy: nftables: apply rules"; !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("ApplyRules() error = %q, want one starting %q", err, want)
+		}
+	})
+	if n := strings.Count(buf.String(), connLogUnavailable); n != 1 {
+		t.Errorf("ApplyRules logged %q %d times, want once:\n%s", connLogUnavailable, n, buf.String())
+	}
+}
+
+// Without a sink nothing reads the group, so ApplyRules installs the rules
+// without their log tags, opens no reader and logs no Warn.
+func TestNftablesController_LoggingWithoutSink(t *testing.T) {
+	var buf bytes.Buffer
+	ctrl := NewNftablesController(captureLogger(&buf))
+	ctrl.openLog = func(uint16, ConnSink, *slog.Logger) (*nflogReader, error) {
+		t.Error("openLog was called without a sink")
+		return nil, errors.New("no sink")
+	}
+
+	got := ctrl.prepareLogging(nftLoggedRules())
+	if want := withoutLogTags(nftLoggedRules()); !reflect.DeepEqual(got, want) {
+		t.Errorf("prepareLogging() = %+v, want %+v", got, want)
+	}
+	assertNoNftLogRules(t, got)
+
+	inTestNetns(t, func() {
+		const chain = "plexd-test-nflog"
+		if err := ctrl.ApplyRules(chain, nftLoggedRules()); err == nil {
+			_ = ctrl.FlushChain(chain)
+			_ = ctrl.DeleteChain(chain)
+		}
+	})
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("logged %q, want no Warn line", buf.String())
+	}
+}
+
+// heldNflogReader returns the reader the controller holds.
+func heldNflogReader(c *NftablesController) *nflogReader {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reader
+}
+
+// The controller opens one reader for logged rules and keeps it, replaces one
+// whose loop ended, and closes it in DeleteChain and when the sink changes.
+func TestNftablesController_LogReaderLifecycle(t *testing.T) {
+	f := &fakeNflog{}
+	ctrl := NewNftablesController(discardLoggerNft())
+	ctrl.openLog = f.open
+	sink := &nflogSink{}
+	ctrl.SetConnSink(sink)
+
+	rules := nftLoggedRules()
+	if got := ctrl.prepareLogging(rules); !reflect.DeepEqual(got, rules) {
+		t.Errorf("prepareLogging() = %+v, want the rules with their tags %+v", got, rules)
+	}
+	if f.opened() != 1 || f.groups[0] != nflogGroup || f.sinks[0] != ConnSink(sink) {
+		t.Fatalf("openLog calls: groups %v, sinks %v; want one for group %d and the sink", f.groups, f.sinks, nflogGroup)
+	}
+	if heldNflogReader(ctrl) != f.readers[0] {
+		t.Error("the controller does not hold the reader it opened")
+	}
+
+	t.Log("a running reader serves the next apply, with or without a logged rule")
+	ctrl.prepareLogging(rules)
+	if got := ctrl.prepareLogging(withoutLogTags(rules)); !reflect.DeepEqual(got, withoutLogTags(rules)) {
+		t.Errorf("prepareLogging() of untagged rules = %+v, want them unchanged", got)
+	}
+	if f.opened() != 1 || !f.readers[0].running() {
+		t.Errorf("openLog called %d times, reader running %v; want once and running", f.opened(), f.readers[0].running())
+	}
+
+	t.Log("a reader whose loop ended is closed and replaced at the next apply with a logged rule")
+	close(f.fails[0])
+	<-f.readers[0].done
+	ctrl.prepareLogging(rules)
+	if f.opened() != 2 {
+		t.Fatalf("openLog called %d times, want twice", f.opened())
+	}
+	if !f.readers[0].closed.Load() {
+		t.Error("the reader whose loop ended was not closed")
+	}
+
+	t.Log("DeleteChain closes the reader, also when no chain exists")
+	inTestNetns(t, func() {
+		_ = ctrl.DeleteChain("plexd-test-nflog-none")
+	})
+	if f.readers[1].running() || heldNflogReader(ctrl) != nil {
+		t.Errorf("after DeleteChain: reader running %v, held %v; want it closed and dropped", f.readers[1].running(), heldNflogReader(ctrl) != nil)
+	}
+
+	t.Log("a new sink closes the reader opened for the old one")
+	ctrl.prepareLogging(rules)
+	other := &nflogSink{}
+	ctrl.SetConnSink(other)
+	if f.readers[2].running() || heldNflogReader(ctrl) != nil {
+		t.Errorf("after SetConnSink: reader running %v, held %v; want it closed and dropped", f.readers[2].running(), heldNflogReader(ctrl) != nil)
+	}
+	ctrl.prepareLogging(rules)
+	if f.opened() != 4 || f.sinks[3] != ConnSink(other) {
+		t.Fatalf("openLog called %d times; want 4, the last with the new sink", f.opened())
+	}
+	ctrl.closeLog()
+	if f.readers[3].running() {
+		t.Error("closeLog left the reader running")
 	}
 }
