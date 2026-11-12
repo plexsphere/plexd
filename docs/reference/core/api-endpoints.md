@@ -1074,9 +1074,13 @@ from `source_cidr` to `destination_cidr` that its `protocol` (`tcp`, `udp`,
 `icmp` or `any`) and its optional `ports` range match, and rule order carries
 no meaning. Both prefixes are IPv4 or both IPv6, `0.0.0.0/0` is every IPv4
 address and `::/0` every IPv6 address, and `icmp` in an IPv6 rule is ICMPv6.
-`log: true` asks for the rule's traffic to be logged: plexd enforces such a
-rule but logs nothing for its traffic in this release. plexd ends the ruleset
-with a default deny for both families, also when the block is `null`. A rule
+`log: true` asks for the rule's traffic to be logged: plexd writes the line
+`policy rule allowed connection` to its own log for each connection such a
+rule allows, naming the block's `revision_id` and the rule's index in `rules`,
+and log forwarding carries the line to the control plane (see
+[Connection logging](../networking/network-policy.md#connection-logging)).
+plexd ends the ruleset with a default deny for both families, also when the
+block is `null`. A rule
 that still carries the `action` key of the format before
 plexsphere/plexsphere#1058 is read as an allow when the value is `allow`. Any
 other value, or any rule plexd cannot translate, rejects the whole revision,

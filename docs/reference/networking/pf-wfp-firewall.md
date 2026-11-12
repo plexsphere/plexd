@@ -5,7 +5,7 @@ package: internal/policy
 
 # pf & WFP Firewall Controllers
 
-`PFController` (`pf_darwin.go`) and `WFPController` (`wfp_windows.go`, `netnat_windows.go`) are the non-Linux implementations of the `FirewallController` interface defined in `internal/policy`. macOS programs its rules with `pfctl(8)` and needs root. Windows programs the Windows Filtering Platform through `github.com/tailscale/wf` and WinNAT through PowerShell, both of which need Administrator, which the LocalSystem service satisfies.
+`PFController` (`pf_darwin.go`, `pflog_darwin.go`) and `WFPController` (`wfp_windows.go`, `netnat_windows.go`) are the non-Linux implementations of the `FirewallController` interface defined in `internal/policy`. macOS programs its rules with `pfctl(8)` and needs root. Windows programs the Windows Filtering Platform through `github.com/tailscale/wf` and WinNAT through PowerShell, both of which need Administrator, which the LocalSystem service satisfies.
 
 Both controllers also implement `bridge.NATController`, so one instance carries the policy rules and the bridge's masquerade rule; see [NAT](#nat).
 
@@ -109,7 +109,7 @@ A deny renders a `block in` line and a `block out` line. The `block out` line na
 |---|---|
 | `# chain plexd-mesh` | pf has no user chains, so the chain is a comment. The name is what `ApplyRules`, `FlushChain` and `DeleteChain` address |
 | `quick` | The first matching rule is final, the first-match semantics the nftables backend has |
-| `no state` | Every packet stays subject to the current rules, so a revoked rule takes effect at once instead of after the last flow expires. Every `pass in` line, every mirror, the relay probe line and the node's own `udp`, `icmp` and protocol-less `pass out` lines carry it |
+| `no state` | Every packet stays subject to the current rules, so a revoked rule takes effect at once instead of after the last flow expires. Every `pass in` line, every mirror, the relay probe line, the node's own `udp`, `icmp` and protocol-less `pass out` lines, and the unlogged `tcp` `pass out` line of a logged rule without a protocol carry it |
 | `keep state` | The node's own TCP connections. pfctl adds `flags S/SA`, so only the node's own SYN creates a state entry, never its SYN-ACK to an inbound connection. A revoked rule stops such a connection only when it ends |
 | `flags A/A` | A TCP mirror matches only a segment with ACK set, so the Mac cannot open a TCP connection through it |
 | `icmp-type { ... }`, `icmp6-type { ... }` | What an ICMP mirror lets the node send: the echo reply and the errors a host sends about a packet it received. IPv4 reports a packet too big for the path as a code of `unreach`, IPv6 as the type `toobig` |
@@ -120,6 +120,29 @@ A deny renders a `block in` line and a `block out` line. The `block out` line na
 | `any` | An empty address field, `0.0.0.0/0` or `::/0`. Under `0.0.0.0/0` or `::/0` the family keyword stays, so the rule still matches only its own family |
 
 Chains are rendered in name order, so the same desired state always yields the same text. A `nat` rule, when one is configured, is rendered ahead of the chains, because pf requires translation rules before filter rules in a file.
+
+### Logged rules
+
+A rule with a `LogTag` carries `log` right after `pass in` or `pass out` on the lines that let in or out what it admits. pf hands each packet such a line matches to `pflog0`, and on a `keep state` line only the packet that creates the state. With `F` the family keyword, `S` and `D` the rendered addresses and `P` the port clause:
+
+- `tcp`: `pass in log quick on <if> F proto tcp from S to D P flags S/SA no state` in front of the unchanged `pass in` line, and `log` on the `keep state` line. The new line matches only a SYN, so an inbound connection logs once, and the line after it passes the rest of the connection without logging.
+- `udp` and `icmp`: `log` on the `pass in` line and on the `pass out ... no state` line. Both keep no state, so every packet logs.
+- No protocol: `pass in log quick on <if> F proto tcp from S to D flags S/SA no state`, then `pass in quick on <if> F proto tcp from S to D no state`, then the protocol-less `pass in` line with `log`. On the way out, `log` on the node's `keep state` line, then an unlogged `pass out quick on <if> F proto tcp from S to D no state`, then `log` on the node's protocol-less `pass out` line. The unlogged TCP lines keep the rest of a TCP connection, and the Mac's replies to an inbound one, away from the logged protocol-less lines, so a TCP connection logs once, whichever side opened it, and every packet of another protocol logs.
+- Mirrors and `block` lines never carry `log`.
+
+For `{utun4, 10.0.0.0/24 → 10.1.0.5, tcp 443, LogTag "3/0"}`, `renderRule` returns:
+
+```text
+pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 flags S/SA no state
+pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state
+pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state
+pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state
+pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state
+```
+
+Without the tag the same rule renders the last four lines, none of them with `log`. The `Enforcer` puts the logged rules first (see [Log tags and rule order](./network-policy.md#log-tags-and-rule-order)), so their lines follow the relay probe line.
+
+pf reports a logged packet with the number of the line that matched it, so `render` also returns a map from line number to tag, for every line that starts `pass in log ` or `pass out log `. pf numbers the rules of an anchor from 0 in the order they load. The header, the `# chain` comments and the `nat` line load none, and every other line loads one rule, except a line with a brace list, which loads one rule per item: an IPv4 ICMP reply mirror loads four and an IPv6 one five. `render` counts the rules that way, and `TestPFController_RealConnLog` proves the numbering on the macOS runner. `ApplyRules` keeps the map of the anchor loaded last as the current one, and the one before as the previous one, and swaps them only after `pfctl -f` succeeds. See [pflog](#pflog) for how the records are read.
 
 ### pfctl invocations
 
@@ -176,6 +199,16 @@ sudo pfctl -s References                 # every holder keeping pf enabled, plex
 
 `pfctl` prints its own normalised form rather than the text plexd loaded: a `block` reads `block drop`, a single port reads `port = 443`, and a dynamic address pool carries a trailing `round-robin`. A `keep state` line reads `flags S/SA keep state`, `from any to any` without ports reads `all`, `icmp6` reads `ipv6-icmp`, and an `icmp-type` or `icmp6-type` list loads as one rule per type. The relay probe's port 9 may read `discard`, its `/etc/services` name.
 
+### pflog
+
+`pflog_darwin.go` reads what the [logged lines](#logged-rules) hand to `pflog0` and reports each record as a `ConnEvent`; see [Connection logging](./network-policy.md#connection-logging) for the line plexd writes. `ApplyRules` opens the reader when the rules carry a tag and none runs, and `DeleteChain` closes it when it flushes the anchor.
+
+XNU creates no pflog interface at boot (`bsd/net/if_pflog.c`), so when `pflog0` does not exist `openPflog` creates it with `/sbin/ifconfig pflog0 create`, through the same runner as `pfctl`. It then opens the first free device of `/dev/bpf0` to `/dev/bpf255`, attaches it to `pflog0` with `BIOCSETIF`, sets `BIOCIMMEDIATE`, checks with `BIOCGDLT` that the link type is `DLT_PFLOG`, and reads with a buffer of the size `BIOCGBLEN` reports. XNU logs only while a BPF reader is attached and does not check whether `pflog0` is up, so plexd leaves the interface's flags alone. Each BPF reader gets its own copy of every record, so `tcpdump -i pflog0` beside plexd takes nothing from it.
+
+The reader splits each read into its BPF records and parses XNU's 64-byte `pfloghdr` (`bsd/net/if_pflog.h`) with `parsePflogRecord`. The packet starts at the header's `length` rounded up to a multiple of 4. A record counts when its `ruleset` is `plexd`, which is how XNU names the anchor `com.apple/plexd`, and its action is pass. Its `subrulenr`, the logged rule's number in the anchor, is looked up in the map of the anchor loaded last, then in the one before; see [Logged rules](#logged-rules). pf's direction out is `out`. pf's direction in is `in` when the destination is an address of the Mac, and `forward` otherwise, from `net.InterfaceAddrs`, cached for 5 s. After each read, `BIOCGSTATS` reports how many records BPF dropped, and the increase counts as lost in the [minute summary](./network-policy.md#rate-limit).
+
+A read error other than `EINTR` logs `policy connection log reader stopped` at Warn with `error` and ends the reader, and the next apply with a logged rule opens a new one. Every error of the open starts `policy: pf: pflog: `, among them `policy: pf: pflog: no free bpf device` when all 256 devices are busy and `policy: pf: pflog: pflog0 has link type <n>, want <m>`. When the open fails, or no sink is set, `ApplyRules` loads the anchor from the rules without their tags, so no line carries `log`, and on a failed open it logs `policy connection logging unavailable, logged rules are enforced without it` at Warn with that error.
+
 ## Windows: WFP
 
 The binding is `github.com/tailscale/wf`, the BSD-3 licensed package tailscaled drives WFP with, pinned to commit `6fbb0a674ee6`. It is imported from `//go:build windows` files only, so no other target pulls it into a build.
@@ -199,7 +232,7 @@ The weight is one below the maximum, which wireguard-windows claims for its kill
 
 ### Layers and conditions
 
-An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, a second at the connect layer `LayerALEAuthConnectV4`, named `plexd <chain> #<i> outbound`, and a third at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6`, `LayerALEAuthConnectV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6`, `plexd <chain> #<i> outbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all six layers. Only an `allow` that names a protocol or a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
+An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, a second at the connect layer `LayerALEAuthConnectV4`, named `plexd <chain> #<i> outbound`, and a third at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6`, `LayerALEAuthConnectV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6`, `plexd <chain> #<i> outbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all six layers. Only an `allow` that names a protocol or a port has no forward filter; see [What the rules govern](#what-the-rules-govern). `<i>` is the rule's position in the list the controller gets, in which the `Enforcer` has put the logged rules first; see [Log tags and rule order](./network-policy.md#log-tags-and-rule-order).
 
 | Rule field | `LayerALEAuthRecvAcceptV4`, `LayerALEAuthRecvAcceptV6` (inbound) | `LayerALEAuthConnectV4`, `LayerALEAuthConnectV6` (outbound) | `LayerIPForwardV4`, `LayerIPForwardV6` (forward) |
 |---|---|---|---|
@@ -243,6 +276,10 @@ netsh wfp show filters file=-
 ```
 
 The dump lists every filter in the engine. plexd's carry the names `plexd <chain> #<i> inbound`, `plexd <chain> #<i> outbound`, `plexd <chain> #<i> forward` and `plexd <chain> relay probe`, with ` v6` appended at the IPv6 layers, and sit in the sublayer `plexd policy`. Without `file=-` the command writes the same XML to `filters.xml` in the working directory.
+
+### Logged rules on Windows
+
+A rule with `log: true` is enforced on Windows like any other: `buildFilters` gives it the filters an untagged rule gets. plexd logs none of its connections, and every apply that holds a logged rule logs `policy connection logging unavailable, logged rules are enforced without it` at Warn with `chain` and the `error` `policy: wfp: connection logging is not available on Windows`; see [Connection logging](./network-policy.md#connection-logging). The filter engine does record a classify-allow net event under plexd's filter for each such connection while the keyword `FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW` is set, but on the `windows-latest` runner a `FwpmNetEventSubscribe1` subscription delivered none of them, only drop events, so plexd does not read them yet.
 
 ## NAT
 
@@ -299,6 +336,8 @@ Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<o
 | Deleting a chain's filters | `policy: wfp: apply rules: delete stale filters:`, `policy: wfp: flush chain "<chain>":`, `policy: wfp: delete chain "<chain>":` |
 | Closing the session | `policy: wfp: probe: close session:`, `policy: wfp: delete chain: close session:` |
 
+The connection logging failures are logged, never returned, so they do not change what `ApplyRules` returns. An open of the [pflog](#pflog) reader fails with `policy: pf: pflog:`, and Windows names `policy: wfp: connection logging is not available on Windows`, each as the `error` of `policy connection logging unavailable, logged rules are enforced without it`.
+
 | NAT failure | Prefix |
 |---|---|
 | Any leg of the macOS masquerade | `bridge: add NAT masquerade on "<iface>":`, `bridge: remove NAT masquerade on "<iface>":` |
@@ -316,7 +355,7 @@ The two failures `plexd up` aborts on, the pre-flight probe and the deny-by-defa
 
 ## Logging
 
-All entries carry `component=policy` for the filter operations and `component=bridge` for the NAT ones. All are at `Debug` except the two `Warn` lines and the one `Error` line.
+All entries carry `component=policy` for the filter operations and `component=bridge` for the NAT ones. All are at `Debug` except the lines the table marks with another level.
 
 | Message (`component=policy`) | Keys |
 |---|---|
@@ -338,6 +377,8 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` (`Warn`) | `chain`, `count` |
 | `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` (`Warn`) | `chain`, `count` |
 | `wfp rollback delete failed` (`Error`) | `filter`, `error` |
+| `policy connection logging unavailable, logged rules are enforced without it` (`Warn`, pf and WFP) | `error`, and `chain` on WFP |
+| `policy connection log reader stopped` (`Warn`, pf) | `error` |
 
 | Message (`component=bridge`) | Keys |
 |---|---|
@@ -347,20 +388,25 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `NAT masquerade removed` | `interface` |
 | `NAT masquerade not configured, idempotent success` (macOS) | `interface` |
 
-`count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger: every rule yields an inbound and an outbound filter per family, some a forward filter too, and every interface two relay probe permits. Three lines sit above `Debug`. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
+`count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger: every rule yields an inbound and an outbound filter per family, some a forward filter too, and every interface two relay probe permits. Three of the lines above `Debug` concern the forward path and the rollback. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
+
+The other two concern [connection logging](./network-policy.md#connection-logging). `policy connection logging unavailable, logged rules are enforced without it` is the line all three backends share, logged once per apply with a logged rule when the backend cannot report its connections, which on Windows is every such apply. `policy connection log reader stopped` reports a pflog reader that ended on a read error. The connection lines themselves, and the minute summary, come from the `ConnLogger`.
 
 ## Tests
 
 Both controllers reach the operating system through seams, so every rendered rule and every idempotent case runs on an ordinary unprivileged runner. macOS wires the package's recording runner in place of `pfctl`, which captures each invocation's arguments and its stdin, so a test pins the whole anchor text a change renders. Windows wires a `wfpEngine` fake in place of the session, which records the sublayer, the filters in the order they were added and the deletions, and can be armed to fail a chosen `AddRule`; PowerShell goes through the same recording runner. The fake refuses a filter whose condition names a field its layer does not have, as the engine does, from a per-layer list of the fields plexd uses: a protocol or a port at a forward layer fails a unit test rather than the real one.
 
-`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, and `block out quick on <if> from (<if>) to any`.
+`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, `block out quick on <if> from (<if>) to any`, and the logged forms `pass in log ... flags S/SA no state`, `pass out log ... keep state` and `pass in log ... no state`.
 
-Five tests drive the real host and are gated:
+The connection logging code has unit tests of its own. On macOS they pin the lines `renderRule` returns for a tagged rule of each protocol, the line numbers `render` maps to tags, `parsePflogRecord` over a hand-built `pfloghdr`, and that a reader which fails to open makes `ApplyRules` load the anchor without `log` and log the Warn line. On Windows a unit test pins that a logged rule gets the filters an untagged one gets and that every apply holding one logs the Warn line.
+
+Six tests drive the real host and are gated:
 
 | Test | Gate | Locally |
 |---|---|---|
 | `TestPFController_Real` (`pf_darwin_test.go`) | `PLEXD_TEST_REAL_PF=1` and `os.Geteuid() == 0` | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_Real$' ./internal/policy/` |
 | `TestPFController_RealTraffic` (`tuntraffic_darwin_test.go`) | The same | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_RealTraffic$' ./internal/policy/` |
+| `TestPFController_RealConnLog` (`tuntraffic_darwin_test.go`) | The same | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_RealConnLog$' ./internal/policy/` |
 | `TestWFPController_Real` (`wfp_windows_test.go`) | `PLEXD_TEST_REAL_WFP=1` and an elevated token | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run '^TestWFPController_Real$' ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealNAT` (`netnat_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealNAT ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealTraffic` (`tuntraffic_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealTraffic ./internal/policy/` from an elevated shell, with every Windows Firewall profile off |
@@ -393,4 +439,24 @@ and checks that:
 
 The SYN-ACK, the echo and the echo reply are replies to what r0 to r2 let in, so the checks prove each platform's reply path: connection tracking on Linux, the mirrors on macOS and the ALE flow on Windows. When the test ends it closes the device, which ends its reader, before it deletes the chain. The Windows Firewall blocks the unsolicited packets the test injects on its own, so the CI step turns every firewall profile off first with `Set-NetFirewallProfile -All -Enabled False`. plexd's filters sit in a sublayer of their own and do not depend on the Windows Firewall.
 
-CI runs all five; see [CI Workflow](../development/ci-workflow.md).
+`TestPFController_RealConnLog` and Linux's `TestNftablesController_RealConnLog` build the same harness, through `newTunTestHarness`, and run `runTunConnLogChecks` (`tunconnlog_test.go`). It sets a recording sink through `ConnReporter`, so the events it checks come from the backend's reader as the kernel reported them, and applies, in chain `plexd-logtest`:
+
+```text
+r0 tcp 10.255.247.2/32 → 10.255.247.1/32 port 7001  LogTag "7/0"
+r1 udp 10.255.247.2/32 → 10.255.247.1/32 port 7002  LogTag "7/1"
+r2 tcp 10.255.247.1/32 → 10.255.247.2/32 port 7006  LogTag "7/2"
+r3 tcp 10.255.247.2/32 → 10.255.247.1/32 port 7003
+r4 the default deny
+```
+
+and checks that:
+
+- a SYN from P:41001 to N:7001 draws a SYN-ACK and exactly one event `{"7/0", in, P, N, 6, 41001, 7001}` within 3 s, and no second event within 2 s;
+- a SYN from P:41002 to N:7003, which the untagged r3 allows, draws a SYN-ACK and no event within 2 s;
+- a datagram from P:41003 to N:7002 comes back and yields one event `{"7/1", in, P, N, 17, 41003, 7002}`. A second datagram on the same ports after the echo yields a second event on macOS, where `tunUDPLogsEveryPacket` holds, and none within 2 s on Linux;
+- a dial from N to P:7006 puts a SYN on the device and yields at least one event `{"7/2", out, N, P, 6, <any port>, 7006}`, and no event with another tag;
+- after a re-apply with r0 untagged, a SYN from P:41004 to N:7001 draws a SYN-ACK and no event within 2 s.
+
+The checks end with `DeleteChain("plexd-logtest")`, and the cleanup deletes the chain only when a check failed before that. `TestPFController_RealConnLog` also finds `pflog0` after the first tagged apply, and its events prove the line numbers of [Logged rules](#logged-rules).
+
+CI runs all six; see [CI Workflow](../development/ci-workflow.md).
