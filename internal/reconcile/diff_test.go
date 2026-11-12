@@ -228,7 +228,7 @@ func TestComputeDiff_PolicyFingerprintShortCircuit(t *testing.T) {
 				RevisionID:  "rev-2",
 				Fingerprint: "fp-same",
 				Rules: []api.PolicyRule{
-					{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+					{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
 				},
 			},
 		}
@@ -248,7 +248,7 @@ func TestComputeDiff_PolicyFingerprintShortCircuit(t *testing.T) {
 	})
 
 	t.Run("revision-only bump is not a change", func(t *testing.T) {
-		rules := []api.PolicyRule{{Action: "deny", Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}}
+		rules := []api.PolicyRule{{Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}}
 		desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-2", Fingerprint: "fp", Rules: rules}}
 		current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp", Rules: rules}}
 
@@ -260,7 +260,7 @@ func TestComputeDiff_PolicyFingerprintShortCircuit(t *testing.T) {
 	})
 
 	t.Run("fingerprint change is a change", func(t *testing.T) {
-		rules := []api.PolicyRule{{Action: "deny", Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}}
+		rules := []api.PolicyRule{{Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}}
 		desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-new", Rules: rules}}
 		current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-old", Rules: rules}}
 
@@ -287,7 +287,7 @@ func TestComputeDiff_PolicyNullToPopulated(t *testing.T) {
 // "" == "" would read as "no change" forever and freeze the firewall at the
 // first applied revision.
 func TestComputeDiff_PolicyEmptyFingerprintAlwaysChanged(t *testing.T) {
-	rules := []api.PolicyRule{{Action: "allow", Protocol: "tcp"}}
+	rules := []api.PolicyRule{{Protocol: "tcp"}}
 	desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "", Rules: rules}}
 	current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "", Rules: rules}}
 

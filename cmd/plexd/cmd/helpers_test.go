@@ -116,6 +116,20 @@ func startFakeAgent(t *testing.T, summary nodeapi.StateSummary) string {
 	return startTestSocketServer(t, mux)
 }
 
+// startFakePolicyAgent starts an agent stub that serves policy, encoded as
+// JSON, on GET /v1/policies, the route plexd policies reads.
+func startFakePolicyAgent(t *testing.T, policy any) string {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/policies", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(policy)
+	})
+
+	return startTestSocketServer(t, mux)
+}
+
 // overrideSocketPath sets socketPathOverride for the duration of the test
 // and restores it on cleanup.
 func overrideSocketPath(t *testing.T, path string) {

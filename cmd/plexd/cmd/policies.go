@@ -47,7 +47,7 @@ func runPolicies(cmd *cobra.Command, _ []string) error {
 	}
 
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "REVISION\tSRC\tDST\tPORT\tPROTOCOL\tACTION")
+	fmt.Fprintln(w, "REVISION\tSRC\tDST\tPORT\tPROTOCOL\tLOG")
 	for _, r := range policy.Rules {
 		port := "*"
 		if r.Ports != nil {
@@ -61,8 +61,12 @@ func runPolicies(cmd *cobra.Command, _ []string) error {
 		if r.Protocol != "" {
 			proto = r.Protocol
 		}
+		logged := "no"
+		if r.Log {
+			logged = "yes"
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			policy.RevisionID, r.SourceCIDR, r.DestinationCIDR, port, proto, r.Action)
+			policy.RevisionID, r.SourceCIDR, r.DestinationCIDR, port, proto, logged)
 	}
 	w.Flush()
 	return nil

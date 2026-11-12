@@ -21,43 +21,48 @@ func NewPolicyEngine(logger *slog.Logger) *PolicyEngine {
 	}
 }
 
-// BuildFirewallRules converts the merged policy's five-tuple rules into concrete
+// BuildFirewallRules converts the merged policy's rules into concrete
 // FirewallRule entries for the local node.
 //
-// The ruleset is ordered and nftables verdicts are terminal: the first matching
-// rule decides accept or drop. Dropping one rule out of the middle therefore
-// changes the verdict for the traffic it covered rather than merely omitting an
-// entry — a deny that carves an exception out of a following broad allow would
-// fail open. Every unparseable rule is therefore an error for the whole set, so
-// the caller keeps the previously installed ruleset and retries.
+// Every rule is an allow and rule order carries no meaning: a packet passes
+// when any rule allows it, and the default deny appended last drops the rest.
+// A rule that still carries the action key of the format before
+// plexsphere/plexsphere#1058 passes only when that action is allow. Any other
+// value, a deny from a control plane that predates the allow-only model
+// included, rejects the set, since enforcing it as an allow would open what
+// the operator denied.
 //
-// Actions allow and deny are kept and a log action is the sole skip: it is
-// observational only (the nftables layer has no log verdict) and non-terminating
-// in the control plane's policy language, so omitting it cannot change the
-// accept/drop outcome. Protocols tcp/udp/icmp are kept and any maps to ""
-// (match all). Both CIDRs must be parseable IPv4 prefixes — an empty string
-// reaches nftables as "match any address" and would silently widen the rule.
-// Ports are valid only for tcp/udp and must be a bounded, non-inverted range;
-// a zero or out-of-range port would drop the port match entirely (widening the
-// rule to every port) or wrap through uint16 onto an unrelated port.
+// DECISION: one untranslatable rule rejects the whole set, and the caller
+// keeps the previously installed ruleset. Under allow-only, skipping the rule
+// would only narrow the ruleset, but the node would then enforce a ruleset
+// that matches no revision, and a revision is reported as either applied or
+// rejected (plexd#177).
+//
+// Protocols tcp/udp/icmp are kept and any maps to "" (match all). Both CIDRs
+// must be parseable prefixes of one family, IPv4 or IPv6. An empty string
+// reaches the backends as "match any address" and would silently widen the
+// rule, and an IPv4-mapped IPv6 prefix would match no packet the operator
+// meant. Ports are valid only for tcp/udp and must be a bounded, non-inverted
+// range; a zero or out-of-range port would drop the port match entirely
+// (widening the rule to every port) or wrap through uint16 onto an unrelated
+// port.
+//
+// A rule's Log flag is read and the rule enforced like any other, but this
+// release logs nothing for it: one Info line per set says how many rules asked.
 //
 // The trailing default-deny rule is always appended — including when rules is
-// empty or nil — for a deny-by-default posture.
+// empty or nil — for a deny-by-default posture. It carries no addresses, so
+// every backend applies it to both families.
 func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) ([]FirewallRule, error) {
 	var fwRules []FirewallRule
+	logged := 0
 
 	for i, r := range rules {
-		var action string
-		switch r.Action {
-		case "allow", "deny":
-			action = r.Action
-		case "log":
-			e.logger.Warn("skipping log rule (observational only)",
-				"action", r.Action,
-			)
-			continue
-		default:
-			return nil, fmt.Errorf("policy: rule %d: unsupported action %q", i, r.Action)
+		if r.LegacyAction != nil && *r.LegacyAction != "allow" {
+			return nil, fmt.Errorf("policy: rule %d: unsupported action %q", i, *r.LegacyAction)
+		}
+		if r.Log {
+			logged++
 		}
 
 		var proto string
@@ -70,11 +75,17 @@ func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) 
 			return nil, fmt.Errorf("policy: rule %d: unsupported protocol %q", i, r.Protocol)
 		}
 
-		if err := validateCIDR(r.SourceCIDR); err != nil {
+		src, err := validateCIDR(r.SourceCIDR)
+		if err != nil {
 			return nil, fmt.Errorf("policy: rule %d: source_cidr: %w", i, err)
 		}
-		if err := validateCIDR(r.DestinationCIDR); err != nil {
+		dst, err := validateCIDR(r.DestinationCIDR)
+		if err != nil {
 			return nil, fmt.Errorf("policy: rule %d: destination_cidr: %w", i, err)
+		}
+		if src.Addr().Is4() != dst.Addr().Is4() {
+			return nil, fmt.Errorf("policy: rule %d: source_cidr %q and destination_cidr %q differ in address family",
+				i, r.SourceCIDR, r.DestinationCIDR)
 		}
 
 		// Ports are only valid for tcp/udp; a portless protocol with ports set
@@ -102,7 +113,7 @@ func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) 
 			Port:      port,
 			PortTo:    portTo,
 			Protocol:  proto,
-			Action:    action,
+			Action:    "allow",
 		}
 		if err := fw.Validate(); err != nil {
 			return nil, fmt.Errorf("policy: rule %d: %w", i, err)
@@ -110,14 +121,17 @@ func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) 
 		fwRules = append(fwRules, fw)
 	}
 
+	if logged > 0 {
+		e.logger.Info("policy rules ask for logging, which this release does not do",
+			"count", logged,
+		)
+	}
+
 	// Append the default-deny rule as the last rule to drop all unmatched
-	// traffic (deny-by-default posture).
+	// traffic (deny-by-default posture). Without addresses it covers IPv4 and
+	// IPv6 alike.
 	fwRules = append(fwRules, FirewallRule{
 		Interface: iface,
-		SrcIP:     "0.0.0.0/0",
-		DstIP:     "0.0.0.0/0",
-		Port:      0,
-		Protocol:  "",
 		Action:    "deny",
 	})
 
@@ -128,20 +142,21 @@ func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) 
 	return fwRules, nil
 }
 
-// validateCIDR checks that a policy rule address is a parseable IPv4 prefix.
-// The zero value is rejected explicitly: the nftables backend reads an empty
+// validateCIDR parses a policy rule address, which must be an IPv4 or IPv6
+// prefix. The zero value is rejected explicitly: the backends read an empty
 // address as "match any", so an omitted field would widen the rule instead of
-// narrowing it.
-func validateCIDR(cidr string) error {
+// narrowing it. An IPv4-mapped IPv6 prefix is rejected too: it names an IPv4
+// host in the IPv6 family, where no mesh packet carries it.
+func validateCIDR(cidr string) (netip.Prefix, error) {
 	if cidr == "" {
-		return fmt.Errorf("policy: firewall rule: address is empty")
+		return netip.Prefix{}, fmt.Errorf("policy: firewall rule: address is empty")
 	}
 	prefix, err := netip.ParsePrefix(cidr)
 	if err != nil {
-		return fmt.Errorf("policy: firewall rule: invalid address %q: %w", cidr, err)
+		return netip.Prefix{}, fmt.Errorf("policy: firewall rule: invalid address %q: %w", cidr, err)
 	}
-	if !prefix.Addr().Is4() {
-		return fmt.Errorf("policy: firewall rule: non-IPv4 address %q", cidr)
+	if prefix.Addr().Is4In6() {
+		return netip.Prefix{}, fmt.Errorf("policy: firewall rule: IPv4-mapped IPv6 address %q", cidr)
 	}
-	return nil
+	return prefix, nil
 }

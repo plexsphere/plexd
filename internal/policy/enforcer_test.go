@@ -2,6 +2,7 @@ package policy
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -118,7 +119,7 @@ func TestEnforcer_ApplyFirewallRulesSuccess(t *testing.T) {
 		RevisionID:  "rev-1",
 		Fingerprint: "fp-1",
 		Rules: []api.PolicyRule{
-			{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+			{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 		},
 	}
 
@@ -191,34 +192,47 @@ func TestEnforcer_ApplyFirewallRulesApplyRulesError(t *testing.T) {
 	}
 }
 
+// A revision the engine rejects never reaches the backend: neither EnsureChain,
+// which on Linux rewrites the table, nor ApplyRules runs. Every action but
+// allow, from the format before plexsphere/plexsphere#1058, is such a revision.
 func TestEnforcer_ApplyFirewallRulesInvalidRuleset(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	mock := &mockFirewallController{}
-	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
-	enf := NewEnforcer(eng, mock, cfg, testLogger())
+	for _, action := range []string{"deny", "log", "", "ALLOW", "quarantine"} {
+		t.Run(action, func(t *testing.T) {
+			eng := NewPolicyEngine(testLogger())
+			mock := &mockFirewallController{}
+			cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
+			enf := NewEnforcer(eng, mock, cfg, testLogger())
 
-	policy := &api.PolicySnapshot{
-		RevisionID:  "rev-bad",
-		Fingerprint: "fp-bad",
-		Rules: []api.PolicyRule{
-			{Action: "quarantine", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
-		},
-	}
+			policy := &api.PolicySnapshot{
+				RevisionID:  "rev-bad",
+				Fingerprint: "fp-bad",
+				Rules: []api.PolicyRule{
+					{LegacyAction: legacyAction(action), Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+				},
+			}
 
-	applied, err := enf.ApplyFirewallRules(policy, "wg0")
-	if err == nil {
-		t.Fatal("ApplyFirewallRules() error = nil, want error")
-	}
-	if applied {
-		t.Error("ApplyFirewallRules() applied = true, want false")
-	}
-	if !errors.Is(err, ErrInvalidRuleset) {
-		t.Errorf("error does not wrap ErrInvalidRuleset: %v", err)
-	}
-	// The previously installed chain must be left untouched — a revision that
-	// does not translate never reaches the backend.
-	if len(mock.applyRulesCalls) != 0 {
-		t.Errorf("ApplyRules called %d times, want 0", len(mock.applyRulesCalls))
+			applied, err := enf.ApplyFirewallRules(policy, "wg0")
+			if err == nil {
+				t.Fatal("ApplyFirewallRules() error = nil, want error")
+			}
+			if applied {
+				t.Error("ApplyFirewallRules() applied = true, want false")
+			}
+			if !errors.Is(err, ErrInvalidRuleset) {
+				t.Errorf("error does not wrap ErrInvalidRuleset: %v", err)
+			}
+			if !strings.Contains(err.Error(), "unsupported action") {
+				t.Errorf("error = %v, want one naming the unsupported action", err)
+			}
+			// The previously installed chain must be left untouched — a revision
+			// that does not translate never reaches the backend.
+			if len(mock.ensureChainCalls) != 0 {
+				t.Errorf("EnsureChain called %d times, want 0", len(mock.ensureChainCalls))
+			}
+			if len(mock.applyRulesCalls) != 0 {
+				t.Errorf("ApplyRules called %d times, want 0", len(mock.applyRulesCalls))
+			}
+		})
 	}
 }
 

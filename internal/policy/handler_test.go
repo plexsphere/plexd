@@ -62,7 +62,7 @@ func TestReconcileHandler_PolicyChangedApplies(t *testing.T) {
 
 	desired := &api.NodeStateSnapshot{
 		Policy: policySnapshot("fp",
-			api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+			api.PolicyRule{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 		),
 	}
 	diff := reconcile.StateDiff{PolicyChanged: true}
@@ -126,7 +126,7 @@ func TestReconcileHandler_InvalidRulesetDoesNotWedgeSnapshot(t *testing.T) {
 	// every handler re-run at the reconcile interval forever.
 	desired := &api.NodeStateSnapshot{
 		Policy: policySnapshot("fp-bad",
-			api.PolicyRule{Action: "quarantine", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+			api.PolicyRule{LegacyAction: legacyAction("quarantine"), Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
 		),
 	}
 	diff := reconcile.StateDiff{PolicyChanged: true}
