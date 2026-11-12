@@ -1132,11 +1132,18 @@ func runAgent(ctx context.Context) error {
 	}
 	metricsMgr := metrics.NewManager(cfg.Metrics, metricsCollectors, metricsReporter, identity.NodeID, logger)
 
-	// 14. Create log forwarding sources and forwarder.
+	// 14. Create log forwarding sources and forwarder. Without a platform
+	// source nothing reads plexd's own output back, as on Linux without
+	// journalctl in a container. The policy connection lines then reach the
+	// forwarder through a queue, and plexd's other lines stay on stderr.
 	hostname, _ := os.Hostname()
 	var logSources []logfwd.LogSource
 	if src := newSystemLogSource(hostname, logger); src != nil {
 		logSources = append(logSources, src)
+	} else if cfg.LogFwd.Enabled {
+		queue := logfwd.NewQueueSource(hostname)
+		logSources = append(logSources, queue)
+		enforcer.ConnLogger().ForwardTo(queue.Add)
 	}
 	for _, pattern := range cfg.LogFwd.FilePatterns {
 		logSources = append(logSources, logfwd.NewFileSource(pattern, hostname, logger))
@@ -1376,6 +1383,15 @@ func runAgent(ctx context.Context) error {
 		if err := logForwarder.Run(ctx); err != nil {
 			logger.Error("log forwarder stopped", "error", err)
 		}
+	}()
+
+	// 22a. Start the policy connection logger's summary loop. Once a minute it
+	// logs how many connection lines the rate limit dropped and how many
+	// records the firewall's reader lost.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		enforcer.ConnLogger().Run(ctx)
 	}()
 
 	// 23. Start audit forwarder.
