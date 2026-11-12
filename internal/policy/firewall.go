@@ -11,7 +11,6 @@ import (
 // build-tagged files that no single test compiles together, which is why the
 // text is shared here rather than repeated in each of them.
 const (
-	errNonIPv4Address = "non-IPv4 address %q"
 	errInvalidAddress = "invalid IP address %q"
 	errMappedAddress  = "IPv4-mapped IPv6 address %q"
 	errMixedFamily    = "source %q and destination %q differ in address family"
