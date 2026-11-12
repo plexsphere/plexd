@@ -44,6 +44,8 @@ Public Internet Clients
 
 Traffic from public internet clients arrives on per-rule TCP listeners, is proxied via bidirectional `io.Copy` relay to the target mesh peer address, and reaches mesh-internal services. For TLS terminate mode, the bridge decrypts TLS before forwarding plaintext. For passthrough mode, raw TCP bytes are forwarded without decryption.
 
+The bridge's dial to a target mesh peer is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). The policy therefore needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, and the bridge logs `bridge: ingress: dial target failed`.
+
 ## Config
 
 Ingress fields extend the existing bridge `Config` struct. Ingress requires bridge mode to be enabled (`Enabled=true`).

@@ -13,26 +13,37 @@ The Linux implementation is [`NftablesController`](./nftables-firewall.md).
 
 ## What the rules govern
 
-On all three platforms the rules govern everything that arrives on the mesh interface, whether the packet is delivered to the node itself or forwarded through it. A node rejects unsolicited mesh traffic to its own addresses until a rule allows it, because the ruleset ends in a default deny. What the node sends is not filtered on any platform; that is plexsphere/plexd#178.
+On all three platforms the rules govern everything that arrives on the mesh interface, whether the packet is delivered to the node itself or forwarded through it, and everything the node's own sockets send over it. A rule matches by its addresses. The control plane compiles every rule for both ends: the destination node's copy names the peer as the source, and the source node's copy names the node itself, so each copy matches one direction. A node rejects unsolicited mesh traffic to its own addresses until a rule allows it, and drops what it sends to a mesh address until a rule allows that too, because the ruleset ends in a default deny. Replies to a connection the policy let in leave without a policy rule of their own on Linux and Windows, and on macOS for tcp, udp and icmp; see below.
+
+What the node forwards into the mesh is not filtered on its way out, on any platform. On Linux such a packet takes the forward hook, whose chain matches the interface it arrived on. On macOS the default deny's `block out` line names the interface's own addresses as the source, which a forwarded packet does not carry. On Windows forwarded traffic never reaches `ALE_AUTH_CONNECT`.
+
+On every platform the node can send UDP to port 9, `RelayProbePort`, over the mesh interface without a rule, ahead of the policy rules. That is plexd's [relay liveness probe](./wireguard.md#relay-liveness-probe). Any local process can use the exemption, to any address the mesh routes, and the receiving node's inbound rules still apply.
 
 Every rule may name IPv4 or IPv6 prefixes. The default deny names no address and covers both families.
 
-On Linux `NftablesController` installs the same rules in an input chain and a forward chain, and connection tracking passes a packet in the reply direction of a tracked connection without a rule; see [nftables Firewall Controller](./nftables-firewall.md#connection-tracking).
+On Linux `NftablesController` installs the same rules in an input chain, a forward chain and an output chain, and connection tracking passes a packet in the reply direction of a tracked connection without a rule; see [nftables Firewall Controller](./nftables-firewall.md#connection-tracking).
 
-On macOS two lines precede the policy rules of every chain, once per interface the chain mentions:
+On macOS one line precedes the policy rules of every chain, once per interface the chain mentions, in order of first appearance:
 
 ```text
-pass out quick on utun4 proto tcp from (utun4) to any keep state
-pass out quick on utun4 from (utun4) to any no state
+pass out quick on utun4 proto udp from (utun4) to any port 9 no state
 ```
 
-Replies to TCP connections the node itself opened over the mesh pass because of the first line. It keeps state for each outbound flow, and the state entry matches the reply before the default deny is reached. The pair names no address family, so the node's own IPv6 TCP connections keep their replies as IPv4 ones do. `(utun4)` is the interface's own addresses as the kernel tracks them, not a snapshot taken when the anchor was loaded, so a mesh address assigned after the load needs no reload.
+It is the relay probe exemption. It names no address family, so it covers IPv4 and IPv6, and it keeps no state, so it lets nothing back in. `(utun4)` is the interface's own addresses as the kernel tracks them, not a snapshot taken when the anchor was loaded, so a mesh address assigned after the load needs no reload. Each policy rule then renders its own lines; see [The rendered anchor](#the-rendered-anchor).
 
-Only TCP keeps state. pf consults the state table ahead of the ruleset and a state entry is bidirectional, so a stateful rule covering every protocol would keep an inbound-initiated UDP or ICMP flow alive after the rule that allowed it was revoked: the node's own reply creates the entry, and every further packet of that flow matches it instead of the ruleset. pf's idle timeouts refresh on each packet, so an active flow would never expire. TCP is not affected, because the implicit `flags S/SA` pfctl puts on a stateful TCP pass rule means an outbound SYN-ACK creates no state.
+The node's own TCP connections keep state. An allow that names `tcp`, or no protocol, renders a `pass out ... proto tcp ... keep state` line, and the state entry matches the reply before the default deny is reached. A revoked rule therefore stops a Mac's established outbound TCP connection only when that connection ends.
 
-The cost is that a Mac's own UDP and ICMP flows over the mesh get no automatic return path: a reply arriving on the mesh interface is subject to the policy like any other inbound packet, so the policy has to allow it. This is the fail-closed side of the trade — a revoked rule takes effect at once, on every protocol.
+Only TCP keeps state. pf consults the state table ahead of the ruleset and a state entry is bidirectional, so a stateful rule covering every protocol would keep an inbound-initiated UDP or ICMP flow alive after the rule that allowed it was revoked: the node's own reply creates the entry, and every further packet of that flow matches it instead of the ruleset. pf's idle timeouts refresh on each packet, so an active flow would never expire. TCP is not affected, because the implicit `flags S/SA` pfctl puts on a stateful TCP pass rule means an outbound SYN-ACK creates no state. The node's own UDP and ICMP flows stop at their next packet once their rule is revoked.
 
-On Windows the forward path is narrower than the local one. `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6` carry interfaces and addresses, but neither a protocol nor a port: the layers have no `IP_PROTOCOL` field and no port field, and `github.com/tailscale/wf` refuses a condition on a field the layer does not have. `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` and `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6` carry the full five-tuple.
+The cost is that a Mac's own UDP and ICMP flows over the mesh get no automatic return path: a reply arriving on the mesh interface is subject to the policy like any other inbound packet, so the policy has to allow it. This is the fail-closed side of the trade: a revoked rule cuts what arrives at once, on every protocol.
+
+Replies to what a rule lets in leave through stateless mirror lines, with the rule's source and destination swapped. The inbound lines stay stateless so that a revoked rule cuts inbound traffic at once, which means pf can tell a reply from a new flow only by its shape. A TCP mirror carries `flags A/A`, which keeps the Mac from opening a TCP connection through it, and an ICMP mirror carries only replies and errors. A UDP mirror, however, lets the Mac send from the rule's port, or from any port for a rule without ports, to a peer that may reach it. Linux and Windows allow no such thing.
+
+The mirrors also carry less than Linux's connection tracking does. A reply in a protocol other than tcp, udp and icmp matches no mirror. Neither does an ICMP error the Mac sends from its own address about traffic it forwards, such as a time exceeded for a traceroute through it. Both meet the default deny unless a rule allows them from the node's own address.
+
+On Windows the node's own traffic is filtered at `FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `FWPM_LAYER_ALE_AUTH_CONNECT_V6`, which authorize the node's own outbound connections and the first packet of its other flows. Replies leave through the ALE flow the inbound accept authorized and need no outbound filter; see [Layers and conditions](#layers-and-conditions).
+
+On Windows the forward path is narrower than the local one. `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6` carry interfaces and addresses, but neither a protocol nor a port: the layers have no `IP_PROTOCOL` field and no port field, and `github.com/tailscale/wf` refuses a condition on a field the layer does not have. `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` and `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6` carry the full five-tuple. The two connect layers carry the protocol and the remote port as well.
 
 A rule left out of the forward layer is not narrowed to nothing: the traffic it covered is decided by the filters that remain, which end in the default deny. An **allow** that names a protocol or a port cannot be narrowed onto a layer without those fields, so it gets no forward filter, and the traffic it covered is dropped unless another rule allows it. Only an allow that names neither, one that matches on addresses alone, reaches the forward path. This fails closed, and an operator notices it: on a bridge or relay node, transit traffic such a rule allows is dropped. `ApplyRules` logs one `Warn` line per apply naming how many rules that affects, so the effect is not mistaken for a routing fault. The controller would install a **deny** that names a protocol or a port on the forward layer without them, which blocks every protocol and port between its addresses, a superset of what it asked for, and log a second `Warn` line counting such rules. The engine builds no such rule: its only deny is the default deny, which names neither.
 
@@ -53,26 +64,59 @@ Seven allow rules and the default deny render as:
 ```text
 # plexd policy anchor. Managed by plexd; edits are overwritten.
 # chain plexd-mesh
-pass out quick on utun4 proto tcp from (utun4) to any keep state
-pass out quick on utun4 from (utun4) to any no state
+pass out quick on utun4 proto udp from (utun4) to any port 9 no state
 pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state
+pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state
+pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state
+pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state
 pass in quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53:60 no state
+pass out quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53:60 no state
+pass out quick on utun4 inet proto udp from 10.1.0.0/24 port 53:60 to 10.0.0.0/24 no state
+pass out quick on utun4 inet proto icmp from 10.1.0.0/24 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state
 pass in quick on utun4 inet proto icmp from 10.0.0.0/24 to 10.1.0.0/24 no state
+pass out quick on utun4 inet proto icmp from 10.0.0.0/24 to 10.1.0.0/24 no state
+pass out quick on utun4 inet proto icmp from 10.1.0.0/24 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state
 pass in quick on utun4 inet from 10.0.0.9 to 10.1.0.0/24 no state
+pass out quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 keep state
+pass out quick on utun4 inet from 10.0.0.9 to 10.1.0.0/24 no state
+pass out quick on utun4 inet proto tcp from 10.1.0.0/24 to 10.0.0.9 flags A/A no state
+pass out quick on utun4 inet proto udp from 10.1.0.0/24 to 10.0.0.9 no state
+pass out quick on utun4 inet proto icmp from 10.1.0.0/24 to 10.0.0.9 icmp-type { echorep, unreach, timex, paramprob } no state
 pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to any port 22 no state
+pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to any port 22 keep state
+pass out quick on utun4 inet proto tcp from any port 22 to 10.0.0.0/24 flags A/A no state
+pass out quick on utun4 inet proto icmp from any to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state
 pass in quick on utun4 inet6 proto tcp from fd00::/64 to fd00::1 port 443 no state
+pass out quick on utun4 inet6 proto tcp from fd00::/64 to fd00::1 port 443 keep state
+pass out quick on utun4 inet6 proto tcp from fd00::1 port 443 to fd00::/64 flags A/A no state
+pass out quick on utun4 inet6 proto icmp6 from fd00::1 to fd00::/64 icmp6-type { echorep, unreach, toobig, timex, paramprob } no state
 pass in quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 no state
+pass out quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 no state
+pass out quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 icmp6-type { echorep, unreach, toobig, timex, paramprob } no state
 block in quick on utun4 from any to any
+block out quick on utun4 from (utun4) to any
 ```
+
+`render` opens the chain with the relay probe line. `renderRule` returns every line of one rule. An allow renders, in this order:
+
+1. A `pass in` line, which lets in what the rule allows.
+2. `pass out` lines for the node's own traffic: `tcp` with `keep state`, `udp` and `icmp` with `no state`. A rule without a protocol renders the `tcp` line and then a `no state` line for every protocol.
+3. Reply mirrors, with source and destination swapped: a `tcp` mirror with `flags A/A` for a rule that names `tcp` or no protocol, a `udp` mirror for one that names `udp` or no protocol, and for every allow the ICMP replies and errors of its family. A rule without addresses gets the ICMP mirror of both families.
+
+A deny renders a `block in` line and a `block out` line. The `block out` line names the interface's own addresses, `(utun4)`, in place of an empty source, so the default deny drops what the node sends and leaves alone what the Mac forwards out of the interface. The engine puts the default deny last, so its two `block` lines follow every `pass` line.
 
 | Element | Meaning |
 |---|---|
 | `# chain plexd-mesh` | pf has no user chains, so the chain is a comment. The name is what `ApplyRules`, `FlushChain` and `DeleteChain` address |
 | `quick` | The first matching rule is final, the first-match semantics the nftables backend has |
-| `no state` | Every packet stays subject to the current rules, so a revoked rule takes effect at once instead of after the last flow expires. The `pass out` pair keeps this true for UDP and ICMP as well |
-| `inet`, `inet6` | The family of the rule's addresses. A rule without addresses, the default deny, carries neither and matches both |
+| `no state` | Every packet stays subject to the current rules, so a revoked rule takes effect at once instead of after the last flow expires. Every `pass in` line, every mirror, the relay probe line and the node's own `udp`, `icmp` and protocol-less `pass out` lines carry it |
+| `keep state` | The node's own TCP connections. pfctl adds `flags S/SA`, so only the node's own SYN creates a state entry, never its SYN-ACK to an inbound connection. A revoked rule stops such a connection only when it ends |
+| `flags A/A` | A TCP mirror matches only a segment with ACK set, so the Mac cannot open a TCP connection through it |
+| `icmp-type { ... }`, `icmp6-type { ... }` | What an ICMP mirror lets the node send: the echo reply and the errors a host sends about a packet it received. IPv4 reports a packet too big for the path as a code of `unreach`, IPv6 as the type `toobig` |
+| `(utun4)` | The interface's own addresses as the kernel tracks them. The relay probe line and the default deny's `block out` line use it, so both match what the node sends and not what the Mac forwards |
+| `inet`, `inet6` | The family of the rule's addresses. A rule without addresses, the default deny, carries neither and matches both, as does the relay probe line. An ICMP mirror names its own family |
 | `icmp6` | Protocol `icmp` in an IPv6 rule, which means ICMPv6 |
-| `block` | The default deny, the only deny rule the engine builds. pf's default block policy is drop, what the nftables backend expresses as `VerdictDrop` |
+| `block in`, `block out` | The default deny, the only deny rule the engine builds. pf's default block policy is drop, what the nftables backend expresses as `VerdictDrop` |
 | `any` | An empty address field, `0.0.0.0/0` or `::/0`. Under `0.0.0.0/0` or `::/0` the family keyword stays, so the rule still matches only its own family |
 
 Chains are rendered in name order, so the same desired state always yields the same text. A `nat` rule, when one is configured, is rendered ahead of the chains, because pf requires translation rules before filter rules in a file.
@@ -130,7 +174,7 @@ sudo pfctl -a com.apple/plexd -s nat     # the masquerade rule, if one is config
 sudo pfctl -s References                 # every holder keeping pf enabled, plexd among them
 ```
 
-`pfctl` prints its own normalised form rather than the text plexd loaded: a `block` reads `block drop`, a single port reads `port = 443`, and a dynamic address pool carries a trailing `round-robin`.
+`pfctl` prints its own normalised form rather than the text plexd loaded: a `block` reads `block drop`, a single port reads `port = 443`, and a dynamic address pool carries a trailing `round-robin`. A `keep state` line reads `flags S/SA keep state`, `from any to any` without ports reads `all`, `icmp6` reads `ipv6-icmp`, and an `icmp-type` or `icmp6-type` list loads as one rule per type. The relay probe's port 9 may read `discard`, its `/etc/services` name.
 
 ## Windows: WFP
 
@@ -155,18 +199,22 @@ The weight is one below the maximum, which wireguard-windows claims for its kill
 
 ### Layers and conditions
 
-An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, and a second at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all four layers. Only an `allow` that names a protocol or a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
+An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, a second at the connect layer `LayerALEAuthConnectV4`, named `plexd <chain> #<i> outbound`, and a third at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6`, `LayerALEAuthConnectV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6`, `plexd <chain> #<i> outbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all six layers. Only an `allow` that names a protocol or a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
 
-| Rule field | `LayerALEAuthRecvAcceptV4`, `LayerALEAuthRecvAcceptV6` (inbound) | `LayerIPForwardV4`, `LayerIPForwardV6` (forward) |
-|---|---|---|
-| `Interface` | `FieldIPLocalInterface` equals the LUID | `FieldSourceInterfaceIndex` equals the index |
-| `SrcIP` | `FieldIPRemoteAddress` | `FieldIPSourceAddress` |
-| `DstIP` | `FieldIPLocalAddress` | `FieldIPDestinationAddress` |
-| `Protocol` | `FieldIPProtocol`; `icmp` is `IPProtoICMP` at the V4 layers and `IPProtoICMPV6` at the V6 layers | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
-| `Port`, `PortTo` | `FieldIPLocalPort`, an equality or a `wf.Range` | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
-| `Action` | `wf.ActionPermit` or `wf.ActionBlock` | The same |
+| Rule field | `LayerALEAuthRecvAcceptV4`, `LayerALEAuthRecvAcceptV6` (inbound) | `LayerALEAuthConnectV4`, `LayerALEAuthConnectV6` (outbound) | `LayerIPForwardV4`, `LayerIPForwardV6` (forward) |
+|---|---|---|---|
+| `Interface` | `FieldIPLocalInterface` equals the LUID | `FieldIPLocalInterface` equals the LUID | `FieldSourceInterfaceIndex` equals the index |
+| `SrcIP` | `FieldIPRemoteAddress` | `FieldIPLocalAddress` | `FieldIPSourceAddress` |
+| `DstIP` | `FieldIPLocalAddress` | `FieldIPRemoteAddress` | `FieldIPDestinationAddress` |
+| `Protocol` | `FieldIPProtocol`; `icmp` is `IPProtoICMP` at the V4 layers and `IPProtoICMPV6` at the V6 layers | `FieldIPProtocol`, as inbound | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
+| `Port`, `PortTo` | `FieldIPLocalPort`, an equality or a `wf.Range` | `FieldIPRemotePort`, an equality or a `wf.Range` | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
+| `Action` | `wf.ActionPermit` or `wf.ActionBlock` | The same | The same |
 
-Windows delivers a packet locally only when its destination is an address of the arrival interface, so the local interface is the arrival interface, the `iifname` the Linux chain matches. `wfpPrefix` parses every address with `parseRuleAddr`, which the three backends share. An empty address field, `0.0.0.0/0` or `::/0` yields no address condition; the layer alone selects the family. An IPv4 address is matched as an address and mask. An IPv6 address is matched as the range from its prefix's first to its last address, which matches the same packets: `github.com/tailscale/wf` builds a filter in an allocator that never aligns, and the 17-byte IPv6 address-and-mask struct would leave the rest of the filter on an odd address, which the race detector's pointer checks reject. `netsh wfp show filters` therefore lists IPv6 addresses as ranges. A rule with an empty interface name is rejected: a filter without an interface condition would govern every adapter of the host.
+Windows delivers a packet locally only when its destination is an address of the arrival interface, so the local interface is the arrival interface, the `iifname` the Linux chain matches. Windows sends a packet only from an address of the interface it leaves through, so at the connect layers the local interface is the outgoing interface, the `oifname` the Linux output chain matches. There the rule's source is the node's side of the flow and its destination the remote side. `wfpPrefix` parses every address with `parseRuleAddr`, which the three backends share. An empty address field, `0.0.0.0/0` or `::/0` yields no address condition; the layer alone selects the family. An IPv4 address is matched as an address and mask. An IPv6 address is matched as the range from its prefix's first to its last address, which matches the same packets: `github.com/tailscale/wf` builds a filter in an allocator that never aligns, and the 17-byte IPv6 address-and-mask struct would leave the rest of the filter on an odd address, which the race detector's pointer checks reject. `netsh wfp show filters` therefore lists IPv6 addresses as ranges. A rule with an empty interface name is rejected: a filter without an interface condition would govern every adapter of the host.
+
+`ALE_AUTH_CONNECT` authorizes the node's own outbound connections and the first packet of its other flows. Replies need no outbound filter: once `ALE_AUTH_RECV_ACCEPT` authorizes a flow, its packets pass in both directions without another classification, and ICMP error messages never reach the ALE layers. Microsoft describes both in [ALE Stateful Filtering](https://learn.microsoft.com/en-us/windows/win32/fwp/ale-stateful-filtering). Forwarded traffic never reaches `ALE_AUTH_CONNECT`, so what the node forwards into the mesh is not filtered on its way out.
+
+Ahead of the rule filters, every interface the rules name gets two relay probe permits, once: `plexd <chain> relay probe` at `LayerALEAuthConnectV4` and `plexd <chain> relay probe v6` at `LayerALEAuthConnectV6`. Their conditions are `FieldIPLocalInterface` equal to the LUID, `FieldIPProtocol` equal to `wf.IPProtoUDP` and `FieldIPRemotePort` equal to `RelayProbePort`, 9. They name no address, since the probe goes to whichever peer is relayed. Their weight is above rule 0's, so no rule of the chain decides the probe; see [Weights and the epoch](#weights-and-the-epoch).
 
 ### Weights and the epoch
 
@@ -176,13 +224,13 @@ Within a sublayer WFP evaluates the heaviest filter first and the first terminat
 weight := uint64(e)<<32 | uint64(n-i)
 ```
 
-Rule 0 is the heaviest of its own apply, and the epoch in the high half makes every filter of a newer apply outweigh every filter of an older one. `ApplyRules` builds its filters in `epoch+1` and installs them all before it deletes the ones the chain held, so the chain is never unfiltered in between and the new decisions win while both sets are installed. The weight stays below 2^60 for 2^28 applies, which is what a `FWP_UINT64` weight accepts.
+Here `i` is the index of the rule, and all filters of one rule share its weight. The relay probe permits take `i = -1`, `wfpWeight(e, n, -1)`, which outweighs rule 0. Rule 0 is the heaviest of its own apply, and the epoch in the high half makes every filter of a newer apply outweigh every filter of an older one. `ApplyRules` builds its filters in `epoch+1` and installs them all before it deletes the ones the chain held, so the chain is never unfiltered in between and the new decisions win while both sets are installed. The weight stays below 2^60 for 2^28 applies, which is what a `FWP_UINT64` weight accepts.
 
 Every rule is translated before the first filter is installed, so a rule the engine would reject fails without leaving half a ruleset behind. When an `AddRule` fails anyway, every filter that call installed is deleted again and the chain keeps the ones it had.
 
 ### Interface resolution
 
-A rule carries the friendly name, the name the configuration holds and the one a Wintun adapter is created under. `net.InterfaceByName` resolves it to an interface index and `winipcfg.LUIDFromIndex` turns that index into the LUID. The forward layer matches the index, the local-delivery layer the LUID. Each name is resolved once per apply, because most rules of a chain name the same interface and every lookup is a syscall.
+A rule carries the friendly name, the name the configuration holds and the one a Wintun adapter is created under. `net.InterfaceByName` resolves it to an interface index and `winipcfg.LUIDFromIndex` turns that index into the LUID. The forward layer matches the index, the local-delivery and connect layers the LUID. Each name is resolved once per apply, because most rules of a chain name the same interface and every lookup is a syscall.
 
 ### Soft permits
 
@@ -194,7 +242,7 @@ A rule carries the friendly name, the name the configuration holds and the one a
 netsh wfp show filters file=-
 ```
 
-The dump lists every filter in the engine. plexd's carry the names `plexd <chain> #<i> inbound` and `plexd <chain> #<i> forward`, with ` v6` appended at the IPv6 layers, and sit in the sublayer `plexd policy`. Without `file=-` the command writes the same XML to `filters.xml` in the working directory.
+The dump lists every filter in the engine. plexd's carry the names `plexd <chain> #<i> inbound`, `plexd <chain> #<i> outbound`, `plexd <chain> #<i> forward` and `plexd <chain> relay probe`, with ` v6` appended at the IPv6 layers, and sit in the sublayer `plexd policy`. Without `file=-` the command writes the same XML to `filters.xml` in the working directory.
 
 ## NAT
 
@@ -247,7 +295,7 @@ Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<o
 | Adding the sublayer | `policy: wfp: <op>: add sublayer:` |
 | An empty chain name | `policy: wfp: ensure chain: chain name is empty`, `policy: wfp: apply rules: chain name is empty` |
 | A rule that does not translate | `policy: wfp: apply rules: rule <i>:` |
-| Installing a filter | `policy: wfp: apply rules: add filter "plexd <chain> #<i> inbound":` |
+| Installing a filter | `policy: wfp: apply rules: add filter "<name>":`, with the filter's name, such as `plexd <chain> #<i> inbound` or `plexd <chain> relay probe` |
 | Deleting a chain's filters | `policy: wfp: apply rules: delete stale filters:`, `policy: wfp: flush chain "<chain>":`, `policy: wfp: delete chain "<chain>":` |
 | Closing the session | `policy: wfp: probe: close session:`, `policy: wfp: delete chain: close session:` |
 
@@ -299,24 +347,50 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `NAT masquerade removed` | `interface` |
 | `NAT masquerade not configured, idempotent success` (macOS) | `interface` |
 
-`count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger whenever a rule reaches the forward layer too. Three lines sit above `Debug`. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
+`count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger: every rule yields an inbound and an outbound filter per family, some a forward filter too, and every interface two relay probe permits. Three lines sit above `Debug`. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
 
 ## Tests
 
 Both controllers reach the operating system through seams, so every rendered rule and every idempotent case runs on an ordinary unprivileged runner. macOS wires the package's recording runner in place of `pfctl`, which captures each invocation's arguments and its stdin, so a test pins the whole anchor text a change renders. Windows wires a `wfpEngine` fake in place of the session, which records the sublayer, the filters in the order they were added and the deletions, and can be armed to fail a chosen `AddRule`; PowerShell goes through the same recording runner. The fake refuses a filter whose condition names a field its layer does not have, as the engine does, from a per-layer list of the fields plexd uses: a protocol or a port at a forward layer fails a unit test rather than the real one.
 
-`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root.
+`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, and `block out quick on <if> from (<if>) to any`.
 
-Three tests drive the real host and are gated:
+Five tests drive the real host and are gated:
 
 | Test | Gate | Locally |
 |---|---|---|
-| `TestPFController_Real` (`pf_darwin_test.go`) | `PLEXD_TEST_REAL_PF=1` and `os.Geteuid() == 0` | `sudo PLEXD_TEST_REAL_PF=1 go test -run TestPFController_Real ./internal/policy/` |
-| `TestWFPController_Real` (`wfp_windows_test.go`) | `PLEXD_TEST_REAL_WFP=1` and an elevated token | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_Real ./internal/policy/` from an elevated shell |
+| `TestPFController_Real` (`pf_darwin_test.go`) | `PLEXD_TEST_REAL_PF=1` and `os.Geteuid() == 0` | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_Real$' ./internal/policy/` |
+| `TestPFController_RealTraffic` (`tuntraffic_darwin_test.go`) | The same | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_RealTraffic$' ./internal/policy/` |
+| `TestWFPController_Real` (`wfp_windows_test.go`) | `PLEXD_TEST_REAL_WFP=1` and an elevated token | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run '^TestWFPController_Real$' ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealNAT` (`netnat_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealNAT ./internal/policy/` from an elevated shell |
+| `TestWFPController_RealTraffic` (`tuntraffic_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealTraffic ./internal/policy/` from an elevated shell, with every Windows Firewall profile off |
 
-`TestPFController_Real` loads an anchor naming `plexd99`, an interface no host has, with an IPv6 rule and the default deny among its rules, takes the pf reference, reads the filter and nat rules back with `pfctl -a com.apple/plexd -s rules` and `-s nat`, and finds the `inet6` rule and a block rule without an address there. It then deletes the chain and asserts the anchor is empty and the token released. A host that had pf disabled is left disabled. The variable gates it in addition to the effective uid, so `sudo go test ./...` on a developer's Mac does not enable pf on their host.
+`TestPFController_Real` loads an anchor naming `plexd99`, an interface no host has, with an IPv6 rule and the default deny among its rules, takes the pf reference, reads the filter and nat rules back with `pfctl -a com.apple/plexd -s rules` and `-s nat`, and finds the `inet6` rule and a block rule without an address there. In pfctl's printed form it also finds a `keep state` outbound line, a `flags A/A` mirror, both ICMP mirrors, `block drop out quick on plexd99 from (plexd99) to any`, and the relay probe line as the only `pass out` line from `(plexd99)`. It then deletes the chain and asserts the anchor is empty and the token released. A host that had pf disabled is left disabled. The variable gates it in addition to the effective uid, so `sudo go test ./...` on a developer's Mac does not enable pf on their host.
 
-`TestWFPController_Real` installs filters for prefixes no host carries, IPv6 rules among them, one of which names addresses alone, and the default deny, which shows that the filter engine accepts filters at the V6 layers, an IPv6 prefix at `FWPM_LAYER_IPFORWARD_V6` included. It enumerates plexd's filters through a session of its own, checks that the allows naming a protocol or a port got no forward filter, and pins `FWP_E_FILTER_NOT_FOUND` by deleting a filter that is not there. A run that fails with the default deny installed first replaces the ruleset with the allow of everything alone and then deletes the chain, so the deny never stands alone on the runner's interface. `TestWFPController_RealNAT` creates the NetNat object for `10.255.252.0/30`, reads the prefix back, and repeats both the add and the remove to prove they are idempotent — the second read after the removal is what proves the absent case is a success with no output rather than a localized error.
+`TestWFPController_Real` installs filters for prefixes no host carries, IPv6 rules among them, one of which names addresses alone, and the default deny, which shows that the filter engine accepts filters at the V6 layers, an IPv6 prefix at `FWPM_LAYER_IPFORWARD_V6` included. It enumerates plexd's filters through a session of its own, checks that the allows naming a protocol or a port got no forward filter, and pins `FWP_E_FILTER_NOT_FOUND` by deleting a filter that is not there. It finds a `#<i> outbound` filter at `LayerALEAuthConnectV4` for every IPv4 rule, a `#<i> outbound v6` filter at `LayerALEAuthConnectV6` for every IPv6 rule, and the two relay probe permits once, which shows that the engine takes plexd's conditions at the connect layers. It also checks that the outbound filters of its allow of everything are permits. It cannot read their weights back: `github.com/tailscale/wf` declares the union of `rawContext` and `providerContextKey` in `FWPM_FILTER0` as two fields, so it reads `effectiveWeight` 8 bytes off and reports 0 for every filter. That the allow outweighs the default deny rests on the unit tests, which pin every filter's weight through the fake engine, and on `TestWFPController_RealTraffic`, which shows on the real engine that a permit at `ALE_AUTH_CONNECT` outweighs the default deny. A run that fails with the default deny installed first replaces the ruleset with the allow of everything alone and then deletes the chain, so the deny never stands alone on the runner's interface. `TestWFPController_RealNAT` creates the NetNat object for `10.255.252.0/30`, reads the prefix back, and repeats both the add and the remove to prove they are idempotent — the second read after the removal is what proves the absent case is a success with no output rather than a localized error.
 
-CI runs all three; see [CI Workflow](../development/ci-workflow.md).
+The two traffic tests and Linux's `TestNftablesController_RealTraffic` (see [nftables Firewall Controller](./nftables-firewall.md#tests)) run the same checks, `runTunTrafficChecks` in `tuntraffic_test.go`. Each test creates a TUN device, puts node N's address 10.255.247.1 on it, and hands the checks a `tunHarness`: the controller, the device, the offset the device needs in front of each packet, and the interface name the rules carry. The test plays peer P, 10.255.247.2, behind the device: a packet it writes into the device arrives at N from P, and what N sends to P comes out of the device for the test to read. No other test uses this prefix. `TestPFController_RealTraffic` creates a `utun` and runs `/sbin/ifconfig <utun> inet 10.255.247.1 10.255.247.2 up`, with an offset of 4 for the address family wireguard-go's utun writes in front of each packet. `TestWFPController_RealTraffic` writes `wintun.dll` beside the test binary with `wintundll.Ensure`, creates the adapter `plexd-fwtest`, and assigns 10.255.247.1/30 through `winipcfg`, with an offset of 0.
+
+N listens on TCP 7001 and 7003 and echoes UDP on 7002. As a control, before any chain exists, a SYN from P to N:7001 must draw a SYN-ACK within 3 s. Otherwise the test fails with `the host answers nothing through the test device without plexd's filters`. The test then applies, in chain `plexd-test`:
+
+```text
+r0 tcp  10.255.247.2/32 → 10.255.247.1/32 port 7001
+r1 udp  10.255.247.2/32 → 10.255.247.1/32 port 7002
+r2 icmp 10.255.247.2/32 → 10.255.247.1/32
+r3 udp  10.255.247.1/32 → 10.255.247.2/32 port 7005
+r4 tcp  10.255.247.1/32 → 10.255.247.2/32 port 7006
+r5 the default deny
+```
+
+and checks that:
+
+- a SYN from P to N:7001 draws a SYN-ACK, and a SYN to N:7003, where N listens, draws no SYN-ACK within 2 s;
+- a datagram from P to N:7002 comes back as N's echo;
+- an echo request from P draws an echo reply with the same id and sequence;
+- a datagram N sends to P:7005 comes out of the device, and one to P:7007 does not within 2 s;
+- a dial from N to P:7006 puts a SYN on the device, and a dial to P:7008 does not within 2 s;
+- a datagram N sends to P:9, which no rule names, comes out of the device.
+
+The SYN-ACK, the echo and the echo reply are replies to what r0 to r2 let in, so the checks prove each platform's reply path: connection tracking on Linux, the mirrors on macOS and the ALE flow on Windows. When the test ends it closes the device, which ends its reader, before it deletes the chain. The Windows Firewall blocks the unsolicited packets the test injects on its own, so the CI step turns every firewall profile off first with `Set-NetFirewallProfile -All -Enabled False`. plexd's filters sit in a sublayer of their own and do not depend on the Windows Firewall.
+
+CI runs all five; see [CI Workflow](../development/ci-workflow.md).

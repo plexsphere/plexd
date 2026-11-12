@@ -48,6 +48,8 @@ Public Internet Clients
 
 SNIRouter accepts TCP connections, peeks at the TLS ClientHello to extract the SNI hostname, looks up the matching backend route, and proxies the full connection (including the replayed peeked bytes) to the backend via bidirectional `io.Copy`. ACMEManager integrates with IngressManager to provide automatic TLS termination for ingress rules using the `acme` mode.
 
+When a route's backend is on a mesh peer, SNIRouter's dial to it is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). The policy therefore needs a rule that allows TCP from the bridge's mesh IP to the backend's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, and SNIRouter logs `bridge: sni: dial backend failed`.
+
 ## ACMEConfig
 
 `ACMEConfig` holds configuration for automatic TLS certificate management via the ACME protocol.

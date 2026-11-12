@@ -42,7 +42,7 @@ The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. T
 | Field       | Type     | Default          | Description                              |
 |-------------|----------|------------------|------------------------------------------|
 | `Enabled`   | `*bool`  | `true` (nil)     | Whether policy enforcement is active     |
-| `ChainName` | `string` | `plexd-mesh`     | Prefix of the two Linux base chains, `<ChainName>-input` and `<ChainName>-forward`; the chain's comment line in the pf anchor on macOS, the prefix of the WFP filter names on Windows |
+| `ChainName` | `string` | `plexd-mesh`     | Prefix of the three Linux base chains, `<ChainName>-input`, `<ChainName>-forward` and `<ChainName>-output`; the chain's comment line in the pf anchor on macOS, the prefix of the WFP filter names on Windows |
 
 ```go
 cfg := policy.Config{}
@@ -87,6 +87,8 @@ type FirewallRule struct {
 
 An address field holds a prefix or a single address, IPv4 or IPv6. The two fields of a rule name one family, and a rule with both empty matches both families. `0.0.0.0/0` and `::/0` match every address of their family and nothing of the other. The engine builds `allow` rules and one `deny`, the default deny, which carries no address.
 
+A backend applies each rule in both directions: to what arrives on `Interface`, delivered to the node or forwarded through it, and to what the node's own sockets send over `Interface`. A rule matches by its addresses. The control plane compiles every authored rule for both ends (plexsphere/plexsphere#1056): the destination node gets a copy that names the source as sender, and the source node gets one that names itself. Each copy therefore matches one direction. `FirewallRule` has no direction field. The engine would need the node's own mesh address to tag a rule inbound or outbound, and it does not receive that address.
+
 ### Validation Rules
 
 | Field      | Rule                                          | Error Message                                                    |
@@ -121,9 +123,11 @@ type FirewallController interface {
 |---------------|----------------------------------------------------------|
 | `Probe`       | Reports whether the backend is usable, without changing kernel state |
 | `EnsureChain` | Creates the named chain if it does not already exist     |
-| `ApplyRules`  | Replaces all rules in the named chain atomically         |
+| `ApplyRules`  | Replaces all rules in the named chain atomically, for traffic in both directions: what arrives on a rule's interface and what the node itself sends over it |
 | `FlushChain`  | Removes all rules from the named chain                   |
 | `DeleteChain` | Deletes the named chain; idempotent on non-existent chain|
+
+`RelayProbePort` is 9, the UDP port of plexd's [relay liveness probe](./wireguard.md#relay-liveness-probe). Every backend lets the node send UDP to this port over the mesh interface without a rule, ahead of the policy rules. Any local process can do so, to any address the mesh routes, and the receiving node's inbound rules still apply. Without the exemption a narrow policy would fail every probe send, and plexd would notice a dead relay only once the handshake went stale.
 
 ## PolicyEngine
 
@@ -284,9 +288,10 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 > **Note:** The policy enforcement model is under active development. The behavior described here reflects the current design and may change in future versions.
 
 - Policy changes are signalled by the control plane via the `policy_updated` SSE event, which triggers a reconcile; the merged policy itself is pulled in the `NodeStateSnapshot` envelope.
-- Filtering operates at **L3/L4** (CIDR, port, protocol) on the mesh interface: an nftables input chain and forward chain on `plexd0` on Linux, pf rules on the kernel's `utunN` on macOS, WFP filters on the Wintun adapter on Windows.
-- On all three platforms the rules govern mesh traffic addressed to the node itself as well as the mesh traffic it forwards, so a node rejects unsolicited mesh traffic to its own addresses until a rule allows it; see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern). On Linux the replies to a connection the node, or a host behind it, opened pass through connection tracking without a rule of their own; see [Connection Tracking](./nftables-firewall.md#connection-tracking). On macOS only TCP keeps state.
-- What a node sends over the mesh is not filtered. That is plexsphere/plexd#178.
+- Filtering operates at **L3/L4** (CIDR, port, protocol) on the mesh interface: an nftables input chain, forward chain and output chain on `plexd0` on Linux, pf rules on the kernel's `utunN` on macOS, WFP filters on the Wintun adapter on Windows.
+- On all three platforms the rules govern mesh traffic addressed to the node itself, the mesh traffic it forwards, and what the node's own sockets send over the mesh. A node therefore rejects unsolicited mesh traffic to its own addresses until a rule allows it, and it drops what it sends to a mesh address until a rule allows that too; see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern). On Linux the replies to a connection the node, or a host behind it, opened pass through connection tracking without a rule of their own, and so do the replies the node sends to a connection the policy let in; see [Connection Tracking](./nftables-firewall.md#connection-tracking). On macOS only TCP keeps state: the node's own TCP connections keep their replies, and the replies to what a rule lets in leave through stateless mirror lines. On Windows those replies leave through the ALE flow the inbound accept authorized.
+- What the node forwards into the mesh is not filtered on its way out: traffic from a user-access client, a site-to-site peer or a host behind a bridge, and on Linux a container or Pod masqueraded onto the node's mesh address. On Linux the output chain also lets out unfiltered what leaves the mesh interface from a source that is not one of its addresses, such as a Pod's packet IPVS sends to a Service endpoint behind the mesh; see [Connection Tracking](./nftables-firewall.md#connection-tracking).
+- plexd's relay liveness probe, UDP to port 9 (`RelayProbePort`), leaves the mesh interface without a rule on every platform; see [Relay liveness probe](./wireguard.md#relay-liveness-probe).
 - Every rule is an allow and rule order carries no meaning. The default stance is **deny-all**: the ruleset always ends with a default-deny rule that covers IPv4 and IPv6, and a `null` policy applies the default-deny-only ruleset.
 - Rules may name IPv4 or IPv6 prefixes on Linux, macOS and Windows. A peer's allowed IPs are its IPv4 mesh address alone today, so an IPv6 rule governs IPv6 traffic only once the mesh carries it.
 - Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped, not node-ID references.
