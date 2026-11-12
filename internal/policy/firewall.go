@@ -66,9 +66,31 @@ func familyOf(prefix netip.Prefix) addrFamily {
 	return familyIPv6
 }
 
+// RelayProbePort is the UDP port of plexd's relay liveness probe
+// (relayProbePort in internal/wireguard/dial.go).
+//
+// DECISION: every backend lets the node send UDP to this port over the mesh
+// interface without a rule, ahead of the policy rules (author, 2026-11-12,
+// #178). Any local process can do so, to any address the mesh routes,
+// and the receiving node's inbound rules still apply. Without the exemption a
+// narrow policy fails every probe send, and plexd notices a dead relay only
+// once the handshake goes stale.
+const RelayProbePort = 9
+
 // FirewallRule describes a single packet filter rule. An address field holds
 // a prefix or a single address of either family; both fields together name one
 // family, and a rule with both empty matches both.
+//
+// A backend applies each rule to what arrives on Interface, delivered to the
+// node or forwarded through it, and to what the node's own sockets send over
+// Interface. A rule matches by its addresses. The control plane compiles every
+// authored rule for both ends (plexsphere/plexsphere#1056): the destination
+// node gets a copy naming the source as sender, the source node one naming
+// itself, so each copy matches one direction.
+//
+// DECISION: a rule carries no direction. The rejected alternative, the engine
+// tagging each rule inbound or outbound, needs the node's own mesh address,
+// which the engine does not receive.
 type FirewallRule struct {
 	Interface string // network interface name
 	SrcIP     string // source IP (CIDR or single IP); "" matches every address
@@ -150,7 +172,9 @@ type FirewallController interface {
 	Probe() error
 	// EnsureChain creates the named iptables chain if it does not already exist.
 	EnsureChain(chain string) error
-	// ApplyRules replaces all rules in the named chain atomically.
+	// ApplyRules replaces all rules of the named chain atomically, for
+	// traffic in both directions: what arrives on a rule's interface and what
+	// the node itself sends over it.
 	ApplyRules(chain string, rules []FirewallRule) error
 	// FlushChain removes all rules from the named chain.
 	FlushChain(chain string) error

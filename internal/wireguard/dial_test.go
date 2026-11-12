@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
@@ -1750,6 +1751,16 @@ func TestSendRelayProbe(t *testing.T) {
 		if err := SendRelayProbe(tc.addr); err == nil || err.Error() != tc.want {
 			t.Errorf("SendRelayProbe(%v) = %v, want %q", tc.addr, err, tc.want)
 		}
+	}
+}
+
+// The policy backends exempt the probe's port from outbound filtering. They
+// cannot import this package, so this test keeps the two constants in step: a
+// probe sent to a port the backends do not exempt would be dropped under any
+// policy without a rule for it.
+func TestRelayProbePortIsPolicyExempt(t *testing.T) {
+	if relayProbePort != policy.RelayProbePort {
+		t.Errorf("relayProbePort = %d, want policy.RelayProbePort %d", relayProbePort, policy.RelayProbePort)
 	}
 }
 
