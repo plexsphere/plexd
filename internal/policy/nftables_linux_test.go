@@ -33,80 +33,92 @@ func TestNewNftablesController(t *testing.T) {
 	}
 }
 
-func TestDeleteChainNonExistent(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+// The tests below that call the controller run inside inTestNetns: as root
+// they work in a network namespace of their own and leave the host's ruleset
+// alone, and unprivileged they run in place and see the permission errors.
 
-	// Deleting a non-existent chain should be idempotent and return nil.
-	// This requires CAP_NET_ADMIN; skip if we get a permission error.
-	err := ctrl.DeleteChain("plexd-test-nonexistent")
-	if err != nil {
-		t.Skipf("skipping: requires elevated privileges: %v", err)
-	}
+func TestDeleteChainNonExistent(t *testing.T) {
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
+
+		// Deleting a non-existent chain should be idempotent and return nil.
+		// This requires CAP_NET_ADMIN; skip if we get a permission error.
+		err := ctrl.DeleteChain("plexd-test-nonexistent")
+		if err != nil {
+			t.Skipf("skipping: requires elevated privileges: %v", err)
+		}
+	})
 }
 
 func TestEnsureChainRequiresPrivileges(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	err := ctrl.EnsureChain("plexd-test-ensure")
-	if err == nil {
-		// Succeeded — running as root. Clean up.
-		_ = ctrl.FlushChain("plexd-test-ensure")
-		_ = ctrl.DeleteChain("plexd-test-ensure")
-		return
-	}
+		err := ctrl.EnsureChain("plexd-test-ensure")
+		if err == nil {
+			// Succeeded — running as root. Clean up.
+			_ = ctrl.FlushChain("plexd-test-ensure")
+			_ = ctrl.DeleteChain("plexd-test-ensure")
+			return
+		}
 
-	// Without CAP_NET_ADMIN the listing of IPv4 tables, which looks for the
-	// table an earlier plexd left behind, is the first call to fail.
-	expected := "policy: nftables: ensure chain: list tables:"
-	if !strings.HasPrefix(err.Error(), expected) {
-		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
-	}
+		// Without CAP_NET_ADMIN the listing of IPv4 tables, which looks for
+		// the table an earlier plexd left behind, is the first call to fail.
+		expected := "policy: nftables: ensure chain: list tables:"
+		if !strings.HasPrefix(err.Error(), expected) {
+			t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+		}
+	})
 }
 
 func TestFlushChainRequiresPrivileges(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	err := ctrl.FlushChain("plexd-test-flush")
-	if err == nil {
-		return
-	}
+		err := ctrl.FlushChain("plexd-test-flush")
+		if err == nil {
+			return
+		}
 
-	expected := "policy: nftables: flush chain"
-	if !strings.HasPrefix(err.Error(), expected) {
-		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
-	}
+		expected := "policy: nftables: flush chain"
+		if !strings.HasPrefix(err.Error(), expected) {
+			t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+		}
+	})
 }
 
 func TestApplyRulesRequiresPrivileges(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	rules := []FirewallRule{
-		{
-			SrcIP:    "10.0.0.1",
-			DstIP:    "10.0.0.2",
-			Port:     443,
-			Protocol: "tcp",
-			Action:   "allow",
-		},
-		{
-			SrcIP:  "0.0.0.0/0",
-			DstIP:  "0.0.0.0/0",
-			Action: "deny",
-		},
-	}
+		rules := []FirewallRule{
+			{
+				SrcIP:    "10.0.0.1",
+				DstIP:    "10.0.0.2",
+				Port:     443,
+				Protocol: "tcp",
+				Action:   "allow",
+			},
+			{
+				SrcIP:  "0.0.0.0/0",
+				DstIP:  "0.0.0.0/0",
+				Action: "deny",
+			},
+		}
 
-	err := ctrl.ApplyRules("plexd-test-apply", rules)
-	if err == nil {
-		// Succeeded — running as root. Clean up.
-		_ = ctrl.FlushChain("plexd-test-apply")
-		_ = ctrl.DeleteChain("plexd-test-apply")
-		return
-	}
+		err := ctrl.ApplyRules("plexd-test-apply", rules)
+		if err == nil {
+			// Succeeded — running as root. Clean up.
+			_ = ctrl.FlushChain("plexd-test-apply")
+			_ = ctrl.DeleteChain("plexd-test-apply")
+			return
+		}
 
-	expected := "policy: nftables: apply rules"
-	if !strings.HasPrefix(err.Error(), expected) {
-		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
-	}
+		expected := "policy: nftables: apply rules"
+		if !strings.HasPrefix(err.Error(), expected) {
+			t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+		}
+	})
 }
 
 func TestNftablesController_DedicatedTable(t *testing.T) {
@@ -117,35 +129,37 @@ func TestNftablesController_DedicatedTable(t *testing.T) {
 }
 
 func TestNftablesController_ApplyRulesWithInterface(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	chain := "plexd-test-iface"
-	if err := ctrl.EnsureChain(chain); err != nil {
-		t.Skipf("skipping: requires elevated privileges: %v", err)
-	}
-	defer func() {
-		_ = ctrl.FlushChain(chain)
-		_ = ctrl.DeleteChain(chain)
-	}()
+		chain := "plexd-test-iface"
+		if err := ctrl.EnsureChain(chain); err != nil {
+			t.Skipf("skipping: requires elevated privileges: %v", err)
+		}
+		defer func() {
+			_ = ctrl.FlushChain(chain)
+			_ = ctrl.DeleteChain(chain)
+		}()
 
-	rules := []FirewallRule{
-		{
-			Interface: "wg0",
-			SrcIP:     "10.0.0.1",
-			DstIP:     "10.0.0.2",
-			Port:      443,
-			Protocol:  "tcp",
-			Action:    "allow",
-		},
-		{
-			Interface: "wg0",
-			Action:    "deny",
-		},
-	}
+		rules := []FirewallRule{
+			{
+				Interface: "wg0",
+				SrcIP:     "10.0.0.1",
+				DstIP:     "10.0.0.2",
+				Port:      443,
+				Protocol:  "tcp",
+				Action:    "allow",
+			},
+			{
+				Interface: "wg0",
+				Action:    "deny",
+			},
+		}
 
-	if err := ctrl.ApplyRules(chain, rules); err != nil {
-		t.Fatalf("ApplyRules with interface failed: %v", err)
-	}
+		if err := ctrl.ApplyRules(chain, rules); err != nil {
+			t.Fatalf("ApplyRules with interface failed: %v", err)
+		}
+	})
 }
 
 func TestBuildRuleExprsAllow(t *testing.T) {
@@ -470,93 +484,101 @@ func TestPortBytes(t *testing.T) {
 }
 
 func TestEnsureChainAndDeleteRoundTrip(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	// Ensure chain — requires privileges.
-	if err := ctrl.EnsureChain("plexd-test-roundtrip"); err != nil {
-		t.Skipf("skipping: requires elevated privileges: %v", err)
-	}
+		// Ensure chain — requires privileges.
+		if err := ctrl.EnsureChain("plexd-test-roundtrip"); err != nil {
+			t.Skipf("skipping: requires elevated privileges: %v", err)
+		}
 
-	// Delete the chain we just created.
-	if err := ctrl.DeleteChain("plexd-test-roundtrip"); err != nil {
-		t.Fatalf("DeleteChain failed: %v", err)
-	}
+		// Delete the chain we just created.
+		if err := ctrl.DeleteChain("plexd-test-roundtrip"); err != nil {
+			t.Fatalf("DeleteChain failed: %v", err)
+		}
 
-	// Deleting again should be idempotent.
-	if err := ctrl.DeleteChain("plexd-test-roundtrip"); err != nil {
-		t.Fatalf("second DeleteChain failed: %v", err)
-	}
+		// Deleting again should be idempotent.
+		if err := ctrl.DeleteChain("plexd-test-roundtrip"); err != nil {
+			t.Fatalf("second DeleteChain failed: %v", err)
+		}
+	})
 }
 
 func TestApplyAndFlushRoundTrip(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	chain := "plexd-test-applyflush"
-	if err := ctrl.EnsureChain(chain); err != nil {
-		t.Skipf("skipping: requires elevated privileges: %v", err)
-	}
-	defer func() {
-		_ = ctrl.FlushChain(chain)
-		_ = ctrl.DeleteChain(chain)
-	}()
+		chain := "plexd-test-applyflush"
+		if err := ctrl.EnsureChain(chain); err != nil {
+			t.Skipf("skipping: requires elevated privileges: %v", err)
+		}
+		defer func() {
+			_ = ctrl.FlushChain(chain)
+			_ = ctrl.DeleteChain(chain)
+		}()
 
-	rules := []FirewallRule{
-		{
-			SrcIP:    "10.0.0.1",
-			DstIP:    "10.0.0.2",
-			Port:     443,
-			Protocol: "tcp",
-			Action:   "allow",
-		},
-		{
-			SrcIP:  "0.0.0.0/0",
-			DstIP:  "0.0.0.0/0",
-			Action: "deny",
-		},
-	}
+		rules := []FirewallRule{
+			{
+				SrcIP:    "10.0.0.1",
+				DstIP:    "10.0.0.2",
+				Port:     443,
+				Protocol: "tcp",
+				Action:   "allow",
+			},
+			{
+				SrcIP:  "0.0.0.0/0",
+				DstIP:  "0.0.0.0/0",
+				Action: "deny",
+			},
+		}
 
-	if err := ctrl.ApplyRules(chain, rules); err != nil {
-		t.Fatalf("ApplyRules failed: %v", err)
-	}
+		if err := ctrl.ApplyRules(chain, rules); err != nil {
+			t.Fatalf("ApplyRules failed: %v", err)
+		}
 
-	if err := ctrl.FlushChain(chain); err != nil {
-		t.Fatalf("FlushChain failed: %v", err)
-	}
+		if err := ctrl.FlushChain(chain); err != nil {
+			t.Fatalf("FlushChain failed: %v", err)
+		}
+	})
 }
 
 func TestProbeErrorPrefix(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
 
-	err := ctrl.Probe()
-	if err == nil {
-		// Backend usable — running with CAP_NET_ADMIN on a kernel offering
-		// nf_tables. Nothing to clean up: the probe only reads.
-		return
-	}
+		err := ctrl.Probe()
+		if err == nil {
+			// Backend usable — running with CAP_NET_ADMIN on a kernel offering
+			// nf_tables. Nothing to clean up: the probe only reads.
+			return
+		}
 
-	expected := "policy: nftables: probe"
-	if !strings.HasPrefix(err.Error(), expected) {
-		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
-	}
+		expected := "policy: nftables: probe"
+		if !strings.HasPrefix(err.Error(), expected) {
+			t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+		}
+	})
 }
 
 // The pre-flight check is only worth running if its verdict matches the one the
 // baseline install would reach, so assert the two agree on whatever host this
 // runs on — privileged or not.
 func TestProbeAgreesWithEnsureChain(t *testing.T) {
-	ctrl := NewNftablesController(discardLoggerNft())
-	chain := "plexd-test-probe-agree"
+	inTestNetns(t, func() {
+		ctrl := NewNftablesController(discardLoggerNft())
+		chain := "plexd-test-probe-agree"
 
-	probeErr := ctrl.Probe()
-	ensureErr := ctrl.EnsureChain(chain)
-	if ensureErr == nil {
-		_ = ctrl.FlushChain(chain)
-		_ = ctrl.DeleteChain(chain)
-	}
+		probeErr := ctrl.Probe()
+		ensureErr := ctrl.EnsureChain(chain)
+		if ensureErr == nil {
+			_ = ctrl.FlushChain(chain)
+			_ = ctrl.DeleteChain(chain)
+		}
 
-	if (probeErr == nil) != (ensureErr == nil) {
-		t.Errorf("Probe and EnsureChain disagree: probe = %v, EnsureChain = %v", probeErr, ensureErr)
-	}
+		if (probeErr == nil) != (ensureErr == nil) {
+			t.Errorf("Probe and EnsureChain disagree: probe = %v, EnsureChain = %v", probeErr, ensureErr)
+		}
+	})
 }
 
 // formatExprs renders an expression list with the values behind its pointers,
