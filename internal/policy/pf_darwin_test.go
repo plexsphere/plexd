@@ -3,16 +3,22 @@
 package policy
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 )
 
-// PFController is the macOS FirewallController the enforcer is handed.
-var _ FirewallController = (*PFController)(nil)
+// PFController is the macOS FirewallController the enforcer is handed, and it
+// reports what its logged rules admit.
+var (
+	_ FirewallController = (*PFController)(nil)
+	_ ConnReporter       = (*PFController)(nil)
+)
 
 // natController mirrors bridge.NATController. The contract is checked against
 // a local copy because internal/policy must not import internal/bridge: the
@@ -668,8 +674,9 @@ func TestPFController_RenderProbeLines(t *testing.T) {
 		{Interface: "utun4", Action: "deny"},
 	}
 
+	text, _ := ctrl.render()
 	var got []string
-	for _, line := range strings.Split(string(ctrl.render()), "\n") {
+	for _, line := range strings.Split(string(text), "\n") {
 		if strings.HasPrefix(line, "pass out ") && strings.Contains(line, " from (") {
 			got = append(got, line)
 		}
@@ -699,8 +706,8 @@ func TestPFController_RenderEmptyChain(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctrl := NewPFController(testLogger())
 			ctrl.chains["plexd-mesh"] = tt.rules
-			if got := string(ctrl.render()); got != want {
-				t.Errorf("render() =\n%q\nwant\n%q", got, want)
+			if text, _ := ctrl.render(); string(text) != want {
+				t.Errorf("render() =\n%q\nwant\n%q", text, want)
 			}
 		})
 	}
@@ -715,10 +722,396 @@ func TestPFController_RenderEmptyChain(t *testing.T) {
 		if err := ctrl.FlushChain("plexd-mesh"); err != nil {
 			t.Fatalf("FlushChain() error = %v, want nil", err)
 		}
-		if got := string(ctrl.render()); got != want {
-			t.Errorf("render() =\n%q\nwant\n%q", got, want)
+		if text, _ := ctrl.render(); string(text) != want {
+			t.Errorf("render() =\n%q\nwant\n%q", text, want)
 		}
 	})
+}
+
+// A logged rule puts log on the lines that see a connection's first packet: a
+// SYN line ahead of the tcp pass in line, the node's own pass out lines, and
+// for udp, icmp or no protocol the pass in line too. Mirrors never log.
+func TestPFController_RenderRuleLogged(t *testing.T) {
+	tcp443 := FirewallRule{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow"}
+	logged443 := tcp443
+	logged443.LogTag = "3/0"
+	loggedAny := FirewallRule{Interface: "utun4", SrcIP: "10.0.0.9", DstIP: "10.1.0.0/24", Action: "allow", LogTag: "3/3"}
+
+	tests := []struct {
+		name string
+		rule FirewallRule
+		want []string
+	}{
+		{
+			name: "tcp",
+			rule: logged443,
+			want: []string{
+				"pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 flags S/SA no state",
+				"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state",
+				"pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state",
+				"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state",
+				"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state",
+			},
+		},
+		{
+			// The same rule without a tag renders exactly as it did before
+			// logging existed.
+			name: "tcp untagged",
+			rule: tcp443,
+			want: []string{
+				"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state",
+				"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state",
+				"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state",
+				"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state",
+			},
+		},
+		{
+			// Neither udp line keeps state, so both log every packet they
+			// pass. The mirrors do not log.
+			name: "udp",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.0/24", Port: 53, Protocol: "udp", Action: "allow", LogTag: "3/1"},
+			want: []string{
+				"pass in log quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53 no state",
+				"pass out log quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53 no state",
+				"pass out quick on utun4 inet proto udp from 10.1.0.0/24 port 53 to 10.0.0.0/24 no state",
+				"pass out quick on utun4 inet proto icmp from 10.1.0.0/24 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state",
+			},
+		},
+		{
+			name: "ipv6 icmp",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "fd00::/64", DstIP: "fd00::1", Protocol: "icmp", Action: "allow", LogTag: "3/2"},
+			want: []string{
+				"pass in log quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::1 no state",
+				"pass out log quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::1 no state",
+				"pass out quick on utun4 inet6 proto icmp6 from fd00::1 to fd00::/64 icmp6-type { echorep, unreach, toobig, timex, paramprob } no state",
+			},
+		},
+		{
+			// The unlogged tcp lines keep the rest of a TCP connection, and
+			// the Mac's replies to an inbound one, from reaching the logged
+			// protocol-less lines.
+			name: "no protocol",
+			rule: loggedAny,
+			want: []string{
+				"pass in log quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 flags S/SA no state",
+				"pass in quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 no state",
+				"pass in log quick on utun4 inet from 10.0.0.9 to 10.1.0.0/24 no state",
+				"pass out log quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 keep state",
+				"pass out quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 no state",
+				"pass out log quick on utun4 inet from 10.0.0.9 to 10.1.0.0/24 no state",
+				"pass out quick on utun4 inet proto tcp from 10.1.0.0/24 to 10.0.0.9 flags A/A no state",
+				"pass out quick on utun4 inet proto udp from 10.1.0.0/24 to 10.0.0.9 no state",
+				"pass out quick on utun4 inet proto icmp from 10.1.0.0/24 to 10.0.0.9 icmp-type { echorep, unreach, timex, paramprob } no state",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkRenderRule(t, tt.rule, tt.want)
+		})
+	}
+
+	// The default deny behind logged rules renders its block lines without
+	// log.
+	t.Run("block lines", func(t *testing.T) {
+		ctrl := NewPFController(testLogger())
+		ctrl.chains["plexd-mesh"] = []FirewallRule{logged443, loggedAny, {Interface: "utun4", Action: "deny"}}
+		text, _ := ctrl.render()
+
+		var got []string
+		for _, line := range strings.Split(string(text), "\n") {
+			if strings.HasPrefix(line, "block ") {
+				got = append(got, line)
+			}
+		}
+		want := []string{
+			"block in quick on utun4 from any to any",
+			"block out quick on utun4 from (utun4) to any",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("block lines =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
+	})
+}
+
+// render maps each logged line to its rule's tag under the number pf gives
+// it, which counts the rules pfctl loads from the first filter line on. In
+// the chain below the relay probe line is filter line 0 and the untagged
+// rule's lines are 1 to 4, so the logged rule's pass in log line is filter
+// line 5 and its pass out log line 7. pfctl loads the untagged rule's ICMP
+// mirror as four rules, one per icmp-type, so pf numbers those two lines 8
+// and 10.
+func TestPFController_RenderLogTags(t *testing.T) {
+	filterLines := func(text []byte) []string {
+		var lines []string
+		for _, line := range strings.Split(string(text), "\n") {
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "nat ") {
+				continue
+			}
+			lines = append(lines, line)
+		}
+		return lines
+	}
+
+	t.Run("after an untagged rule", func(t *testing.T) {
+		ctrl := NewPFController(testLogger())
+		ctrl.chains["plexd-mesh"] = []FirewallRule{
+			{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow"},
+			{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.6", Port: 8443, Protocol: "tcp", Action: "allow", LogTag: "1/1"},
+			{Interface: "utun4", Action: "deny"},
+		}
+		text, tags := ctrl.render()
+
+		lines := filterLines(text)
+		if len(lines) != 12 {
+			t.Fatalf("filter lines = %d, want 12:\n%s", len(lines), text)
+		}
+		if want := "pass out quick on utun4 proto udp from (utun4) to any port 9 no state"; lines[0] != want {
+			t.Errorf("filter line 0 = %q, want %q", lines[0], want)
+		}
+		if want := "pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.6 port 8443 flags S/SA no state"; lines[5] != want {
+			t.Errorf("filter line 5 = %q, want %q", lines[5], want)
+		}
+		if want := "pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.6 port 8443 keep state"; lines[7] != want {
+			t.Errorf("filter line 7 = %q, want %q", lines[7], want)
+		}
+		if want := map[uint32]string{8: "1/1", 10: "1/1"}; !maps.Equal(tags, want) {
+			t.Errorf("render() tags = %v, want %v", tags, want)
+		}
+	})
+
+	// A rule without addresses has an ICMP mirror for each family, four and
+	// five rules, so the logged rule behind it starts at 18.
+	t.Run("after both icmp mirrors", func(t *testing.T) {
+		ctrl := NewPFController(testLogger())
+		ctrl.chains["plexd-mesh"] = []FirewallRule{
+			{Interface: "utun4", Action: "allow", LogTag: "2/0"},
+			{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow", LogTag: "2/1"},
+			{Interface: "utun4", Action: "deny"},
+		}
+		_, tags := ctrl.render()
+
+		want := map[uint32]string{1: "2/0", 3: "2/0", 4: "2/0", 6: "2/0", 18: "2/1", 20: "2/1"}
+		if !maps.Equal(tags, want) {
+			t.Errorf("render() tags = %v, want %v", tags, want)
+		}
+	})
+
+	t.Run("untagged", func(t *testing.T) {
+		ctrl := NewPFController(testLogger())
+		ctrl.chains["plexd-mesh"] = sixRules
+		if _, tags := ctrl.render(); tags == nil || len(tags) != 0 {
+			t.Errorf("render() tags = %v, want an empty map", tags)
+		}
+	})
+}
+
+// tcp443Rules is a logged tcp rule and the default deny, the ruleset the
+// connection logging tests apply.
+func tcp443Rules(tag string) []FirewallRule {
+	return []FirewallRule{
+		{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow", LogTag: tag},
+		{Interface: "utun4", Action: "deny"},
+	}
+}
+
+// The anchor tcp443Rules renders to with its tag and without it.
+const (
+	tcp443LoggedText = pfHeader +
+		"# chain plexd-mesh\n" +
+		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+		"pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 flags S/SA no state\n" +
+		"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state\n" +
+		"pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
+		"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state\n" +
+		"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state\n" +
+		"block in quick on utun4 from any to any\n" +
+		"block out quick on utun4 from (utun4) to any\n"
+
+	tcp443UnloggedText = pfHeader +
+		"# chain plexd-mesh\n" +
+		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+		"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state\n" +
+		"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
+		"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state\n" +
+		"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state\n" +
+		"block in quick on utun4 from any to any\n" +
+		"block out quick on utun4 from (utun4) to any\n"
+)
+
+// A logged apply opens a reader once and loads the log lines. The tags change
+// only when pf took the anchor, the ones they replace stay one more load, and
+// deleting the last chain closes the reader.
+func TestPFController_ApplyRules_ConnLog(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	ctrl.SetConnSink(&pflogTestSink{})
+	reader, released := idlePflogReader()
+	opens := 0
+	ctrl.openLog = func() (*pflogReader, error) {
+		opens++
+		return reader, nil
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("1/0")); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+	checkCalls(t, runner,
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: tcp443LoggedText},
+		runnerCall{Args: []string{"-E"}},
+	)
+	if want := map[uint32]string{1: "1/0", 3: "1/0"}; !maps.Equal(ctrl.logTags, want) {
+		t.Errorf("logTags = %v, want %v", ctrl.logTags, want)
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("2/0")); err != nil {
+		t.Fatalf("ApplyRules() second error = %v, want nil", err)
+	}
+	if opens != 1 {
+		t.Errorf("openLog calls = %d, want 1", opens)
+	}
+	if tag, ok := ctrl.pflogTag(3); !ok || tag != "2/0" {
+		t.Errorf("pflogTag(3) = %q, %v, want %q, true", tag, ok, "2/0")
+	}
+	if want := map[uint32]string{1: "1/0", 3: "1/0"}; !maps.Equal(ctrl.prevLogTags, want) {
+		t.Errorf("prevLogTags = %v, want %v", ctrl.prevLogTags, want)
+	}
+
+	// A load pf refuses changes no tag.
+	runner.outputs[loadKey] = []byte("stdin:3: syntax error")
+	runner.errs[loadKey] = errors.New("exit status 1")
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("3/0")); err == nil {
+		t.Fatal("ApplyRules() error = nil, want the load error")
+	}
+	if want := map[uint32]string{1: "2/0", 3: "2/0"}; !maps.Equal(ctrl.logTags, want) {
+		t.Errorf("logTags after a refused load = %v, want %v", ctrl.logTags, want)
+	}
+	delete(runner.outputs, loadKey)
+	delete(runner.errs, loadKey)
+
+	// Deleting the last chain flushes the anchor and closes the reader. A
+	// record pf wrote before the flush still finds its line.
+	if err := ctrl.DeleteChain("plexd-mesh"); err != nil {
+		t.Fatalf("DeleteChain() error = %v, want nil", err)
+	}
+	if reader.running() || !released.Load() {
+		t.Error("the reader still runs after the last chain was deleted")
+	}
+	if ctrl.reader != nil {
+		t.Error("the controller still holds the closed reader")
+	}
+	if len(ctrl.logTags) != 0 {
+		t.Errorf("logTags after the flush = %v, want none", ctrl.logTags)
+	}
+	if tag, ok := ctrl.pflogTag(1); !ok || tag != "2/0" {
+		t.Errorf("pflogTag(1) after the flush = %q, %v, want %q, true", tag, ok, "2/0")
+	}
+}
+
+// When the reader cannot open, the logged rules are stored and loaded without
+// their tags, so pf enforces them without log, and every such apply logs the
+// shared Warn line with the error.
+func TestPFController_ApplyRules_ConnLogUnavailable(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	var buf bytes.Buffer
+	ctrl.logger = captureLogger(&buf)
+	ctrl.SetConnSink(&pflogTestSink{})
+	ctrl.openLog = func() (*pflogReader, error) {
+		return nil, errors.New("policy: pf: pflog: no free bpf device")
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("1/0")); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+	checkCalls(t, runner,
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: tcp443UnloggedText},
+		runnerCall{Args: []string{"-E"}},
+	)
+
+	out := buf.String()
+	if got := countLines(out, `level=WARN msg="`+connLogUnavailable+`"`); got != 1 {
+		t.Errorf("Warn lines %q = %d, want 1:\n%s", connLogUnavailable, got, out)
+	}
+	if !strings.Contains(out, `error="policy: pf: pflog: no free bpf device"`) {
+		t.Errorf("Warn line misses the error:\n%s", out)
+	}
+	if len(ctrl.logTags) != 0 {
+		t.Errorf("logTags = %v, want none", ctrl.logTags)
+	}
+	// The stored rules carry no tag, so a reload for another reason adds no
+	// log keyword either.
+	if tag := ctrl.chains["plexd-mesh"][0].LogTag; tag != "" {
+		t.Errorf("stored rule 0 LogTag = %q, want empty", tag)
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("2/0")); err != nil {
+		t.Fatalf("ApplyRules() second error = %v, want nil", err)
+	}
+	if got := countLines(buf.String(), `msg="`+connLogUnavailable+`"`); got != 2 {
+		t.Errorf("Warn lines after a second apply = %d, want 2", got)
+	}
+}
+
+// Without a sink nobody reads what pf would log, so no reader opens, the
+// rules load without log, and nothing is logged at Warn.
+func TestPFController_ApplyRules_ConnLogNoSink(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	var buf bytes.Buffer
+	ctrl.logger = captureLogger(&buf)
+	ctrl.openLog = func() (*pflogReader, error) {
+		t.Error("openLog called without a sink")
+		return nil, errors.New("no sink")
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("1/0")); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+	checkCalls(t, runner,
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: tcp443UnloggedText},
+		runnerCall{Args: []string{"-E"}},
+	)
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("logged at Warn without a sink:\n%s", buf.String())
+	}
+}
+
+// A reader whose loop ended, as a read error ends it, is replaced at the next
+// logged apply.
+func TestPFController_ApplyRules_ConnLogReopens(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	ctrl.SetConnSink(&pflogTestSink{})
+	var readers []*pflogReader
+	ctrl.openLog = func() (*pflogReader, error) {
+		r, _ := idlePflogReader()
+		readers = append(readers, r)
+		return r, nil
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("1/0")); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+	readers[0].close()
+
+	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("2/0")); err != nil {
+		t.Fatalf("ApplyRules() second error = %v, want nil", err)
+	}
+	if len(readers) != 2 {
+		t.Fatalf("openLog calls = %d, want 2", len(readers))
+	}
+	if ctrl.reader != readers[1] {
+		t.Error("the controller does not hold the new reader")
+	}
+
+	if err := ctrl.DeleteChain("plexd-mesh"); err != nil {
+		t.Fatalf("DeleteChain() error = %v, want nil", err)
+	}
+	if readers[1].running() {
+		t.Error("the new reader still runs after the last chain was deleted")
+	}
 }
 
 // A rule whose source does not parse is refused before anything reaches
@@ -810,8 +1203,18 @@ func TestPFController_RenderParses(t *testing.T) {
 		{Interface: "utun5", Action: "allow"},
 		{Interface: "utun5", Action: "deny"},
 	}
+	// The third chain carries the logged lines: the tcp SYN line with flags
+	// S/SA, the logged keep state line, logged udp and icmp6 lines without
+	// state, and the protocol-less logged pass in line.
+	ctrl.chains["plexd-log"] = []FirewallRule{
+		{Interface: "utun6", SrcIP: "10.2.0.0/24", DstIP: "10.3.0.5", Port: 443, Protocol: "tcp", Action: "allow", LogTag: "1/0"},
+		{Interface: "utun6", SrcIP: "10.2.0.0/24", DstIP: "10.3.0.0/24", Port: 53, Protocol: "udp", Action: "allow", LogTag: "1/1"},
+		{Interface: "utun6", SrcIP: "10.2.0.9", DstIP: "10.3.0.0/24", Action: "allow", LogTag: "1/2"},
+		{Interface: "utun6", SrcIP: "fd00:3::/64", DstIP: "fd00:3::1", Protocol: "icmp", Action: "allow", LogTag: "1/3"},
+		{Interface: "utun6", Action: "deny"},
+	}
 
-	text := ctrl.render()
+	text, _ := ctrl.render()
 
 	// The anchor has to hold every line form, or pfctl would pass without
 	// having seen one.
@@ -825,6 +1228,14 @@ func TestPFController_RenderParses(t *testing.T) {
 		"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state",
 		"pass out quick on utun5 inet6 proto icmp6 from fd00::1 to fd00::/64 icmp6-type { echorep, unreach, toobig, timex, paramprob } no state",
 		"block out quick on utun5 from (utun5) to any",
+		"pass in log quick on utun6 inet proto tcp from 10.2.0.0/24 to 10.3.0.5 port 443 flags S/SA no state",
+		"pass out log quick on utun6 inet proto tcp from 10.2.0.0/24 to 10.3.0.5 port 443 keep state",
+		"pass in log quick on utun6 inet proto udp from 10.2.0.0/24 to 10.3.0.0/24 port 53 no state",
+		"pass out log quick on utun6 inet proto udp from 10.2.0.0/24 to 10.3.0.0/24 port 53 no state",
+		"pass in log quick on utun6 inet proto tcp from 10.2.0.9 to 10.3.0.0/24 flags S/SA no state",
+		"pass in log quick on utun6 inet from 10.2.0.9 to 10.3.0.0/24 no state",
+		"pass out log quick on utun6 inet from 10.2.0.9 to 10.3.0.0/24 no state",
+		"pass in log quick on utun6 inet6 proto icmp6 from fd00:3::/64 to fd00:3::1 no state",
 	} {
 		if !slices.Contains(lines, form) {
 			t.Errorf("rendered anchor misses %q:\n%s", form, text)
