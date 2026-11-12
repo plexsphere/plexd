@@ -17,6 +17,10 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
+// errWFPConnLogUnavailable is the error of the connLogUnavailable line the
+// controller logs for every apply that holds a logged rule.
+var errWFPConnLogUnavailable = errors.New("policy: wfp: connection logging is not available on Windows")
+
 // wfpEngine is the part of *wf.Session's API the controller uses. It is a
 // seam: production opens a dynamic WFP session, tests record what would reach
 // the filter engine, which is what makes the translation testable without
@@ -664,6 +668,22 @@ func (c *WFPController) ApplyRules(chain string, rules []FirewallRule) error {
 	kept, delErr := c.deleteFilters(c.chains[chain])
 	c.chains[chain] = append(added, kept...)
 	c.epoch++
+
+	// DECISION: Windows enforces a logged rule like any other and logs none
+	// of its connections (author, 2026-11-12, #179). The filter engine
+	// records a classify-allow net event under plexd's filter for each such
+	// connection, but on windows-latest a FwpmNetEventSubscribe1
+	// subscription delivered none of them, only drop events (measured for
+	// PR #182). Reading them is left to a later change, so every apply that
+	// holds a logged rule says so with the line the other backends log when
+	// they cannot report their connections.
+	if hasLogTags(rules) {
+		c.logger.Warn(connLogUnavailable,
+			"component", "policy",
+			"chain", chain,
+			"error", errWFPConnLogUnavailable,
+		)
+	}
 
 	c.logger.Debug("wfp rules applied",
 		"component", "policy",
