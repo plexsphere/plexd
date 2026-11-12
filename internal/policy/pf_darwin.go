@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -123,13 +122,16 @@ func (c *PFController) render() []byte {
 			// Only TCP keeps state. pf consults the state table ahead of the
 			// ruleset and a state entry is bidirectional, so a stateful rule
 			// covering every protocol would let an inbound-initiated UDP or
-			// ICMP flow keep running after its rule turned into a deny: the
-			// node's reply creates the entry and every further packet of that
-			// flow matches it. The implicit flags S/SA pfctl puts on a
-			// stateful TCP pass rule stops the same happening for TCP, because
-			// an outbound SYN-ACK creates no state.
-			fmt.Fprintf(&b, "pass out quick on %s inet proto tcp from (%s) to any keep state\n", rule.Interface, rule.Interface)
-			fmt.Fprintf(&b, "pass out quick on %s inet from (%s) to any no state\n", rule.Interface, rule.Interface)
+			// ICMP flow keep running after the rule that let it in was
+			// removed: the node's reply creates the entry and every further
+			// packet of that flow matches it. The implicit flags S/SA pfctl
+			// puts on a stateful TCP pass rule stops the same happening for
+			// TCP, because an outbound SYN-ACK creates no state. The pair
+			// names no address family: the node's own IPv6 TCP connections
+			// get their replies as its IPv4 ones do, and the rest of what it
+			// sends over IPv6 leaves as its IPv4 traffic does.
+			fmt.Fprintf(&b, "pass out quick on %s proto tcp from (%s) to any keep state\n", rule.Interface, rule.Interface)
+			fmt.Fprintf(&b, "pass out quick on %s from (%s) to any no state\n", rule.Interface, rule.Interface)
 		}
 
 		for _, rule := range c.chains[name] {
@@ -168,6 +170,12 @@ func renderRule(rule FirewallRule) (string, error) {
 		verb = "block"
 	}
 
+	// Validate has parsed both addresses already, so these fail only on what
+	// it refused.
+	fam, err := rule.family()
+	if err != nil {
+		return "", err
+	}
 	src, err := pfAddress(rule.SrcIP)
 	if err != nil {
 		return "", err
@@ -178,9 +186,25 @@ func renderRule(rule FirewallRule) (string, error) {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s in quick on %s inet", verb, rule.Interface)
+	fmt.Fprintf(&b, "%s in quick on %s", verb, rule.Interface)
+	// A rule without a family keyword matches IPv4 and IPv6, which is what
+	// the address-less default deny has to cover. A wildcard prefix renders
+	// as "any", so the keyword is what keeps 0.0.0.0/0 and ::/0 to their own
+	// family.
+	switch fam {
+	case familyIPv4:
+		b.WriteString(" inet")
+	case familyIPv6:
+		b.WriteString(" inet6")
+	}
 	if rule.Protocol != "" {
-		fmt.Fprintf(&b, " proto %s", rule.Protocol)
+		proto := rule.Protocol
+		// ICMP and ICMPv6 are different protocols, and an IPv6 packet never
+		// carries protocol 1.
+		if proto == "icmp" && fam == familyIPv6 {
+			proto = "icmp6"
+		}
+		fmt.Fprintf(&b, " proto %s", proto)
 	}
 	fmt.Fprintf(&b, " from %s to %s", src, dst)
 	switch {
@@ -196,30 +220,25 @@ func renderRule(rule FirewallRule) (string, error) {
 	return b.String(), nil
 }
 
-// pfAddress renders one address field as a pf address. An empty field and the
-// wildcard prefix both become "any", the match the nftables backend leaves out
-// of a rule entirely. The rejection texts are shared with the other backends,
-// so a rejected rule reads the same on every platform.
+// pfAddress renders one address field as a pf address. An empty field and a
+// zero-length prefix, 0.0.0.0/0 or ::/0, both become "any", the match the
+// nftables backend leaves out of a rule entirely; renderRule's family keyword
+// keeps a wildcard prefix to its family. A prefix renders masked, and a bare
+// address stays bare, as the rule wrote it. The field is parsed by
+// parseRuleAddr, which every backend shares, so a rejected address reads the
+// same on every platform.
 func pfAddress(addr string) (string, error) {
-	if addr == "" || addr == "0.0.0.0/0" {
+	prefix, ok, err := parseRuleAddr(addr)
+	if err != nil {
+		return "", err
+	}
+	if !ok || prefix.Bits() == 0 {
 		return "any", nil
 	}
-
-	if prefix, err := netip.ParsePrefix(addr); err == nil {
-		if !prefix.Addr().Is4() {
-			return "", fmt.Errorf(errNonIPv4Address, addr)
-		}
-		return prefix.Masked().String(), nil
+	if !strings.Contains(addr, "/") {
+		return prefix.Addr().String(), nil
 	}
-
-	parsed, err := netip.ParseAddr(addr)
-	if err != nil {
-		return "", fmt.Errorf(errInvalidAddress, addr)
-	}
-	if !parsed.Is4() {
-		return "", fmt.Errorf(errNonIPv4Address, addr)
-	}
-	return parsed.String(), nil
+	return prefix.String(), nil
 }
 
 // sync writes the current desired state to the kernel. It loads the rendered
