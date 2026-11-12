@@ -16,6 +16,17 @@ const (
 	errMixedFamily    = "source %q and destination %q differ in address family"
 )
 
+// connLogUnavailable is the Warn line every backend logs, once per apply that
+// carries a logged rule, when the reader that reports the connections a logged
+// rule admits cannot start. It is shared for the same reason as the texts
+// above. The ruleset is installed without its log tags then: logging never
+// blocks enforcement.
+const connLogUnavailable = "policy connection logging unavailable, logged rules are enforced without it"
+
+// maxLogTagLen bounds FirewallRule.LogTag, which keeps a tag inside the
+// 127-byte prefix an nftables log expression carries.
+const maxLogTagLen = 64
+
 // addrFamily is the address family a rule's addresses select.
 type addrFamily int
 
@@ -99,6 +110,9 @@ type FirewallRule struct {
 	PortTo    int    // inclusive end of a destination port range, 0 means single-Port match
 	Protocol  string // "tcp", "udp", "icmp", or "" (any)
 	Action    string // "allow" or "deny"
+	// LogTag, when set, asks the backend to report the connections this rule
+	// admits, carrying the tag. Only an allow carries one.
+	LogTag string
 }
 
 // family returns the address family the rule's addresses select: familyAny
@@ -134,6 +148,14 @@ func (r *FirewallRule) Validate() error {
 	if r.Action != "allow" && r.Action != "deny" {
 		return fmt.Errorf("policy: firewall rule: invalid action %q", r.Action)
 	}
+	if r.LogTag != "" {
+		if r.Action != "allow" {
+			return fmt.Errorf("policy: firewall rule: log tag on a %q rule", r.Action)
+		}
+		if len(r.LogTag) > maxLogTagLen {
+			return fmt.Errorf("policy: firewall rule: log tag %q longer than %d bytes", r.LogTag, maxLogTagLen)
+		}
+	}
 	if r.Port < 0 || r.Port > 65535 {
 		return fmt.Errorf("policy: firewall rule: invalid port %d", r.Port)
 	}
@@ -161,6 +183,137 @@ func (r *FirewallRule) Validate() error {
 		return errors.New("policy: firewall rule: protocol icmp needs an address to choose between ICMP and ICMPv6")
 	}
 	return nil
+}
+
+// admits reports whether the rule's addresses, protocol and port match the
+// event. It ignores Interface and Dir: a rule matches by its addresses in
+// either direction, and the backend that reported the event read it off the
+// interface already. An empty address matches every address and a zero-length
+// prefix every address of its family. Protocol "" matches every protocol, icmp
+// matches ICMP for an IPv4 event and ICMPv6 for an IPv6 one, and a port or port
+// range matches the event's destination port. The connection logger uses it to
+// drop an event a backend attributed to the wrong rule.
+func (r *FirewallRule) admits(ev ConnEvent) bool {
+	if !addrAdmits(r.SrcIP, ev.Src) || !addrAdmits(r.DstIP, ev.Dst) {
+		return false
+	}
+	switch r.Protocol {
+	case "":
+	case "tcp":
+		if ev.Protocol != ipProtoTCP {
+			return false
+		}
+	case "udp":
+		if ev.Protocol != ipProtoUDP {
+			return false
+		}
+	case "icmp":
+		want := uint8(ipProtoICMP)
+		if ev.Dst.Is6() {
+			want = ipProtoICMPv6
+		}
+		if ev.Protocol != want {
+			return false
+		}
+	default:
+		return false
+	}
+	if r.Port > 0 {
+		last := r.Port
+		if r.PortTo > r.Port {
+			last = r.PortTo
+		}
+		if int(ev.DstPort) < r.Port || int(ev.DstPort) > last {
+			return false
+		}
+	}
+	return true
+}
+
+// addrAdmits reports whether addr lies in the prefix an address field of a
+// FirewallRule names. An empty field matches every address.
+func addrAdmits(field string, addr netip.Addr) bool {
+	prefix, ok, err := parseRuleAddr(field)
+	if err != nil {
+		return false
+	}
+	if !ok {
+		return true
+	}
+	return prefix.Contains(addr)
+}
+
+// hasLogTags reports whether any rule carries a LogTag.
+func hasLogTags(rules []FirewallRule) bool {
+	for _, r := range rules {
+		if r.LogTag != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutLogTags returns a copy of rules with every LogTag cleared, the ruleset
+// a backend installs when it cannot report what its logged rules admit.
+func withoutLogTags(rules []FirewallRule) []FirewallRule {
+	if rules == nil {
+		return nil
+	}
+	out := make([]FirewallRule, len(rules))
+	for i, r := range rules {
+		r.LogTag = ""
+		out[i] = r
+	}
+	return out
+}
+
+// ConnDir is the direction of a connection a logged rule admitted, as the node
+// sees it.
+type ConnDir int
+
+const (
+	// ConnIn is a connection addressed to the node.
+	ConnIn ConnDir = iota
+	// ConnOut is a connection the node's own sockets opened.
+	ConnOut
+	// ConnForward is a connection the node routes.
+	ConnForward
+)
+
+// String returns the direction as the connection line names it.
+func (d ConnDir) String() string {
+	switch d {
+	case ConnIn:
+		return "in"
+	case ConnOut:
+		return "out"
+	case ConnForward:
+		return "forward"
+	}
+	return fmt.Sprintf("ConnDir(%d)", int(d))
+}
+
+// ConnEvent is one connection a logged rule admitted, as a backend's kernel
+// reported it. SrcPort and DstPort are 0 unless Protocol is TCP or UDP.
+type ConnEvent struct {
+	Tag              string
+	Dir              ConnDir
+	Src, Dst         netip.Addr
+	Protocol         uint8
+	SrcPort, DstPort uint16
+}
+
+// ConnSink receives what a backend's reader produces. Lost counts records the
+// reader knows it missed.
+type ConnSink interface {
+	Event(ev ConnEvent)
+	Lost(n int)
+}
+
+// ConnReporter is implemented by a FirewallController that can report the
+// connections its logged rules admit.
+type ConnReporter interface {
+	SetConnSink(sink ConnSink)
 }
 
 // FirewallController abstracts OS-level iptables operations for testability.
