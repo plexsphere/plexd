@@ -597,7 +597,7 @@ A configured `tamper` spoils one check plexd makes before it installs a version:
 ### `GET /v1/nodes/{id}/state`
 
 Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
-default it is an enriched envelope containing two peers, a merged policy with two
+default it is an enriched envelope containing two peers, a merged policy with three
 rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions`,
 `sessions`, and `secrets` blocks.
@@ -614,7 +614,7 @@ therefore hands the node the new key.
 |-------|---------------|
 | `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint` and one `endpoint_candidates` entry (`192.0.2.10:51820`) but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
-| `policy` | merged block: 2 rules, `fingerprint` from `policyFingerprint` |
+| `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint` |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
 | `bridge.ingress` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
@@ -656,6 +656,13 @@ The relay block's one assignment is peer `...a0b1`, whose `fallback_endpoint`
 because the Docker suite runs node mode only, and a node outside bridge mode
 ignores it.
 
+The policy block is in the allow-only format plexd reads: no rule carries
+`action`, every rule is an allow, and plexd appends the default deny. The second
+rule asks for logging, so every apply of the fixture logs
+`policy rules ask for logging, which this release does not do` with `count=1`,
+and the third names IPv6 prefixes. See
+[Network Policy Enforcement](../networking/network-policy.md#buildfirewallrules).
+
 The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
 44-char base64 SHA-256 over the compact-JSON encoding of the rules slice. This
 canonicalization is mock-internal: plexd treats the fingerprint as an opaque
@@ -686,16 +693,21 @@ comparison key and never re-derives it from the rules.
     "fingerprint": "<44-char base64 SHA-256>",
     "rules": [
       {
-        "action": "allow",
         "protocol": "any",
         "source_cidr": "10.99.0.0/24",
         "destination_cidr": "10.99.0.0/24"
       },
       {
-        "action": "allow",
         "protocol": "tcp",
         "source_cidr": "10.99.0.0/24",
         "destination_cidr": "0.0.0.0/0",
+        "ports": {"from": 443, "to": 443},
+        "log": true
+      },
+      {
+        "protocol": "tcp",
+        "source_cidr": "fd00:99::/64",
+        "destination_cidr": "fd00:99::/64",
         "ports": {"from": 443, "to": 443}
       }
     ]
