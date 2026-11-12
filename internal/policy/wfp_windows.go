@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/tailscale/wf"
+	"go4.org/netipx"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
@@ -247,40 +248,75 @@ func newRuleID() (wf.RuleID, error) {
 }
 
 // wfpPrefix parses one address field into the prefix an address condition
-// matches on. The second result is false for an empty field and for the
-// wildcard prefix, which both mean "no condition at all", the match the
-// nftables backend leaves out of a rule. The rejection texts are shared with
-// the other backends, so a rejected rule reads the same on every platform.
+// matches on. The second result is false for an empty field and for a
+// zero-length prefix, 0.0.0.0/0 or ::/0, which both mean "no address
+// condition": the layer a filter sits at already selects the family. The
+// parsing and its rejection texts are shared with the other backends, so a
+// rejected rule reads the same on every platform.
 func wfpPrefix(addr string) (netip.Prefix, bool, error) {
-	if addr == "" || addr == "0.0.0.0/0" {
-		return netip.Prefix{}, false, nil
+	prefix, ok, err := parseRuleAddr(addr)
+	if err != nil || !ok || prefix.Bits() == 0 {
+		return netip.Prefix{}, false, err
 	}
+	return prefix, true, nil
+}
 
-	if prefix, err := netip.ParsePrefix(addr); err == nil {
-		if !prefix.Addr().Is4() {
-			return netip.Prefix{}, false, fmt.Errorf(errNonIPv4Address, addr)
-		}
-		return prefix.Masked(), true, nil
+// addrMatch is the condition that matches field against prefix. An IPv4
+// prefix goes in as an address and mask, an IPv6 prefix as the range from its
+// first to its last address, which matches the same packets.
+//
+// DECISION: github.com/tailscale/wf builds a filter's structs in a bump arena
+// that never aligns an allocation. FWP_V6_ADDR_AND_MASK is 17 bytes, so
+// every allocation after it in the same filter, FWPM_FILTER0 included, lands
+// on an odd address, and under -race checkptr aborts the conversion
+// ("misaligned pointer conversion" in toFilter0). A range is two 16-byte
+// addresses and an FWP_RANGE0, which keeps every allocation a multiple of 8.
+// Upstream's head has the same arena, so there is no version to move to.
+func addrMatch(field wf.FieldID, prefix netip.Prefix) *wf.Match {
+	if prefix.Addr().Is4() {
+		return &wf.Match{Field: field, Op: wf.MatchTypeEqual, Value: prefix}
 	}
+	return &wf.Match{Field: field, Op: wf.MatchTypeRange, Value: netipx.RangeOfPrefix(prefix)}
+}
 
-	parsed, err := netip.ParseAddr(addr)
-	if err != nil {
-		return netip.Prefix{}, false, fmt.Errorf(errInvalidAddress, addr)
+// wfpLayers is the pair of layers the filters of one address family sit at,
+// and the suffix that tells their names apart from the other family's.
+type wfpLayers struct {
+	inbound wf.LayerID
+	forward wf.LayerID
+	suffix  string
+}
+
+// wfpFamilies holds the IPv4 pair, whose filter names carry no suffix as
+// before IPv6 rules existed, and the IPv6 pair.
+var wfpFamilies = [...]wfpLayers{
+	{inbound: wf.LayerALEAuthRecvAcceptV4, forward: wf.LayerIPForwardV4},
+	{inbound: wf.LayerALEAuthRecvAcceptV6, forward: wf.LayerIPForwardV6, suffix: " v6"},
+}
+
+// wfpLayersOf returns the layers a rule of the given family is installed at.
+// A WFP layer sees one family only, so a rule without addresses, the default
+// deny, is installed at the layers of both.
+func wfpLayersOf(fam addrFamily) []wfpLayers {
+	switch fam {
+	case familyIPv4:
+		return wfpFamilies[:1]
+	case familyIPv6:
+		return wfpFamilies[1:]
 	}
-	if !parsed.Is4() {
-		return netip.Prefix{}, false, fmt.Errorf(errNonIPv4Address, addr)
-	}
-	return netip.PrefixFrom(parsed, 32), true, nil
+	return wfpFamilies[:]
 }
 
 // buildFilters translates one chain's rules into filters, none of which is
 // installed yet: a rule the engine would reject has to fail before the first
 // AddRule, or an apply would leave half a ruleset in the kernel.
 //
-// Every rule yields a filter at the local-delivery layer, which is where the
-// five-tuple is available, and a second at the forward layer, so that traffic
-// through the node is governed by the same decision. The forward layer carries
-// an interface, addresses and a protocol, but no port.
+// Every rule yields a filter at the local-delivery layer of its address
+// family, which is where the five-tuple is available, and a second at that
+// family's forward layer, so that traffic through the node is governed by the
+// same decision. A rule without addresses yields the pair at the IPv4 and at
+// the IPv6 layers, all four of the same weight. The forward layer carries an
+// interface, addresses and a protocol, but no port.
 //
 // The ruleset is ordered and first-match-terminating, so a rule left out of
 // the forward layer is not narrowed to nothing: the traffic it covered is
@@ -320,6 +356,10 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 			resolved[rule.Interface] = ids
 		}
 
+		fam, err := rule.family()
+		if err != nil {
+			return nil, fmt.Errorf("rule %d: %w", i, err)
+		}
 		src, srcOK, err := wfpPrefix(rule.SrcIP)
 		if err != nil {
 			return nil, fmt.Errorf("rule %d: %w", i, err)
@@ -346,78 +386,93 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 		case "udp":
 			proto = wf.IPProtoUDP
 		case "icmp":
+			// icmp in an IPv6 rule means ICMPv6. Validate refuses icmp in a
+			// rule without an address, so the family is one of the two.
 			proto = wf.IPProtoICMP
+			if fam == familyIPv6 {
+				proto = wf.IPProtoICMPV6
+			}
 		}
 
-		// Windows delivers a packet locally only when its destination is an
-		// address of the arrival interface, so the local interface is the
-		// arrival interface, the iifname the Linux chain matches.
-		inbound := []*wf.Match{{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: ids.luid}}
-		if srcOK {
-			inbound = append(inbound, &wf.Match{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: src})
-		}
-		if dstOK {
-			inbound = append(inbound, &wf.Match{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: dst})
-		}
-		if rule.Protocol != "" {
-			inbound = append(inbound, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
-		}
-		switch {
-		case rule.Port > 0 && rule.PortTo > rule.Port:
-			inbound = append(inbound, &wf.Match{
-				Field: wf.FieldIPLocalPort,
-				Op:    wf.MatchTypeRange,
-				Value: wf.Range{From: uint16(rule.Port), To: uint16(rule.PortTo)},
-			})
-		case rule.Port > 0:
-			inbound = append(inbound, &wf.Match{Field: wf.FieldIPLocalPort, Op: wf.MatchTypeEqual, Value: uint16(rule.Port)})
-		}
-
-		id, err := newRuleID()
-		if err != nil {
-			return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
-		}
-		filters = append(filters, &wf.Rule{
-			ID:         id,
-			Name:       fmt.Sprintf("plexd %s #%d inbound", chain, i),
-			Layer:      wf.LayerALEAuthRecvAcceptV4,
-			Sublayer:   plexdSublayerID,
-			Weight:     weight,
-			Conditions: inbound,
-			Action:     action,
-		})
-
+		// The counts are per rule, not per filter: a rule without addresses
+		// has a forward filter in each family, but it is still one rule.
+		hasForward := true
 		if rule.Port > 0 {
 			if rule.Action != "deny" {
 				unenforceable++
+				hasForward = false
+			} else {
+				widened++
+			}
+		}
+
+		for _, layers := range wfpLayersOf(fam) {
+			// Windows delivers a packet locally only when its destination is
+			// an address of the arrival interface, so the local interface is
+			// the arrival interface, the iifname the Linux chain matches.
+			inbound := []*wf.Match{{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: ids.luid}}
+			if srcOK {
+				inbound = append(inbound, addrMatch(wf.FieldIPRemoteAddress, src))
+			}
+			if dstOK {
+				inbound = append(inbound, addrMatch(wf.FieldIPLocalAddress, dst))
+			}
+			if rule.Protocol != "" {
+				inbound = append(inbound, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
+			}
+			switch {
+			case rule.Port > 0 && rule.PortTo > rule.Port:
+				inbound = append(inbound, &wf.Match{
+					Field: wf.FieldIPLocalPort,
+					Op:    wf.MatchTypeRange,
+					Value: wf.Range{From: uint16(rule.Port), To: uint16(rule.PortTo)},
+				})
+			case rule.Port > 0:
+				inbound = append(inbound, &wf.Match{Field: wf.FieldIPLocalPort, Op: wf.MatchTypeEqual, Value: uint16(rule.Port)})
+			}
+
+			id, err := newRuleID()
+			if err != nil {
+				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+			}
+			filters = append(filters, &wf.Rule{
+				ID:         id,
+				Name:       fmt.Sprintf("plexd %s #%d inbound%s", chain, i, layers.suffix),
+				Layer:      layers.inbound,
+				Sublayer:   plexdSublayerID,
+				Weight:     weight,
+				Conditions: inbound,
+				Action:     action,
+			})
+
+			if !hasForward {
 				continue
 			}
-			widened++
-		}
 
-		forward := []*wf.Match{{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: ids.index}}
-		if srcOK {
-			forward = append(forward, &wf.Match{Field: wf.FieldIPSourceAddress, Op: wf.MatchTypeEqual, Value: src})
-		}
-		if dstOK {
-			forward = append(forward, &wf.Match{Field: wf.FieldIPDestinationAddress, Op: wf.MatchTypeEqual, Value: dst})
-		}
-		if rule.Protocol != "" {
-			forward = append(forward, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
-		}
+			forward := []*wf.Match{{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: ids.index}}
+			if srcOK {
+				forward = append(forward, addrMatch(wf.FieldIPSourceAddress, src))
+			}
+			if dstOK {
+				forward = append(forward, addrMatch(wf.FieldIPDestinationAddress, dst))
+			}
+			if rule.Protocol != "" {
+				forward = append(forward, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
+			}
 
-		if id, err = newRuleID(); err != nil {
-			return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+			if id, err = newRuleID(); err != nil {
+				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+			}
+			filters = append(filters, &wf.Rule{
+				ID:         id,
+				Name:       fmt.Sprintf("plexd %s #%d forward%s", chain, i, layers.suffix),
+				Layer:      layers.forward,
+				Sublayer:   plexdSublayerID,
+				Weight:     weight,
+				Conditions: forward,
+				Action:     action,
+			})
 		}
-		filters = append(filters, &wf.Rule{
-			ID:         id,
-			Name:       fmt.Sprintf("plexd %s #%d forward", chain, i),
-			Layer:      wf.LayerIPForwardV4,
-			Sublayer:   plexdSublayerID,
-			Weight:     weight,
-			Conditions: forward,
-			Action:     action,
-		})
 	}
 
 	if unenforceable > 0 {
