@@ -235,7 +235,7 @@ REVISION                              SRC           DST           PORT  PROTOCOL
 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1  fd00:99::/64  fd00:99::/64  443   tcp       no
 ```
 
-The format makes every rule an allow, so the table has no action column. The block plexd pulled last can be a revision plexd rejected and does not enforce: it then keeps the ruleset it applied before and logs `policy revision rejected, keeping previous ruleset`. `PORT` is the destination port, a range as `<from>-<to>`, or `*` for none. `LOG` is `yes` for a rule with `log: true`: plexd enforces such a rule but logs nothing for its traffic in this release, and says so once per apply with the Info line `policy rules ask for logging, which this release does not do`. The default deny plexd appends is not a rule of the block and is not listed. With no rule to show, the command prints `No policies active.`
+The format makes every rule an allow, so the table has no action column. The block plexd pulled last can be a revision plexd rejected and does not enforce: it then keeps the ruleset it applied before and logs `policy revision rejected, keeping previous ruleset`. `PORT` is the destination port, a range as `<from>-<to>`, or `*` for none. `LOG` is `yes` for a rule with `log: true`: plexd logs `policy rule allowed connection` for each connection such a rule allows. The rows come in the block's order, so in a line with the block's `revision_id` the `rule` value is the row's position, counted from 0; see [Connection logging](../networking/network-policy.md#connection-logging). The default deny plexd appends is not a rule of the block and is not listed. With no rule to show, the command prints `No policies active.`
 
 ### `plexd state`
 

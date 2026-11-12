@@ -658,9 +658,11 @@ ignores it.
 
 The policy block is in the allow-only format plexd reads: no rule carries
 `action`, every rule is an allow, and plexd appends the default deny. The second
-rule asks for logging, so every apply of the fixture logs
-`policy rules ask for logging, which this release does not do` with `count=1`,
-and the third names IPv6 prefixes. See
+rule asks for logging, so plexd logs `policy rule allowed connection` with
+`rule=1` for each TCP connection from `10.99.0.0/24` to port 443 it allows, one
+the first rule allows as well included (see
+[Connection logging](../networking/network-policy.md#connection-logging)). The
+third rule names IPv6 prefixes. See
 [Network Policy Enforcement](../networking/network-policy.md#buildfirewallrules).
 
 The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
@@ -1159,6 +1161,11 @@ non-zero `timestamp`. A batch with no non-blank lines is malformed. Success is
 | `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` other than `gzip` or `identity` |
 
 **Counter:** Increments `logs_count` on each accepted batch.
+
+The body is captured, gzip decoded, under `logs` and retrievable via
+`GET /test/last-request/logs`. Phase `12e` of the
+[Docker e2e run](docker-e2e-test.md#phase-8-cont-network-policy-over-a-wireguard-peer)
+reads the connection lines plexd forwards from it.
 
 ### `POST /v1/nodes/{id}/audit`
 

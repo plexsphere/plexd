@@ -29,12 +29,13 @@ Each log line is serialized as:
 
 - **Filtering:** Severity-level filters (`min_severity`), unit inclusion lists (`include_units`), and unit exclusion lists (`exclude_units`) are applied before batching.
 - **File patterns:** Glob patterns in `file_patterns` specify additional log files to monitor beyond journald.
-- **Platform sources:** Every platform registers one source for the daemon's own output, and `file_patterns` adds file sources on top of it on every platform. The journald source is only registered on a Linux host that actually has `journalctl`; on a host without it (a container image without systemd), `plexd up` logs `journald not available, journald log source disabled` once at startup and forwards from the configured `file_patterns` only.
+- **Platform sources:** Every platform registers one source for the daemon's own output, and `file_patterns` adds file sources on top of it on every platform. The journald source is only registered on a Linux host that actually has `journalctl`. On a host without it, such as the Docker image, the Kubernetes DaemonSet and OpenWRT, `plexd up` logs `journald not available, journald log source disabled` once at startup and registers a [`QueueSource`](#queuesource) in its place. From plexd's own output only the [connection lines](../networking/network-policy.md#connection-logging) of logged policy rules, and their minute summary, are forwarded there. plexd's other lines stay on stderr, and the configured `file_patterns` are forwarded as on any host.
 - **Offline buffering:** When the control plane is unreachable, log entries are buffered internally. Buffered entries are drained on reconnection.
 
 | Platform | Source            | Reads                                    | `Unit`                                            |
 |----------|-------------------|------------------------------------------|---------------------------------------------------|
 | Linux    | `JournaldSource`  | The systemd journal through `journalctl` | The systemd unit (`plexd.service` for the daemon) |
+| Linux without `journalctl` | `QueueSource` | The connection lines plexd's policy `ConnLogger` hands it | `plexd` |
 | macOS    | `DaemonLogSource` | `/Library/Logs/plexd/plexd.log`          | `plexd`                                           |
 | Windows  | `EventLogSource`  | The Application log, provider `plexd`    | `plexd`                                           |
 
@@ -555,6 +556,45 @@ Clearing the channel at runtime (`wevtutil cl Application`) is not detected: the
 
 Running `plexd up` from a console sends the daemon's own lines to stderr rather than to the Event Log, so the source then forwards only what the service wrote.
 
+## QueueSource
+
+Holds the entries plexd hands it in memory until the next collection. `plexd up` uses it where no platform source reads plexd's own output, on Linux without `journalctl`. There, with `log_fwd.enabled`, it registers a `QueueSource` and passes its `Add` to the policy `ConnLogger` through `ForwardTo`, so the [connection lines](../networking/network-policy.md#connection-logging) of logged policy rules and their minute summary, `policy connection lines dropped`, reach the control plane. Nothing else writes into the queue, so plexd's other lines are not forwarded on such a host.
+
+### Constructor
+
+```go
+func NewQueueSource(hostname string) *QueueSource
+```
+
+| Parameter  | Description                               |
+|------------|-------------------------------------------|
+| `hostname` | Node hostname included in every log entry |
+
+### Add
+
+```go
+func (q *QueueSource) Add(ts time.Time, severity, message string)
+```
+
+Appends one entry. The queue keeps at most 1000 entries (`queueSourceCapacity`) and drops the oldest beyond that, which holds 200 s of connection lines at their rate limit of 5 a second.
+
+### Collect Behavior
+
+Returns the queued entries and empties the queue. Returns `nil, nil` when the queue is empty.
+
+### Log Entry Fields
+
+| Field       | Value                                                   |
+|-------------|---------------------------------------------------------|
+| `Timestamp` | The `ts` given to `Add`, the time the line was logged   |
+| `Source`    | `"plexd"`                                               |
+| `Unit`      | `"plexd"`                                               |
+| `Message`   | The record as plexd's text handler renders it, without the trailing newline, such as `time=2026-11-12T10:00:00.000Z level=INFO msg="policy rule allowed connection" component=policy revision_id=... rule=0 direction=in protocol=tcp src=10.99.0.3 dst=10.99.0.1 dst_port=7001` |
+| `Severity`  | `info` for a connection line, `warning` for the summary |
+| `Hostname`  | Set at construction time                                |
+
+An `include_units` or `exclude_units` filter matches these entries by the unit `plexd`, not `plexd.service`.
+
 ## LogFilter
 
 The `FilteringSource` wraps a `LogSource` and applies filter rules to its output. The `Forwarder` automatically wraps all sources with `FilteringSource` when `Config.Filter` is non-empty.
@@ -799,8 +839,8 @@ type LogEntry struct {
 | Field       | Type        | Description                                              |
 |-------------|-------------|----------------------------------------------------------|
 | `Timestamp` | `time.Time` | When the log entry was recorded (RFC 3339)              |
-| `Source`    | `string`    | Log source identifier: `"journald"`, `"file"`, `"daemonlog"` or `"eventlog"` |
-| `Unit`      | `string`    | The systemd unit on Linux, `plexd` on macOS and Windows, the file path for a `file_patterns` source |
+| `Source`    | `string`    | Log source identifier: `"journald"`, `"file"`, `"daemonlog"`, `"eventlog"` or `"plexd"` |
+| `Unit`      | `string`    | The systemd unit on Linux, `plexd` on macOS and Windows and for the queue source, the file path for a `file_patterns` source |
 | `Message`   | `string`    | Log message content                                      |
 | `Severity`  | `string`    | Syslog severity string (see priority mapping table)     |
 | `Hostname`  | `string`    | Originating node hostname                                |

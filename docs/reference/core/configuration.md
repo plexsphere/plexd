@@ -411,8 +411,7 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > rules may name IPv6 prefixes. A rule with `action: "allow"`, which the control plane sends
 > since plexsphere/plexsphere#1056, still reads as an allow, so the node works against
 > today's control plane. A rule with any other `action` rejects its revision, and the node
-> keeps the ruleset it enforces. A rule with `log: true` is enforced but its traffic is not
-> logged yet.
+> keeps the ruleset it enforces. A rule with `log: true` is enforced like any other rule.
 
 > **Migration:** The policy now also governs what the node itself sends over the mesh, on
 > Linux, macOS and Windows. The control plane compiles every rule for both ends, so a
@@ -446,6 +445,20 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > before you start the earlier binary. See
 > [Tunnel established but no traffic](../../guide/troubleshooting.md#tunnel-established-but-no-traffic)
 > for how to find a packet the node's policy drops on its way out.
+
+> **Migration:** A rule with `log: true` now makes plexd log
+> `policy rule allowed connection` for each connection the rule allows, on Linux and macOS,
+> at most 5 lines a second with a burst of 50; see
+> [Connection logging](../networking/network-policy.md#connection-logging). plexd applies
+> the logged rules ahead of the others, which changes nothing that passes or drops. No key
+> turns the lines off; `policy.enabled: false` stays the way out of enforcement. On Linux
+> plexd binds NFLOG group 28772, and when another process holds that group it logs
+> `policy connection logging unavailable, logged rules are enforced without it` and
+> enforces the rules without logging them. On Linux without `journalctl`, as in a
+> container, plexd forwards the connection lines to the control plane, and its other lines
+> stay unforwarded as before. Windows enforces logged rules without logging their
+> connections, and every apply that holds one logs that line; see
+> [Logged rules on Windows](../networking/pf-wfp-firewall.md#logged-rules-on-windows).
 
 Source: `internal/policy/config.go`
 
