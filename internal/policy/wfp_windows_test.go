@@ -1980,3 +1980,38 @@ func TestWFPController_Real(t *testing.T) {
 		t.Errorf("the filter engine still holds %d plexd filters: %v", len(left), left)
 	}
 }
+
+// A logged rule is enforced like any other on Windows, and every apply that
+// holds one logs that its connections are not logged.
+func TestWFPController_ApplyRules_LoggedRulesWarn(t *testing.T) {
+	ctrl, engine, _ := newTestWFPController(t)
+	var buf bytes.Buffer
+	ctrl.logger = captureLogger(&buf)
+
+	logged := []FirewallRule{
+		{Interface: "plexd0", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5/32", Port: 443, Protocol: "tcp", Action: "allow", LogTag: "1/0"},
+		{Interface: "plexd0", Action: "deny"},
+	}
+	untagged := withoutLogTags(logged)
+
+	if err := ctrl.ApplyRules("plexd-mesh", untagged); err != nil {
+		t.Fatalf("ApplyRules() of untagged rules error = %v", err)
+	}
+	if strings.Contains(buf.String(), connLogUnavailable) {
+		t.Errorf("an untagged apply logged %q", buf.String())
+	}
+	untaggedFilters := len(engine.rules)
+
+	for range 2 {
+		if err := ctrl.ApplyRules("plexd-mesh", logged); err != nil {
+			t.Fatalf("ApplyRules() of a logged rule error = %v", err)
+		}
+	}
+	const want = `level=WARN msg="policy connection logging unavailable, logged rules are enforced without it" component=policy chain=plexd-mesh error="policy: wfp: connection logging is not available on Windows"`
+	if n := strings.Count(buf.String(), want); n != 2 {
+		t.Errorf("two logged applies logged %d lines containing %q, want 2:\n%s", n, want, buf.String())
+	}
+	if len(engine.rules) != untaggedFilters {
+		t.Errorf("a logged apply installed %d filters, want %d, the same as without the tag", len(engine.rules), untaggedFilters)
+	}
+}
