@@ -97,9 +97,10 @@ func (c *PFController) pfctl(op string, stdin []byte, args ...string) ([]byte, e
 // render builds the whole anchor text from the desired state. The nat rule
 // comes first because pf requires translation rules ahead of filter rules in
 // a file. Chains are rendered in name order so the same state always yields
-// the same text, and each chain opens with a pair of pass out rules per
-// interface it mentions, so the node's own outbound connections still get
-// through a chain that otherwise ends in a default deny.
+// the same text. Each chain opens with the relay probe line for every
+// interface it mentions, in order of first appearance, and then holds the
+// lines renderRule returns for each rule. A chain without rules renders as
+// its comment line alone.
 //
 // The caller holds c.mu.
 func (c *PFController) render() []byte {
@@ -119,105 +120,188 @@ func (c *PFController) render() []byte {
 				continue
 			}
 			seen = append(seen, rule.Interface)
-			// Only TCP keeps state. pf consults the state table ahead of the
-			// ruleset and a state entry is bidirectional, so a stateful rule
-			// covering every protocol would let an inbound-initiated UDP or
-			// ICMP flow keep running after the rule that let it in was
-			// removed: the node's reply creates the entry and every further
-			// packet of that flow matches it. The implicit flags S/SA pfctl
-			// puts on a stateful TCP pass rule stops the same happening for
-			// TCP, because an outbound SYN-ACK creates no state. The pair
-			// names no address family: the node's own IPv6 TCP connections
-			// get their replies as its IPv4 ones do, and the rest of what it
-			// sends over IPv6 leaves as its IPv4 traffic does.
-			fmt.Fprintf(&b, "pass out quick on %s proto tcp from (%s) to any keep state\n", rule.Interface, rule.Interface)
-			fmt.Fprintf(&b, "pass out quick on %s from (%s) to any no state\n", rule.Interface, rule.Interface)
+			// The relay probe passes ahead of the rules, as RelayProbePort
+			// records. (<if>) is the interface's own addresses as the kernel
+			// tracks them, so the line matches what the node sends and not
+			// what the Mac forwards out of the interface, and a mesh address
+			// assigned after the load needs no reload. The line names no
+			// address family, so it covers IPv4 and IPv6. It keeps no state,
+			// so it lets nothing back in.
+			fmt.Fprintf(&b, "pass out quick on %s proto udp from (%s) to any port %d no state\n", rule.Interface, rule.Interface, RelayProbePort)
 		}
 
 		for _, rule := range c.chains[name] {
-			line, err := renderRule(rule)
+			lines, err := renderRule(rule)
 			if err != nil {
 				// Unreachable: ApplyRules renders every rule before it stores
 				// one. Dropping the rule is still safer than writing a
 				// half-formed line pf would reject along with the rest.
 				continue
 			}
-			b.WriteString(line + "\n")
+			for _, line := range lines {
+				b.WriteString(line + "\n")
+			}
 		}
 	}
 
 	return []byte(b.String())
 }
 
-// renderRule turns one rule into a pf filter line. quick makes the first
-// matching rule final, which is the first-match semantics the nftables
-// backend has, and no state keeps every packet subject to the current rules,
-// so a new deny takes effect at once instead of after the last flow expires.
-func renderRule(rule FirewallRule) (string, error) {
+// The ICMP types a reply mirror lets the node send: the echo reply and the
+// errors a host sends about a packet it received. IPv4 reports a packet too
+// big for the path as a code of unreach, IPv6 as a type of its own.
+const (
+	pfICMPReplies  = "icmp-type { echorep, unreach, timex, paramprob }"
+	pfICMP6Replies = "icmp6-type { echorep, unreach, toobig, timex, paramprob }"
+)
+
+// renderRule turns one rule into its pf filter lines. Every line is quick,
+// which makes the first matching line final, the first-match semantics the
+// nftables backend has.
+//
+// An allow renders, in this order:
+//
+//   - a pass in line with no state, so a new deny takes effect at once
+//     instead of after the last flow expires;
+//   - pass out lines for the node's own traffic: tcp with keep state, udp
+//     and icmp with no state, and for a rule without a protocol the tcp line
+//     and then a no state line for every protocol;
+//   - reply mirrors, with source and destination swapped: tcp with flags
+//     A/A for a rule naming tcp or no protocol, udp for one naming udp or no
+//     protocol, and for every allow the ICMP replies and errors of its
+//     family, both families for a rule without addresses.
+//
+// A deny renders a block in line and a block out line. The block out line
+// names the interface's own addresses in place of an empty source, so the
+// default deny drops what the node sends and leaves alone what the Mac
+// forwards out of the interface. The engine puts the default deny last, so
+// its block lines follow every pass line.
+//
+// DECISION: the node's own TCP connections keep state, as the pass out pair
+// before #178 did, and its UDP and ICMP flows do not, so #176's decision
+// stands. pf consults the state table ahead of the ruleset and a state entry
+// is bidirectional, so a stateful UDP or ICMP line would let a flow keep
+// running after the rule that allowed it was removed: every further packet
+// matches the entry instead of the rules. The implicit flags S/SA pfctl puts
+// on a stateful TCP pass line means only the node's own SYN creates an
+// entry, never its SYN-ACK to an inbound connection. A revoked rule
+// therefore stops the Mac's established outbound TCP connection only when
+// that connection ends, and its UDP and ICMP flows at their next packet.
+//
+// DECISION: replies to what a rule lets in leave through stateless mirror
+// lines (author, 2026-11-12, #178). Inbound lines stay stateless so that a
+// revoked rule cuts inbound traffic at once, which means pf can tell a reply
+// from a new flow only by its shape. flags A/A keeps the Mac from opening a
+// TCP connection through a mirror, and the ICMP mirrors carry only replies
+// and errors. A UDP mirror, however, lets the Mac send from the rule's port,
+// or from any port for a rule without ports, to a peer that may reach it.
+// Linux and Windows allow no such thing. The mirrors also carry less than
+// Linux's connection tracking does. A reply in a protocol other than tcp,
+// udp and icmp matches no mirror, and neither does an ICMP error the Mac
+// sends from its own address about traffic it forwards, such as a time
+// exceeded for a traceroute through it. Both meet the default deny unless a
+// rule allows them from the node's own address.
+func renderRule(rule FirewallRule) ([]string, error) {
 	if err := rule.Validate(); err != nil {
-		return "", err
+		return nil, err
 	}
 	// A pf rule without "on" applies to every interface of the host, so a
 	// default deny among them would cut the Mac off its own networks.
 	if rule.Interface == "" {
-		return "", errors.New("interface name is empty")
-	}
-
-	// pf's default block policy is drop, what the nftables backend expresses
-	// as VerdictDrop.
-	verb := "pass"
-	if rule.Action == "deny" {
-		verb = "block"
+		return nil, errors.New("interface name is empty")
 	}
 
 	// Validate has parsed both addresses already, so these fail only on what
 	// it refused.
 	fam, err := rule.family()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	src, err := pfAddress(rule.SrcIP)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	dst, err := pfAddress(rule.DstIP)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s in quick on %s", verb, rule.Interface)
-	// A rule without a family keyword matches IPv4 and IPv6, which is what
-	// the address-less default deny has to cover. A wildcard prefix renders
-	// as "any", so the keyword is what keeps 0.0.0.0/0 and ::/0 to their own
-	// family.
+	// on opens every line but the ICMP mirrors, which name their family
+	// themselves. A rule without a family keyword matches IPv4 and IPv6,
+	// which is what the address-less default deny has to cover. A wildcard
+	// prefix renders as "any", so the keyword is what keeps 0.0.0.0/0 and
+	// ::/0 to their own family.
+	on := "quick on " + rule.Interface
 	switch fam {
 	case familyIPv4:
-		b.WriteString(" inet")
+		on += " inet"
 	case familyIPv6:
-		b.WriteString(" inet6")
-	}
-	if rule.Protocol != "" {
-		proto := rule.Protocol
-		// ICMP and ICMPv6 are different protocols, and an IPv6 packet never
-		// carries protocol 1.
-		if proto == "icmp" && fam == familyIPv6 {
-			proto = "icmp6"
-		}
-		fmt.Fprintf(&b, " proto %s", proto)
-	}
-	fmt.Fprintf(&b, " from %s to %s", src, dst)
-	switch {
-	case rule.Port > 0 && rule.PortTo > rule.Port:
-		fmt.Fprintf(&b, " port %d:%d", rule.Port, rule.PortTo)
-	case rule.Port > 0:
-		fmt.Fprintf(&b, " port %d", rule.Port)
-	}
-	if verb == "pass" {
-		b.WriteString(" no state")
+		on += " inet6"
 	}
 
-	return b.String(), nil
+	proto := ""
+	if rule.Protocol != "" {
+		p := rule.Protocol
+		// ICMP and ICMPv6 are different protocols, and an IPv6 packet never
+		// carries protocol 1.
+		if p == "icmp" && fam == familyIPv6 {
+			p = "icmp6"
+		}
+		proto = " proto " + p
+	}
+
+	port := ""
+	switch {
+	case rule.Port > 0 && rule.PortTo > rule.Port:
+		port = fmt.Sprintf(" port %d:%d", rule.Port, rule.PortTo)
+	case rule.Port > 0:
+		port = fmt.Sprintf(" port %d", rule.Port)
+	}
+
+	// pf's default block policy is drop, what the nftables backend expresses
+	// as VerdictDrop.
+	if rule.Action == "deny" {
+		outSrc := src
+		if rule.SrcIP == "" {
+			outSrc = "(" + rule.Interface + ")"
+		}
+		return []string{
+			fmt.Sprintf("block in %s%s from %s to %s%s", on, proto, src, dst, port),
+			fmt.Sprintf("block out %s%s from %s to %s%s", on, proto, outSrc, dst, port),
+		}, nil
+	}
+
+	lines := []string{
+		fmt.Sprintf("pass in %s%s from %s to %s%s no state", on, proto, src, dst, port),
+	}
+
+	switch rule.Protocol {
+	case "tcp":
+		lines = append(lines, fmt.Sprintf("pass out %s proto tcp from %s to %s%s keep state", on, src, dst, port))
+	case "udp", "icmp":
+		lines = append(lines, fmt.Sprintf("pass out %s%s from %s to %s%s no state", on, proto, src, dst, port))
+	case "":
+		// Validate refuses a port without a protocol, so neither line has one.
+		lines = append(lines,
+			fmt.Sprintf("pass out %s proto tcp from %s to %s keep state", on, src, dst),
+			fmt.Sprintf("pass out %s from %s to %s no state", on, src, dst),
+		)
+	}
+
+	if rule.Protocol == "tcp" || rule.Protocol == "" {
+		lines = append(lines, fmt.Sprintf("pass out %s proto tcp from %s%s to %s flags A/A no state", on, dst, port, src))
+	}
+	if rule.Protocol == "udp" || rule.Protocol == "" {
+		lines = append(lines, fmt.Sprintf("pass out %s proto udp from %s%s to %s no state", on, dst, port, src))
+	}
+	if fam != familyIPv6 {
+		lines = append(lines, fmt.Sprintf("pass out quick on %s inet proto icmp from %s to %s %s no state", rule.Interface, dst, src, pfICMPReplies))
+	}
+	if fam != familyIPv4 {
+		lines = append(lines, fmt.Sprintf("pass out quick on %s inet6 proto icmp6 from %s to %s %s no state", rule.Interface, dst, src, pfICMP6Replies))
+	}
+
+	return lines, nil
 }
 
 // pfAddress renders one address field as a pf address. An empty field and a
