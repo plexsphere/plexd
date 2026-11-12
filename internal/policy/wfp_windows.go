@@ -316,14 +316,17 @@ func wfpLayersOf(fam addrFamily) []wfpLayers {
 // family's forward layer, so that traffic through the node is governed by the
 // same decision. A rule without addresses yields the pair at the IPv4 and at
 // the IPv6 layers, all four of the same weight. The forward layer carries an
-// interface, addresses and a protocol, but no port.
+// interface and addresses, but neither a protocol nor a port: IPFORWARD_V4
+// and IPFORWARD_V6 have no IP_PROTOCOL field, and the engine refuses a
+// condition on one.
 //
 // The ruleset is ordered and first-match-terminating, so a rule left out of
 // the forward layer is not narrowed to nothing: the traffic it covered is
-// re-decided by whatever follows it. A port-scoped deny is therefore installed
-// without the port, which blocks a superset of what the rule asked for, and a
-// port-scoped allow gets no forward filter, which leaves its traffic to the
-// rules below — at worst the default deny. Both directions fail closed.
+// re-decided by whatever follows it. A deny that names a protocol or a port
+// is therefore installed without them, which blocks a superset of what the
+// rule asked for, and such an allow gets no forward filter, which leaves its
+// traffic to the rules below — at worst the default deny. Both directions
+// fail closed.
 //
 // The caller holds c.mu.
 func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch uint32) ([]*wf.Rule, error) {
@@ -332,7 +335,8 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 	resolved := make(map[string]ifaceIDs)
 
 	// unenforceable counts the allow rules the forward layer cannot express,
-	// widened the deny rules it can only express without their port.
+	// widened the deny rules it can only express without their protocol and
+	// port.
 	unenforceable := 0
 	widened := 0
 
@@ -397,7 +401,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 		// The counts are per rule, not per filter: a rule without addresses
 		// has a forward filter in each family, but it is still one rule.
 		hasForward := true
-		if rule.Port > 0 {
+		if rule.Protocol != "" || rule.Port > 0 {
 			if rule.Action != "deny" {
 				unenforceable++
 				hasForward = false
@@ -456,9 +460,6 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 			if dstOK {
 				forward = append(forward, addrMatch(wf.FieldIPDestinationAddress, dst))
 			}
-			if rule.Protocol != "" {
-				forward = append(forward, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
-			}
 
 			if id, err = newRuleID(); err != nil {
 				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
@@ -480,7 +481,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 		// rules meant to allow is blocked on that path by the rules below
 		// them. Without this line an operator sees transit connections the
 		// policy permits fail to arrive and reads it as a routing fault.
-		c.logger.Warn("wfp forward path cannot enforce a port, allow rules narrowed away",
+		c.logger.Warn("wfp forward path cannot enforce a protocol or port, allow rules narrowed away",
 			"component", "policy",
 			"chain", chain,
 			"count", unenforceable,
@@ -490,11 +491,11 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 	if widened > 0 {
 		// The counterpart on the deny side, and the louder of the two: the
 		// widened rule outweighs every rule below it, so it blocks transit
-		// those rules permit — every port of the protocol it names, not just
-		// the one it asked for. Without this line an operator sees transit
-		// connections the policy permits fail to arrive and reads it as a
-		// routing fault.
-		c.logger.Warn("wfp forward path cannot enforce a port, deny rules widened to every port",
+		// those rules permit — every protocol and every port between its
+		// addresses, not just the ones it asked for. Without this line an
+		// operator sees transit connections the policy permits fail to arrive
+		// and reads it as a routing fault.
+		c.logger.Warn("wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port",
 			"component", "policy",
 			"chain", chain,
 			"count", widened,

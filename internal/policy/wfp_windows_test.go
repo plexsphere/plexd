@@ -34,6 +34,42 @@ type natController interface {
 
 var _ natController = (*WFPController)(nil)
 
+// wfpLayerFields is, per layer plexd installs filters at, the set of condition
+// fields plexd may use there. The real engine reports the fields of each layer,
+// and tailscale/wf refuses a condition on a field the layer does not have:
+// FWPM_LAYER_IPFORWARD_V4 and _V6 have no IP_PROTOCOL and no port field, and a
+// forward filter that named a protocol failed on the Windows runner with
+// "cannot map Go type wf.IPProto to field type <nil>". fakeEngine.AddRule
+// refuses the same conditions, so a unit test catches a filter the engine
+// would reject. The forward sets list only what plexd uses, not every field
+// Microsoft documents for IPFORWARD.
+var wfpLayerFields = map[wf.LayerID]map[wf.FieldID]bool{
+	wf.LayerALEAuthRecvAcceptV4: {
+		wf.FieldIPLocalInterface: true,
+		wf.FieldIPRemoteAddress:  true,
+		wf.FieldIPLocalAddress:   true,
+		wf.FieldIPProtocol:       true,
+		wf.FieldIPLocalPort:      true,
+	},
+	wf.LayerALEAuthRecvAcceptV6: {
+		wf.FieldIPLocalInterface: true,
+		wf.FieldIPRemoteAddress:  true,
+		wf.FieldIPLocalAddress:   true,
+		wf.FieldIPProtocol:       true,
+		wf.FieldIPLocalPort:      true,
+	},
+	wf.LayerIPForwardV4: {
+		wf.FieldSourceInterfaceIndex: true,
+		wf.FieldIPSourceAddress:      true,
+		wf.FieldIPDestinationAddress: true,
+	},
+	wf.LayerIPForwardV6: {
+		wf.FieldSourceInterfaceIndex: true,
+		wf.FieldIPSourceAddress:      true,
+		wf.FieldIPDestinationAddress: true,
+	},
+}
+
 // v6AddrMatch is the condition buildFilters installs for an IPv6 address:
 // the range from the prefix's first to its last address. See addrMatch for
 // why the IPv6 layers take a range rather than an address and mask.
@@ -76,6 +112,9 @@ func TestAddrMatch(t *testing.T) {
 // addRuleErrAt arms a failure: the fake counts only the AddRule calls made
 // while it is set, so a test arms it after a successful apply and numbers the
 // calls of the failing one from 1.
+//
+// AddRule refuses a filter at a layer wfpLayerFields does not list, or with a
+// condition on a field that layer does not have, as the real engine does.
 type fakeEngine struct {
 	sublayers []*wf.Sublayer
 	rules     map[wf.RuleID]*wf.Rule
@@ -110,6 +149,15 @@ func (e *fakeEngine) AddRule(r *wf.Rule) error {
 		e.addRuleCalls++
 		if e.addRuleCalls == e.addRuleErrAt {
 			return e.addRuleErr
+		}
+	}
+	fields, ok := wfpLayerFields[r.Layer]
+	if !ok {
+		return fmt.Errorf("fake engine: layer %v is not one plexd installs filters at", r.Layer)
+	}
+	for _, m := range r.Conditions {
+		if !fields[m.Field] {
+			return fmt.Errorf("fake engine: field %v not available at layer %v", m.Field, r.Layer)
 		}
 	}
 	e.rules[r.ID] = r
@@ -377,20 +425,19 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 	if err := ctrl.ApplyRules("plexd-mesh", sixRules); err != nil {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
-	if got := len(engine.order); got != 10 {
-		t.Fatalf("installed %d filters, want 10", got)
+	if got := len(engine.order); got != 9 {
+		t.Fatalf("installed %d filters, want 9", got)
 	}
 
 	var (
-		iface    = wf.Match{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: uint64(42)}
-		index    = wf.Match{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: uint32(12)}
-		src24    = wf.Match{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.0/24")}
-		srcHost  = wf.Match{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.9/32")}
-		dstHost  = wf.Match{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.5/32")}
-		dst24    = wf.Match{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.0/24")}
-		fwdSrc   = wf.Match{Field: wf.FieldIPSourceAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.9/32")}
-		fwdSrc24 = wf.Match{Field: wf.FieldIPSourceAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.0/24")}
-		fwdDst   = wf.Match{Field: wf.FieldIPDestinationAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.0/24")}
+		iface   = wf.Match{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: uint64(42)}
+		index   = wf.Match{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: uint32(12)}
+		src24   = wf.Match{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.0/24")}
+		srcHost = wf.Match{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.9/32")}
+		dstHost = wf.Match{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.5/32")}
+		dst24   = wf.Match{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.0/24")}
+		fwdSrc  = wf.Match{Field: wf.FieldIPSourceAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.9/32")}
+		fwdDst  = wf.Match{Field: wf.FieldIPDestinationAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.0/24")}
 	)
 
 	tests := []struct {
@@ -423,14 +470,6 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 			action: wf.ActionPermit, weight: uint64(1)<<32 | 4,
 			conds: []wf.Match{
 				iface, src24, dst24,
-				{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoICMP},
-			},
-		},
-		{
-			name: "plexd plexd-mesh #2 forward", layer: wf.LayerIPForwardV4,
-			action: wf.ActionPermit, weight: uint64(1)<<32 | 4,
-			conds: []wf.Match{
-				index, fwdSrc24, fwdDst,
 				{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoICMP},
 			},
 		},
@@ -485,19 +524,21 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 		}
 	}
 
-	// An allow that names a port has no forward filter: the layer carries no
-	// port field, and installing the permit without it would widen the rule.
+	// An allow that names a protocol or a port has no forward filter: the
+	// layer carries neither field, and installing the permit without them
+	// would widen the rule.
 	for _, name := range []string{
 		"plexd plexd-mesh #0 forward",
 		"plexd plexd-mesh #1 forward",
+		"plexd plexd-mesh #2 forward",
 	} {
 		if r := findFilter(engine, name); r != nil {
-			t.Errorf("the filter engine holds %q, want no forward filter for an allow with a port", name)
+			t.Errorf("the filter engine holds %q, want no forward filter for an allow with a protocol or a port", name)
 		}
 	}
 
 	if got := ctrl.chains["plexd-mesh"]; !slices.Equal(got, engine.order) {
-		t.Errorf("chain plexd-mesh = %v, want the ten installed filters %v", got, engine.order)
+		t.Errorf("chain plexd-mesh = %v, want the nine installed filters %v", got, engine.order)
 	}
 	if ctrl.epoch != 1 {
 		t.Errorf("epoch = %d, want 1", ctrl.epoch)
@@ -506,10 +547,10 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 
 // The ruleset is ordered and first-match-terminating, so a rule the forward
 // layer cannot express exactly must not simply be dropped: the traffic it
-// covered would be re-decided by whatever follows it. A port-scoped deny ahead
-// of a broad allow is the shape that turns that into a bypass on a bridge
-// node, so the deny is installed without the port instead — blocking more than
-// it asked for, never less.
+// covered would be re-decided by whatever follows it. A deny that names a
+// protocol and a port ahead of a broad allow is the shape that turns that into
+// a bypass on a bridge node, so the deny is installed without its protocol and
+// its port instead — blocking more than it asked for, never less.
 func TestWFPController_ApplyRules_ForwardLayerFailsClosed(t *testing.T) {
 	ctrl, engine, _ := newTestWFPController(t)
 	var logs bytes.Buffer
@@ -531,7 +572,6 @@ func TestWFPController_ApplyRules_ForwardLayerFailsClosed(t *testing.T) {
 	want := []wf.Match{
 		{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: uint32(12)},
 		{Field: wf.FieldIPDestinationAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.10.0.0/24")},
-		{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoTCP},
 	}
 	if got := conds(t, deny); !reflect.DeepEqual(got, want) {
 		t.Errorf("forward filter conditions =\n%v\nwant\n%v", got, want)
@@ -545,19 +585,142 @@ func TestWFPController_ApplyRules_ForwardLayerFailsClosed(t *testing.T) {
 	}
 
 	// Outweighing the allow is what makes the widening visible in traffic: on
-	// this ruleset every forwarded TCP flow to 10.10.0.0/24 is blocked, not
-	// only port 22. The operator debugging that has nothing else to go on, so
-	// the widening has to be logged — the narrowed-allow counter above never
-	// counts a deny.
-	if got := logs.String(); !strings.Contains(got, "deny rules widened to every port") {
+	// this ruleset every forwarded flow to 10.10.0.0/24 is blocked, of every
+	// protocol, not only TCP port 22. The operator debugging that has nothing
+	// else to go on, so the widening has to be logged — the narrowed-allow
+	// counter above never counts a deny.
+	if got := logs.String(); !strings.Contains(got, "deny rules widened to every protocol and port") {
 		t.Errorf("logs do not report the widened deny:\n%s", got)
+	}
+}
+
+// IPFORWARD_V4 and IPFORWARD_V6 have no protocol field, and the engine refuses
+// a condition on one, so no forward filter may carry a protocol. An allow that
+// names one keeps it at the inbound layer and gets no forward filter; a deny
+// that names one is installed at the forward layer without it. The fake
+// refuses a protocol at a forward layer as the engine does, so the apply
+// succeeding is part of what this test checks.
+func TestWFPController_ApplyRules_ForwardFiltersCarryNoProtocol(t *testing.T) {
+	ctrl, engine, _ := newTestWFPController(t)
+
+	rules := []FirewallRule{
+		{Interface: "plexd0", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.0/24", Protocol: "icmp", Action: "allow"},
+		{Interface: "plexd0", SrcIP: "fd00:99::/64", DstIP: "fd00:99::/64", Protocol: "icmp", Action: "allow"},
+		{Interface: "plexd0", Protocol: "tcp", Action: "allow"},
+		{Interface: "plexd0", Protocol: "tcp", Action: "deny"},
+		{Interface: "plexd0", Action: "deny"},
+	}
+	if err := ctrl.ApplyRules("plexd-mesh", rules); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+
+	var (
+		iface = wf.Match{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: uint64(42)}
+		index = wf.Match{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: uint32(12)}
+		v6Net = netip.MustParsePrefix("fd00:99::/64")
+	)
+	proto := func(p wf.IPProto) wf.Match {
+		return wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: p}
+	}
+
+	// The three allows yield inbound filters alone, each with its protocol.
+	// The tcp deny and the default deny name no address, so each yields a
+	// filter at all four layers, and the forward ones carry the interface
+	// index and nothing else.
+	want := []struct {
+		name  string
+		layer wf.LayerID
+		conds []wf.Match
+	}{
+		{
+			name: "plexd plexd-mesh #0 inbound", layer: wf.LayerALEAuthRecvAcceptV4,
+			conds: []wf.Match{
+				iface,
+				{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.0/24")},
+				{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.0/24")},
+				proto(wf.IPProtoICMP),
+			},
+		},
+		{
+			name: "plexd plexd-mesh #1 inbound v6", layer: wf.LayerALEAuthRecvAcceptV6,
+			conds: []wf.Match{
+				iface,
+				v6AddrMatch(wf.FieldIPRemoteAddress, v6Net),
+				v6AddrMatch(wf.FieldIPLocalAddress, v6Net),
+				proto(wf.IPProtoICMPV6),
+			},
+		},
+		{name: "plexd plexd-mesh #2 inbound", layer: wf.LayerALEAuthRecvAcceptV4, conds: []wf.Match{iface, proto(wf.IPProtoTCP)}},
+		{name: "plexd plexd-mesh #2 inbound v6", layer: wf.LayerALEAuthRecvAcceptV6, conds: []wf.Match{iface, proto(wf.IPProtoTCP)}},
+		{name: "plexd plexd-mesh #3 inbound", layer: wf.LayerALEAuthRecvAcceptV4, conds: []wf.Match{iface, proto(wf.IPProtoTCP)}},
+		{name: "plexd plexd-mesh #3 forward", layer: wf.LayerIPForwardV4, conds: []wf.Match{index}},
+		{name: "plexd plexd-mesh #3 inbound v6", layer: wf.LayerALEAuthRecvAcceptV6, conds: []wf.Match{iface, proto(wf.IPProtoTCP)}},
+		{name: "plexd plexd-mesh #3 forward v6", layer: wf.LayerIPForwardV6, conds: []wf.Match{index}},
+		{name: "plexd plexd-mesh #4 inbound", layer: wf.LayerALEAuthRecvAcceptV4, conds: []wf.Match{iface}},
+		{name: "plexd plexd-mesh #4 forward", layer: wf.LayerIPForwardV4, conds: []wf.Match{index}},
+		{name: "plexd plexd-mesh #4 inbound v6", layer: wf.LayerALEAuthRecvAcceptV6, conds: []wf.Match{iface}},
+		{name: "plexd plexd-mesh #4 forward v6", layer: wf.LayerIPForwardV6, conds: []wf.Match{index}},
+	}
+
+	if len(engine.order) != len(want) {
+		names := make([]string, 0, len(engine.order))
+		for _, id := range engine.order {
+			names = append(names, engine.rules[id].Name)
+		}
+		t.Fatalf("installed %d filters %q, want %d", len(engine.order), names, len(want))
+	}
+	for i, w := range want {
+		got := engine.rules[engine.order[i]]
+		if got.Name != w.name {
+			t.Errorf("filter %d name = %q, want %q", i, got.Name, w.name)
+		}
+		if got.Layer != w.layer {
+			t.Errorf("filter %q layer = %v, want %v", got.Name, got.Layer, w.layer)
+		}
+		if c := conds(t, got); !reflect.DeepEqual(c, w.conds) {
+			t.Errorf("filter %q conditions =\n%v\nwant\n%v", got.Name, c, w.conds)
+		}
+	}
+}
+
+// The fake has to refuse what the engine refuses, or the test above would pass
+// on a forward filter that names a protocol: an empty or mistyped entry in
+// wfpLayerFields would turn the check into a no-op without failing anything.
+func TestFakeEngine_RefusesFieldTheLayerLacks(t *testing.T) {
+	engine := &fakeEngine{rules: make(map[wf.RuleID]*wf.Rule)}
+
+	refused := &wf.Rule{
+		Name:       "protocol at the forward layer",
+		Layer:      wf.LayerIPForwardV4,
+		Conditions: []*wf.Match{{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoTCP}},
+	}
+	err := engine.AddRule(refused)
+	want := fmt.Sprintf("fake engine: field %v not available at layer %v", wf.FieldIPProtocol, wf.LayerIPForwardV4)
+	if err == nil || err.Error() != want {
+		t.Fatalf("AddRule() error = %v, want %q", err, want)
+	}
+	if len(engine.order) != 0 || len(engine.rules) != 0 {
+		t.Errorf("the fake recorded the refused filter: order %v", engine.order)
+	}
+
+	// The interface index at the same layer is taken, so the refusal is the
+	// field's, not the layer's.
+	accepted := &wf.Rule{
+		Name:       "interface index at the forward layer",
+		Layer:      wf.LayerIPForwardV4,
+		Conditions: []*wf.Match{{Field: wf.FieldSourceInterfaceIndex, Op: wf.MatchTypeEqual, Value: uint32(12)}},
+	}
+	if err := engine.AddRule(accepted); err != nil {
+		t.Fatalf("AddRule() error = %v, want nil", err)
 	}
 }
 
 // A rule's addresses choose the layers its filters sit at: an IPv4 rule the
 // IPv4 pair, as before IPv6 rules existed, an IPv6 rule the IPv6 pair, and a
 // rule without addresses, the default deny, both pairs, since a WFP layer sees
-// one family only. Every filter of a rule carries the rule's weight.
+// one family only. An allow that names a protocol gets the inbound filter of
+// its family alone, because the forward layers have no protocol field. Every
+// filter of a rule carries the rule's weight.
 func TestWFPController_BuildFilters_Families(t *testing.T) {
 	type filter struct {
 		name  string
@@ -595,13 +758,27 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 						proto(wf.IPProtoUDP),
 					},
 				},
+			},
+		},
+		{
+			name:   "ipv4 rule without a protocol",
+			rule:   FirewallRule{Interface: "plexd0", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Action: "allow"},
+			action: wf.ActionPermit,
+			want: []filter{
+				{
+					name: "plexd plexd-mesh #0 inbound", layer: wf.LayerALEAuthRecvAcceptV4,
+					conds: []wf.Match{
+						iface,
+						{Field: wf.FieldIPRemoteAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.0/24")},
+						{Field: wf.FieldIPLocalAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.5/32")},
+					},
+				},
 				{
 					name: "plexd plexd-mesh #0 forward", layer: wf.LayerIPForwardV4,
 					conds: []wf.Match{
 						index,
 						{Field: wf.FieldIPSourceAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.0.0.0/24")},
 						{Field: wf.FieldIPDestinationAddress, Op: wf.MatchTypeEqual, Value: netip.MustParsePrefix("10.1.0.5/32")},
-						proto(wf.IPProtoUDP),
 					},
 				},
 			},
@@ -617,15 +794,6 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 						iface,
 						v6AddrMatch(wf.FieldIPRemoteAddress, v6Net),
 						v6AddrMatch(wf.FieldIPLocalAddress, v6One),
-						proto(wf.IPProtoTCP),
-					},
-				},
-				{
-					name: "plexd plexd-mesh #0 forward v6", layer: wf.LayerIPForwardV6,
-					conds: []wf.Match{
-						index,
-						v6AddrMatch(wf.FieldIPSourceAddress, v6Net),
-						v6AddrMatch(wf.FieldIPDestinationAddress, v6One),
 						proto(wf.IPProtoTCP),
 					},
 				},
@@ -650,6 +818,7 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 		},
 		{
 			// icmp in an IPv6 rule means ICMPv6, a protocol of its own number.
+			// The allow names a protocol, so it has no forward filter.
 			name:   "ipv6 icmp rule",
 			rule:   FirewallRule{Interface: "plexd0", SrcIP: "fd00:99::/64", DstIP: "fd00:99::/64", Protocol: "icmp", Action: "allow"},
 			action: wf.ActionPermit,
@@ -660,15 +829,6 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 						iface,
 						v6AddrMatch(wf.FieldIPRemoteAddress, v6Net),
 						v6AddrMatch(wf.FieldIPLocalAddress, v6Net),
-						proto(wf.IPProtoICMPV6),
-					},
-				},
-				{
-					name: "plexd plexd-mesh #0 forward v6", layer: wf.LayerIPForwardV6,
-					conds: []wf.Match{
-						index,
-						v6AddrMatch(wf.FieldIPSourceAddress, v6Net),
-						v6AddrMatch(wf.FieldIPDestinationAddress, v6Net),
 						proto(wf.IPProtoICMPV6),
 					},
 				},
@@ -729,9 +889,11 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 	}
 }
 
-// The forward layer's two warnings name how many rules lost their port there,
-// not how many filters: a rule without addresses yields a filter per family at
-// each layer, but it is one rule the operator has to look for.
+// The forward layer's two warnings name how many rules lost their protocol or
+// port there, not how many filters: a rule without addresses yields a filter
+// per family at each layer, but it is one rule the operator has to look for.
+// A rule that names a protocol and no port counts too, since the forward
+// layers carry neither a protocol nor a port.
 func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 	ctrl, _, _ := newTestWFPController(t)
 	var logs bytes.Buffer
@@ -740,14 +902,16 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 	rules := []FirewallRule{
 		{Interface: "plexd0", Port: 22, Protocol: "tcp", Action: "deny"},
 		{Interface: "plexd0", Port: 443, Protocol: "tcp", Action: "allow"},
+		{Interface: "plexd0", Protocol: "udp", Action: "deny"},
+		{Interface: "plexd0", Protocol: "udp", Action: "allow"},
 	}
 	filters, err := ctrl.buildFilters("plexd-mesh", rules, 1)
 	if err != nil {
 		t.Fatalf("buildFilters() error = %v, want nil", err)
 	}
 
-	// The deny keeps its forward filters, widened to every port; the allow
-	// has none.
+	// The denies keep their forward filters, widened to every protocol and
+	// port; the allows have none.
 	var names []string
 	for _, f := range filters {
 		names = append(names, f.Name)
@@ -759,6 +923,12 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 		"plexd plexd-mesh #0 forward v6",
 		"plexd plexd-mesh #1 inbound",
 		"plexd plexd-mesh #1 inbound v6",
+		"plexd plexd-mesh #2 inbound",
+		"plexd plexd-mesh #2 forward",
+		"plexd plexd-mesh #2 inbound v6",
+		"plexd plexd-mesh #2 forward v6",
+		"plexd plexd-mesh #3 inbound",
+		"plexd plexd-mesh #3 inbound v6",
 	}
 	if !slices.Equal(names, want) {
 		t.Errorf("buildFilters() built %q, want %q", names, want)
@@ -767,7 +937,7 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
 	for _, msg := range []string{
 		"allow rules narrowed away",
-		"deny rules widened to every port",
+		"deny rules widened to every protocol and port",
 	} {
 		found := false
 		for _, line := range lines {
@@ -775,8 +945,8 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 				continue
 			}
 			found = true
-			if !strings.HasSuffix(line, " count=1") {
-				t.Errorf("warning %q does not count one rule: %s", msg, line)
+			if !strings.HasSuffix(line, " count=2") {
+				t.Errorf("warning %q does not count two rules: %s", msg, line)
 			}
 		}
 		if !found {
@@ -806,10 +976,10 @@ func TestWFPController_ApplyRules_ReplacesWithHigherEpoch(t *testing.T) {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
 	first := slices.Clone(ctrl.chains["plexd-mesh"])
-	// The first three rules yield four filters: the two port-scoped allows
-	// get no forward filter, the ICMP allow gets both layers.
-	if len(first) != 4 {
-		t.Fatalf("the first apply installed %d filters, want 4", len(first))
+	// The first three rules yield three filters: each is an allow that names
+	// a protocol, so none of them gets a forward filter.
+	if len(first) != 3 {
+		t.Fatalf("the first apply installed %d filters, want 3", len(first))
 	}
 
 	if err := ctrl.ApplyRules("plexd-mesh", sixRules[3:]); err != nil {
@@ -828,14 +998,14 @@ func TestWFPController_ApplyRules_ReplacesWithHigherEpoch(t *testing.T) {
 	if !slices.Equal(engine.deleted, first) {
 		t.Errorf("deleted = %v, want the filters of the first apply %v", engine.deleted, first)
 	}
-	if len(engine.order) != 10 {
-		t.Fatalf("added %d filters over both applies, want 10", len(engine.order))
+	if len(engine.order) != 9 {
+		t.Fatalf("added %d filters over both applies, want 9", len(engine.order))
 	}
-	// The chain is never unfiltered: every stale filter went after all ten
+	// The chain is never unfiltered: every stale filter went after all nine
 	// filters had been added.
 	for i, added := range engine.deletedAfter {
-		if added != 10 {
-			t.Errorf("deletion %d ran after %d additions, want 10", i, added)
+		if added != 9 {
+			t.Errorf("deletion %d ran after %d additions, want 9", i, added)
 		}
 	}
 }
@@ -1294,7 +1464,27 @@ func TestWFPController_Real(t *testing.T) {
 		t.Fatalf("Probe() error = %v, want nil", err)
 	}
 
+	rules := []FirewallRule{
+		{Interface: iface, SrcIP: "10.255.252.0/30", DstIP: "10.255.252.4/30", Port: 443, Protocol: "tcp", Action: "allow"},
+		{Interface: iface, SrcIP: "10.255.252.8/30", DstIP: "0.0.0.0/0", Action: "deny"},
+		{Interface: iface, SrcIP: "fd00:255:252::/64", DstIP: "fd00:255:252:1::/64", Port: 443, Protocol: "tcp", Action: "allow"},
+		{Interface: iface, SrcIP: "fd00:255:252:2::/64", DstIP: "::/0", Protocol: "icmp", Action: "allow"},
+		{Interface: iface, SrcIP: "fd00:255:252:8::/64", DstIP: "fd00:255:252:9::/64", Action: "allow"},
+		{Interface: iface, Action: "allow"},
+		{Interface: iface, Action: "deny"},
+	}
+
 	t.Cleanup(func() {
+		// DeleteChain deletes in installation order, which would leave the
+		// default deny alone on the runner's interface between the deletion
+		// of the allow's filters and of its own. A test that failed with the
+		// deny installed therefore first replaces the ruleset with the allow
+		// of everything alone, so the deny goes while the allow still stands.
+		if len(ctrl.chains["plexd-test"]) > 0 {
+			if err := ctrl.ApplyRules("plexd-test", rules[5:6]); err != nil {
+				t.Errorf("cleanup ApplyRules() of the allow alone error = %v", err)
+			}
+		}
 		if err := ctrl.DeleteChain("plexd-test"); err != nil {
 			t.Errorf("cleanup DeleteChain() error = %v", err)
 		}
@@ -1303,20 +1493,15 @@ func TestWFPController_Real(t *testing.T) {
 	if err := ctrl.EnsureChain("plexd-test"); err != nil {
 		t.Fatalf("EnsureChain() error = %v, want nil", err)
 	}
-	rules := []FirewallRule{
-		{Interface: iface, SrcIP: "10.255.252.0/30", DstIP: "10.255.252.4/30", Port: 443, Protocol: "tcp", Action: "allow"},
-		{Interface: iface, SrcIP: "10.255.252.8/30", DstIP: "0.0.0.0/0", Action: "deny"},
-		{Interface: iface, SrcIP: "fd00:255:252::/64", DstIP: "fd00:255:252:1::/64", Port: 443, Protocol: "tcp", Action: "allow"},
-		{Interface: iface, SrcIP: "fd00:255:252:2::/64", DstIP: "::/0", Protocol: "icmp", Action: "allow"},
-		{Interface: iface, Action: "allow"},
-		{Interface: iface, Action: "deny"},
-	}
 	// The plan of #176 assumes the engine takes plexd's conditions at the
 	// IPv6 layers as it does at the IPv4 ones: the interface LUID, IPv6
 	// prefixes, ICMPv6 and the local port at ALE_AUTH_RECV_ACCEPT_V6, the
 	// interface index at IPFORWARD_V6. An error that names a " v6" filter
 	// means that assumption failed, not this test: report it, and do not
-	// narrow the rules until the engine takes them.
+	// narrow the rules until the engine takes them. A protocol or a port at
+	// a forward layer is not that failure: IPFORWARD_V4 and IPFORWARD_V6
+	// both lack the fields, buildFilters puts neither there, and fakeEngine
+	// refuses them, so the unit tests catch such a filter first.
 	if err := ctrl.ApplyRules("plexd-test", rules); err != nil {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
@@ -1350,26 +1535,30 @@ func TestWFPController_Real(t *testing.T) {
 		}
 	}
 
-	// Rules 0 and 2 are allows naming a port, which the forward layer cannot
-	// express, so they have no forward filter. The two rules without
-	// addresses have a filter at each of the four layers.
+	// Rules 0, 2 and 3 are allows naming a protocol, 0 and 2 a port as well,
+	// which the forward layers cannot express, so they have no forward
+	// filter. Rule 4 names IPv6 addresses alone, so IPFORWARD_V6 takes an
+	// IPv6 prefix from it, as it does from an address-only IPv6 rule in
+	// production. The two rules without addresses have a filter at each of
+	// the four layers.
 	withoutDeny := map[string]wf.LayerID{
 		"plexd plexd-test #0 inbound":    wf.LayerALEAuthRecvAcceptV4,
 		"plexd plexd-test #1 inbound":    wf.LayerALEAuthRecvAcceptV4,
 		"plexd plexd-test #1 forward":    wf.LayerIPForwardV4,
 		"plexd plexd-test #2 inbound v6": wf.LayerALEAuthRecvAcceptV6,
 		"plexd plexd-test #3 inbound v6": wf.LayerALEAuthRecvAcceptV6,
-		"plexd plexd-test #3 forward v6": wf.LayerIPForwardV6,
-		"plexd plexd-test #4 inbound":    wf.LayerALEAuthRecvAcceptV4,
-		"plexd plexd-test #4 forward":    wf.LayerIPForwardV4,
 		"plexd plexd-test #4 inbound v6": wf.LayerALEAuthRecvAcceptV6,
 		"plexd plexd-test #4 forward v6": wf.LayerIPForwardV6,
+		"plexd plexd-test #5 inbound":    wf.LayerALEAuthRecvAcceptV4,
+		"plexd plexd-test #5 forward":    wf.LayerIPForwardV4,
+		"plexd plexd-test #5 inbound v6": wf.LayerALEAuthRecvAcceptV6,
+		"plexd plexd-test #5 forward v6": wf.LayerIPForwardV6,
 	}
 	withDeny := maps.Clone(withoutDeny)
-	withDeny["plexd plexd-test #5 inbound"] = wf.LayerALEAuthRecvAcceptV4
-	withDeny["plexd plexd-test #5 forward"] = wf.LayerIPForwardV4
-	withDeny["plexd plexd-test #5 inbound v6"] = wf.LayerALEAuthRecvAcceptV6
-	withDeny["plexd plexd-test #5 forward v6"] = wf.LayerIPForwardV6
+	withDeny["plexd plexd-test #6 inbound"] = wf.LayerALEAuthRecvAcceptV4
+	withDeny["plexd plexd-test #6 forward"] = wf.LayerIPForwardV4
+	withDeny["plexd plexd-test #6 inbound v6"] = wf.LayerALEAuthRecvAcceptV6
+	withDeny["plexd plexd-test #6 forward v6"] = wf.LayerIPForwardV6
 	checkInstalled(withDeny)
 
 	// DeleteChain deletes in installation order, which would leave the deny
@@ -1377,7 +1566,7 @@ func TestWFPController_Real(t *testing.T) {
 	// filters and of its own. A ruleset without the deny replaces it instead:
 	// the new filters outweigh the old ones before any of them goes, and the
 	// stale filters, those at the IPv6 layers among them, are deleted.
-	if err := ctrl.ApplyRules("plexd-test", rules[:5]); err != nil {
+	if err := ctrl.ApplyRules("plexd-test", rules[:6]); err != nil {
 		t.Fatalf("ApplyRules() without the deny error = %v, want nil", err)
 	}
 	checkInstalled(withoutDeny)

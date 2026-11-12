@@ -32,9 +32,9 @@ Only TCP keeps state. pf consults the state table ahead of the ruleset and a sta
 
 The cost is that a Mac's own UDP and ICMP flows over the mesh get no automatic return path: a reply arriving on the mesh interface is subject to the policy like any other inbound packet, so the policy has to allow it. This is the fail-closed side of the trade — a revoked rule takes effect at once, on every protocol.
 
-On Windows the forward path is narrower than the local one. `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6` carry interfaces, addresses and a protocol, but no port. `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` and `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6` carry the full five-tuple.
+On Windows the forward path is narrower than the local one. `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6` carry interfaces and addresses, but neither a protocol nor a port: the layers have no `IP_PROTOCOL` field and no port field, and `github.com/tailscale/wf` refuses a condition on a field the layer does not have. `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` and `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6` carry the full five-tuple.
 
-A rule left out of the forward layer is not narrowed to nothing: the traffic it covered is decided by the filters that remain, which end in the default deny. A port-scoped **allow** cannot be narrowed onto a layer without ports, so it gets no forward filter, and the traffic it covered is dropped unless another rule allows it. This fails closed, and an operator notices it: on a bridge or relay node, transit traffic a port-scoped rule allows is dropped. `ApplyRules` logs one `Warn` line per apply naming how many rules that affects, so the effect is not mistaken for a routing fault. The controller would install a port-scoped **deny** on the forward layer without its port, a superset of what it asked for, but the engine builds no such rule: its only deny is the default deny, which names no port.
+A rule left out of the forward layer is not narrowed to nothing: the traffic it covered is decided by the filters that remain, which end in the default deny. An **allow** that names a protocol or a port cannot be narrowed onto a layer without those fields, so it gets no forward filter, and the traffic it covered is dropped unless another rule allows it. Only an allow that names neither, one that matches on addresses alone, reaches the forward path. This fails closed, and an operator notices it: on a bridge or relay node, transit traffic such a rule allows is dropped. `ApplyRules` logs one `Warn` line per apply naming how many rules that affects, so the effect is not mistaken for a routing fault. The controller would install a **deny** that names a protocol or a port on the forward layer without them, which blocks every protocol and port between its addresses, a superset of what it asked for, and log a second `Warn` line counting such rules. The engine builds no such rule: its only deny is the default deny, which names neither.
 
 One more Windows difference: the ALE receive-accept layers classify a TCP connection once, at accept, so a revoked allow does not cut an already accepted inbound connection, which pf `no state` and the nftables chains both do.
 
@@ -155,14 +155,14 @@ The weight is one below the maximum, which wireguard-windows claims for its kill
 
 ### Layers and conditions
 
-An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, and a second at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all four layers. Only an `allow` that names a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
+An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, and a second at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all four layers. Only an `allow` that names a protocol or a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
 
 | Rule field | `LayerALEAuthRecvAcceptV4`, `LayerALEAuthRecvAcceptV6` (inbound) | `LayerIPForwardV4`, `LayerIPForwardV6` (forward) |
 |---|---|---|
 | `Interface` | `FieldIPLocalInterface` equals the LUID | `FieldSourceInterfaceIndex` equals the index |
 | `SrcIP` | `FieldIPRemoteAddress` | `FieldIPSourceAddress` |
 | `DstIP` | `FieldIPLocalAddress` | `FieldIPDestinationAddress` |
-| `Protocol` | `FieldIPProtocol`; `icmp` is `IPProtoICMP` at the V4 layers and `IPProtoICMPV6` at the V6 layers | The same |
+| `Protocol` | `FieldIPProtocol`; `icmp` is `IPProtoICMP` at the V4 layers and `IPProtoICMPV6` at the V6 layers | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
 | `Port`, `PortTo` | `FieldIPLocalPort`, an equality or a `wf.Range` | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
 | `Action` | `wf.ActionPermit` or `wf.ActionBlock` | The same |
 
@@ -268,7 +268,7 @@ The two failures `plexd up` aborts on, the pre-flight probe and the deny-by-defa
 
 ## Logging
 
-All entries carry `component=policy` for the filter operations and `component=bridge` for the NAT ones. All are at `Debug` except the one `Warn` and the one `Error` line.
+All entries carry `component=policy` for the filter operations and `component=bridge` for the NAT ones. All are at `Debug` except the two `Warn` lines and the one `Error` line.
 
 | Message (`component=policy`) | Keys |
 |---|---|
@@ -287,7 +287,8 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `wfp chain flushed`, `wfp chain deleted` | `chain` |
 | `wfp chain not found, nothing to flush` | `chain` |
 | `wfp chain not found, nothing to delete` | `chain` |
-| `wfp forward path cannot enforce a port, allow rules narrowed away` (`Warn`) | `chain`, `count` |
+| `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` (`Warn`) | `chain`, `count` |
+| `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` (`Warn`) | `chain`, `count` |
 | `wfp rollback delete failed` (`Error`) | `filter`, `error` |
 
 | Message (`component=bridge`) | Keys |
@@ -298,11 +299,11 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `NAT masquerade removed` | `interface` |
 | `NAT masquerade not configured, idempotent success` (macOS) | `interface` |
 
-`count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger whenever a rule reaches the forward layer too. Two lines sit above `Debug`. `wfp forward path cannot enforce a port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path; its `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
+`count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger whenever a rule reaches the forward layer too. Three lines sit above `Debug`. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
 
 ## Tests
 
-Both controllers reach the operating system through seams, so every rendered rule and every idempotent case runs on an ordinary unprivileged runner. macOS wires the package's recording runner in place of `pfctl`, which captures each invocation's arguments and its stdin, so a test pins the whole anchor text a change renders. Windows wires a `wfpEngine` fake in place of the session, which records the sublayer, the filters in the order they were added and the deletions, and can be armed to fail a chosen `AddRule`; PowerShell goes through the same recording runner.
+Both controllers reach the operating system through seams, so every rendered rule and every idempotent case runs on an ordinary unprivileged runner. macOS wires the package's recording runner in place of `pfctl`, which captures each invocation's arguments and its stdin, so a test pins the whole anchor text a change renders. Windows wires a `wfpEngine` fake in place of the session, which records the sublayer, the filters in the order they were added and the deletions, and can be armed to fail a chosen `AddRule`; PowerShell goes through the same recording runner. The fake refuses a filter whose condition names a field its layer does not have, as the engine does, from a per-layer list of the fields plexd uses: a protocol or a port at a forward layer fails a unit test rather than the real one.
 
 `TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root.
 
@@ -316,6 +317,6 @@ Three tests drive the real host and are gated:
 
 `TestPFController_Real` loads an anchor naming `plexd99`, an interface no host has, with an IPv6 rule and the default deny among its rules, takes the pf reference, reads the filter and nat rules back with `pfctl -a com.apple/plexd -s rules` and `-s nat`, and finds the `inet6` rule and a block rule without an address there. It then deletes the chain and asserts the anchor is empty and the token released. A host that had pf disabled is left disabled. The variable gates it in addition to the effective uid, so `sudo go test ./...` on a developer's Mac does not enable pf on their host.
 
-`TestWFPController_Real` installs filters for prefixes no host carries, an IPv6 rule among them, and the default deny, which shows that the filter engine accepts filters at the V6 layers. It enumerates plexd's filters through a session of its own, checks that the `allow` naming a port got no forward filter, and pins `FWP_E_FILTER_NOT_FOUND` by deleting a filter that is not there. `TestWFPController_RealNAT` creates the NetNat object for `10.255.252.0/30`, reads the prefix back, and repeats both the add and the remove to prove they are idempotent — the second read after the removal is what proves the absent case is a success with no output rather than a localized error.
+`TestWFPController_Real` installs filters for prefixes no host carries, IPv6 rules among them, one of which names addresses alone, and the default deny, which shows that the filter engine accepts filters at the V6 layers, an IPv6 prefix at `FWPM_LAYER_IPFORWARD_V6` included. It enumerates plexd's filters through a session of its own, checks that the allows naming a protocol or a port got no forward filter, and pins `FWP_E_FILTER_NOT_FOUND` by deleting a filter that is not there. A run that fails with the default deny installed first replaces the ruleset with the allow of everything alone and then deletes the chain, so the deny never stands alone on the runner's interface. `TestWFPController_RealNAT` creates the NetNat object for `10.255.252.0/30`, reads the prefix back, and repeats both the add and the remove to prove they are idempotent — the second read after the removal is what proves the absent case is a success with no output rather than a localized error.
 
 CI runs all three; see [CI Workflow](../development/ci-workflow.md).
