@@ -5195,8 +5195,9 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # revision id and fingerprint, and checks which traffic the chains on plexd's
 # mesh interface let through in each direction:
 #
-#   A  tcp 7001 to plexd over IPv4 and over IPv6, a logged udp 7004 rule, and
-#      tcp 7003 from plexd to meshpeer
+#   A  tcp 7001 to plexd over IPv4 and over IPv6, udp 7004 to plexd, and tcp
+#      7003 from plexd to meshpeer, with "log": true on the IPv4 7001 rule,
+#      the 7004 rule and the 7003 rule
 #   B  A's rules, each carrying the legacy "action": "allow"
 #   C  one rule carrying "action": "deny", which rejects the revision
 #   D  A without its 7001 rules
@@ -5215,10 +5216,22 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # port 9 arrives and one to 7006 does not. A query from inside plexd's
 # container reaches the mesh resolver over lo, which no chain matches, so mesh
 # DNS answers even under E. The mesh carries IPv4 only, so A's IPv6 rule proves
-# that plexd applies such a rule, not that it matches IPv6 traffic. The phase
-# runs before Phase 13, which replaces the fixture, and ends by serving the
-# saved peers and policy again. Like Phase 12d it needs kernel WireGuard and
-# fails without it.
+# that plexd applies such a rule, not that it matches IPv6 traffic.
+#
+# plexd writes one line to its own log for each connection a logged rule
+# allows, and the line's rule key holds the rule's index in the revision. Under
+# A the phase wants that line with rule=0 and direction=in for meshpeer's
+# connection to 7001, and with rule=3 and direction=out for the connection from
+# plexd's container to meshpeer's 7003. The dropped 7002 probe draws no line.
+# plexd's container has no journalctl, so plexd hands its connection lines to
+# the log forwarder directly, and the phase finds one of A's in the last logs
+# batch the mock received. No apply in the phase may log "policy connection
+# logging unavailable", the Warn line of a backend that enforces logged rules
+# without logging their connections.
+#
+# The phase runs before Phase 13, which replaces the fixture, and ends by
+# serving the saved peers and policy again. Like Phase 12d it needs kernel
+# WireGuard and fails without it.
 echo "=== Testing policy enforcement on the mesh interface ==="
 
 if [ "${WG_CONFIGURED}" -eq 0 ]; then
@@ -5228,6 +5241,12 @@ fi
 MESH_NODE_IP="10.99.0.1"
 MESH_PEER_IP="10.99.0.3"
 FIXTURE_POLICY_REVISION="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+
+# expect_no_conn_unavailable wants no more "policy connection logging
+# unavailable" lines in the plexd log than it holds now.
+MESH_UNAVAILABLE_MSG='msg="policy connection logging unavailable'
+POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh policy] dc logs plexd failed: ${POLICY_LOG}"
+MESH_UNAVAILABLE_BASE=$(count_log_lines "${POLICY_LOG}" "${MESH_UNAVAILABLE_MSG}")
 
 # splice_state <tag> <jq-filter> <value-json> applies the filter, which reads
 # the value as $v, to the live snapshot, posts the result back and nudges the
@@ -5327,28 +5346,103 @@ expect_policy_applied() {
     echo "  PASS: [${tag}] plexd logged 'policy ruleset applied' with revision_id=${rev} and rules=${rules}"
 }
 
-# logged_rule_count <log> <revision-id> prints the count of the last
-# "policy rules ask for logging" line between the first "policy ruleset
-# applied" line of the revision and the policy line before it: the line the
-# engine logged while it built that revision's ruleset. It prints nothing when
-# the engine logged none for it.
-logged_rule_count() {
-    local log=$1 rev=$2 line count=""
+# conn_lines <log> <key=value>... prints each "policy rule allowed connection"
+# line of the log that holds every key=value as a whole blank-separated token,
+# so rule=0 does not match rule=03 and src=10.99.0.3 does not match
+# src=10.99.0.30.
+conn_lines() {
+    local log=$1 line token
+    shift
     while IFS= read -r line; do
         case "${line}" in
-            *'msg="policy rules ask for logging, which this release does not do"'*)
-                count=${line##*count=}
-                count=${count%% *}
-                ;;
-            *'msg="policy ruleset applied"'*"revision_id=${rev}"*)
-                printf '%s' "${count}"
-                return 0
-                ;;
-            *'msg="policy ruleset applied"'* | *'msg="policy revision rejected, keeping previous ruleset"'*)
-                count=""
+            *'msg="policy rule allowed connection"'*) ;;
+            *) continue ;;
+        esac
+        for token in "$@"; do
+            case " ${line} " in
+                *" ${token} "*) ;;
+                *) continue 2 ;;
+            esac
+        done
+        printf '%s\n' "${line}"
+    done <<< "${log}"
+}
+
+# expect_conn_line <tag> <revision-id> <rule> <direction> <src> <dst> <port>
+# reads the plexd log every second for up to 10 s until it holds a "policy rule
+# allowed connection" line with revision_id=<revision-id>, rule=<rule>,
+# direction=<direction>, protocol=tcp, src=<src>, dst=<dst> and
+# dst_port=<port>. rule is the rule's index in the revision.
+expect_conn_line() {
+    local tag=$1 rev=$2 rule=$3 dir=$4 src=$5 dst=$6 port=$7 start=${SECONDS} log found
+    while :; do
+        log=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${log}"
+        found=$(conn_lines "${log}" "revision_id=${rev}" "rule=${rule}" "direction=${dir}" \
+            protocol=tcp "src=${src}" "dst=${dst}" "dst_port=${port}")
+        if [ -n "${found}" ]; then
+            found=${found%%$'\n'*}
+            echo "  PASS: [${tag}] plexd logged '${found}'"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge 10 ]; then
+            fail "[${tag}] 10s after the connection, the plexd log holds no 'policy rule allowed connection' line with revision_id=${rev} rule=${rule} direction=${dir} protocol=tcp src=${src} dst=${dst} dst_port=${port}; its connection lines for the revision: '$(conn_lines "${log}" "revision_id=${rev}")'"
+        fi
+        sleep 1
+    done
+}
+
+# expect_conn_line_forwarded <tag> <revision-id> reads the last logs batch the
+# mock received every second for up to 30 s until one of its records carries a
+# "policy rule allowed connection" line with revision_id=<revision-id> in its
+# message. The batch is NDJSON, one api.LogLine per line, and the message is
+# the line as plexd's text handler writes it. plexd's container has no
+# journalctl, so plexd hands its connection lines to the log forwarder
+# directly, and a record of one proves that path. With collect_interval 5s and
+# report_interval 10s a line reaches the mock within 15 s. The mock keeps only
+# the last batch, and plexd sends one at most every 10 s, so a check every
+# second sees the batch that carries the line before a later one replaces it.
+expect_conn_line_forwarded() {
+    local tag=$1 rev=$2 start=${SECONDS} body rc found
+    while :; do
+        rc=0
+        body=$(curl -sf "http://localhost:18080/test/last-request/logs" 2>&1) || rc=$?
+        found=""
+        if [ "${rc}" -eq 0 ]; then
+            found=$(printf '%s' "${body}" | jq -r --arg rev "${rev}" \
+                'select((" " + (.message // "") + " ") | contains("msg=\"policy rule allowed connection\"") and contains(" revision_id=" + $rev + " ")) | .message' 2>&1) \
+                || fail "[${tag}] jq could not read the last logs batch as NDJSON api.LogLine records: ${found} (body: ${body})"
+        fi
+        if [ -n "${found}" ]; then
+            found=${found%%$'\n'*}
+            echo "  PASS: [${tag}] the mock received the forwarded line '${found}'"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge 30 ]; then
+            fail "[${tag}] 30s after the connection, the last logs batch the mock received holds no record whose message is a 'policy rule allowed connection' line with revision_id=${rev} (curl exited ${rc}; body: ${body})"
+        fi
+        sleep 1
+    done
+}
+
+# expect_no_conn_unavailable <tag> <log> fails with the last "policy connection
+# logging unavailable" line of the log when the log holds more such lines than
+# it did when the phase started. A backend logs that line when it enforces the
+# logged rules without logging their connections, for one when it cannot read
+# its kernel's connection log.
+expect_no_conn_unavailable() {
+    local tag=$1 log=$2 line last="" n=0
+    while IFS= read -r line; do
+        case "${line}" in
+            *"${MESH_UNAVAILABLE_MSG}"*)
+                n=$((n + 1))
+                last=${line}
                 ;;
         esac
     done <<< "${log}"
+    if [ "${n}" -gt "${MESH_UNAVAILABLE_BASE}" ]; then
+        fail "[${tag}] plexd logged '${last}' in this phase, want no 'policy connection logging unavailable' line"
+    fi
+    echo "  PASS: [${tag}] plexd logged no 'policy connection logging unavailable' line in this phase"
 }
 
 # plexd_listening <port> succeeds when a socket in plexd's container listens on
@@ -5633,28 +5727,37 @@ echo "  PASS: [mesh policy] meshpeer completed a handshake with plexd $((SECONDS
 # (e) Policy A: 7001 is open to meshpeer and 7002 is not, and plexd's answers
 # on 7001 leave through the output chain as replies. plexd's container connects
 # to meshpeer's 7003, which A's fourth rule allows, and fails on 7005, which no
-# rule names, while meshpeer listens there. The one logged rule is counted in
-# the engine's Info line for the revision.
+# rule names, while meshpeer listens there. Rules 0, 2 and 3 are logged, and
+# the apply logs no "policy connection logging unavailable" line. meshpeer's
+# connection to 7001 draws a connection line for rule 0 with direction=in, the
+# dropped 7002 probe draws none, and the connection from plexd's container to
+# meshpeer's 7003 draws one for rule 3 with direction=out. One of these lines
+# then reaches the mock through the log forwarder.
 MESH_REV_A="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c4"
 MESH_RULES_A=$(jq -c . <<'MESHRULESAEOF'
 [
-  {"protocol": "tcp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7001, "to": 7001}},
+  {"protocol": "tcp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7001, "to": 7001}, "log": true},
   {"protocol": "tcp", "source_cidr": "fd00:99::3/128", "destination_cidr": "fd00:99::1/128", "ports": {"from": 7001, "to": 7001}},
   {"protocol": "udp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7004, "to": 7004}, "log": true},
-  {"protocol": "tcp", "source_cidr": "10.99.0.1/32", "destination_cidr": "10.99.0.3/32", "ports": {"from": 7003, "to": 7003}}
+  {"protocol": "tcp", "source_cidr": "10.99.0.1/32", "destination_cidr": "10.99.0.3/32", "ports": {"from": 7003, "to": 7003}, "log": true}
 ]
 MESHRULESAEOF
 )
 serve_policy "mesh-policy-a" "${MESH_REV_A}" "${MESH_RULES_A}"
 expect_policy_applied "mesh policy A" "${MESH_REV_A}" 4
-MESH_LOGGED_A=$(logged_rule_count "${POLICY_LOG}" "${MESH_REV_A}")
-if [ "${MESH_LOGGED_A}" != "1" ]; then
-    fail "[mesh policy A] the 'policy rules ask for logging, which this release does not do' line plexd logged for revision ${MESH_REV_A} carries count='${MESH_LOGGED_A}', want count=1"
-fi
-echo "  PASS: [mesh policy A] plexd logged 'policy rules ask for logging, which this release does not do' with count=1 for revision ${MESH_REV_A}"
+expect_no_conn_unavailable "mesh policy A" "${POLICY_LOG}"
 probe_plexd_port "mesh policy A" 7001 open
+expect_conn_line "mesh policy A" "${MESH_REV_A}" 0 in "${MESH_PEER_IP}" "${MESH_NODE_IP}" 7001
 probe_plexd_port "mesh policy A" 7002 closed
+POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh policy A] dc logs plexd failed: ${POLICY_LOG}"
+MESH_CONN_7002=$(conn_lines "${POLICY_LOG}" dst_port=7002)
+if [ -n "${MESH_CONN_7002}" ]; then
+    fail "[mesh policy A] plexd logged '${MESH_CONN_7002}', want no 'policy rule allowed connection' line with dst_port=7002, since no rule allows the port"
+fi
+echo "  PASS: [mesh policy A] plexd logged no 'policy rule allowed connection' line with dst_port=7002 for the dropped probe"
 probe_meshpeer_port "mesh policy A" 7003 open
+expect_conn_line "mesh policy A" "${MESH_REV_A}" 3 out "${MESH_NODE_IP}" "${MESH_PEER_IP}" 7003
+expect_conn_line_forwarded "mesh policy A" "${MESH_REV_A}"
 probe_meshpeer_port "mesh policy A" 7005 closed
 
 # (f) Policy B, A's rules with the legacy "action": "allow", is applied, and
@@ -5721,6 +5824,11 @@ else
     fail "[mesh restore] the mock serves '${MESH_SERVED}' after the restore, want the saved '${MESH_SAVED}'"
 fi
 MESH_DEL_OUT=$(dc exec -T meshpeer ip link del wg0 2>&1) || fail "[mesh restore] deleting wg0 in meshpeer failed: ${MESH_DEL_OUT}"
+
+# (i) No apply in the phase, B's and D's included, logged "policy connection
+# logging unavailable".
+POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh conn log] dc logs plexd failed: ${POLICY_LOG}"
+expect_no_conn_unavailable "mesh conn log" "${POLICY_LOG}"
 
 echo "=== Phase 12e PASSED: policy enforcement on the mesh interface ==="
 
