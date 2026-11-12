@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -21,18 +22,38 @@ type Enforcer struct {
 	firewall FirewallController
 	cfg      Config
 	logger   *slog.Logger
+	connLog  *ConnLogger
+
+	// generation counts the applies that got past the engine. It names an
+	// apply in the log tags, so a tag from one ruleset never names a rule of
+	// another.
+	generation uint64
 }
 
 // NewEnforcer creates an Enforcer. The firewall parameter may be nil if no
 // firewall backend is available; in that case ApplyFirewallRules is a no-op.
+// When the firewall can report the connections its logged rules admit, its
+// reports go to the Enforcer's ConnLogger.
 func NewEnforcer(engine *PolicyEngine, firewall FirewallController, cfg Config, logger *slog.Logger) *Enforcer {
 	cfg.ApplyDefaults()
-	return &Enforcer{
+	e := &Enforcer{
 		engine:   engine,
 		firewall: firewall,
 		cfg:      cfg,
 		logger:   logger.With("component", "policy"),
+		connLog:  NewConnLogger(logger),
 	}
+	if reporter, ok := firewall.(ConnReporter); ok {
+		reporter.SetConnSink(e.connLog)
+	}
+	return e
+}
+
+// ConnLogger returns the logger that writes a line for each connection a
+// logged rule admits. plexd up runs its summary loop and, where no platform
+// log source reads plexd's output, forwards its lines.
+func (e *Enforcer) ConnLogger() *ConnLogger {
+	return e.connLog
 }
 
 // ApplyFirewallRules builds firewall rules from the merged policy and applies
@@ -47,6 +68,22 @@ func NewEnforcer(engine *PolicyEngine, firewall FirewallController, cfg Config, 
 // A ruleset the engine refuses to translate is reported as ErrInvalidRuleset so
 // callers can tell a permanently broken revision from a transient netlink
 // failure.
+//
+// Every rule with log: true gets the tag "<generation>/<index>", the index
+// being the rule's position in the policy's rules. The ConnLogger learns the
+// tags before the firewall does, so an event the kernel produces right after
+// the apply finds its rule, and forgets them again when the apply fails, so
+// repeated failures never push the installed ruleset's tags out of it.
+//
+// DECISION: the logged rules go ahead of the unlogged ones, each group in the
+// order given, and the default deny stays last. Every rule is an allow and
+// order carries no verdict, so the move changes nothing that passes or drops.
+// It makes every backend's first match a logged rule whenever one allows the
+// connection, so a narrow logged rule still logs behind a Project's allow-all
+// policy. A connection is named after the first logged rule in revision order
+// that allows it. The backends see the reordered list, so a WFP filter's #<i>
+// and a pf line's position follow it, while a line's rule stays the revision
+// index.
 func (e *Enforcer) ApplyFirewallRules(policy *api.PolicySnapshot, iface string) (bool, error) {
 	if !e.cfg.IsEnabled() {
 		return false, nil
@@ -65,15 +102,41 @@ func (e *Enforcer) ApplyFirewallRules(policy *api.PolicySnapshot, iface string) 
 		return false, fmt.Errorf("policy: enforce: %w: %w", ErrInvalidRuleset, err)
 	}
 
+	e.generation++
+	for i, r := range rules {
+		if r.Log {
+			fwRules[i].LogTag = fmt.Sprintf("%d/%d", e.generation, i)
+		}
+	}
+	slices.SortStableFunc(fwRules, func(a, b FirewallRule) int {
+		return untagged(a) - untagged(b)
+	})
+
+	revisionID := ""
+	if policy != nil {
+		revisionID = policy.RevisionID
+	}
+	e.connLog.SetRuleset(revisionID, fwRules)
+
 	if err := e.firewall.EnsureChain(e.cfg.ChainName); err != nil {
+		e.connLog.Revert()
 		return false, fmt.Errorf("policy: enforce: %w", err)
 	}
 	if err := e.firewall.ApplyRules(e.cfg.ChainName, fwRules); err != nil {
+		e.connLog.Revert()
 		return false, fmt.Errorf("policy: enforce: %w", err)
 	}
 
 	e.logger.Info("applied firewall rules", "count", len(fwRules), "chain", e.cfg.ChainName)
 	return true, nil
+}
+
+// untagged sorts a rule without a log tag after one with a tag.
+func untagged(r FirewallRule) int {
+	if r.LogTag == "" {
+		return 1
+	}
+	return 0
 }
 
 // Preflight reports whether this node can enforce policy at all, without

@@ -2,6 +2,8 @@ package policy
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -361,5 +363,191 @@ func TestEnforcer_PreflightProbeError(t *testing.T) {
 	want := "policy: preflight: policy: nftables: probe: operation not permitted"
 	if err.Error() != want {
 		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// reportingFirewall is a mockFirewallController that can report connections.
+// It records the sink it is given and, at each ApplyRules, the tags the sink
+// already knows.
+type reportingFirewall struct {
+	mockFirewallController
+	sinks          []ConnSink
+	tagsAtApply    [][]string
+	revisionAtTags []string
+}
+
+func (f *reportingFirewall) SetConnSink(sink ConnSink) {
+	f.sinks = append(f.sinks, sink)
+}
+
+func (f *reportingFirewall) ApplyRules(chain string, rules []FirewallRule) error {
+	var tags []string
+	revision := ""
+	if len(f.sinks) > 0 {
+		if cl, ok := f.sinks[len(f.sinks)-1].(*ConnLogger); ok {
+			cl.mu.Lock()
+			for tag, entry := range cl.current {
+				tags = append(tags, tag)
+				revision = entry.revisionID
+			}
+			cl.mu.Unlock()
+		}
+	}
+	slices.Sort(tags)
+	f.tagsAtApply = append(f.tagsAtApply, tags)
+	f.revisionAtTags = append(f.revisionAtTags, revision)
+	return f.mockFirewallController.ApplyRules(chain, rules)
+}
+
+// fourRules is a policy whose rules 1 and 3 carry log: true.
+func fourRules(revision string) *api.PolicySnapshot {
+	return &api.PolicySnapshot{
+		RevisionID: revision,
+		Rules: []api.PolicyRule{
+			{Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.1/32", Ports: &api.PortRange{From: 22, To: 22}},
+			{Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.1/32", Ports: &api.PortRange{From: 443, To: 443}, Log: true},
+			{Protocol: "udp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.1/32", Ports: &api.PortRange{From: 53, To: 53}},
+			{Protocol: "any", SourceCIDR: "10.99.0.3/32", DestinationCIDR: "10.99.0.1/32", Log: true},
+		},
+	}
+}
+
+func TestEnforcer_TagsLoggedRulesAndAppliesThemFirst(t *testing.T) {
+	fw := &reportingFirewall{}
+	e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{}, testLogger())
+
+	for gen := 1; gen <= 2; gen++ {
+		if _, err := e.ApplyFirewallRules(fourRules("R"), "plexd0"); err != nil {
+			t.Fatalf("apply %d: ApplyFirewallRules() error = %v", gen, err)
+		}
+		got := fw.applyRulesCalls[gen-1].Rules
+		if len(got) != 5 {
+			t.Fatalf("apply %d handed the firewall %d rules, want 5: %+v", gen, len(got), got)
+		}
+		want := []struct {
+			port int
+			tag  string
+		}{
+			{443, fmt.Sprintf("%d/1", gen)},
+			{0, fmt.Sprintf("%d/3", gen)},
+			{22, ""},
+			{53, ""},
+		}
+		for i, w := range want {
+			if got[i].Port != w.port || got[i].LogTag != w.tag || got[i].Action != "allow" {
+				t.Errorf("apply %d rule %d = %+v, want port %d and tag %q", gen, i, got[i], w.port, w.tag)
+			}
+		}
+		if got[4].Action != "deny" || got[4].LogTag != "" || got[4].SrcIP != "" {
+			t.Errorf("apply %d rule 4 = %+v, want the untagged default deny", gen, got[4])
+		}
+	}
+}
+
+func TestEnforcer_HandsItsConnLoggerTheTagsBeforeTheApply(t *testing.T) {
+	fw := &reportingFirewall{}
+	e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{}, testLogger())
+
+	if len(fw.sinks) != 1 || fw.sinks[0] != ConnSink(e.ConnLogger()) {
+		t.Fatalf("NewEnforcer() set the sinks %v, want once the Enforcer's ConnLogger", fw.sinks)
+	}
+	if _, err := e.ApplyFirewallRules(fourRules("R"), "plexd0"); err != nil {
+		t.Fatalf("ApplyFirewallRules() error = %v", err)
+	}
+	if got := fw.tagsAtApply[0]; !slices.Equal(got, []string{"1/1", "1/3"}) || fw.revisionAtTags[0] != "R" {
+		t.Errorf("at ApplyRules the logger knew the tags %v of revision %q, want [1/1 1/3] of R", got, fw.revisionAtTags[0])
+	}
+	if len(fw.sinks) != 1 {
+		t.Errorf("SetConnSink was called %d times, want once", len(fw.sinks))
+	}
+
+	// A firewall that cannot report is left alone.
+	plain := &mockFirewallController{}
+	if NewEnforcer(NewPolicyEngine(testLogger()), plain, Config{}, testLogger()).ConnLogger() == nil {
+		t.Error("ConnLogger() = nil for a firewall that cannot report")
+	}
+}
+
+func TestEnforcer_NoLoggedRulesAppliesUntagged(t *testing.T) {
+	for name, policy := range map[string]*api.PolicySnapshot{
+		"a nil policy": nil,
+		"empty rules":  {RevisionID: "R", Rules: []api.PolicyRule{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fw := &reportingFirewall{}
+			e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{}, testLogger())
+			if _, err := e.ApplyFirewallRules(policy, "plexd0"); err != nil {
+				t.Fatalf("ApplyFirewallRules() error = %v", err)
+			}
+			got := fw.applyRulesCalls[0].Rules
+			if len(got) != 1 || got[0].Action != "deny" || got[0].LogTag != "" {
+				t.Errorf("ApplyRules got %+v, want only the untagged default deny", got)
+			}
+			if len(fw.tagsAtApply[0]) != 0 {
+				t.Errorf("the logger knew the tags %v, want none", fw.tagsAtApply[0])
+			}
+		})
+	}
+}
+
+func TestEnforcer_NoGenerationWithoutEnforcement(t *testing.T) {
+	disabled := false
+	off := NewEnforcer(NewPolicyEngine(testLogger()), &reportingFirewall{}, Config{Enabled: &disabled}, testLogger())
+	none := NewEnforcer(NewPolicyEngine(testLogger()), nil, Config{}, testLogger())
+	for name, e := range map[string]*Enforcer{"disabled": off, "no firewall": none} {
+		if _, err := e.ApplyFirewallRules(fourRules("R"), "plexd0"); err != nil {
+			t.Fatalf("%s: ApplyFirewallRules() error = %v", name, err)
+		}
+		if e.generation != 0 {
+			t.Errorf("%s: generation = %d, want 0", name, e.generation)
+		}
+	}
+}
+
+func TestEnforcer_RevertsTheConnLoggerWhenTheApplyFails(t *testing.T) {
+	for name, fail := range map[string]func(fw *reportingFirewall){
+		"EnsureChain": func(fw *reportingFirewall) { fw.ensureChainErr = errors.New("netlink: busy") },
+		"ApplyRules":  func(fw *reportingFirewall) { fw.applyRulesErr = errors.New("netlink: busy") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fw := &reportingFirewall{}
+			e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{}, testLogger())
+			if _, err := e.ApplyFirewallRules(fourRules("R1"), "plexd0"); err != nil {
+				t.Fatalf("first ApplyFirewallRules() error = %v", err)
+			}
+
+			fail(fw)
+			for i := 0; i < 2; i++ {
+				if _, err := e.ApplyFirewallRules(fourRules("R2"), "plexd0"); err == nil {
+					t.Fatal("ApplyFirewallRules() error = nil, want the injected failure")
+				}
+			}
+
+			cl := e.ConnLogger()
+			cl.mu.Lock()
+			_, installed := cl.current["1/1"]
+			_, failed := cl.current["3/1"]
+			cl.mu.Unlock()
+			if !installed || failed {
+				t.Errorf("after two failed applies the logger holds tag 1/1: %v and tag 3/1: %v, want true and false", installed, failed)
+			}
+		})
+	}
+
+	// A successful apply keeps its tags.
+	fw := &reportingFirewall{}
+	e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{}, testLogger())
+	for range 2 {
+		if _, err := e.ApplyFirewallRules(fourRules("R"), "plexd0"); err != nil {
+			t.Fatalf("ApplyFirewallRules() error = %v", err)
+		}
+	}
+	cl := e.ConnLogger()
+	cl.mu.Lock()
+	_, current := cl.current["2/1"]
+	_, previous := cl.previous["1/1"]
+	cl.mu.Unlock()
+	if !current || !previous {
+		t.Errorf("after two successful applies the logger holds 2/1: %v and previously 1/1: %v, want both", current, previous)
 	}
 }

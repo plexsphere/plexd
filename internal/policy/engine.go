@@ -47,22 +47,20 @@ func NewPolicyEngine(logger *slog.Logger) *PolicyEngine {
 // (widening the rule to every port) or wrap through uint16 onto an unrelated
 // port.
 //
-// A rule's Log flag is read and the rule enforced like any other, but this
-// release logs nothing for it: one Info line per set says how many rules asked.
+// The result holds one FirewallRule per policy rule, in the order given, and
+// then the default deny. A rule's Log flag does not change its FirewallRule:
+// the Enforcer tags the logged rules by that order, since a tag names the
+// apply, which the engine does not know.
 //
 // The trailing default-deny rule is always appended — including when rules is
 // empty or nil — for a deny-by-default posture. It carries no addresses, so
 // every backend applies it to both families.
 func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) ([]FirewallRule, error) {
 	var fwRules []FirewallRule
-	logged := 0
 
 	for i, r := range rules {
 		if r.LegacyAction != nil && *r.LegacyAction != "allow" {
 			return nil, fmt.Errorf("policy: rule %d: unsupported action %q", i, *r.LegacyAction)
-		}
-		if r.Log {
-			logged++
 		}
 
 		var proto string
@@ -119,12 +117,6 @@ func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) 
 			return nil, fmt.Errorf("policy: rule %d: %w", i, err)
 		}
 		fwRules = append(fwRules, fw)
-	}
-
-	if logged > 0 {
-		e.logger.Info("policy rules ask for logging, which this release does not do",
-			"count", logged,
-		)
 	}
 
 	// Append the default-deny rule as the last rule to drop all unmatched

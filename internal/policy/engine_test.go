@@ -133,11 +133,10 @@ func TestBuildFirewallRules_ICMPPassesThrough(t *testing.T) {
 	}
 }
 
-// A logged rule is enforced like any other. This release logs none of its
-// traffic and says so once per set, not once per rule.
+// A logged rule is enforced like any other, and the engine logs nothing about
+// it: the Enforcer tags the logged rules, and the backends report what they
+// admit.
 func TestBuildFirewallRules_LogRuleEnforcedAsAllow(t *testing.T) {
-	const line = `msg="policy rules ask for logging, which this release does not do"`
-
 	var buf bytes.Buffer
 	eng := NewPolicyEngine(captureLogger(&buf))
 	got, err := eng.BuildFirewallRules([]api.PolicyRule{
@@ -151,41 +150,16 @@ func TestBuildFirewallRules_LogRuleEnforcedAsAllow(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("BuildFirewallRules() returned %d rules, want 4 (three allows and the default deny)", len(got))
 	}
-	for _, r := range got[:3] {
-		if r.Action != "allow" {
-			t.Errorf("rule %+v Action = %q, want allow", r, r.Action)
+	for i, r := range got[:3] {
+		if r.Action != "allow" || r.LogTag != "" {
+			t.Errorf("rule %d = %+v, want an allow without a log tag", i, r)
 		}
 	}
-	if n := strings.Count(buf.String(), line); n != 1 {
-		t.Fatalf("log has %d logging lines, want 1:\n%s", n, buf.String())
+	if got[0].Port != 80 || got[1].Port != 53 || got[2].DstIP != "10.0.0.6/32" {
+		t.Errorf("BuildFirewallRules() = %+v, want the rules in the order given", got)
 	}
-	for _, l := range strings.Split(buf.String(), "\n") {
-		if strings.Contains(l, line) && !strings.HasSuffix(l, " count=2") {
-			t.Errorf("logging line does not carry count=2: %s", l)
-		}
-	}
-
-	// No logged rule: no line.
-	buf.Reset()
-	if _, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32"},
-	}, "wg0"); err != nil {
-		t.Fatalf("BuildFirewallRules() error = %v", err)
-	}
-	if strings.Contains(buf.String(), line) {
-		t.Errorf("logging line written for a set without logged rules:\n%s", buf.String())
-	}
-
-	// A set rejected after a logged rule: no line, since nothing is enforced.
-	buf.Reset()
-	if _, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32", Log: true},
-		{Protocol: "sctp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32"},
-	}, "wg0"); err == nil {
-		t.Fatal("BuildFirewallRules() error = nil, want error for the sctp rule")
-	}
-	if strings.Contains(buf.String(), line) {
-		t.Errorf("logging line written for a rejected set:\n%s", buf.String())
+	if buf.Len() != 0 {
+		t.Errorf("BuildFirewallRules() logged %q at Info or above, want nothing", buf.String())
 	}
 }
 
