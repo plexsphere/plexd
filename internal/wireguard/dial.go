@@ -40,7 +40,9 @@ const relayProbeTimeout = 15 * time.Second
 
 // relayProbePort is the UDP port SendRelayProbe sends to, the discard port.
 // Nothing has to listen there: the peer's WireGuard answers the data packet
-// that carries the datagram, whatever the host behind it does with it.
+// that carries the datagram, whatever the host behind it does with it. The
+// policy backends let the node send to this port over the mesh interface
+// without a rule (policy.RelayProbePort), so the probe leaves under any policy.
 const relayProbePort = 9
 
 // dialState is one peer's endpoint selection: the peer as last written, the
