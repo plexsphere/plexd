@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -36,6 +37,10 @@ const (
 // "ct direction" when a packet travels against its connection's first packet.
 const ctDirectionReply = 1
 
+// nflogGroup is the NFLOG group plexd's log rules write to and its reader
+// binds: 28772 is ASCII "pd".
+const nflogGroup uint16 = 28772
+
 // NftablesController implements FirewallController using the Linux nftables subsystem
 // via the google/nftables netlink library. It manages one inet filter table
 // ("plexd"), which matches IPv4 and IPv6 alike, and gives every configured
@@ -46,13 +51,95 @@ const ctDirectionReply = 1
 // interface a packet arrives on, and the output chain against the interface
 // a packet leaves through, behind the foreign-source rule and the relay probe
 // exemption.
+//
+// A rule with a LogTag gets a log rule in front of it, which sends the first
+// packet of each connection it admits to NFLOG group nflogGroup. The
+// controller reads that group and hands each record to the sink SetConnSink
+// set.
 type NftablesController struct {
 	logger *slog.Logger
+
+	// openLog opens the reader of the NFLOG group. It is openNflog, which
+	// tests replace.
+	openLog func(group uint16, sink ConnSink, logger *slog.Logger) (*nflogReader, error)
+
+	mu     sync.Mutex // guards sink and reader
+	sink   ConnSink
+	reader *nflogReader
 }
+
+var _ ConnReporter = (*NftablesController)(nil)
 
 // NewNftablesController returns a new NftablesController.
 func NewNftablesController(logger *slog.Logger) *NftablesController {
-	return &NftablesController{logger: logger}
+	return &NftablesController{logger: logger, openLog: openNflog}
+}
+
+// SetConnSink sets the sink the NFLOG reader hands the connections of logged
+// rules to. Without a sink ApplyRules installs no log rule. A reader opened
+// for an earlier sink is closed, and the next ApplyRules with a logged rule
+// opens one for this sink.
+func (c *NftablesController) SetConnSink(sink ConnSink) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sink = sink
+	c.closeReaderLocked()
+}
+
+// prepareLogging returns the rules ApplyRules installs. Rules without a log
+// tag come back as they are. For rules with one it makes sure a reader of the
+// NFLOG group runs, opening one when none does, and returns them as they are.
+// Without a sink, or when the reader cannot be opened, it returns them
+// without their log tags, and a failed open is logged at Warn.
+//
+// DECISION: logging never blocks enforcement (#179). A
+// reader that cannot start leaves the logged rules enforced without logging,
+// rather than failing the apply. Leaving the log rules out also keeps the
+// records away from another process that holds plexd's NFLOG group, which
+// would otherwise receive them.
+func (c *NftablesController) prepareLogging(rules []FirewallRule) []FirewallRule {
+	if !hasLogTags(rules) {
+		return rules
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sink == nil {
+		return withoutLogTags(rules)
+	}
+	if c.reader != nil && c.reader.running() {
+		return rules
+	}
+	// A reader whose loop ended still holds the group: closing it lets the
+	// new one bind.
+	c.closeReaderLocked()
+	reader, err := c.openLog(nflogGroup, c.sink, c.logger)
+	if err != nil {
+		c.logger.Warn(connLogUnavailable,
+			"component", "policy",
+			"error", err,
+		)
+		return withoutLogTags(rules)
+	}
+	c.reader = reader
+	return rules
+}
+
+// closeLog closes the NFLOG reader, if one is open.
+func (c *NftablesController) closeLog() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeReaderLocked()
+}
+
+// closeReaderLocked closes the NFLOG reader, if one is open. c.mu must be
+// held.
+func (c *NftablesController) closeReaderLocked() {
+	if c.reader == nil {
+		return
+	}
+	_ = c.reader.Close()
+	c.reader = nil
 }
 
 // ifaceDir selects the interface a rule's interface match reads.
@@ -186,9 +273,14 @@ func (c *NftablesController) EnsureChain(chain string) error {
 // packet leaves through. Each list opens with the connection tracking rules
 // of every interface the rules name, which the output list follows with that
 // interface's foreign-source rule and relay probe rule, and then holds each
-// FirewallRule as an nftables rule with its match expressions and verdict.
-// It flushes the three chains and writes the lists into them in one batch,
-// so the three change together or not at all.
+// FirewallRule as an nftables rule with its match expressions and verdict,
+// behind its log rule when it carries a LogTag. It flushes the three chains
+// and writes the lists into them in one batch, so the three change together
+// or not at all.
+//
+// Before it builds the lists, prepareLogging opens the NFLOG reader a logged
+// rule needs, or takes the log tags off when it cannot. A host whose kernel
+// cannot load nfnetlink_log fails the open, not the batch.
 //
 // DECISION: only packets in the reply direction of a tracked connection bypass
 // the rules, in all three chains. Every packet in a connection's original
@@ -225,6 +317,7 @@ func (c *NftablesController) EnsureChain(chain string) error {
 // adds (applyBufferBytes), because the default ones cannot hold the echoes
 // of a ruleset of a few dozen policy rules written into three chains.
 func (c *NftablesController) ApplyRules(chain string, rules []FirewallRule) error {
+	rules = c.prepareLogging(rules)
 	inList, err := chainRuleExprs(rules, dirIn)
 	if err != nil {
 		return err
@@ -318,8 +411,11 @@ func (c *NftablesController) FlushChain(chain string) error {
 
 // DeleteChain deletes the three base chains of the named chain. It is
 // idempotent: a chain that does not exist is skipped, and deleting a chain
-// none of whose base chains exists returns nil.
+// none of whose base chains exists returns nil. It closes the NFLOG reader
+// first, also when no chain exists.
 func (c *NftablesController) DeleteChain(chain string) error {
+	c.closeLog()
+
 	conn, err := nftables.New()
 	if err != nil {
 		return fmt.Errorf("policy: nftables: delete chain: %w", err)
@@ -411,7 +507,8 @@ func (c *NftablesController) ensureTable(conn *nftables.Conn) *nftables.Table {
 // list opens, for every interface the rules name, once per interface in order
 // of first appearance, with its two connection tracking rules and, for
 // dirOut, its foreign-source rule and its relay probe rule. One rule per
-// FirewallRule follows, in the order given.
+// FirewallRule follows, in the order given, with the log rule of a rule that
+// carries a LogTag directly in front of it.
 func chainRuleExprs(rules []FirewallRule, dir ifaceDir) ([][]expr.Any, error) {
 	var ifaces []string
 	seen := make(map[string]bool)
@@ -419,6 +516,13 @@ func chainRuleExprs(rules []FirewallRule, dir ifaceDir) ([][]expr.Any, error) {
 	for _, rule := range rules {
 		if err := rule.Validate(); err != nil {
 			return nil, fmt.Errorf("policy: nftables: apply rules: %w", err)
+		}
+		if rule.LogTag != "" {
+			logExprs, err := logRuleExprs(rule, dir)
+			if err != nil {
+				return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
+			}
+			ruleExprs = append(ruleExprs, logExprs)
 		}
 		exprs, err := buildRuleExprs(rule, dir)
 		if err != nil {
@@ -449,6 +553,28 @@ func chainRuleExprs(rules []FirewallRule, dir ifaceDir) ([][]expr.Any, error) {
 		list = append(list, probe)
 	}
 	return append(list, ruleExprs...), nil
+}
+
+// logRuleExprs builds the log rule of a rule that carries a LogTag: the
+// rule's match expressions, a match on the conntrack state new, and a log
+// expression that hands the packet to NFLOG group nflogGroup with the tag as
+// its prefix. It has no verdict, so evaluation goes on to the rule's own
+// accept, which follows it. The state match logs a connection's first packet;
+// the later packets of a flow nothing has answered yet are new as well.
+func logRuleExprs(rule FirewallRule, dir ifaceDir) ([]expr.Any, error) {
+	exprs, err := buildRuleExprs(rule, dir)
+	if err != nil {
+		return nil, err
+	}
+	// buildRuleExprs ends every rule with a counter and a verdict, which the
+	// log rule leaves out.
+	matches := len(exprs) - 2
+	exprs = append(exprs[:matches:matches], ctStateExprs(expr.CtStateBitNEW)...)
+	return append(exprs, &expr.Log{
+		Key:   1<<unix.NFTA_LOG_GROUP | 1<<unix.NFTA_LOG_PREFIX,
+		Group: nflogGroup,
+		Data:  []byte(rule.LogTag),
+	}), nil
 }
 
 // foreignSourceExprs builds the rule that lets a packet leave iface without
