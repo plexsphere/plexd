@@ -226,6 +226,17 @@ List network policies from the local agent.
 plexd policies
 ```
 
+Reads [`GET /v1/policies`](nodeapi.md#get-v1-policies) and prints one row per rule of the policy block plexd pulled last:
+
+```
+REVISION                              SRC           DST           PORT  PROTOCOL  LOG
+0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1  10.99.0.0/24  10.99.0.0/24  *     any       no
+0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1  10.99.0.0/24  0.0.0.0/0     443   tcp       yes
+0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1  fd00:99::/64  fd00:99::/64  443   tcp       no
+```
+
+The format makes every rule an allow, so the table has no action column. The block plexd pulled last can be a revision plexd rejected and does not enforce: it then keeps the ruleset it applied before and logs `policy revision rejected, keeping previous ruleset`. `PORT` is the destination port, a range as `<from>-<to>`, or `*` for none. `LOG` is `yes` for a rule with `log: true`: plexd enforces such a rule but logs nothing for its traffic in this release, and says so once per apply with the Info line `policy rules ask for logging, which this release does not do`. The default deny plexd appends is not a rule of the block and is not listed. With no rule to show, the command prints `No policies active.`
+
 ### `plexd state`
 
 Show a JSON summary of the local agent state.

@@ -33,7 +33,7 @@ Control Plane
                         └──────────────────┘
 ```
 
-The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. The `PolicyEngine` converts its five-tuple rules into `FirewallRule` entries, and the `Enforcer` applies them via the `FirewallController`. `ReconcileHandler` wires it into the reconciliation loop, rebuilding the ruleset only when the policy fingerprint changes.
+The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. The `PolicyEngine` converts its allow rules into `FirewallRule` entries, and the `Enforcer` applies them via the `FirewallController`. `ReconcileHandler` wires it into the reconciliation loop, rebuilding the ruleset only when the policy fingerprint changes.
 
 ## Config
 
@@ -42,7 +42,7 @@ The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. T
 | Field       | Type     | Default          | Description                              |
 |-------------|----------|------------------|------------------------------------------|
 | `Enabled`   | `*bool`  | `true` (nil)     | Whether policy enforcement is active     |
-| `ChainName` | `string` | `plexd-mesh`   | iptables chain name for firewall rules   |
+| `ChainName` | `string` | `plexd-mesh`     | Prefix of the two Linux base chains, `<ChainName>-input` and `<ChainName>-forward`; the chain's comment line in the pf anchor on macOS, the prefix of the WFP filter names on Windows |
 
 ```go
 cfg := policy.Config{}
@@ -74,8 +74,8 @@ Describes a single iptables-style packet filter rule.
 ```go
 type FirewallRule struct {
     Interface string // network interface name
-    SrcIP     string // source IP (CIDR or single IP)
-    DstIP     string // destination IP (CIDR or single IP)
+    SrcIP     string // source IP (CIDR or single IP); "" matches every address
+    DstIP     string // destination IP (CIDR or single IP); "" matches every address
     Port      int    // destination port (0 = any)
     PortTo    int    // inclusive end of a destination port range, 0 means single-Port match
     Protocol  string // "tcp", "udp", "icmp", or "" (any)
@@ -84,6 +84,8 @@ type FirewallRule struct {
 ```
 
 `PortTo` carries the inclusive end of a destination port range, mapping to an nftables range match; `0` means a single-port match on `Port`.
+
+An address field holds a prefix or a single address, IPv4 or IPv6. The two fields of a rule name one family, and a rule with both empty matches both families. `0.0.0.0/0` and `::/0` match every address of their family and nothing of the other. The engine builds `allow` rules and one `deny`, the default deny, which carries no address.
 
 ### Validation Rules
 
@@ -94,6 +96,12 @@ type FirewallRule struct {
 | `Protocol` | Must be `""`, `"tcp"`, `"udp"`, or `"icmp"`   | `policy: firewall rule: invalid protocol "..."`                  |
 | `Port`     | Requires `tcp`/`udp` if > 0                   | `policy: firewall rule: port N requires protocol tcp or udp`     |
 | `PortTo`   | Requires a start port and `Port ≤ PortTo ≤ 65535` | `policy: firewall rule: port range end N requires a start port` / `... invalid port range end N` |
+| `SrcIP`, `DstIP` | Empty, or a prefix or address without a zone | `policy: firewall rule: invalid IP address "..."`          |
+| `SrcIP`, `DstIP` | Not an IPv4-mapped IPv6 address such as `::ffff:10.0.0.1` | `policy: firewall rule: IPv4-mapped IPv6 address "..."` |
+| `SrcIP`, `DstIP` | Both of one family when both are set  | `policy: firewall rule: source "..." and destination "..." differ in address family` |
+| `Protocol` | `icmp` needs an address, which chooses between ICMP and ICMPv6 | `policy: firewall rule: protocol icmp needs an address to choose between ICMP and ICMPv6` |
+
+Every backend parses the addresses with the same function, `parseRuleAddr`, so a rejected address reads the same on Linux, macOS and Windows.
 
 ## FirewallController
 
@@ -132,15 +140,27 @@ Logger is tagged with `component=policy`.
 ### BuildFirewallRules
 
 ```go
-func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) []FirewallRule
+func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) ([]FirewallRule, error)
 ```
 
-Converts the merged policy's five-tuple `api.PolicyRule` entries into concrete `FirewallRule` entries for the local node. Each `PolicyRule` carries `{action, protocol, source_cidr, destination_cidr, ports?}`; the CIDR fields map directly to `SrcIP`/`DstIP`, and the `{from, to}` port range maps to `Port`/`PortTo` (a single port when `from == to`).
+Converts the merged policy's `api.PolicyRule` entries into concrete `FirewallRule` entries for the local node. A rule is `{protocol, source_cidr, destination_cidr, ports?, log?}`:
 
-- **Action** — `allow` and `deny` are kept. A `log` action is observational only: nftables has no log verdict and skipping it cannot change the accept/drop outcome, so `log` rules are **skipped with a warning**. Unknown actions are also skipped.
-- **Protocol** — `tcp`, `udp`, and `icmp` are kept; `any` maps to `""` (match all); unknown protocols are skipped with a warning.
-- **Ports** — valid only for `tcp`/`udp`. A rule that sets `ports` on a portless protocol (`icmp`/`any`) violates the contract and is skipped with a warning.
-- A default-deny rule dropping all traffic on the interface is always appended as the last rule — including when `rules` is empty or `nil` — giving a deny-by-default posture.
+```json
+{ "protocol": "tcp", "source_cidr": "10.99.0.2/32", "destination_cidr": "10.99.0.1/32", "ports": { "from": 5432, "to": 5432 }, "log": true }
+```
+
+Every rule is an allow, and rule order carries no meaning: a packet passes when any rule allows it, and the default deny appended last drops the rest. The CIDR fields map directly to `SrcIP`/`DstIP`, the `{from, to}` port range maps to `Port`/`PortTo` (a single port when `from == to`), and every rule becomes a `FirewallRule` with `Action: "allow"`.
+
+- **Legacy `action`**: the key is not part of the format. A rule without it, or with `action: "allow"`, passes. Any other value, `""` included, returns `policy: rule <i>: unsupported action "<value>"`. Since plexsphere/plexsphere#1056 the control plane sends `action: "allow"` on every rule, so a node on this release works against it, and a control plane older than that cannot have a deny enforced as an allow.
+- **Protocol**: `tcp`, `udp`, and `icmp` are kept; `any` maps to `""` (match all); any other value returns `policy: rule <i>: unsupported protocol "<value>"`. `icmp` in an IPv6 rule means ICMPv6.
+- **Addresses**: `source_cidr` and `destination_cidr` are both required, in prefix notation, IPv4 or IPv6, and of one family. `0.0.0.0/0` is every IPv4 address and `::/0` every IPv6 address. The engine rejects an empty value with `address is empty`, a value that is not a prefix, such as `10.0.0.1` without a prefix length, with `invalid address "<value>": <parse error>`, and an IPv4-mapped IPv6 prefix such as `::ffff:10.0.0.1/128` with `IPv4-mapped IPv6 address "<value>"`. Each reads `policy: rule <i>: source_cidr: policy: firewall rule: <text>`, or the same with `destination_cidr`. Two families return `policy: rule <i>: source_cidr "<value>" and destination_cidr "<value>" differ in address family`.
+- **Ports**: valid only for `tcp`/`udp`. `ports` on `icmp` or `any` returns `policy: rule <i>: ports set on portless protocol "<value>"`, and a range outside 1–65535 or with `to < from` returns `policy: rule <i>: port range <from>-<to> out of bounds`.
+- **Log**: `log: true` asks for the rule's traffic to be logged. Absent and `false` mean the same. The engine enforces a logged rule like any other, but this release logs nothing for its traffic; that is plexsphere/plexd#179. When every rule translated and at least one asks for logging, the engine logs one Info line, `policy rules ask for logging, which this release does not do`, with `count`, the number of such rules. A rejected revision logs no such line.
+- **Default deny**: `FirewallRule{Interface: iface, Action: "deny"}` with both addresses empty is always appended as the last rule, including when `rules` is empty or `nil`. Without addresses it covers IPv4 and IPv6, on every backend.
+
+One untranslatable rule rejects the whole revision. The engine returns the error, `ApplyFirewallRules` wraps it in `ErrInvalidRuleset`, and the node keeps the ruleset it enforces (see [Error Handling](#error-handling)). Skipping only that rule would merely narrow an allow-only ruleset, but the node would then enforce a ruleset that matches no revision, and a revision is either applied or rejected (plexsphere/plexd#177).
+
+A plexd before this release rejects every rule of this format with `unsupported action ""` and keeps its previous ruleset.
 
 ## Enforcer
 
@@ -264,10 +284,12 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 > **Note:** The policy enforcement model is under active development. The behavior described here reflects the current design and may change in future versions.
 
 - Policy changes are signalled by the control plane via the `policy_updated` SSE event, which triggers a reconcile; the merged policy itself is pulled in the `NodeStateSnapshot` envelope.
-- Filtering operates at **L3/L4** (CIDR, port, protocol) on the mesh interface: nftables forward rules on `plexd0` on Linux, pf rules on the kernel's `utunN` on macOS, WFP filters on the Wintun adapter on Windows.
-- The Linux chain hooks the forward path alone, while the macOS and Windows rules also govern what the node itself receives, so a Mac or a Windows node rejects unsolicited mesh traffic to its own addresses until a rule allows it; see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern).
-- The default stance is **deny-all**: the ruleset always ends with a default-deny rule, and a `null` policy applies the default-deny-only ruleset.
-- Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped five-tuples, not node-ID references.
+- Filtering operates at **L3/L4** (CIDR, port, protocol) on the mesh interface: an nftables input chain and forward chain on `plexd0` on Linux, pf rules on the kernel's `utunN` on macOS, WFP filters on the Wintun adapter on Windows.
+- On all three platforms the rules govern mesh traffic addressed to the node itself as well as the mesh traffic it forwards, so a node rejects unsolicited mesh traffic to its own addresses until a rule allows it; see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern). On Linux the replies to a connection the node, or a host behind it, opened pass through connection tracking without a rule of their own; see [Connection Tracking](./nftables-firewall.md#connection-tracking). On macOS only TCP keeps state.
+- What a node sends over the mesh is not filtered. That is plexsphere/plexd#178.
+- Every rule is an allow and rule order carries no meaning. The default stance is **deny-all**: the ruleset always ends with a default-deny rule that covers IPv4 and IPv6, and a `null` policy applies the default-deny-only ruleset.
+- Rules may name IPv4 or IPv6 prefixes on Linux, macOS and Windows. A peer's allowed IPs are its IPv4 mesh address alone today, so an IPv6 rule governs IPv6 traffic only once the mesh carries it.
+- Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped, not node-ID references.
 - On a genuine policy change (fingerprint mismatch), plexd rebuilds the nftables ruleset from the merged policy. Revision-only bumps short-circuit and leave the ruleset untouched.
 
 ## Integration Points
@@ -291,7 +313,7 @@ r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 | Type             | Package        | Usage                                                     |
 |------------------|----------------|-----------------------------------------------------------|
 | `api.PolicySnapshot` | `internal/api` | Merged policy block `{revision_id, fingerprint, rules[]}` |
-| `api.PolicyRule` | `internal/api` | Five-tuple: `action`, `protocol`, `source_cidr`, `destination_cidr`, `ports?` |
+| `api.PolicyRule` | `internal/api` | Allow rule: `protocol`, `source_cidr`, `destination_cidr`, `ports?`, `log?`; a legacy `action` key lands in `LegacyAction` |
 | `api.PortRange`  | `internal/api` | Inclusive destination port range `{from, to}`             |
 | `api.NodeStateSnapshot` | `internal/api` | Desired-state envelope from the control plane        |
 | `api.Envelope` | `internal/api` | SSE event wrapper                                     |

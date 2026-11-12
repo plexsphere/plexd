@@ -13,28 +13,30 @@ The Linux implementation is [`NftablesController`](./nftables-firewall.md).
 
 ## What the rules govern
 
-On macOS and Windows the rules govern everything that arrives on the mesh interface, whether the packet is delivered to the node itself or forwarded through it.
+On all three platforms the rules govern everything that arrives on the mesh interface, whether the packet is delivered to the node itself or forwarded through it. A node rejects unsolicited mesh traffic to its own addresses until a rule allows it, because the ruleset ends in a default deny. What the node sends is not filtered on any platform; that is plexsphere/plexd#178.
 
-Linux differs. `NftablesController` creates its base chain with a forward hook (`internal/policy/nftables_linux.go`), so the kernel evaluates it for forwarded packets alone and a Linux node enforces nothing on traffic addressed to itself. A Mac or a Windows node rejects unsolicited mesh traffic to its own addresses until a rule allows it, because the ruleset ends in a default deny.
+Every rule may name IPv4 or IPv6 prefixes. The default deny names no address and covers both families.
+
+On Linux `NftablesController` installs the same rules in an input chain and a forward chain, and connection tracking passes a packet in the reply direction of a tracked connection without a rule; see [nftables Firewall Controller](./nftables-firewall.md#connection-tracking).
 
 On macOS two lines precede the policy rules of every chain, once per interface the chain mentions:
 
 ```text
-pass out quick on utun4 inet proto tcp from (utun4) to any keep state
-pass out quick on utun4 inet from (utun4) to any no state
+pass out quick on utun4 proto tcp from (utun4) to any keep state
+pass out quick on utun4 from (utun4) to any no state
 ```
 
-Replies to TCP connections the node itself opened over the mesh pass because of the first line. It keeps state for each outbound flow, and the state entry matches the reply before the default deny is reached. `(utun4)` is the interface's own addresses as the kernel tracks them, not a snapshot taken when the anchor was loaded, so a mesh address assigned after the load needs no reload.
+Replies to TCP connections the node itself opened over the mesh pass because of the first line. It keeps state for each outbound flow, and the state entry matches the reply before the default deny is reached. The pair names no address family, so the node's own IPv6 TCP connections keep their replies as IPv4 ones do. `(utun4)` is the interface's own addresses as the kernel tracks them, not a snapshot taken when the anchor was loaded, so a mesh address assigned after the load needs no reload.
 
-Only TCP keeps state. pf consults the state table ahead of the ruleset and a state entry is bidirectional, so a stateful rule covering every protocol would keep an inbound-initiated UDP or ICMP flow alive after its rule turned into a deny: the node's own reply creates the entry, and every further packet of that flow matches it instead of the ruleset. pf's idle timeouts refresh on each packet, so an active flow would never expire. TCP is not affected, because the implicit `flags S/SA` pfctl puts on a stateful TCP pass rule means an outbound SYN-ACK creates no state.
+Only TCP keeps state. pf consults the state table ahead of the ruleset and a state entry is bidirectional, so a stateful rule covering every protocol would keep an inbound-initiated UDP or ICMP flow alive after the rule that allowed it was revoked: the node's own reply creates the entry, and every further packet of that flow matches it instead of the ruleset. pf's idle timeouts refresh on each packet, so an active flow would never expire. TCP is not affected, because the implicit `flags S/SA` pfctl puts on a stateful TCP pass rule means an outbound SYN-ACK creates no state.
 
-The cost is that the node's own outbound UDP and ICMP flows get no automatic return path: a reply arriving on the mesh interface is subject to the policy like any other inbound packet, so the policy has to allow it. This is the fail-closed side of the trade — a revoked rule takes effect at once, on every protocol.
+The cost is that a Mac's own UDP and ICMP flows over the mesh get no automatic return path: a reply arriving on the mesh interface is subject to the policy like any other inbound packet, so the policy has to allow it. This is the fail-closed side of the trade — a revoked rule takes effect at once, on every protocol.
 
-On Windows the forward path is narrower than the local one. `FWPM_LAYER_IPFORWARD_V4` carries interfaces, addresses and a protocol, but no port. `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` carries the full five-tuple.
+On Windows the forward path is narrower than the local one. `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6` carry interfaces, addresses and a protocol, but no port. `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` and `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6` carry the full five-tuple.
 
-The ruleset is ordered and first-match-terminating, so a rule left out of the forward layer is not narrowed to nothing: the traffic it covered is re-decided by whatever rule follows it. A port-scoped **deny** is therefore installed on the forward layer without the port condition, which blocks a superset of what the rule asked for. A port-scoped **allow** cannot be narrowed that way, so it gets no forward filter and the traffic it covered falls through to the rules below it — at worst the default deny. Both directions fail closed, and the second is the one an operator notices: on a bridge or relay node, transit traffic a port-scoped rule allows is dropped. `ApplyRules` logs one `Warn` line per apply naming how many rules that affects, so the effect is not mistaken for a routing fault.
+A rule left out of the forward layer is not narrowed to nothing: the traffic it covered is decided by the filters that remain, which end in the default deny. A port-scoped **allow** cannot be narrowed onto a layer without ports, so it gets no forward filter, and the traffic it covered is dropped unless another rule allows it. This fails closed, and an operator notices it: on a bridge or relay node, transit traffic a port-scoped rule allows is dropped. `ApplyRules` logs one `Warn` line per apply naming how many rules that affects, so the effect is not mistaken for a routing fault. The controller would install a port-scoped **deny** on the forward layer without its port, a superset of what it asked for, but the engine builds no such rule: its only deny is the default deny, which names no port.
 
-One more Windows difference: `FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` classifies a TCP connection once, at accept, so a newly applied deny does not cut an already accepted inbound connection, which pf `no state` and the nftables forward chain both do.
+One more Windows difference: the ALE receive-accept layers classify a TCP connection once, at accept, so a revoked allow does not cut an already accepted inbound connection, which pf `no state` and the nftables chains both do.
 
 ## macOS: pf
 
@@ -46,28 +48,32 @@ plexd's rules live in the pf anchor `com.apple/plexd`. Apple's `/etc/pf.conf` re
 
 ### The rendered anchor
 
-Six rules covering every field combination render as:
+Seven allow rules and the default deny render as:
 
 ```text
 # plexd policy anchor. Managed by plexd; edits are overwritten.
 # chain plexd-mesh
-pass out quick on utun4 inet proto tcp from (utun4) to any keep state
-pass out quick on utun4 inet from (utun4) to any no state
+pass out quick on utun4 proto tcp from (utun4) to any keep state
+pass out quick on utun4 from (utun4) to any no state
 pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state
 pass in quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53:60 no state
 pass in quick on utun4 inet proto icmp from 10.0.0.0/24 to 10.1.0.0/24 no state
 pass in quick on utun4 inet from 10.0.0.9 to 10.1.0.0/24 no state
-block in quick on utun4 inet from 10.0.0.9/32 to any
-block in quick on utun4 inet from any to any
+pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to any port 22 no state
+pass in quick on utun4 inet6 proto tcp from fd00::/64 to fd00::1 port 443 no state
+pass in quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 no state
+block in quick on utun4 from any to any
 ```
 
 | Element | Meaning |
 |---|---|
 | `# chain plexd-mesh` | pf has no user chains, so the chain is a comment. The name is what `ApplyRules`, `FlushChain` and `DeleteChain` address |
 | `quick` | The first matching rule is final, the first-match semantics the nftables backend has |
-| `no state` | Every packet stays subject to the current rules, so a new deny takes effect at once instead of after the last flow expires. The `pass out` pair keeps this true for UDP and ICMP as well |
-| `block` | A `deny` rule. pf's default block policy is drop, what the nftables backend expresses as `VerdictDrop` |
-| `any` | An empty address field or `0.0.0.0/0`, the match the nftables backend leaves out of a rule |
+| `no state` | Every packet stays subject to the current rules, so a revoked rule takes effect at once instead of after the last flow expires. The `pass out` pair keeps this true for UDP and ICMP as well |
+| `inet`, `inet6` | The family of the rule's addresses. A rule without addresses, the default deny, carries neither and matches both |
+| `icmp6` | Protocol `icmp` in an IPv6 rule, which means ICMPv6 |
+| `block` | The default deny, the only deny rule the engine builds. pf's default block policy is drop, what the nftables backend expresses as `VerdictDrop` |
+| `any` | An empty address field, `0.0.0.0/0` or `::/0`. Under `0.0.0.0/0` or `::/0` the family keyword stays, so the rule still matches only its own family |
 
 Chains are rendered in name order, so the same desired state always yields the same text. A `nat` rule, when one is configured, is rendered ahead of the chains, because pf requires translation rules before filter rules in a file.
 
@@ -149,18 +155,18 @@ The weight is one below the maximum, which wireguard-windows claims for its kill
 
 ### Layers and conditions
 
-Each rule yields one filter at the local-delivery layer, named `plexd <chain> #<i> inbound`, and a second at the forward layer, named `plexd <chain> #<i> forward`. Only an `allow` that names a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
+An IPv4 rule yields one filter at the local-delivery layer `LayerALEAuthRecvAcceptV4`, named `plexd <chain> #<i> inbound`, and a second at the forward layer `LayerIPForwardV4`, named `plexd <chain> #<i> forward`. An IPv6 rule goes to `LayerALEAuthRecvAcceptV6` and `LayerIPForwardV6` instead, under names ending in ` v6`: `plexd <chain> #<i> inbound v6` and `plexd <chain> #<i> forward v6`. A rule without addresses, the default deny, goes to all four layers. Only an `allow` that names a port has no forward filter; see [What the rules govern](#what-the-rules-govern).
 
-| Rule field | `LayerALEAuthRecvAcceptV4` (inbound) | `LayerIPForwardV4` (forward) |
+| Rule field | `LayerALEAuthRecvAcceptV4`, `LayerALEAuthRecvAcceptV6` (inbound) | `LayerIPForwardV4`, `LayerIPForwardV6` (forward) |
 |---|---|---|
 | `Interface` | `FieldIPLocalInterface` equals the LUID | `FieldSourceInterfaceIndex` equals the index |
 | `SrcIP` | `FieldIPRemoteAddress` | `FieldIPSourceAddress` |
 | `DstIP` | `FieldIPLocalAddress` | `FieldIPDestinationAddress` |
-| `Protocol` | `FieldIPProtocol` | `FieldIPProtocol` |
+| `Protocol` | `FieldIPProtocol`; `icmp` is `IPProtoICMP` at the V4 layers and `IPProtoICMPV6` at the V6 layers | The same |
 | `Port`, `PortTo` | `FieldIPLocalPort`, an equality or a `wf.Range` | The layer has no such field: dropped on a `deny`, and an `allow` gets no forward filter |
 | `Action` | `wf.ActionPermit` or `wf.ActionBlock` | The same |
 
-Windows delivers a packet locally only when its destination is an address of the arrival interface, so the local interface is the arrival interface, the `iifname` the Linux chain matches. An empty address field or `0.0.0.0/0` yields no condition at all. A rule with an empty interface name is rejected: a filter without an interface condition would govern every adapter of the host.
+Windows delivers a packet locally only when its destination is an address of the arrival interface, so the local interface is the arrival interface, the `iifname` the Linux chain matches. `wfpPrefix` parses every address with `parseRuleAddr`, which the three backends share. An empty address field, `0.0.0.0/0` or `::/0` yields no address condition; the layer alone selects the family. An IPv4 address is matched as an address and mask. An IPv6 address is matched as the range from its prefix's first to its last address, which matches the same packets: `github.com/tailscale/wf` builds a filter in an allocator that never aligns, and the 17-byte IPv6 address-and-mask struct would leave the rest of the filter on an odd address, which the race detector's pointer checks reject. `netsh wfp show filters` therefore lists IPv6 addresses as ranges. A rule with an empty interface name is rejected: a filter without an interface condition would govern every adapter of the host.
 
 ### Weights and the epoch
 
@@ -188,7 +194,7 @@ A rule carries the friendly name, the name the configuration holds and the one a
 netsh wfp show filters file=-
 ```
 
-The dump lists every filter in the engine. plexd's carry the names `plexd <chain> #<i> inbound` and `plexd <chain> #<i> forward` and sit in the sublayer `plexd policy`. Without `file=-` the command writes the same XML to `filters.xml` in the working directory.
+The dump lists every filter in the engine. plexd's carry the names `plexd <chain> #<i> inbound` and `plexd <chain> #<i> forward`, with ` v6` appended at the IPv6 layers, and sit in the sublayer `plexd policy`. Without `file=-` the command writes the same XML to `filters.xml` in the working directory.
 
 ## NAT
 
@@ -308,8 +314,8 @@ Three tests drive the real host and are gated:
 | `TestWFPController_Real` (`wfp_windows_test.go`) | `PLEXD_TEST_REAL_WFP=1` and an elevated token | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_Real ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealNAT` (`netnat_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealNAT ./internal/policy/` from an elevated shell |
 
-`TestPFController_Real` loads an anchor naming `plexd99`, an interface no host has, takes the pf reference, reads the filter and nat rules back with `pfctl -a com.apple/plexd -s rules` and `-s nat`, then deletes the chain and asserts the anchor is empty and the token released. A host that had pf disabled is left disabled. The variable gates it in addition to the effective uid, so `sudo go test ./...` on a developer's Mac does not enable pf on their host.
+`TestPFController_Real` loads an anchor naming `plexd99`, an interface no host has, with an IPv6 rule and the default deny among its rules, takes the pf reference, reads the filter and nat rules back with `pfctl -a com.apple/plexd -s rules` and `-s nat`, and finds the `inet6` rule and a block rule without an address there. It then deletes the chain and asserts the anchor is empty and the token released. A host that had pf disabled is left disabled. The variable gates it in addition to the effective uid, so `sudo go test ./...` on a developer's Mac does not enable pf on their host.
 
-`TestWFPController_Real` installs filters for prefixes no host carries and no blanket deny, so the runner's own traffic is untouched. It enumerates plexd's filters through a session of its own, checks that the `allow` naming a port got no forward filter, and pins `FWP_E_FILTER_NOT_FOUND` by deleting a filter that is not there. `TestWFPController_RealNAT` creates the NetNat object for `10.255.252.0/30`, reads the prefix back, and repeats both the add and the remove to prove they are idempotent — the second read after the removal is what proves the absent case is a success with no output rather than a localized error.
+`TestWFPController_Real` installs filters for prefixes no host carries, an IPv6 rule among them, and the default deny, which shows that the filter engine accepts filters at the V6 layers. It enumerates plexd's filters through a session of its own, checks that the `allow` naming a port got no forward filter, and pins `FWP_E_FILTER_NOT_FOUND` by deleting a filter that is not there. `TestWFPController_RealNAT` creates the NetNat object for `10.255.252.0/30`, reads the prefix back, and repeats both the add and the remove to prove they are idempotent — the second read after the removal is what proves the absent case is a success with no output rather than a localized error.
 
 CI runs all three; see [CI Workflow](../development/ci-workflow.md).

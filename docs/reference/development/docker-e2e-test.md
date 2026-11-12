@@ -6,7 +6,7 @@ feature: PXD-0038
 
 # Docker E2E Test
 
-Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, converges to desired state, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
+Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, converges to desired state, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate three services — `mock-api` (a fixture-based mock of the Central API), `plexd` (the agent under test) and `meshpeer` (a WireGuard peer for the policy phase) — on an isolated bridge network.
 
 The test runs fourteen phases:
 
@@ -17,7 +17,7 @@ The test runs fourteen phases:
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected), then switches the mock to a new signing key and verifies that a pull installs it, that an event signed with it is dispatched, and that plexd starts from the persisted key after a restart (script phase `7c`)
 7. **Session lifecycle from the state pull** — splices a `tcp` entry into the snapshot's `sessions` block and verifies a `session_started` activity row carrying `listener_endpoint`, then re-posts the snapshot **without** the entry: the `session_ended` row the drain produces is accepted, so the test verifies `session_activity_count` advances by 2 over the phase's baseline while `session_activity_rejected_count` stays unchanged, and that the captured row carries `plexd_close` and numeric byte counters; a second entry carrying `idle_timeout_seconds` verifies the idle window closes a session on its own with `idle_timeout`; a third entry is closed by a signed `session_revoked` event while it still stands in the block, and its ending row reports `operator_revoke` (script phase `8j`); bytes sent through a fourth entry's listener are reported as `session_active` rows, at most one per interval, and a quiet tunnel posts none (script phase `8k`)
-8. **Session events as pull triggers** — injects a `session_setup` envelope with an opaque payload and a `session_revoked` envelope whose payload plexd refuses as malformed, verifies each advances `state_count` while leaving `session_activity_count` unchanged, then verifies that the pull's `secrets` block fills, changes, and empties the local node API's secret index, and that `node_secrets_updated` triggers the pull for the change (script phase `12c`), then that plexd, with no systemd-resolved in its image, logs its mesh DNS listener and the missing resolver once per start, answers a mesh name on its mesh IP, forwards a forward zone and a catch-all to the mock's DNS stub, and keeps the names through a `null` dns block (script phase `12d`)
+8. **Session events as pull triggers** — injects a `session_setup` envelope with an opaque payload and a `session_revoked` envelope whose payload plexd refuses as malformed, verifies each advances `state_count` while leaving `session_activity_count` unchanged, then verifies that the pull's `secrets` block fills, changes, and empties the local node API's secret index, and that `node_secrets_updated` triggers the pull for the change (script phase `12c`), then that plexd, with no systemd-resolved in its image, logs its mesh DNS listener and the missing resolver once per start, answers a mesh name on its mesh IP, forwards a forward zone and a catch-all to the mock's DNS stub, and keeps the names through a `null` dns block (script phase `12d`), then that plexd enforces the allow-only policy on what a real WireGuard peer sends to it, passes the replies to its own connection, applies a legacy `action: "allow"`, rejects a legacy deny while keeping its ruleset, and restores the fixture's revision (script phase `12e`)
 9. **Convergence cycle** — posts a mutated `NodeStateSnapshot` envelope via `/test/configure-state`, verifies `state_count` advances AND a reconcile cycle reports `policy` drift
 10. **Policy fingerprint no-op** — re-posts the envelope with only `revision_id` bumped (same fingerprint), verifies `state_count` advances but no cycle reports `policy` drift (the differ's fingerprint short-circuit holds)
 11. **Local endpoint delivery** — all 3 local endpoint counters >= 1 (dual delivery to HTTPS local endpoint works)
@@ -28,26 +28,28 @@ The test runs fourteen phases:
 ## Service Topology
 
 ```
-┌──────────────┐       ┌──────────────┐
-│   mock-api   │◄──────│    plexd     │
-│  :8080 (HTTP)│       │  (agent)     │
-│  :8443 (TLS) │       │  depends_on  │
-│  /v1/health  │       │  mock-api    │
-└──────────────┘       └──────────────┘
-        │                      │
-        └──────── e2e-net ─────┘
+┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+│   mock-api   │◄──────│    plexd     │◄─────▶│   meshpeer   │
+│  :8080 (HTTP)│       │  (agent)     │  wg   │  wg0         │
+│  :8443 (TLS) │       │  depends_on  │ :51820│  10.99.0.3   │
+│  /v1/health  │       │  mock-api    │       │              │
+└──────────────┘       └──────────────┘       └──────────────┘
+        │                      │                      │
+        └──────────────────────┴───── e2e-net ────────┘
 ```
 
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
 | `mock-api` | Built from `test/e2e/mockapi/Dockerfile` | 8080 (host: 18080), 8443 (host: 18443), 53 (UDP and TCP, not published) | Returns fixture responses, tracks call counters, TLS local endpoint, DNS stub for phase `12d` |
 | `plexd` | Built from `test/e2e/docker/Dockerfile.plexd` | — | Agent under test, connects to mock-api |
+| `meshpeer` | Built from `test/e2e/meshpeer/Dockerfile`: `alpine:3.22` with `wireguard-tools`, `iproute2`, `netcat-openbsd` and `openssl` | — | Stands in for fixture peer `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`, mesh IP `10.99.0.3`, over a real WireGuard tunnel to plexd in phase `12e`. Runs `sleep infinity` with `cap_add: NET_ADMIN` |
 
 ### Startup Ordering
 
 1. `mock-api` starts with `command: ["-addr", ":8080", "-dns-addr", ":53"]` and exposes a healthcheck on `GET /v1/health`. `-dns-addr :53` starts its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53 of the container, which phase `12d` forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds.
 2. docker compose waits for `mock-api` to become healthy (2s interval, 10 retries).
 3. `plexd` starts with `depends_on: mock-api (service_healthy)`.
+4. `meshpeer` idles on `sleep infinity`. Nothing configures it before phase `12e`.
 
 ## Assertion Logic
 
@@ -285,7 +287,7 @@ Runs as script phase `8k`, after phase `8j` and before phase `8h`, and covers th
 
 1. It reads the baselines of `session_activity_count` and `session_active_count`, and sets `expires_at` 5 minutes ahead, as phase `8j` does.
 2. It configures `tcp` session `sess-e2e-active` (target `mock-api:8080`, `idle_timeout_seconds` 24). The 24-second window gives a 6-second interval. It polls `session_activity_count` for up to 30 seconds to +1 over the baseline, reads `tcp.listener_endpoint` from `GET /test/last-request/session_activity`, and splits it into host and port. It requires `session_active_count` still at its baseline: no byte has crossed yet.
-3. It sends two requests through the listener from inside the plexd container with the busybox `nc` applet, the second straight after the first, and requires exit status 0 from each. The tunnel forwards to the mock's own health route. The first request, `dc exec -T plexd /bin/busybox sh -c "{ printf 'GET /v1/health HTTP/1.0\r\n\r\n'; /bin/busybox sleep 1; } | /bin/busybox nc -w 3 <host> <port>"`, keeps `nc`'s stdin open for a second so the mock's answer comes back before `nc` half-closes its socket, since the tunnel ends both halves as soon as either direction ends. The answer has to start with an `HTTP/1.x` status line, so bytes crossed in both directions. The second request only sends. plexd's nftables chain hooks `forward` only, so a connection from inside the container to its own mesh address is not filtered.
+3. It sends two requests through the listener from inside the plexd container with the busybox `nc` applet, the second straight after the first, and requires exit status 0 from each. The tunnel forwards to the mock's own health route. The first request, `dc exec -T plexd /bin/busybox sh -c "{ printf 'GET /v1/health HTTP/1.0\r\n\r\n'; /bin/busybox sleep 1; } | /bin/busybox nc -w 3 <host> <port>"`, keeps `nc`'s stdin open for a second so the mock's answer comes back before `nc` half-closes its socket, since the tunnel ends both halves as soon as either direction ends. The answer has to start with an `HTTP/1.x` status line, so bytes crossed in both directions. The second request only sends. A connection from inside the container to its own mesh address arrives on `lo`, which plexd's nftables chains do not match, so the policy does not filter it.
 4. It requires both requests to have taken at most 3 seconds, counted in whole seconds, which keeps them well inside the first 6-second interval; a slower host fails the phase with that reason. It then reads `session_active_count` once and requires exactly +1: the first bytes posted a row at once, and the bytes after them, the answer and the second request, wait for the interval's end. It requires the captured `session_activity` body, compacted with `jq -c .`, to equal `{"tcp":{"phase":"session_active"}}`.
 5. It polls for up to 10 seconds for `session_active_count` at +2: the row at the end of the first interval, which covers the answer and the second request.
 6. It sleeps 13 seconds, more than two intervals, with no traffic, and requires `session_active_count` still at +2: a quiet tunnel posts nothing.
@@ -319,11 +321,35 @@ The queries run inside the plexd container with `dc exec -T plexd /bin/busybox n
 4. **Null block.** It saves the `dns` block the mock serves, requires it to carry `peer-1.app.e2e.internal` at `10.99.0.2` once and to hold 8 records, so the restore of step 5 serves the records again, and counts the `state pull carries no dns block, keeping the names held` lines. After `configure_dns` splices `null`, the phase takes a `state_count` baseline and waits up to 65 seconds for the count to grow by 2, for the reason given for step `10i` check 3: one pull past the baseline may have started before the splice. The `keeping the names held` line must have grown by exactly 1, since only the first pull without a block logs it, `peer-1.app.e2e.internal` must still answer `10.99.0.2`, and `db.e2e.internal` must still answer `192.0.2.10`.
 5. **Restore.** It splices the saved block back with `configure_dns` and requires the `dns` block of the live snapshot to equal it, so the phase leaves the fixture as it found it.
 
+### Phase 8 (cont.): Network Policy over a WireGuard Peer
+
+Runs as script phase `12e`, between phases `12d` and `13`, and checks [policy enforcement](../networking/network-policy.md) on the [nftables chains](../networking/nftables-firewall.md) with traffic a real WireGuard peer sends: the allow-only format, the filtering of traffic addressed to the node, the replies to the node's own connection, the legacy `action` key, and a rejected revision. It reuses phase `12d`'s `mesh_nslookup` and runs before phase `13`, which replaces the fixture. It fails, as phase `12d` does, when WireGuard did not come up in the container. Every check fails the suite.
+
+The `meshpeer` service stands in for fixture peer `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`, mesh IP `10.99.0.3`:
+
+1. **Save.** The phase saves the live snapshot's `peers` and `policy`.
+2. **Peer.** It gives meshpeer's `wg0` a fresh key pair, the address `10.99.0.3`, and the edge PSK the mock derives for that peer: the base64 of the SHA-256 of `mock-edge-psk|0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2` (`mockEdgePSK`; see [the PSK route](mock-api-server.md#get-v1-nodes-id-peers-peer-node-id-psk)). Its single peer is plexd's current public key: the `new_public_key` of the last `key_rotate` request from `GET /test/last-request/key_rotate`, or the `public_key` of the `register` request when there is none. That peer has the endpoint `plexd:51820`, the allowed IP `10.99.0.1/32` and a 5 s keepalive.
+3. **Splice.** It splices meshpeer's `public_key` and its `endpoint`, `<meshpeer IP>:51820` with the IP that `dc exec -T meshpeer hostname -i` prints, into peer `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2` of the live snapshot, the way `configure_executions_no_nudge` splices its block, with a `node_state_updated` nudge. It then waits up to 60 seconds until `wg show wg0 latest-handshakes` in meshpeer prints a non-zero time.
+
+Each policy below is served with a fresh `revision_id` and fingerprint, and the phase waits up to 60 seconds for the log line that names that `revision_id`: `policy ruleset applied`, or for policy C the rejection. A probe of a port on plexd starts a listener in plexd's container with `/bin/busybox nc -l -p <port>`, one per probe, and connects from meshpeer with `nc -z -w 3 10.99.0.1 <port>`. The probe of meshpeer starts `nc -l 7003` there and connects from plexd's container with `/bin/busybox nc -w 3 10.99.0.3 7003 </dev/null`, exit status 0 meaning connected.
+
+| Policy | Rules | Checks |
+|---|---|---|
+| A | `{tcp 10.99.0.3/32 → 10.99.0.1/32 7001}`, `{tcp fd00:99::3/128 → fd00:99::1/128 7001}` and `{udp 10.99.0.3/32 → 10.99.0.1/32 7004, log: true}` | Applied with `rules=3`, and the line `policy rules ask for logging, which this release does not do` carries `count=1`. 7001 connects. 7002 fails while a listener runs on it. plexd's container connects to meshpeer's 7003, which no rule names: the replies pass through [connection tracking](../networking/nftables-firewall.md#connection-tracking) |
+| B | Policy A's rules with `"action":"allow"` added to each | Applied |
+| C | One rule carrying `"action":"deny"` | Logged as `policy revision rejected, keeping previous ruleset` with C's `revision_id`, and 7001 still connects |
+| D | Policy A without the two 7001 rules | 7001 fails |
+| E | `"rules": []` | `mesh_nslookup node-1.app.e2e.internal` answers `10.99.0.1`, because the node's own query to its mesh IP arrives on `lo`, and 7001 fails |
+
+The IPv6 rule of policy A shows that the kernel takes an IPv6 rule. No probe runs over IPv6, because a peer's allowed IPs are its IPv4 mesh address alone.
+
+At the end the phase splices the saved `peers` and `policy` back and waits for `policy ruleset applied` with the fixture's revision `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1`, so phase `13` and the phases after it see the fixture as it was.
+
 ### Phase 9: Convergence Cycle
 
 Posts a full mutated `NodeStateSnapshot` envelope to `POST /test/configure-state` (a new policy fingerprint and new state values), then polls until **both** hard conditions hold: `state_count` advances (the agent re-fetched the snapshot) and the count of `"reconciliation cycle completed"` lines whose `drift` summary contains `policy` increases (the differ reported `PolicyChanged`, so the policy handler ran). Both fixture peers are surfaced and asserted through the node API `GET /v1/peers`.
 
-The assertion deliberately gates on the reconciler drift summary rather than on `"policy ruleset applied"`. The test container's kernel exposes no nftables backend, so policy enforcement stays disabled there and no rule can reach the kernel; the applied-log is emitted only on a real apply and would never fire. Proving rule installation requires an environment with a working nftables backend.
+The assertion deliberately gates on the reconciler drift summary rather than on `"policy ruleset applied"`: what this phase proves is that the differ reports `PolicyChanged` on a new fingerprint. Phase `12e` proves rule installation, with `policy ruleset applied` and with traffic through a real WireGuard peer.
 
 `POST /test/configure-state` replaces the **whole** snapshot fixture, which is also how the action phases drive execution: they queue a dispatch by reading the live snapshot, splicing an entry into its `executions` array, and posting the result back, then inject a `node_state_updated` envelope so the agent pulls immediately instead of waiting out the reconcile cadence. Because the fetch leg is a real `GET` on the state endpoint, it increments `state_count` — a phase gating on that counter must take its baseline **after** configuring the block. Action dispatches never ride an SSE payload, so `action_request` can only be used the same way: as a nudge that pulls the next reconcile forward.
 
@@ -386,7 +412,8 @@ bash test/e2e/docker/test.sh
 
 - Docker with compose v2 plugin
 - `curl` and `jq` on the host (for assertion polling)
-- Kernel WireGuard on the host: phase `12d` needs the `wg-plexd` interface, whose mesh IP `10.99.0.1` the resolver listens on; phases `4b` to `4e` skip without it
+- Kernel WireGuard on the host: phase `12d` needs the `wg-plexd` interface, whose mesh IP `10.99.0.1` the resolver listens on, and phase `12e` needs it and meshpeer's `wg0`; phases `4b` to `4e` skip without it
+- `nf_tables` with the `inet` family and connection tracking on the host kernel, for plexd's policy chains (see [Host Requirements](../networking/nftables-firewall.md#host-requirements))
 
 ## Debugging Failures
 
@@ -419,11 +446,12 @@ docker compose -f test/e2e/docker-compose.yml -p plexd-e2e down -v
 
 | File | Purpose |
 |------|---------|
-| `test/e2e/docker-compose.yml` | Service definitions, network, healthcheck |
+| `test/e2e/docker-compose.yml` | Service definitions (`mock-api`, `plexd`, `meshpeer`), network, healthcheck |
 | `test/e2e/docker/test.sh` | Orchestration script (build, wait, assert, cleanup) |
 | `test/e2e/docker/plexd-e2e.yaml` | Minimal plexd config for the E2E test |
 | `test/e2e/docker/Dockerfile.plexd` | E2E plexd image: the production runtime plus a static busybox shell and the hook fixture |
 | `test/e2e/docker/hooks/` | Hook fixture copied into the image (`e2e-bigout`) |
 | `test/e2e/mockapi/Dockerfile` | Mock API image (includes wget for healthcheck) |
+| `test/e2e/meshpeer/Dockerfile` | WireGuard peer image for phase `12e`: `alpine:3.22` with `wireguard-tools`, `iproute2`, `netcat-openbsd` and `openssl` |
 | `deploy/docker/Dockerfile` | plexd production image |
 | `Makefile` | `test-e2e-docker` target |

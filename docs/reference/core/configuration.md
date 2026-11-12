@@ -369,9 +369,9 @@ Network policy enforcement and firewall rules. See [Network Policy Enforcement](
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable policy enforcement. An omitted key means enabled; an explicit `false` is preserved. Also settable as [`PLEXD_POLICY_ENABLED`](environment-variables.md#plexd-up-variables), which is how a deployment without a config file reaches the opt-out below. |
-| `chain_name` | string | `plexd-mesh` | Name of the nftables chain on Linux; on macOS the chain's comment line in the pf anchor, on Windows the prefix of the WFP filter names |
+| `chain_name` | string | `plexd-mesh` | On Linux the prefix of the two nftables base chains in table `inet plexd`, `<chain_name>-input` on the input hook and `<chain_name>-forward` on the forward hook; on macOS the chain's comment line in the pf anchor, on Windows the prefix of the WFP filter names |
 
-Policy enforcement needs `CAP_NET_ADMIN`. On macOS it needs root and a pf main ruleset that references `anchor "com.apple/*"`, which Apple's `/etc/pf.conf` does; on Windows it needs Administrator. With enforcement on, `plexd up` probes the backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
+Policy enforcement needs `CAP_NET_ADMIN`. On Linux it also needs `nf_tables` with the `inet` family and connection tracking, whose modules the kernel loads itself (see [Host Requirements](../networking/nftables-firewall.md#host-requirements)). On macOS it needs root and a pf main ruleset that references `anchor "com.apple/*"`, which Apple's `/etc/pf.conf` does; on Windows it needs Administrator. With enforcement on, `plexd up` probes the backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
 
 ```
 plexd up: firewall baseline pre-flight: policy enforcement needs CAP_NET_ADMIN,
@@ -393,6 +393,26 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > node hosts.
 
 > **Migration:** `enabled` was previously resolved by a zero-value heuristic that guessed intent from `chain_name`. A `policy` block naming a chain without an `enabled` key was read as *disabled* — such a node ran unenforced and now comes up enforcing, which on a host without `CAP_NET_ADMIN` means it fails the pre-flight instead of starting. A block setting only `enabled: false` was forced back on and now takes effect as written. Spell `enabled` out to be certain of either.
+
+> **Migration:** On Linux the policy now governs mesh traffic addressed to the node,
+> not only the traffic the node forwards. A service on the node's mesh IP, a tcp tunnel
+> listener included, therefore needs a rule that allows its traffic; a Project's
+> allow-all policy is one. The replies to connections the node, or a host behind it,
+> opened pass without a rule, through connection tracking, which the kernel turns on for
+> the whole host with plexd's first ruleset. `chain_name` now names two chains,
+> `<chain_name>-input` and `<chain_name>-forward`, in the new table `inet plexd`, and plexd
+> deletes the `ip plexd` table of earlier releases when it installs its first ruleset. Set
+> `policy.enabled: false` before rolling the binary forward to keep the old behaviour for
+> traffic to the node; that turns the filtering of forwarded traffic off with it. A rollback
+> to an earlier binary is clean after a stop. After a crash the two chains stay in place,
+> with their default deny, and the earlier binary does not know them, so remove them with
+> `nft delete table inet plexd`.
+> This release reads the allow-only rule format: a rule carries `log` and no `action`, and
+> rules may name IPv6 prefixes. A rule with `action: "allow"`, which the control plane sends
+> since plexsphere/plexsphere#1056, still reads as an allow, so the node works against
+> today's control plane. A rule with any other `action` rejects its revision, and the node
+> keeps the ruleset it enforces. A rule with `log: true` is enforced but its traffic is not
+> logged yet.
 
 Source: `internal/policy/config.go`
 

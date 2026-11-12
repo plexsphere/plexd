@@ -854,8 +854,9 @@ absence.
     "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
     "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
     "rules": [
-      { "action": "allow", "protocol": "any", "source_cidr": "10.99.0.0/24", "destination_cidr": "10.99.0.0/24" },
-      { "action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 } }
+      { "protocol": "any", "source_cidr": "10.99.0.0/24", "destination_cidr": "10.99.0.0/24" },
+      { "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 }, "log": true },
+      { "protocol": "tcp", "source_cidr": "fd00:99::/64", "destination_cidr": "fd00:99::/64", "ports": { "from": 443, "to": 443 } }
     ]
   },
   "bridge": {
@@ -1067,6 +1068,21 @@ projection, never desired state: plexd logs the verdict whenever it changes and
 neither stores nor converges on it. The same projection is served at
 `GET /v1/nodes/{node_id}/reachability`, which plexd does not call because the
 pull already carries it.
+
+`policy` is the node's merged network policy. Every rule allows the traffic
+from `source_cidr` to `destination_cidr` that its `protocol` (`tcp`, `udp`,
+`icmp` or `any`) and its optional `ports` range match, and rule order carries
+no meaning. Both prefixes are IPv4 or both IPv6, `0.0.0.0/0` is every IPv4
+address and `::/0` every IPv6 address, and `icmp` in an IPv6 rule is ICMPv6.
+`log: true` asks for the rule's traffic to be logged: plexd enforces such a
+rule but logs nothing for its traffic in this release. plexd ends the ruleset
+with a default deny for both families, also when the block is `null`. A rule
+that still carries the `action` key of the format before
+plexsphere/plexsphere#1058 is read as an allow when the value is `allow`. Any
+other value, or any rule plexd cannot translate, rejects the whole revision,
+and the node keeps the ruleset it enforces. plexd compares `fingerprint` byte
+for byte and never re-derives it from the rules. See
+[Network Policy Enforcement](../networking/network-policy.md#buildfirewallrules).
 
 `executions` is the delivery channel for action dispatches, and the only block
 that is a delivery queue rather than desired state. It is always an array — `[]` when empty, never `null` —

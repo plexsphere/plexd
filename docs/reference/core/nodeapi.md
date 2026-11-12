@@ -561,6 +561,11 @@ Returns the active merged policy block — a single
 `{revision_id, fingerprint, rules[]}` object, not an array. Returns an empty
 object `{}` when no policy is active (or no policy provider is wired).
 
+Every rule is an allow and rule order carries no meaning; see
+`PolicyRule` in [API Types](api-types.md#get-v1-nodes-node-id-state). The block is the one plexd decoded from
+its last pull, so a rule carries `action` only when the control plane sent one,
+and `log` only when it is `true`.
+
 **Response** `200 OK`:
 
 ```json
@@ -568,7 +573,8 @@ object `{}` when no policy is active (or no policy provider is wired).
   "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
   "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
   "rules": [
-    { "action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 } }
+    { "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 }, "log": true },
+    { "protocol": "tcp", "source_cidr": "fd00:99::/64", "destination_cidr": "fd00:99::/64", "ports": { "from": 443, "to": 443 } }
   ]
 }
 ```

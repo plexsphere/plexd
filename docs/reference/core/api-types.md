@@ -202,25 +202,28 @@ know is logged verbatim rather than rejected.
 
 **PolicySnapshot**
 
-The single merged policy block.
+The single merged policy block. Every rule is an allow and rule order carries no meaning: traffic no rule allows is dropped.
 
 | Field         | Type           | JSON Tag          | Description                                                     |
 |---------------|----------------|-------------------|-----------------------------------------------------------------|
 | `RevisionID`  | `string`       | `"revision_id"`   | Policy revision identifier                                      |
 | `Fingerprint` | `string`       | `"fingerprint"`   | 44-char base64 SHA-256 over the server's canonical rule stream; plexd compares it byte-for-byte and never re-derives it |
-| `Rules`       | `[]PolicyRule` | `"rules"`         | Ordered firewall rules                                          |
+| `Rules`       | `[]PolicyRule` | `"rules"`         | Allow rules, in no meaningful order                             |
 
 **PolicyRule**
 
-A five-tuple firewall rule. `Ports` is present iff `Protocol` is `tcp` or `udp`.
+Allows the traffic from `SourceCIDR` to `DestinationCIDR` that its protocol and port range match. Both prefixes are IPv4 or both IPv6. `Ports` is present iff `Protocol` is `tcp` or `udp`.
 
 | Field             | Type         | JSON Tag             | Description                              |
 |-------------------|--------------|----------------------|------------------------------------------|
-| `Action`          | `string`     | `"action"`           | `allow`, `deny`, or `log`                |
-| `Protocol`        | `string`     | `"protocol"`         | `tcp`, `udp`, `icmp`, or `any`           |
-| `SourceCIDR`      | `string`     | `"source_cidr"`      | Source CIDR                              |
-| `DestinationCIDR` | `string`     | `"destination_cidr"` | Destination CIDR                        |
+| `Protocol`        | `string`     | `"protocol"`         | `tcp`, `udp`, `icmp`, or `any`; `icmp` in an IPv6 rule is ICMPv6 |
+| `SourceCIDR`      | `string`     | `"source_cidr"`      | Source prefix, IPv4 or IPv6; `0.0.0.0/0` is every IPv4 address and `::/0` every IPv6 address. An IPv4-mapped IPv6 prefix such as `::ffff:10.0.0.1/128` is invalid |
+| `DestinationCIDR` | `string`     | `"destination_cidr"` | Destination prefix, of the source's family |
 | `Ports`           | `*PortRange` | `"ports,omitempty"`  | Inclusive destination port range        |
+| `Log`             | `bool`       | `"log,omitempty"`    | Asks for the rule's traffic to be logged; absent, `null` and `false` mean the same. plexd enforces the rule but logs nothing for its traffic in this release (plexsphere/plexd#179) |
+| `LegacyAction`    | `*string`    | `"action,omitempty"` | The `action` key of the format before plexsphere/plexsphere#1058; `nil` when the key is absent. `allow` reads as an allow, and any other value, `""` included, rejects the revision |
+
+A `log` that is not a boolean, such as `"yes"`, fails the decode of the whole state pull with a `*json.UnmarshalTypeError`, as any mistyped field of the snapshot does, so the pull fails and the previous ruleset stays. The node API's [`GET /v1/policies`](nodeapi.md#get-v1-policies) serves the block plexd decoded, so a rule carries `action` there only when the control plane sent one, and `log` only when it is `true`. See [BuildFirewallRules](../networking/network-policy.md#buildfirewallrules) for how plexd translates the rules.
 
 **PortRange**
 
