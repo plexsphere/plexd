@@ -55,31 +55,37 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Creating network namespaces and loading nftables rules need root, so
-      # the Linux test against the real kernel skips in the unprivileged run
-      # above. It builds its three namespaces and their links itself and leaves
-      # the runner's own links and ruleset alone. It also asks for
-      # PLEXD_TEST_REAL_NFTABLES, so sudo go test ./... on a developer's machine
-      # creates nothing unasked. The absolute go path is resolved before sudo
-      # resets PATH, and the two cache variables let root reuse what the step
-      # above downloaded and built. The step fails unless the test passed: a
-      # skip would pass as well otherwise, so it greps the -v output for the
-      # PASS line.
+      # the two Linux tests against the real kernel skip in the unprivileged
+      # run above. They build their namespaces, links and TUN device themselves
+      # and leave the runner's own links and ruleset alone. The traffic test
+      # runs the same checks as the macOS and Windows ones, through a TUN
+      # device in a fresh namespace. Both ask for PLEXD_TEST_REAL_NFTABLES, so
+      # sudo go test ./... on a developer's machine creates nothing unasked.
+      # The absolute go path is resolved before sudo resets PATH, and the two
+      # cache variables let root reuse what the step above downloaded and
+      # built. The step fails unless both tests passed: a skip would pass as
+      # well otherwise, so it greps the -v output for each PASS line. The
+      # space after the first name keeps the traffic test's line from
+      # matching it.
       - name: Run privileged Linux tests
         if: runner.os == 'Linux'
         run: |
           set -o pipefail
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_NFTABLES=1 \
-            "$(command -v go)" test -race -count=1 -v -run '^TestNftablesController_Real$' ./internal/policy/ \
+            "$(command -v go)" test -race -count=1 -v -run '^TestNftablesController_Real(Traffic)?$' ./internal/policy/ \
             | tee "$RUNNER_TEMP/real-nftables.txt"
-          grep -q -- '--- PASS: TestNftablesController_Real' "$RUNNER_TEMP/real-nftables.txt"
+          grep -q -- '--- PASS: TestNftablesController_Real ' "$RUNNER_TEMP/real-nftables.txt"
+          grep -q -- '--- PASS: TestNftablesController_RealTraffic ' "$RUNNER_TEMP/real-nftables.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
-      # and the forwarding sysctl, so the four macOS tests against the real
+      # and the forwarding sysctl, so the five macOS tests against the real
       # kernel skip in the unprivileged run above. The bridge controller test
       # creates its utuns through the bridge controllers and routes over them.
       # Loading a pf anchor and taking a pf enable reference need root as well;
-      # that test also asks for PLEXD_TEST_REAL_PF, so sudo go test ./... on a
-      # developer's Mac leaves the host's pf alone. The absolute go path is
+      # the two pf tests also ask for PLEXD_TEST_REAL_PF, so sudo go test ./...
+      # on a developer's Mac leaves the host's pf alone. The pf traffic test
+      # creates a utun of its own and sends traffic through it, under rules
+      # that name that utun alone. The absolute go path is
       # resolved before sudo resets PATH, and the two cache variables let root
       # reuse what the step above downloaded and built instead of filling a
       # second cache under /var/root. -v is what makes a skip visible in the log
@@ -90,15 +96,20 @@ jobs:
       # and resolves through mDNSResponder over a real utun, which changes the
       # host's resolver configuration while it runs; it also asks for
       # PLEXD_TEST_REAL_RESOLVER, so sudo go test ./... on a developer's Mac
-      # leaves their resolver alone.
+      # leaves their resolver alone. The pf traffic test is the only proof of
+      # what a Mac's pf lines let out and back in, so the step also fails
+      # unless its PASS line is in the output: a skip would pass otherwise.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
+          set -o pipefail
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
             PLEXD_TEST_REAL_PF=1 PLEXD_TEST_REAL_RESOLVER=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestWGControllers_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
-            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/ ./internal/meshdns/
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestWGControllers_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
+            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/ ./internal/meshdns/ \
+            | tee "$RUNNER_TEMP/real-darwin.txt"
+          grep -q -- '--- PASS: TestPFController_RealTraffic ' "$RUNNER_TEMP/real-darwin.txt"
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
@@ -130,13 +141,26 @@ jobs:
       # Administrator. The runner has it, so the gate is this variable for the
       # same reason as above: without one the tests would install real filters
       # inside the ordinary step. The NAT test uses a prefix no adapter carries.
+      # The traffic test creates a Wintun adapter and injects unsolicited
+      # packets into it, which the Windows Firewall would block on its own, so
+      # the step turns every firewall profile off first. plexd's filters live
+      # in a sublayer of their own and do not depend on the Windows Firewall.
+      # The traffic test is the only proof of what plexd's filters let out and
+      # back in on Windows, so the step fails unless its PASS line is in the
+      # output: a skip would pass otherwise.
       - name: Run real WFP tests
         if: runner.os == 'Windows'
         env:
           PLEXD_TEST_REAL_WFP: '1'
-        run: >-
-          go test -race -count=1 -v
-          -run '^TestWFPController_Real(NAT)?$' ./internal/policy/
+        run: |
+          Set-NetFirewallProfile -All -Enabled False
+          $out = Join-Path $env:RUNNER_TEMP 'real-wfp.txt'
+          go test -race -count=1 -v -run '^TestWFPController_Real(NAT|Traffic)?$' ./internal/policy/ | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWFPController_RealTraffic ')) {
+            Write-Error 'TestWFPController_RealTraffic did not pass'
+            exit 1
+          }
 
       # The mesh DNS registrar test writes Name Resolution Policy Table rules,
       # the search list of a Wintun adapter and the Group Policy key, refreshes
