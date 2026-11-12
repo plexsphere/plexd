@@ -29,6 +29,11 @@
 #     logged once per start, mesh names and the dns block's A, CNAME, SRV, MX
 #     and TXT records answered on the mesh IP, a forward zone and a catch-all
 #     forwarded to the mock's DNS stub, and kept by a null dns block
+#   - Policy enforcement on the mesh interface: a WireGuard peer in the meshpeer
+#     container reaches the ports the served policy allows and no other, plexd's
+#     own connection to it needs no rule, a revision with a legacy deny rule is
+#     rejected, and mesh DNS inside the container still answers under an empty
+#     policy
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -2727,8 +2732,9 @@ echo "=== Phase 8j PASSED: a signed session_revoked closes the session it names 
 # ends, so a tunnel that kept posting would show. The tunnel targets the mock's
 # own unauthenticated health route, and the first request reads its answer back,
 # so bytes cross both ways. nc dials the listener from inside the plexd
-# container, which plexd's nftables chain does not filter: it hooks forward
-# only. The mock counts the row on session_active_count alone, so
+# container, which plexd's nftables chains do not filter: they match traffic
+# arriving on the mesh interface, and a connection from inside the container
+# arrives on lo. The mock counts the row on session_active_count alone, so
 # session_activity_count still moves only for the started and ended rows.
 echo "=== Testing tcp tunnel traffic reported as session_active rows ==="
 
@@ -5179,6 +5185,444 @@ fi
 echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 
 # ===================================================================
+# Phase 12e: policy enforcement on the mesh interface
+# ===================================================================
+# The meshpeer container stands in for the fixture's peer ...a0b2 at mesh IP
+# 10.99.0.3. Its wg0 gets a key pair of its own, the edge PSK the mock derives
+# for that peer, and plexd's current public key as its one peer. The phase
+# splices meshpeer's key and address into that peer of the served snapshot and
+# waits for a handshake. It then serves policies of its own, each under a fresh
+# revision id and fingerprint, and checks which connections the chain on
+# plexd's mesh interface lets through:
+#
+#   A  tcp 7001 over IPv4 and over IPv6, and a logged udp 7004 rule
+#   B  A's rules, each carrying the legacy "action": "allow"
+#   C  one rule carrying "action": "deny", which rejects the revision
+#   D  A without its 7001 rules
+#   E  no rules
+#
+# meshpeer probes plexd with nc -z, and every probe meets a listener of its
+# own in plexd's container, so a probe that fails was dropped by the chain, not
+# refused at a closed port. plexd's own connection to a listener in meshpeer
+# needs no rule: its replies belong to a connection plexd opened. A query from
+# inside plexd's container reaches the mesh resolver over lo, which the chain
+# does not match, so mesh DNS answers even under E. The mesh carries IPv4 only,
+# so A's IPv6 rule proves that plexd applies such a rule, not that it matches
+# IPv6 traffic. The phase runs before Phase 13, which replaces the fixture, and
+# ends by serving the saved peers and policy again. Like Phase 12d it needs
+# kernel WireGuard and fails without it.
+echo "=== Testing policy enforcement on the mesh interface ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    fail "[mesh policy] WireGuard did not come up in the plexd container: this phase needs kernel WireGuard to carry meshpeer's traffic to plexd's mesh interface"
+fi
+
+MESH_NODE_IP="10.99.0.1"
+MESH_PEER_IP="10.99.0.3"
+FIXTURE_POLICY_REVISION="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+
+# splice_state <tag> <jq-filter> <value-json> applies the filter, which reads
+# the value as $v, to the live snapshot, posts the result back and nudges the
+# agent, the way configure_dns does for the dns block. Reading the live
+# snapshot is a real GET on the state endpoint and INCREMENTS state_count.
+splice_state() {
+    local tag=$1 filter=$2 value=$3 snapshot spliced status payload
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson v "${value}" "${filter}") \
+        || fail "[${tag}] could not splice ${value} into the live snapshot with '${filter}'"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    payload=$(cat <<MESHNUDGEEOF
+{
+    "id": "evt-e2e-${tag}-nudge",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+MESHNUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# serve_policy <tag> <revision-id> <rules-json> serves a policy block with that
+# revision and those rules. Its fingerprint is base64 of the SHA-256 of the
+# revision id and the rules, the shape the control plane's has, computed in
+# meshpeer, which has openssl. plexd compares the fingerprint and never derives
+# it, so one that differs from the fingerprint it holds makes it apply the
+# block.
+serve_policy() {
+    local tag=$1 rev=$2 rules=$3 fp block
+    fp=$(dc exec -T meshpeer sh -c 'set -o pipefail; printf "%s" "$1" | openssl dgst -sha256 -binary | base64' sh "${rev}|${rules}" 2>&1) \
+        || fail "[${tag}] could not compute a fingerprint in meshpeer: ${fp}"
+    if [ "${#fp}" -ne 44 ]; then
+        fail "[${tag}] meshpeer computed the fingerprint '${fp}', want 44 characters of base64"
+    fi
+    block=$(jq -cn --arg r "${rev}" --arg f "${fp}" --argjson rules "${rules}" \
+        '{revision_id: $r, fingerprint: $f, rules: $rules}') \
+        || fail "[${tag}] could not build a policy block from the rules ${rules}"
+    splice_state "${tag}" '.policy = $v' "${block}"
+    echo "  revision ${rev} served with the rules ${rules}"
+}
+
+# wait_policy_line <tag> <msg> <revision-id> <baseline> reads the plexd log
+# every 2 s for up to 60 s until it holds more than baseline lines that carry
+# msg="<msg>" and revision_id=<revision-id>, and leaves the last log it read in
+# POLICY_LOG.
+wait_policy_line() {
+    local tag=$1 msg=$2 rev=$3 base=$4 start=${SECONDS} n
+    while :; do
+        POLICY_LOG=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${POLICY_LOG}"
+        n=$(count_log_lines "${POLICY_LOG}" "msg=\"${msg}\"" "revision_id=${rev}")
+        if [ "${n}" -gt "${base}" ]; then
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            fail "[${tag}] 60s after revision ${rev} was served, the plexd log holds ${n} '${msg}' line(s) with revision_id=${rev}, want more than ${base}"
+        fi
+        sleep 2
+    done
+}
+
+# expect_policy_applied <tag> <revision-id> <rules> [<baseline>] waits for a
+# "policy ruleset applied" line of the revision past the baseline (0 when left
+# out) and requires the last such line to carry rules=<rules>. plexd logs the
+# line once the ruleset is in the kernel, so the probes after it see the new
+# ruleset.
+expect_policy_applied() {
+    local tag=$1 rev=$2 rules=$3 base=${4:-0} line applied=""
+    wait_policy_line "${tag}" "policy ruleset applied" "${rev}" "${base}"
+    while IFS= read -r line; do
+        case "${line}" in
+            *'msg="policy ruleset applied"'*"revision_id=${rev}"*) applied=${line} ;;
+        esac
+    done <<< "${POLICY_LOG}"
+    case "${applied}" in
+        *" rules=${rules}" | *" rules=${rules} "*) ;;
+        *) fail "[${tag}] plexd applied revision ${rev} with the line '${applied}', want rules=${rules}" ;;
+    esac
+    echo "  PASS: [${tag}] plexd logged 'policy ruleset applied' with revision_id=${rev} and rules=${rules}"
+}
+
+# logged_rule_count <log> <revision-id> prints the count of the last
+# "policy rules ask for logging" line between the first "policy ruleset
+# applied" line of the revision and the policy line before it: the line the
+# engine logged while it built that revision's ruleset. It prints nothing when
+# the engine logged none for it.
+logged_rule_count() {
+    local log=$1 rev=$2 line count=""
+    while IFS= read -r line; do
+        case "${line}" in
+            *'msg="policy rules ask for logging, which this release does not do"'*)
+                count=${line##*count=}
+                count=${count%% *}
+                ;;
+            *'msg="policy ruleset applied"'*"revision_id=${rev}"*)
+                printf '%s' "${count}"
+                return 0
+                ;;
+            *'msg="policy ruleset applied"'* | *'msg="policy revision rejected, keeping previous ruleset"'*)
+                count=""
+                ;;
+        esac
+    done <<< "${log}"
+}
+
+# plexd_listening <port> succeeds when a socket in plexd's container listens on
+# TCP port <port>. busybox netstat prints each local address as
+# <address>:<port> followed by blanks.
+plexd_listening() {
+    local out line
+    out=$(dc exec -T plexd /bin/busybox netstat -ltn 2>&1) \
+        || fail "[mesh policy] netstat -ltn in the plexd container failed: ${out}"
+    while IFS= read -r line; do
+        case "${line}" in
+            *":$1 "*LISTEN*) return 0 ;;
+        esac
+    done <<< "${out}"
+    return 1
+}
+
+# meshpeer_listening <port> succeeds when a socket in meshpeer listens on TCP
+# port <port>.
+meshpeer_listening() {
+    local out
+    out=$(dc exec -T meshpeer ss -Hltn "sport = :$1" 2>&1) \
+        || fail "[mesh policy] ss -Hltn in meshpeer failed: ${out}"
+    [ -n "${out}" ]
+}
+
+# await_listening <tag> <check> <port> <yes|no> runs check (plexd_listening or
+# meshpeer_listening) on port every second for up to 10 s until a listener is
+# there (yes) or gone (no).
+await_listening() {
+    local tag=$1 check=$2 port=$3 want=$4 waited=0 now
+    while :; do
+        if "${check}" "${port}"; then
+            now=yes
+        else
+            now=no
+        fi
+        if [ "${now}" = "${want}" ]; then
+            return 0
+        fi
+        if [ "${waited}" -ge 10 ]; then
+            fail "[${tag}] ${check} ${port} still says listening=${now} after 10s, want listening=${want}"
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# probe_plexd_port <tag> <port> <open|closed> starts a one-connection listener
+# on port in plexd's container, probes it from meshpeer over the mesh with
+# nc -z, and stops the listener again, so each probe meets a listener of its
+# own. A connection the chain drops times out after 3 s, while one that reached
+# a port without a listener would be refused, so closed wants the time-out.
+probe_plexd_port() {
+    local tag=$1 port=$2 want=$3 rc=0 out
+    dc exec -d -T plexd /bin/busybox nc -l -p "${port}" \
+        || fail "[${tag}] could not start a listener on port ${port} in the plexd container"
+    await_listening "${tag}" plexd_listening "${port}" yes
+    out=$(dc exec -T meshpeer nc -nvz -w 3 "${MESH_NODE_IP}" "${port}" 2>&1) || rc=$?
+    # A listener the probe reached took its one connection and exits by itself,
+    # and pkill then finds nothing. One the chain kept the probe from still
+    # listens and is stopped here. The wait below proves the port free.
+    dc exec -T plexd /bin/busybox pkill -f "nc -l -p ${port}" >/dev/null 2>&1 || true
+    await_listening "${tag}" plexd_listening "${port}" no
+    if [ "${want}" = open ]; then
+        if [ "${rc}" -ne 0 ]; then
+            fail "[${tag}] meshpeer's nc -nvz -w 3 ${MESH_NODE_IP} ${port} exited ${rc}, want 0 (output: ${out})"
+        fi
+        echo "  PASS: [${tag}] meshpeer connects to ${MESH_NODE_IP}:${port}"
+        return 0
+    fi
+    if [ "${rc}" -eq 0 ]; then
+        fail "[${tag}] meshpeer's nc -nvz -w 3 ${MESH_NODE_IP} ${port} connected, want the chain to drop it (output: ${out})"
+    fi
+    case "${out}" in
+        *"timed out"*) ;;
+        *) fail "[${tag}] meshpeer's nc -nvz -w 3 ${MESH_NODE_IP} ${port} exited ${rc} without timing out, want the chain to drop it while a listener runs on the port (output: ${out})" ;;
+    esac
+    echo "  PASS: [${tag}] meshpeer's connection to ${MESH_NODE_IP}:${port} times out while a listener runs there"
+}
+
+# probe_meshpeer_port <tag> <port> starts a one-connection listener on port in
+# meshpeer and connects to it from plexd's container, where busybox nc exits 0
+# once connected. No rule names that direction.
+probe_meshpeer_port() {
+    local tag=$1 port=$2 rc=0 out
+    dc exec -d -T meshpeer nc -l "${port}" \
+        || fail "[${tag}] could not start a listener on port ${port} in meshpeer"
+    await_listening "${tag}" meshpeer_listening "${port}" yes
+    out=$(dc exec -T plexd /bin/busybox sh -c "/bin/busybox nc -w 3 ${MESH_PEER_IP} ${port} </dev/null" 2>&1) || rc=$?
+    # As in probe_plexd_port: the listener exits after its one connection, and
+    # one the probe did not reach is stopped here.
+    dc exec -T meshpeer pkill -f "nc -l ${port}" >/dev/null 2>&1 || true
+    await_listening "${tag}" meshpeer_listening "${port}" no
+    if [ "${rc}" -ne 0 ]; then
+        fail "[${tag}] plexd's container could not connect to meshpeer's listener at ${MESH_PEER_IP}:${port}: busybox nc exited ${rc}, want 0, since the replies to a connection plexd opened need no rule (output: ${out})"
+    fi
+    echo "  PASS: [${tag}] plexd's container connects to meshpeer's listener at ${MESH_PEER_IP}:${port}, which no rule names"
+}
+
+# (a) Save the snapshot's peers and policy, which step (h) serves again. The
+# policy must be the fixture's, whose revision step (h) waits for.
+MESH_SAVED=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null \
+    | jq -c '{peers: .peers, policy: .policy}' 2>/dev/null || true)
+MESH_SAVED_PEER=$(printf '%s' "${MESH_SAVED}" | jq -r --arg id "${FIXTURE_PEER_B2}" '[.peers[]? | select(.node_id == $id)] | length' 2>/dev/null || true)
+if [ "${MESH_SAVED_PEER}" != "1" ]; then
+    fail "[mesh policy] the live snapshot carries ${MESH_SAVED_PEER:-no} peer(s) with node_id ${FIXTURE_PEER_B2}, want 1 (saved: ${MESH_SAVED})"
+fi
+MESH_SAVED_REVISION=$(printf '%s' "${MESH_SAVED}" | jq -r '.policy.revision_id // empty' 2>/dev/null || true)
+if [ "${MESH_SAVED_REVISION}" != "${FIXTURE_POLICY_REVISION}" ]; then
+    fail "[mesh policy] the live snapshot serves policy revision '${MESH_SAVED_REVISION}', want the fixture's ${FIXTURE_POLICY_REVISION}"
+fi
+MESH_SAVED_RULES=$(printf '%s' "${MESH_SAVED}" | jq -r '.policy.rules | length' 2>/dev/null || true)
+echo "  saved the live snapshot's peers and policy revision ${MESH_SAVED_REVISION} with ${MESH_SAVED_RULES} rule(s)"
+
+# (b) plexd's current public key: the last rotation's new key, or the key it
+# registered with when it never rotated. Phases 9 and 9b rotate, so here it is
+# the rotation's. A register body is plexd's only while it names plexd's
+# resource handle: Phase 3b's crafted register calls replace the captured body.
+MESH_KEY_BODY=$(curl -sf "http://localhost:18080/test/last-request/key_rotate" 2>/dev/null || true)
+if [ -n "${MESH_KEY_BODY}" ]; then
+    PLEXD_PUBKEY=$(printf '%s' "${MESH_KEY_BODY}" | jq -r '.new_public_key // empty' 2>/dev/null || true)
+    PLEXD_PUBKEY_FROM="new_public_key of the last key_rotate request"
+else
+    MESH_KEY_BODY=$(curl -sf "http://localhost:18080/test/last-request/register" 2>/dev/null || true)
+    MESH_KEY_HANDLE=$(printf '%s' "${MESH_KEY_BODY}" | jq -r '.resource_handle // empty' 2>/dev/null || true)
+    if [ "${MESH_KEY_HANDLE}" != "e2e-node-1" ]; then
+        fail "[mesh policy] no key_rotate request was captured, and the captured register body names resource_handle '${MESH_KEY_HANDLE}', not plexd's e2e-node-1, so it does not carry plexd's key"
+    fi
+    PLEXD_PUBKEY=$(printf '%s' "${MESH_KEY_BODY}" | jq -r '.public_key // empty' 2>/dev/null || true)
+    PLEXD_PUBKEY_FROM="public_key of the register request"
+fi
+case "${PLEXD_PUBKEY}" in
+    *[!A-Za-z0-9+/=]* | '') fail "[mesh policy] plexd's public key from the ${PLEXD_PUBKEY_FROM} is '${PLEXD_PUBKEY}', want 44 characters of base64 (body: ${MESH_KEY_BODY})" ;;
+esac
+if [ "${#PLEXD_PUBKEY}" -ne 44 ]; then
+    fail "[mesh policy] plexd's public key from the ${PLEXD_PUBKEY_FROM} is '${PLEXD_PUBKEY}', want 44 characters of base64"
+fi
+echo "  plexd's public key ${PLEXD_PUBKEY} is the ${PLEXD_PUBKEY_FROM}"
+
+# (c) meshpeer's wg0: a fresh key pair, the edge PSK the mock derives for peer
+# ...a0b2 (base64 of the SHA-256 of "mock-edge-psk|<peer id>"), and plexd as
+# its one peer at plexd:51820 with plexd's mesh IP and a 5 s keepalive, which
+# keeps it initiating until plexd takes its key. The script prints meshpeer's
+# public key last.
+MESH_SETUP='
+set -o pipefail
+umask 077
+wg genkey > /tmp/wg0.key
+printf "%s" "mock-edge-psk|$2" | openssl dgst -sha256 -binary | base64 > /tmp/wg0.psk
+ip link add wg0 type wireguard
+wg set wg0 listen-port 51820 private-key /tmp/wg0.key \
+    peer "$1" preshared-key /tmp/wg0.psk endpoint plexd:51820 \
+    allowed-ips "$3/32" persistent-keepalive 5
+ip address add "$4/24" dev wg0
+ip link set wg0 up
+wg pubkey < /tmp/wg0.key
+'
+MESH_SETUP_OUT=$(dc exec -T meshpeer sh -euc "${MESH_SETUP}" sh "${PLEXD_PUBKEY}" "${FIXTURE_PEER_B2}" "${MESH_NODE_IP}" "${MESH_PEER_IP}" 2>&1) \
+    || fail "[mesh policy] setting up wg0 in meshpeer failed: ${MESH_SETUP_OUT}"
+MESHPEER_PUBKEY=${MESH_SETUP_OUT##*$'\n'}
+case "${MESHPEER_PUBKEY}" in
+    *[!A-Za-z0-9+/=]* | '') fail "[mesh policy] meshpeer's wg0 setup printed '${MESH_SETUP_OUT}', want its public key on the last line" ;;
+esac
+if [ "${#MESHPEER_PUBKEY}" -ne 44 ]; then
+    fail "[mesh policy] meshpeer's wg0 setup printed '${MESH_SETUP_OUT}', want its 44-character public key on the last line"
+fi
+# busybox hostname -i prints each address followed by a blank.
+MESHPEER_IP=$(dc exec -T meshpeer hostname -i 2>&1) || fail "[mesh policy] hostname -i in meshpeer failed: ${MESHPEER_IP}"
+MESHPEER_IP=${MESHPEER_IP%% *}
+case "${MESHPEER_IP}" in
+    *[!0-9.]* | '') fail "[mesh policy] hostname -i in meshpeer printed '${MESHPEER_IP}', want its IPv4 address on e2e-net" ;;
+esac
+echo "  meshpeer's wg0 is up at ${MESH_PEER_IP} with public key ${MESHPEER_PUBKEY}, endpoint ${MESHPEER_IP}:51820"
+
+# (d) Peer ...a0b2 of the served snapshot becomes meshpeer, and the two
+# complete a handshake.
+splice_state "mesh-policy-peer" \
+    '.peers |= map(if .node_id == $v.id then .public_key = $v.key | .endpoint = $v.endpoint else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg key "${MESHPEER_PUBKEY}" --arg endpoint "${MESHPEER_IP}:51820" \
+        '{id: $id, key: $key, endpoint: $endpoint}')"
+MESH_HS_START=${SECONDS}
+while :; do
+    MESH_HS=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+        || fail "[mesh policy] wg show wg0 latest-handshakes in meshpeer failed: ${MESH_HS}"
+    MESH_HS_TIME=${MESH_HS##*[[:space:]]}
+    case "${MESH_HS_TIME}" in
+        *[!0-9]* | '') MESH_HS_TIME=0 ;;
+    esac
+    if [ "${MESH_HS_TIME}" -gt 0 ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_HS_START)) -ge 60 ]; then
+        fail "[mesh policy] meshpeer completed no handshake with plexd within 60s of the splice (plexd's key is the ${PLEXD_PUBKEY_FROM}); wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
+    fi
+    sleep 2
+done
+echo "  PASS: [mesh policy] meshpeer completed a handshake with plexd $((SECONDS - MESH_HS_START))s after the splice"
+
+# (e) Policy A: 7001 is open to meshpeer and 7002 is not, plexd's own
+# connection to meshpeer passes, and the one logged rule is counted in the
+# engine's Info line for the revision.
+MESH_REV_A="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c4"
+MESH_RULES_A=$(jq -c . <<'MESHRULESAEOF'
+[
+  {"protocol": "tcp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7001, "to": 7001}},
+  {"protocol": "tcp", "source_cidr": "fd00:99::3/128", "destination_cidr": "fd00:99::1/128", "ports": {"from": 7001, "to": 7001}},
+  {"protocol": "udp", "source_cidr": "10.99.0.3/32", "destination_cidr": "10.99.0.1/32", "ports": {"from": 7004, "to": 7004}, "log": true}
+]
+MESHRULESAEOF
+)
+serve_policy "mesh-policy-a" "${MESH_REV_A}" "${MESH_RULES_A}"
+expect_policy_applied "mesh policy A" "${MESH_REV_A}" 3
+MESH_LOGGED_A=$(logged_rule_count "${POLICY_LOG}" "${MESH_REV_A}")
+if [ "${MESH_LOGGED_A}" != "1" ]; then
+    fail "[mesh policy A] the 'policy rules ask for logging, which this release does not do' line plexd logged for revision ${MESH_REV_A} carries count='${MESH_LOGGED_A}', want count=1"
+fi
+echo "  PASS: [mesh policy A] plexd logged 'policy rules ask for logging, which this release does not do' with count=1 for revision ${MESH_REV_A}"
+probe_plexd_port "mesh policy A" 7001 open
+probe_plexd_port "mesh policy A" 7002 closed
+probe_meshpeer_port "mesh policy A" 7003
+
+# (f) Policy B, A's rules with the legacy "action": "allow", is applied, and
+# policy C, whose one rule carries "action": "deny", is rejected whole, so B's
+# ruleset stays and 7001 still connects.
+MESH_REV_B="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c5"
+MESH_RULES_B=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(. + {action: "allow"})')
+serve_policy "mesh-policy-b" "${MESH_REV_B}" "${MESH_RULES_B}"
+expect_policy_applied "mesh policy B" "${MESH_REV_B}" 3
+
+MESH_REV_C="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c6"
+MESH_RULES_C='[{"action":"deny","protocol":"tcp","source_cidr":"10.99.0.3/32","destination_cidr":"10.99.0.1/32","ports":{"from":7001,"to":7001}}]'
+serve_policy "mesh-policy-c" "${MESH_REV_C}" "${MESH_RULES_C}"
+wait_policy_line "mesh policy C" "policy revision rejected, keeping previous ruleset" "${MESH_REV_C}" 0
+MESH_REJECTED_C=$(count_log_lines "${POLICY_LOG}" 'msg="policy revision rejected, keeping previous ruleset"' "revision_id=${MESH_REV_C}" "unsupported action")
+if [ "${MESH_REJECTED_C}" -lt 1 ]; then
+    fail "[mesh policy C] plexd rejected revision ${MESH_REV_C}, but no rejection line names 'unsupported action'"
+fi
+MESH_APPLIED_C=$(count_log_lines "${POLICY_LOG}" 'msg="policy ruleset applied"' "revision_id=${MESH_REV_C}")
+if [ "${MESH_APPLIED_C}" -ne 0 ]; then
+    fail "[mesh policy C] plexd logged 'policy ruleset applied' for the rejected revision ${MESH_REV_C} ${MESH_APPLIED_C} time(s)"
+fi
+echo "  PASS: [mesh policy C] plexd logged 'policy revision rejected, keeping previous ruleset' with revision_id=${MESH_REV_C} for its unsupported action"
+probe_plexd_port "mesh policy C" 7001 open
+
+# (g) Policy D, A without its 7001 rules, closes 7001, and so does policy E,
+# which has no rules, while mesh DNS inside plexd's container still answers.
+MESH_REV_D="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7"
+MESH_RULES_D=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(select(.ports.from != 7001))')
+serve_policy "mesh-policy-d" "${MESH_REV_D}" "${MESH_RULES_D}"
+expect_policy_applied "mesh policy D" "${MESH_REV_D}" 1
+probe_plexd_port "mesh policy D" 7001 closed
+
+MESH_REV_E="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c8"
+serve_policy "mesh-policy-e" "${MESH_REV_E}" '[]'
+expect_policy_applied "mesh policy E" "${MESH_REV_E}" 0
+mesh_nslookup node-1.app.e2e.internal
+if [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" node-1.app.e2e.internal "${MESH_NODE_IP}"; then
+    echo "  PASS: [mesh policy E] nslookup -type=a node-1.app.e2e.internal ${MESH_DNS_LISTEN} answers ${MESH_NODE_IP} from inside the plexd container"
+else
+    fail "[mesh policy E] nslookup -type=a node-1.app.e2e.internal ${MESH_DNS_LISTEN} exited ${NSLOOKUP_RC}, want 0 and ${MESH_NODE_IP}: the query arrives on lo, which the chain does not match (output: ${NSLOOKUP_OUT})"
+fi
+probe_plexd_port "mesh policy E" 7001 closed
+
+# (h) The saved peers and policy are served again, plexd applies the fixture's
+# revision once more, and meshpeer's wg0 goes, so no later phase meets it.
+POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh restore] dc logs plexd failed: ${POLICY_LOG}"
+MESH_FIXTURE_APPLIED=$(count_log_lines "${POLICY_LOG}" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_POLICY_REVISION}")
+splice_state "mesh-policy-restore" '.peers = $v.peers | .policy = $v.policy' "${MESH_SAVED}"
+expect_policy_applied "mesh restore" "${FIXTURE_POLICY_REVISION}" "${MESH_SAVED_RULES}" "${MESH_FIXTURE_APPLIED}"
+MESH_SERVED=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null \
+    | jq -c '{peers: .peers, policy: .policy}' 2>/dev/null || true)
+if [ "$(jq -n --argjson a "${MESH_SERVED:-null}" --argjson b "${MESH_SAVED}" '$a == $b' 2>&1)" = "true" ]; then
+    echo "  PASS: [mesh restore] the mock serves the saved peers and policy again"
+else
+    fail "[mesh restore] the mock serves '${MESH_SERVED}' after the restore, want the saved '${MESH_SAVED}'"
+fi
+MESH_DEL_OUT=$(dc exec -T meshpeer ip link del wg0 2>&1) || fail "[mesh restore] deleting wg0 in meshpeer failed: ${MESH_DEL_OUT}"
+
+echo "=== Phase 12e PASSED: policy enforcement on the mesh interface ==="
+
+# ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
 # ===================================================================
 # POST a mutated NodeStateSnapshot whose policy fingerprint differs from the
@@ -5187,10 +5631,12 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # opaque to plexd, so a fresh constant forces PolicyChanged.
 #
 # This gates on the reconciler's own drift summary, NOT on "policy ruleset
-# applied". This container's kernel exposes no nftables backend, so no rule can
-# reach the kernel here and the handler no longer claims an apply it did not
-# perform — the drift summary is the signal that actually holds. Proving rule
-# installation needs an environment with a working nftables backend.
+# applied". The phase proves the differ's verdict on a changed fingerprint, and
+# Phase 13a proves its verdict on an unchanged one by counting the same drift
+# lines from where this phase leaves them, so both read the differ's own
+# output. The applied line would add nothing here: Phase 12e has already shown,
+# with traffic over the mesh interface, that an applied ruleset reaches the
+# kernel.
 POLICY_DRIFT_RE='reconciliation cycle completed.*drift=("[^"]*policy|policy)'
 # grep -c exits 1 when it finds nothing, so tolerate that with '|| true'.
 policy_drift_count() { dc logs plexd 2>&1 | grep -cE "${POLICY_DRIFT_RE}" || true; }

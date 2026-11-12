@@ -55,6 +55,20 @@ services:
     networks:
       - e2e-net
 
+  # The WireGuard peer phase 12e probes plexd's policy enforcement from. It
+  # stands in for the state fixture's peer ...a0b2 at mesh IP 10.99.0.3, and
+  # NET_ADMIN lets it create its wg0. It publishes no port: it reaches plexd,
+  # and plexd reaches it, on e2e-net. The init forwards SIGTERM to sleep, so
+  # `dc down` does not wait out the stop timeout.
+  meshpeer:
+    build:
+      context: ./meshpeer
+    cap_add:
+      - NET_ADMIN
+    init: true
+    networks:
+      - e2e-net
+
 networks:
   e2e-net:
     driver: bridge
