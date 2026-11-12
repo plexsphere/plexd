@@ -57,9 +57,9 @@ const (
 	tokenOut = "No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : 13971906727590307623\n"
 )
 
-// sixRules covers every field combination renderRule handles: both actions,
-// each protocol and none, a prefix and a bare address on either side, a single
-// port and a range, and the wildcard prefix on both sides.
+// sixRules covers every field combination renderRule handles for IPv4: both
+// actions, each protocol and none, a prefix and a bare address on either side,
+// a single port and a range, and the wildcard prefix on both sides.
 var sixRules = []FirewallRule{
 	{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow"},
 	{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.0/24", Port: 53, PortTo: 60, Protocol: "udp", Action: "allow"},
@@ -72,8 +72,8 @@ var sixRules = []FirewallRule{
 // sixRulesText is the anchor sixRules renders to in chain plexd-mesh.
 const sixRulesText = pfHeader +
 	"# chain plexd-mesh\n" +
-	"pass out quick on utun4 inet proto tcp from (utun4) to any keep state\n" +
-	"pass out quick on utun4 inet from (utun4) to any no state\n" +
+	"pass out quick on utun4 proto tcp from (utun4) to any keep state\n" +
+	"pass out quick on utun4 from (utun4) to any no state\n" +
 	"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state\n" +
 	"pass in quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53:60 no state\n" +
 	"pass in quick on utun4 inet proto icmp from 10.0.0.0/24 to 10.1.0.0/24 no state\n" +
@@ -310,10 +310,10 @@ func TestPFController_ApplyRules_TwoInterfaces(t *testing.T) {
 
 	want := pfHeader +
 		"# chain plexd-mesh\n" +
-		"pass out quick on utun4 inet proto tcp from (utun4) to any keep state\n" +
-		"pass out quick on utun4 inet from (utun4) to any no state\n" +
-		"pass out quick on utun5 inet proto tcp from (utun5) to any keep state\n" +
-		"pass out quick on utun5 inet from (utun5) to any no state\n" +
+		"pass out quick on utun4 proto tcp from (utun4) to any keep state\n" +
+		"pass out quick on utun4 from (utun4) to any no state\n" +
+		"pass out quick on utun5 proto tcp from (utun5) to any keep state\n" +
+		"pass out quick on utun5 from (utun5) to any no state\n" +
 		"pass in quick on utun4 inet from 10.0.0.0/24 to any no state\n" +
 		"pass in quick on utun5 inet from 10.0.0.0/24 to any no state\n" +
 		"block in quick on utun4 inet from 10.0.0.9 to any\n"
@@ -383,13 +383,107 @@ func TestPFController_ApplyRules_EmptyInterface(t *testing.T) {
 	checkCalls(t, runner)
 }
 
+// An IPv6 rule is loaded under inet6, which keeps it to IPv6 packets as inet
+// keeps an IPv4 rule to IPv4 ones.
 func TestPFController_ApplyRules_IPv6Address(t *testing.T) {
-	ctrl, _ := newTestPFController(t)
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
 
-	err := ctrl.ApplyRules("plexd-mesh", []FirewallRule{{Interface: "utun4", SrcIP: "fd00::/64", Action: "allow"}})
-	want := `policy: pf: apply rules: rule 0: non-IPv4 address "fd00::/64"`
+	if err := ctrl.ApplyRules("plexd-mesh", []FirewallRule{{Interface: "utun4", SrcIP: "fd00::/64", Action: "allow"}}); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+
+	want := pfHeader +
+		"# chain plexd-mesh\n" +
+		"pass out quick on utun4 proto tcp from (utun4) to any keep state\n" +
+		"pass out quick on utun4 from (utun4) to any no state\n" +
+		"pass in quick on utun4 inet6 from fd00::/64 to any no state\n"
+	checkCalls(t, runner,
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: want},
+		runnerCall{Args: []string{"-E"}},
+	)
+}
+
+// A rule naming two families matches no packet. It is refused before anything
+// reaches pfctl, with the text every backend uses.
+func TestPFController_ApplyRules_MixedFamily(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+
+	err := ctrl.ApplyRules("plexd-mesh", []FirewallRule{{Interface: "utun4", SrcIP: "fd00::/64", DstIP: "10.1.0.5", Action: "allow"}})
+	want := `policy: pf: apply rules: rule 0: policy: firewall rule: source "fd00::/64" and destination "10.1.0.5" differ in address family`
 	if err == nil || err.Error() != want {
 		t.Fatalf("ApplyRules() error = %v, want %q", err, want)
+	}
+
+	checkCalls(t, runner)
+}
+
+// renderRule writes the family keyword the rule's addresses select. The IPv4
+// lines are the ones sixRulesText pinned before IPv6 was rendered, so an IPv4
+// rule renders as it did.
+func TestPFController_RenderRuleFamilies(t *testing.T) {
+	tests := []struct {
+		name string
+		rule FirewallRule
+		want string
+	}{
+		{
+			name: "ipv4 rule",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow"},
+			want: "pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state",
+		},
+		{
+			name: "ipv4 icmp",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.0/24", Protocol: "icmp", Action: "allow"},
+			want: "pass in quick on utun4 inet proto icmp from 10.0.0.0/24 to 10.1.0.0/24 no state",
+		},
+		{
+			name: "ipv4 wildcard keeps inet",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "0.0.0.0/0", DstIP: "0.0.0.0/0", Action: "deny"},
+			want: "block in quick on utun4 inet from any to any",
+		},
+		{
+			name: "ipv6 rule",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "fd00::/64", DstIP: "fd00::1", Port: 443, Protocol: "tcp", Action: "allow"},
+			want: "pass in quick on utun4 inet6 proto tcp from fd00::/64 to fd00::1 port 443 no state",
+		},
+		{
+			name: "ipv6 icmp is icmp6",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "fd00::/64", DstIP: "fd00::1", Protocol: "icmp", Action: "allow"},
+			want: "pass in quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::1 no state",
+		},
+		{
+			name: "ipv6 host prefix and port range",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "fd00::5/128", DstIP: "fd00::/64", Port: 53, PortTo: 60, Protocol: "udp", Action: "allow"},
+			want: "pass in quick on utun4 inet6 proto udp from fd00::5/128 to fd00::/64 port 53:60 no state",
+		},
+		{
+			name: "ipv6 prefix is masked",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "fd00::7/64", Action: "allow"},
+			want: "pass in quick on utun4 inet6 from fd00::/64 to any no state",
+		},
+		{
+			name: "ipv6 wildcard keeps inet6",
+			rule: FirewallRule{Interface: "utun4", SrcIP: "::/0", DstIP: "fd00::1", Action: "allow"},
+			want: "pass in quick on utun4 inet6 from any to fd00::1 no state",
+		},
+		{
+			name: "default deny covers both families",
+			rule: FirewallRule{Interface: "utun4", Action: "deny"},
+			want: "block in quick on utun4 from any to any",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := renderRule(tt.rule)
+			if err != nil {
+				t.Fatalf("renderRule() error = %v, want nil", err)
+			}
+			if got != tt.want {
+				t.Errorf("renderRule() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -453,6 +547,14 @@ func TestPFController_RenderParses(t *testing.T) {
 	ctrl := NewPFController(testLogger())
 	ctrl.natIface = "en1"
 	ctrl.chains["plexd-mesh"] = sixRules
+	// The second chain carries the lines sixRules cannot produce: inet6,
+	// icmp6, the IPv6 wildcard, and the default deny without a family.
+	ctrl.chains["plexd-v6"] = []FirewallRule{
+		{Interface: "utun5", SrcIP: "fd00::/64", DstIP: "fd00::1", Port: 443, Protocol: "tcp", Action: "allow"},
+		{Interface: "utun5", SrcIP: "fd00::/64", DstIP: "fd00::1/128", Protocol: "icmp", Action: "allow"},
+		{Interface: "utun5", SrcIP: "::/0", DstIP: "fd00::/64", Port: 53, PortTo: 60, Protocol: "udp", Action: "allow"},
+		{Interface: "utun5", Action: "deny"},
+	}
 
 	text := ctrl.render()
 
@@ -911,6 +1013,8 @@ func TestPFController_Real(t *testing.T) {
 	rules := []FirewallRule{
 		{Interface: "plexd99", SrcIP: "10.255.252.0/30", DstIP: "10.255.252.4/30", Port: 443, Protocol: "tcp", Action: "allow"},
 		{Interface: "plexd99", SrcIP: "10.255.252.8/30", DstIP: "0.0.0.0/0", Action: "deny"},
+		{Interface: "plexd99", SrcIP: "fd00:99::/64", DstIP: "fd00:99::1/128", Port: 44301, Protocol: "tcp", Action: "allow"},
+		{Interface: "plexd99", Action: "deny"},
 	}
 	if err := ctrl.ApplyRules("plexd-test", rules); err != nil {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
@@ -921,13 +1025,23 @@ func TestPFController_Real(t *testing.T) {
 
 	// pfctl prints its own normalised form: block becomes "block drop", a
 	// single port "port = 443", a pass rule with state carries "flags S/SA",
-	// and a dynamic pool a trailing "round-robin".
+	// and a dynamic pool a trailing "round-robin". The two inet rule lines are
+	// the ones this test asserted before IPv6 was rendered. The pass out pair
+	// without a family, the inet6 line, and "all" for the block rule without
+	// a family or address are read off pfctl's printer, which drops a host
+	// mask (fd00:99::1/128 prints as fd00:99::1) and prints "all" for from
+	// any to any without ports. The IPv6 rule's port has no /etc/services
+	// name, so the line reads the same whether pfctl prints a port by number
+	// or by service name. These normalised forms are what macos-latest must
+	// confirm; where it prints another form, that form is the one to assert.
 	loaded := pfctlOut("-a", pfAnchor, "-s", "rules")
 	for _, want := range []string{
-		"pass out quick on plexd99 inet proto tcp from (plexd99) to any flags S/SA keep state",
-		"pass out quick on plexd99 inet from (plexd99) to any no state",
+		"pass out quick on plexd99 proto tcp from (plexd99) to any flags S/SA keep state",
+		"pass out quick on plexd99 from (plexd99) to any no state",
 		"pass in quick on plexd99 inet proto tcp from 10.255.252.0/30 to 10.255.252.4/30",
 		"block drop in quick on plexd99 inet from 10.255.252.8/30 to any",
+		"pass in quick on plexd99 inet6 proto tcp from fd00:99::/64 to fd00:99::1 port = 44301",
+		"block drop in quick on plexd99 all",
 	} {
 		if !strings.Contains(loaded, want) {
 			t.Errorf("loaded rules miss %q:\n%s", want, loaded)
