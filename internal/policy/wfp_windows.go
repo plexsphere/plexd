@@ -29,7 +29,8 @@ type wfpEngine interface {
 }
 
 // ifaceIDs is what a rule's interface name resolves to: the index the forward
-// layer matches on and the LUID the local-delivery layer matches on.
+// layer matches on and the LUID the local-delivery and connect layers match
+// on.
 type ifaceIDs struct {
 	index uint32
 	luid  uint64
@@ -153,8 +154,9 @@ func adminHint(err error) string {
 // sublayer WFP evaluates the heaviest filter first and the first terminating
 // action wins, so rule 0 has to be the heaviest, and the epoch in the high
 // half makes every filter of a newer apply outweigh every filter of an older
-// one. The result stays below 2^60 for 2^28 applies, which is what a
-// FWP_UINT64 weight accepts.
+// one. The relay probe permits sit at index -1, which outweighs rule 0. The
+// result stays below 2^60 for 2^28 applies, which is what a FWP_UINT64
+// weight accepts.
 func wfpWeight(epoch uint32, n, i int) uint64 {
 	return uint64(epoch)<<32 | uint64(n-i)
 }
@@ -279,19 +281,20 @@ func addrMatch(field wf.FieldID, prefix netip.Prefix) *wf.Match {
 	return &wf.Match{Field: field, Op: wf.MatchTypeRange, Value: netipx.RangeOfPrefix(prefix)}
 }
 
-// wfpLayers is the pair of layers the filters of one address family sit at,
+// wfpLayers is the set of layers the filters of one address family sit at,
 // and the suffix that tells their names apart from the other family's.
 type wfpLayers struct {
-	inbound wf.LayerID
-	forward wf.LayerID
-	suffix  string
+	inbound  wf.LayerID
+	outbound wf.LayerID
+	forward  wf.LayerID
+	suffix   string
 }
 
-// wfpFamilies holds the IPv4 pair, whose filter names carry no suffix as
-// before IPv6 rules existed, and the IPv6 pair.
+// wfpFamilies holds the IPv4 layers, whose filter names carry no suffix as
+// before IPv6 rules existed, and the IPv6 layers.
 var wfpFamilies = [...]wfpLayers{
-	{inbound: wf.LayerALEAuthRecvAcceptV4, forward: wf.LayerIPForwardV4},
-	{inbound: wf.LayerALEAuthRecvAcceptV6, forward: wf.LayerIPForwardV6, suffix: " v6"},
+	{inbound: wf.LayerALEAuthRecvAcceptV4, outbound: wf.LayerALEAuthConnectV4, forward: wf.LayerIPForwardV4},
+	{inbound: wf.LayerALEAuthRecvAcceptV6, outbound: wf.LayerALEAuthConnectV6, forward: wf.LayerIPForwardV6, suffix: " v6"},
 }
 
 // wfpLayersOf returns the layers a rule of the given family is installed at.
@@ -307,25 +310,87 @@ func wfpLayersOf(fam addrFamily) []wfpLayers {
 	return wfpFamilies[:]
 }
 
+// portMatch is the condition that matches field against the rule's port or
+// port range. It is nil for a rule that names no port.
+func portMatch(field wf.FieldID, rule FirewallRule) *wf.Match {
+	switch {
+	case rule.Port > 0 && rule.PortTo > rule.Port:
+		return &wf.Match{
+			Field: field,
+			Op:    wf.MatchTypeRange,
+			Value: wf.Range{From: uint16(rule.Port), To: uint16(rule.PortTo)},
+		}
+	case rule.Port > 0:
+		return &wf.Match{Field: field, Op: wf.MatchTypeEqual, Value: uint16(rule.Port)}
+	}
+	return nil
+}
+
+// relayProbeFilters returns the permits that let the node send UDP to
+// RelayProbePort over one interface, one at the connect layer of each family.
+// They carry no address, since the probe goes to whichever peer is relayed.
+// Their weight is above rule 0's, so no rule of the chain decides the probe.
+func relayProbeFilters(chain string, ids ifaceIDs, epoch uint32, n int) ([]*wf.Rule, error) {
+	weight := wfpWeight(epoch, n, -1)
+
+	filters := make([]*wf.Rule, 0, len(wfpFamilies))
+	for _, layers := range wfpFamilies {
+		id, err := newRuleID()
+		if err != nil {
+			return nil, err
+		}
+		filters = append(filters, &wf.Rule{
+			ID:       id,
+			Name:     fmt.Sprintf("plexd %s relay probe%s", chain, layers.suffix),
+			Layer:    layers.outbound,
+			Sublayer: plexdSublayerID,
+			Weight:   weight,
+			Conditions: []*wf.Match{
+				{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: ids.luid},
+				{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoUDP},
+				{Field: wf.FieldIPRemotePort, Op: wf.MatchTypeEqual, Value: uint16(RelayProbePort)},
+			},
+			Action: wf.ActionPermit,
+		})
+	}
+	return filters, nil
+}
+
 // buildFilters translates one chain's rules into filters, none of which is
 // installed yet: a rule the engine would reject has to fail before the first
 // AddRule, or an apply would leave half a ruleset in the kernel.
 //
-// Every rule yields a filter at the local-delivery layer of its address
-// family, which is where the five-tuple is available, and a second at that
-// family's forward layer, so that traffic through the node is governed by the
-// same decision. A rule without addresses yields the pair at the IPv4 and at
-// the IPv6 layers, all four of the same weight. The forward layer carries an
-// interface and addresses, but neither a protocol nor a port: IPFORWARD_V4
-// and IPFORWARD_V6 have no IP_PROTOCOL field, and the engine refuses a
-// condition on one.
+// Every rule yields up to three filters of its address family, all of the
+// same weight. The inbound filter sits at ALE_AUTH_RECV_ACCEPT, the
+// local-delivery layer, which is where the five-tuple is available. The
+// outbound filter sits at ALE_AUTH_CONNECT, which authorizes the node's own
+// outbound connections and the first packet of its other flows. It matches
+// the rule's source as the local address and its destination as the remote
+// one. The forward filter sits at the family's forward layer, so that traffic
+// through the node is governed by the same decision. A rule without addresses
+// yields its filters at the IPv4 and at the IPv6 layers. The forward layer
+// carries an interface and addresses, but neither a protocol nor a port:
+// IPFORWARD_V4 and IPFORWARD_V6 have no IP_PROTOCOL field, and the engine
+// refuses a condition on one.
+//
+// Replies need no outbound filter. Once ALE_AUTH_RECV_ACCEPT authorizes a
+// flow, its packets pass in both directions without another classification,
+// and ICMP error messages never reach the ALE layers. Microsoft describes both
+// in "ALE Stateful Filtering":
+// https://learn.microsoft.com/en-us/windows/win32/fwp/ale-stateful-filtering
+//
+// Forwarded traffic never reaches ALE_AUTH_CONNECT, so what the node forwards
+// into the mesh is not filtered on its way out.
+//
+// Ahead of the rule filters, every interface the rules name gets the relay
+// probe permits of relayProbeFilters, once.
 //
 // The ruleset is ordered and first-match-terminating, so a rule left out of
 // the forward layer is not narrowed to nothing: the traffic it covered is
 // re-decided by whatever follows it. A deny that names a protocol or a port
 // is therefore installed without them, which blocks a superset of what the
 // rule asked for, and such an allow gets no forward filter, which leaves its
-// traffic to the rules below — at worst the default deny. Both directions
+// traffic to the rules below, at worst the default deny. Both directions
 // fail closed.
 //
 // The caller holds c.mu.
@@ -340,7 +405,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 	unenforceable := 0
 	widened := 0
 
-	var filters []*wf.Rule
+	var probes, filters []*wf.Rule
 	for i, rule := range rules {
 		if err := rule.Validate(); err != nil {
 			return nil, fmt.Errorf("rule %d: %w", i, err)
@@ -358,6 +423,12 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 				return nil, fmt.Errorf("rule %d: lookup interface %q: %w", i, rule.Interface, err)
 			}
 			resolved[rule.Interface] = ids
+
+			p, err := relayProbeFilters(chain, ids, epoch, len(rules))
+			if err != nil {
+				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+			}
+			probes = append(probes, p...)
 		}
 
 		fam, err := rule.family()
@@ -424,15 +495,8 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 			if rule.Protocol != "" {
 				inbound = append(inbound, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
 			}
-			switch {
-			case rule.Port > 0 && rule.PortTo > rule.Port:
-				inbound = append(inbound, &wf.Match{
-					Field: wf.FieldIPLocalPort,
-					Op:    wf.MatchTypeRange,
-					Value: wf.Range{From: uint16(rule.Port), To: uint16(rule.PortTo)},
-				})
-			case rule.Port > 0:
-				inbound = append(inbound, &wf.Match{Field: wf.FieldIPLocalPort, Op: wf.MatchTypeEqual, Value: uint16(rule.Port)})
+			if m := portMatch(wf.FieldIPLocalPort, rule); m != nil {
+				inbound = append(inbound, m)
 			}
 
 			id, err := newRuleID()
@@ -446,6 +510,38 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 				Sublayer:   plexdSublayerID,
 				Weight:     weight,
 				Conditions: inbound,
+				Action:     action,
+			})
+
+			// Windows sends a packet only from an address of the interface
+			// it leaves through, so the local interface is the outgoing
+			// interface, the oifname the Linux output chain matches. The
+			// rule's source is the node's side of the flow here, and its
+			// destination the remote side.
+			outbound := []*wf.Match{{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: ids.luid}}
+			if srcOK {
+				outbound = append(outbound, addrMatch(wf.FieldIPLocalAddress, src))
+			}
+			if dstOK {
+				outbound = append(outbound, addrMatch(wf.FieldIPRemoteAddress, dst))
+			}
+			if rule.Protocol != "" {
+				outbound = append(outbound, &wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: proto})
+			}
+			if m := portMatch(wf.FieldIPRemotePort, rule); m != nil {
+				outbound = append(outbound, m)
+			}
+
+			if id, err = newRuleID(); err != nil {
+				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+			}
+			filters = append(filters, &wf.Rule{
+				ID:         id,
+				Name:       fmt.Sprintf("plexd %s #%d outbound%s", chain, i, layers.suffix),
+				Layer:      layers.outbound,
+				Sublayer:   plexdSublayerID,
+				Weight:     weight,
+				Conditions: outbound,
 				Action:     action,
 			})
 
@@ -502,7 +598,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 		)
 	}
 
-	return filters, nil
+	return append(probes, filters...), nil
 }
 
 // deleteFilters removes the given filters and returns the ones that are still
