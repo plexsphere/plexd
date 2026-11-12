@@ -1,6 +1,9 @@
 package policy
 
-import "testing"
+import (
+	"net/netip"
+	"testing"
+)
 
 func TestFirewallRule_ValidateAcceptsValid(t *testing.T) {
 	valid := []FirewallRule{
@@ -9,7 +12,7 @@ func TestFirewallRule_ValidateAcceptsValid(t *testing.T) {
 		{Action: "allow", Port: 443, Protocol: "tcp"},
 		{Action: "deny", Port: 53, Protocol: "udp"},
 		{Action: "allow", Protocol: "tcp"},
-		{Action: "allow", Protocol: "icmp"},
+		{Action: "allow", Protocol: "icmp", DstIP: "10.0.0.1"},
 		{Action: "allow", Port: 1000, PortTo: 2000, Protocol: "tcp"},
 		{Action: "allow", Port: 443, PortTo: 443, Protocol: "tcp"},
 		{Action: "allow", SrcIP: "10.0.0.0/8", DstIP: "192.168.1.1", Interface: "eth0"},
@@ -64,7 +67,7 @@ func TestFirewallRule_ValidateRejectsPortWithICMP(t *testing.T) {
 }
 
 func TestFirewallRule_ValidateAcceptsICMPWithoutPort(t *testing.T) {
-	r := FirewallRule{Action: "allow", Protocol: "icmp"}
+	r := FirewallRule{Action: "allow", Protocol: "icmp", DstIP: "10.0.0.1"}
 	if err := r.Validate(); err != nil {
 		t.Errorf("Validate() rejected a portless icmp rule: %v", err)
 	}
@@ -85,6 +88,92 @@ func TestFirewallRule_ValidateRejectsPortToBounds(t *testing.T) {
 	} {
 		if err := r.Validate(); err == nil {
 			t.Errorf("Validate() accepted out-of-bounds port range %+v", r)
+		}
+	}
+}
+
+func TestFirewallRule_ValidateFamilies(t *testing.T) {
+	for _, r := range []FirewallRule{
+		{Action: "allow", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5"},
+		{Action: "allow", SrcIP: "fd00::/64", DstIP: "fd00::1", Protocol: "icmp"},
+		{Action: "allow", SrcIP: "::/0", DstIP: "fd00::1/128", Port: 443, Protocol: "tcp"},
+		{Action: "deny"},
+	} {
+		if err := r.Validate(); err != nil {
+			t.Errorf("Validate(%+v) = %v, want nil", r, err)
+		}
+	}
+
+	for _, tt := range []struct {
+		rule FirewallRule
+		want string
+	}{
+		{
+			rule: FirewallRule{Action: "allow", SrcIP: "fd00::/32", DstIP: "10.99.0.5/32"},
+			want: `policy: firewall rule: source "fd00::/32" and destination "10.99.0.5/32" differ in address family`,
+		},
+		{
+			rule: FirewallRule{Action: "allow", DstIP: "::ffff:10.0.0.1"},
+			want: `policy: firewall rule: IPv4-mapped IPv6 address "::ffff:10.0.0.1"`,
+		},
+		{
+			rule: FirewallRule{Action: "allow", SrcIP: "::ffff:10.0.0.1/128"},
+			want: `policy: firewall rule: IPv4-mapped IPv6 address "::ffff:10.0.0.1/128"`,
+		},
+		{
+			rule: FirewallRule{Action: "allow", SrcIP: "not-an-ip"},
+			want: `policy: firewall rule: invalid IP address "not-an-ip"`,
+		},
+		{
+			rule: FirewallRule{Action: "allow", DstIP: "fe80::1%eth0"},
+			want: `policy: firewall rule: invalid IP address "fe80::1%eth0"`,
+		},
+		{
+			rule: FirewallRule{Action: "allow", Protocol: "icmp"},
+			want: "policy: firewall rule: protocol icmp needs an address to choose between ICMP and ICMPv6",
+		},
+	} {
+		err := tt.rule.Validate()
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("Validate(%+v) = %v, want %q", tt.rule, err, tt.want)
+		}
+	}
+}
+
+func TestParseRuleAddr(t *testing.T) {
+	for _, tt := range []struct {
+		in     string
+		want   netip.Prefix
+		wantOK bool
+	}{
+		{in: "", want: netip.Prefix{}, wantOK: false},
+		{in: "10.0.0.1", want: netip.MustParsePrefix("10.0.0.1/32"), wantOK: true},
+		{in: "fd00::1", want: netip.MustParsePrefix("fd00::1/128"), wantOK: true},
+		{in: "10.0.0.5/24", want: netip.MustParsePrefix("10.0.0.0/24"), wantOK: true},
+		{in: "fd00::5/64", want: netip.MustParsePrefix("fd00::/64"), wantOK: true},
+		{in: "0.0.0.0/0", want: netip.MustParsePrefix("0.0.0.0/0"), wantOK: true},
+		{in: "::/0", want: netip.MustParsePrefix("::/0"), wantOK: true},
+	} {
+		got, ok, err := parseRuleAddr(tt.in)
+		if err != nil || ok != tt.wantOK || got != tt.want {
+			t.Errorf("parseRuleAddr(%q) = %v, %v, %v; want %v, %v, nil", tt.in, got, ok, err, tt.want, tt.wantOK)
+		}
+	}
+}
+
+func TestFirewallRule_Family(t *testing.T) {
+	for _, tt := range []struct {
+		rule FirewallRule
+		want addrFamily
+	}{
+		{rule: FirewallRule{}, want: familyAny},
+		{rule: FirewallRule{SrcIP: "10.0.0.0/8"}, want: familyIPv4},
+		{rule: FirewallRule{DstIP: "0.0.0.0/0"}, want: familyIPv4},
+		{rule: FirewallRule{SrcIP: "::/0", DstIP: "fd00::1"}, want: familyIPv6},
+	} {
+		got, err := tt.rule.family()
+		if err != nil || got != tt.want {
+			t.Errorf("family(%+v) = %v, %v; want %v, nil", tt.rule, got, err, tt.want)
 		}
 	}
 }
