@@ -535,6 +535,8 @@ Pings a mesh peer and reports latency. The binary and its flags are picked per p
 
 Returns ping output in stdout. Exit code 0 on success, 1 on failure (unreachable or invalid IP).
 
+The echo requests are traffic the node itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). The policy therefore needs a rule that allows ICMP from the node's mesh IP to the peer. On macOS the echo replies need a rule from the peer to the node as well, because pf keeps no state for the node's own ICMP. A Project's allow-all policy covers both. Without the outbound rule no echo request leaves the node, and the run fails as it does for an unreachable peer.
+
 On Windows the exit status is not the whole answer: `ping.exe` exits 0 for any ICMP response, a router's `Destination host unreachable` and a `TTL expired in transit` included. The reply is therefore checked for the `TTL=` token of a real echo reply, the one part of the line Windows does not localize, and an answer without it is reported as exit code 1 with the output on stderr. `iputils` and BSD `ping` report the same case through the exit status, so their output is not read.
 
 A cancel request or the run deadline kills `ping`. A cancel reports `cancelled`, and the deadline reports `failed` with `error` `action timed out`. Either report carries what `ping` printed before the kill, with the exit code of the killed process: -1 on Linux and macOS, where the kill is a signal, and 1 on Windows, where the kill ends `ping.exe` with exit status 1. A run stopped before `ping` started reports exit code 1.
@@ -555,6 +557,8 @@ Traceroute to a mesh peer. The binary and its flags are picked per platform:
 | `max_hops` | string | no       | `15`    | Maximum number of hops   |
 
 Returns traceroute output in stdout. Exit code 1 with the error `traceroute not available` when neither the Linux system directories nor the `PATH` lookup hold the binary; macOS and Windows ship it at a fixed path.
+
+The probes are traffic the node itself sends over the mesh, so they need a rule from the node's mesh IP to the peer, as `diagnostics.ping_peer` does. A rule that names no protocol covers the probes of every platform's binary. On macOS the replies need a rule from the peer to the node as well, because pf keeps no state for the node's own UDP and ICMP. A Project's allow-all policy covers both.
 
 A cancel request or the run deadline kills the traceroute binary. A cancel reports `cancelled`, and the deadline reports `failed` with `error` `action timed out`. Either report carries what the binary printed before the kill, with the exit code of the killed process: -1 on Linux and macOS and 1 on Windows, as for `ping`. A run stopped before the binary started reports exit code 1.
 

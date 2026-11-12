@@ -369,7 +369,7 @@ Network policy enforcement and firewall rules. See [Network Policy Enforcement](
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable policy enforcement. An omitted key means enabled; an explicit `false` is preserved. Also settable as [`PLEXD_POLICY_ENABLED`](environment-variables.md#plexd-up-variables), which is how a deployment without a config file reaches the opt-out below. |
-| `chain_name` | string | `plexd-mesh` | On Linux the prefix of the two nftables base chains in table `inet plexd`, `<chain_name>-input` on the input hook and `<chain_name>-forward` on the forward hook; on macOS the chain's comment line in the pf anchor, on Windows the prefix of the WFP filter names |
+| `chain_name` | string | `plexd-mesh` | On Linux the prefix of the three nftables base chains in table `inet plexd`, `<chain_name>-input` on the input hook, `<chain_name>-forward` on the forward hook and `<chain_name>-output` on the output hook; on macOS the chain's comment line in the pf anchor, on Windows the prefix of the WFP filter names |
 
 Policy enforcement needs `CAP_NET_ADMIN`. On Linux it also needs `nf_tables` with the `inet` family and connection tracking, whose modules the kernel loads itself (see [Host Requirements](../networking/nftables-firewall.md#host-requirements)). On macOS it needs root and a pf main ruleset that references `anchor "com.apple/*"`, which Apple's `/etc/pf.conf` does; on Windows it needs Administrator. With enforcement on, `plexd up` probes the backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
 
@@ -413,6 +413,39 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > today's control plane. A rule with any other `action` rejects its revision, and the node
 > keeps the ruleset it enforces. A rule with `log: true` is enforced but its traffic is not
 > logged yet.
+
+> **Migration:** The policy now also governs what the node itself sends over the mesh, on
+> Linux, macOS and Windows. The control plane compiles every rule for both ends, so a
+> node's ruleset already holds the rules that name it as the source, and plexd now enforces
+> them. A connection or datagram the node's own sockets send through the mesh interface
+> therefore needs a rule from the node's mesh IP to its destination, unless it is a reply
+> to a connection the policy let in. On macOS such replies leave through mirror lines that
+> carry tcp, udp and icmp only, so a reply in another protocol, or an ICMP error the Mac
+> sends from its own address about traffic it forwards, meets the default deny unless a
+> rule allows it. A Project's allow-all policy holds a rule from the node to every mesh
+> address. The node-originated traffic that now needs a rule:
+>
+> - a bridge's ingress and SNI dials to targets on mesh peers;
+> - tcp session targets and `direct-tcpip` destinations of the mesh SSH server on mesh peers;
+> - `diagnostics.ping_peer` and `diagnostics.traceroute_peer`;
+> - mesh DNS forwarding to a resolver behind a bridge.
+>
+> A destination behind a bridge is not a mesh address, so it needs a rule that names it,
+> which the bridge needs to forward the traffic anyway. UDP to port 9, plexd's relay
+> liveness probe, passes without a rule on every platform; any local process can send to
+> that port over the mesh, and the receiving node's inbound rules still apply. Traffic the
+> node forwards into the mesh, from a user-access client, a site-to-site peer or a host
+> behind a bridge, and on Linux a container or Pod masqueraded onto the node's mesh address,
+> is not filtered on its way out. On Linux `chain_name` now names three chains:
+> `<chain_name>-output` on the output hook joins the input and forward chains. There is no
+> separate switch for the outbound filtering: `policy.enabled: false`, set before rolling
+> the binary forward, is the way out, and it turns the inbound filtering off with it. A rollback to an earlier
+> binary is clean after a stop. After a crash the three chains stay in place, and an earlier
+> binary neither updates nor removes the output chain, which keeps filtering what the node
+> sends by the rules it last held, so remove the table with `nft delete table inet plexd`
+> before you start the earlier binary. See
+> [Tunnel established but no traffic](../../guide/troubleshooting.md#tunnel-established-but-no-traffic)
+> for how to find a packet the node's policy drops on its way out.
 
 Source: `internal/policy/config.go`
 
