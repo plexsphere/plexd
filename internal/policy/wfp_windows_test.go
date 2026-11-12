@@ -644,7 +644,7 @@ func TestWFPController_ApplyRules_IPv6Address(t *testing.T) {
 
 func TestWFPController_ApplyRules_InvalidAddress(t *testing.T) {
 	err := applyRejected(t, "plexd-mesh", []FirewallRule{{Interface: "plexd0", DstIP: "bogus", Action: "allow"}})
-	want := `policy: wfp: apply rules: rule 0: invalid IP address "bogus"`
+	want := `policy: wfp: apply rules: rule 0: policy: firewall rule: invalid IP address "bogus"`
 	if err.Error() != want {
 		t.Errorf("ApplyRules() error = %v, want %q", err, want)
 	}

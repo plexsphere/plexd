@@ -397,7 +397,7 @@ func TestPFController_ApplyRules_InvalidAddress(t *testing.T) {
 	ctrl, _ := newTestPFController(t)
 
 	err := ctrl.ApplyRules("plexd-mesh", []FirewallRule{{Interface: "utun4", DstIP: "bogus", Action: "allow"}})
-	want := `policy: pf: apply rules: rule 0: invalid IP address "bogus"`
+	want := `policy: pf: apply rules: rule 0: policy: firewall rule: invalid IP address "bogus"`
 	if err == nil || err.Error() != want {
 		t.Fatalf("ApplyRules() error = %v, want %q", err, want)
 	}
