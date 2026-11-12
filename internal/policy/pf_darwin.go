@@ -41,10 +41,10 @@ const (
 // pfTokenRE finds the reference token pfctl -E prints ("Token : 1397...").
 var pfTokenRE = regexp.MustCompile(`Token\s*:\s*([0-9]+)`)
 
-// PFController implements FirewallController and bridge.NATController on
-// macOS with pfctl(8). It keeps the desired state itself and renders the
-// whole anchor on every change, because pfctl -f replaces an anchor's
-// rules wholesale: there is no way to add one rule to it.
+// PFController implements FirewallController, ConnReporter and
+// bridge.NATController on macOS with pfctl(8). It keeps the desired state
+// itself and renders the whole anchor on every change, because pfctl -f
+// replaces an anchor's rules wholesale: there is no way to add one rule to it.
 type PFController struct {
 	run    commandRunner
 	logger *slog.Logger
@@ -53,15 +53,39 @@ type PFController struct {
 	chains   map[string][]FirewallRule // chain name -> rules; a key exists once EnsureChain ran
 	natIface string                    // access interface with masquerade, "" for none
 	token    string                    // pf enable reference from pfctl -E, "" while released
+	sink     ConnSink                  // where the pflog reader reports, nil for nobody
+	reader   *pflogReader              // the pflog reader opened last, nil for none
+
+	// openLog starts a pflog reader. It is a seam: openPflog in production,
+	// a fake in tests.
+	openLog func() (*pflogReader, error)
+
+	// logMu guards the tags of the logged lines, which the pflog reader looks
+	// up without c.mu: pf's number of each logged line in the anchor loaded
+	// last, and in the one before it.
+	logMu       sync.RWMutex
+	logTags     map[uint32]string
+	prevLogTags map[uint32]string
 }
 
 // NewPFController returns a controller driving the host's pfctl binary.
 func NewPFController(logger *slog.Logger) *PFController {
-	return &PFController{
+	c := &PFController{
 		run:    execCommand,
 		logger: logger,
 		chains: make(map[string][]FirewallRule),
 	}
+	c.openLog = c.openPflog
+	return c
+}
+
+// SetConnSink makes the pflog reader report the connections the logged rules
+// admit to sink. It implements ConnReporter. Without a sink, ApplyRules loads
+// the logged rules without their log keyword.
+func (c *PFController) SetConnSink(sink ConnSink) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sink = sink
 }
 
 // pfctl runs one pfctl invocation under a timeout and returns its combined
@@ -102,10 +126,33 @@ func (c *PFController) pfctl(op string, stdin []byte, args ...string) ([]byte, e
 // lines renderRule returns for each rule. A chain without rules renders as
 // its comment line alone.
 //
+// The map takes pf's number of each line that starts "pass in log " or "pass
+// out log " to the tag of the rule the line came from. A pflog record carries
+// that number as its subrulenr. pf numbers the filter rules of an anchor from
+// 0 in the order they load, and the header, the chain comments and the nat
+// line load none. pfctl loads a line holding a brace list as one rule per
+// item, so an ICMP reply mirror takes four numbers, or five for ICMPv6, and
+// every other line takes one. pfctl's ruleset optimizer reorders and merges
+// rules only within a run of lines alike in action, log and state. A logged
+// line differs in log from the lines next to it, and the Enforcer puts the
+// logged rules ahead of the others, so the count of rules in front of a
+// logged line stays as rendered. TestPFController_RealConnLog proves the
+// numbering on a real kernel.
+//
 // The caller holds c.mu.
-func (c *PFController) render() []byte {
+func (c *PFController) render() ([]byte, map[uint32]string) {
 	var b strings.Builder
 	b.WriteString(pfHeader)
+
+	tags := make(map[uint32]string)
+	var nr uint32
+	filter := func(line, tag string) {
+		b.WriteString(line + "\n")
+		if strings.HasPrefix(line, "pass in log ") || strings.HasPrefix(line, "pass out log ") {
+			tags[nr] = tag
+		}
+		nr += pfRuleCount(line)
+	}
 
 	if c.natIface != "" {
 		fmt.Fprintf(&b, "nat on %s inet from any to any -> (%s)\n", c.natIface, c.natIface)
@@ -127,7 +174,7 @@ func (c *PFController) render() []byte {
 			// assigned after the load needs no reload. The line names no
 			// address family, so it covers IPv4 and IPv6. It keeps no state,
 			// so it lets nothing back in.
-			fmt.Fprintf(&b, "pass out quick on %s proto udp from (%s) to any port %d no state\n", rule.Interface, rule.Interface, RelayProbePort)
+			filter(fmt.Sprintf("pass out quick on %s proto udp from (%s) to any port %d no state", rule.Interface, rule.Interface, RelayProbePort), "")
 		}
 
 		for _, rule := range c.chains[name] {
@@ -139,12 +186,30 @@ func (c *PFController) render() []byte {
 				continue
 			}
 			for _, line := range lines {
-				b.WriteString(line + "\n")
+				filter(line, rule.LogTag)
 			}
 		}
 	}
 
-	return []byte(b.String())
+	return []byte(b.String()), tags
+}
+
+// pfRuleCount returns how many rules pfctl loads for one filter line: a brace
+// list loads as one rule per item, and several lists multiply.
+func pfRuleCount(line string) uint32 {
+	n := uint32(1)
+	for rest := line; ; {
+		open := strings.IndexByte(rest, '{')
+		if open < 0 {
+			return n
+		}
+		end := strings.IndexByte(rest[open:], '}')
+		if end < 0 {
+			return n
+		}
+		n *= uint32(strings.Count(rest[open:open+end], ",") + 1)
+		rest = rest[open+end+1:]
+	}
 }
 
 // The ICMP types a reply mirror lets the node send: the echo reply and the
@@ -170,6 +235,22 @@ const (
 //     A/A for a rule naming tcp or no protocol, udp for one naming udp or no
 //     protocol, and for every allow the ICMP replies and errors of its
 //     family, both families for a rule without addresses.
+//
+// A rule with a LogTag puts log right after pass in or pass out on the lines
+// that see a connection's first packet, so pf hands that packet to pflog0:
+//
+//   - tcp: a pass in log line with flags S/SA ahead of the unchanged pass in
+//     line, so only the SYN logs, and log on the keep state line, which logs
+//     only the packet that creates the state;
+//   - udp and icmp: log on the pass in line and on the pass out line, which
+//     keep no state, so pf logs every packet they pass;
+//   - no protocol: the tcp SYN line, then an unlogged tcp pass in line, so the
+//     rest of a TCP connection does not log, then the protocol-less pass in
+//     line with log; log on the node's own keep state line, then an unlogged
+//     tcp pass out line, so the Mac's replies to an inbound TCP connection do
+//     not log, then log on the node's protocol-less pass out line.
+//
+// Mirrors and block lines never log.
 //
 // A deny renders a block in line and a block out line. The block out line
 // names the interface's own addresses in place of an empty source, so the
@@ -271,21 +352,47 @@ func renderRule(rule FirewallRule) ([]string, error) {
 		}, nil
 	}
 
-	lines := []string{
-		fmt.Sprintf("pass in %s%s from %s to %s%s no state", on, proto, src, dst, port),
+	logged := rule.LogTag != ""
+	in, out := "pass in", "pass out"
+	if logged {
+		in, out = "pass in log", "pass out log"
 	}
 
+	var lines []string
 	switch rule.Protocol {
 	case "tcp":
-		lines = append(lines, fmt.Sprintf("pass out %s proto tcp from %s to %s%s keep state", on, src, dst, port))
-	case "udp", "icmp":
-		lines = append(lines, fmt.Sprintf("pass out %s%s from %s to %s%s no state", on, proto, src, dst, port))
-	case "":
-		// Validate refuses a port without a protocol, so neither line has one.
+		if logged {
+			lines = append(lines, fmt.Sprintf("%s %s%s from %s to %s%s flags S/SA no state", in, on, proto, src, dst, port))
+		}
 		lines = append(lines,
-			fmt.Sprintf("pass out %s proto tcp from %s to %s keep state", on, src, dst),
-			fmt.Sprintf("pass out %s from %s to %s no state", on, src, dst),
+			fmt.Sprintf("pass in %s%s from %s to %s%s no state", on, proto, src, dst, port),
+			fmt.Sprintf("%s %s proto tcp from %s to %s%s keep state", out, on, src, dst, port),
 		)
+	case "udp", "icmp":
+		lines = append(lines,
+			fmt.Sprintf("%s %s%s from %s to %s%s no state", in, on, proto, src, dst, port),
+			fmt.Sprintf("%s %s%s from %s to %s%s no state", out, on, proto, src, dst, port),
+		)
+	case "":
+		// Validate refuses a port without a protocol, so no line has one.
+		if logged {
+			lines = append(lines,
+				fmt.Sprintf("%s %s proto tcp from %s to %s flags S/SA no state", in, on, src, dst),
+				fmt.Sprintf("pass in %s proto tcp from %s to %s no state", on, src, dst),
+			)
+		}
+		lines = append(lines,
+			fmt.Sprintf("%s %s from %s to %s no state", in, on, src, dst),
+			fmt.Sprintf("%s %s proto tcp from %s to %s keep state", out, on, src, dst),
+		)
+		if logged {
+			// The TCP packets the Mac sends that create no state, its replies
+			// to an inbound connection among them, pass here unlogged, so the
+			// logged line below sees the other protocols only. The line below
+			// passed them before, so the verdict is the same.
+			lines = append(lines, fmt.Sprintf("pass out %s proto tcp from %s to %s no state", on, src, dst))
+		}
+		lines = append(lines, fmt.Sprintf("%s %s from %s to %s no state", out, on, src, dst))
 	}
 
 	if rule.Protocol == "tcp" || rule.Protocol == "" {
@@ -329,7 +436,8 @@ func pfAddress(addr string) (string, error) {
 // anchor and enables pf afterwards, in that order, so pf never runs with an
 // empty plexd anchor in between. Once nothing is left to enforce it flushes
 // the anchor and gives the enable reference back, so plexd does not keep pf
-// switched on for a host that had it off.
+// switched on for a host that had it off. The tags of the logged lines change
+// only once pf took the new anchor.
 //
 // The caller holds c.mu and restores the fields it changed when sync fails,
 // which keeps the controller's picture at what the kernel last accepted. The
@@ -343,6 +451,7 @@ func (c *PFController) sync(op string) error {
 		if _, err := c.pfctl(op, nil, "-a", pfAnchor, "-F", "all"); err != nil {
 			return err
 		}
+		c.setLogTags(nil)
 		// The reference is dropped even when -X failed: pf then keeps a leaked
 		// one, which only means pf stays enabled, and a retry with the same
 		// token could never release it either.
@@ -358,9 +467,11 @@ func (c *PFController) sync(op string) error {
 		return nil
 	}
 
-	if _, err := c.pfctl(op, c.render(), "-a", pfAnchor, "-f", "-"); err != nil {
+	text, tags := c.render()
+	if _, err := c.pfctl(op, text, "-a", pfAnchor, "-f", "-"); err != nil {
 		return err
 	}
+	c.setLogTags(tags)
 
 	if c.token != "" {
 		return nil
@@ -382,6 +493,33 @@ func (c *PFController) sync(op string) error {
 		"token", c.token,
 	)
 	return nil
+}
+
+// setLogTags records the tags of the logged lines in the anchor pf just took.
+// The tags it replaces stay for one more change, so a record pf wrote just
+// before the load still finds its line. A load that changes no logged line,
+// such as one for a NAT change, keeps both.
+func (c *PFController) setLogTags(tags map[uint32]string) {
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+	if maps.Equal(tags, c.logTags) {
+		return
+	}
+	c.prevLogTags = c.logTags
+	c.logTags = tags
+}
+
+// pflogTag returns the tag of the logged line pf numbers nr, in the anchor
+// loaded last or in the one before it. The pflog reader calls it and takes
+// logMu alone, never c.mu.
+func (c *PFController) pflogTag(nr uint32) (string, bool) {
+	c.logMu.RLock()
+	defer c.logMu.RUnlock()
+	if tag, ok := c.logTags[nr]; ok {
+		return tag, true
+	}
+	tag, ok := c.prevLogTags[nr]
+	return tag, ok
 }
 
 // Probe reports whether the pf backend is usable, without changing any kernel
@@ -466,6 +604,12 @@ func (c *PFController) EnsureChain(chain string) error {
 // before anything is stored or run, so a bad rule leaves both the kernel and
 // the desired state untouched. A chain that was never ensured is created
 // here, as NftablesController.ApplyRules adds its chain itself.
+//
+// Rules with a LogTag need a pflog reader, which the first such apply opens.
+// Without a sink, or with a reader that cannot open, the rules are stored and
+// loaded without their tags, so the anchor carries no log keyword and logging
+// never stands in the way of enforcement. A failed open logs
+// connLogUnavailable, and the next apply tries again.
 func (c *PFController) ApplyRules(chain string, rules []FirewallRule) error {
 	if chain == "" {
 		return errors.New("policy: pf: apply rules: chain name is empty")
@@ -478,6 +622,10 @@ func (c *PFController) ApplyRules(chain string, rules []FirewallRule) error {
 		if _, err := renderRule(rule); err != nil {
 			return fmt.Errorf("policy: pf: apply rules: rule %d: %w", i, err)
 		}
+	}
+
+	if hasLogTags(rules) && !c.connLogReady() {
+		rules = withoutLogTags(rules)
 	}
 
 	// Nil and empty both leave a chain with no rules, which renders as the
@@ -499,6 +647,30 @@ func (c *PFController) ApplyRules(chain string, rules []FirewallRule) error {
 		"count", len(rules),
 	)
 	return nil
+}
+
+// connLogReady reports whether a pflog reader runs to report what the logged
+// lines of the next load pass, and opens one when none does. A reader whose
+// loop ended has released its device already and is replaced.
+//
+// The caller holds c.mu.
+func (c *PFController) connLogReady() bool {
+	if c.sink == nil {
+		return false
+	}
+	if c.reader != nil && c.reader.running() {
+		return true
+	}
+	reader, err := c.openLog()
+	if err != nil {
+		c.logger.Warn(connLogUnavailable,
+			"component", "policy",
+			"error", err,
+		)
+		return false
+	}
+	c.reader = reader
+	return true
 }
 
 // FlushChain drops the rules of the named chain but keeps the chain itself.
@@ -530,12 +702,28 @@ func (c *PFController) FlushChain(chain string) error {
 }
 
 // DeleteChain forgets the named chain. When it was the last one and no NAT is
-// configured, the anchor is flushed and the pf reference released.
+// configured, the anchor is flushed and the pf reference released. Once no
+// chain is left, no logged line is either, and the pflog reader is closed.
 // Idempotent: deleting a chain that was never ensured returns nil.
 func (c *PFController) DeleteChain(chain string) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	err := c.deleteChain(chain)
+	var reader *pflogReader
+	if err == nil && len(c.chains) == 0 {
+		reader, c.reader = c.reader, nil
+	}
+	c.mu.Unlock()
 
+	// Closing waits for the reader's loop, which notices within a read
+	// timeout, so it runs without c.mu.
+	if reader != nil {
+		reader.close()
+	}
+	return err
+}
+
+// deleteChain is DeleteChain without the reader. The caller holds c.mu.
+func (c *PFController) deleteChain(chain string) error {
 	prev, ok := c.chains[chain]
 	if !ok {
 		c.logger.Debug("pf chain not found, nothing to delete",
