@@ -9,17 +9,17 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// TestNftablesController_RealTraffic runs the traffic checks the macOS and
-// Windows backends run, through a TUN device in a fresh network namespace N.
+// tunUDPLogsEveryPacket tells runTunConnLogChecks that NFLOG reports a UDP
+// flow once: after its first reply, conntrack sees its later datagrams as
+// established, which the log rule's ct state new does not match.
+const tunUDPLogsEveryPacket = false
+
+// newTunTestHarness creates a fresh network namespace N with a TUN device
+// that carries N's address, and an nftables controller whose calls run in N.
 // The device, its address and every rule live in N, never in the host's
 // namespace, which may run a live plexd0.
-func TestNftablesController_RealTraffic(t *testing.T) {
-	if os.Getenv("PLEXD_TEST_REAL_NFTABLES") != "1" {
-		t.Skip("set PLEXD_TEST_REAL_NFTABLES=1 to load real nftables rules in test network namespaces")
-	}
-	if os.Geteuid() != 0 {
-		t.Skip("creating network namespaces and loading nftables rules needs root; run with sudo")
-	}
+func newTunTestHarness(t *testing.T) tunHarness {
+	t.Helper()
 
 	n := newRealNetns(t, "N")
 
@@ -39,11 +39,39 @@ func TestNftablesController_RealTraffic(t *testing.T) {
 
 	// wireguard-go's Linux device writes a virtio header in front of each
 	// packet, so a buffer needs room for it.
-	runTunTrafficChecks(t, tunHarness{
-		ctrl:   NewNftablesController(testLogger()),
+	return tunHarness{
+		ctrl:   NewNftablesController(tunTestLogger(t)),
 		dev:    dev,
 		offset: 16,
 		iface:  "plexdtun0",
 		do:     n.do,
-	})
+	}
+}
+
+// TestNftablesController_RealTraffic runs the traffic checks the macOS and
+// Windows backends run, through a TUN device in a fresh network namespace N.
+func TestNftablesController_RealTraffic(t *testing.T) {
+	if os.Getenv("PLEXD_TEST_REAL_NFTABLES") != "1" {
+		t.Skip("set PLEXD_TEST_REAL_NFTABLES=1 to load real nftables rules in test network namespaces")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("creating network namespaces and loading nftables rules needs root; run with sudo")
+	}
+
+	runTunTrafficChecks(t, newTunTestHarness(t))
+}
+
+// TestNftablesController_RealConnLog runs the connection-log checks the macOS
+// and Windows backends run, through a TUN device in a fresh network namespace
+// N. The controller's NFLOG reader opens in N, where ApplyRules runs, so it
+// reads only what N's log rules send.
+func TestNftablesController_RealConnLog(t *testing.T) {
+	if os.Getenv("PLEXD_TEST_REAL_NFTABLES") != "1" {
+		t.Skip("set PLEXD_TEST_REAL_NFTABLES=1 to load real nftables rules in test network namespaces")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("creating network namespaces and loading nftables rules needs root; run with sudo")
+	}
+
+	runTunConnLogChecks(t, newTunTestHarness(t))
 }
