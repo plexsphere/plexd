@@ -171,7 +171,7 @@ func TestBuildRuleExprsAllow(t *testing.T) {
 		Action:   "allow",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestBuildRuleExprsDeny(t *testing.T) {
 		Action: "deny",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestBuildRuleExprsDeny(t *testing.T) {
 
 func TestBuildRuleExprsInvalidAction(t *testing.T) {
 	rule := FirewallRule{Action: "reject"}
-	_, err := buildRuleExprs(rule)
+	_, err := buildRuleExprs(rule, dirIn)
 	if err == nil {
 		t.Fatal("expected error for invalid action")
 	}
@@ -206,7 +206,7 @@ func TestBuildRuleExprsInvalidAction(t *testing.T) {
 
 func TestBuildRuleExprsInvalidProtocol(t *testing.T) {
 	rule := FirewallRule{Protocol: "sctp", Action: "allow"}
-	_, err := buildRuleExprs(rule)
+	_, err := buildRuleExprs(rule, dirIn)
 	if err == nil {
 		t.Fatal("expected error for unsupported protocol")
 	}
@@ -214,7 +214,7 @@ func TestBuildRuleExprsInvalidProtocol(t *testing.T) {
 
 func TestBuildRuleExprsICMP(t *testing.T) {
 	rule := FirewallRule{DstIP: "10.0.0.1", Protocol: "icmp", Action: "allow"}
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error for icmp: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestBuildRuleExprsPortRange(t *testing.T) {
 		Action:   "allow",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestBuildRuleExprsPortRange(t *testing.T) {
 
 func TestBuildRuleExprsSinglePortUsesEq(t *testing.T) {
 	rule := FirewallRule{DstIP: "10.0.0.1", Port: 443, Protocol: "tcp", Action: "allow"}
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestBuildRuleExprsCIDRSubnet(t *testing.T) {
 		Action: "allow",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestBuildRuleExprsWildcardSkipped(t *testing.T) {
 		Action: "deny",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestBuildRuleExprsUDP(t *testing.T) {
 		Action:   "allow",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestBuildRuleExprsWithInterface(t *testing.T) {
 		Action:    "allow",
 	}
 
-	exprs, err := buildRuleExprs(rule)
+	exprs, err := buildRuleExprs(rule, dirIn)
 	if err != nil {
 		t.Fatalf("buildRuleExprs returned error: %v", err)
 	}
@@ -386,7 +386,7 @@ func TestBuildRuleExprsInvalidIP(t *testing.T) {
 		Action: "allow",
 	}
 
-	_, err := buildRuleExprs(rule)
+	_, err := buildRuleExprs(rule, dirIn)
 	if err == nil {
 		t.Fatal("expected error for invalid IP address")
 	}
@@ -696,7 +696,7 @@ func TestBuildRuleExprsAddressFamilies(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := buildRuleExprs(tt.rule)
+			got, err := buildRuleExprs(tt.rule, dirIn)
 			if err != nil {
 				t.Fatalf("buildRuleExprs returned error: %v", err)
 			}
@@ -730,7 +730,7 @@ func TestBuildRuleExprsRejectsAddresses(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := buildRuleExprs(tt.rule)
+			_, err := buildRuleExprs(tt.rule, dirIn)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("buildRuleExprs error = %v, want one containing %q", err, tt.want)
 			}
@@ -738,10 +738,13 @@ func TestBuildRuleExprsRejectsAddresses(t *testing.T) {
 	}
 }
 
-func TestConnTrackExprs(t *testing.T) {
-	iface := []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("plexd0\x00")},
+// pinnedConnTrackExprs writes out the two connection tracking rules for iface
+// by hand, with key as the interface match: MetaKeyIIFNAME for the input and
+// forward chains, MetaKeyOIFNAME for the output chain.
+func pinnedConnTrackExprs(iface string, key expr.MetaKey) [][]expr.Any {
+	ifaceMatch := []expr.Any{
+		&expr.Meta{Key: key, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
 	}
 	state := func(bit uint32) []expr.Any {
 		return []expr.Any{
@@ -758,7 +761,7 @@ func TestConnTrackExprs(t *testing.T) {
 	}
 
 	var established []expr.Any
-	established = append(established, iface...)
+	established = append(established, ifaceMatch...)
 	established = append(established, state(expr.CtStateBitESTABLISHED)...)
 	established = append(established,
 		&expr.Ct{Register: 1, Key: expr.CtKeyDIRECTION},
@@ -769,27 +772,46 @@ func TestConnTrackExprs(t *testing.T) {
 	)
 
 	var related []expr.Any
-	related = append(related, iface...)
+	related = append(related, ifaceMatch...)
 	related = append(related, state(expr.CtStateBitRELATED)...)
 	related = append(related,
 		&expr.Counter{},
 		&expr.Verdict{Kind: expr.VerdictAccept},
 	)
 
-	got := connTrackExprs("plexd0")
+	return [][]expr.Any{established, related}
+}
+
+func TestConnTrackExprs(t *testing.T) {
+	want := pinnedConnTrackExprs("plexd0", expr.MetaKeyIIFNAME)
+	got := connTrackExprs("plexd0", dirIn)
 	if len(got) != 2 {
 		t.Fatalf("connTrackExprs returned %d rules, want 2", len(got))
 	}
-	assertExprs(t, got[0], established)
-	assertExprs(t, got[1], related)
+	assertExprs(t, got[0], want[0])
+	assertExprs(t, got[1], want[1])
+}
+
+// The output chain opens with the same two rules, matched against the
+// interface a packet leaves through.
+func TestConnTrackExprsOut(t *testing.T) {
+	want := pinnedConnTrackExprs("plexd0", expr.MetaKeyOIFNAME)
+	got := connTrackExprs("plexd0", dirOut)
+	if len(got) != 2 {
+		t.Fatalf("connTrackExprs returned %d rules, want 2", len(got))
+	}
+	assertExprs(t, got[0], want[0])
+	assertExprs(t, got[1], want[1])
 }
 
 // A rule without an interface matches every interface, and so do the
 // connection tracking rules that open its chain.
 func TestConnTrackExprsWithoutInterface(t *testing.T) {
-	for i, rule := range connTrackExprs("") {
-		if ct, ok := rule[0].(*expr.Ct); !ok || ct.Key != expr.CtKeySTATE {
-			t.Errorf("rule %d starts with %s, want the ct state load", i, formatExprs(rule[:1]))
+	for _, dir := range []ifaceDir{dirIn, dirOut} {
+		for i, rule := range connTrackExprs("", dir) {
+			if ct, ok := rule[0].(*expr.Ct); !ok || ct.Key != expr.CtKeySTATE {
+				t.Errorf("direction %d: rule %d starts with %s, want the ct state load", dir, i, formatExprs(rule[:1]))
+			}
 		}
 	}
 }
@@ -801,7 +823,7 @@ func TestChainRuleExprs(t *testing.T) {
 		{Interface: "wg0", Action: "deny"},
 	}
 
-	got, err := chainRuleExprs(rules)
+	got, err := chainRuleExprs(rules, dirIn)
 	if err != nil {
 		t.Fatalf("chainRuleExprs returned error: %v", err)
 	}
@@ -809,10 +831,10 @@ func TestChainRuleExprs(t *testing.T) {
 	// One connection tracking pair per interface, in order of first
 	// appearance, then the rules in the order given.
 	var want [][]expr.Any
-	want = append(want, connTrackExprs("wg0")...)
-	want = append(want, connTrackExprs("wg1")...)
+	want = append(want, connTrackExprs("wg0", dirIn)...)
+	want = append(want, connTrackExprs("wg1", dirIn)...)
 	for _, rule := range rules {
-		exprs, err := buildRuleExprs(rule)
+		exprs, err := buildRuleExprs(rule, dirIn)
 		if err != nil {
 			t.Fatalf("buildRuleExprs returned error: %v", err)
 		}
@@ -827,7 +849,7 @@ func TestChainRuleExprs(t *testing.T) {
 }
 
 func TestChainRuleExprsEmpty(t *testing.T) {
-	got, err := chainRuleExprs(nil)
+	got, err := chainRuleExprs(nil, dirIn)
 	if err != nil {
 		t.Fatalf("chainRuleExprs returned error: %v", err)
 	}
@@ -840,16 +862,207 @@ func TestChainRuleExprsRejectsInvalidRule(t *testing.T) {
 	_, err := chainRuleExprs([]FirewallRule{
 		{Interface: "wg0", Action: "allow"},
 		{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
-	})
+	}, dirIn)
 	want := "policy: nftables: apply rules: policy: firewall rule:"
 	if err == nil || !strings.HasPrefix(err.Error(), want) {
 		t.Fatalf("chainRuleExprs error = %v, want one starting %q", err, want)
 	}
 }
 
+// pinnedForeignSourceExprs is the rule that lets a packet leave iface
+// unfiltered when its source is not an address of iface: oifname "<iface>"
+// fib saddr . oif type != local counter accept. RTN_LOCAL is 2, loaded in
+// host byte order.
+func pinnedForeignSourceExprs(iface string) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+		&expr.Fib{Register: 1, ResultADDRTYPE: true, FlagSADDR: true, FlagOIF: true},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(2)},
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}
+}
+
+func TestForeignSourceExprs(t *testing.T) {
+	assertExprs(t, foreignSourceExprs("plexd0"), pinnedForeignSourceExprs("plexd0"))
+}
+
+func TestChainRuleExprsOut(t *testing.T) {
+	rules := []FirewallRule{
+		{Interface: "wg0", DstIP: "10.0.0.1/32", Protocol: "tcp", Port: 22, Action: "allow"},
+		{Interface: "wg1", DstIP: "fd00::1/128", Action: "allow"},
+		{Interface: "wg0", Action: "deny"},
+	}
+
+	got, err := chainRuleExprs(rules, dirOut)
+	if err != nil {
+		t.Fatalf("chainRuleExprs returned error: %v", err)
+	}
+
+	oifname := func(iface string) []expr.Any {
+		return []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+		}
+	}
+	// The relay probe rule: UDP to port 9 leaving through iface, from and to
+	// any address of either family.
+	probe := func(iface string) []expr.Any {
+		return append(oifname(iface),
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{17}},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x00, 0x09}},
+			&expr.Counter{},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		)
+	}
+
+	// Per interface, in order of first appearance, the connection tracking
+	// pair, the foreign-source rule and the relay probe rule, then the rules
+	// in the order given.
+	var want [][]expr.Any
+	for _, iface := range []string{"wg0", "wg1"} {
+		want = append(want, pinnedConnTrackExprs(iface, expr.MetaKeyOIFNAME)...)
+		want = append(want, pinnedForeignSourceExprs(iface))
+		want = append(want, probe(iface))
+	}
+	for _, rule := range rules {
+		exprs, err := buildRuleExprs(rule, dirOut)
+		if err != nil {
+			t.Fatalf("buildRuleExprs returned error: %v", err)
+		}
+		want = append(want, exprs)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("chainRuleExprs returned %d rules, want %d", len(got), len(want))
+	}
+	for i := range want {
+		assertExprs(t, got[i], want[i])
+	}
+
+	// Every rule of the policy matches the interface it leaves through.
+	for i, rule := range rules {
+		exprs := got[len(got)-len(rules)+i]
+		if len(exprs) < 2 {
+			t.Fatalf("rule %d has %d expressions, want an interface match first", i, len(exprs))
+		}
+		assertExprs(t, exprs[:2], oifname(rule.Interface))
+	}
+}
+
+func TestChainRuleExprsOutEmpty(t *testing.T) {
+	for _, rules := range [][]FirewallRule{nil, {}} {
+		got, err := chainRuleExprs(rules, dirOut)
+		if err != nil {
+			t.Fatalf("chainRuleExprs(%#v, dirOut) returned error: %v", rules, err)
+		}
+		if len(got) != 0 {
+			t.Errorf("chainRuleExprs(%#v, dirOut) returned %d rules, want none", rules, len(got))
+		}
+	}
+}
+
+func TestChainRuleExprsOutRejectsInvalidRule(t *testing.T) {
+	rules := []FirewallRule{
+		{Interface: "wg0", Action: "allow"},
+		{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
+	}
+	_, err := chainRuleExprs(rules, dirOut)
+	want := "policy: nftables: apply rules: policy: firewall rule:"
+	if err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("chainRuleExprs error = %v, want one starting %q", err, want)
+	}
+	if _, errIn := chainRuleExprs(rules, dirIn); errIn == nil || errIn.Error() != err.Error() {
+		t.Errorf("chainRuleExprs errors differ by direction: dirIn %v, dirOut %v", errIn, err)
+	}
+}
+
+// The output chain matches a rule exactly as the input chain does, except
+// that the interface match reads the interface a packet leaves through.
+func TestBuildRuleExprsOutInterface(t *testing.T) {
+	rule := FirewallRule{
+		Interface: "wg0",
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		Port:      443,
+		Protocol:  "tcp",
+		Action:    "allow",
+	}
+
+	in, err := buildRuleExprs(rule, dirIn)
+	if err != nil {
+		t.Fatalf("buildRuleExprs(dirIn) returned error: %v", err)
+	}
+	out, err := buildRuleExprs(rule, dirOut)
+	if err != nil {
+		t.Fatalf("buildRuleExprs(dirOut) returned error: %v", err)
+	}
+	if len(out) < 2 {
+		t.Fatalf("buildRuleExprs(dirOut) returned %d expressions, want an interface match first", len(out))
+	}
+	assertExprs(t, out[:2], []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("wg0\x00")},
+	})
+	assertExprs(t, out[2:], in[2:])
+}
+
+// A rule without an interface gets no interface match in either direction.
+func TestBuildRuleExprsOutWithoutInterface(t *testing.T) {
+	for _, rule := range []FirewallRule{
+		{DstIP: "10.0.0.1/32", Port: 22, Protocol: "tcp", Action: "allow"},
+		{Action: "deny"},
+	} {
+		in, err := buildRuleExprs(rule, dirIn)
+		if err != nil {
+			t.Fatalf("buildRuleExprs(%+v, dirIn) returned error: %v", rule, err)
+		}
+		out, err := buildRuleExprs(rule, dirOut)
+		if err != nil {
+			t.Fatalf("buildRuleExprs(%+v, dirOut) returned error: %v", rule, err)
+		}
+		for _, e := range out {
+			if meta, ok := e.(*expr.Meta); ok && (meta.Key == expr.MetaKeyOIFNAME || meta.Key == expr.MetaKeyIIFNAME) {
+				t.Errorf("buildRuleExprs(%+v, dirOut) = %s, want no interface match", rule, formatExprs(out))
+			}
+		}
+		assertExprs(t, out, in)
+	}
+}
+
+func TestRelayProbeRule(t *testing.T) {
+	got := relayProbeRule("plexd0")
+	want := FirewallRule{Interface: "plexd0", Protocol: "udp", Port: 9, Action: "allow"}
+	if got != want {
+		t.Errorf("relayProbeRule(plexd0) = %+v, want %+v", got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("relayProbeRule(plexd0).Validate() = %v, want nil", err)
+	}
+}
+
+// An ApplyRules batch writes the input list into two chains and the output
+// list into one, and every rule it adds gets the per-rule allowance on top of
+// the base.
+func TestApplyBufferBytes(t *testing.T) {
+	for _, tc := range []struct {
+		in, out, want int
+	}{
+		{0, 0, netlinkBufferBase},
+		{3, 4, netlinkBufferBase + 10*netlinkBufferPerRule},
+		{1003, 1004, netlinkBufferBase + 3010*netlinkBufferPerRule},
+	} {
+		if got := applyBufferBytes(tc.in, tc.out); got != tc.want {
+			t.Errorf("applyBufferBytes(%d, %d) = %d, want %d", tc.in, tc.out, got, tc.want)
+		}
+	}
+}
+
 func TestChainNames(t *testing.T) {
-	input, forward := chainNames("plexd-mesh")
-	if input != "plexd-mesh-input" || forward != "plexd-mesh-forward" {
-		t.Errorf("chainNames(plexd-mesh) = %q, %q, want plexd-mesh-input, plexd-mesh-forward", input, forward)
+	input, forward, output := chainNames("plexd-mesh")
+	if input != "plexd-mesh-input" || forward != "plexd-mesh-forward" || output != "plexd-mesh-output" {
+		t.Errorf("chainNames(plexd-mesh) = %q, %q, %q, want plexd-mesh-input, plexd-mesh-forward, plexd-mesh-output", input, forward, output)
 	}
 }
