@@ -313,23 +313,33 @@ const (
 	ReachabilityNeverReported = "never_reported"
 )
 
-// PolicySnapshot is the single merged policy block. Fingerprint is a 44-char
-// base64 SHA-256 over the server's canonical rule byte stream; plexd treats it
-// as an opaque comparison key and never re-derives it from Rules.
+// PolicySnapshot is the single merged policy block. Every rule is an allow and
+// rule order carries no meaning: traffic no rule allows is dropped. Fingerprint
+// is a 44-char base64 SHA-256 over the server's canonical rule byte stream;
+// plexd treats it as an opaque comparison key and never re-derives it from
+// Rules.
 type PolicySnapshot struct {
 	RevisionID  string       `json:"revision_id"`
 	Fingerprint string       `json:"fingerprint"`
 	Rules       []PolicyRule `json:"rules"`
 }
 
-// PolicyRule is a five-tuple firewall rule. Ports is present iff Protocol is
-// tcp or udp and is absent for icmp/any.
+// PolicyRule allows the traffic from SourceCIDR to DestinationCIDR that its
+// protocol and port range match. Both prefixes are IPv4 or both IPv6. Ports is
+// present iff Protocol is tcp or udp and is absent for icmp/any. Log asks for
+// the rule's traffic to be logged.
 type PolicyRule struct {
-	Action          string     `json:"action"`
 	Protocol        string     `json:"protocol"`
 	SourceCIDR      string     `json:"source_cidr"`
 	DestinationCIDR string     `json:"destination_cidr"`
 	Ports           *PortRange `json:"ports,omitempty"`
+	Log             bool       `json:"log,omitempty"`
+	// LegacyAction is the action key of the format before
+	// plexsphere/plexsphere#1058; nil when the key is absent. The engine reads
+	// a rule carrying "allow" as an allow and rejects any other value, so a
+	// control plane that still sends deny rules cannot have them enforced as
+	// allows.
+	LegacyAction *string `json:"action,omitempty"`
 }
 
 // PortRange is a single inclusive destination port range (from <= to).

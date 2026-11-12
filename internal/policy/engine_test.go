@@ -1,8 +1,10 @@
 package policy
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -12,10 +14,21 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// captureLogger returns a logger whose Info and higher lines land in buf.
+func captureLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, nil))
+}
+
+// legacyAction returns a pointer to action, the shape the action key of the
+// format before plexsphere/plexsphere#1058 decodes into.
+func legacyAction(action string) *string {
+	return &action
+}
+
 func TestBuildFirewallRules_FiveTupleMapping(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	rules := []api.PolicyRule{
-		{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+		{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 	}
 
 	got, err := eng.BuildFirewallRules(rules, "wg0")
@@ -55,7 +68,7 @@ func TestBuildFirewallRules_PortRangeMapping(t *testing.T) {
 
 	t.Run("single-port range collapses to Port with PortTo 0", func(t *testing.T) {
 		got, err := eng.BuildFirewallRules([]api.PolicyRule{
-			{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+			{Protocol: "tcp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 		}, "wg0")
 		if err != nil {
 			t.Fatalf("BuildFirewallRules() error = %v", err)
@@ -67,7 +80,7 @@ func TestBuildFirewallRules_PortRangeMapping(t *testing.T) {
 
 	t.Run("multi-port range keeps PortTo", func(t *testing.T) {
 		got, err := eng.BuildFirewallRules([]api.PolicyRule{
-			{Action: "allow", Protocol: "udp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 1000, To: 2000}},
+			{Protocol: "udp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 1000, To: 2000}},
 		}, "wg0")
 		if err != nil {
 			t.Fatalf("BuildFirewallRules() error = %v", err)
@@ -81,7 +94,7 @@ func TestBuildFirewallRules_PortRangeMapping(t *testing.T) {
 func TestBuildFirewallRules_PortlessRule(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	got, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"},
+		{Protocol: "tcp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"},
 	}, "wg0")
 	if err != nil {
 		t.Fatalf("BuildFirewallRules() error = %v", err)
@@ -94,7 +107,7 @@ func TestBuildFirewallRules_PortlessRule(t *testing.T) {
 func TestBuildFirewallRules_AnyProtocolMapsToEmpty(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	got, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "allow", Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
+		{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
 	}, "wg0")
 	if err != nil {
 		t.Fatalf("BuildFirewallRules() error = %v", err)
@@ -107,7 +120,7 @@ func TestBuildFirewallRules_AnyProtocolMapsToEmpty(t *testing.T) {
 func TestBuildFirewallRules_ICMPPassesThrough(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	got, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
+		{Protocol: "icmp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
 	}, "wg0")
 	if err != nil {
 		t.Fatalf("BuildFirewallRules() error = %v", err)
@@ -120,44 +133,143 @@ func TestBuildFirewallRules_ICMPPassesThrough(t *testing.T) {
 	}
 }
 
-func TestBuildFirewallRules_LogActionSkipped(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
+// A logged rule is enforced like any other. This release logs none of its
+// traffic and says so once per set, not once per rule.
+func TestBuildFirewallRules_LogRuleEnforcedAsAllow(t *testing.T) {
+	const line = `msg="policy rules ask for logging, which this release does not do"`
+
+	var buf bytes.Buffer
+	eng := NewPolicyEngine(captureLogger(&buf))
 	got, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "log", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 80, To: 80}},
+		{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 80, To: 80}, Log: true},
+		{Protocol: "udp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.5/32", Ports: &api.PortRange{From: 53, To: 53}, Log: true},
+		{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32"},
 	}, "wg0")
 	if err != nil {
 		t.Fatalf("BuildFirewallRules() error = %v", err)
 	}
-	// The log rule is observational and non-terminating; only the trailing
-	// default-deny remains.
-	if len(got) != 1 {
-		t.Fatalf("BuildFirewallRules() returned %d rules, want 1 (log rule skipped)", len(got))
+	if len(got) != 4 {
+		t.Fatalf("BuildFirewallRules() returned %d rules, want 4 (three allows and the default deny)", len(got))
 	}
-	if got[0].Action != "deny" {
-		t.Errorf("remaining rule Action = %q, want %q (default-deny)", got[0].Action, "deny")
+	for _, r := range got[:3] {
+		if r.Action != "allow" {
+			t.Errorf("rule %+v Action = %q, want allow", r, r.Action)
+		}
+	}
+	if n := strings.Count(buf.String(), line); n != 1 {
+		t.Fatalf("log has %d logging lines, want 1:\n%s", n, buf.String())
+	}
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(l, line) && !strings.HasSuffix(l, " count=2") {
+			t.Errorf("logging line does not carry count=2: %s", l)
+		}
+	}
+
+	// No logged rule: no line.
+	buf.Reset()
+	if _, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32"},
+	}, "wg0"); err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
+	}
+	if strings.Contains(buf.String(), line) {
+		t.Errorf("logging line written for a set without logged rules:\n%s", buf.String())
+	}
+
+	// A set rejected after a logged rule: no line, since nothing is enforced.
+	buf.Reset()
+	if _, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32", Log: true},
+		{Protocol: "sctp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.6/32"},
+	}, "wg0"); err == nil {
+		t.Fatal("BuildFirewallRules() error = nil, want error for the sctp rule")
+	}
+	if strings.Contains(buf.String(), line) {
+		t.Errorf("logging line written for a rejected set:\n%s", buf.String())
 	}
 }
 
-// An unknown action must abort the whole ruleset: nftables verdicts are terminal
-// and order-sensitive, so silently dropping one rule out of an ordered ACL can
-// flip the verdict for the traffic it covered (a deny carving an exception out
-// of a following broad allow would fail open).
-func TestBuildFirewallRules_UnknownActionErrors(t *testing.T) {
+// The action key of the format before plexsphere/plexsphere#1058 reads as an
+// allow when it says allow, as today's control plane sends it.
+func TestBuildFirewallRules_LegacyActionAllowAccepted(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	_, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "deny", Protocol: "tcp", SourceCIDR: "10.0.0.99/32", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 22, To: 22}},
-		{Action: "reject", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+	got, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
+		{LegacyAction: legacyAction("allow"), Protocol: "udp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.5/32", Ports: &api.PortRange{From: 53, To: 53}},
 	}, "wg0")
-	if err == nil {
-		t.Fatal("BuildFirewallRules() error = nil, want error for unknown action")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
+	}
+	want := []FirewallRule{
+		{Interface: "wg0", SrcIP: "10.0.0.0/24", DstIP: "10.0.0.5/32", Port: 22, Protocol: "tcp", Action: "allow"},
+		{Interface: "wg0", SrcIP: "10.0.0.0/24", DstIP: "10.0.0.5/32", Port: 53, Protocol: "udp", Action: "allow"},
+		{Interface: "wg0", Action: "deny"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("BuildFirewallRules() = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rule %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// Any other action rejects the whole set: a deny from a control plane that
+// predates the allow-only model must not be enforced as an allow.
+func TestBuildFirewallRules_LegacyActionOtherRejected(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	for _, action := range []string{"deny", "log", "", "ALLOW"} {
+		_, err := eng.BuildFirewallRules([]api.PolicyRule{
+			{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
+			{LegacyAction: legacyAction(action), Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+		}, "wg0")
+		want := `policy: rule 1: unsupported action "` + action + `"`
+		if err == nil || err.Error() != want {
+			t.Errorf("BuildFirewallRules(action %q) error = %v, want %q", action, err, want)
+		}
+	}
+}
+
+// An IPv6 rule maps like an IPv4 one.
+func TestBuildFirewallRules_IPv6Rule(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	got, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Protocol: "tcp", SourceCIDR: "fd00:99::/64", DestinationCIDR: "fd00:99::1/128", Ports: &api.PortRange{From: 443, To: 443}},
+	}, "wg0")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
+	}
+	want := FirewallRule{Interface: "wg0", SrcIP: "fd00:99::/64", DstIP: "fd00:99::1/128", Port: 443, Protocol: "tcp", Action: "allow"}
+	if len(got) != 2 || got[0] != want {
+		t.Errorf("BuildFirewallRules() = %+v, want [%+v, default deny]", got, want)
+	}
+}
+
+// Each address the format forbids rejects the set with a text naming why.
+func TestBuildFirewallRules_AddressErrors(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	for _, tt := range []struct {
+		src, dst string
+		want     string
+	}{
+		{src: "fd00::/32", dst: "10.99.0.5/32", want: `policy: rule 0: source_cidr "fd00::/32" and destination_cidr "10.99.0.5/32" differ in address family`},
+		{src: "::ffff:10.0.0.1/128", dst: "::/0", want: `policy: rule 0: source_cidr: policy: firewall rule: IPv4-mapped IPv6 address "::ffff:10.0.0.1/128"`},
+		{src: "", dst: "10.99.0.5/32", want: "policy: rule 0: source_cidr: policy: firewall rule: address is empty"},
+		{src: "10.0.0.1", dst: "10.99.0.5/32", want: `policy: rule 0: source_cidr: policy: firewall rule: invalid address "10.0.0.1"`},
+	} {
+		_, err := eng.BuildFirewallRules([]api.PolicyRule{{Protocol: "any", SourceCIDR: tt.src, DestinationCIDR: tt.dst}}, "wg0")
+		if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+			t.Errorf("BuildFirewallRules(%q -> %q) error = %v, want one starting %q", tt.src, tt.dst, err, tt.want)
+		}
 	}
 }
 
 func TestBuildFirewallRules_UnknownProtocolErrors(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	_, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "deny", Protocol: "sctp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.99.0.5/32"},
-		{Action: "allow", Protocol: "any", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "0.0.0.0/0"},
+		{Protocol: "sctp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.99.0.5/32"},
+		{Protocol: "any", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "0.0.0.0/0"},
 	}, "wg0")
 	if err == nil {
 		t.Fatal("BuildFirewallRules() error = nil, want error for unknown protocol")
@@ -167,7 +279,7 @@ func TestBuildFirewallRules_UnknownProtocolErrors(t *testing.T) {
 func TestBuildFirewallRules_PortsOnICMPErrors(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	_, err := eng.BuildFirewallRules([]api.PolicyRule{
-		{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24", Ports: &api.PortRange{From: 80, To: 80}},
+		{Protocol: "icmp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24", Ports: &api.PortRange{From: 80, To: 80}},
 	}, "wg0")
 	if err == nil {
 		t.Fatal("BuildFirewallRules() error = nil, want error for ports on a portless protocol")
@@ -187,35 +299,35 @@ func TestBuildFirewallRules_PortAndCIDRBounds(t *testing.T) {
 	}{
 		{
 			name: "zero from port",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 0, To: 0}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 0, To: 0}},
 		},
 		{
 			name: "negative from port",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: -1, To: -1}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: -1, To: -1}},
 		},
 		{
 			name: "from port above 65535 truncates through uint16",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 70000, To: 70000}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 70000, To: 70000}},
 		},
 		{
 			name: "to port above 65535",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 65558, To: 65558}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 65558, To: 65558}},
 		},
 		{
 			name: "inverted range collapses to single port",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 1000, To: 80}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 1000, To: 80}},
 		},
 		{
 			name: "empty source cidr matches every address",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "", DestinationCIDR: "10.99.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "", DestinationCIDR: "10.99.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
 		},
 		{
 			name: "empty destination cidr matches every address",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "10.99.0.5/32", DestinationCIDR: "", Ports: &api.PortRange{From: 22, To: 22}},
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "10.99.0.5/32", DestinationCIDR: "", Ports: &api.PortRange{From: 22, To: 22}},
 		},
 		{
-			name: "non-ipv4 source cidr",
-			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "fd00::/32", DestinationCIDR: "10.99.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
+			name: "source and destination of different families",
+			rule: api.PolicyRule{Protocol: "tcp", SourceCIDR: "fd00::/32", DestinationCIDR: "10.99.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
 		},
 	}
 
@@ -234,7 +346,7 @@ func TestBuildFirewallRules_DefaultDenyAlwaysAppended(t *testing.T) {
 	for _, rules := range [][]api.PolicyRule{
 		nil,
 		{},
-		{{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}}},
+		{{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}}},
 	} {
 		got, err := eng.BuildFirewallRules(rules, "wg0")
 		if err != nil {
@@ -243,12 +355,14 @@ func TestBuildFirewallRules_DefaultDenyAlwaysAppended(t *testing.T) {
 		if len(got) == 0 {
 			t.Fatal("BuildFirewallRules() returned no rules, want at least the default-deny")
 		}
-		last := got[len(got)-1]
-		if last.Action != "deny" || last.SrcIP != "0.0.0.0/0" || last.DstIP != "0.0.0.0/0" {
-			t.Errorf("trailing rule = %+v, want default-deny 0.0.0.0/0", last)
+		// No addresses: the default deny covers IPv4 and IPv6 alike.
+		if last := got[len(got)-1]; last != (FirewallRule{Interface: "wg0", Action: "deny"}) {
+			t.Errorf("trailing rule = %+v, want the address-less default deny on wg0", last)
 		}
-		if last.Interface != "wg0" {
-			t.Errorf("trailing rule Interface = %q, want %q", last.Interface, "wg0")
+		if len(rules) == 0 {
+			if len(got) != 1 {
+				t.Errorf("BuildFirewallRules(%v) returned %d rules, want only the default deny", rules, len(got))
+			}
 		}
 	}
 }

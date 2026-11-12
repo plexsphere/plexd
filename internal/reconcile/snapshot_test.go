@@ -20,7 +20,7 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 			RevisionID:  "rev-1",
 			Fingerprint: "fp-1",
 			Rules: []api.PolicyRule{
-				{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+				{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 			},
 		},
 		Bridge: &api.BridgeSnapshot{
@@ -120,7 +120,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	desired.Peers[0].NodeID = "mutated"
 	desired.Peers[0].FallbackEndpoints[0] = "mutated"
 	desired.Peers[0].EndpointCandidates[0] = "mutated"
-	desired.Policy.Rules[0].Action = "deny"
+	desired.Policy.Rules[0].SourceCIDR = "mutated"
 	desired.Policy.Rules[0].Ports.From = 8443
 	desired.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
 	desired.Bridge.SiteToSite.Tunnels[0].LocalSubnets[0] = "mutated"
@@ -138,7 +138,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	if got.Peers[0].EndpointCandidates[0] == "mutated" {
 		t.Error("Peer endpoint candidates were not copied on Update")
 	}
-	if got.Policy.Rules[0].Action == "deny" {
+	if got.Policy.Rules[0].SourceCIDR == "mutated" {
 		t.Error("Policy rules were not copied on Update")
 	}
 	if got.Policy.Rules[0].Ports.From == 8443 {
@@ -168,7 +168,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	got.Peers[0].NodeID = "mutated"
 	got.Peers[0].FallbackEndpoints[0] = "mutated"
 	got.Peers[0].EndpointCandidates[0] = "mutated"
-	got.Policy.Rules[0].Action = "deny"
+	got.Policy.Rules[0].SourceCIDR = "mutated"
 	got.Policy.Rules[0].Ports.To = 8443
 	got.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
 	got.Bridge.SiteToSite.Tunnels[0].RemoteSubnets[0] = "mutated"
@@ -185,7 +185,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	if got2.Peers[0].EndpointCandidates[0] == "mutated" {
 		t.Error("Get did not return a copy of the peer endpoint candidates")
 	}
-	if got2.Policy.Rules[0].Action == "deny" {
+	if got2.Policy.Rules[0].SourceCIDR == "mutated" {
 		t.Error("Get did not return a copy of Policy rules")
 	}
 	if got2.Policy.Rules[0].Ports.To == 8443 {

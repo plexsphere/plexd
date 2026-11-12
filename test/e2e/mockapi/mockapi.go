@@ -361,8 +361,9 @@ func (s *Server) Assertions() AssertionCounters {
 // agent's mesh.
 func newStateFixture() api.NodeStateSnapshot {
 	rules := []api.PolicyRule{
-		{Action: "allow", Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"},
-		{Action: "allow", Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+		{Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"},
+		{Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}, Log: true},
+		{Protocol: "tcp", SourceCIDR: "fd00:99::/64", DestinationCIDR: "fd00:99::/64", Ports: &api.PortRange{From: 443, To: 443}},
 	}
 	block := func() *api.NodeStateBlock {
 		return &api.NodeStateBlock{

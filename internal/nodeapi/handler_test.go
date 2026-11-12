@@ -1692,7 +1692,7 @@ func TestHandler_GetPolicies_MergedBlock(t *testing.T) {
 		RevisionID:  "rev-1",
 		Fingerprint: "fp-1",
 		Rules: []api.PolicyRule{
-			{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+			{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 		},
 	}}
 	srv := newTestHandlerWithPolicy(t, provider)

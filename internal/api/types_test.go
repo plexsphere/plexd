@@ -486,7 +486,7 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			RevisionID:  "rev-1",
 			Fingerprint: "0123456789012345678901234567890123456789012=",
 			Rules: []PolicyRule{
-				{Action: "allow", Protocol: "tcp", SourceCIDR: "10.42.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &PortRange{From: 443, To: 443}},
+				{Protocol: "tcp", SourceCIDR: "10.42.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &PortRange{From: 443, To: 443}},
 			},
 		},
 		Bridge: &BridgeSnapshot{
@@ -1076,7 +1076,7 @@ func TestPeer_EndpointsTag(t *testing.T) {
 
 func TestPolicyRule_PortsOmittedWhenNil(t *testing.T) {
 	// Nil Ports → no "ports" key (icmp carries no ports).
-	orig := PolicyRule{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}
+	orig := PolicyRule{Protocol: "icmp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 	if s := string(data); strings.Contains(s, `"ports"`) {
@@ -1090,6 +1090,57 @@ func TestPolicyRule_PortsOmittedWhenNil(t *testing.T) {
 	requireEqual(t, orig, got2)
 	if s := string(data2); !strings.Contains(s, `"ports":{"from":443,"to":443}`) {
 		t.Errorf(`ports should serialize as {"from":443,"to":443}, got: %s`, s)
+	}
+}
+
+// TestPolicyRule_DecodesAllowOnlyFormat pins how the allow-only rule format
+// reads: log is a plain boolean whose absence means false, and the action key
+// of the format before plexsphere/plexsphere#1058 survives decoding whenever
+// it is present, an empty value included, so the engine can refuse anything
+// but allow.
+func TestPolicyRule_DecodesAllowOnlyFormat(t *testing.T) {
+	var logged PolicyRule
+	if err := json.Unmarshal([]byte(`{"protocol":"tcp","source_cidr":"10.99.0.2/32","destination_cidr":"10.99.0.1/32","ports":{"from":22,"to":22},"log":true}`), &logged); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if !logged.Log || logged.LegacyAction != nil {
+		t.Errorf("Log = %v, LegacyAction = %v; want true, nil", logged.Log, logged.LegacyAction)
+	}
+
+	for _, body := range []string{
+		`{"protocol":"any","source_cidr":"fd00:99::/64","destination_cidr":"fd00:99::1/128"}`,
+		`{"protocol":"any","source_cidr":"fd00:99::/64","destination_cidr":"fd00:99::1/128","log":null}`,
+	} {
+		var r PolicyRule
+		if err := json.Unmarshal([]byte(body), &r); err != nil {
+			t.Fatalf("Unmarshal(%s) error = %v", body, err)
+		}
+		if r.Log {
+			t.Errorf("Unmarshal(%s): Log = true, want false", body)
+		}
+	}
+
+	for _, action := range []string{"deny", ""} {
+		var r PolicyRule
+		body := `{"action":"` + action + `","protocol":"any","source_cidr":"10.0.0.0/8","destination_cidr":"10.0.0.0/8"}`
+		if err := json.Unmarshal([]byte(body), &r); err != nil {
+			t.Fatalf("Unmarshal(%s) error = %v", body, err)
+		}
+		if r.LegacyAction == nil || *r.LegacyAction != action {
+			t.Errorf("Unmarshal(%s): LegacyAction = %v, want %q", body, r.LegacyAction, action)
+		}
+	}
+}
+
+func TestPolicyRule_MarshalOmitsLogAndAction(t *testing.T) {
+	data, err := json.Marshal(PolicyRule{Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	for _, key := range []string{`"log"`, `"action"`} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("Marshal() = %s, want no %s key", data, key)
+		}
 	}
 }
 

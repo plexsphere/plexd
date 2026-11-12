@@ -951,11 +951,36 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 	if state.Policy == nil {
 		t.Fatal("Policy is nil")
 	}
-	if len(state.Policy.Rules) != 2 {
-		t.Fatalf("len(Policy.Rules) = %d, want 2", len(state.Policy.Rules))
+	if len(state.Policy.Rules) != 3 {
+		t.Fatalf("len(Policy.Rules) = %d, want 3", len(state.Policy.Rules))
 	}
 	if want := policyFingerprint(t, state.Policy.Rules); state.Policy.Fingerprint != want {
 		t.Errorf("policy.fingerprint = %q, want %q", state.Policy.Fingerprint, want)
+	}
+	// The allow-only format: no rule carries an action key, one asks for
+	// logging, and one is IPv6.
+	var rawPolicy struct {
+		Rules []map[string]json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(envelope["policy"], &rawPolicy); err != nil {
+		t.Fatalf("unmarshal policy block: %v", err)
+	}
+	for i, r := range rawPolicy.Rules {
+		if _, ok := r["action"]; ok {
+			t.Errorf("policy rule %d carries an action key", i)
+		}
+	}
+	logged, ipv6 := 0, 0
+	for _, r := range state.Policy.Rules {
+		if r.Log {
+			logged++
+		}
+		if strings.Contains(r.SourceCIDR, ":") {
+			ipv6++
+		}
+	}
+	if logged != 1 || ipv6 != 1 {
+		t.Errorf("policy rules with log = %d and IPv6 = %d, want 1 and 1", logged, ipv6)
 	}
 
 	// Verify state_count increments.
@@ -7923,12 +7948,12 @@ func TestSetState_DefaultMatchesOriginal(t *testing.T) {
 		t.Errorf("Peers[1].NodeID = %q", state.Peers[1].NodeID)
 	}
 
-	// Merged policy with two rules.
+	// Merged policy with three rules.
 	if state.Policy == nil {
 		t.Fatal("Policy is nil")
 	}
-	if len(state.Policy.Rules) != 2 {
-		t.Errorf("len(Policy.Rules) = %d, want 2", len(state.Policy.Rules))
+	if len(state.Policy.Rules) != 3 {
+		t.Errorf("len(Policy.Rules) = %d, want 3", len(state.Policy.Rules))
 	}
 
 	// Bridge subtree and its four children populated.

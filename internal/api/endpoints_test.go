@@ -316,6 +316,28 @@ func TestFetchState_MalformedFallbackEndpoints(t *testing.T) {
 	}
 }
 
+// TestFetchState_MistypedPolicyLog proves a rule whose log is not a boolean
+// fails the pull's decode like any mistyped field, so the reconciler keeps the
+// snapshot, and the ruleset, it already has.
+func TestFetchState_MistypedPolicyLog(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"peers":[],"reachability":null,"policy":{"revision_id":"rev-1","fingerprint":"fp-1",` +
+			`"rules":[{"protocol":"any","source_cidr":"10.0.0.0/8","destination_cidr":"10.0.0.0/8","log":"yes"}]},` +
+			`"bridge":null,"state":null,"reports":null,"executions":[]}`))
+	})
+
+	_, err := client.FetchState(context.Background(), "n1")
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("FetchState error = %v, want it to wrap a *json.UnmarshalTypeError", err)
+	}
+	if !strings.HasSuffix(typeErr.Field, "log") {
+		t.Errorf("UnmarshalTypeError.Field = %q, want one ending in log", typeErr.Field)
+	}
+}
+
 func TestRotateKeys_Success(t *testing.T) {
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
