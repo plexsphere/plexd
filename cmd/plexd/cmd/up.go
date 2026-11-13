@@ -1085,8 +1085,13 @@ func runAgent(ctx context.Context) error {
 		logger.Warn("wireguard unavailable, skipping peer reconcile handler, handshake reports, tunnel metrics, endpoint selection and endpoint candidates")
 	}
 
-	// Register policy reconcile handler.
-	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, policyIface))
+	// Register the policy dispatch handler. It runs on every successful pull,
+	// so a block the Enforcer could not apply is applied again on the next
+	// pull instead of being stored as converged, and a failed apply never
+	// holds back the rest of the snapshot. Dispatch handlers run before the
+	// reconcile handlers, so a new ruleset is in place before the WireGuard
+	// handler changes peers in the same cycle.
+	reconciler.RegisterDispatchHandler(policy.DispatchHandler(enforcer, policyIface))
 
 	// Register peer/policy snapshot reconcile handler for node API queries.
 	reconciler.RegisterHandler(func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {

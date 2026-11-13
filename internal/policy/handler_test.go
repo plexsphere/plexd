@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
-	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,41 +34,35 @@ func (m *mockReconcileTrigger) TriggerReconcile() {
 }
 
 // ---------------------------------------------------------------------------
-// ReconcileHandler tests
+// DispatchHandler tests
 // ---------------------------------------------------------------------------
 
-func TestReconcileHandler_PolicyUnchangedSkips(t *testing.T) {
+// pull wraps a policy block in the snapshot a dispatch handler receives.
+func pull(policy *api.PolicySnapshot) *api.NodeStateSnapshot {
+	return &api.NodeStateSnapshot{Policy: policy}
+}
+
+func TestDispatchHandler_SameFingerprintSkips(t *testing.T) {
 	fwCtrl := &mockFirewallController{}
-	enforcer := newEnabledEnforcer(fwCtrl)
-	handler := ReconcileHandler(enforcer, "wg0")
+	handler := DispatchHandler(newEnabledEnforcer(fwCtrl), "wg0")
 
-	desired := &api.NodeStateSnapshot{Policy: policySnapshot("fp")}
-	diff := reconcile.StateDiff{} // PolicyChanged is false.
+	handler(context.Background(), pull(policySnapshot("fp")))
+	handler(context.Background(), pull(policySnapshot("fp")))
 
-	if err := handler(context.Background(), desired, diff); err != nil {
-		t.Fatalf("handler error = %v, want nil", err)
-	}
-	if len(fwCtrl.ensureChainCalls) != 0 || len(fwCtrl.applyRulesCalls) != 0 {
-		t.Errorf("enforcer touched despite PolicyChanged=false: ensure=%d apply=%d",
-			len(fwCtrl.ensureChainCalls), len(fwCtrl.applyRulesCalls))
+	if len(fwCtrl.applyRulesCalls) != 1 {
+		t.Errorf("ApplyRules calls = %d after two pulls of one fingerprint, want 1", len(fwCtrl.applyRulesCalls))
 	}
 }
 
-func TestReconcileHandler_PolicyChangedApplies(t *testing.T) {
+func TestDispatchHandler_NewBlockApplies(t *testing.T) {
 	fwCtrl := &mockFirewallController{}
 	enforcer := newEnabledEnforcer(fwCtrl)
-	handler := ReconcileHandler(enforcer, "wg0")
+	handler := DispatchHandler(enforcer, "wg0")
 
-	desired := &api.NodeStateSnapshot{
-		Policy: policySnapshot("fp",
-			api.PolicyRule{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
-		),
-	}
-	diff := reconcile.StateDiff{PolicyChanged: true}
+	handler(context.Background(), pull(policySnapshot("fp",
+		api.PolicyRule{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+	)))
 
-	if err := handler(context.Background(), desired, diff); err != nil {
-		t.Fatalf("handler error = %v, want nil", err)
-	}
 	if len(fwCtrl.ensureChainCalls) != 1 {
 		t.Errorf("EnsureChain calls = %d, want 1", len(fwCtrl.ensureChainCalls))
 	}
@@ -80,67 +73,77 @@ func TestReconcileHandler_PolicyChangedApplies(t *testing.T) {
 	if got := len(fwCtrl.applyRulesCalls[0].Rules); got != 2 {
 		t.Errorf("applied rules = %d, want 2", got)
 	}
+	if st := enforcer.Status(); !st.HasApplied || st.Applied == nil || st.Applied.Fingerprint != "fp" {
+		t.Errorf("Status() = %+v, want the block applied", st)
+	}
 }
 
-func TestReconcileHandler_NilPolicyAppliesDefaultDeny(t *testing.T) {
+// A pull with policy: null after a pull with a block takes the block away,
+// which leaves the default deny alone.
+func TestDispatchHandler_NullPolicyAfterABlockAppliesDefaultDeny(t *testing.T) {
 	fwCtrl := &mockFirewallController{}
 	enforcer := newEnabledEnforcer(fwCtrl)
-	handler := ReconcileHandler(enforcer, "wg0")
+	handler := DispatchHandler(enforcer, "wg0")
 
-	// Policy transitioned populated→nil: PolicyChanged is true, desired.Policy nil.
-	desired := &api.NodeStateSnapshot{Policy: nil}
-	diff := reconcile.StateDiff{PolicyChanged: true}
+	handler(context.Background(), pull(policySnapshot("fp",
+		api.PolicyRule{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
+	)))
+	handler(context.Background(), pull(nil))
 
-	if err := handler(context.Background(), desired, diff); err != nil {
-		t.Fatalf("handler error = %v, want nil", err)
+	if len(fwCtrl.applyRulesCalls) != 2 {
+		t.Fatalf("ApplyRules calls = %d, want 2", len(fwCtrl.applyRulesCalls))
 	}
-	if len(fwCtrl.applyRulesCalls) != 1 {
-		t.Fatalf("ApplyRules calls = %d, want 1", len(fwCtrl.applyRulesCalls))
-	}
-	rules := fwCtrl.applyRulesCalls[0].Rules
+	rules := fwCtrl.applyRulesCalls[1].Rules
 	if len(rules) != 1 || rules[0].Action != "deny" {
-		t.Errorf("nil policy should apply default-deny only, got %+v", rules)
+		t.Errorf("policy: null should apply default-deny only, got %+v", rules)
+	}
+	if st := enforcer.Status(); !st.HasApplied || st.Applied != nil {
+		t.Errorf("Status() = %+v, want the null pull applied (HasApplied, nil Applied)", st)
 	}
 }
 
-func TestReconcileHandler_EnforcerErrorPropagates(t *testing.T) {
+// A backend failure is the Enforcer's to record and retry; a dispatch handler
+// has no error to return, so it can never hold the snapshot back.
+func TestDispatchHandler_BackendErrorIsRecorded(t *testing.T) {
 	fwCtrl := &mockFirewallController{ensureChainErr: errors.New("firewall error")}
 	enforcer := newEnabledEnforcer(fwCtrl)
-	handler := ReconcileHandler(enforcer, "wg0")
+	handler := DispatchHandler(enforcer, "wg0")
 
-	desired := &api.NodeStateSnapshot{Policy: policySnapshot("fp")}
-	diff := reconcile.StateDiff{PolicyChanged: true}
+	handler(context.Background(), pull(policySnapshot("fp")))
 
-	if err := handler(context.Background(), desired, diff); err == nil {
-		t.Fatal("handler error = nil, want error (firewall failed)")
+	st := enforcer.Status()
+	if st.Rejected == nil || st.Rejected.Fingerprint != "fp" || !strings.Contains(st.Reason, "firewall error") {
+		t.Errorf("Status() = %+v, want fp rejected with the backend's error", st)
 	}
 }
 
-func TestReconcileHandler_InvalidRulesetDoesNotWedgeSnapshot(t *testing.T) {
+func TestDispatchHandler_InvalidRulesetKeepsPrevious(t *testing.T) {
 	fwCtrl := &mockFirewallController{}
 	enforcer := newEnabledEnforcer(fwCtrl)
-	handler := ReconcileHandler(enforcer, "wg0")
+	handler := DispatchHandler(enforcer, "wg0")
 
-	// One rule the engine cannot translate. Returning the error would hold the
-	// reconciler snapshot back, so the identical revision would be re-diffed and
-	// every handler re-run at the reconcile interval forever.
-	desired := &api.NodeStateSnapshot{
-		Policy: policySnapshot("fp-bad",
-			api.PolicyRule{LegacyAction: legacyAction("quarantine"), Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
-		),
-	}
-	diff := reconcile.StateDiff{PolicyChanged: true}
+	handler(context.Background(), pull(policySnapshot("fp-good",
+		api.PolicyRule{Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
+	)))
+	// One rule the engine cannot translate.
+	handler(context.Background(), pull(policySnapshot("fp-bad",
+		api.PolicyRule{LegacyAction: legacyAction("quarantine"), Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+	)))
 
-	if err := handler(context.Background(), desired, diff); err != nil {
-		t.Fatalf("handler error = %v, want nil (rejected revision must not wedge the snapshot)", err)
-	}
 	// Fail-closed: the previously applied ruleset stays in place.
-	if len(fwCtrl.applyRulesCalls) != 0 {
-		t.Errorf("ApplyRules calls = %d, want 0", len(fwCtrl.applyRulesCalls))
+	if len(fwCtrl.applyRulesCalls) != 1 {
+		t.Errorf("ApplyRules calls = %d, want 1", len(fwCtrl.applyRulesCalls))
+	}
+	st := enforcer.Status()
+	if st.Applied == nil || st.Applied.Fingerprint != "fp-good" {
+		t.Errorf("Applied = %+v, want fp-good kept", st.Applied)
+	}
+	if st.Rejected == nil || st.Rejected.Fingerprint != "fp-bad" {
+		t.Errorf("Rejected = %+v, want fp-bad", st.Rejected)
 	}
 }
 
-func TestReconcileHandler_DisabledEnforcementDoesNotClaimApplied(t *testing.T) {
+func TestDispatchHandler_DisabledEnforcementDoesNotClaimApplied(t *testing.T) {
 	var logs bytes.Buffer
 	enforcer := NewEnforcer(
 		NewPolicyEngine(testLogger()),
@@ -148,17 +151,16 @@ func TestReconcileHandler_DisabledEnforcementDoesNotClaimApplied(t *testing.T) {
 		Config{Enabled: boolPtr(false), ChainName: "TEST"},
 		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	)
-	handler := ReconcileHandler(enforcer, "wg0")
+	handler := DispatchHandler(enforcer, "wg0")
 
-	desired := &api.NodeStateSnapshot{Policy: policySnapshot("fp")}
-	diff := reconcile.StateDiff{PolicyChanged: true}
+	handler(context.Background(), pull(policySnapshot("fp")))
 
-	if err := handler(context.Background(), desired, diff); err != nil {
-		t.Fatalf("handler error = %v, want nil", err)
-	}
 	if strings.Contains(logs.String(), "policy ruleset applied") {
 		t.Errorf("handler logged %q with enforcement disabled; nothing was applied:\n%s",
 			"policy ruleset applied", logs.String())
+	}
+	if st := enforcer.Status(); st.Enforcement != api.PolicyEnforcementDisabled || st.HasApplied {
+		t.Errorf("Status() = %+v, want disabled and nothing applied", st)
 	}
 }
 
