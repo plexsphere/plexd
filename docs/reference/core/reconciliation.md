@@ -8,7 +8,7 @@ feature: PXD-0003
 
 The `internal/reconcile` package implements the core convergence loop that keeps every node aligned with desired state. It periodically fetches the `NodeStateSnapshot` envelope from the control plane, computes a diff against a local snapshot, and invokes pluggable handlers to converge local state toward the envelope.
 
-The pull is one-way: plexd does not report drift corrections back to the control plane. `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility will return as node-authored state reports (issue #23).
+The pull is one-way: plexd does not report drift corrections back to the control plane, except for the policy block, whose outcome (the ruleset plexd applied, the one it rejected and why, and what its default deny dropped) it sends as its [policy status report](../networking/network-policy.md#policy-status-report). `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility for the other blocks will return as node-authored state reports (issue #23).
 
 The envelope carries ten always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, and `signing_key`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
 
@@ -17,6 +17,8 @@ The envelope carries ten always-present blocks — `peers`, `reachability`, `pol
 `signing_key` is consumed by the dispatch stage too, and is not desired state at all: it is the key the node's Domain signs envelopes and session tokens with, and the signing-key dispatch handler installs it on every successful pull. It is neither stored nor diffed. A `null` block means "keep the key you hold", never "drop it".
 
 `secrets` is consumed by the dispatch stage too. It is the node's secret inventory, names and versions only, and the node API's [`SecretIndexDispatchHandler`](nodeapi.md#secretindexdispatchhandler) replaces the secret index from it on every successful pull. It is neither stored nor diffed. A `null` block keeps the index; an empty block empties it.
+
+`policy` is diffed and stored, but applied on the dispatch seam: the differ still reports a fingerprint change as `policy` drift in the cycle log, and no reconcile handler acts on it. The policy dispatch handler hands the block to the Enforcer on every successful pull, so a block the Enforcer could not apply is applied again on the next pull, and a failed apply never holds the snapshot back.
 
 ## Config
 
@@ -76,6 +78,8 @@ The `secrets` block is consumed on this seam too, by the node API's [`SecretInde
 
 The `hooks` block is consumed on this seam as well, by `actions.RolloutInstaller.Handle`, which `cmd/plexd/cmd/up.go` registers after `SecretIndexDispatchHandler` and before the action dispatcher. The handler only copies the block into the installer's pending slot and returns: the installer fetches, verifies and installs on its own goroutine, because a fetch inside the cycle would hold back the `executions` block behind it. A `null` block keeps every rolled-out hook and logs `actions: rollout: pull carried no hooks block; keeping rolled-out hooks` at debug; an empty block removes every one. The block is neither stored nor diffed. See [Rolled-out Hooks](../actions/remote-actions-hooks.md#the-pass).
 
+The `policy` block is consumed on this seam as well, by `policy.DispatchHandler`, which `cmd/plexd/cmd/up.go` registers on every node after every other dispatch handler. It hands the block to `Enforcer.Sync`, which applies it when it is not the installed ruleset and records the outcome for the policy status report and `GET /v1/policies`. It runs here rather than behind the diff so that a block the Enforcer could not apply is applied again on every pull, drift or not, without failing a reconcile handler and holding the snapshot back. Because dispatch handlers run before the reconcile handlers, a new ruleset is installed before the WireGuard handler changes peers in the same cycle. The block is still diffed and stored, so a new fingerprint shows as `policy` drift in the cycle log. See [DispatchHandler](../networking/network-policy.md#dispatchhandler).
+
 The `dns` block is consumed on this seam as well, by `meshdns.Manager.Handle`, which `cmd/plexd/cmd/up.go` registers after the reachability observer and before the edge PSK handler, and only on Linux, macOS and Windows when the mesh resolver listens. Every pull with a block rebuilds the names the resolver answers and the table it forwards with, and compares the registration it wants with the one the system resolver accepted last, systemd-resolved on Linux, configd on macOS and Dnscache on Windows, so a registration that failed is retried on the next pull, drift or not. A `null` block keeps the names, the forwarding and the registration and logs `state pull carries no dns block, keeping the names held` at info, once until a block arrives again. A block without its `forwarding` member keeps the member the manager holds and builds it anew against the block's records. When the manager holds one, it logs `dns block carries no forwarding member, keeping the forwarding held` at info, once until a member arrives again. The block is neither stored nor diffed. See [Mesh DNS](../networking/mesh-dns.md#following-the-state-pull).
 
 ## Reconciler
@@ -114,9 +118,8 @@ r.RegisterHandler(func(ctx context.Context, desired *api.NodeStateSnapshot, diff
     // apply WireGuard peer changes
     return nil
 })
-r.RegisterHandler(func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
-    // apply network policy changes
-    return nil
+r.RegisterDispatchHandler(func(ctx context.Context, desired *api.NodeStateSnapshot) {
+    // apply the network policy block of every successful pull
 })
 
 // Run blocks until context cancelled
@@ -220,7 +223,7 @@ Comparison logic by block:
 | State   | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | Reports | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 
-The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change, so the ruleset rebuild short-circuits. `reachability` is the control plane's verdict about this node, not desired state, so it is never diffed or stored — the reachability observer decodes it on every successful pull and logs the verdict when it changes, and that is the whole of what plexd does with it. `executions` is a delivery queue whose entries are consumed once by the dispatch stage and settled through the execution callback, not converged on, so it too is never diffed or stored — there is no `ExecutionsChanged` flag, and a pull carrying only new executions still reports an empty diff. `signing_key` is not desired state either, so it is never diffed or stored: there is no `SigningKeyChanged` flag, the signing-key dispatch handler installs the key on every successful pull, and a pull whose only change is a new key reports an empty diff. `secrets` is never diffed either, because the node API's secret-index dispatch handler consumes it on every successful pull: there is no `SecretsChanged` flag, and a pull whose only change is the `secrets` block reports an empty diff.
+The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change. The policy dispatch handler does not read the diff: `Enforcer.Sync` compares the fingerprint with the installed ruleset's the same way, so such a pull does not rebuild the ruleset either. `reachability` is the control plane's verdict about this node, not desired state, so it is never diffed or stored — the reachability observer decodes it on every successful pull and logs the verdict when it changes, and that is the whole of what plexd does with it. `executions` is a delivery queue whose entries are consumed once by the dispatch stage and settled through the execution callback, not converged on, so it too is never diffed or stored — there is no `ExecutionsChanged` flag, and a pull carrying only new executions still reports an empty diff. `signing_key` is not desired state either, so it is never diffed or stored: there is no `SigningKeyChanged` flag, the signing-key dispatch handler installs the key on every successful pull, and a pull whose only change is a new key reports an empty diff. `secrets` is never diffed either, because the node API's secret-index dispatch handler consumes it on every successful pull: there is no `SecretsChanged` flag, and a pull whose only change is the `secrets` block reports an empty diff.
 
 ### Summary
 
@@ -282,7 +285,6 @@ The agent registers these handlers (in `cmd/plexd/cmd/up.go`):
 |----------------------------------|----------------------------------------------------------------------|
 | `nodeapi` cache handler          | Feed the local state cache from the snapshot `state` block           |
 | `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block, with each peer's [dial order](../networking/wireguard.md#dial-order) (on-link `endpoint_candidates`, the usable direct `endpoint`, off-link candidates, then the relays from `fallback_endpoints`, or from `fallback_endpoint` on a control plane that predates the set) and the edge PSK held for its current public key (registered only when the WireGuard interface came up) |
-| `policy.ReconcileHandler`        | Rebuild the nftables ruleset from the merged `policy` block on a fingerprint change |
 | bridge sub-handlers              | Reconcile relay, user-access, ingress, and site-to-site subtrees      |
 
 Signing-key rotation is no longer a reconcile handler. Key material comes from registration, from the pull's `signing_key` block through the signing-key dispatch handler below, and from the `signing_key_rotated` SSE event.
@@ -297,5 +299,6 @@ Signing-key rotation is no longer a reconcile handler. Key material comes from r
 | `actions.Dispatcher.Handle`| Turn each entry of the `executions` block into an action execution |
 | `meshdns.Manager.Handle` | Build the names and the records the mesh resolver answers, and the table it forwards with, from the pull's `dns` block and keep the registration with the system resolver, systemd-resolved on Linux, configd on macOS and Dnscache on Windows, in step with them; a `null` block keeps the names, the records, the forwarding and the registration, a block without its `forwarding` member keeps the forwarding, and a registration that failed is retried on the next pull (registered after the reachability observer and before `wireguard.EdgePSKDispatchHandler`, and only on Linux, macOS and Windows when the resolver listens; see [Following the State Pull](../networking/mesh-dns.md#following-the-state-pull)) |
 | `wireguard.EdgePSKDispatchHandler` | Fetch, open and install the edge PSKs the `peers` block makes due (registered only when the WireGuard interface came up, `wireguard.edge_psk` is not `false` and the node secret key decodes) |
+| `policy.DispatchHandler` | Hand the pull's `policy` block to `Enforcer.Sync`, which applies it when it is not the installed ruleset, applies a block it could not apply again on the next pull, and records the outcome for the policy status report and `GET /v1/policies` (registered on every node, after every other dispatch handler; see [DispatchHandler](../networking/network-policy.md#dispatchhandler)) |
 
 See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks) for the dispatcher's decision table.

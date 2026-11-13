@@ -144,6 +144,7 @@ While parked, the loops that call the control plane on every cycle fail locally 
 | `endpoint report failed` | `internal/nat`: the endpoint discoverer |
 | `nat: endpoint candidates: send failed` | `internal/nat`: the endpoint candidate publisher |
 | `relay status: send failed` | `internal/bridge`: the relay status reporter, in bridge mode |
+| `policy status: send failed` | `internal/policy`: the [policy status reporter](../networking/network-policy.md#policy-status-report), which sends again on every tick while its last send failed |
 | `metrics report failed`, `local metrics report failed` | `internal/metrics` |
 | `log report failed`, `local log report failed` | `internal/logfwd` |
 | `audit report failed`, `local audit report failed` | `internal/auditfwd` |

@@ -557,27 +557,70 @@ Deletes a report entry and its persisted file.
 
 ### GET /v1/policies
 
-Returns the active merged policy block — a single
-`{revision_id, fingerprint, rules[]}` object, not an array. Returns an empty
-object `{}` when no policy is active (or no policy provider is wired).
+Returns what plexd did with the policy block of its pulls, as a single
+`PolicyView` object, not an array: the merged policy block plexd applied, what
+it enforces, the block of the latest pull, and whether the two are the same
+block (`in_sync`). It
+reads the [Enforcer's record](../networking/network-policy.md#status-and-changed),
+the same record plexd sends to the control plane as its
+[policy status report](../networking/network-policy.md#policy-status-report).
+Returns an empty object `{}` when no policy provider is wired. `plexd up`
+always wires one, so before its first pull it answers
+`{"enforcement":"","applied":false,"in_sync":false}`.
 
 Every rule is an allow and rule order carries no meaning; see
-`PolicyRule` in [API Types](api-types.md#get-v1-nodes-node-id-state). The block is the one plexd decoded from
-its last pull, so a rule carries `action` only when the control plane sent one,
-and `log` only when it is `true`.
+`PolicyRule` in [API Types](api-types.md#get-v1-nodes-node-id-state). The block is the one plexd applied, as it
+decoded it from its pull, so a rule carries `action` only when the control plane
+sent one, and `log` only when it is `true`.
 
-**Response** `200 OK`:
+**Response** `200 OK`, for a node that applied one revision and could not apply
+the next:
 
 ```json
 {
   "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
-  "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
+  "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM0=",
   "rules": [
     { "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 }, "log": true },
     { "protocol": "tcp", "source_cidr": "fd00:99::/64", "destination_cidr": "fd00:99::/64", "ports": { "from": 443, "to": 443 } }
-  ]
+  ],
+  "revisions": [
+    { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" }
+  ],
+  "enforcement": "enforcing",
+  "applied": true,
+  "in_sync": false,
+  "received": {
+    "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2",
+    "fingerprint": "q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=",
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2" }
+    ]
+  },
+  "rejected": {
+    "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2",
+    "fingerprint": "q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=",
+    "reason": "policy: enforce: policy: invalid ruleset: policy: rule 0: unsupported action \"deny\"",
+    "attempts": 3
+  }
 }
 ```
+
+| Member | Content |
+|--------|---------|
+| `revision_id`, `fingerprint`, `rules`, `revisions` | The block plexd applied last. Absent while no pull's block is applied, and when the applied pull carried `policy: null`. They keep the names of the body earlier releases served, which held the block of the last pull, so a reader of that body still decodes them |
+| `enforcement` | `enforcing`; `disabled` when `policy.enabled` is `false`; or `unavailable` when the platform has no firewall backend. With `disabled` or `unavailable` no ruleset is applied. Empty before the first pull |
+| `applied` | `true` when a pull's block is applied, a pull with `policy: null` included. The default deny plexd installs at startup does not count |
+| `in_sync` | `true` when `applied` is `true` and the applied block is the block of the latest pull: both `null`, or both with the same non-empty fingerprint |
+| `received` | The latest pull's block, as `revision_id`, `fingerprint` and `revisions` (absent when the block names none). Present when that pull carried a block, absent for `policy: null` |
+| `rejected` | The block plexd's latest apply failed on: its `revision_id` and `fingerprint`, `reason`, plexd's error text in at most 1024 bytes without control characters, and `attempts`, the applies of that block that failed in a row with that reason. Absent when the latest apply did not fail, and for a failed block without a fingerprint |
+
+A rejected block is applied again on every state pull, so `attempts` grows by
+one per pull while the reason stays the same, until an apply succeeds or the
+control plane serves another block.
+See [Sync](../networking/network-policy.md#sync) for when plexd applies,
+adopts or rejects a block. [`plexd policies`](cli.md#plexd-policies) prints the
+body.
 
 ### POST /v1/hooks/reload
 

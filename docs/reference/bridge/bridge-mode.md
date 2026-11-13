@@ -259,7 +259,7 @@ The bridge feature sub-handlers plug into `internal/reconcile` alongside the Wir
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
+r.RegisterDispatchHandler(policy.DispatchHandler(enforcer, "plexd0"))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger)) // relay may be nil
 r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))

@@ -31,6 +31,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 19 | `GET` | `/v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}` | ssh session connection (WebSocket upgrade) |
 | 20 | `PUT` | `/v1/nodes/{node_id}/relay-status` | Relay status report (bridges) |
 | 21 | `GET` | `/v1/nodes/{node_id}/hooks/{name}/versions/{version}` | Published hook version fetch (signed envelope and script) |
+| 22 | `PUT` | `/v1/nodes/{node_id}/policy-status` | Policy status report |
 
 ## Registration & Identity
 
@@ -719,6 +720,154 @@ it is false. A `501` with any other code is an ordinary failure and logged at
 Warn. No answer stops the reporter, and none touches the relay. While the
 control plane does not serve the report, plexd sends no `stopped` at shutdown.
 
+## Policy Status
+
+### PUT /v1/nodes/{node_id}/policy-status
+
+Reports what the node did with the policy block of its
+[state pulls](#get-v1-nodes-node-id-state): whether it enforces, which ruleset
+it applied, which ruleset its latest apply failed on and why, and how many
+packets and bytes its default deny dropped. Without the report the control
+plane cannot tell a ruleset the node applied from one it refused, because a
+node that refuses a revision keeps its previous ruleset while the pull goes on
+serving the new one. The control plane keeps the latest report per node and
+derives the node's policy status from it. A report that changes what the node
+applied, rejected or enforces also appends a policy transition to the log of
+the node's Project. See
+[Policy status report](../networking/network-policy.md#policy-status-report)
+for how plexd builds and sends it.
+
+**Request body** (`PolicyStatusRequest`, at most 1 MiB):
+
+```json
+{
+  "enforcement": "enforcing",
+  "applied": {
+    "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM0=",
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" },
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7" }
+    ]
+  },
+  "rejected": {
+    "fingerprint": "q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=",
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2" },
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7" }
+    ],
+    "reason": "policy: enforce: policy: invalid ruleset: policy: rule 0: unsupported action \"deny\""
+  },
+  "drops": { "packets": 5, "bytes": 500 }
+}
+```
+
+A node that applied a pull with `policy: null` sends `applied` without a
+fingerprint, and a node with enforcement off sends `enforcement` alone:
+
+```json
+{ "enforcement": "enforcing", "applied": { "revisions": [] }, "drops": { "packets": 0, "bytes": 0 } }
+```
+
+```json
+{ "enforcement": "disabled" }
+```
+
+- `enforcement`: required, one of `enforcing`, `disabled` and `unavailable`.
+  `enforcing` means plexd programs the rulesets it applies, with its default
+  deny after them; `disabled`, that `policy.enabled` is `false`; and
+  `unavailable`, that enforcement is on but the platform has no firewall
+  backend.
+- `applied`: the ruleset the node applied last, as the `fingerprint` and the
+  `revisions` of the pull's `policy` block, echoed byte for byte. `revisions` is
+  required and holds at most 4096 pairs. `fingerprint` is absent, and
+  `revisions` is `[]`, when the pull the node applied carried `policy: null`.
+  `applied` is absent while the node has applied no pull's block since plexd
+  started; plexd also leaves it out for an applied block without a fingerprint,
+  which it cannot echo.
+- `rejected`: the ruleset the node's latest apply failed on, as its
+  `fingerprint` and `revisions`, and `reason`, all required. `reason` is
+  plexd's error text, 1 to 1024 bytes of UTF-8 without control characters.
+  plexd reports a ruleset its engine cannot translate and a failure of its
+  firewall backend alike. Absent when the latest apply did not fail.
+- `drops`: `packets` and `bytes`, both required integers of at least 0, that
+  the node's default deny dropped since plexd last installed the ruleset. A
+  counter below its previous value tells the control plane that the count
+  restarted. Linux and macOS send it; Windows does not, because WFP keeps no
+  per-filter counters. Absent too while nothing is installed.
+
+Each pair of `revisions` is `{policy_id, revision_id}`, in strictly ascending
+`policy_id`, as the pull lists them. plexd echoes the ids as strings and never
+parses them.
+
+The control plane decodes the body with unknown members refused. A member of
+the wrong JSON type, an unknown member or data after the report answers
+`400 malformed_policy_status`; a missing or `null` required member and a value
+that breaks a rule answer `400 invalid_policy_status`, with a `detail` naming
+the member. `ReportPolicyStatus` sends a nil `revisions` as `[]`, on a copy,
+and validates nothing else, because plexd builds only the shapes the contract
+admits.
+
+**Response** (`200 OK`, `PolicyStatusResponse`):
+
+```json
+{
+  "accepted_at": "2026-11-13T10:15:30.123Z",
+  "status": "rejected"
+}
+```
+
+`accepted_at` is the server receive time the report is stored with. `status`
+is the policy status the report derives against the ruleset the pull serves at
+that moment, by the first matching condition:
+
+| Condition | `status` |
+|---|---|
+| `enforcement` is not `enforcing` | `not_enforced` |
+| `rejected` is present, the pull serves a `policy` block, and the rejected `fingerprint` equals the served one | `rejected` |
+| `applied` is present and its `fingerprint` equals the served one; an `applied` without a fingerprint equals a pull that still carries `policy: null` | `applied` |
+| Otherwise: the node has not yet reported the ruleset the pull serves | `pending` |
+
+plexd logs `status` with each accepted report and acts on none of it.
+
+**Cadence.** plexd reports from a loop of its own, never from inside the
+reconcile cycle, so a slow control plane never delays a pull. It sends a report
+on every change of what the node applied, rejected or enforces. On a tick of
+`heartbeat.interval` (default 30s) it sends only when the drop counters moved
+since the report the control plane accepted last, or when the last send
+failed. A quiet node sends nothing, so the age of its last report is no
+liveness signal. plexd sends one report at a time, nothing before its first
+state pull, and nothing at shutdown: the contract defines no shutdown report,
+and the control plane keeps the last one.
+
+**Fresh state.** Every attempt builds the body from the node's current record
+and counters, so a send after a failure carries the latest state, not the one
+that failed. `ReportPolicyStatus` has no internal retry, and Go's HTTP
+transport does not replay a `PUT`.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Report stored; body is a `PolicyStatusResponse` | Logged as `policy status: reported` at Info when what the node applied, rejected or enforces changed, at Debug when only the counters did; once at Info after a not-provisioned phase, that the control plane accepts reports |
+| `400 Bad Request` | `malformed_policy_status` | The body is empty, is not one JSON object, carries a member of the wrong JSON type (a `policy_id` or `revision_id` that is not a UUID string, or a drop counter above the int64 range, included), an unknown member, or data after the report | Logged at Warn as `send failed`; the next tick sends again |
+| `400 Bad Request` | `invalid_policy_status` | A required member is missing or `null`; `enforcement` is outside the three values; a `fingerprint` is not standard base64 of 32 bytes; a drop counter is negative; a `policy_id` or `revision_id` is zero; `revisions` are not strictly ascending by `policy_id` or hold more than 4096 pairs; or `reason` is empty, longer than 1024 bytes, not valid UTF-8, or carries a control character. The `detail` names the member | Logged at Warn as `send failed`; the next tick sends again |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends again. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends again |
+| `404 Not Found` | `policy_status_node_gone` | The node was removed while the report was in flight | Logged at Warn as `rejected, this node was removed` on every send; the next tick sends again |
+| `404 Not Found` | any other, or none | A control plane that predates the report | Logged once at Info as not accepting reports; plexd sends no further report until it restarts, as the contract asks |
+| `413 Payload Too Large` | `policy_status_body_too_large` | Body exceeds 1 MiB | Logged at Warn as `send failed`; the next tick sends again |
+| `500 Internal Server Error` | `internal` | The report could not be recorded | Logged at Warn as `send failed`; the next tick sends again |
+| `501 Not Implemented` | `policy_status_not_provisioned` | The control plane serves the operation, but its recording service is not wired | Logged once at Info as not provisioned; plexd sends again on every tick |
+| `503 Service Unavailable` | `datastore_unavailable` | The control plane could not reach the store that holds the NSK; the answer carries `Retry-After` | Logged at Warn as `send failed`; the next tick sends again |
+
+`api.IsPolicyStatusNotServed` classifies the `404` of a control plane without
+the route: any code but `policy_status_node_gone`. Unlike the not-served
+answers of the relay status report, that answer stops the reporter until plexd
+restarts, as the contract asks.
+`api.IsPolicyStatusNotProvisioned` classifies the `501` carrying
+`policy_status_not_provisioned`, which does not stop it. A `501` with any other
+code is an ordinary failure and logged at Warn.
+
 ## Edge PSK
 
 ### GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk
@@ -852,11 +1001,15 @@ absence.
   },
   "policy": {
     "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
-    "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
+    "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM0=",
     "rules": [
       { "protocol": "any", "source_cidr": "10.99.0.0/24", "destination_cidr": "10.99.0.0/24" },
       { "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 }, "log": true },
       { "protocol": "tcp", "source_cidr": "fd00:99::/64", "destination_cidr": "fd00:99::/64", "ports": { "from": 443, "to": 443 } }
+    ],
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" },
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7" }
     ]
   },
   "bridge": {
@@ -1083,10 +1236,20 @@ plexd ends the ruleset with a default deny for both families, also when the
 block is `null`. A rule
 that still carries the `action` key of the format before
 plexsphere/plexsphere#1058 is read as an allow when the value is `allow`. Any
-other value, or any rule plexd cannot translate, rejects the whole revision,
-and the node keeps the ruleset it enforces. plexd compares `fingerprint` byte
-for byte and never re-derives it from the rules. See
+other value, or any rule plexd cannot translate, rejects the whole revision:
+the node keeps the ruleset it enforces, reports the revision as `rejected` in
+its [policy status report](#policy-status), and applies it again on every pull.
+plexd compares `fingerprint` byte for byte with the installed ruleset's on every
+pull and never re-derives it from the rules: a block with the installed
+fingerprint is not applied again. See
 [Network Policy Enforcement](../networking/network-policy.md#buildfirewallrules).
+
+`revisions` names every compiled row the block merges, one
+`{policy_id, revision_id}` pair per row, in ascending `policy_id`, the order the
+`fingerprint` covers. The first pair's `revision_id` equals the block's
+`revision_id`. A control plane before plexsphere/plexsphere#1059 sends none.
+plexd echoes the pairs of the block it applied or rejected in its
+[policy status report](#policy-status) and never parses the ids.
 
 `executions` is the delivery channel for action dispatches, and the only block
 that is a delivery queue rather than desired state. It is always an array — `[]` when empty, never `null` —

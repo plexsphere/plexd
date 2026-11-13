@@ -146,6 +146,10 @@ names it answers and the table it forwards with from it on every successful
 pull (see `NodeStateDNS` below).
 `peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
+`policy` goes to both as well: the differ reports a new fingerprint as policy
+drift in the cycle log, and the policy dispatch handler applies the block on
+every successful pull (see
+[DispatchHandler](../networking/network-policy.md#dispatchhandler)).
 
 **SnapshotPeer**
 
@@ -209,6 +213,18 @@ The single merged policy block. Every rule is an allow and rule order carries no
 | `RevisionID`  | `string`       | `"revision_id"`   | Policy revision identifier                                      |
 | `Fingerprint` | `string`       | `"fingerprint"`   | 44-char base64 SHA-256 over the server's canonical rule stream; plexd compares it byte-for-byte and never re-derives it |
 | `Rules`       | `[]PolicyRule` | `"rules"`         | Allow rules, in no meaningful order                             |
+| `Revisions`   | `[]PolicyRevisionRef` | `"revisions,omitempty"` | The (Policy, revision) pair of every compiled row the block merges, in ascending `policy_id`, the order `Fingerprint` covers. The first pair's `revision_id` equals `RevisionID`. `nil` when the control plane sends none, as one before plexsphere/plexsphere#1059 does. plexd echoes the pairs in its [policy status report](#policy-status) and never parses them |
+
+`func (p *PolicySnapshot) Clone() *PolicySnapshot` returns a deep copy: its `Rules`, each rule's `Ports` and `LegacyAction`, and its `Revisions` share no memory with `p`. A `nil` receiver yields `nil`. The reconciler's stored snapshot copies the block through it, and so does the Enforcer's record of the applied, the received and the rejected block.
+
+**PolicyRevisionRef**
+
+Names one revision of one Policy. Both ids are UUIDs that plexd passes through as strings.
+
+| Field        | Type     | JSON Tag        | Description                    |
+|--------------|----------|-----------------|--------------------------------|
+| `PolicyID`   | `string` | `"policy_id"`   | The Policy's id                |
+| `RevisionID` | `string` | `"revision_id"` | The id of the Policy's revision the block compiled |
 
 **PolicyRule**
 
@@ -223,7 +239,7 @@ Allows the traffic from `SourceCIDR` to `DestinationCIDR` that its protocol and 
 | `Log`             | `bool`       | `"log,omitempty"`    | Asks for the rule's traffic to be logged; absent, `null` and `false` mean the same. plexd logs `policy rule allowed connection` for each connection the rule allows; see [Connection logging](../networking/network-policy.md#connection-logging) |
 | `LegacyAction`    | `*string`    | `"action,omitempty"` | The `action` key of the format before plexsphere/plexsphere#1058; `nil` when the key is absent. `allow` reads as an allow, and any other value, `""` included, rejects the revision |
 
-A `log` that is not a boolean, such as `"yes"`, fails the decode of the whole state pull with a `*json.UnmarshalTypeError`, as any mistyped field of the snapshot does, so the pull fails and the previous ruleset stays. The node API's [`GET /v1/policies`](nodeapi.md#get-v1-policies) serves the block plexd decoded, so a rule carries `action` there only when the control plane sent one, and `log` only when it is `true`. See [BuildFirewallRules](../networking/network-policy.md#buildfirewallrules) for how plexd translates the rules.
+A `log` that is not a boolean, such as `"yes"`, fails the decode of the whole state pull with a `*json.UnmarshalTypeError`, as any mistyped field of the snapshot does, so the pull fails and the previous ruleset stays. The node API's [`GET /v1/policies`](nodeapi.md#get-v1-policies) serves the block plexd applied, as it decoded it, so a rule carries `action` there only when the control plane sent one, and `log` only when it is `true`. See [BuildFirewallRules](../networking/network-policy.md#buildfirewallrules) for how plexd translates the rules.
 
 **PortRange**
 
@@ -1113,6 +1129,73 @@ receive time, so plexd builds a fresh request for every attempt.
 | `RelayStateBindFailed`       | `"bind_failed"`   | The relay socket could not be bound on `ListenPort`  |
 | `RelayStateNotConsented`     | `"not_consented"` | The pull enables a relay that `bridge.relay_enabled` does not consent to |
 | `MaxRelayStatusBoundSeconds` | `315360000`       | The contract's ceiling on `bound_seconds`, 3650 days |
+
+## Policy Status
+
+### `PUT /v1/nodes/{node_id}/policy-status`
+
+What the node did with the policy block of its pulls: what it enforces, the
+ruleset it applied, the ruleset its latest apply failed on and why, and what its
+default deny dropped. The handler decodes with unknown members refused. See
+[Control Plane API Endpoints](api-endpoints.md#policy-status) for the wire
+examples and error taxonomy, and
+[Policy status report](../networking/network-policy.md#policy-status-report)
+for how plexd builds the report.
+
+**PolicyStatusRequest**
+
+| Field         | Type                    | JSON Tag                 | Description                                    |
+|---------------|-------------------------|--------------------------|------------------------------------------------|
+| `Enforcement` | `string`                | `"enforcement"`          | One of the `PolicyEnforcement*` constants      |
+| `Applied`     | `*PolicyStatusApplied`  | `"applied,omitempty"`    | The ruleset the node applied last; nil while it applied none since plexd started |
+| `Rejected`    | `*PolicyStatusRejected` | `"rejected,omitempty"`   | The ruleset the node's latest apply failed on; nil when the latest apply did not fail |
+| `Drops`       | `*PolicyStatusDrops`    | `"drops,omitempty"`      | The default deny's counters; nil when the firewall backend does not count drops |
+
+**PolicyStatusApplied**
+
+| Field         | Type                  | JSON Tag                 | Description                                    |
+|---------------|-----------------------|--------------------------|------------------------------------------------|
+| `Fingerprint` | `string`              | `"fingerprint,omitempty"` | The applied block's fingerprint; empty, and so absent, when the applied pull carried `policy: null` |
+| `Revisions`   | `[]PolicyRevisionRef` | `"revisions"`            | The applied block's revisions, at most 4096; `[]` for a `policy: null` pull, never `null` |
+
+**PolicyStatusRejected**
+
+| Field         | Type                  | JSON Tag          | Description                                    |
+|---------------|-----------------------|-------------------|------------------------------------------------|
+| `Fingerprint` | `string`              | `"fingerprint"`   | The rejected block's fingerprint               |
+| `Revisions`   | `[]PolicyRevisionRef` | `"revisions"`     | The rejected block's revisions, at most 4096; never `null` |
+| `Reason`      | `string`              | `"reason"`        | Why the apply failed: 1 to 1024 bytes of UTF-8 without control characters |
+
+**PolicyStatusDrops**
+
+| Field     | Type    | JSON Tag    | Description                                    |
+|-----------|---------|-------------|------------------------------------------------|
+| `Packets` | `int64` | `"packets"` | Packets the default deny dropped since plexd last installed the ruleset, at least 0 |
+| `Bytes`   | `int64` | `"bytes"`   | Bytes the default deny dropped since then, at least 0 |
+
+Every member of `PolicyStatusApplied`, `PolicyStatusRejected` and
+`PolicyStatusDrops` is required where its block is present, except
+`PolicyStatusApplied.Fingerprint`. The control plane refuses a `null`
+`revisions` with `400 invalid_policy_status`, so `ReportPolicyStatus` replaces a
+nil `Revisions` in `Applied` and in `Rejected` with `[]`, on a copy, and leaves
+the caller's request as passed. It checks nothing else. A counter below its
+previous report tells the control plane that the count restarted. plexd counts
+in `uint64` and caps each counter at `math.MaxInt64` before it sends.
+
+**PolicyStatusResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                                    |
+|--------------|-------------|-----------------|------------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time the report is stored with  |
+| `Status`     | `string`    | `"status"`      | The policy status the report derives against the ruleset the pull serves: `applied`, `pending`, `rejected` or `not_enforced` |
+
+**Constants**
+
+| Constant                       | Value           | Description                                    |
+|--------------------------------|-----------------|------------------------------------------------|
+| `PolicyEnforcementEnforcing`   | `"enforcing"`   | The node programs the rulesets it applies, with its default deny after them |
+| `PolicyEnforcementDisabled`    | `"disabled"`    | The node's local configuration turned enforcement off (`policy.enabled: false`) |
+| `PolicyEnforcementUnavailable` | `"unavailable"` | Enforcement is on, but the node has no firewall backend that can program rules |
 
 ## Key Rotation
 

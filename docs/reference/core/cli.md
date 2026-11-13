@@ -226,7 +226,7 @@ List network policies from the local agent.
 plexd policies
 ```
 
-Reads [`GET /v1/policies`](nodeapi.md#get-v1-policies) and prints one row per rule of the policy block plexd pulled last:
+Reads [`GET /v1/policies`](nodeapi.md#get-v1-policies) and prints one row per rule of the policy block plexd applied:
 
 ```
 REVISION                              SRC           DST           PORT  PROTOCOL  LOG
@@ -235,7 +235,31 @@ REVISION                              SRC           DST           PORT  PROTOCOL
 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1  fd00:99::/64  fd00:99::/64  443   tcp       no
 ```
 
-The format makes every rule an allow, so the table has no action column. The block plexd pulled last can be a revision plexd rejected and does not enforce: it then keeps the ruleset it applied before and logs `policy revision rejected, keeping previous ruleset`. `PORT` is the destination port, a range as `<from>-<to>`, or `*` for none. `LOG` is `yes` for a rule with `log: true`: plexd logs `policy rule allowed connection` for each connection such a rule allows. The rows come in the block's order, so in a line with the block's `revision_id` the `rule` value is the row's position, counted from 0; see [Connection logging](../networking/network-policy.md#connection-logging). The default deny plexd appends is not a rule of the block and is not listed. With no rule to show, the command prints `No policies active.`
+The format makes every rule an allow, so the table has no action column. `PORT` is the destination port, a range as `<from>-<to>`, or `*` for none. `LOG` is `yes` for a rule with `log: true`: plexd logs `policy rule allowed connection` for each connection such a rule allows. The rows come in the block's order, so in a line with the block's `revision_id` the `rule` value is the row's position, counted from 0; see [Connection logging](../networking/network-policy.md#connection-logging). The default deny plexd appends is not a rule of the block and is not listed. With no rule to show, the command prints `No policies active.`
+
+The block plexd applied is not always the block of its last pull. plexd keeps the ruleset it applied before when it cannot apply a revision, and applies no ruleset while enforcement is off. The command says so ahead of the table, from the members of the body, in this order:
+
+| State | Output |
+|---|---|
+| `enforcement` is `disabled` | `Policy enforcement is disabled (policy.enabled: false). No ruleset is applied.` |
+| `enforcement` is `unavailable` | `Policy enforcement is unavailable: this platform has no firewall backend. No ruleset is applied.` |
+| Either of the two, with `received` | Also `Received revision <revision_id> (fingerprint <fingerprint>) is not enforced.`, from `received`. No table follows |
+| `enforcing`, `applied` false | `No ruleset from the control plane is applied yet.`, then the rejection line of the next row when `rejected` is present. No table follows |
+| `enforcing`, `applied`, not `in_sync`, `rejected` present | `Received revision <revision_id> (fingerprint <fingerprint>) is not applied: <reason> (tried <attempts> times).`, from `rejected`, then `Showing the ruleset applied before it.`, an empty line, and the table or `No policies active.` |
+| `enforcing`, `applied`, not `in_sync`, no `rejected` | `The ruleset below is not the one the node received last.`, an empty line, and the table or `No policies active.` |
+| `enforcing`, `applied`, `in_sync`, or a body without `enforcement` | The table or `No policies active.` alone |
+
+A body without `enforcement` is the one an agent of an earlier release serves, which held the block of its last pull; the command prints its table as before. For a node that could not apply its latest revision:
+
+```
+Received revision 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2 (fingerprint q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=) is not applied: policy: enforce: policy: invalid ruleset: policy: rule 0: unsupported action "deny" (tried 3 times).
+Showing the ruleset applied before it.
+
+REVISION                              SRC           DST           PORT  PROTOCOL  LOG
+0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1  10.99.0.0/24  10.99.0.0/24  *     any       no
+```
+
+plexd applies a rejected revision again on every state pull, so `tried` counts up while the reason stays the same; see [Error Handling](../networking/network-policy.md#error-handling). The command exits `0` in every one of these states. Without a running agent it fails with the socket error.
 
 ### `plexd state`
 

@@ -165,15 +165,14 @@ The reconciliation loop (`reconcile.interval`, default 60s) ensures that the loc
 Each reconciliation cycle:
 
 1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`). A `null` block means "not populated".
-2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted.
+2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted. The merged `policy` block is applied on this step too, by the [policy dispatch handler](/reference/networking/network-policy#dispatchhandler): plexd rebuilds the firewall rules when the block is not the ruleset it installed, so a block it could not apply is applied again on every pull.
 3. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, and per-block change flags for policy, bridge, and the state/reports buckets. `executions` is a queue rather than desired state, so it is neither stored nor diffed.
 4. **Apply corrections** for any detected drift:
    - Add, update or remove WireGuard peers. Membership comes from the `peers` block, AllowedIPs are derived as `mesh_ip/32`, and the endpoint is the first entry of the peer's dial order (its `endpoint_candidates` on a shared subnet, its usable direct `endpoint`, its other candidates, then its relays from `fallback_endpoints`, or from `fallback_endpoint` on a control plane that predates the set), which endpoint selection moves along until a handshake completes. The PSK is the edge PSK plexd fetched for the peer's current public key; a peer gets none while plexd holds no PSK for it, for example with `wireguard.edge_psk: false`. plexd syncs the edge PSKs on every successful pull before the diff, so a new peer can get its PSK in the same cycle that adds it (see [Pre-Shared Keys](/guide/security#pre-shared-keys-psk))
-   - Rebuild nftables rules from the merged `policy` block, but only when its fingerprint changed
    - Reconcile the bridge subtrees (relay, user access, ingress, site-to-site)
    - Feed the node state cache from the `state` block
 
-The pull is one-way — plexd does not report drift back to the control plane. Applied-correction visibility will return as node-authored state reports (issue #23). Reconciliation is also triggered immediately after SSE reconnection (see [SSE Reconnection](#sse-reconnection)).
+The pull is one-way — plexd does not report drift back to the control plane, except for the policy block: plexd reports which ruleset it applied, which it rejected and why, and what its default deny dropped, as its [policy status report](/reference/networking/network-policy#policy-status-report). Applied-correction visibility for the other blocks will return as node-authored state reports (issue #23). Reconciliation is also triggered immediately after SSE reconnection (see [SSE Reconnection](#sse-reconnection)).
 
 ## See Also
 

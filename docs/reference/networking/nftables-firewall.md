@@ -43,7 +43,7 @@ Logger entries use `component=policy`.
 
 ## Interface Implementation
 
-`NftablesController` implements `FirewallController`, and `ConnReporter` through `SetConnSink`, which stores the sink its [NFLOG reader](#connection-logging) hands events to. `chainNames(chain)` derives the three chain names from the configured one, and every method acts on all three.
+`NftablesController` implements `FirewallController`, `ConnReporter` through `SetConnSink`, which stores the sink its [NFLOG reader](#connection-logging) hands events to, and `DropCounter` through [`DropCounts`](#dropcounts). `chainNames(chain)` derives the three chain names from the configured one, and every method acts on all three.
 
 | Method        | nftables Operation                                                    |
 |---------------|-----------------------------------------------------------------------|
@@ -52,6 +52,7 @@ Logger entries use `component=policy`.
 | `ApplyRules`  | `chainRuleExprs` for both lists, then on a socket sized by `applyBufferBytes`: `AddTable` + `AddChain` and `FlushChain` for all three chains + `AddRule` per rule of the input list into the input and forward chains and of the output list into the output chain + `Flush` |
 | `FlushChain`  | `ListChainsOfTableFamily(INet)` → `FlushChain` for each chain found + `Flush` |
 | `DeleteChain` | `ListChainsOfTableFamily(INet)` → `DelChain` for each chain found + `Flush`; closes the NFLOG reader, also when no chain exists |
+| `DropCounts`  | `GetRules` for each of the three chains, read-only, then `sumDropCounters` over the rules |
 
 ### Probe
 
@@ -87,6 +88,12 @@ The kernel echoes every rule add back on the batch's netlink socket, and the ech
 ### FlushChain and DeleteChain
 
 `FlushChain` lists the chains of the `inet` family and empties those of the three that exist in table `plexd`, skipping the others, and returns `nil` when none exists. So `Enforcer.Teardown` reaches `DeleteChain` also where only some exist, such as the two chains of a plexd before the output chain. `DeleteChain` lists the chains the same way and deletes those of the three that belong to the configured name in table `plexd`. It returns `nil` when none exists, so a second call is a no-op. The empty `inet plexd` table stays.
+
+### DropCounts
+
+`DropCounts(chain)` returns the packets and bytes the default deny dropped, which the Enforcer sends as `drops` in the [policy status report](./network-policy.md#policy-status-report). It opens a netlink connection, calls `GetRules` for `<chain>-input`, `<chain>-forward` and `<chain>-output` in table `inet plexd`, and returns `sumDropCounters` over the rules of all three: the sum of the `expr.Counter` of every rule whose last expression is an `expr.Verdict` of kind `VerdictDrop`. Every rule but a log rule ends in a counter and a verdict, and the default deny is the only rule with a drop verdict, so the sum is what the default deny dropped on the three hooks. Rules that end in accept are not counted. The read changes nothing.
+
+`ApplyRules` flushes the three chains and adds every rule anew, so the counters restart from 0 whenever it replaces the chains. The control plane reads a count below the previous one as such a restart. A failed read returns `policy: nftables: drop counts: <cause>`, and the Enforcer logs it as `policy drop counters unavailable`; see [DropCounts](./network-policy.md#dropcounts).
 
 ## Connection Tracking
 
@@ -218,7 +225,7 @@ Inspect the chains with:
 sudo nft list table inet plexd
 ```
 
-nft prints the rules in its own form, which can leave out a match the next one implies. Every rule but a log rule carries a counter, so the listing shows the packets and bytes each rule matched, and the counter of the final `drop` is what the policy dropped on that hook.
+nft prints the rules in its own form, which can leave out a match the next one implies. Every rule but a log rule carries a counter, so the listing shows the packets and bytes each rule matched, and the counter of the final `drop` is what the policy dropped on that hook. [`DropCounts`](#dropcounts) sums the three final `drop` counters for the policy status report.
 
 ## Connection Logging
 
@@ -265,6 +272,7 @@ The command deletes the whole table, so it also removes the output chain an olde
 | `ApplyRules`  | `policy: nftables: apply rules`                  |
 | `FlushChain`  | `policy: nftables: flush chain`                  |
 | `DeleteChain` | `policy: nftables: delete chain`                 |
+| `DropCounts`  | `policy: nftables: drop counts`                  |
 
 The NFLOG reader's open fails with `policy: nftables: nflog: bind group 28772: <error>`. `ApplyRules` does not return it: it logs it as the `error` of `policy connection logging unavailable, logged rules are enforced without it` and applies the rules.
 
@@ -285,6 +293,8 @@ All methods require `CAP_NET_ADMIN`. When running without privileges, methods re
 
 Every test in `nftables_linux_test.go` that calls the controller runs through `inTestNetns(t, fn)`, which runs `fn` on the test's own goroutine, locked to a thread moved into a fresh network namespace. Run as root, those tests therefore never change the host's tables, and `EnsureChain` never deletes the `ip plexd` table of a live older plexd. A process that may not create a namespace and lacks `CAP_NET_ADMIN` runs `fn` in place, where every nftables call fails with the permission error the unprivileged assertions expect. A process that holds `CAP_NET_ADMIN` but may not create a namespace, such as a container granted `NET_ADMIN` alone, skips the test rather than change its ruleset.
 
+`TestSumDropCounters` needs no privilege either. It checks that `sumDropCounters` sums the counters of the rules that end in a drop verdict, ignores the rules that end in accept, and returns 0 packets and 0 bytes for an empty and for a nil rule list.
+
 The connection logging tests need no privilege. `nftables_linux_test.go` checks that `chainRuleExprs` puts the log rule, ending in the new-state match and the log expression for group 28772 with the tag, directly in front of a tagged rule in both lists, and that an untagged ruleset yields the lists it yielded before. Through the `openLog` seam it checks that a reader that fails to open with `EBUSY`, and a controller without a sink, both make `ApplyRules` write the rules without their log rules, and that only the first logs the Warn line. `nflog_linux_test.go` pins the bytes of the two config messages, the hooks, tags and attributes `parseNflogPacket` accepts and refuses, and the read loop, fed a `receive` that returns `ENOBUFS` and then a packet, or another error.
 
 `TestNftablesController_Real` (`nftables_real_linux_test.go`) drives the real kernel. It runs only with `PLEXD_TEST_REAL_NFTABLES=1` and an effective uid of 0. It builds three network namespaces with `github.com/vishvananda/netlink` and `github.com/vishvananda/netns`: a peer P, joined by a veth pair to the node N's `plexd0` (10.99.0.2/24 and fd00:99::2/64 on P, 10.99.0.1/24 and fd00:99::1/64 on N), and an external host E behind N's `lan0` (192.0.2.1/24 on N, 192.0.2.2/24 on E). N forwards IPv4. Every link is created inside the test's namespaces, never in the host's, which may run a live `plexd0`, and the controller runs on a goroutine locked to N. The rules include `allowOut9001`, N's own copy of a rule from N (10.99.0.1/32) to P (10.99.0.2/32) on TCP 9001, the copy the control plane compiles for the source node. The test shows that:
@@ -304,7 +314,7 @@ The connection logging tests need no privilege. `nftables_linux_test.go` checks 
 - After `DeleteChain`, none of the three chains remains, P connects to 10.99.0.1:7002 again, N connects to P at 9003, and a second `DeleteChain` returns `nil`.
 - With only the input and forward chains in table `inet plexd`, as a plexd before the output chain leaves them, `FlushChain` and `DeleteChain` return `nil` and no chain remains, and `FlushChain` of a chain name that does not exist returns `nil`.
 
-`TestNftablesController_RealTraffic` (`tuntraffic_linux_test.go`) runs the traffic checks the macOS and Windows backends run, described under [Tests](./pf-wfp-firewall.md#tests), through a TUN device. It has the same gate. It creates a fresh network namespace N, creates the TUN device `plexdtun0` there with 10.255.247.1/30, and hands `runTunTrafficChecks` the controller, the device, an offset of 16, which leaves room for the 10-byte virtio header wireguard-go's Linux device writes in front of each packet, and N's `do`, so N's sockets and the controller's calls run inside N. The device, its address and every rule stay in N, never in the host's namespace.
+`TestNftablesController_RealTraffic` (`tuntraffic_linux_test.go`) runs the traffic checks the macOS and Windows backends run, described under [Tests](./pf-wfp-firewall.md#tests), through a TUN device. It has the same gate. It creates a fresh network namespace N, creates the TUN device `plexdtun0` there with 10.255.247.1/30, and hands `runTunTrafficChecks` the controller, the device, an offset of 16, which leaves room for the 10-byte virtio header wireguard-go's Linux device writes in front of each packet, and N's `do`, so N's sockets and the controller's calls run inside N. The device, its address and every rule stay in N, never in the host's namespace. Among the checks is the drop check: `DropCounts` before and after one injected packet that no rule allows must differ by at least 1 packet and at least that packet's length in bytes, which proves on the real kernel that the sum reads the default deny's counters.
 
 `TestNftablesController_RealConnLog` (`tuntraffic_linux_test.go`) has the same gate and builds the same namespace and device through `newTunTestHarness`, which the traffic test calls too. It runs the connection logging checks the macOS test runs too, `runTunConnLogChecks`, described under [Tests](./pf-wfp-firewall.md#tests). The NFLOG reader opens inside N, so it binds group 28772 in N's namespace, not in the host's.
 

@@ -84,11 +84,22 @@ plexd logs | grep mtu # Check the mesh MTU
 
 Network policies may be blocking traffic. Verify that the desired communication is allowed by the policies configured in the control plane.
 
+`plexd policies` lists the ruleset the node applied, which is not always the one the control plane serves. When plexd could not apply the latest revision, the command says so ahead of the table:
+
+```text
+Received revision 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2 (fingerprint q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=) is not applied: policy: enforce: policy: invalid ruleset: policy: rule 0: unsupported action "deny" (tried 3 times).
+Showing the ruleset applied before it.
+```
+
+The node enforces the rows that follow, the ruleset it applied before, and not the received revision. The text after `is not applied:` is plexd's error. One that holds `invalid ruleset`, as above, names a rule plexd cannot translate, and the revision fails the same way until the control plane serves another. Any other text is a failure of the node's firewall backend. plexd applies the revision again on every state pull and counts the attempts in `tried`. It logs the first failure at Error, as `policy revision rejected, keeping previous ruleset` or `reconcile: apply firewall rules failed`, and every repeat at Debug as `policy revision still rejected`. The control plane sees the revision as `rejected` from the node's [policy status report](../reference/networking/network-policy.md#policy-status-report). `Policy enforcement is disabled` or `is unavailable` means the node enforces no ruleset at all. See [`plexd policies`](../reference/core/cli.md#plexd-policies) for every state the command prints.
+
 The policy filters both directions on the mesh interface: what arrives on it and what the node itself sends over it. A connection the node opens to a peer needs a rule from the node's mesh IP to the peer, and the peer's policy has to let it in. A Project's allow-all policy does both. UDP to port 9, plexd's relay liveness probe, passes without a rule. To find a packet the node's own policy drops on its way out:
 
 - On Linux a blocked UDP or ICMP send fails at once with `EPERM`, which a local program reports as `operation not permitted`. A blocked TCP connect times out instead. `sudo nft list chain inet plexd plexd-mesh-output` lists the output chain with a counter on every rule. The counter of its last rule, the default deny, grows with every packet the chain drops.
-- On macOS `sudo pfctl -a com.apple/plexd -vs rules` lists the anchor's rules with their counters. The counters of `block drop out quick on <utun> from (<utun>) to any`, the default deny for what the Mac sends, grow with every packet it drops.
-- On Windows `netsh wfp show filters file=-` lists plexd's outbound filters as `plexd <chain> #<i> outbound`, with ` v6` appended at the IPv6 layer. WFP counts no drops there; reporting them is plexsphere/plexd#177.
+- On macOS `sudo pfctl -a com.apple/plexd -vs rules` lists the anchor's rules with their counters. The counters of `block drop out quick on <utun> from (<utun>) to any label "plexd-default-deny"`, the default deny for what the Mac sends, grow with every packet it drops. `sudo pfctl -a com.apple/plexd -sl` prints the counters of both default deny lines under their label.
+- On Windows `netsh wfp show filters file=-` lists plexd's outbound filters as `plexd <chain> #<i> outbound`, with ` v6` appended at the IPv6 layer. WFP keeps no per-filter counters, so a Windows node reports no drop counters to the control plane.
+
+On Linux and macOS plexd sends the sum of the default deny's counters to the control plane as `drops` in its [policy status report](../reference/networking/network-policy.md#policy-status-report).
 
 If pings and WireGuard handshakes pass but TCP connections over the mesh stall, the uplink may carry less than the mesh MTU plus WireGuard's 80 bytes of encapsulation. Small packets get through and full-size ones are lost without an error, so a connection hangs at its first full-size segment. SSH, for example, hangs in key exchange. A DS-Lite uplink over PPPoE carries 1452-byte packets, which fit a mesh MTU of at most 1372.
 
