@@ -957,6 +957,15 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 	if want := policyFingerprint(t, state.Policy.Rules); state.Policy.Fingerprint != want {
 		t.Errorf("policy.fingerprint = %q, want %q", state.Policy.Fingerprint, want)
 	}
+	// The block merges one compiled row, so revisions names one pair, whose
+	// revision_id is the block's.
+	if state.Policy.RevisionID != testFixtureRevisionID {
+		t.Errorf("policy.revision_id = %q, want %q", state.Policy.RevisionID, testFixtureRevisionID)
+	}
+	wantRevisions := []api.PolicyRevisionRef{{PolicyID: testFixturePolicyID, RevisionID: testFixtureRevisionID}}
+	if !reflect.DeepEqual(state.Policy.Revisions, wantRevisions) {
+		t.Errorf("policy.revisions = %+v, want %+v", state.Policy.Revisions, wantRevisions)
+	}
 	// The allow-only format: no rule carries an action key, one asks for
 	// logging, and one is IPv6.
 	var rawPolicy struct {
@@ -1878,6 +1887,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/handshakes", handshakeBody())
 	resp.Body.Close()
+	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/policy-status", policyStatusBody(t, fixturePolicyReport()))
+	resp.Body.Close()
 	// The hook version fetch serves only a version the hooks block lists.
 	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
 	resp = doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1), "")
@@ -1947,6 +1958,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.HandshakeReportCount != 1 {
 		t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
 	}
+	if a.PolicyStatusCount != 1 {
+		t.Errorf("policy_status_count = %d, want 1", a.PolicyStatusCount)
+	}
 	if a.HookFetchCount != 1 {
 		t.Errorf("hook_fetch_count = %d, want 1", a.HookFetchCount)
 	}
@@ -2000,6 +2014,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_active"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
 		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
+		{http.MethodPut, "/v1/nodes/node-1/policy-status", policyStatusBody(t, fixturePolicyReport())},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/peers/" + testFixturePeerB1 + "/psk", ""},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/hooks/conc-hook/versions/1", ""},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
@@ -5255,6 +5270,497 @@ func TestHandshakes_RequiresBearerEnvelope(t *testing.T) {
 			}
 			if a.HandshakeReportCount != 0 {
 				t.Errorf("handshake_report_count = %d, want 0", a.HandshakeReportCount)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Policy status report endpoint (issue #177)
+// ---------------------------------------------------------------------------
+
+// policyStatusPath is PUT /v1/nodes/{mockNode}/policy-status.
+const policyStatusPath = "/v1/nodes/" + testMockNodeID + "/policy-status"
+
+// The one revision pair of the fixture's policy block: a policy id no other
+// fixture uses and the block's own revision id.
+const (
+	testFixturePolicyID   = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1"
+	testFixtureRevisionID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+)
+
+// staleFingerprint is a well-formed fingerprint the fixture never serves.
+var staleFingerprint = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32))
+
+// fixturePolicyReport returns the report of an enforcing node that applied the
+// policy block a fresh mock serves: it echoes the block's fingerprint and
+// revisions and carries drop counters.
+func fixturePolicyReport() api.PolicyStatusRequest {
+	served := mockapi.New().GetState().Policy
+	return api.PolicyStatusRequest{
+		Enforcement: api.PolicyEnforcementEnforcing,
+		Applied:     &api.PolicyStatusApplied{Fingerprint: served.Fingerprint, Revisions: served.Revisions},
+		Drops:       &api.PolicyStatusDrops{Packets: 5, Bytes: 500},
+	}
+}
+
+// policyStatusBody renders a report in plexd's own wire types, so the tests
+// also prove that the mock accepts what the agent's encoder produces.
+func policyStatusBody(t *testing.T, req api.PolicyStatusRequest) string {
+	t.Helper()
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal policy status report: %v", err)
+	}
+	return string(data)
+}
+
+// revisionPair renders one {policy_id, revision_id} pair.
+func revisionPair(policyID, revisionID string) string {
+	return fmt.Sprintf(`{"policy_id":%q,"revision_id":%q}`, policyID, revisionID)
+}
+
+// ascendingRevisionPairs renders n pairs, strictly ascending by policy_id.
+func ascendingRevisionPairs(n int) string {
+	pairs := make([]string, n)
+	for i := range pairs {
+		pairs[i] = revisionPair(fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", i+1), testFixtureRevisionID)
+	}
+	return "[" + strings.Join(pairs, ",") + "]"
+}
+
+// decodePolicyStatusReceipt strict-decodes a 200 policy status answer.
+func decodePolicyStatusReceipt(t *testing.T, resp *http.Response) api.PolicyStatusResponse {
+	t.Helper()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+	}
+	var receipt api.PolicyStatusResponse
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&receipt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	return receipt
+}
+
+// TestPolicyStatus_DerivesStatus walks the contract's status table, first match
+// wins, against the policy block the fixture serves and against a fixture that
+// serves policy: null. Every report is valid, so each one is answered 200 with
+// the derived status and a fresh accepted_at, and counted.
+func TestPolicyStatus_DerivesStatus(t *testing.T) {
+	fixture := fixturePolicyReport()
+	applied := fixture.Applied
+	staleApplied := &api.PolicyStatusApplied{
+		Fingerprint: staleFingerprint,
+		Revisions:   []api.PolicyRevisionRef{{PolicyID: testFixturePolicyID, RevisionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c0"}},
+	}
+	nullApplied := &api.PolicyStatusApplied{Revisions: []api.PolicyRevisionRef{}}
+	rejectedServed := &api.PolicyStatusRejected{
+		Fingerprint: applied.Fingerprint,
+		Revisions:   applied.Revisions,
+		Reason:      `policy: unsupported action "deny"`,
+	}
+	rejectedStale := &api.PolicyStatusRejected{
+		Fingerprint: staleFingerprint,
+		Revisions:   staleApplied.Revisions,
+		Reason:      "apply failed",
+	}
+	enforcing := api.PolicyEnforcementEnforcing
+
+	tests := []struct {
+		name       string
+		nullPolicy bool // the fixture serves policy: null
+		req        api.PolicyStatusRequest
+		want       string
+	}{
+		{"applied echoes the served block", false, fixture, "applied"},
+		{"enforcement disabled", false, api.PolicyStatusRequest{Enforcement: api.PolicyEnforcementDisabled, Applied: applied}, "not_enforced"},
+		{"enforcement unavailable", false, api.PolicyStatusRequest{Enforcement: api.PolicyEnforcementUnavailable}, "not_enforced"},
+		{"enforcement disabled beats a served rejection", false, api.PolicyStatusRequest{Enforcement: api.PolicyEnforcementDisabled, Rejected: rejectedServed}, "not_enforced"},
+		{"rejected names the served fingerprint", false, api.PolicyStatusRequest{Enforcement: enforcing, Applied: staleApplied, Rejected: rejectedServed}, "rejected"},
+		{"rejected beats applied", false, api.PolicyStatusRequest{Enforcement: enforcing, Applied: applied, Rejected: rejectedServed}, "rejected"},
+		{"rejected names another fingerprint", false, api.PolicyStatusRequest{Enforcement: enforcing, Applied: applied, Rejected: rejectedStale}, "applied"},
+		{"stale applied fingerprint", false, api.PolicyStatusRequest{Enforcement: enforcing, Applied: staleApplied}, "pending"},
+		{"nothing applied yet", false, api.PolicyStatusRequest{Enforcement: enforcing}, "pending"},
+		{"applied without fingerprint while a block is served", false, api.PolicyStatusRequest{Enforcement: enforcing, Applied: nullApplied}, "pending"},
+		{"applied without fingerprint while policy is null", true, api.PolicyStatusRequest{Enforcement: enforcing, Applied: nullApplied}, "applied"},
+		{"applied fingerprint while policy is null", true, api.PolicyStatusRequest{Enforcement: enforcing, Applied: applied}, "pending"},
+		{"rejected while policy is null", true, api.PolicyStatusRequest{Enforcement: enforcing, Rejected: rejectedServed}, "pending"},
+		{"rejected beside the applied null pull", true, api.PolicyStatusRequest{Enforcement: enforcing, Applied: nullApplied, Rejected: rejectedServed}, "applied"},
+		{"enforcement disabled while policy is null", true, api.PolicyStatusRequest{Enforcement: api.PolicyEnforcementDisabled}, "not_enforced"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, ts := newTestServer(t)
+			if tt.nullPolicy {
+				state := srv.GetState()
+				state.Policy = nil
+				srv.SetState(state)
+			}
+
+			before := time.Now().UTC()
+			resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, policyStatusBody(t, tt.req))
+			defer resp.Body.Close()
+			receipt := decodePolicyStatusReceipt(t, resp)
+			after := time.Now().UTC()
+
+			if receipt.Status != tt.want {
+				t.Errorf("status = %q, want %q", receipt.Status, tt.want)
+			}
+			if receipt.AcceptedAt.Before(before) || receipt.AcceptedAt.After(after) {
+				t.Errorf("accepted_at = %v, want between %v and %v", receipt.AcceptedAt, before, after)
+			}
+			if a := getAssertions(t, ts.URL); a.PolicyStatusCount != 1 {
+				t.Errorf("policy_status_count = %d, want 1", a.PolicyStatusCount)
+			}
+		})
+	}
+}
+
+// The status follows the block the fixture serves at the moment of the report:
+// the same report reads applied, then pending once the served block changes.
+func TestPolicyStatus_FollowsTheServedBlock(t *testing.T) {
+	srv, ts := newTestServer(t)
+	body := policyStatusBody(t, fixturePolicyReport())
+
+	resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, body)
+	if got := decodePolicyStatusReceipt(t, resp).Status; got != "applied" {
+		t.Errorf("before the change: status = %q, want %q", got, "applied")
+	}
+	resp.Body.Close()
+
+	state := srv.GetState()
+	state.Policy = &api.PolicySnapshot{
+		RevisionID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2",
+		Fingerprint: staleFingerprint,
+		Rules:       []api.PolicyRule{},
+		Revisions:   []api.PolicyRevisionRef{{PolicyID: testFixturePolicyID, RevisionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2"}},
+	}
+	srv.SetState(state)
+
+	resp = doRequest(t, http.MethodPut, ts.URL+policyStatusPath, body)
+	if got := decodePolicyStatusReceipt(t, resp).Status; got != "pending" {
+		t.Errorf("after the change: status = %q, want %q", got, "pending")
+	}
+	resp.Body.Close()
+
+	if a := getAssertions(t, ts.URL); a.PolicyStatusCount != 2 {
+		t.Errorf("policy_status_count = %d, want 2", a.PolicyStatusCount)
+	}
+}
+
+// Values at the edges of the contract's rules are accepted: two lists of 4096
+// revisions, a reason of 1024 bytes, counters of zero, upper-case UUIDs, and
+// optional members sent as null, which read as absent.
+func TestPolicyStatus_AcceptsTheContractBounds(t *testing.T) {
+	fp := fixturePolicyReport().Applied.Fingerprint
+	fixturePairs := "[" + revisionPair(testFixturePolicyID, testFixtureRevisionID) + "]"
+	rejected := func(reason string) string {
+		return fmt.Sprintf(`{"enforcement":"enforcing","rejected":{"fingerprint":%q,"revisions":%s,"reason":%s}}`, fp, fixturePairs, reason)
+	}
+
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"4096 revisions in each list",
+			fmt.Sprintf(`{"enforcement":"enforcing","applied":{"fingerprint":%q,"revisions":%s},"rejected":{"fingerprint":%q,"revisions":%s,"reason":"apply failed"}}`,
+				staleFingerprint, ascendingRevisionPairs(4096), fp, ascendingRevisionPairs(4096)),
+			"rejected",
+		},
+		{"reason of 1024 ASCII bytes", rejected(`"` + strings.Repeat("a", 1024) + `"`), "rejected"},
+		{"reason of 512 two-byte runes", rejected(`"` + strings.Repeat("ä", 512) + `"`), "rejected"},
+		// encoding/json turns invalid UTF-8 into U+FFFD while it decodes, on the
+		// control plane as here, so such a reason arrives valid.
+		{"reason with an invalid UTF-8 byte", rejected("\"apply \xff failed\""), "rejected"},
+		{"counters of zero", `{"enforcement":"enforcing","drops":{"packets":0,"bytes":0}}`, "pending"},
+		{"counters at the int64 ceiling", `{"enforcement":"enforcing","drops":{"packets":9223372036854775807,"bytes":9223372036854775807}}`, "pending"},
+		{
+			"upper-case UUIDs",
+			fmt.Sprintf(`{"enforcement":"enforcing","applied":{"fingerprint":%q,"revisions":[%s]}}`, fp, revisionPair(strings.ToUpper(testFixturePolicyID), strings.ToUpper(testFixtureRevisionID))),
+			"applied",
+		},
+		{"optional members sent as null", `{"enforcement":"enforcing","applied":null,"rejected":null,"drops":null}`, "pending"},
+		{"applied fingerprint sent as null", `{"enforcement":"enforcing","applied":{"fingerprint":null,"revisions":[]}}`, "pending"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, tt.body)
+			defer resp.Body.Close()
+			if got := decodePolicyStatusReceipt(t, resp).Status; got != tt.want {
+				t.Errorf("status = %q, want %q", got, tt.want)
+			}
+			if a := getAssertions(t, ts.URL); a.PolicyStatusCount != 1 {
+				t.Errorf("policy_status_count = %d, want 1", a.PolicyStatusCount)
+			}
+		})
+	}
+}
+
+// TestPolicyStatus_DenialTaxonomy walks the contract's two 400 codes: what the
+// JSON decoder refuses answers malformed_policy_status, and a decoded value
+// that breaks a rule answers invalid_policy_status with a detail naming the
+// member. A refused report is never counted.
+func TestPolicyStatus_DenialTaxonomy(t *testing.T) {
+	fp := fixturePolicyReport().Applied.Fingerprint
+	fixturePair := revisionPair(testFixturePolicyID, testFixtureRevisionID)
+	applied := func(revisions string) string {
+		return fmt.Sprintf(`{"enforcement":"enforcing","applied":{"fingerprint":%q,"revisions":%s}}`, fp, revisions)
+	}
+	appliedFingerprint := func(fingerprint string) string {
+		return fmt.Sprintf(`{"enforcement":"enforcing","applied":{"fingerprint":%q,"revisions":[%s]}}`, fingerprint, fixturePair)
+	}
+	rejected := func(members ...string) string {
+		return `{"enforcement":"enforcing","rejected":{` + strings.Join(members, ",") + `}}`
+	}
+	rejectedFP := fmt.Sprintf(`"fingerprint":%q`, fp)
+	rejectedRevs := `"revisions":[` + fixturePair + `]`
+	reason := func(r string) string { return `"reason":` + r }
+	drops := func(members string) string {
+		return `{"enforcement":"enforcing","drops":{` + members + `}}`
+	}
+	valid := applied("[" + fixturePair + "]")
+	fp31 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 31))
+	const (
+		pidB1 = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+		pidB2 = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+	)
+	const fingerprintDetail = " is not 32 bytes in standard base64 with padding."
+	const orderDetail = " is not above the one before it; revisions must be strictly ascending by policy_id."
+
+	tests := []struct {
+		name       string
+		body       string
+		wantCode   string
+		wantDetail string // checked only when non-empty
+	}{
+		{"empty body", "", "malformed_policy_status", ""},
+		{"not json", "not-json", "malformed_policy_status", ""},
+		{"null body", "null", "malformed_policy_status", ""},
+		{"an array", `[{"enforcement":"enforcing"}]`, "malformed_policy_status", ""},
+		{"a string", `"enforcing"`, "malformed_policy_status", ""},
+		{"unknown member", `{"enforcement":"enforcing","revision_id":"x"}`, "malformed_policy_status", ""},
+		{"unknown member in applied", `{"enforcement":"enforcing","applied":{"revisions":[],"rules":[]}}`, "malformed_policy_status", ""},
+		{"unknown member in a pair", applied(`[{"policy_id":"` + testFixturePolicyID + `","revision_id":"` + testFixtureRevisionID + `","name":"x"}]`), "malformed_policy_status", ""},
+		{"enforcement of the wrong type", `{"enforcement":true}`, "malformed_policy_status", ""},
+		{"revisions of the wrong type", `{"enforcement":"enforcing","applied":{"revisions":{}}}`, "malformed_policy_status", ""},
+		{"policy_id not a UUID", applied("[" + revisionPair("pol-e2e-001", testFixtureRevisionID) + "]"), "malformed_policy_status", ""},
+		{"revision_id a number", applied(`[{"policy_id":"` + testFixturePolicyID + `","revision_id":7}]`), "malformed_policy_status", ""},
+		{"counter above the int64 range", drops(`"packets":9223372036854775808,"bytes":0`), "malformed_policy_status", ""},
+		{"fractional counter", drops(`"packets":1.5,"bytes":0`), "malformed_policy_status", ""},
+		{"trailing data", valid + "x", "malformed_policy_status", ""},
+		{"a second report", valid + valid, "malformed_policy_status", ""},
+
+		{"enforcement missing", `{}`, "invalid_policy_status", "enforcement is required."},
+		{"enforcement null", `{"enforcement":null}`, "invalid_policy_status", "enforcement is required."},
+		{"enforcement outside the enum", `{"enforcement":"enabled"}`, "invalid_policy_status", "enforcement is not one of enforcing, disabled and unavailable."},
+		{"applied.revisions missing", fmt.Sprintf(`{"enforcement":"enforcing","applied":{"fingerprint":%q}}`, fp), "invalid_policy_status", "applied.revisions is required and must be an array, not null."},
+		{"applied.revisions null", applied("null"), "invalid_policy_status", "applied.revisions is required and must be an array, not null."},
+		{"applied fingerprint of 31 bytes", appliedFingerprint(fp31), "invalid_policy_status", "applied.fingerprint" + fingerprintDetail},
+		{"applied fingerprint without padding", appliedFingerprint(strings.TrimRight(fp, "=")), "invalid_policy_status", "applied.fingerprint" + fingerprintDetail},
+		{"applied fingerprint in hex", appliedFingerprint(validHexChecksum), "invalid_policy_status", "applied.fingerprint" + fingerprintDetail},
+		{"rejected.fingerprint missing", rejected(rejectedRevs, reason(`"apply failed"`)), "invalid_policy_status", "rejected.fingerprint is required."},
+		{"rejected fingerprint of 31 bytes", rejected(fmt.Sprintf(`"fingerprint":%q`, fp31), rejectedRevs, reason(`"apply failed"`)), "invalid_policy_status", "rejected.fingerprint" + fingerprintDetail},
+		{"rejected.revisions missing", rejected(rejectedFP, reason(`"apply failed"`)), "invalid_policy_status", "rejected.revisions is required and must be an array, not null."},
+		{"rejected.reason missing", rejected(rejectedFP, rejectedRevs), "invalid_policy_status", "rejected.reason is required."},
+		{"rejected.reason null", rejected(rejectedFP, rejectedRevs, reason("null")), "invalid_policy_status", "rejected.reason is required."},
+		{"empty reason", rejected(rejectedFP, rejectedRevs, reason(`""`)), "invalid_policy_status", "rejected.reason is empty."},
+		{"reason of 1025 bytes", rejected(rejectedFP, rejectedRevs, reason(`"`+strings.Repeat("a", 1025)+`"`)), "invalid_policy_status", "rejected.reason is 1025 bytes, at most 1024 are accepted."},
+		{"reason with a newline", rejected(rejectedFP, rejectedRevs, reason(`"line one\nline two"`)), "invalid_policy_status", "rejected.reason carries the control character U+000A."},
+		{"reason with a NUL", rejected(rejectedFP, rejectedRevs, reason(`"apply\u0000failed"`)), "invalid_policy_status", "rejected.reason carries the control character U+0000."},
+		{"reason with U+007F", rejected(rejectedFP, rejectedRevs, reason(`"apply\u007ffailed"`)), "invalid_policy_status", "rejected.reason carries the control character U+007F."},
+		{"drops.packets missing", drops(`"bytes":0`), "invalid_policy_status", "drops.packets is required."},
+		{"drops.bytes null", drops(`"packets":0,"bytes":null`), "invalid_policy_status", "drops.bytes is required."},
+		{"negative packets", drops(`"packets":-1,"bytes":0`), "invalid_policy_status", "drops.packets is negative."},
+		{"negative bytes", drops(`"packets":0,"bytes":-40`), "invalid_policy_status", "drops.bytes is negative."},
+		{"policy_id missing", applied(`[{"revision_id":"` + testFixtureRevisionID + `"}]`), "invalid_policy_status", "applied.revisions[0].policy_id is required."},
+		{"revision_id null", applied(`[{"policy_id":"` + testFixturePolicyID + `","revision_id":null}]`), "invalid_policy_status", "applied.revisions[0].revision_id is required."},
+		{"zero policy_id", applied("[" + revisionPair("00000000-0000-0000-0000-000000000000", testFixtureRevisionID) + "]"), "invalid_policy_status", "applied.revisions[0].policy_id is the zero UUID."},
+		{"zero revision_id", rejected(rejectedFP, `"revisions":[`+revisionPair(testFixturePolicyID, "00000000-0000-0000-0000-000000000000")+`]`, reason(`"apply failed"`)), "invalid_policy_status", "rejected.revisions[0].revision_id is the zero UUID."},
+		{"revisions out of order", applied("[" + revisionPair(pidB2, testFixtureRevisionID) + "," + revisionPair(pidB1, testFixtureRevisionID) + "]"), "invalid_policy_status", "applied.revisions[1].policy_id" + orderDetail},
+		{"policy_id repeats", applied("[" + revisionPair(pidB1, testFixtureRevisionID) + "," + revisionPair(pidB1, "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2") + "]"), "invalid_policy_status", "applied.revisions[1].policy_id" + orderDetail},
+		// UUIDs compare by value, as the control plane's decoded ones do, so
+		// the same id in another case repeats it.
+		{"policy_id repeats in another case", applied("[" + revisionPair(strings.ToUpper(pidB1), testFixtureRevisionID) + "," + revisionPair(pidB1, testFixtureRevisionID) + "]"), "invalid_policy_status", "applied.revisions[1].policy_id" + orderDetail},
+		{"rejected revisions out of order", rejected(rejectedFP, `"revisions":[`+revisionPair(pidB2, testFixtureRevisionID)+","+revisionPair(pidB1, testFixtureRevisionID)+`]`, reason(`"apply failed"`)), "invalid_policy_status", "rejected.revisions[1].policy_id" + orderDetail},
+		{"4097 revisions", applied(ascendingRevisionPairs(4097)), "invalid_policy_status", "applied.revisions carries 4097 revisions, at most 4096 are accepted."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, body)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+			if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+			}
+
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			for _, member := range []string{"type", "title", "status", "detail", "instance"} {
+				if _, ok := problem[member]; !ok {
+					t.Errorf("problem missing required member %q", member)
+				}
+			}
+			if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q (detail: %v)", problem["code"], tt.wantCode, problem["detail"])
+			}
+			if tt.wantDetail != "" && problem["detail"] != tt.wantDetail {
+				t.Errorf("detail = %v, want %q", problem["detail"], tt.wantDetail)
+			}
+			if problem["instance"] != policyStatusPath {
+				t.Errorf("instance = %v, want %q", problem["instance"], policyStatusPath)
+			}
+
+			// A refused report must not be counted as accepted.
+			if a := getAssertions(t, ts.URL); a.PolicyStatusCount != 0 {
+				t.Errorf("policy_status_count = %d, want 0", a.PolicyStatusCount)
+			}
+		})
+	}
+}
+
+// The 1 MiB cap is inclusive and exact. captureBody keeps exactly 1 MiB too, so
+// without the handler's drain a longer body would arrive truncated and draw a
+// 400 instead of the contract's 413. The cap is judged before the decode.
+func TestPolicyStatus_BodyCap(t *testing.T) {
+	const capBytes = 1 << 20
+	padded := func(n int) string {
+		body := policyStatusBody(t, fixturePolicyReport())
+		return body + strings.Repeat(" ", n-len(body))
+	}
+
+	t.Run("exactly 1 MiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, padded(capBytes))
+		defer resp.Body.Close()
+		if got := decodePolicyStatusReceipt(t, resp).Status; got != "applied" {
+			t.Errorf("status = %q, want %q", got, "applied")
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{"one byte more is refused", padded(capBytes + 1)},
+		{"the cap is judged before the decode", strings.Repeat("x", capBytes+1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, tt.body)
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusRequestEntityTooLarge, "policy_status_body_too_large")
+			if a := getAssertions(t, ts.URL); a.PolicyStatusCount != 0 {
+				t.Errorf("policy_status_count = %d, want 0", a.PolicyStatusCount)
+			}
+		})
+	}
+}
+
+// The body is captured under policy-status, which is what the Docker e2e run
+// reads back to check the agent's report. Before any report there is nothing
+// to read.
+func TestPolicyStatus_CapturesRequestBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	none, err := http.Get(ts.URL + "/test/last-request/policy-status")
+	if err != nil {
+		t.Fatalf("GET last-request/policy-status: %v", err)
+	}
+	none.Body.Close()
+	if none.StatusCode != http.StatusNotFound {
+		t.Errorf("before any report: status = %d, want %d", none.StatusCode, http.StatusNotFound)
+	}
+
+	body := policyStatusBody(t, fixturePolicyReport())
+	resp := doRequest(t, http.MethodPut, ts.URL+policyStatusPath, body)
+	decodePolicyStatusReceipt(t, resp)
+	resp.Body.Close()
+
+	if got := string(getCapturedBody(t, ts.URL, "policy-status")); got != body {
+		t.Errorf("captured body = %s, want %s", got, body)
+	}
+}
+
+func TestPolicyStatus_WrongMethod_Returns405(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, method, ts.URL+policyStatusPath, "")
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+			}
+		})
+	}
+}
+
+// The route sits behind the bearer-envelope gate like every node route: a
+// report without the envelope, or with any other credential, is a 401 that
+// reaches neither the handler nor its counter.
+func TestPolicyStatus_RequiresBearerEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"no header", ""},
+		{"wrong credential", "Bearer wrong-token-value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockapi.New()
+			ts := httptest.NewServer(srv.Handler())
+			t.Cleanup(ts.Close)
+
+			req, err := http.NewRequest(http.MethodPut, ts.URL+policyStatusPath, strings.NewReader(policyStatusBody(t, fixturePolicyReport())))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("PUT policy-status: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+			}
+
+			a := srv.Assertions()
+			if a.UnauthorizedCount != 1 {
+				t.Errorf("unauthorized_count = %d, want 1", a.UnauthorizedCount)
+			}
+			if a.PolicyStatusCount != 0 {
+				t.Errorf("policy_status_count = %d, want 0", a.PolicyStatusCount)
 			}
 		})
 	}
