@@ -5229,6 +5229,17 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # logging unavailable", the Warn line of a backend that enforces logged rules
 # without logging their connections.
 #
+# Every served block names its one revision in revisions, and plexd reports
+# what it did with it to PUT /v1/nodes/{id}/policy-status, which the phase
+# reads back through GET /test/last-request/policy-status. After A the report
+# echoes A's fingerprint and revisions as applied, and within 45 s of the
+# dropped 7002 probe a report carries drop counters above those plexd reported
+# before it: the reporter sends on a tick once they move. After C it names C
+# as rejected for its unsupported action over B, plexd policies in the
+# container says that C is not applied and lists B's rules, and the node API
+# counts a second attempt once a nudge has pulled C again. After D it reports
+# D as applied and nothing rejected.
+#
 # The phase runs before Phase 13, which replaces the fixture, and ends by
 # serving the saved peers and policy again. Like Phase 12d it needs kernel
 # WireGuard and fails without it.
@@ -5241,12 +5252,22 @@ fi
 MESH_NODE_IP="10.99.0.1"
 MESH_PEER_IP="10.99.0.3"
 FIXTURE_POLICY_REVISION="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+# MESH_POLICY_ID is the policy every block the phase serves names in its
+# revisions.
+MESH_POLICY_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2"
 
 # expect_no_conn_unavailable wants no more "policy connection logging
 # unavailable" lines in the plexd log than it holds now.
 MESH_UNAVAILABLE_MSG='msg="policy connection logging unavailable'
 POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh policy] dc logs plexd failed: ${POLICY_LOG}"
 MESH_UNAVAILABLE_BASE=$(count_log_lines "${POLICY_LOG}" "${MESH_UNAVAILABLE_MSG}")
+
+# The mock captures a policy status report before it checks it, so the reports
+# the phase reads back prove nothing about their acceptance on their own.
+# Every report the mock refuses makes plexd log "policy status: send failed",
+# and the phase ends by wanting no more such lines than it starts with.
+MESH_STATUS_FAILED_MSG='msg="policy status: send failed"'
+MESH_STATUS_FAILED_BASE=$(count_log_lines "${POLICY_LOG}" "${MESH_STATUS_FAILED_MSG}")
 
 # splice_state <tag> <jq-filter> <value-json> applies the filter, which reads
 # the value as $v, to the live snapshot, posts the result back and nudges the
@@ -5288,11 +5309,13 @@ MESHNUDGEEOF
 }
 
 # serve_policy <tag> <revision-id> <rules-json> serves a policy block with that
-# revision and those rules. Its fingerprint is base64 of the SHA-256 of the
-# revision id and the rules, the shape the control plane's has, computed in
-# meshpeer, which has openssl. plexd compares the fingerprint and never derives
-# it, so one that differs from the fingerprint it holds makes it apply the
-# block.
+# revision and those rules, and leaves its fingerprint in SERVED_FP. The
+# fingerprint is base64 of the SHA-256 of the revision id and the rules, the
+# shape the control plane's has, computed in meshpeer, which has openssl. plexd
+# compares the fingerprint and never derives it, so one that differs from the
+# fingerprint it holds makes it apply the block. The block's revisions names
+# MESH_POLICY_ID at that revision, the pair plexd echoes in its policy status
+# report.
 serve_policy() {
     local tag=$1 rev=$2 rules=$3 fp block
     fp=$(dc exec -T meshpeer sh -c 'set -o pipefail; printf "%s" "$1" | openssl dgst -sha256 -binary | base64' sh "${rev}|${rules}" 2>&1) \
@@ -5300,11 +5323,33 @@ serve_policy() {
     if [ "${#fp}" -ne 44 ]; then
         fail "[${tag}] meshpeer computed the fingerprint '${fp}', want 44 characters of base64"
     fi
-    block=$(jq -cn --arg r "${rev}" --arg f "${fp}" --argjson rules "${rules}" \
-        '{revision_id: $r, fingerprint: $f, rules: $rules}') \
+    block=$(jq -cn --arg r "${rev}" --arg f "${fp}" --arg p "${MESH_POLICY_ID}" --argjson rules "${rules}" \
+        '{revision_id: $r, fingerprint: $f, rules: $rules, revisions: [{policy_id: $p, revision_id: $r}]}') \
         || fail "[${tag}] could not build a policy block from the rules ${rules}"
     splice_state "${tag}" '.policy = $v' "${block}"
+    SERVED_FP=${fp}
     echo "  revision ${rev} served with the rules ${rules}"
+}
+
+# wait_policy_report <tag> <timeout-s> <what> <jq-filter> [<jq-option>...]
+# reads the last policy status report the mock captured every 2 s until the
+# filter, run by jq -e with the given options (--arg and --argjson), holds for
+# it, and leaves that report in POLICY_REPORT. It fails after <timeout-s>
+# seconds with the last report it read.
+wait_policy_report() {
+    local tag=$1 timeout=$2 what=$3 filter=$4 start=${SECONDS}
+    shift 4
+    while :; do
+        POLICY_REPORT=$(curl -sf "http://localhost:18080/test/last-request/policy-status" 2>/dev/null || true)
+        if [ -n "${POLICY_REPORT}" ] && printf '%s' "${POLICY_REPORT}" | jq -e "$@" "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${tag}] plexd reported ${what}"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge "${timeout}" ]; then
+            fail "[${tag}] ${timeout}s on, the last policy status report the mock captured is '${POLICY_REPORT}', want one that reports ${what}"
+        fi
+        sleep 2
+    done
 }
 
 # wait_policy_line <tag> <msg> <revision-id> <baseline> reads the plexd log
@@ -5744,11 +5789,24 @@ MESH_RULES_A=$(jq -c . <<'MESHRULESAEOF'
 MESHRULESAEOF
 )
 serve_policy "mesh-policy-a" "${MESH_REV_A}" "${MESH_RULES_A}"
+MESH_FP_A=${SERVED_FP}
 expect_policy_applied "mesh policy A" "${MESH_REV_A}" 4
+wait_policy_report "mesh policy A" 15 "A applied with its revisions while enforcing, and nothing rejected" \
+    '.enforcement == "enforcing" and .applied.fingerprint == $fp and .applied.revisions == [{policy_id: $pol, revision_id: $rev}] and (has("rejected") | not)' \
+    --arg fp "${MESH_FP_A}" --arg pol "${MESH_POLICY_ID}" --arg rev "${MESH_REV_A}"
 expect_no_conn_unavailable "mesh policy A" "${POLICY_LOG}"
 probe_plexd_port "mesh policy A" 7001 open
 expect_conn_line "mesh policy A" "${MESH_REV_A}" 0 in "${MESH_PEER_IP}" "${MESH_NODE_IP}" 7001
+# The drop counters plexd reported last, read right before the 7002 probe:
+# A's install restarted them, and the reports since carry what A's default
+# deny dropped.
+MESH_DROPS_REPORT=$(curl -sf "http://localhost:18080/test/last-request/policy-status" 2>/dev/null || true)
+MESH_DROPS_BEFORE=$(printf '%s' "${MESH_DROPS_REPORT}" | jq -e '.drops.packets // 0' 2>/dev/null) \
+    || fail "[mesh policy A] could not read the drop counters of the last policy status report '${MESH_DROPS_REPORT}'"
 probe_plexd_port "mesh policy A" 7002 closed
+wait_policy_report "mesh policy A" 45 "drop counters above the ${MESH_DROPS_BEFORE} packets it reported before the dropped 7002 probe" \
+    '.applied.fingerprint == $fp and .drops.packets > $before and .drops.bytes >= 40' \
+    --arg fp "${MESH_FP_A}" --argjson before "${MESH_DROPS_BEFORE}"
 POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh policy A] dc logs plexd failed: ${POLICY_LOG}"
 MESH_CONN_7002=$(conn_lines "${POLICY_LOG}" dst_port=7002)
 if [ -n "${MESH_CONN_7002}" ]; then
@@ -5766,11 +5824,13 @@ probe_meshpeer_port "mesh policy A" 7005 closed
 MESH_REV_B="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c5"
 MESH_RULES_B=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(. + {action: "allow"})')
 serve_policy "mesh-policy-b" "${MESH_REV_B}" "${MESH_RULES_B}"
+MESH_FP_B=${SERVED_FP}
 expect_policy_applied "mesh policy B" "${MESH_REV_B}" 4
 
 MESH_REV_C="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c6"
 MESH_RULES_C='[{"action":"deny","protocol":"tcp","source_cidr":"10.99.0.3/32","destination_cidr":"10.99.0.1/32","ports":{"from":7001,"to":7001}}]'
 serve_policy "mesh-policy-c" "${MESH_REV_C}" "${MESH_RULES_C}"
+MESH_FP_C=${SERVED_FP}
 wait_policy_line "mesh policy C" "policy revision rejected, keeping previous ruleset" "${MESH_REV_C}" 0
 MESH_REJECTED_C=$(count_log_lines "${POLICY_LOG}" 'msg="policy revision rejected, keeping previous ruleset"' "revision_id=${MESH_REV_C}" "unsupported action")
 if [ "${MESH_REJECTED_C}" -lt 1 ]; then
@@ -5781,6 +5841,45 @@ if [ "${MESH_APPLIED_C}" -ne 0 ]; then
     fail "[mesh policy C] plexd logged 'policy ruleset applied' for the rejected revision ${MESH_REV_C} ${MESH_APPLIED_C} time(s)"
 fi
 echo "  PASS: [mesh policy C] plexd logged 'policy revision rejected, keeping previous ruleset' with revision_id=${MESH_REV_C} for its unsupported action"
+wait_policy_report "mesh policy C" 15 "C rejected for its unsupported action, with B still applied" \
+    '.rejected.fingerprint == $c and .rejected.revisions == [{policy_id: $pol, revision_id: $rev}] and (.rejected.reason | contains("unsupported action")) and .applied.fingerprint == $b' \
+    --arg c "${MESH_FP_C}" --arg b "${MESH_FP_B}" --arg pol "${MESH_POLICY_ID}" --arg rev "${MESH_REV_C}"
+
+# plexd policies in the container names the rejected revision and lists the
+# rules it still enforces, B's four, under B's revision.
+MESH_POLICIES_OUT=$(dc exec -T plexd /usr/local/bin/plexd policies 2>&1) \
+    || fail "[mesh policy C] plexd policies in the plexd container failed: ${MESH_POLICIES_OUT}"
+case "${MESH_POLICIES_OUT}" in
+    *"Received revision ${MESH_REV_C} (fingerprint ${MESH_FP_C}) is not applied: "*"unsupported action"*"Showing the ruleset applied before it."*) ;;
+    *) fail "[mesh policy C] plexd policies printed '${MESH_POLICIES_OUT}', want it to say that revision ${MESH_REV_C} is not applied for its unsupported action and that it shows the ruleset applied before it" ;;
+esac
+MESH_ROWS_B=0
+while IFS= read -r line; do
+    case "${line}" in
+        "${MESH_REV_B} "*) MESH_ROWS_B=$((MESH_ROWS_B + 1)) ;;
+    esac
+done <<< "${MESH_POLICIES_OUT}"
+if [ "${MESH_ROWS_B}" -ne 4 ]; then
+    fail "[mesh policy C] plexd policies lists ${MESH_ROWS_B} row(s) of revision ${MESH_REV_B}, want B's 4 rules: ${MESH_POLICIES_OUT}"
+fi
+echo "  PASS: [mesh policy C] plexd policies says that C is not applied and lists B's 4 rules"
+
+# A nudge pulls C again, and plexd tries it again: the node API counts the
+# attempts.
+splice_state "mesh-policy-c-retry" '.' 'null'
+MESH_RETRY_START=${SECONDS}
+while :; do
+    MESH_VIEW=$(curl -sf "${NAPI_AUTH[@]}" "${NODE_API_URL}/v1/policies" 2>/dev/null || true)
+    if printf '%s' "${MESH_VIEW}" | jq -e --arg c "${MESH_REV_C}" --arg b "${MESH_REV_B}" \
+        '.rejected.revision_id == $c and .rejected.attempts >= 2 and .revision_id == $b and .applied == true and .in_sync == false' >/dev/null 2>&1; then
+        echo "  PASS: [mesh policy C] GET /v1/policies counts $(printf '%s' "${MESH_VIEW}" | jq -r '.rejected.attempts') attempts of C and shows B as the applied ruleset"
+        break
+    fi
+    if [ $((SECONDS - MESH_RETRY_START)) -ge 30 ]; then
+        fail "[mesh policy C] 30s after the nudge, GET /v1/policies answers '${MESH_VIEW}', want C rejected after at least 2 attempts and B applied, not in sync"
+    fi
+    sleep 2
+done
 probe_plexd_port "mesh policy C" 7001 open
 
 # (g) Policy D, A without its 7001 rules, closes 7001 and keeps the 7003 rule,
@@ -5792,7 +5891,11 @@ probe_plexd_port "mesh policy C" 7001 open
 MESH_REV_D="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7"
 MESH_RULES_D=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(select(.ports.from != 7001))')
 serve_policy "mesh-policy-d" "${MESH_REV_D}" "${MESH_RULES_D}"
+MESH_FP_D=${SERVED_FP}
 expect_policy_applied "mesh policy D" "${MESH_REV_D}" 2
+wait_policy_report "mesh policy D" 15 "D applied and nothing rejected" \
+    '.applied.fingerprint == $d and (has("rejected") | not)' \
+    --arg d "${MESH_FP_D}"
 probe_plexd_port "mesh policy D" 7001 closed
 probe_meshpeer_port "mesh policy D" 7003 open
 
@@ -5826,9 +5929,14 @@ fi
 MESH_DEL_OUT=$(dc exec -T meshpeer ip link del wg0 2>&1) || fail "[mesh restore] deleting wg0 in meshpeer failed: ${MESH_DEL_OUT}"
 
 # (i) No apply in the phase, B's and D's included, logged "policy connection
-# logging unavailable".
+# logging unavailable", and the mock refused no policy status report.
 POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh conn log] dc logs plexd failed: ${POLICY_LOG}"
 expect_no_conn_unavailable "mesh conn log" "${POLICY_LOG}"
+MESH_STATUS_FAILED=$(count_log_lines "${POLICY_LOG}" "${MESH_STATUS_FAILED_MSG}")
+if [ "${MESH_STATUS_FAILED}" -gt "${MESH_STATUS_FAILED_BASE}" ]; then
+    fail "[mesh policy status] plexd logged $((MESH_STATUS_FAILED - MESH_STATUS_FAILED_BASE)) 'policy status: send failed' line(s) in this phase, want none: the mock refused a report the phase read back"
+fi
+echo "  PASS: [mesh policy status] the mock refused none of plexd's policy status reports in this phase"
 
 echo "=== Phase 12e PASSED: policy enforcement on the mesh interface ==="
 
@@ -5862,8 +5970,10 @@ echo "  policy-drift cycle count before: ${PDRIFT_BEFORE_CONV}"
 
 # Mutated NodeStateSnapshot envelope (contract shape). ports is an object
 # {from,to}; peers carry no psk/allowed_ips/endpoint. The 44-char base64
-# fingerprint is an arbitrary constant, deliberately different from the mock's
-# computed fixture fingerprint, so the differ reports PolicyChanged.
+# fingerprint is an arbitrary 32-byte constant, deliberately different from the
+# mock's computed fixture fingerprint, so the differ reports PolicyChanged. It
+# is 32 bytes, as a control plane's SHA-256 is, because plexd echoes it in its
+# policy status report and the mock refuses any other length.
 CONVERGE_STATE=$(cat <<'CONVEOF'
 {
   "peers": [
@@ -5873,7 +5983,7 @@ CONVERGE_STATE=$(cat <<'CONVEOF'
   "reachability": {"state": "healthy", "changed_at": "2026-01-01T00:00:00Z"},
   "policy": {
     "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2",
-    "fingerprint": "ZTJlLW11dGF0ZWQtZmluZ2VycHJpbnQtY29uc3RhbnQx",
+    "fingerprint": "ZTJlLW11dGF0ZWQtZmluZ2VycHJpbnQtY29uc3RhbnQ=",
     "rules": [
       {"action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": {"from": 443, "to": 8080}}
     ]
@@ -5967,7 +6077,7 @@ NOOP_STATE=$(cat <<'NOOPEOF'
   "reachability": {"state": "healthy", "changed_at": "2026-01-01T00:00:00Z"},
   "policy": {
     "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c3",
-    "fingerprint": "ZTJlLW11dGF0ZWQtZmluZ2VycHJpbnQtY29uc3RhbnQx",
+    "fingerprint": "ZTJlLW11dGF0ZWQtZmluZ2VycHJpbnQtY29uc3RhbnQ=",
     "rules": [
       {"action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": {"from": 443, "to": 8080}}
     ]
