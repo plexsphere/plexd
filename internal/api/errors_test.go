@@ -826,6 +826,57 @@ func TestIsRelayStatusNotServed(t *testing.T) {
 	}
 }
 
+func TestIsPolicyStatusNotServed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// An older control plane has no route, so its router's 404 carries
+		// whatever code its not-found handler writes, or none.
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"404 with a router code", &APIError{StatusCode: 404, Code: "not_found"}, true},
+		{"wrapped 404", fmt.Errorf("report policy status: %w", &APIError{StatusCode: 404}), true},
+		{"404 policy_status_node_gone is a verdict on the node", &APIError{StatusCode: 404, Code: "policy_status_node_gone"}, false},
+		{"501 policy_status_not_provisioned serves the route", &APIError{StatusCode: 501, Code: "policy_status_not_provisioned"}, false},
+		{"500 internal", &APIError{StatusCode: 500, Code: "internal"}, false},
+		{"400 invalid_policy_status", &APIError{StatusCode: 400, Code: "invalid_policy_status"}, false},
+		{"non-API error", errors.New("x"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPolicyStatusNotServed(tt.err); got != tt.want {
+				t.Errorf("IsPolicyStatusNotServed(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsPolicyStatusNotProvisioned(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"501 policy_status_not_provisioned", &APIError{StatusCode: 501, Code: "policy_status_not_provisioned"}, true},
+		{"wrapped 501", fmt.Errorf("report policy status: %w", &APIError{StatusCode: 501, Code: "policy_status_not_provisioned"}), true},
+		{"501 with another surface's code", &APIError{StatusCode: 501, Code: "relay_status_not_provisioned"}, false},
+		{"404 without a code", &APIError{StatusCode: 404}, false},
+		{"404 policy_status_node_gone", &APIError{StatusCode: 404, Code: "policy_status_node_gone"}, false},
+		{"500 internal", &APIError{StatusCode: 500, Code: "internal"}, false},
+		{"non-API error", errors.New("x"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPolicyStatusNotProvisioned(tt.err); got != tt.want {
+				t.Errorf("IsPolicyStatusNotProvisioned(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsSessionRevokedOrExpired(t *testing.T) {
 	tests := []struct {
 		name string

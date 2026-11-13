@@ -243,6 +243,37 @@ func IsRelayStatusNotServed(err error) bool {
 	}
 }
 
+// IsPolicyStatusNotServed reports whether err says the control plane has no
+// route for PUT /v1/nodes/{node_id}/policy-status: a 404 with any code but
+// policy_status_node_gone.
+//
+// A control plane older than the operation has no route for it, and its router
+// answers 404 with whatever its not-found handler writes, so no code can be
+// required of it. The operation's own 404 is policy_status_node_gone: the node
+// was removed while the report was in flight. The contract asks the agent to
+// stop reporting until it restarts on any other 404, which is why the 501 of a
+// control plane that serves the route without its recording service is a
+// separate classifier, IsPolicyStatusNotProvisioned.
+func IsPolicyStatusNotServed(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusNotFound && apiErr.Code != "policy_status_node_gone"
+}
+
+// IsPolicyStatusNotProvisioned reports whether err is the 501 carrying the
+// policy_status_not_provisioned problem code: the control plane serves
+// PUT /v1/nodes/{node_id}/policy-status, but its recording service is not
+// wired, so a later report may be accepted.
+func IsPolicyStatusNotProvisioned(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusNotImplemented && apiErr.Code == "policy_status_not_provisioned"
+}
+
 // IsSessionRevokedOrExpired reports whether err is the control plane's verdict
 // that the session a session activity callback names has reached a terminal
 // state: a 409 carrying session_already_revoked or session_expired. Like the

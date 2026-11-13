@@ -1342,6 +1342,275 @@ func TestReportRelayStatus_PathParametersEscaped(t *testing.T) {
 	}
 }
 
+// testPolicyStatusAccepted is a 200 body of PUT /v1/nodes/{node_id}/policy-status.
+const testPolicyStatusAccepted = `{"accepted_at":"2026-11-13T10:15:30.123Z","status":"applied"}`
+
+func TestReportPolicyStatus_Success(t *testing.T) {
+	var gotMethod, gotPath, gotContentType, gotAuth string
+	var gotBody []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotAuth = r.Header.Get("Authorization")
+		var err error
+		if gotBody, err = io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testPolicyStatusAccepted)
+	})
+
+	resp, err := client.ReportPolicyStatus(context.Background(), "node-1", PolicyStatusRequest{
+		Enforcement: PolicyEnforcementEnforcing,
+		Applied: &PolicyStatusApplied{
+			Fingerprint: "q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=",
+			Revisions:   []PolicyRevisionRef{{PolicyID: "p1", RevisionID: "r1"}},
+		},
+		Rejected: &PolicyStatusRejected{
+			Fingerprint: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+			Revisions:   []PolicyRevisionRef{{PolicyID: "p1", RevisionID: "r2"}},
+			Reason:      "unsupported action",
+		},
+		Drops: &PolicyStatusDrops{Packets: 5, Bytes: 500},
+	})
+	if err != nil {
+		t.Fatalf("ReportPolicyStatus: %v", err)
+	}
+
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	if gotPath != "/v1/nodes/node-1/policy-status" {
+		t.Errorf("path = %s, want /v1/nodes/node-1/policy-status", gotPath)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+	}
+
+	const wantBody = `{"enforcement":"enforcing",` +
+		`"applied":{"fingerprint":"q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=","revisions":[{"policy_id":"p1","revision_id":"r1"}]},` +
+		`"rejected":{"fingerprint":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","revisions":[{"policy_id":"p1","revision_id":"r2"}],"reason":"unsupported action"},` +
+		`"drops":{"packets":5,"bytes":500}}`
+	if got := strings.TrimSpace(string(gotBody)); got != wantBody {
+		t.Errorf("request body =\n  %s\nwant\n  %s", got, wantBody)
+	}
+
+	wantAcceptedAt := time.Date(2026, 11, 13, 10, 15, 30, 123_000_000, time.UTC)
+	if !resp.AcceptedAt.Equal(wantAcceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, wantAcceptedAt)
+	}
+	if resp.Status != "applied" {
+		t.Errorf("Status = %q, want %q", resp.Status, "applied")
+	}
+}
+
+// The contract refuses a null revisions list, and omits only what the node
+// leaves out: an applied null pull has no fingerprint, a report with only an
+// enforcement carries nothing else, and zero drop counters are still sent.
+func TestReportPolicyStatus_Members(t *testing.T) {
+	tests := []struct {
+		name string
+		req  PolicyStatusRequest
+		want string
+	}{
+		{
+			name: "only enforcement",
+			req:  PolicyStatusRequest{Enforcement: PolicyEnforcementDisabled},
+			want: `{"enforcement":"disabled"}`,
+		},
+		{
+			name: "applied null pull with nil revisions",
+			req:  PolicyStatusRequest{Enforcement: PolicyEnforcementEnforcing, Applied: &PolicyStatusApplied{}},
+			want: `{"enforcement":"enforcing","applied":{"revisions":[]}}`,
+		},
+		{
+			name: "rejected with nil revisions",
+			req:  PolicyStatusRequest{Enforcement: PolicyEnforcementEnforcing, Rejected: &PolicyStatusRejected{Fingerprint: "fp", Reason: "r"}},
+			want: `{"enforcement":"enforcing","rejected":{"fingerprint":"fp","revisions":[],"reason":"r"}}`,
+		},
+		{
+			name: "zero drop counters",
+			req:  PolicyStatusRequest{Enforcement: PolicyEnforcementEnforcing, Drops: &PolicyStatusDrops{}},
+			want: `{"enforcement":"enforcing","drops":{"packets":0,"bytes":0}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				if body, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, testPolicyStatusAccepted)
+			})
+
+			if _, err := client.ReportPolicyStatus(context.Background(), "node-1", tt.req); err != nil {
+				t.Fatalf("ReportPolicyStatus: %v", err)
+			}
+			if got := strings.TrimSpace(string(body)); got != tt.want {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// The [] substitution is made on a copy: the reporter keeps the request it
+// built to compare the next one against.
+func TestReportPolicyStatus_LeavesTheRequestUnchanged(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, testPolicyStatusAccepted)
+	})
+
+	applied := &PolicyStatusApplied{}
+	rejected := &PolicyStatusRejected{Fingerprint: "fp", Reason: "r"}
+	if _, err := client.ReportPolicyStatus(context.Background(), "node-1", PolicyStatusRequest{
+		Enforcement: PolicyEnforcementEnforcing, Applied: applied, Rejected: rejected,
+	}); err != nil {
+		t.Fatalf("ReportPolicyStatus: %v", err)
+	}
+	if applied.Revisions != nil || rejected.Revisions != nil {
+		t.Errorf("Revisions = %v, %v after the call, want both nil as passed", applied.Revisions, rejected.Revisions)
+	}
+}
+
+// A refusal must survive the client's error mapping in the shape the reporter
+// reads: the status and problem code, and the classifiers' verdicts.
+func TestReportPolicyStatus_ErrorAnswers(t *testing.T) {
+	tests := []struct {
+		name               string
+		status             int
+		contentType        string
+		body               string
+		wantCode           string
+		wantNotServed      bool
+		wantNotProvisioned bool
+	}{
+		{
+			name:   "400 invalid_policy_status",
+			status: http.StatusBadRequest, contentType: "application/problem+json",
+			body:     `{"title":"Bad Request","status":400,"detail":"applied.fingerprint is not 32 bytes.","code":"invalid_policy_status"}`,
+			wantCode: "invalid_policy_status",
+		},
+		{
+			name:          "404 with an empty body",
+			status:        http.StatusNotFound,
+			wantNotServed: true,
+		},
+		{
+			name:   "404 policy_status_node_gone",
+			status: http.StatusNotFound, contentType: "application/problem+json",
+			body:     `{"title":"Not Found","status":404,"code":"policy_status_node_gone"}`,
+			wantCode: "policy_status_node_gone",
+		},
+		{
+			name:   "500 internal",
+			status: http.StatusInternalServerError, contentType: "application/problem+json",
+			body:     `{"title":"Internal Server Error","status":500,"code":"internal"}`,
+			wantCode: "internal",
+		},
+		{
+			name:   "501 policy_status_not_provisioned",
+			status: http.StatusNotImplemented, contentType: "application/problem+json",
+			body:               `{"title":"Not Implemented","status":501,"code":"policy_status_not_provisioned"}`,
+			wantCode:           "policy_status_not_provisioned",
+			wantNotProvisioned: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			resp, err := client.ReportPolicyStatus(context.Background(), "node-1", PolicyStatusRequest{Enforcement: PolicyEnforcementEnforcing})
+			if resp != nil {
+				t.Errorf("response = %+v, want nil", resp)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("errors.As failed to extract *APIError: %v", err)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", apiErr.Code, tt.wantCode)
+			}
+			if got := IsPolicyStatusNotServed(err); got != tt.wantNotServed {
+				t.Errorf("IsPolicyStatusNotServed(%v) = %v, want %v", err, got, tt.wantNotServed)
+			}
+			if got := IsPolicyStatusNotProvisioned(err); got != tt.wantNotProvisioned {
+				t.Errorf("IsPolicyStatusNotProvisioned(%v) = %v, want %v", err, got, tt.wantNotProvisioned)
+			}
+		})
+	}
+}
+
+// The reporter's context ends at shutdown, possibly while a report waits on a
+// slow control plane. The call must end with it and say why.
+func TestReportPolicyStatus_ContextCanceled(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	client, _ := newEndpointTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		// Read the body first, so the server notices the client hanging up;
+		// see TestReportRelayStatus_ContextCanceled.
+		_, _ = io.Copy(io.Discard, r.Body)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(backstopContext(t))
+	defer cancel()
+	go func() {
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	resp, err := client.ReportPolicyStatus(ctx, "node-1", PolicyStatusRequest{Enforcement: PolicyEnforcementEnforcing})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want %v", err, context.Canceled)
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+}
+
+func TestReportPolicyStatus_PathParametersEscaped(t *testing.T) {
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, testPolicyStatusAccepted)
+	})
+
+	if _, err := client.ReportPolicyStatus(context.Background(), "../../../etc/passwd", PolicyStatusRequest{Enforcement: PolicyEnforcementEnforcing}); err != nil {
+		t.Fatalf("ReportPolicyStatus: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/policy-status"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 func TestFetchSecret_Success(t *testing.T) {
 	envelope := []byte("\x00\x01\x02nonce+ciphertext+tag-bytes")
 	var gotQuery string

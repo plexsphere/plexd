@@ -1144,6 +1144,75 @@ func TestPolicyRule_MarshalOmitsLogAndAction(t *testing.T) {
 	}
 }
 
+// The pull names every compiled row's (Policy, revision) pair in revisions,
+// which plexd echoes in its policy status report; a control plane before
+// plexsphere/plexsphere#1059 sends no such key.
+func TestPolicySnapshot_DecodesRevisions(t *testing.T) {
+	const withRevisions = `{"revision_id":"r1","fingerprint":"fp","rules":[],` +
+		`"revisions":[{"policy_id":"p1","revision_id":"r1"},{"policy_id":"p2","revision_id":"r7"}]}`
+	var got PolicySnapshot
+	if err := json.Unmarshal([]byte(withRevisions), &got); err != nil {
+		t.Fatalf("Unmarshal(%s) error = %v", withRevisions, err)
+	}
+	want := []PolicyRevisionRef{{PolicyID: "p1", RevisionID: "r1"}, {PolicyID: "p2", RevisionID: "r7"}}
+	if !slices.Equal(got.Revisions, want) {
+		t.Errorf("Revisions = %+v, want %+v", got.Revisions, want)
+	}
+
+	const withoutRevisions = `{"revision_id":"r1","fingerprint":"fp","rules":[]}`
+	var old PolicySnapshot
+	if err := json.Unmarshal([]byte(withoutRevisions), &old); err != nil {
+		t.Fatalf("Unmarshal(%s) error = %v", withoutRevisions, err)
+	}
+	if old.Revisions != nil {
+		t.Errorf("Revisions = %+v, want nil for a block without the key", old.Revisions)
+	}
+}
+
+// Clone backs the reconciler's stored snapshot and the Enforcer's record of
+// what it installed, so a later change to the pulled block must not reach
+// either through a shared slice or pointer.
+func TestPolicySnapshot_Clone(t *testing.T) {
+	action := "allow"
+	src := &PolicySnapshot{
+		RevisionID:  "r1",
+		Fingerprint: "fp",
+		Rules: []PolicyRule{
+			{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.1/32", Ports: &PortRange{From: 443, To: 443}, LegacyAction: &action},
+		},
+		Revisions: []PolicyRevisionRef{{PolicyID: "p1", RevisionID: "r1"}},
+	}
+	got := src.Clone()
+	if !reflect.DeepEqual(got, src) {
+		t.Fatalf("Clone() = %+v, want a copy equal to %+v", got, src)
+	}
+
+	src.Rules[0].SourceCIDR = "mutated"
+	src.Rules[0].Ports.From = 8443
+	*src.Rules[0].LegacyAction = "deny"
+	src.Revisions[0].RevisionID = "mutated"
+
+	if got.Rules[0].SourceCIDR != "10.0.0.0/24" {
+		t.Errorf("Rules share memory with the source: SourceCIDR = %q", got.Rules[0].SourceCIDR)
+	}
+	if got.Rules[0].Ports.From != 443 {
+		t.Errorf("Ports shares memory with the source: From = %d", got.Rules[0].Ports.From)
+	}
+	if *got.Rules[0].LegacyAction != "allow" {
+		t.Errorf("LegacyAction shares memory with the source: %q", *got.Rules[0].LegacyAction)
+	}
+	if got.Revisions[0].RevisionID != "r1" {
+		t.Errorf("Revisions share memory with the source: RevisionID = %q", got.Revisions[0].RevisionID)
+	}
+}
+
+func TestPolicySnapshot_CloneNil(t *testing.T) {
+	var p *PolicySnapshot
+	if got := p.Clone(); got != nil {
+		t.Errorf("(*PolicySnapshot)(nil).Clone() = %+v, want nil", got)
+	}
+}
+
 func TestTypesMetricPoint(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := MetricPoint{
