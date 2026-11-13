@@ -100,8 +100,8 @@ func startFakeAgent(t *testing.T, summary nodeapi.StateSummary) string {
 	})
 	mux.HandleFunc("GET /v1/policies", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// Mirror the real handler: the merged policy is served as an object
-		// ({} when no policy is active), never as an array.
+		// Mirror the real handler without a policy provider: the policy view
+		// is served as an object, {} here, never as an array.
 		_ = json.NewEncoder(w).Encode(struct{}{})
 	})
 	mux.HandleFunc("GET /v1/log-status", func(w http.ResponseWriter, _ *http.Request) {
@@ -117,7 +117,8 @@ func startFakeAgent(t *testing.T, summary nodeapi.StateSummary) string {
 }
 
 // startFakePolicyAgent starts an agent stub that serves policy, encoded as
-// JSON, on GET /v1/policies, the route plexd policies reads.
+// JSON, on GET /v1/policies, the route plexd policies reads. policy is a
+// nodeapi.PolicyView, the body of an older agent, or raw JSON.
 func startFakePolicyAgent(t *testing.T, policy any) string {
 	t.Helper()
 

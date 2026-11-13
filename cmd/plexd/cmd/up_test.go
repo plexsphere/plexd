@@ -5430,6 +5430,196 @@ func TestPeerSnapshot_UpdateReportsProgrammedEndpoint(t *testing.T) {
 	}
 }
 
+// fakePolicyStatusSource serves a fixed policy.Status to policyView.
+type fakePolicyStatusSource struct {
+	status policy.Status
+}
+
+func (f fakePolicyStatusSource) Status() policy.Status { return f.status }
+
+// The Enforcer is the source plexd up wires into policyView.
+var _ policyStatusSource = (*policy.Enforcer)(nil)
+
+func TestPolicyView(t *testing.T) {
+	blockA := func() *api.PolicySnapshot {
+		return &api.PolicySnapshot{
+			RevisionID:  "rev-a",
+			Fingerprint: "fp-a",
+			Rules: []api.PolicyRule{
+				{Protocol: "tcp", SourceCIDR: "10.99.0.2/32", DestinationCIDR: "10.99.0.1/32", Ports: &api.PortRange{From: 5432, To: 5432}},
+			},
+			Revisions: []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-a"}},
+		}
+	}
+	blockB := func() *api.PolicySnapshot {
+		return &api.PolicySnapshot{
+			RevisionID:  "rev-b",
+			Fingerprint: "fp-b",
+			Rules: []api.PolicyRule{
+				{Protocol: "tcp", SourceCIDR: "10.99.0.2/32", DestinationCIDR: "10.99.0.1/32", Ports: &api.PortRange{From: 22, To: 22}},
+			},
+			Revisions: []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-b"}},
+		}
+	}
+	unfingerprinted := func() *api.PolicySnapshot {
+		b := blockA()
+		b.Fingerprint = ""
+		return b
+	}
+	receivedA := &nodeapi.PolicyViewReceived{
+		RevisionID:  "rev-a",
+		Fingerprint: "fp-a",
+		Revisions:   []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-a"}},
+	}
+	receivedB := &nodeapi.PolicyViewReceived{
+		RevisionID:  "rev-b",
+		Fingerprint: "fp-b",
+		Revisions:   []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-b"}},
+	}
+	// viewOfA is the view of block A applied, before the state members.
+	viewOfA := func() nodeapi.PolicyView {
+		a := blockA()
+		return nodeapi.PolicyView{
+			RevisionID:  a.RevisionID,
+			Fingerprint: a.Fingerprint,
+			Rules:       a.Rules,
+			Revisions:   a.Revisions,
+		}
+	}
+	const reason = `policy: invalid ruleset: rule 0: unsupported action "deny"`
+
+	tests := []struct {
+		name   string
+		status policy.Status
+		want   func() nodeapi.PolicyView
+	}{
+		{
+			name: "applied block is the received one",
+			status: policy.Status{
+				Enforcement: api.PolicyEnforcementEnforcing,
+				Synced:      true,
+				HasApplied:  true,
+				Applied:     blockA(),
+				Received:    blockA(),
+			},
+			want: func() nodeapi.PolicyView {
+				v := viewOfA()
+				v.Enforcement = api.PolicyEnforcementEnforcing
+				v.Applied, v.InSync = true, true
+				v.Received = receivedA
+				return v
+			},
+		},
+		{
+			name: "rejected block leaves the previous one applied",
+			status: policy.Status{
+				Enforcement: api.PolicyEnforcementEnforcing,
+				Synced:      true,
+				HasApplied:  true,
+				Applied:     blockA(),
+				Received:    blockB(),
+				Rejected:    blockB(),
+				Reason:      reason,
+				Attempts:    3,
+			},
+			want: func() nodeapi.PolicyView {
+				v := viewOfA()
+				v.Enforcement = api.PolicyEnforcementEnforcing
+				v.Applied = true
+				v.Received = receivedB
+				v.Rejected = &nodeapi.PolicyViewRejected{
+					RevisionID:  "rev-b",
+					Fingerprint: "fp-b",
+					Reason:      reason,
+					Attempts:    3,
+				}
+				return v
+			},
+		},
+		{
+			name: "applied null pull",
+			status: policy.Status{
+				Enforcement: api.PolicyEnforcementEnforcing,
+				Synced:      true,
+				HasApplied:  true,
+			},
+			want: func() nodeapi.PolicyView {
+				return nodeapi.PolicyView{
+					Enforcement: api.PolicyEnforcementEnforcing,
+					Applied:     true,
+					InSync:      true,
+				}
+			},
+		},
+		{
+			name: "null pull received over an applied block",
+			status: policy.Status{
+				Enforcement: api.PolicyEnforcementEnforcing,
+				Synced:      true,
+				HasApplied:  true,
+				Applied:     blockA(),
+			},
+			want: func() nodeapi.PolicyView {
+				v := viewOfA()
+				v.Enforcement = api.PolicyEnforcementEnforcing
+				v.Applied = true
+				return v
+			},
+		},
+		{
+			name: "applied block without a fingerprint is never in sync",
+			status: policy.Status{
+				Enforcement: api.PolicyEnforcementEnforcing,
+				Synced:      true,
+				HasApplied:  true,
+				Applied:     unfingerprinted(),
+				Received:    unfingerprinted(),
+			},
+			want: func() nodeapi.PolicyView {
+				v := viewOfA()
+				v.Fingerprint = ""
+				v.Enforcement = api.PolicyEnforcementEnforcing
+				v.Applied = true
+				v.Received = &nodeapi.PolicyViewReceived{
+					RevisionID: "rev-a",
+					Revisions:  []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-a"}},
+				}
+				return v
+			},
+		},
+		{
+			name: "enforcement disabled",
+			status: policy.Status{
+				Enforcement: api.PolicyEnforcementDisabled,
+				Synced:      true,
+				Received:    blockA(),
+			},
+			want: func() nodeapi.PolicyView {
+				return nodeapi.PolicyView{
+					Enforcement: api.PolicyEnforcementDisabled,
+					Received:    receivedA,
+				}
+			},
+		},
+		{
+			name:   "before the first pull",
+			status: policy.Status{},
+			want:   func() nodeapi.PolicyView { return nodeapi.PolicyView{} },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policyView{source: fakePolicyStatusSource{status: tt.status}}.PolicyView()
+			if want := tt.want(); !reflect.DeepEqual(got, want) {
+				gotJSON, _ := json.Marshal(got)
+				wantJSON, _ := json.Marshal(want)
+				t.Errorf("PolicyView() =\n%s\nwant\n%s", gotJSON, wantJSON)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Mesh DNS
 // ---------------------------------------------------------------------------

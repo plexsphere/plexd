@@ -952,14 +952,15 @@ func runAgent(ctx context.Context) error {
 	nodeAPISrv.SetActionProvider(executor)
 	nodeAPISrv.SetHookReloader(hookDirs)
 
-	// Set up peer and policy snapshot providers for the node API.
+	// Set up the peer snapshot and the policy view for the node API. The
+	// policy view reads the Enforcer's record, so GET /v1/policies shows the
+	// applied ruleset rather than the block of the last pull.
 	peerSnap := &peerSnapshot{}
 	if wgReady {
 		peerSnap.mesh = wgMgr.MeshPrefix()
 	}
-	policySnap := &policySnapshot{}
 	nodeAPISrv.SetPeerProvider(peerSnap)
-	nodeAPISrv.SetPolicyProvider(policySnap)
+	nodeAPISrv.SetPolicyProvider(policyView{source: enforcer})
 
 	// Publish the SSE delivery mode as node-API cache metadata so `plexd status`
 	// surfaces it, and feed it to the health listener's readiness state. Seed it
@@ -1093,10 +1094,9 @@ func runAgent(ctx context.Context) error {
 	// handler changes peers in the same cycle.
 	reconciler.RegisterDispatchHandler(policy.DispatchHandler(enforcer, policyIface))
 
-	// Register peer/policy snapshot reconcile handler for node API queries.
+	// Register the peer snapshot reconcile handler for node API queries.
 	reconciler.RegisterHandler(func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
 		peerSnap.update(desired.Peers)
-		policySnap.update(desired.Policy)
 		return nil
 	})
 
@@ -1829,23 +1829,61 @@ func (t rotationReconcileTrigger) TriggerReconcile() {
 	t.rt.TriggerReconcile()
 }
 
-// policySnapshot implements nodeapi.PolicyProvider with a thread-safe cached
-// merged policy.
-type policySnapshot struct {
-	mu     sync.RWMutex
-	policy *api.PolicySnapshot
+// policyStatusSource is the part of *policy.Enforcer that policyView reads.
+type policyStatusSource interface {
+	Status() policy.Status
 }
 
-func (ps *policySnapshot) ActivePolicy() *api.PolicySnapshot {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	return ps.policy
+// policyView implements nodeapi.PolicyProvider over the Enforcer's record, so
+// GET /v1/policies and plexd policies show the ruleset that is applied and
+// say when it is not the block of the latest pull.
+type policyView struct {
+	source policyStatusSource
 }
 
-func (ps *policySnapshot) update(policy *api.PolicySnapshot) {
-	ps.mu.Lock()
-	ps.policy = policy
-	ps.mu.Unlock()
+// PolicyView builds the node API's view from one Status of the source. The
+// block members hold the applied block, and stay empty when no block is
+// applied or the applied pull carried policy: null. The view is in sync when
+// a block is applied and it is the block of the latest pull: both null, or
+// both with the same non-empty fingerprint.
+func (v policyView) PolicyView() nodeapi.PolicyView {
+	s := v.source.Status()
+	view := nodeapi.PolicyView{
+		Enforcement: s.Enforcement,
+		Applied:     s.HasApplied,
+		InSync:      s.HasApplied && samePolicyBlock(s.Applied, s.Received),
+	}
+	if s.HasApplied && s.Applied != nil {
+		view.RevisionID = s.Applied.RevisionID
+		view.Fingerprint = s.Applied.Fingerprint
+		view.Rules = s.Applied.Rules
+		view.Revisions = s.Applied.Revisions
+	}
+	if s.Received != nil {
+		view.Received = &nodeapi.PolicyViewReceived{
+			RevisionID:  s.Received.RevisionID,
+			Fingerprint: s.Received.Fingerprint,
+			Revisions:   s.Received.Revisions,
+		}
+	}
+	if s.Rejected != nil {
+		view.Rejected = &nodeapi.PolicyViewRejected{
+			RevisionID:  s.Rejected.RevisionID,
+			Fingerprint: s.Rejected.Fingerprint,
+			Reason:      s.Reason,
+			Attempts:    s.Attempts,
+		}
+	}
+	return view
+}
+
+// samePolicyBlock reports whether two policy blocks are the same ruleset:
+// both nil, or both non-nil with the same fingerprint that is not empty.
+func samePolicyBlock(a, b *api.PolicySnapshot) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Fingerprint != "" && a.Fingerprint == b.Fingerprint
 }
 
 // logForwarderStatus adapts logfwd.Forwarder to nodeapi.ForwarderStatusProvider.
