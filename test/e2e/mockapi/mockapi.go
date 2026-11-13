@@ -82,6 +82,7 @@ type AssertionCounters struct {
 	SessionConnectionTimeoutCount int64 `json:"session_connection_timeout_count"`
 	IntegrityViolationCount       int64 `json:"integrity_violation_count"`
 	HandshakeReportCount          int64 `json:"handshake_report_count"`
+	PolicyStatusCount             int64 `json:"policy_status_count"`
 	EdgePSKCount                  int64 `json:"edge_psk_count"`
 	HookFetchCount                int64 `json:"hook_fetch_count"`
 	InjectEventCount              int64 `json:"inject_event_count"`
@@ -145,6 +146,7 @@ type Server struct {
 	sessionConnectionTimeoutCount  atomic.Int64
 	integrityViolationCount        atomic.Int64
 	handshakeReportCount           atomic.Int64
+	policyStatusCount              atomic.Int64
 	edgePSKCount                   atomic.Int64
 	hookFetchCount                 atomic.Int64
 	injectEventCount               atomic.Int64
@@ -332,6 +334,7 @@ func (s *Server) Assertions() AssertionCounters {
 		SessionConnectionTimeoutCount:  s.sessionConnectionTimeoutCount.Load(),
 		IntegrityViolationCount:        s.integrityViolationCount.Load(),
 		HandshakeReportCount:           s.handshakeReportCount.Load(),
+		PolicyStatusCount:              s.policyStatusCount.Load(),
 		EdgePSKCount:                   s.edgePSKCount.Load(),
 		HookFetchCount:                 s.hookFetchCount.Load(),
 		InjectEventCount:               s.injectEventCount.Load(),
@@ -398,10 +401,15 @@ func newStateFixture() api.NodeStateSnapshot {
 		// so never_reported is the honest verdict — and the one a real control
 		// plane serves for a freshly enrolled node.
 		Reachability: json.RawMessage(`{"state":"never_reported","changed_at":"2026-01-01T00:00:00Z"}`),
+		// The block merges one compiled row, so revisions names one pair, whose
+		// revision_id is the block's, as the contract has it for the first pair.
 		Policy: &api.PolicySnapshot{
 			RevisionID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
 			Fingerprint: policyFingerprint(rules),
 			Rules:       rules,
+			Revisions: []api.PolicyRevisionRef{
+				{PolicyID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", RevisionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"},
+			},
 		},
 		Bridge: &api.BridgeSnapshot{
 			// The relay block's one assignment is peer ...a0b1, whose
@@ -630,6 +638,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}", s.handleSessionConnection)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/policy-status", s.handlePolicyStatus)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/hooks/{name}/versions/{version}", s.handleHookVersion)
 
@@ -672,6 +681,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}/connections/{cid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/policy-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/hooks/{name}/versions/{version}", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
@@ -3288,6 +3298,307 @@ func (s *Server) fixturePeerIDs() map[string]struct{} {
 		ids[strings.ToLower(p.NodeID)] = struct{}{}
 	}
 	return ids
+}
+
+// Policy status report contract bounds. They are the mock's own copies of the
+// contract's numbers, so the mock checks the contract, not the agent's reading
+// of it.
+const (
+	maxPolicyStatusBody      = 1 << 20
+	maxPolicyStatusRevisions = 4096
+	maxPolicyStatusReason    = 1024
+)
+
+// The policy statuses a 200 policy status answer derives. The contract's fifth
+// status, unknown, belongs to a Node read only.
+const (
+	nodePolicyApplied     = "applied"
+	nodePolicyPending     = "pending"
+	nodePolicyRejected    = "rejected"
+	nodePolicyNotEnforced = "not_enforced"
+)
+
+// handlePolicyStatus handles PUT /v1/nodes/{id}/policy-status, the node's
+// report of the policy it enforces. It enforces the contract's gates in order:
+// the 1 MiB body cap (413 policy_status_body_too_large), the strict decode of
+// decodePolicyStatus (400 malformed_policy_status), and the rules of
+// checkPolicyStatus (400 invalid_policy_status, the detail naming the member).
+// The 200 answer carries accepted_at and the status derivePolicyStatus derives
+// against the policy block the state fixture serves at that moment. Every
+// answer of the handler carries Cache-Control: no-store, as the contract asks.
+// The counter increments only on the 200.
+//
+// The decode target is mock-local rather than api.PolicyStatusRequest, for the
+// reason handleHandshakes gives: the agent's struct turns a missing member into
+// a zero value and a null list into nil, while the mock's pointers keep both
+// missing, so an agent that drops a required member or sends null is refused
+// here as it would be by the control plane.
+func (s *Server) handlePolicyStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, maxPolicyStatusBody)
+	data, err := s.captureBody("policy-status", r)
+	if err == nil && len(data) == maxPolicyStatusBody {
+		// captureBody stops reading at maxCapturedBody, the same 1 MiB as the
+		// cap, so the MaxBytesReader beneath it never reads the byte that would
+		// trip it. Draining the rest tells a body of exactly 1 MiB from a longer
+		// one, as in handleHandshakes.
+		_, err = io.Copy(io.Discard, r.Body)
+	}
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "policy_status_body_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte policy status cap.", maxPolicyStatusBody))
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_policy_status", "invalid request body")
+		return
+	}
+
+	req, err := decodePolicyStatus(data)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_policy_status",
+			"request body is not a valid NodePolicyStatusReport: "+err.Error())
+		return
+	}
+	if detail := checkPolicyStatus(req); detail != "" {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_policy_status", detail)
+		return
+	}
+
+	status := s.derivePolicyStatus(req)
+	s.policyStatusCount.Add(1)
+	writeJSON(w, http.StatusOK, api.PolicyStatusResponse{
+		AcceptedAt: time.Now().UTC(),
+		Status:     status,
+	})
+}
+
+// policyStatusBody is the mock's reading of a policy status report. Every
+// member is a pointer, so a missing or null one decodes to nil: an optional
+// member reads as absent and a required one as missing, as the contract has
+// it.
+type policyStatusBody struct {
+	Enforcement *string               `json:"enforcement"`
+	Applied     *policyStatusApplied  `json:"applied"`
+	Rejected    *policyStatusRejected `json:"rejected"`
+	Drops       *policyStatusDrops    `json:"drops"`
+}
+
+// policyStatusApplied is the applied member of a policyStatusBody.
+type policyStatusApplied struct {
+	Fingerprint *string                 `json:"fingerprint"`
+	Revisions   *[]policyStatusRevision `json:"revisions"`
+}
+
+// policyStatusRejected is the rejected member of a policyStatusBody.
+type policyStatusRejected struct {
+	Fingerprint *string                 `json:"fingerprint"`
+	Revisions   *[]policyStatusRevision `json:"revisions"`
+	Reason      *string                 `json:"reason"`
+}
+
+// policyStatusDrops is the drops member of a policyStatusBody. A counter
+// above the int64 range fails the decode, as the contract has it.
+type policyStatusDrops struct {
+	Packets *int64 `json:"packets"`
+	Bytes   *int64 `json:"bytes"`
+}
+
+// policyStatusRevision is one pair of a revisions list.
+type policyStatusRevision struct {
+	PolicyID   *policyStatusUUID `json:"policy_id"`
+	RevisionID *policyStatusUUID `json:"revision_id"`
+}
+
+// policyStatusUUID is a policy_id or revision_id. The control plane decodes
+// both into a UUID type, so a value that is not a UUID string fails its decode
+// and answers malformed_policy_status, not invalid_policy_status. The mock
+// accepts the canonical 8-4-4-4-12 form uuidRe matches, the form the pull
+// serves and the agent echoes.
+type policyStatusUUID string
+
+// UnmarshalJSON refuses a value that is not a JSON string in UUID form.
+func (u *policyStatusUUID) UnmarshalJSON(data []byte) error {
+	var v string
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("a policy_id or revision_id is not a string: %w", err)
+	}
+	if !uuidRe.MatchString(v) {
+		return errors.New("a policy_id or revision_id is not a UUID")
+	}
+	*u = policyStatusUUID(v)
+	return nil
+}
+
+// decodePolicyStatus decodes exactly one report object from data, refusing
+// unknown members anywhere in it, a value of the wrong JSON type, a body that
+// is empty or not one object (null included), and any data after the object.
+// Each of these answers 400 malformed_policy_status.
+func decodePolicyStatus(data []byte) (*policyStatusBody, error) {
+	var req *policyStatusBody
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, errors.New("the body is null, not a JSON object")
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("the body carries data after the report")
+	}
+	return req, nil
+}
+
+// checkPolicyStatus runs the contract's rules over a decoded report and
+// returns the detail of the first one it breaks, naming the member, or "" when
+// the report is valid. Every one of them answers 400 invalid_policy_status. The
+// detail never quotes a value the agent sent.
+func checkPolicyStatus(req *policyStatusBody) string {
+	switch {
+	case req.Enforcement == nil:
+		return "enforcement is required."
+	case !validPolicyEnforcement(*req.Enforcement):
+		return "enforcement is not one of enforcing, disabled and unavailable."
+	}
+	if a := req.Applied; a != nil {
+		if a.Fingerprint != nil && !isBase64Digest(*a.Fingerprint) {
+			return "applied.fingerprint is not 32 bytes in standard base64 with padding."
+		}
+		if detail := checkPolicyStatusRevisions("applied.revisions", a.Revisions); detail != "" {
+			return detail
+		}
+	}
+	if j := req.Rejected; j != nil {
+		switch {
+		case j.Fingerprint == nil:
+			return "rejected.fingerprint is required."
+		case !isBase64Digest(*j.Fingerprint):
+			return "rejected.fingerprint is not 32 bytes in standard base64 with padding."
+		}
+		if detail := checkPolicyStatusRevisions("rejected.revisions", j.Revisions); detail != "" {
+			return detail
+		}
+		if detail := checkPolicyStatusReason(j.Reason); detail != "" {
+			return detail
+		}
+	}
+	if d := req.Drops; d != nil {
+		for _, c := range []struct {
+			name  string
+			value *int64
+		}{{"drops.packets", d.Packets}, {"drops.bytes", d.Bytes}} {
+			switch {
+			case c.value == nil:
+				return c.name + " is required."
+			case *c.value < 0:
+				return c.name + " is negative."
+			}
+		}
+	}
+	return ""
+}
+
+// validPolicyEnforcement reports whether e is inside the closed enforcement
+// enum.
+func validPolicyEnforcement(e string) bool {
+	switch e {
+	case api.PolicyEnforcementEnforcing, api.PolicyEnforcementDisabled, api.PolicyEnforcementUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// zeroUUID is the all-zero UUID, which the contract refuses as a policy_id or
+// revision_id.
+const zeroUUID = "00000000-0000-0000-0000-000000000000"
+
+// checkPolicyStatusRevisions checks one revisions list; field names the list
+// in the detail. The list is required and holds at most 4096 pairs, each with
+// a non-zero policy_id and revision_id, strictly ascending by policy_id, which
+// also refuses a policy_id that repeats. The ids compare case-insensitively,
+// in the byte order the control plane compares its decoded UUIDs in.
+func checkPolicyStatusRevisions(field string, revisions *[]policyStatusRevision) string {
+	if revisions == nil {
+		return field + " is required and must be an array, not null."
+	}
+	list := *revisions
+	if len(list) > maxPolicyStatusRevisions {
+		return fmt.Sprintf("%s carries %d revisions, at most %d are accepted.", field, len(list), maxPolicyStatusRevisions)
+	}
+	for i, ref := range list {
+		switch {
+		case ref.PolicyID == nil:
+			return fmt.Sprintf("%s[%d].policy_id is required.", field, i)
+		case ref.RevisionID == nil:
+			return fmt.Sprintf("%s[%d].revision_id is required.", field, i)
+		case string(*ref.PolicyID) == zeroUUID:
+			return fmt.Sprintf("%s[%d].policy_id is the zero UUID.", field, i)
+		case string(*ref.RevisionID) == zeroUUID:
+			return fmt.Sprintf("%s[%d].revision_id is the zero UUID.", field, i)
+		case i > 0 && strings.ToLower(string(*list[i-1].PolicyID)) >= strings.ToLower(string(*ref.PolicyID)):
+			return fmt.Sprintf("%s[%d].policy_id is not above the one before it; revisions must be strictly ascending by policy_id.", field, i)
+		}
+	}
+	return ""
+}
+
+// checkPolicyStatusReason checks a rejection reason: required, 1 to 1024 bytes
+// of valid UTF-8, and free of control characters (U+0000 to U+001F, U+007F).
+// encoding/json turns invalid UTF-8 in a string into U+FFFD while it decodes,
+// here as on the control plane, so the UTF-8 rule never refuses a reason that
+// arrives over the wire; the mock checks it all the same, as the control plane
+// does.
+func checkPolicyStatusReason(reason *string) string {
+	switch {
+	case reason == nil:
+		return "rejected.reason is required."
+	case *reason == "":
+		return "rejected.reason is empty."
+	case len(*reason) > maxPolicyStatusReason:
+		return fmt.Sprintf("rejected.reason is %d bytes, at most %d are accepted.", len(*reason), maxPolicyStatusReason)
+	case !utf8.ValidString(*reason):
+		return "rejected.reason is not valid UTF-8."
+	}
+	for _, c := range *reason {
+		if c <= 0x1f || c == 0x7f {
+			return fmt.Sprintf("rejected.reason carries the control character U+%04X.", c)
+		}
+	}
+	return ""
+}
+
+// derivePolicyStatus derives the status of a valid report against the policy
+// block the state fixture serves now, first match wins: not_enforced when
+// enforcement is not enforcing; rejected when the report rejects the served
+// block's fingerprint; applied when the applied fingerprint is the served one,
+// or the applied member carries none and the fixture serves policy: null;
+// pending otherwise. It compares the fingerprint strings the fixture holds and
+// the report echoes: the mock never derives a fingerprint from the rules it
+// serves.
+func (s *Server) derivePolicyStatus(req *policyStatusBody) string {
+	s.stateFixtureMu.RLock()
+	served := s.stateFixture.Policy != nil
+	var servedFingerprint string
+	if served {
+		servedFingerprint = s.stateFixture.Policy.Fingerprint
+	}
+	s.stateFixtureMu.RUnlock()
+
+	switch {
+	case *req.Enforcement != api.PolicyEnforcementEnforcing:
+		return nodePolicyNotEnforced
+	case req.Rejected != nil && served && *req.Rejected.Fingerprint == servedFingerprint:
+		return nodePolicyRejected
+	case req.Applied != nil && req.Applied.Fingerprint == nil && !served:
+		return nodePolicyApplied
+	case req.Applied != nil && req.Applied.Fingerprint != nil && served && *req.Applied.Fingerprint == servedFingerprint:
+		return nodePolicyApplied
+	default:
+		return nodePolicyPending
+	}
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state

@@ -37,8 +37,8 @@ The gate exists because its absence hid a shipped defect: the mock used to admit
 The mock refuses what the real handlers refuse, because a fixture that accepts
 more than the contract hides exactly the defects the suite exists to catch. The
 first three gates were added after a release shipped past them; the handshake
-report, the edge PSK route, the endpoint candidates route and the hook version
-route were gated from the start:
+report, the edge PSK route, the endpoint candidates route, the hook version
+route and the policy status report were gated from the start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** caps the body at 1 MiB
   (`413 capabilities_body_too_large`), strict-decodes a `CapabilityManifestRequest`
@@ -122,6 +122,22 @@ route were gated from the start:
   `netip.ParseAddrPort`, has port 0 or a zone, or names a loopback, link-local,
   multicast or unspecified host. An empty array is accepted. See
   [the route](#put-v1-nodes-id-endpoint-candidates).
+- **`PUT /v1/nodes/{id}/policy-status`** caps the body at 1 MiB
+  (`413 policy_status_body_too_large`) and strict-decodes it into mock-local
+  pointer types, so a missing or `null` member is told apart from a zero one.
+  It answers `400 malformed_policy_status` for what the JSON decoder refuses:
+  an empty body, one that is not one JSON object, a member of the wrong JSON
+  type (a `policy_id` or `revision_id` that is not a UUID string and a counter
+  above the int64 range included), an unknown member, or data after the
+  report. It answers `400 invalid_policy_status`, with a `detail` naming the
+  member, for a required member that is missing or `null`, an `enforcement`
+  outside `enforcing`, `disabled` and `unavailable`, a `fingerprint` that is
+  not 32 bytes of standard base64, a negative counter, a zero `policy_id` or
+  `revision_id`, `revisions` not strictly ascending by `policy_id` or longer
+  than 4096 pairs, and a `reason` that is empty, over 1024 bytes or holds a
+  control character. The `200` answer derives the status against the policy
+  block the fixture serves, so the agent's report reads `applied` only when
+  it echoes that block. See [the route](#put-v1-nodes-id-policy-status).
 - **`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`** answers
   `403 node_id_mismatch` for an `id` other than the registered node, then
   `404 hook_not_assigned` for a pair the state fixture's `hooks` block does not
@@ -495,6 +511,83 @@ Docker e2e run expects: the fixture peers never complete a handshake.
 
 **Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `POST`.
 
+### `PUT /v1/nodes/{id}/policy-status`
+
+Enforces the policy status report contract (`PutNodePolicyStatus`, the
+"Policy status report" section of the control plane's
+`docs/reference/api/plexd-agent-contract.md`): a 1 MiB body cap, strict JSON
+decoding, and the rules of each member. The body is captured under
+`policy-status` and decoded into mock-local pointer types, so a missing or
+`null` member is told apart from a zero one: an optional member sent as `null`
+reads as absent, a required one as missing. The bounds of 4096 revisions and
+1024 reason bytes are the mock's own copies of the contract's. The handler
+does not compare the path `id` with the node, as the endpoint candidates route
+does not. `policy_status_count` increments only when every check passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `policy_status_body_too_large` if the body exceeds 1 MiB (1,048,576 bytes). A body of exactly 1 MiB is read to its end, so one byte more is refused and never arrives truncated.
+2. **Body decode** → `400` `malformed_policy_status` if the body is empty, is not one JSON object (`null` included), carries a member of the wrong JSON type, an unknown member at any depth, or data after the report. A `policy_id` or `revision_id` that is not a UUID string fails the decode, as on the control plane, whose decoder reads the ids as UUIDs; the mock accepts the 8-4-4-4-12 form the pull serves. A counter that is fractional or above the int64 range fails it too.
+3. **Member rules** → `400` `invalid_policy_status`, the `detail` naming the member, if:
+   - `enforcement` is missing, `null`, or outside `enforcing`, `disabled` and `unavailable`;
+   - `applied.fingerprint` is present and is not 32 bytes in standard base64 with padding;
+   - `applied.revisions` or `rejected.revisions` is missing or `null`, holds more than 4096 pairs, holds a pair whose `policy_id` or `revision_id` is missing, `null` or the zero UUID, or is not strictly ascending by `policy_id`. A repeated `policy_id` is not ascending. The ids compare without regard to case, the order the control plane's decoded UUIDs take. The `detail` names the pair, for example `applied.revisions[1].policy_id is not above the one before it; revisions must be strictly ascending by policy_id.`;
+   - `rejected.fingerprint` is missing, `null`, or not 32 bytes in standard base64 with padding;
+   - `rejected.reason` is missing, `null`, empty, longer than 1024 bytes, not valid UTF-8, or carries a control character (U+0000 to U+001F, U+007F). The JSON decoder turns invalid UTF-8 into U+FFFD, here as on the control plane, so a reason that arrives over the wire is always valid UTF-8;
+   - `drops.packets` or `drops.bytes` is missing, `null` or negative.
+
+**Request body:**
+
+```json
+{
+  "enforcement": "enforcing",
+  "applied": {
+    "fingerprint": "<44-char base64 SHA-256>",
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" }
+    ]
+  },
+  "drops": { "packets": 5, "bytes": 500 }
+}
+```
+
+`applied`, `rejected` and `drops` are optional. An `applied` without a
+`fingerprint`, with `"revisions": []`, is the report of a node that applied a
+pull with `policy: null`. A `rejected` carries `fingerprint`, `revisions` and
+`reason`.
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-11-13T10:15:30Z",
+  "status": "applied"
+}
+```
+
+`accepted_at` is the mock's clock in UTC. `status` is derived against the
+policy block the [state fixture](#get-v1-nodes-id-state) serves at the moment of
+the report, first match wins:
+
+| Condition | `status` |
+|-----------|----------|
+| `enforcement` is not `enforcing` | `not_enforced` |
+| `rejected` is present, the fixture serves a `policy` block, and `rejected.fingerprint` equals its `fingerprint` | `rejected` |
+| `applied` is present and its `fingerprint` equals the served one, or `applied` carries no `fingerprint` and the fixture serves `policy: null` | `applied` |
+| Otherwise | `pending` |
+
+The mock compares the fingerprint strings the fixture holds and the report
+carries. It never derives a fingerprint from the rules it serves. A report that
+echoes the default fixture's block therefore reads `applied`, and the same
+report reads `pending` once `POST /test/configure-state` serves another block.
+The report is not stored: the mock keeps only the captured body.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`). Every answer of the handler, the `200` and each refusal above, carries `Cache-Control: no-store`, as the contract asks.
+
+**Counter:** Increments `policy_status_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
+
 ### `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`
 
 Serves the edge PSKs of the two fixture peers the way the control plane does:
@@ -614,7 +707,7 @@ therefore hands the node the new key.
 |-------|---------------|
 | `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint` and one `endpoint_candidates` entry (`192.0.2.10:51820`) but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
-| `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint` |
+| `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
 | `bridge.ingress` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
@@ -670,6 +763,13 @@ The `fingerprint` is produced by the mock-internal `policyFingerprint` helper �
 canonicalization is mock-internal: plexd treats the fingerprint as an opaque
 comparison key and never re-derives it from the rules.
 
+The block merges one compiled row, so `revisions` names one pair: the policy id
+`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, which no other fixture uses, and the
+block's own `revision_id`, as the contract has it for the first pair. plexd
+echoes the fingerprint and the pair in its
+[policy status report](#put-v1-nodes-id-policy-status), which the mock then
+answers `applied`.
+
 **Response:** `200 OK`
 
 ```json
@@ -712,6 +812,9 @@ comparison key and never re-derives it from the rules.
         "destination_cidr": "fd00:99::/64",
         "ports": {"from": 443, "to": 443}
       }
+    ],
+    "revisions": [
+      {"policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"}
     ]
   },
   "bridge": {
@@ -1232,6 +1335,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "session_connection_timeout_count": 0,
   "integrity_violation_count": 0,
   "handshake_report_count": 0,
+  "policy_status_count": 0,
   "edge_psk_count": 0,
   "hook_fetch_count": 0,
   "inject_event_count": 0,
@@ -1821,6 +1925,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `session_connection_timeout_count` | `POST /test/session-connect` (relays that waited out `expires_at` without a connection) |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
+| `policy_status_count` | `PUT /v1/nodes/{id}/policy-status` (accepted reports only, `200`) |
 | `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |
 | `hook_fetch_count` | `GET /v1/nodes/{id}/hooks/{name}/versions/{version}` (served `200` versions only) |
 | `inject_event_count` | `POST /test/inject-event` |
