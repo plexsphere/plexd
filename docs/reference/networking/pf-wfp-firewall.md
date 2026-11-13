@@ -93,8 +93,8 @@ pass out quick on utun4 inet6 proto icmp6 from fd00::1 to fd00::/64 icmp6-type {
 pass in quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 no state
 pass out quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 no state
 pass out quick on utun4 inet6 proto icmp6 from fd00::/64 to fd00::/64 icmp6-type { echorep, unreach, toobig, timex, paramprob } no state
-block in quick on utun4 from any to any
-block out quick on utun4 from (utun4) to any
+block in quick on utun4 from any to any label "plexd-default-deny"
+block out quick on utun4 from (utun4) to any label "plexd-default-deny"
 ```
 
 `render` opens the chain with the relay probe line. `renderRule` returns every line of one rule. An allow renders, in this order:
@@ -103,7 +103,7 @@ block out quick on utun4 from (utun4) to any
 2. `pass out` lines for the node's own traffic: `tcp` with `keep state`, `udp` and `icmp` with `no state`. A rule without a protocol renders the `tcp` line and then a `no state` line for every protocol.
 3. Reply mirrors, with source and destination swapped: a `tcp` mirror with `flags A/A` for a rule that names `tcp` or no protocol, a `udp` mirror for one that names `udp` or no protocol, and for every allow the ICMP replies and errors of its family. A rule without addresses gets the ICMP mirror of both families.
 
-A deny renders a `block in` line and a `block out` line. The `block out` line names the interface's own addresses, `(utun4)`, in place of an empty source, so the default deny drops what the node sends and leaves alone what the Mac forwards out of the interface. The engine puts the default deny last, so its two `block` lines follow every `pass` line.
+A deny renders a `block in` line and a `block out` line. The `block out` line names the interface's own addresses, `(utun4)`, in place of an empty source, so the default deny drops what the node sends and leaves alone what the Mac forwards out of the interface. Both lines end in `label "plexd-default-deny"`, the constant `pfDropLabel`, under which pf counts what they drop; see [Drop counters](#drop-counters). No `pass` line carries a label. The engine puts the default deny last, so its two `block` lines follow every `pass` line.
 
 | Element | Meaning |
 |---|---|
@@ -117,6 +117,7 @@ A deny renders a `block in` line and a `block out` line. The `block out` line na
 | `inet`, `inet6` | The family of the rule's addresses. A rule without addresses, the default deny, carries neither and matches both, as does the relay probe line. An ICMP mirror names its own family |
 | `icmp6` | Protocol `icmp` in an IPv6 rule, which means ICMPv6 |
 | `block in`, `block out` | The default deny, the only deny rule the engine builds. pf's default block policy is drop, what the nftables backend expresses as `VerdictDrop` |
+| `label "plexd-default-deny"` | Makes pf keep the packets and bytes the `block` lines drop under one label, which `pfctl -sl` prints and `DropCounts` sums |
 | `any` | An empty address field, `0.0.0.0/0` or `::/0`. Under `0.0.0.0/0` or `::/0` the family keyword stays, so the rule still matches only its own family |
 
 Chains are rendered in name order, so the same desired state always yields the same text. A `nat` rule, when one is configured, is rendered ahead of the chains, because pf requires translation rules before filter rules in a file.
@@ -154,6 +155,7 @@ pf reports a logged packet with the number of the line that matched it, so `rend
 | `pfctl -E` | After the first load | Enables pf and prints a reference token |
 | `pfctl -a com.apple/plexd -F all` | Last chain gone, no NAT | Flushes the anchor |
 | `pfctl -X <token>` | After that flush | Gives plexd's reference back |
+| `pfctl -a com.apple/plexd -sl` | `DropCounts`, once per send or tick of the policy status report | Prints the anchor's labels with their counters, and changes nothing |
 
 The binary is addressed as `/sbin/pfctl`, absolutely, because launchd starts the daemon with a minimal environment in which `pfctl` is not guaranteed to be on `PATH`. Every invocation runs under a 10 second timeout, so a wedged host cannot stall policy enforcement. The anchor is loaded before pf is enabled, so pf never runs with an empty plexd anchor in between.
 
@@ -195,9 +197,22 @@ The name has to be the kernel's. `plexd up` hands the enforcer `Manager.OSInterf
 sudo pfctl -a com.apple/plexd -s rules   # the filter rules plexd loaded
 sudo pfctl -a com.apple/plexd -s nat     # the masquerade rule, if one is configured
 sudo pfctl -s References                 # every holder keeping pf enabled, plexd among them
+sudo pfctl -a com.apple/plexd -sl        # the default deny's counters, which plexd reports
 ```
 
 `pfctl` prints its own normalised form rather than the text plexd loaded: a `block` reads `block drop`, a single port reads `port = 443`, and a dynamic address pool carries a trailing `round-robin`. A `keep state` line reads `flags S/SA keep state`, `from any to any` without ports reads `all`, `icmp6` reads `ipv6-icmp`, and an `icmp-type` or `icmp6-type` list loads as one rule per type. The relay probe's port 9 may read `discard`, its `/etc/services` name.
+
+### Drop counters
+
+`PFController` implements `DropCounter`, so the Enforcer can send what the default deny dropped as `drops` in the [policy status report](./network-policy.md#policy-status-report). `DropCounts(chain)` returns an error for a chain the controller does not hold. Otherwise it runs `pfctl -a com.apple/plexd -sl`, which prints one line per labelled rule of the anchor:
+
+```text
+<label> <evaluations> <packets> <bytes> <per-direction counts...>
+```
+
+It sums fields 3 and 4, the packets and the bytes, of every line whose first field is `plexd-default-deny`, which covers the `block in` and the `block out` line, and ignores a line of any other label. A label line with fewer than four fields, a count that is not a number, an output without any `plexd-default-deny` line and a failed `pfctl` run are errors, each reading `policy: pf: drop counts: <cause>`. pf keeps one anchor for plexd, so the sum covers every chain in it; plexd keeps one policy chain.
+
+The column order is taken from pfctl(8). `TestPFController_RealTraffic` on the `macos-latest` runner proves it: it reads the counts before and after one packet that no rule allows, and fails unless they grew by at least 1 packet and at least that packet's length in bytes. `pfctl -f` replaces the anchor's rules on every apply, so the counters restart from 0 at every install.
 
 ### pflog
 
@@ -281,6 +296,10 @@ The dump lists every filter in the engine. plexd's carry the names `plexd <chain
 
 A rule with `log: true` is enforced on Windows like any other: `buildFilters` gives it the filters an untagged rule gets. plexd logs none of its connections, and every apply that holds a logged rule logs `policy connection logging unavailable, logged rules are enforced without it` at Warn with `chain` and the `error` `policy: wfp: connection logging is not available on Windows`; see [Connection logging](./network-policy.md#connection-logging). The filter engine does record a classify-allow net event under plexd's filter for each such connection while the keyword `FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW` is set, but on the `windows-latest` runner a `FwpmNetEventSubscribe1` subscription delivered none of them, only drop events, so plexd does not read them yet.
 
+### Drop counters on Windows
+
+`WFPController` does not implement `DropCounter`. WFP keeps no per-filter counters, and its drop net events carry no byte count, so the `bytes` the policy status report requires could not be filled. A Windows node's [policy status report](./network-policy.md#policy-status-report) therefore carries no `drops`. `TestWFPController_RealTraffic` checks that the controller is not a `DropCounter`.
+
 ## NAT
 
 `RouteController` embeds `bridge.NATController`, and on both platforms the firewall controller is the backend the route controller delegates to. `cmd/plexd/cmd/up_darwin.go` and `up_windows.go` build one controller and hand the same instance to the enforcer and to the route controller; see [macOS & Windows Route Controllers](../bridge/route-controllers-macos-windows.md#nat).
@@ -319,7 +338,7 @@ Get-NetNat -Name plexd
 
 ## Error prefixes
 
-Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<op>` one of `probe`, `ensure chain`, `apply rules`, `flush chain` and `delete chain`. NAT failures carry the bridge prefixes instead, so a log line reads the same as the Linux one and the route controller's.
+Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<op>` one of `probe`, `ensure chain`, `apply rules`, `flush chain` and `delete chain`, and on macOS also `drop counts`. NAT failures carry the bridge prefixes instead, so a log line reads the same as the Linux one and the route controller's.
 
 | Failure | Prefix |
 |---|---|
@@ -328,6 +347,7 @@ Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<o
 | A rule that does not render | `policy: pf: apply rules: rule <i>:` |
 | A wildcard anchor missing from the main ruleset | `policy: pf: probe: the main ruleset does not reference anchor "com.apple/*"`, and the same for `nat-anchor` |
 | `pfctl -E` without a token line | `policy: pf: <op>: pfctl -E printed no token: "<output>"` |
+| Reading the drop counters | `policy: pf: drop counts:`, for a chain the controller does not hold, a failed `pfctl -sl`, a label line it cannot read, or no `plexd-default-deny` line |
 | Opening the filter engine | `policy: wfp: probe:`, `policy: wfp: <op>: open session:` |
 | Adding the sublayer | `policy: wfp: <op>: add sublayer:` |
 | An empty chain name | `policy: wfp: ensure chain: chain name is empty`, `policy: wfp: apply rules: chain name is empty` |
@@ -396,7 +416,9 @@ The other two concern [connection logging](./network-policy.md#connection-loggin
 
 Both controllers reach the operating system through seams, so every rendered rule and every idempotent case runs on an ordinary unprivileged runner. macOS wires the package's recording runner in place of `pfctl`, which captures each invocation's arguments and its stdin, so a test pins the whole anchor text a change renders. Windows wires a `wfpEngine` fake in place of the session, which records the sublayer, the filters in the order they were added and the deletions, and can be armed to fail a chosen `AddRule`; PowerShell goes through the same recording runner. The fake refuses a filter whose condition names a field its layer does not have, as the engine does, from a per-layer list of the fields plexd uses: a protocol or a port at a forward layer fails a unit test rather than the real one.
 
-`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, `block out quick on <if> from (<if>) to any`, and the logged forms `pass in log ... flags S/SA no state`, `pass out log ... keep state` and `pass in log ... no state`.
+`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, `block out quick on <if> from (<if>) to any label "plexd-default-deny"`, and the logged forms `pass in log ... flags S/SA no state`, `pass out log ... keep state` and `pass in log ... no state`.
+
+The drop counters have unit tests on macOS too. `TestPFController_RenderRuleLines` checks that both `block` lines end in `label "plexd-default-deny"` and that no `pass` line carries a label. `TestPFController_DropCounts` feeds the recording runner `pfctl -sl` output: it sums fields 3 and 4 of two label lines, ignores a line of another label, and returns an error containing `policy: pf: drop counts` for a label line with three fields, a non-numeric count, an output without a label line, a `pfctl` exit status 1, and a chain the controller does not hold.
 
 The connection logging code has unit tests of its own. On macOS they pin the lines `renderRule` returns for a tagged rule of each protocol, the line numbers `render` maps to tags, `parsePflogRecord` over a hand-built `pfloghdr`, and that a reader which fails to open makes `ApplyRules` load the anchor without `log` and log the Warn line. On Windows a unit test pins that a logged rule gets the filters an untagged one gets and that every apply holding one logs the Warn line.
 
@@ -435,9 +457,10 @@ and checks that:
 - an echo request from P draws an echo reply with the same id and sequence;
 - a datagram N sends to P:7005 comes out of the device, and one to P:7007 does not within 2 s;
 - a dial from N to P:7006 puts a SYN on the device, and a dial to P:7008 does not within 2 s;
-- a datagram N sends to P:9, which no rule names, comes out of the device.
+- a datagram N sends to P:9, which no rule names, comes out of the device;
+- on Linux and macOS, `DropCounts("plexd-test")` before and after one packet from P that no rule allows differ by at least 1 packet and at least that packet's length in bytes. On Windows the checks assert instead that the controller is not a `DropCounter`.
 
-The SYN-ACK, the echo and the echo reply are replies to what r0 to r2 let in, so the checks prove each platform's reply path: connection tracking on Linux, the mirrors on macOS and the ALE flow on Windows. When the test ends it closes the device, which ends its reader, before it deletes the chain. The Windows Firewall blocks the unsolicited packets the test injects on its own, so the CI step turns every firewall profile off first with `Set-NetFirewallProfile -All -Enabled False`. plexd's filters sit in a sublayer of their own and do not depend on the Windows Firewall.
+The SYN-ACK, the echo and the echo reply are replies to what r0 to r2 let in, so the checks prove each platform's reply path: connection tracking on Linux, the mirrors on macOS and the ALE flow on Windows. The drop check proves that `DropCounts` reads the default deny's counters on the real kernel, and on macOS it is the proof of the `pfctl -sl` column layout; see [Drop counters](#drop-counters). When the test ends it closes the device, which ends its reader, before it deletes the chain. The Windows Firewall blocks the unsolicited packets the test injects on its own, so the CI step turns every firewall profile off first with `Set-NetFirewallProfile -All -Enabled False`. plexd's filters sit in a sublayer of their own and do not depend on the Windows Firewall.
 
 `TestPFController_RealConnLog` and Linux's `TestNftablesController_RealConnLog` build the same harness, through `newTunTestHarness`, and run `runTunConnLogChecks` (`tunconnlog_test.go`). It sets a recording sink through `ConnReporter`, so the events it checks come from the backend's reader as the kernel reported them, and applies, in chain `plexd-logtest`:
 

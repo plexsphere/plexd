@@ -8,32 +8,33 @@ feature: PXD-0008
 
 The `internal/policy` package enforces network policies on mesh nodes. It translates the control plane's merged policy — a single `{revision_id, fingerprint, rules[]}` block on the `NodeStateSnapshot` envelope — into concrete firewall rules (nftables on Linux, pf on macOS, the Windows Filtering Platform on Windows) for packet-level enforcement.
 
-The package integrates with `internal/reconcile` for periodic convergence and with `internal/api` for real-time SSE-driven policy updates.
+The package integrates with `internal/reconcile` for periodic convergence and with `internal/api` for real-time SSE-driven policy updates and the [policy status report](#policy-status-report) it sends back to the control plane.
 
 > **Peer membership is not a policy concern.** WireGuard peer visibility comes solely from the snapshot `peers` block, applied by `wireguard.ReconcileHandler`. The policy package no longer filters peers: node-ID rule matching and `FilterPeers` have been removed, and policy rules are CIDR-scoped rather than node-ID-scoped.
 
 ## Data Flow
 
 ```
-Control Plane
-      │
-      ▼
-┌──────────────────┐     ┌──────────────┐
-│ NodeStateSnapshot│────▶│ PolicyEngine │
-│  .Policy         │     └──────┬───────┘
-│  (merged block)  │            │
-└──────────────────┘            ▼
-                        ┌──────────────────┐
-                        │BuildFirewallRules│
-                        └───────┬──────────┘
-                                ▼
-                        ┌──────────────────┐
-                        │FirewallController │
-                        │      (nft)        │
-                        └──────────────────┘
+Control Plane ◀─────── PUT /v1/nodes/{node_id}/policy-status ────────┐
+      │                                                              │
+      ▼                                                              │
+┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐   ┌───┴────────────┐
+│ NodeStateSnapshot│──▶│ DispatchHandler │──▶│ Enforcer.Sync │──▶│ StatusReporter │
+│  .Policy         │   └─────────────────┘   └───────┬───────┘   └────────────────┘
+│  (merged block)  │                                 │
+└──────────────────┘                                 ▼
+                                            ┌──────────────────┐
+                                            │   PolicyEngine   │
+                                            │BuildFirewallRules│
+                                            └────────┬─────────┘
+                                                     ▼
+                                            ┌──────────────────┐
+                                            │FirewallController│
+                                            │  (nft, pf, WFP)  │
+                                            └──────────────────┘
 ```
 
-The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. The `PolicyEngine` converts its allow rules into `FirewallRule` entries, and the `Enforcer` applies them via the `FirewallController`. `ReconcileHandler` wires it into the reconciliation loop, rebuilding the ruleset only when the policy fingerprint changes.
+The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. [`DispatchHandler`](#dispatchhandler) hands the block of every successful pull to [`Enforcer.Sync`](#sync), which compares it with its record of what the firewall holds and applies it when it is not the installed ruleset: the `PolicyEngine` converts its allow rules into `FirewallRule` entries, and the `Enforcer` applies them via the `FirewallController`. `Sync` records the outcome in the Enforcer's [`Status`](#status-and-changed): what it enforces, the block it applied, and the block its latest apply failed on, with the reason. A block it could not apply is applied again on the next pull. The [`StatusReporter`](#policy-status-report) sends that record, with the drop counters of the default deny, to the control plane, and the node API serves it as [`GET /v1/policies`](../core/nodeapi.md#get-v1-policies).
 
 ## Config
 
@@ -159,6 +160,24 @@ type ConnEvent struct {
 
 `RelayProbePort` is 9, the UDP port of plexd's [relay liveness probe](./wireguard.md#relay-liveness-probe). Every backend lets the node send UDP to this port over the mesh interface without a rule, ahead of the policy rules. Any local process can do so, to any address the mesh routes, and the receiving node's inbound rules still apply. Without the exemption a narrow policy would fail every probe send, and plexd would notice a dead relay only once the handshake went stale.
 
+### DropCounter
+
+A backend that counts what its default deny drops also implements `DropCounter`. The Enforcer reads the counts through it for the [policy status report](#policy-status-report).
+
+```go
+type DropCounter interface {
+    DropCounts(chain string) (packets, bytes uint64, err error)
+}
+```
+
+`DropCounts` returns the packets and bytes the deny rules of `chain` dropped since the chain was last loaded. The engine's only deny is the default deny, so that is what the default deny dropped. Every apply loads the chain anew, so the counts start from 0 at every install.
+
+| Platform | Backend | Counts |
+|---|---|---|
+| Linux | `NftablesController` | The counters of every rule ending in a drop verdict in the input, forward and output chain; see [DropCounts](./nftables-firewall.md#dropcounts) |
+| macOS | `PFController` | The packets and bytes `pfctl -a com.apple/plexd -sl` prints for the label `plexd-default-deny`, which every `block` line carries; see [Drop counters](./pf-wfp-firewall.md#drop-counters) |
+| Windows | `WFPController` | Does not implement `DropCounter`: WFP keeps no per-filter counters, and its drop events carry no byte count. A Windows node reports no drops; see [Drop counters on Windows](./pf-wfp-firewall.md#drop-counters-on-windows) |
+
 ## PolicyEngine
 
 Translates the merged policy's rules into concrete firewall rules for the local node.
@@ -192,7 +211,7 @@ Every rule is an allow, and rule order carries no meaning: a packet passes when 
 - **Log**: `log: true` asks for the rule's traffic to be logged. Absent and `false` mean the same. The engine translates a logged rule like any other and sets no `LogTag`. The `Enforcer` tags the rule when it applies the ruleset, and plexd then writes one line for each connection the rule allows; see [Connection logging](#connection-logging).
 - **Default deny**: `FirewallRule{Interface: iface, Action: "deny"}` with both addresses empty is always appended as the last rule, including when `rules` is empty or `nil`. Without addresses it covers IPv4 and IPv6, on every backend.
 
-One untranslatable rule rejects the whole revision. The engine returns the error, `ApplyFirewallRules` wraps it in `ErrInvalidRuleset`, and the node keeps the ruleset it enforces (see [Error Handling](#error-handling)). Skipping only that rule would merely narrow an allow-only ruleset, but the node would then enforce a ruleset that matches no revision, and a revision is either applied or rejected (plexsphere/plexd#177).
+One untranslatable rule rejects the whole revision. The engine returns the error, `ApplyFirewallRules` wraps it in `ErrInvalidRuleset`, and the node keeps the ruleset it enforces, reports the revision as rejected, and tries it again on every pull (see [Error Handling](#error-handling)). Skipping only that rule would merely narrow an allow-only ruleset, but the node would then enforce a ruleset that matches no revision, and a revision is either applied or rejected (plexsphere/plexd#177).
 
 A plexd before this release rejects every rule of this format with `unsupported action ""` and keeps its previous ruleset.
 
@@ -212,7 +231,7 @@ func NewEnforcer(
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
-- `firewall` may be `nil` — `ApplyFirewallRules` is a no-op in that case
+- `firewall` may be `nil` — `ApplyFirewallRules` is a no-op in that case, and `Sync` records the enforcement `unavailable`
 - Builds the Enforcer's `ConnLogger` from `logger`. When `firewall` implements [`ConnReporter`](#connreporter), it calls `SetConnSink` with that logger once
 
 ### Methods
@@ -220,13 +239,19 @@ func NewEnforcer(
 | Method              | Signature                                                     | Description                                                        |
 |---------------------|---------------------------------------------------------------|-------------------------------------------------------------------|
 | `Preflight`         | `() error`                                                    | Probes the firewall backend without changing kernel state; no-op when disabled or nil firewall |
-| `ApplyFirewallRules` | `(policy *api.PolicySnapshot, iface string) (bool, error)`   | Builds and applies rules; no-op when disabled or nil firewall. A `nil` policy yields the default-deny-only ruleset. The `bool` reports whether the ruleset actually reached the kernel |
-| `Teardown`          | `() error`                                                    | Flushes and deletes firewall chain; safe with nil firewall        |
+| `ApplyFirewallRules` | `(policy *api.PolicySnapshot, iface string) (bool, error)`   | Builds and applies rules; no-op when disabled or nil firewall. A `nil` policy yields the default-deny-only ruleset. The `bool` reports whether the ruleset actually reached the kernel. On success it records `policy` as the ruleset the backend holds |
+| `Sync`              | `(desired *api.PolicySnapshot, iface string)`                 | Brings the firewall to the policy block of a pull and records the outcome; see [Sync](#sync) |
+| `Status`            | `() Status`                                                   | A deep copy of the Enforcer's record; the zero `Status` before the first `Sync`; see [Status and Changed](#status-and-changed) |
+| `Changed`           | `() <-chan struct{}`                                          | A channel of capacity 1 that `Sync` signals when the reported state moves |
+| `DropCounts`        | `() (packets, bytes uint64, ok bool)`                         | What the installed ruleset's default deny dropped since it was installed; see [DropCounts](#dropcounts) |
+| `Teardown`          | `() error`                                                    | Flushes and deletes firewall chain; safe with nil firewall. Clears the record of the installed and the applied ruleset, and closes the Enforcer: a later `Sync` or `ApplyFirewallRules` touches the backend no more |
 | `ConnLogger`        | `() *ConnLogger`                                              | The logger that writes a line for each connection a logged rule admits; see [Connection logging](#connection-logging) |
 
 The `bool` exists so callers cannot log an enforcement that never happened: both no-op paths return `(false, nil)`, which is indistinguishable from a successful apply on the error value alone.
 
 Before the backend gets the rules, `ApplyFirewallRules` tags the logged ones and moves them ahead of the others; see [Log tags and rule order](#log-tags-and-rule-order).
+
+`Sync`, `ApplyFirewallRules`, `Teardown` and `DropCounts` hold one lock across their backend calls, so the record always describes what the backend holds, and `Status` reads it under the same lock.
 
 ### Preflight
 
@@ -236,13 +261,66 @@ The check exists because the baseline install is fatal but happens *after* regis
 
 `Preflight` mirrors the no-op paths of `ApplyFirewallRules` exactly — with enforcement disabled or no backend compiled in there is no enforcement to be unable to perform — and it never mutates kernel state, so a node that goes on to fail startup for another reason leaves nothing behind.
 
+### Sync
+
+```go
+func (e *Enforcer) Sync(desired *api.PolicySnapshot, iface string)
+```
+
+[`DispatchHandler`](#dispatchhandler) calls `Sync` with the policy block of every successful pull, `nil` for a pull with `policy: null`. `Sync` brings the firewall to that block and records the outcome. It compares the block with the policy the backend holds, which `ApplyFirewallRules` records on every successful apply, `nil` standing for the default deny alone. It decides in this order:
+
+1. It stores a copy of `desired` as `Received` and sets `Synced`.
+2. With enforcement disabled (`policy.enabled: false`) it records the enforcement `disabled`, and without a firewall backend `unavailable`. Either way it clears the applied and the rejected block and touches nothing else. Otherwise the enforcement is `enforcing`.
+3. When a ruleset is installed and `desired` is the same block, both `nil` or both with the same non-empty fingerprint, it makes no kernel call. It records `desired` as applied and clears the rejection. This is how a first pull with `policy: null` is recorded as applied over the startup baseline, and how a pull that changes only `revision_id` or `revisions` under an unchanged fingerprint is adopted. The `ConnLogger` is not told, so connection lines keep the `revision_id` of the install they came from.
+4. When nothing is installed and `desired` is `nil`, it does nothing. That is the node whose startup skipped the baseline because no interface carried the mesh address under the mesh name.
+5. Otherwise it calls `ApplyFirewallRules(desired, iface)`. A block without a fingerprint is never the installed one, so it reaches this step on every pull and logs `policy snapshot carries no fingerprint, ruleset rebuilds every cycle` at Warn with `revision_id`.
+6. On success it records `desired` as applied, clears the rejection, and logs `policy ruleset applied` at Info with `revision_id`, `fingerprint` and `rules`, the rule count.
+7. On failure the applied block stays: every backend replaces its chains whole or leaves them as they were. A block with a fingerprint becomes `Rejected`, with `rejectionReason(err)` as `Reason`. `Attempts` counts up while the fingerprint and the reason repeat, and restarts at 1 otherwise. A `nil` block or one without a fingerprint cannot be named in the policy status report, so its failure clears `Rejected` instead.
+
+A ruleset the engine refuses and a failure of the backend are both recorded as a rejection, with plexd's error text as the reason. The first failure of a fingerprint and reason logs at Error, and every repeat logs `policy revision still rejected` at Debug; see [Error Handling](#error-handling).
+
+DECISION: the retry is the next pull. `Sync` runs on every successful pull, every `reconcile.interval` (60 s by default) and on every trigger, and a block that is not installed is applied again each time. There is no backoff: a ruleset the engine refuses costs one pass over its rules and no kernel call, and a backend failure was retried every cycle when the apply ran as a reconcile handler.
+
+`rejectionReason(err)` makes the error text fit the report's `reason`, which the contract bounds to 1 to 1024 bytes of UTF-8 without control characters. Invalid UTF-8 becomes U+FFFD, every rune from U+0000 to U+001F and U+007F becomes a space, the text is trimmed and cut to at most 1024 bytes on a rune boundary, and an error that leaves nothing reads `apply failed`.
+
+### Status and Changed
+
+```go
+type Status struct {
+    Enforcement string              // api.PolicyEnforcementEnforcing, ...Disabled or ...Unavailable
+    Synced      bool                // Sync ran at least once
+    HasApplied  bool                // a pull's block is applied
+    Applied     *api.PolicySnapshot // that block; nil when the applied pull carried policy: null
+    Received    *api.PolicySnapshot // the block of the latest pull; nil for policy: null
+    Rejected    *api.PolicySnapshot // the block the latest apply failed on; nil when it did not fail
+    Reason      string              // why, as rejectionReason renders the error; "" without Rejected
+    Attempts    int                 // applies of Rejected that failed in a row with the same reason; 0 without Rejected
+}
+```
+
+`Status()` returns a copy whose blocks share no memory with the Enforcer's. Before the first `Sync` it is the zero `Status`. The startup baseline, `ApplyFirewallRules(nil, iface)`, records an installed default deny without setting `HasApplied`, because it is no ruleset of the control plane's. `Teardown` clears `HasApplied`, `Applied` and the rejection, so `Status` no longer claims a ruleset the backend dropped.
+
+`Changed()` returns a channel of capacity 1. `Sync` signals it, without blocking, when it ran for the first time, or when the enforcement, `HasApplied`, the fingerprint or revisions of `Applied`, or the fingerprint, revisions or `Reason` of `Rejected` changed. `Attempts` and `Received` alone signal nothing. Several changes before the reader wakes collapse into one signal, and the reader then reads the latest `Status`.
+
+### DropCounts
+
+```go
+func (e *Enforcer) DropCounts() (packets, bytes uint64, ok bool)
+```
+
+Returns what the installed ruleset's default deny dropped since it was installed. `ok` is false while enforcement is disabled, while nothing is installed, and for a backend that does not implement [`DropCounter`](#dropcounter), a `nil` backend and the Windows one included. Otherwise it reads the counts of `cfg.ChainName` from the backend and remembers them with the install they belong to. An install is an apply the backend accepted: a failed apply leaves the chain and its counters as they were, so the counts it remembered stay those of the install still in place.
+
+A failed read returns the counts remembered for the same install, or `ok == false` when there are none, and logs `policy drop counters unavailable` at Warn with `chain` and `error`, once per run of failures. Returning the remembered counts keeps `drops` in every report of one install: the control plane counts the whole value of a report that follows one without counters, so a gap would count the same drops twice. A new install starts without remembered counts.
+
+The read holds the Enforcer's lock, so the counts always belong to the install it remembers them for. It costs one dump of three chains on Linux and one `pfctl` run on macOS.
+
 ### Behavior by State
 
-| `IsEnabled()` | `firewall` | `Preflight`                  | `ApplyFirewallRules`          | `Teardown`          |
-|---------------|------------|------------------------------|-------------------------------|---------------------|
-| `true`        | non-nil    | Backend probed               | Rules applied, `(true, nil)`  | Chain removed       |
-| `true`        | `nil`      | No-op, `nil`                 | No-op, `(false, nil)`         | No-op               |
-| `false`       | any        | No-op, `nil`                 | No-op, `(false, nil)`         | No-op/chain removed |
+| `IsEnabled()` | `firewall` | `Preflight`                  | `ApplyFirewallRules`          | `Sync`                                         | `Teardown`          |
+|---------------|------------|------------------------------|-------------------------------|------------------------------------------------|---------------------|
+| `true`        | non-nil    | Backend probed               | Rules applied, `(true, nil)`  | Records `enforcing`; applies the block when it is not the installed one | Chain removed       |
+| `true`        | `nil`      | No-op, `nil`                 | No-op, `(false, nil)`         | Records `unavailable`; no backend call         | No-op               |
+| `false`       | any        | No-op, `nil`                 | No-op, `(false, nil)`         | Records `disabled`; no backend call            | No-op/chain removed |
 
 ### Error Prefixes
 
@@ -252,34 +330,42 @@ The check exists because the baseline install is fatal but happens *after* regis
 | `ApplyFirewallRules`| `policy: enforce: `  |
 | `Teardown`          | `policy: teardown: ` |
 
-A ruleset the engine refuses to translate is additionally wrapped in the sentinel `ErrInvalidRuleset`, so callers can distinguish a permanently broken revision (`errors.Is(err, policy.ErrInvalidRuleset)`) from a transient netlink failure. The backend is never touched in that case — the previously installed chain stays in place.
+A ruleset the engine refuses to translate is additionally wrapped in the sentinel `ErrInvalidRuleset`, so callers can distinguish a permanently broken revision (`errors.Is(err, policy.ErrInvalidRuleset)`) from a transient netlink failure. The backend is never touched in that case — the previously installed chain stays in place. `Sync` records both kinds as a rejection and uses the sentinel only to choose its Error line.
 
-## ReconcileHandler
+## DispatchHandler
 
-Factory function returning a `reconcile.ReconcileHandler` that rebuilds the firewall ruleset during reconciliation cycles.
+Factory function returning a `reconcile.DispatchHandler` that hands the policy block of every successful pull to `Enforcer.Sync`.
 
 ```go
-func ReconcileHandler(enforcer *Enforcer, iface string) reconcile.ReconcileHandler
+func DispatchHandler(enforcer *Enforcer, iface string) reconcile.DispatchHandler
 ```
 
-The handler does not touch WireGuard peers — peer membership is owned by `wireguard.ReconcileHandler`. It only rebuilds nftables rules from the merged policy.
+The handler calls `enforcer.Sync(desired.Policy, iface)` and ignores a `nil` snapshot. [`Sync`](#sync) applies the block when it is not the installed ruleset and records the outcome for the [policy status report](#policy-status-report) and the node API. The handler does not touch WireGuard peers: `wireguard.ReconcileHandler` owns peer membership.
 
-### Processing Order
+### Why the Dispatch Seam
 
-1. **Skip check** — if `!diff.PolicyChanged`, return `nil`
-2. **Fingerprint check** — a populated policy block with an empty `fingerprint` logs a warning: the differ treats it as always-changed, so the ruleset is rebuilt every cycle
-3. **Apply firewall rules** — call `Enforcer.ApplyFirewallRules(desired.Policy, iface)`
-4. **Log** — emit `"policy ruleset applied"` with `revision_id`, `fingerprint`, and rule count, but **only** when the enforcer reports the ruleset reached the kernel. A disabled config or a missing firewall backend logs at debug level instead, so the applied-log never claims an enforcement that did not happen
+DECISION: the apply runs on the dispatch seam, on every pull, rather than as a reconcile handler behind the differ's `PolicyChanged`. A reconcile handler could not retry a rejected revision: the reconciler stores the pulled block once the cycle completes, and the differ never offers its fingerprint again. Returning the error instead would hold back every other block of the snapshot. On the dispatch seam a failed apply holds nothing back, and `Sync` compares the pull with what is installed itself, so a rejected block is applied again on the next pull, and a pull with `policy: null` can be recorded as applied over the startup baseline.
+
+The differ still compares the policy block and sets `StateDiff.PolicyChanged`, so a new fingerprint shows as `drift=policy` in the cycle log, but no reconcile handler acts on the flag. Dispatch handlers run before the reconcile handlers, so a new ruleset is installed before the WireGuard handler changes peers in the same cycle. The default deny stands throughout either way.
+
+### Retry
+
+`Sync` runs on every successful pull, every `reconcile.interval` (60 s by default) and on every trigger, such as a `policy_updated` event. A block that is not installed is applied again each time, without a backoff, until it succeeds or the control plane serves another block. While the retry fails, the node enforces the ruleset it applied before, and `Status` names the rejected block, its reason and the attempts in a row.
 
 ### Fingerprint Short-Circuit
 
-`diff.PolicyChanged` is set by the differ, which compares the policy `Fingerprint` byte-for-byte and **never re-derives it from the rules**. A revision-only bump (same fingerprint) leaves `PolicyChanged` false, so this handler — and its `"policy ruleset applied"` log — does not fire and the ruleset is not rebuilt. Only a genuine fingerprint change reapplies rules.
+`Sync` compares the pulled `fingerprint` with the installed ruleset's byte for byte and **never re-derives it from the rules**. A revision-only bump (same fingerprint) makes no kernel call and logs no `policy ruleset applied`. `Sync` records the block as applied all the same, so the policy status report and `GET /v1/policies` name its `revision_id` and `revisions`. A block without a fingerprint has no comparison key and is applied on every pull.
 
 ### Error Handling
 
-Transient `ApplyFirewallRules` failures (netlink, chain creation) propagate so the reconciler holds the snapshot back and retries the ruleset next cycle.
+No apply failure reaches the reconciler: a dispatch handler returns nothing, so the rest of the snapshot converges while the Enforcer retries on its own. The firewall keeps the last successfully applied ruleset, which is fail-closed.
 
-`ErrInvalidRuleset` does **not** propagate. Rules the engine cannot translate are a permanent property of the revision, so returning the error would hold the snapshot back and re-run every handler at the reconcile interval forever, with no chance of the same rules parsing on a later attempt. The handler logs `"policy revision rejected, keeping previous ruleset"` at error level and returns `nil` so the rest of the snapshot converges. The firewall keeps the last successfully applied ruleset, which is fail-closed; the rejected revision is retried only when the control plane publishes a new fingerprint.
+`Sync` records a failed apply of a block with a fingerprint as `Rejected` and applies it again on every pull. The first failure of a fingerprint and reason logs at Error, with `revision_id`, `fingerprint` and `error`:
+
+- `policy revision rejected, keeping previous ruleset` for a ruleset the engine refuses (`ErrInvalidRuleset`). Its rules are a permanent property of the revision, so the same block fails on every pull until the control plane serves another.
+- `reconcile: apply firewall rules failed` for a failure of the backend, such as a netlink error.
+
+Every repeat of the same fingerprint and reason logs `policy revision still rejected` at Debug with `revision_id`, `fingerprint` and `attempts`, so a revision stuck behind the retry does not repeat its Error every minute. A successful apply resets this, and the next failure logs at Error again. A failure with another reason logs at Error and restarts `attempts` at 1.
 
 ### Registration
 
@@ -287,8 +373,10 @@ Transient `ApplyFirewallRules` failures (netlink, chain creation) propagate so t
 enforcer := policy.NewEnforcer(engine, fwCtrl, policy.Config{}, logger)
 
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
+r.RegisterDispatchHandler(policy.DispatchHandler(enforcer, "plexd0"))
 ```
+
+`plexd up` registers it on every node, after every other dispatch handler and so ahead of every reconcile handler.
 
 ## HandlePolicyUpdated
 
@@ -330,7 +418,8 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 - Every rule is an allow and rule order carries no meaning. The default stance is **deny-all**: the ruleset always ends with a default-deny rule that covers IPv4 and IPv6, and a `null` policy applies the default-deny-only ruleset.
 - Rules may name IPv4 or IPv6 prefixes on Linux, macOS and Windows. A peer's allowed IPs are its IPv4 mesh address alone today, so an IPv6 rule governs IPv6 traffic only once the mesh carries it.
 - Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped, not node-ID references.
-- On a genuine policy change (fingerprint mismatch), plexd rebuilds the nftables ruleset from the merged policy. Revision-only bumps short-circuit and leave the ruleset untouched.
+- On every successful pull plexd compares the block's fingerprint with the installed ruleset's and rebuilds the ruleset only when they differ. Revision-only bumps short-circuit and leave the ruleset untouched. A block plexd could not apply is applied again on every pull, and the node keeps the ruleset it applied before in the meantime.
+- plexd reports what it enforces, the ruleset it applied, the one its latest apply failed on and the drop counters of its default deny to the control plane; see [Policy status report](#policy-status-report).
 
 ## Connection logging
 
@@ -426,30 +515,120 @@ func NewConnLogger(logger *slog.Logger) *ConnLogger
 | `Run(ctx context.Context)` | Logs `policy connection lines dropped` once a minute when either count is above 0, and resets both. Returns when `ctx` ends |
 | `ForwardTo(fn func(ts time.Time, severity, message string))` | Also hands every line and summary to `fn`, with severity `info` or `warning` and the record as `slog.TextHandler` renders it, without the trailing newline. A nil `fn` stops forwarding |
 
+## Policy status report
+
+`StatusReporter` sends the Enforcer's record to the control plane as [`PUT /v1/nodes/{node_id}/policy-status`](../core/api-endpoints.md#policy-status): what the node enforces, the ruleset it applied, the ruleset its latest apply failed on and why, and how many packets and bytes its default deny dropped. Without the report the control plane cannot tell a ruleset the node applied from one it refused. The control plane derives the node's policy status from it, `applied`, `pending`, `rejected` or `not_enforced`, and logs every change of what the node enforces.
+
+```go
+type StatusClient interface {
+    ReportPolicyStatus(ctx context.Context, nodeID string, req api.PolicyStatusRequest) (*api.PolicyStatusResponse, error)
+}
+
+func NewStatusReporter(interval time.Duration, nodeID string, client StatusClient, enforcer *Enforcer, logger *slog.Logger) *StatusReporter
+func (r *StatusReporter) Run(ctx context.Context) error
+```
+
+`*api.ControlPlane` satisfies `StatusClient`. A non-positive interval becomes 30 s, the default heartbeat interval. `plexd up` starts the reporter on every node, after the relay status reporter, at `heartbeat.interval`. No configuration key turns it on or off: a node with `policy.enabled: false` reports `disabled`. Its log lines carry `component=policy`, and `Run` logs `policy status: reporter started` at Info with `interval` when it starts.
+
+### What a report carries
+
+`buildPolicyStatusRequest` builds every report from the Enforcer's [`Status`](#status-and-changed) and its [`DropCounts`](#dropcounts):
+
+| Member | Content |
+|---|---|
+| `enforcement` | `Status.Enforcement`: `enforcing`, `disabled` or `unavailable` |
+| `applied` | Set while `HasApplied` is: `{"revisions": []}`, without a fingerprint, for an applied pull with `policy: null`, and the block's `fingerprint` and `revisions` for a block with a fingerprint. Left out for an applied block without a fingerprint, which cannot be echoed, and while no pull's block is applied |
+| `rejected` | Set while `Rejected` is: its `fingerprint` and `revisions`, and `Reason` as `reason` |
+| `drops` | Set when `DropCounts` returns `ok`: `packets` and `bytes`, each capped at `math.MaxInt64` |
+
+`revisions` go out as the pull listed them. A block from a control plane that sends none goes out with `[]`, because the contract refuses `null`. For a node that applied one block and rejected the next:
+
+```json
+{
+  "enforcement": "enforcing",
+  "applied": {
+    "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM0=",
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" }
+    ]
+  },
+  "rejected": {
+    "fingerprint": "q7vZ4Zx0d8nU1m3oW5bJk2pQ9rT6yH4sL0aE8cV1fG4=",
+    "revisions": [
+      { "policy_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2" }
+    ],
+    "reason": "policy: enforce: policy: invalid ruleset: policy: rule 0: unsupported action \"deny\""
+  },
+  "drops": { "packets": 5, "bytes": 500 }
+}
+```
+
+### When a report is sent
+
+- On every signal of `Enforcer.Changed()`: after the first `Sync`, and on every change of the enforcement, of the applied block, or of the rejected block or its reason. The interval restarts after such a send.
+- On a tick of the interval, only when no report of the current state was accepted yet, which is the case after a failed send, or when the drop counters differ from the ones the control plane accepted last. A quiet node sends nothing, so the age of its last report is no liveness signal.
+- Nothing before the Enforcer's first `Sync`: until then plexd has seen no pull and could only report the startup baseline, which is no ruleset of the control plane's.
+- Nothing at shutdown: the contract defines no such report, and the control plane keeps the last one. `Run` returns `nil` when its context ends.
+
+A change of `Attempts` alone sends nothing. Every send and every tick reads the drop counters once, so a quiet node costs one dump of three chains on Linux, or one `pfctl` run on macOS, per heartbeat interval.
+
+DECISION: the reporter sends from a goroutine of its own, one report at a time, never from inside the dispatch handler, so a slow control plane never delays a reconcile cycle. This follows the [relay status reporter](../bridge/nat-relay.md#relay-status-report).
+
+### Answers
+
+| Answer | Log line | Level | Then |
+|---|---|---|---|
+| `200` | `policy status: reported`, with `enforcement`, `status` (the answer's), `applied_fingerprint` and `rejected_fingerprint` | Info for the first accepted report and when what the node applied, rejected or enforces changed since the last one; Debug when only the counters did | The report counts as accepted |
+| `200` after a `501 policy_status_not_provisioned` | `policy status: control plane accepts policy status reports`, ahead of the line above | Info | As for any `200` |
+| `404` with any code but `policy_status_node_gone`, which `api.IsPolicyStatusNotServed` classifies | `policy status: control plane does not accept policy status reports, not reporting until restart`, with `status` and `code` | Info, once | No further report until plexd restarts, as the contract asks |
+| `501 policy_status_not_provisioned`, which `api.IsPolicyStatusNotProvisioned` classifies | `policy status: control plane has not provisioned policy status reports, retrying every interval`, with `status` and `code` | Info, once until a report is accepted | Every tick sends again |
+| `api.ErrCredentialRefused` | `policy status: send failed`, with `error` | Debug, because the heartbeat names the cause when it parks the agent | The next tick sends again |
+| `404 policy_status_node_gone` | `policy status: rejected, this node was removed`, with `code` | Warn, on every send | The next tick sends again |
+| Any other failure: `400`, `401`, `403`, `413`, `500`, `503`, a `501` with another code, a transport error or a timeout | `policy status: send failed`, with `error` | Warn | The next tick sends again |
+
+An error that arrives once the reporter's context is done is the shutdown itself and is not logged.
+
+### Drop counters
+
+Linux and macOS send `drops`. Windows never does: WFP keeps no per-filter counters and its drop events carry no byte count, so the contract's required `bytes` could not be filled. [DropCounter](#dropcounter) lists what each backend counts. On every platform `drops` is left out while enforcement is disabled or unavailable and while nothing is installed.
+
+The counters start from 0 at every install, and the control plane reads a value below the previous one as a restart of the count. Within one install a failed read sends the counts read last; see [DropCounts](#dropcounts).
+
 ## Integration Points
 
 ### Reconciliation Loop
 
-The policy reconcile handler plugs into `internal/reconcile` alongside the WireGuard handler. Both are invoked sequentially on each cycle:
+The policy dispatch handler plugs into `internal/reconcile` on the dispatch seam, so it runs on every successful pull, ahead of the WireGuard reconcile handler and every other reconcile handler:
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
+r.RegisterDispatchHandler(policy.DispatchHandler(enforcer, "plexd0"))
 r.RegisterHandler(wireguard.ReconcileHandler(mgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 ```
 
 ### SSE Real-Time Updates
 
-`HandlePolicyUpdated` triggers reconciliation when the control plane pushes a `policy_updated` event. The reconciliation cycle then pulls a fresh snapshot and re-applies the merged policy if its fingerprint changed.
+`HandlePolicyUpdated` triggers reconciliation when the control plane pushes a `policy_updated` event. The reconciliation cycle then pulls a fresh snapshot, and the dispatch handler hands its policy block to `Sync`, which applies it when it is not the installed ruleset.
+
+### Status Reporter
+
+`plexd up` runs the [`StatusReporter`](#policy-status-report) on its own goroutine beside the reconciler. It reads the Enforcer's `Status` on every `Changed` signal and on every tick, and sends through the shared control plane client.
+
+### Node API
+
+`GET /v1/policies` serves the same record as the report: the applied block, the enforcement, the latest pull's block, and whether the two are the same block (`in_sync`). `plexd policies` prints it; see [`GET /v1/policies`](../core/nodeapi.md#get-v1-policies) and [`plexd policies`](../core/cli.md#plexd-policies).
 
 ### Control Plane Types
 
 | Type             | Package        | Usage                                                     |
 |------------------|----------------|-----------------------------------------------------------|
-| `api.PolicySnapshot` | `internal/api` | Merged policy block `{revision_id, fingerprint, rules[]}` |
+| `api.PolicySnapshot` | `internal/api` | Merged policy block `{revision_id, fingerprint, rules[], revisions[]}`; `Clone` deep-copies it |
+| `api.PolicyRevisionRef` | `internal/api` | One `{policy_id, revision_id}` pair of the block's `revisions`, echoed in the report |
 | `api.PolicyRule` | `internal/api` | Allow rule: `protocol`, `source_cidr`, `destination_cidr`, `ports?`, `log?`; a legacy `action` key lands in `LegacyAction` |
 | `api.PortRange`  | `internal/api` | Inclusive destination port range `{from, to}`             |
 | `api.NodeStateSnapshot` | `internal/api` | Desired-state envelope from the control plane        |
+| `api.PolicyStatusRequest` | `internal/api` | The policy status report: `enforcement`, `applied?`, `rejected?`, `drops?` |
+| `api.PolicyStatusResponse` | `internal/api` | The report's `200` body: `accepted_at`, `status` |
 | `api.Envelope` | `internal/api` | SSE event wrapper                                     |
 | `api.EventPolicyUpdated` | `internal/api` | Event type constant `"policy_updated"`            |
 
@@ -463,3 +642,5 @@ if err := enforcer.Teardown(); err != nil {
     logger.Warn("policy teardown failed", "error", err)
 }
 ```
+
+`Teardown` also clears the Enforcer's record of the installed and the applied ruleset, so `Status` no longer claims a ruleset the backend dropped, and it closes the Enforcer. `plexd up` tears the chain down before it waits for the reconciler, which can still be inside a cycle whose pull it fetched before the shutdown; a closed Enforcer makes the `Sync` of that pull, and any `ApplyFirewallRules`, a no-op, so the chain is not installed again. The status reporter sends no report at shutdown: `Run` returns `nil` when its context ends, and the control plane keeps the last report.
