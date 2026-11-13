@@ -73,23 +73,7 @@ func copyPeers(src []api.SnapshotPeer) []api.SnapshotPeer {
 }
 
 func copyPolicy(src *api.PolicySnapshot) *api.PolicySnapshot {
-	if src == nil {
-		return nil
-	}
-	cp := *src
-	cp.Rules = copyRules(src.Rules)
-	return &cp
-}
-
-func copyRules(src []api.PolicyRule) []api.PolicyRule {
-	dst := slices.Clone(src)
-	for i := range dst {
-		if src[i].Ports != nil {
-			pr := *src[i].Ports
-			dst[i].Ports = &pr
-		}
-	}
-	return dst
+	return src.Clone()
 }
 
 func copyBridge(src *api.BridgeSnapshot) *api.BridgeSnapshot {

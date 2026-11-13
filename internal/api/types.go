@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"time"
 )
 
@@ -322,6 +323,40 @@ type PolicySnapshot struct {
 	RevisionID  string       `json:"revision_id"`
 	Fingerprint string       `json:"fingerprint"`
 	Rules       []PolicyRule `json:"rules"`
+	// Revisions names the (Policy, revision) pair of every compiled row the
+	// block merges, in ascending policy_id, the order Fingerprint covers. A
+	// control plane before plexsphere/plexsphere#1059 sends none. plexd echoes
+	// the pairs in its policy status report and never parses them.
+	Revisions []PolicyRevisionRef `json:"revisions,omitempty"`
+}
+
+// PolicyRevisionRef names one revision of one Policy. Both ids are UUIDs that
+// plexd passes through as strings.
+type PolicyRevisionRef struct {
+	PolicyID   string `json:"policy_id"`
+	RevisionID string `json:"revision_id"`
+}
+
+// Clone returns a deep copy of p: its Rules, each rule's Ports and
+// LegacyAction, and its Revisions share no memory with p. A nil p yields nil.
+func (p *PolicySnapshot) Clone() *PolicySnapshot {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Rules = slices.Clone(p.Rules)
+	for i := range cp.Rules {
+		if p.Rules[i].Ports != nil {
+			ports := *p.Rules[i].Ports
+			cp.Rules[i].Ports = &ports
+		}
+		if p.Rules[i].LegacyAction != nil {
+			action := *p.Rules[i].LegacyAction
+			cp.Rules[i].LegacyAction = &action
+		}
+	}
+	cp.Revisions = slices.Clone(p.Revisions)
+	return &cp
 }
 
 // PolicyRule allows the traffic from SourceCIDR to DestinationCIDR that its
@@ -1198,6 +1233,77 @@ type RelayStatusRequest struct {
 type RelayStatusResponse struct {
 	// AcceptedAt is the server receive time BoundSeconds was anchored on.
 	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// ---------------------------------------------------------------------------
+// Policy Status  PUT /v1/nodes/{node_id}/policy-status
+// ---------------------------------------------------------------------------
+
+// Enforcement values of a PolicyStatusRequest.
+const (
+	// PolicyEnforcementEnforcing marks a node that programs the rulesets it
+	// applies, with its default deny after them.
+	PolicyEnforcementEnforcing = "enforcing"
+	// PolicyEnforcementDisabled marks a node whose local configuration turned
+	// enforcement off (policy.enabled: false).
+	PolicyEnforcementDisabled = "disabled"
+	// PolicyEnforcementUnavailable marks a node that enforces but has no
+	// firewall backend that can program rules.
+	PolicyEnforcementUnavailable = "unavailable"
+)
+
+// PolicyStatusRequest is the body of PUT /v1/nodes/{node_id}/policy-status:
+// what the node did with the policy block of its pulls. The control plane
+// decodes it with unknown members refused, refuses a missing or null required
+// member with 400 invalid_policy_status, and a member of the wrong JSON type
+// with 400 malformed_policy_status.
+type PolicyStatusRequest struct {
+	// Enforcement is one of the PolicyEnforcement* constants.
+	Enforcement string `json:"enforcement"`
+	// Applied is the ruleset the node applied last; nil when it applied none
+	// since its agent started.
+	Applied *PolicyStatusApplied `json:"applied,omitempty"`
+	// Rejected is the ruleset the node's latest apply failed on; nil when the
+	// latest apply did not fail.
+	Rejected *PolicyStatusRejected `json:"rejected,omitempty"`
+	// Drops are the default deny's counters; nil when the firewall backend
+	// does not count drops.
+	Drops *PolicyStatusDrops `json:"drops,omitempty"`
+}
+
+// PolicyStatusApplied echoes the policy block a node applied. Fingerprint is
+// empty, and so absent on the wire, when the pull carried policy: null.
+// Revisions is required; ReportPolicyStatus sends a nil one as [].
+type PolicyStatusApplied struct {
+	Fingerprint string              `json:"fingerprint,omitempty"`
+	Revisions   []PolicyRevisionRef `json:"revisions"`
+}
+
+// PolicyStatusRejected echoes the policy block a node's latest apply failed
+// on, and why. Every member is required; ReportPolicyStatus sends a nil
+// Revisions as []. Reason holds 1 to 1024 bytes of UTF-8 without control
+// characters.
+type PolicyStatusRejected struct {
+	Fingerprint string              `json:"fingerprint"`
+	Revisions   []PolicyRevisionRef `json:"revisions"`
+	Reason      string              `json:"reason"`
+}
+
+// PolicyStatusDrops counts what the node's default deny dropped since its
+// agent last installed the ruleset. A counter below its previous report tells
+// the control plane that the count restarted.
+type PolicyStatusDrops struct {
+	Packets int64 `json:"packets"`
+	Bytes   int64 `json:"bytes"`
+}
+
+// PolicyStatusResponse is the 200 body of PUT /v1/nodes/{node_id}/policy-status.
+type PolicyStatusResponse struct {
+	// AcceptedAt is the server receive time the report is stored with.
+	AcceptedAt time.Time `json:"accepted_at"`
+	// Status is the policy status the report derives against the ruleset the
+	// pull serves: applied, pending, rejected or not_enforced.
+	Status string `json:"status"`
 }
 
 // ---------------------------------------------------------------------------

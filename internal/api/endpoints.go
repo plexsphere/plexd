@@ -242,6 +242,35 @@ func (c *ControlPlane) ReportRelayStatus(ctx context.Context, nodeID string, req
 	return &resp, nil
 }
 
+// ReportPolicyStatus reports what the node did with the policy block of its
+// pulls and returns the control plane's receipt.
+//
+// The contract refuses a null revisions list, so a nil Revisions in Applied or
+// Rejected is sent as [], on a copy: the caller's request is left as passed.
+// It validates nothing else: the policy status reporter builds only the shapes
+// the contract admits, and the control plane refuses any other with
+// 400 invalid_policy_status or malformed_policy_status.
+// PUT /v1/nodes/{node_id}/policy-status
+func (c *ControlPlane) ReportPolicyStatus(ctx context.Context, nodeID string, req PolicyStatusRequest) (*PolicyStatusResponse, error) {
+	body := req
+	if req.Applied != nil && req.Applied.Revisions == nil {
+		applied := *req.Applied
+		applied.Revisions = []PolicyRevisionRef{}
+		body.Applied = &applied
+	}
+	if req.Rejected != nil && req.Rejected.Revisions == nil {
+		rejected := *req.Rejected
+		rejected.Revisions = []PolicyRevisionRef{}
+		body.Rejected = &rejected
+	}
+	var resp PolicyStatusResponse
+	path := fmt.Sprintf("/v1/nodes/%s/policy-status", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPut, path, body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // FetchState retrieves the desired-state snapshot for a node.
 // GET /v1/nodes/{node_id}/state
 func (c *ControlPlane) FetchState(ctx context.Context, nodeID string) (*NodeStateSnapshot, error) {

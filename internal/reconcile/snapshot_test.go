@@ -22,6 +22,7 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 			Rules: []api.PolicyRule{
 				{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 			},
+			Revisions: []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-1"}},
 		},
 		Bridge: &api.BridgeSnapshot{
 			UserAccess: &api.UserAccessConfig{
@@ -122,6 +123,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	desired.Peers[0].EndpointCandidates[0] = "mutated"
 	desired.Policy.Rules[0].SourceCIDR = "mutated"
 	desired.Policy.Rules[0].Ports.From = 8443
+	desired.Policy.Revisions[0].RevisionID = "mutated"
 	desired.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
 	desired.Bridge.SiteToSite.Tunnels[0].LocalSubnets[0] = "mutated"
 	desired.State.Metadata[0].Value = "mutated"
@@ -143,6 +145,9 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	}
 	if got.Policy.Rules[0].Ports.From == 8443 {
 		t.Error("Policy rule port range pointer was not deep-copied on Update")
+	}
+	if len(got.Policy.Revisions) != 1 || got.Policy.Revisions[0].RevisionID != "rev-1" {
+		t.Errorf("Policy revisions = %+v, want the stored [{pol-1 rev-1}] unaffected by the source", got.Policy.Revisions)
 	}
 	if got.Bridge.UserAccess.Peers[0].AllowedIPs[0] == "mutated" {
 		t.Error("Bridge user access AllowedIPs were not copied on Update")
