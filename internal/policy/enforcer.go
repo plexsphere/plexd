@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -24,10 +25,42 @@ type Enforcer struct {
 	logger   *slog.Logger
 	connLog  *ConnLogger
 
+	// mu guards every field below. Sync, ApplyFirewallRules, Teardown and
+	// DropCounts hold it across their backend calls, so the record always
+	// describes what the backend holds.
+	mu sync.Mutex
+
 	// generation counts the applies that got past the engine. It names an
 	// apply in the log tags, so a tag from one ruleset never names a rule of
 	// another.
 	generation uint64
+
+	// installed is the policy the backend holds, nil standing for the
+	// default deny alone; hasInstalled tells whether the backend holds a
+	// ruleset of plexd's at all. installs counts the applies the backend
+	// accepted, so it names the install whose counters the backend keeps: a
+	// failed apply leaves the chain, and its counters, as they were.
+	installed    *api.PolicySnapshot
+	hasInstalled bool
+	installs     uint64
+
+	// closed is set by Teardown. A closed Enforcer touches the backend no
+	// more, so a pull that the reconciler dispatches while plexd shuts down
+	// cannot install the chain Teardown removed.
+	closed bool
+
+	// status is what Status returns; changed carries Sync's signal.
+	status  Status
+	changed chan struct{}
+
+	// failKey names the last failed apply, its fingerprint and reason, so a
+	// repeat logs at Debug; it is empty after a successful apply.
+	failKey string
+
+	// lastDrops are the drop counts read last, and dropsFailing tells
+	// whether the latest reads failed, so the failure is logged once.
+	lastDrops    dropCounts
+	dropsFailing bool
 }
 
 // NewEnforcer creates an Enforcer. The firewall parameter may be nil if no
@@ -42,6 +75,7 @@ func NewEnforcer(engine *PolicyEngine, firewall FirewallController, cfg Config, 
 		cfg:      cfg,
 		logger:   logger.With("component", "policy"),
 		connLog:  NewConnLogger(logger),
+		changed:  make(chan struct{}, 1),
 	}
 	if reporter, ok := firewall.(ConnReporter); ok {
 		reporter.SetConnSink(e.connLog)
@@ -84,7 +118,22 @@ func (e *Enforcer) ConnLogger() *ConnLogger {
 // that allows it. The backends see the reordered list, so a WFP filter's #<i>
 // and a pf line's position follow it, while a line's rule stays the revision
 // index.
+//
+// A successful apply records the policy as the one the backend holds, which
+// Sync compares the next pull against. It does not count as applying a
+// pull's block: the startup baseline, ApplyFirewallRules(nil, iface), leaves
+// Status's HasApplied false until Sync adopts a pull.
 func (e *Enforcer) ApplyFirewallRules(policy *api.PolicySnapshot, iface string) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return false, nil
+	}
+	return e.applyLocked(policy, iface)
+}
+
+// applyLocked is ApplyFirewallRules with e.mu held.
+func (e *Enforcer) applyLocked(policy *api.PolicySnapshot, iface string) (bool, error) {
 	if !e.cfg.IsEnabled() {
 		return false, nil
 	}
@@ -127,6 +176,9 @@ func (e *Enforcer) ApplyFirewallRules(policy *api.PolicySnapshot, iface string) 
 		return false, fmt.Errorf("policy: enforce: %w", err)
 	}
 
+	e.installed = policy.Clone()
+	e.hasInstalled = true
+	e.installs++
 	e.logger.Info("applied firewall rules", "count", len(fwRules), "chain", e.cfg.ChainName)
 	return true, nil
 }
@@ -164,8 +216,21 @@ func (e *Enforcer) Preflight() error {
 }
 
 // Teardown removes the firewall chain and its rules. It is safe to call when
-// the firewall backend is nil.
+// the firewall backend is nil. It clears the record of what is installed and
+// applied, so Status no longer claims a ruleset the backend dropped, and
+// closes the Enforcer: Sync and ApplyFirewallRules touch the backend no more.
+//
+// DECISION: plexd up tears the chain down before it waits for the
+// reconciler, which can still be inside a cycle whose pull it fetched before
+// the shutdown. The dispatch handler syncs every pull, so without the close
+// that cycle would install the chain again after Teardown removed it.
 func (e *Enforcer) Teardown() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closed = true
+	e.installed, e.hasInstalled = nil, false
+	e.status.HasApplied, e.status.Applied = false, nil
+	e.clearRejectedLocked()
 	if e.firewall == nil {
 		return nil
 	}

@@ -316,6 +316,15 @@ type ConnReporter interface {
 	SetConnSink(sink ConnSink)
 }
 
+// DropCounter is implemented by a FirewallController that counts what the
+// deny rules of a chain dropped since the chain was last loaded. The engine's
+// only deny is the default deny, so the count is what the default deny
+// dropped. The Enforcer reports it to the control plane; a backend without it
+// reports no drops.
+type DropCounter interface {
+	DropCounts(chain string) (packets, bytes uint64, err error)
+}
+
 // FirewallController abstracts OS-level iptables operations for testability.
 type FirewallController interface {
 	// Probe reports whether the backend is usable, without changing any kernel

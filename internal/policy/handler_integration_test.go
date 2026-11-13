@@ -143,7 +143,7 @@ func TestIntegration_PolicyEnforcementFlow(t *testing.T) {
 	fetcher := &integrationStateFetcher{state: state}
 
 	reconciler := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, testLogger())
-	reconciler.RegisterHandler(ReconcileHandler(enforcer, "wg0"))
+	reconciler.RegisterDispatchHandler(DispatchHandler(enforcer, "wg0"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +177,7 @@ func TestIntegration_FingerprintShortCircuit(t *testing.T) {
 	)}
 
 	reconciler := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, testLogger())
-	reconciler.RegisterHandler(ReconcileHandler(enforcer, "wg0"))
+	reconciler.RegisterDispatchHandler(DispatchHandler(enforcer, "wg0"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -225,7 +225,7 @@ func TestIntegration_SSEPolicyUpdatedTriggersReconcile(t *testing.T) {
 	)}
 
 	reconciler := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, testLogger())
-	reconciler.RegisterHandler(ReconcileHandler(enforcer, "wg0"))
+	reconciler.RegisterDispatchHandler(DispatchHandler(enforcer, "wg0"))
 
 	dispatcher := api.NewEventDispatcher(testLogger())
 	dispatcher.Register(api.EventPolicyUpdated, HandlePolicyUpdated(reconciler))
@@ -273,7 +273,7 @@ func TestIntegration_ConcurrentPolicyChangesNoRace(t *testing.T) {
 	}
 
 	reconciler := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: 30 * time.Millisecond}, testLogger())
-	reconciler.RegisterHandler(ReconcileHandler(enforcer, "wg0"))
+	reconciler.RegisterDispatchHandler(DispatchHandler(enforcer, "wg0"))
 
 	dispatcher := api.NewEventDispatcher(testLogger())
 	dispatcher.Register(api.EventPolicyUpdated, HandlePolicyUpdated(reconciler))
@@ -335,8 +335,9 @@ func (f *alternatingStateFetcher) getFetchCount() int {
 // TestIntegration_LegacyDenyRejectedKeepsPrevious drives a revision whose rule
 // still carries a deny through a real Reconciler. The engine rejects it, the
 // firewall keeps the ruleset it had, and the cycle completes without a failed
-// handler, so the snapshot moves on and the next cycle finds no drift instead
-// of rejecting the same revision again.
+// handler, so the snapshot moves on and the next cycle finds no drift. The
+// Enforcer tries the revision again on that pull, but logs the repeat at
+// Debug under another message, so the Error line stays one.
 func TestIntegration_LegacyDenyRejectedKeepsPrevious(t *testing.T) {
 	const (
 		rejected  = `msg="policy revision rejected, keeping previous ruleset"`
@@ -354,7 +355,7 @@ func TestIntegration_LegacyDenyRejectedKeepsPrevious(t *testing.T) {
 	)}
 
 	reconciler := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, logger)
-	reconciler.RegisterHandler(ReconcileHandler(enforcer, "wg0"))
+	reconciler.RegisterDispatchHandler(DispatchHandler(enforcer, "wg0"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -390,6 +391,69 @@ func TestIntegration_LegacyDenyRejectedKeepsPrevious(t *testing.T) {
 	<-done
 
 	if got := logs.count(rejected); got != 1 {
-		t.Errorf("rejection lines = %d after another cycle, want 1 (snapshot not held back)", got)
+		t.Errorf("rejection lines = %d after another cycle, want 1 (the retry logs at Debug)", got)
+	}
+}
+
+// TestIntegration_RejectedRevisionRetriedEveryPull serves one rejected
+// revision on three pulls through a real Reconciler. The firewall keeps the
+// ruleset it had, the Enforcer counts three failed applies of that revision,
+// and the reconciler still stores the pull, so the pulls after the first
+// rejection find no drift.
+func TestIntegration_RejectedRevisionRetriedEveryPull(t *testing.T) {
+	const (
+		completed = `msg="reconciliation cycle completed"`
+		noDrift   = `msg="no drift detected"`
+		retried   = `msg="policy revision still rejected"`
+	)
+
+	fw := &countingFirewall{}
+	logs := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	enforcer := NewEnforcer(NewPolicyEngine(logger), fw, Config{Enabled: boolPtr(true), ChainName: "TEST"}, logger)
+
+	fetcher := &integrationStateFetcher{state: snapshotWithPolicy("fp-1",
+		api.PolicyRule{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.5/32", Ports: &api.PortRange{From: 443, To: 443}},
+	)}
+
+	reconciler := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, logger)
+	reconciler.RegisterDispatchHandler(DispatchHandler(enforcer, "wg0"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- reconciler.Run(ctx, "node-a") }()
+
+	waitForCondition(t, 2*time.Second, func() bool { return logs.count(completed) >= 1 })
+
+	fetcher.setState(snapshotWithPolicy("fp-2",
+		api.PolicyRule{LegacyAction: legacyAction("deny"), Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.5/32"},
+	))
+	for pulls := 1; pulls <= 3; pulls++ {
+		before := fetcher.getFetchCount()
+		reconciler.TriggerReconcile()
+		waitForCondition(t, 2*time.Second, func() bool { return enforcer.Status().Attempts >= pulls })
+		if got := fetcher.getFetchCount(); got != before+1 {
+			t.Fatalf("FetchState calls = %d, want %d", got, before+1)
+		}
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return logs.count(noDrift) >= 2 })
+
+	cancel()
+	<-done
+
+	st := enforcer.Status()
+	if st.Rejected == nil || st.Rejected.Fingerprint != "fp-2" || st.Attempts != 3 {
+		t.Errorf("Status() = %+v, want fp-2 rejected after 3 attempts", st)
+	}
+	if st.Applied == nil || st.Applied.Fingerprint != "fp-1" {
+		t.Errorf("Applied = %+v, want fp-1 kept", st.Applied)
+	}
+	if got := fw.applyCount(); got != 1 {
+		t.Errorf("apply count = %d, want 1 (previous ruleset kept)", got)
+	}
+	if got := logs.count(retried); got != 2 {
+		t.Errorf("retry lines = %d, want 2 (the first failure logs at Error)", got)
 	}
 }
