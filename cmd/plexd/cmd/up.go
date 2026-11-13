@@ -1279,6 +1279,21 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
+	// 17e. Start the policy status reporter. It sends what the policy
+	// dispatch handler records on the Enforcer from a goroutine of its own, so
+	// a slow control plane never delays a reconcile cycle: a report on every
+	// change of what the node applied, rejected or enforces, and on a tick of
+	// the heartbeat's interval only when the drop counters moved or the last
+	// send failed. It sends nothing before the first pull and nothing at
+	// shutdown, and a control plane without the route ends it until plexd
+	// restarts.
+	policyStatusReporter := policy.NewStatusReporter(statusInterval, identity.NodeID, client, enforcer, logger)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = policyStatusReporter.Run(ctx)
+	}()
+
 	// 18. Start reconciler.
 	wg.Add(1)
 	go func() {
