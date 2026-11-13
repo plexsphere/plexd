@@ -1664,10 +1664,10 @@ func TestHandler_ReloadHooks_NoReloader(t *testing.T) {
 // --- Policy endpoint tests ---
 
 type mockPolicyProvider struct {
-	policy *api.PolicySnapshot
+	view PolicyView
 }
 
-func (m *mockPolicyProvider) ActivePolicy() *api.PolicySnapshot { return m.policy }
+func (m *mockPolicyProvider) PolicyView() PolicyView { return m.view }
 
 func newTestHandlerWithPolicy(t *testing.T, provider PolicyProvider) *httptest.Server {
 	t.Helper()
@@ -1687,42 +1687,162 @@ func newTestHandlerWithPolicy(t *testing.T, provider PolicyProvider) *httptest.S
 	return srv
 }
 
-func TestHandler_GetPolicies_MergedBlock(t *testing.T) {
-	provider := &mockPolicyProvider{policy: &api.PolicySnapshot{
+// getPoliciesBody fetches GET /v1/policies from srv and returns its body,
+// failing the test on any status but 200.
+func getPoliciesBody(t *testing.T, srv *httptest.Server) []byte {
+	t.Helper()
+	resp := mustGet(t, srv.URL+"/v1/policies")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return body
+}
+
+func TestHandler_GetPolicies_AppliedBlockBesideItsState(t *testing.T) {
+	provider := &mockPolicyProvider{view: PolicyView{
 		RevisionID:  "rev-1",
 		Fingerprint: "fp-1",
 		Rules: []api.PolicyRule{
 			{Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 		},
+		Revisions:   []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-1"}},
+		Enforcement: api.PolicyEnforcementEnforcing,
+		Applied:     true,
+		InSync:      false,
+		Received: &PolicyViewReceived{
+			RevisionID:  "rev-2",
+			Fingerprint: "fp-2",
+			Revisions:   []api.PolicyRevisionRef{{PolicyID: "pol-1", RevisionID: "rev-2"}},
+		},
+		Rejected: &PolicyViewRejected{
+			RevisionID:  "rev-2",
+			Fingerprint: "fp-2",
+			Reason:      `policy: invalid ruleset: unsupported action "deny"`,
+			Attempts:    3,
+		},
 	}}
 	srv := newTestHandlerWithPolicy(t, provider)
+	body := getPoliciesBody(t, srv)
 
-	resp := mustGet(t, srv.URL+"/v1/policies")
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	// The members sit at the top level of one object: the applied block
+	// beside its state, as a reader of the old body expects the block.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		t.Fatalf("decode body %s: %v", body, err)
 	}
-	var got api.PolicySnapshot
-	decodeJSON(t, resp, &got)
-	if got.Fingerprint != "fp-1" {
-		t.Errorf("fingerprint = %q, want %q", got.Fingerprint, "fp-1")
+	wantMembers := []string{
+		"revision_id", "fingerprint", "rules", "revisions",
+		"enforcement", "applied", "in_sync", "received", "rejected",
 	}
-	if len(got.Rules) != 1 || got.Rules[0].Ports == nil || got.Rules[0].Ports.From != 443 {
-		t.Errorf("rules = %+v, want a single tcp/443 rule", got.Rules)
+	for _, name := range wantMembers {
+		if _, ok := members[name]; !ok {
+			t.Errorf("body lacks member %q: %s", name, body)
+		}
+	}
+	if len(members) != len(wantMembers) {
+		t.Errorf("body has %d members, want %d: %s", len(members), len(wantMembers), body)
+	}
+
+	var top struct {
+		RevisionID  string                  `json:"revision_id"`
+		Fingerprint string                  `json:"fingerprint"`
+		Rules       []api.PolicyRule        `json:"rules"`
+		Revisions   []api.PolicyRevisionRef `json:"revisions"`
+		Enforcement string                  `json:"enforcement"`
+		Applied     bool                    `json:"applied"`
+		InSync      bool                    `json:"in_sync"`
+		Received    struct {
+			RevisionID  string                  `json:"revision_id"`
+			Fingerprint string                  `json:"fingerprint"`
+			Revisions   []api.PolicyRevisionRef `json:"revisions"`
+		} `json:"received"`
+		Rejected struct {
+			RevisionID  string `json:"revision_id"`
+			Fingerprint string `json:"fingerprint"`
+			Reason      string `json:"reason"`
+			Attempts    int    `json:"attempts"`
+		} `json:"rejected"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("decode body %s: %v", body, err)
+	}
+	if top.RevisionID != "rev-1" || top.Fingerprint != "fp-1" {
+		t.Errorf("block = %q/%q, want rev-1/fp-1", top.RevisionID, top.Fingerprint)
+	}
+	if len(top.Rules) != 1 || top.Rules[0].Ports == nil || top.Rules[0].Ports.From != 443 {
+		t.Errorf("rules = %+v, want a single tcp/443 rule", top.Rules)
+	}
+	if len(top.Revisions) != 1 || top.Revisions[0] != (api.PolicyRevisionRef{PolicyID: "pol-1", RevisionID: "rev-1"}) {
+		t.Errorf("revisions = %+v, want [{pol-1 rev-1}]", top.Revisions)
+	}
+	if top.Enforcement != "enforcing" || !top.Applied || top.InSync {
+		t.Errorf("enforcement, applied, in_sync = %q, %v, %v, want enforcing, true, false", top.Enforcement, top.Applied, top.InSync)
+	}
+	if top.Received.RevisionID != "rev-2" || top.Received.Fingerprint != "fp-2" ||
+		len(top.Received.Revisions) != 1 || top.Received.Revisions[0].RevisionID != "rev-2" {
+		t.Errorf("received = %+v, want rev-2/fp-2 with one revision pair", top.Received)
+	}
+	if top.Rejected.RevisionID != "rev-2" || top.Rejected.Fingerprint != "fp-2" ||
+		top.Rejected.Reason != `policy: invalid ruleset: unsupported action "deny"` || top.Rejected.Attempts != 3 {
+		t.Errorf("rejected = %+v, want rev-2/fp-2, the reason and 3 attempts", top.Rejected)
+	}
+
+	// A reader of the old body decodes the applied block from it.
+	var legacy api.PolicySnapshot
+	if err := json.Unmarshal(body, &legacy); err != nil {
+		t.Fatalf("decode body as PolicySnapshot: %v", err)
+	}
+	if legacy.RevisionID != "rev-1" || legacy.Fingerprint != "fp-1" || len(legacy.Rules) != 1 {
+		t.Errorf("legacy decode = %+v, want the applied block rev-1/fp-1 with one rule", legacy)
 	}
 }
 
-func TestHandler_GetPolicies_EmptyWhenAbsent(t *testing.T) {
-	// Both a nil provider and a nil policy serve an empty JSON object.
-	for _, provider := range []PolicyProvider{nil, &mockPolicyProvider{policy: nil}} {
-		srv := newTestHandlerWithPolicy(t, provider)
-		resp := mustGet(t, srv.URL+"/v1/policies")
-		if resp.StatusCode != 200 {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
+func TestHandler_GetPolicies_NullPullLeavesTheBlockOut(t *testing.T) {
+	// An applied pull with policy: null in sync: the state members only.
+	srv := newTestHandlerWithPolicy(t, &mockPolicyProvider{view: PolicyView{
+		Enforcement: api.PolicyEnforcementEnforcing,
+		Applied:     true,
+		InSync:      true,
+	}})
+	body := getPoliciesBody(t, srv)
+
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		t.Fatalf("decode body %s: %v", body, err)
+	}
+	want := map[string]string{
+		"enforcement": `"enforcing"`,
+		"applied":     `true`,
+		"in_sync":     `true`,
+	}
+	if len(members) != len(want) {
+		t.Errorf("body = %s, want only enforcement, applied and in_sync", body)
+	}
+	for name, value := range want {
+		if got := string(members[name]); got != value {
+			t.Errorf("%s = %s, want %s", name, got, value)
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if strings.TrimSpace(string(body)) != "{}" {
-			t.Errorf("absent policy body = %q, want {}", strings.TrimSpace(string(body)))
-		}
+	}
+}
+
+func TestHandler_GetPolicies_BeforeTheFirstPull(t *testing.T) {
+	// The zero view: no enforcement yet, nothing applied, nothing received.
+	srv := newTestHandlerWithPolicy(t, &mockPolicyProvider{})
+	body := getPoliciesBody(t, srv)
+	if got, want := strings.TrimSpace(string(body)), `{"enforcement":"","applied":false,"in_sync":false}`; got != want {
+		t.Errorf("body before the first pull = %s, want %s", got, want)
+	}
+}
+
+func TestHandler_GetPolicies_EmptyWithoutProvider(t *testing.T) {
+	srv := newTestHandlerWithPolicy(t, nil)
+	body := getPoliciesBody(t, srv)
+	if strings.TrimSpace(string(body)) != "{}" {
+		t.Errorf("body without a provider = %q, want {}", strings.TrimSpace(string(body)))
 	}
 }

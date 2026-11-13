@@ -44,9 +44,51 @@ type PeerProvider interface {
 	PeerStatuses() []PeerStatus
 }
 
-// PolicyProvider supplies the active merged network policy.
+// PolicyProvider supplies what plexd did with the policy blocks it pulled.
 type PolicyProvider interface {
-	ActivePolicy() *api.PolicySnapshot
+	PolicyView() PolicyView
+}
+
+// PolicyView is the body of GET /v1/policies: the ruleset plexd applied and
+// how it relates to the block of the latest pull.
+//
+// RevisionID, Fingerprint, Rules and Revisions keep the names of the body
+// that served the pulled block before, so a reader of that body still
+// decodes it. They hold the applied block now, and are absent when no pull's
+// block is applied or the applied pull carried policy: null.
+//
+// Enforcement is one of the api.PolicyEnforcement* constants, or empty before
+// the first pull. Applied tells whether a pull's block is applied. InSync
+// tells whether the applied block is the block of the latest pull: both
+// null, or both with the same non-empty fingerprint. Received names the block
+// of the latest pull and is nil when that pull carried policy: null. Rejected
+// names the block the latest apply failed on and is nil when it did not fail.
+type PolicyView struct {
+	RevisionID  string                  `json:"revision_id,omitempty"`
+	Fingerprint string                  `json:"fingerprint,omitempty"`
+	Rules       []api.PolicyRule        `json:"rules,omitempty"`
+	Revisions   []api.PolicyRevisionRef `json:"revisions,omitempty"`
+	Enforcement string                  `json:"enforcement"`
+	Applied     bool                    `json:"applied"`
+	InSync      bool                    `json:"in_sync"`
+	Received    *PolicyViewReceived     `json:"received,omitempty"`
+	Rejected    *PolicyViewRejected     `json:"rejected,omitempty"`
+}
+
+// PolicyViewReceived names the policy block of the latest pull.
+type PolicyViewReceived struct {
+	RevisionID  string                  `json:"revision_id"`
+	Fingerprint string                  `json:"fingerprint"`
+	Revisions   []api.PolicyRevisionRef `json:"revisions,omitempty"`
+}
+
+// PolicyViewRejected names the policy block the latest apply failed on, why
+// it failed, and how many applies of it failed in a row.
+type PolicyViewRejected struct {
+	RevisionID  string `json:"revision_id"`
+	Fingerprint string `json:"fingerprint"`
+	Reason      string `json:"reason"`
+	Attempts    int    `json:"attempts"`
 }
 
 // ForwarderStatus describes the operational status of a log or audit forwarder.
@@ -627,12 +669,7 @@ func (h *Handler) handleGetPolicies(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, struct{}{})
 		return
 	}
-	policy := h.policyProvider.ActivePolicy()
-	if policy == nil {
-		writeJSON(w, http.StatusOK, struct{}{})
-		return
-	}
-	writeJSON(w, http.StatusOK, policy)
+	writeJSON(w, http.StatusOK, h.policyProvider.PolicyView())
 }
 
 func (h *Handler) handleGetLogStatus(w http.ResponseWriter, _ *http.Request) {

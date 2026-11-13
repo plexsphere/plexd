@@ -81,7 +81,8 @@ func (s *Server) SetPeerProvider(p PeerProvider) {
 	s.peerProvider = p
 }
 
-// SetPolicyProvider sets the policy provider. Must be called before Start.
+// SetPolicyProvider sets the provider of the policy view GET /v1/policies
+// serves. Without one the route answers {}. Must be called before Start.
 func (s *Server) SetPolicyProvider(p PolicyProvider) {
 	s.policyProvider = p
 }
