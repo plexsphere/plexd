@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -50,6 +51,25 @@ func (h tunHarness) run(fn func() error) error {
 		return fn()
 	}
 	return h.do(fn)
+}
+
+// dropCounts reads what the default deny of the test chain dropped, where the
+// controller's calls belong. It stops the test unless the controller is a
+// DropCounter and the read succeeds.
+func (h tunHarness) dropCounts(t *testing.T) (packets, octets uint64) {
+	t.Helper()
+	counter, ok := h.ctrl.(DropCounter)
+	if !ok {
+		t.Fatalf("%T does not implement DropCounter", h.ctrl)
+	}
+	if err := h.run(func() error {
+		var err error
+		packets, octets, err = counter.DropCounts(tunTrafficChain)
+		return err
+	}); err != nil {
+		t.Fatalf("DropCounts(%q) error = %v, want nil", tunTrafficChain, err)
+	}
+	return packets, octets
 }
 
 // inject writes one packet into the device, so it arrives at N from P.
@@ -292,7 +312,9 @@ func fromNodeUDP(srcPort, dstPort uint16, payload []byte) func(tunPacket) bool {
 //	r5 the default deny
 //
 // Every injected packet has a source port or ICMP id of its own, so an answer
-// to one check never satisfies another. When the test ends, the device is
+// to one check never satisfies another. On Linux and macOS the checks also
+// read DropCounts around a packet only r5 matches, and on Windows they check
+// that the controller is no DropCounter. When the test ends, the device is
 // closed before the chain is deleted.
 func runTunTrafficChecks(t *testing.T, h tunHarness) {
 	h.waitForNodeAddr(t)
@@ -354,10 +376,35 @@ func runTunTrafficChecks(t *testing.T, h tunHarness) {
 	reader.expectPacket(t, tunAnswerWait, "SYN-ACK from N:7001 to P:40001",
 		fromNodeTCP(7001, 40001, tcpFlagSYN|tcpFlagACK, tcpFlagSYN|tcpFlagACK))
 
+	// The SYN to N:7003 is a packet only the default deny matches. Linux and
+	// macOS count what the default deny drops, so their counters move by at
+	// least this one packet and its length in bytes. WFP keeps no per-filter
+	// counters, so the Windows controller must not claim to count drops: the
+	// Enforcer would report counters that never move.
+	countsDrops := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if _, ok := h.ctrl.(DropCounter); ok != countsDrops {
+		t.Errorf("%T implements DropCounter = %v, want %v on %s", h.ctrl, ok, countsDrops, runtime.GOOS)
+	}
+	var droppedPackets, droppedBytes uint64
+	if countsDrops {
+		droppedPackets, droppedBytes = h.dropCounts(t)
+	}
+
 	t.Log("no rule lets P open a connection to N:7003, where N listens; a RST is accepted")
-	h.inject(t, buildIPv4TCPSyn(tunPeerAddr, tunNodeAddr, 40002, 7003, 1))
+	unallowedSyn := buildIPv4TCPSyn(tunPeerAddr, tunNodeAddr, 40002, 7003, 1)
+	h.inject(t, unallowedSyn)
 	reader.expectNoPacket(t, tunSilenceWait, "a SYN-ACK from N:7003 to P:40002",
 		fromNodeTCP(7003, 40002, tcpFlagSYN|tcpFlagACK, tcpFlagSYN|tcpFlagACK))
+
+	if countsDrops {
+		gotPackets, gotBytes := h.dropCounts(t)
+		t.Logf("around the %d-byte SYN to N:7003 DropCounts went from %d packets, %d bytes to %d packets, %d bytes",
+			len(unallowedSyn), droppedPackets, droppedBytes, gotPackets, gotBytes)
+		if gotPackets < droppedPackets+1 || gotBytes < droppedBytes+uint64(len(unallowedSyn)) {
+			t.Errorf("DropCounts() went from %d packets, %d bytes to %d packets, %d bytes, want at least 1 packet and %d bytes more",
+				droppedPackets, droppedBytes, gotPackets, gotBytes, len(unallowedSyn))
+		}
+	}
 
 	t.Log("r1 lets P's datagram reach N:7002, and N's echo leaves")
 	h.inject(t, buildIPv4UDP(tunPeerAddr, tunNodeAddr, 40003, 7002, []byte("plexd 7002")))

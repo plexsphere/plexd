@@ -13,11 +13,13 @@ import (
 	"testing"
 )
 
-// PFController is the macOS FirewallController the enforcer is handed, and it
-// reports what its logged rules admit.
+// PFController is the macOS FirewallController the enforcer is handed, it
+// reports what its logged rules admit, and it counts what its block lines
+// drop.
 var (
 	_ FirewallController = (*PFController)(nil)
 	_ ConnReporter       = (*PFController)(nil)
+	_ DropCounter        = (*PFController)(nil)
 )
 
 // natController mirrors bridge.NATController. The contract is checked against
@@ -102,11 +104,11 @@ const sixRulesText = pfHeader +
 	"pass out quick on utun4 inet proto udp from 10.1.0.0/24 to 10.0.0.9 no state\n" +
 	"pass out quick on utun4 inet proto icmp from 10.1.0.0/24 to 10.0.0.9 icmp-type { echorep, unreach, timex, paramprob } no state\n" +
 	// the deny from 10.0.0.9/32
-	"block in quick on utun4 inet from 10.0.0.9/32 to any\n" +
-	"block out quick on utun4 inet from 10.0.0.9/32 to any\n" +
+	"block in quick on utun4 inet from 10.0.0.9/32 to any label \"plexd-default-deny\"\n" +
+	"block out quick on utun4 inet from 10.0.0.9/32 to any label \"plexd-default-deny\"\n" +
 	// the IPv4 wildcard deny, whose source is not empty
-	"block in quick on utun4 inet from any to any\n" +
-	"block out quick on utun4 inet from any to any\n"
+	"block in quick on utun4 inet from any to any label \"plexd-default-deny\"\n" +
+	"block out quick on utun4 inet from any to any label \"plexd-default-deny\"\n"
 
 // checkCalls asserts that exactly the wanted pfctl invocations ran, in order,
 // with the wanted arguments and stdin. Every test pins the whole list: a
@@ -351,8 +353,8 @@ func TestPFController_ApplyRules_TwoInterfaces(t *testing.T) {
 		"pass out quick on utun5 inet proto tcp from any to 10.0.0.0/24 flags A/A no state\n" +
 		"pass out quick on utun5 inet proto udp from any to 10.0.0.0/24 no state\n" +
 		"pass out quick on utun5 inet proto icmp from any to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state\n" +
-		"block in quick on utun4 inet from 10.0.0.9 to any\n" +
-		"block out quick on utun4 inet from 10.0.0.9 to any\n"
+		"block in quick on utun4 inet from 10.0.0.9 to any label \"plexd-default-deny\"\n" +
+		"block out quick on utun4 inet from 10.0.0.9 to any label \"plexd-default-deny\"\n"
 	checkCalls(t, runner,
 		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: want},
 		runnerCall{Args: []string{"-E"}},
@@ -505,8 +507,8 @@ func TestPFController_RenderRuleFamilies(t *testing.T) {
 			name: "ipv4 wildcard keeps inet",
 			rule: FirewallRule{Interface: "utun4", SrcIP: "0.0.0.0/0", DstIP: "0.0.0.0/0", Action: "deny"},
 			want: []string{
-				"block in quick on utun4 inet from any to any",
-				"block out quick on utun4 inet from any to any",
+				"block in quick on utun4 inet from any to any label \"plexd-default-deny\"",
+				"block out quick on utun4 inet from any to any label \"plexd-default-deny\"",
 			},
 		},
 		{
@@ -568,8 +570,8 @@ func TestPFController_RenderRuleFamilies(t *testing.T) {
 			name: "default deny covers both families",
 			rule: FirewallRule{Interface: "utun4", Action: "deny"},
 			want: []string{
-				"block in quick on utun4 from any to any",
-				"block out quick on utun4 from (utun4) to any",
+				"block in quick on utun4 from any to any label \"plexd-default-deny\"",
+				"block out quick on utun4 from (utun4) to any label \"plexd-default-deny\"",
 			},
 		},
 	}
@@ -582,9 +584,9 @@ func TestPFController_RenderRuleFamilies(t *testing.T) {
 }
 
 // An allow renders its pass in line, the node's own traffic and the reply
-// mirrors; a deny renders a block line for each direction. The tcp 443,
-// ICMPv6 and default deny examples of #178 are cases of
-// TestPFController_RenderRuleFamilies; these are the others.
+// mirrors; a deny renders a block line for each direction, which ends in the
+// drop label. The tcp 443, ICMPv6 and default deny examples of #178 are cases
+// of TestPFController_RenderRuleFamilies; these are the others.
 func TestPFController_RenderRuleLines(t *testing.T) {
 	tests := []struct {
 		name string
@@ -637,8 +639,8 @@ func TestPFController_RenderRuleLines(t *testing.T) {
 			name: "deny without source",
 			rule: FirewallRule{Interface: "utun4", DstIP: "fd00::1", Protocol: "icmp", Action: "deny"},
 			want: []string{
-				"block in quick on utun4 inet6 proto icmp6 from any to fd00::1",
-				"block out quick on utun4 inet6 proto icmp6 from (utun4) to fd00::1",
+				"block in quick on utun4 inet6 proto icmp6 from any to fd00::1 label \"plexd-default-deny\"",
+				"block out quick on utun4 inet6 proto icmp6 from (utun4) to fd00::1 label \"plexd-default-deny\"",
 			},
 		},
 		{
@@ -647,8 +649,8 @@ func TestPFController_RenderRuleLines(t *testing.T) {
 			name: "deny with port range",
 			rule: FirewallRule{Interface: "utun4", SrcIP: "10.0.0.9", DstIP: "10.1.0.0/24", Port: 8000, PortTo: 8080, Protocol: "tcp", Action: "deny"},
 			want: []string{
-				"block in quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 port 8000:8080",
-				"block out quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 port 8000:8080",
+				"block in quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 port 8000:8080 label \"plexd-default-deny\"",
+				"block out quick on utun4 inet proto tcp from 10.0.0.9 to 10.1.0.0/24 port 8000:8080 label \"plexd-default-deny\"",
 			},
 		},
 	}
@@ -658,6 +660,27 @@ func TestPFController_RenderRuleLines(t *testing.T) {
 			checkRenderRule(t, tt.rule, tt.want)
 		})
 	}
+
+	// DropCounts sums every line of the label, so a pass line that carried
+	// it would count what it passed as dropped.
+	t.Run("only block lines carry the label", func(t *testing.T) {
+		suffix := ` label "` + pfDropLabel + `"`
+		for _, tt := range tests {
+			lines, err := renderRule(tt.rule)
+			if err != nil {
+				t.Fatalf("%s: renderRule() error = %v, want nil", tt.name, err)
+			}
+			for _, line := range lines {
+				block := strings.HasPrefix(line, "block in ") || strings.HasPrefix(line, "block out ")
+				switch {
+				case block && !strings.HasSuffix(line, suffix):
+					t.Errorf("%s: block line %q does not end in %q", tt.name, line, suffix)
+				case !block && strings.Contains(line, " label "):
+					t.Errorf("%s: pass line %q carries a label", tt.name, line)
+				}
+			}
+		}
+	})
 }
 
 // The relay probe line opens a chain once per interface, in the order the
@@ -826,8 +849,8 @@ func TestPFController_RenderRuleLogged(t *testing.T) {
 			}
 		}
 		want := []string{
-			"block in quick on utun4 from any to any",
-			"block out quick on utun4 from (utun4) to any",
+			"block in quick on utun4 from any to any label \"plexd-default-deny\"",
+			"block out quick on utun4 from (utun4) to any label \"plexd-default-deny\"",
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("block lines =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -926,8 +949,8 @@ const (
 		"pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
 		"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state\n" +
 		"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state\n" +
-		"block in quick on utun4 from any to any\n" +
-		"block out quick on utun4 from (utun4) to any\n"
+		"block in quick on utun4 from any to any label \"plexd-default-deny\"\n" +
+		"block out quick on utun4 from (utun4) to any label \"plexd-default-deny\"\n"
 
 	tcp443UnloggedText = pfHeader +
 		"# chain plexd-mesh\n" +
@@ -936,8 +959,8 @@ const (
 		"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
 		"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state\n" +
 		"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state\n" +
-		"block in quick on utun4 from any to any\n" +
-		"block out quick on utun4 from (utun4) to any\n"
+		"block in quick on utun4 from any to any label \"plexd-default-deny\"\n" +
+		"block out quick on utun4 from (utun4) to any label \"plexd-default-deny\"\n"
 )
 
 // A logged apply opens a reader once and loads the log lines. The tags change
@@ -1194,7 +1217,7 @@ func TestPFController_RenderParses(t *testing.T) {
 	// The second chain carries the lines sixRules cannot produce: inet6,
 	// icmp6 and the ICMPv6 mirror, the IPv6 wildcard, a flags A/A mirror with
 	// a port range, the lines of an allow without a family, and the default
-	// deny with its block out line from (utun5).
+	// deny with its labelled block out line from (utun5).
 	ctrl.chains["plexd-v6"] = []FirewallRule{
 		{Interface: "utun5", SrcIP: "fd00::/64", DstIP: "fd00::1", Port: 443, Protocol: "tcp", Action: "allow"},
 		{Interface: "utun5", SrcIP: "fd00::/64", DstIP: "fd00::1/128", Protocol: "icmp", Action: "allow"},
@@ -1227,7 +1250,7 @@ func TestPFController_RenderParses(t *testing.T) {
 		"pass out quick on utun5 inet6 proto tcp from fd00::1 port 8000:8080 to fd00::/64 flags A/A no state",
 		"pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type { echorep, unreach, timex, paramprob } no state",
 		"pass out quick on utun5 inet6 proto icmp6 from fd00::1 to fd00::/64 icmp6-type { echorep, unreach, toobig, timex, paramprob } no state",
-		"block out quick on utun5 from (utun5) to any",
+		"block out quick on utun5 from (utun5) to any label \"plexd-default-deny\"",
 		"pass in log quick on utun6 inet proto tcp from 10.2.0.0/24 to 10.3.0.5 port 443 flags S/SA no state",
 		"pass out log quick on utun6 inet proto tcp from 10.2.0.0/24 to 10.3.0.5 port 443 keep state",
 		"pass in log quick on utun6 inet proto udp from 10.2.0.0/24 to 10.3.0.0/24 port 53 no state",
@@ -1621,17 +1644,149 @@ func TestPFController_RemoveNATMasquerade_LoadFails(t *testing.T) {
 	}
 }
 
+// labelsKey is the answer-map key of the pfctl call DropCounts runs.
+var labelsKey = pfKey("-a", pfAnchor, "-sl")
+
+// DropCounts sums fields 3 and 4, packets and bytes, of the pfctl -sl lines of
+// the drop label and skips every other line. A label line it cannot read, an
+// output without one, a failed pfctl and a chain the controller does not hold
+// are errors. It reads the counters and never reloads the anchor.
+func TestPFController_DropCounts(t *testing.T) {
+	// applied returns a controller that loaded sixRules into chain
+	// plexd-mesh and whose pfctl -sl prints out and fails with runErr.
+	applied := func(t *testing.T, out string, runErr error) (*PFController, *recordingRunner) {
+		t.Helper()
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		if err := ctrl.ApplyRules("plexd-mesh", sixRules); err != nil {
+			t.Fatalf("ApplyRules() error = %v, want nil", err)
+		}
+		runner.outputs[labelsKey] = []byte(out)
+		if runErr != nil {
+			runner.errs[labelsKey] = runErr
+		}
+		return ctrl, runner
+	}
+	loadCalls := []runnerCall{
+		{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: sixRulesText},
+		{Args: []string{"-E"}},
+	}
+	labelsCall := runnerCall{Args: []string{"-a", pfAnchor, "-sl"}}
+
+	for _, tt := range []struct {
+		name        string
+		out         string
+		wantPackets uint64
+		wantBytes   uint64
+	}{
+		{
+			// The default deny's block in and block out lines.
+			name: "two label lines summed",
+			out: "plexd-default-deny 12 3 120 3 120 0 0\n" +
+				"plexd-default-deny 7 2 96 0 0 2 96\n",
+			wantPackets: 5,
+			wantBytes:   216,
+		},
+		{
+			// pfctl writes its ALTQ warnings into the same output.
+			name: "another label ignored",
+			out: "No ALTQ support in kernel\nALTQ related functions disabled\n" +
+				"plexd-other 50 40 4000 20 2000 20 2000\n" +
+				"plexd-default-deny 12 3 120 3 120 0 0\n" +
+				"plexd-default-deny-extra 9 9 900 9 900 0 0\n",
+			wantPackets: 3,
+			wantBytes:   120,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl, runner := applied(t, tt.out, nil)
+
+			gotPackets, gotBytes, err := ctrl.DropCounts("plexd-mesh")
+			if err != nil {
+				t.Fatalf("DropCounts() error = %v, want nil", err)
+			}
+			if gotPackets != tt.wantPackets || gotBytes != tt.wantBytes {
+				t.Errorf("DropCounts() = %d, %d, want %d, %d", gotPackets, gotBytes, tt.wantPackets, tt.wantBytes)
+			}
+			checkCalls(t, runner, append(loadCalls, labelsCall)...)
+		})
+	}
+
+	for _, tt := range []struct {
+		name   string
+		out    string
+		runErr error
+		chain  string
+		want   string // a part of the error after the prefix
+	}{
+		{
+			name: "label line with three fields",
+			out:  "plexd-default-deny 12 3\n",
+			want: `line "plexd-default-deny 12 3" has 3 fields, want at least 4`,
+		},
+		{
+			name: "non-numeric count",
+			out:  "plexd-default-deny 12 3 many 3 120 0 0\n",
+			want: `bytes: strconv.ParseUint: parsing "many": invalid syntax`,
+		},
+		{
+			name: "no label line",
+			out:  "No ALTQ support in kernel\nALTQ related functions disabled\n",
+			want: `/sbin/pfctl -a com.apple/plexd -sl printed no line labelled "plexd-default-deny"`,
+		},
+		{
+			name:   "pfctl exit status 1",
+			out:    "pfctl: /dev/pf: Permission denied",
+			runErr: errors.New("exit status 1"),
+			want:   "/sbin/pfctl -a com.apple/plexd -sl: exit status 1: pfctl: /dev/pf: Permission denied",
+		},
+		{
+			name:  "chain the controller does not hold",
+			out:   "plexd-default-deny 12 3 120 3 120 0 0\n",
+			chain: "plexd-other",
+			want:  `no chain "plexd-other"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl, runner := applied(t, tt.out, tt.runErr)
+			chain := tt.chain
+			if chain == "" {
+				chain = "plexd-mesh"
+			}
+
+			gotPackets, gotBytes, err := ctrl.DropCounts(chain)
+			const prefix = "policy: pf: drop counts: "
+			if err == nil || !strings.HasPrefix(err.Error(), prefix) || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("DropCounts() error = %v, want %q followed by %q", err, prefix, tt.want)
+			}
+			if gotPackets != 0 || gotBytes != 0 {
+				t.Errorf("DropCounts() = %d, %d with an error, want 0, 0", gotPackets, gotBytes)
+			}
+			if tt.chain != "" {
+				// A chain it does not hold never reaches pfctl.
+				checkCalls(t, runner, loadCalls...)
+				return
+			}
+			checkCalls(t, runner, append(loadCalls, labelsCall)...)
+		})
+	}
+}
+
 func TestPFController_CommandsCarryDeadline(t *testing.T) {
 	ctrl, runner := newTestPFController(t)
 	runner.outputs[pfKey("-s", "rules")] = []byte(okRules)
 	runner.outputs[pfKey("-s", "nat")] = []byte(okNAT)
 	runner.outputs[enableKey] = []byte(tokenOut)
+	runner.outputs[labelsKey] = []byte("plexd-default-deny 0 0 0 0 0 0 0\n")
 
 	if err := ctrl.Probe(); err != nil {
 		t.Fatalf("Probe() error = %v, want nil", err)
 	}
 	if err := ctrl.EnsureChain("plexd-mesh"); err != nil {
 		t.Fatalf("EnsureChain() error = %v, want nil", err)
+	}
+	if _, _, err := ctrl.DropCounts("plexd-mesh"); err != nil {
+		t.Fatalf("DropCounts() error = %v, want nil", err)
 	}
 	if err := ctrl.DeleteChain("plexd-mesh"); err != nil {
 		t.Fatalf("DeleteChain() error = %v, want nil", err)
@@ -1709,7 +1864,8 @@ func TestPFController_Real(t *testing.T) {
 
 	// pfctl prints its own normalised form: block becomes "block drop", a
 	// single port "port = 443", a pass rule with state carries "flags S/SA",
-	// and a dynamic pool a trailing "round-robin". The two inet lines that
+	// a dynamic pool a trailing "round-robin", and a label comes last, in
+	// quotes, as the anchor text writes it. The two inet lines that
 	// pass and block inbound are the ones this test asserted before IPv6 was
 	// rendered. The other lines are read off pfctl's printer, which drops a
 	// host mask (fd00:99::1/128 prints as fd00:99::1), prints "all" for from
@@ -1724,13 +1880,13 @@ func TestPFController_Real(t *testing.T) {
 	loaded := pfctlOut("-a", pfAnchor, "-s", "rules")
 	wants := []string{
 		"pass in quick on plexd99 inet proto tcp from 10.255.252.0/30 to 10.255.252.4/30",
-		"block drop in quick on plexd99 inet from 10.255.252.8/30 to any",
-		"block drop out quick on plexd99 inet from 10.255.252.8/30 to any",
+		"block drop in quick on plexd99 inet from 10.255.252.8/30 to any label \"plexd-default-deny\"",
+		"block drop out quick on plexd99 inet from 10.255.252.8/30 to any label \"plexd-default-deny\"",
 		"pass in quick on plexd99 inet6 proto tcp from fd00:99::/64 to fd00:99::1 port = 44301",
 		"pass out quick on plexd99 inet6 proto tcp from fd00:99::/64 to fd00:99::1 port = 44301 flags S/SA keep state",
 		"pass out quick on plexd99 inet6 proto tcp from fd00:99::1 port = 44301 to fd00:99::/64 flags A/A no state",
-		"block drop in quick on plexd99 all",
-		"block drop out quick on plexd99 from (plexd99) to any",
+		"block drop in quick on plexd99 all label \"plexd-default-deny\"",
+		"block drop out quick on plexd99 from (plexd99) to any label \"plexd-default-deny\"",
 	}
 	for _, typ := range []string{"echorep", "unreach", "timex", "paramprob"} {
 		wants = append(wants, "pass out quick on plexd99 inet proto icmp from 10.255.252.4/30 to 10.255.252.0/30 icmp-type "+typ+" no state")

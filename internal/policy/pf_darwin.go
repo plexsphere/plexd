@@ -10,6 +10,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,12 +37,17 @@ const (
 	// pfHeader opens the anchor text, so an operator reading the loaded
 	// ruleset knows who owns it and that local edits do not survive.
 	pfHeader = "# plexd policy anchor. Managed by plexd; edits are overwritten.\n"
+
+	// pfDropLabel is the label every block line carries, so pfctl -sl
+	// reports what the deny lines dropped under one name. DropCounts sums the
+	// lines of this label.
+	pfDropLabel = "plexd-default-deny"
 )
 
 // pfTokenRE finds the reference token pfctl -E prints ("Token : 1397...").
 var pfTokenRE = regexp.MustCompile(`Token\s*:\s*([0-9]+)`)
 
-// PFController implements FirewallController, ConnReporter and
+// PFController implements FirewallController, ConnReporter, DropCounter and
 // bridge.NATController on macOS with pfctl(8). It keeps the desired state
 // itself and renders the whole anchor on every change, because pfctl -f
 // replaces an anchor's rules wholesale: there is no way to add one rule to it.
@@ -256,7 +262,8 @@ const (
 // names the interface's own addresses in place of an empty source, so the
 // default deny drops what the node sends and leaves alone what the Mac
 // forwards out of the interface. The engine puts the default deny last, so
-// its block lines follow every pass line.
+// its block lines follow every pass line. Both block lines end in the label
+// pfDropLabel, whose counters DropCounts reads.
 //
 // DECISION: the node's own TCP connections keep state, as the pass out pair
 // before #178 did, and its UDP and ICMP flows do not, so #176's decision
@@ -340,15 +347,18 @@ func renderRule(rule FirewallRule) ([]string, error) {
 	}
 
 	// pf's default block policy is drop, what the nftables backend expresses
-	// as VerdictDrop.
+	// as VerdictDrop. Every block line carries pfDropLabel, not only the
+	// default deny's: the engine's only deny is the default deny, and the
+	// nftables backend counts every rule with a drop verdict too.
 	if rule.Action == "deny" {
 		outSrc := src
 		if rule.SrcIP == "" {
 			outSrc = "(" + rule.Interface + ")"
 		}
+		label := fmt.Sprintf(" label %q", pfDropLabel)
 		return []string{
-			fmt.Sprintf("block in %s%s from %s to %s%s", on, proto, src, dst, port),
-			fmt.Sprintf("block out %s%s from %s to %s%s", on, proto, outSrc, dst, port),
+			fmt.Sprintf("block in %s%s from %s to %s%s%s", on, proto, src, dst, port, label),
+			fmt.Sprintf("block out %s%s from %s to %s%s%s", on, proto, outSrc, dst, port, label),
 		}, nil
 	}
 
@@ -744,6 +754,67 @@ func (c *PFController) deleteChain(chain string) error {
 		"chain", chain,
 	)
 	return nil
+}
+
+// DropCounts returns the packets and bytes the block lines of the anchor
+// dropped since pf last loaded it. It implements DropCounter. Every change
+// reloads the whole anchor, which restarts the counters. pf keeps one anchor,
+// so the sum covers every chain in it; plexd keeps one policy chain. A chain
+// the controller does not hold is an error.
+//
+// It runs pfctl -a com.apple/plexd -sl, which prints one line per labelled
+// rule, and sums fields 3 and 4 of the lines whose first field is
+// pfDropLabel. The column layout, the label, then the evaluations, packets
+// and bytes, then the packets and bytes of each direction, comes from
+// pfctl(8). TestPFController_RealTraffic proves it on the macos-latest CI
+// runner.
+func (c *PFController) DropCounts(chain string) (packets, bytes uint64, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.chains[chain]; !ok {
+		return 0, 0, fmt.Errorf("policy: pf: drop counts: no chain %q", chain)
+	}
+
+	out, err := c.pfctl("drop counts", nil, "-a", pfAnchor, "-sl")
+	if err != nil {
+		return 0, 0, err
+	}
+	return sumPFDropLabels(out)
+}
+
+// sumPFDropLabels sums fields 3 and 4, the packets and bytes, of every line
+// of pfctl -sl output whose first field is pfDropLabel. The output also holds
+// pfctl's warnings, such as the ALTQ lines, and the lines of other labels,
+// which it skips. A label line with fewer than four fields or a count that is
+// not a number, and an output without any label line, are errors.
+func sumPFDropLabels(out []byte) (uint64, uint64, error) {
+	var packets, bytes uint64
+	found := false
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != pfDropLabel {
+			continue
+		}
+		if len(fields) < 4 {
+			return 0, 0, fmt.Errorf("policy: pf: drop counts: line %q has %d fields, want at least 4", line, len(fields))
+		}
+		p, perr := strconv.ParseUint(fields[2], 10, 64)
+		if perr != nil {
+			return 0, 0, fmt.Errorf("policy: pf: drop counts: line %q: packets: %w", line, perr)
+		}
+		b, berr := strconv.ParseUint(fields[3], 10, 64)
+		if berr != nil {
+			return 0, 0, fmt.Errorf("policy: pf: drop counts: line %q: bytes: %w", line, berr)
+		}
+		packets += p
+		bytes += b
+		found = true
+	}
+	if !found {
+		return 0, 0, fmt.Errorf("policy: pf: drop counts: %s -a %s -sl printed no line labelled %q", pfctlPath, pfAnchor, pfDropLabel)
+	}
+	return packets, bytes, nil
 }
 
 // AddNATMasquerade configures NAT for bridge egress on the given interface.

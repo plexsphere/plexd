@@ -68,7 +68,10 @@ type NftablesController struct {
 	reader *nflogReader
 }
 
-var _ ConnReporter = (*NftablesController)(nil)
+var (
+	_ ConnReporter = (*NftablesController)(nil)
+	_ DropCounter  = (*NftablesController)(nil)
+)
 
 // NewNftablesController returns a new NftablesController.
 func NewNftablesController(logger *slog.Logger) *NftablesController {
@@ -454,6 +457,57 @@ func (c *NftablesController) DeleteChain(chain string) error {
 		"chain", chain,
 	)
 	return nil
+}
+
+// DropCounts returns the packets and bytes the drop rules in the three base
+// chains of the named chain dropped. It implements DropCounter. buildRuleExprs
+// ends every rule in a counter and a verdict, and the default deny is the only
+// rule the engine gives a drop verdict, so the sum is what the default deny
+// dropped. The counters restart when ApplyRules replaces the chain: it
+// flushes the three chains and adds every rule again with a counter at zero.
+// It reads the counters with one rule dump per base chain.
+func (c *NftablesController) DropCounts(chain string) (packets, bytes uint64, err error) {
+	conn, err := nftables.New()
+	if err != nil {
+		return 0, 0, fmt.Errorf("policy: nftables: drop counts: %w", err)
+	}
+
+	table := &nftables.Table{Family: nftables.TableFamilyINet, Name: tableName}
+	inputName, forwardName, outputName := chainNames(chain)
+	for _, name := range []string{inputName, forwardName, outputName} {
+		rules, getErr := conn.GetRules(table, &nftables.Chain{Name: name, Table: table})
+		if getErr != nil {
+			return 0, 0, fmt.Errorf("policy: nftables: drop counts: chain %q: %w", name, getErr)
+		}
+		p, b := sumDropCounters(rules)
+		packets += p
+		bytes += b
+	}
+	return packets, bytes, nil
+}
+
+// sumDropCounters sums the counters of the rules whose last expression is a
+// drop verdict, and ignores every other rule: those that accept, and the log
+// rules, which end in their log expression. A rule's counter is the first
+// counter expression it holds; buildRuleExprs gives every rule exactly one.
+func sumDropCounters(rules []*nftables.Rule) (packets, bytes uint64) {
+	for _, rule := range rules {
+		if len(rule.Exprs) == 0 {
+			continue
+		}
+		verdict, ok := rule.Exprs[len(rule.Exprs)-1].(*expr.Verdict)
+		if !ok || verdict.Kind != expr.VerdictDrop {
+			continue
+		}
+		for _, e := range rule.Exprs {
+			if counter, ok := e.(*expr.Counter); ok {
+				packets += counter.Packets
+				bytes += counter.Bytes
+				break
+			}
+		}
+	}
+	return packets, bytes
 }
 
 // applyBufferBytes returns the netlink socket buffer size for an ApplyRules

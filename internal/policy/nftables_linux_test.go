@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
 	"github.com/mdlayher/netlink"
@@ -1068,6 +1069,74 @@ func TestChainNames(t *testing.T) {
 	input, forward, output := chainNames("plexd-mesh")
 	if input != "plexd-mesh-input" || forward != "plexd-mesh-forward" || output != "plexd-mesh-output" {
 		t.Errorf("chainNames(plexd-mesh) = %q, %q, %q, want plexd-mesh-input, plexd-mesh-forward, plexd-mesh-output", input, forward, output)
+	}
+}
+
+// sumDropCounters adds up the counters of the rules whose last expression is
+// a drop verdict. It skips the rules that accept, the log rules, which end in
+// their log expression, and a rule without expressions, and it returns 0, 0
+// for no rules at all.
+func TestSumDropCounters(t *testing.T) {
+	counted := func(packets, octets uint64, verdict expr.VerdictKind) *nftables.Rule {
+		return &nftables.Rule{Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceNameBytes("plexd0")},
+			&expr.Counter{Packets: packets, Bytes: octets},
+			&expr.Verdict{Kind: verdict},
+		}}
+	}
+
+	// The default deny as buildRuleExprs builds it, with its counter set as a
+	// dump would return it.
+	defaultDeny, err := buildRuleExprs(FirewallRule{Interface: "plexd0", Action: "deny"}, dirIn)
+	if err != nil {
+		t.Fatalf("buildRuleExprs(default deny) error = %v", err)
+	}
+	for _, e := range defaultDeny {
+		if c, ok := e.(*expr.Counter); ok {
+			c.Packets, c.Bytes = 4, 160
+		}
+	}
+
+	logRule := &nftables.Rule{Exprs: []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceNameBytes("plexd0")},
+		&expr.Log{Key: 1 << unix.NFTA_LOG_GROUP, Group: nflogGroup},
+	}}
+
+	tests := []struct {
+		name        string
+		rules       []*nftables.Rule
+		wantPackets uint64
+		wantBytes   uint64
+	}{
+		{name: "nil list"},
+		{name: "empty list", rules: []*nftables.Rule{}},
+		{
+			name:  "accept rules ignored",
+			rules: []*nftables.Rule{counted(7, 700, expr.VerdictAccept), counted(9, 900, expr.VerdictAccept)},
+		},
+		{
+			name: "drop rules summed",
+			rules: []*nftables.Rule{
+				counted(100, 9000, expr.VerdictAccept),
+				counted(3, 120, expr.VerdictDrop),
+				logRule,
+				{},
+				{Exprs: defaultDeny},
+				counted(2, 80, expr.VerdictDrop),
+			},
+			wantPackets: 9,
+			wantBytes:   360,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPackets, gotBytes := sumDropCounters(tt.rules)
+			if gotPackets != tt.wantPackets || gotBytes != tt.wantBytes {
+				t.Errorf("sumDropCounters() = %d, %d, want %d, %d", gotPackets, gotBytes, tt.wantPackets, tt.wantBytes)
+			}
+		})
 	}
 }
 
