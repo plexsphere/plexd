@@ -294,7 +294,61 @@ The dump lists every filter in the engine. plexd's carry the names `plexd <chain
 
 ### Logged rules on Windows
 
-A rule with `log: true` is enforced on Windows like any other: `buildFilters` gives it the filters an untagged rule gets. plexd logs none of its connections, and every apply that holds a logged rule logs `policy connection logging unavailable, logged rules are enforced without it` at Warn with `chain` and the `error` `policy: wfp: connection logging is not available on Windows`; see [Connection logging](./network-policy.md#connection-logging). The filter engine does record a classify-allow net event under plexd's filter for each such connection while the keyword `FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW` is set, but on the `windows-latest` runner a `FwpmNetEventSubscribe1` subscription delivered none of them, only drop events, so plexd does not read them yet.
+A rule with `log: true` gets the filters an untagged rule gets, and plexd writes `policy rule allowed connection` for each connection it allows, as on Linux and macOS; see [Connection logging](./network-policy.md#connection-logging). The filter engine reports each connection it permits as a classify-allow net event that names the filter that permitted it. `netevents_windows.go` reads these events through a `FwpmNetEventSubscribe4` subscription and hands each one that names a logged filter to the sink as a `ConnEvent`. `WFPController` implements `ConnReporter`, so `NewEnforcer` hands it the `ConnLogger` as that sink. Without a sink the controller reports nothing, changes no engine option and logs no Warn line, as the Linux backend does.
+
+Logging never blocks enforcement. When plexd cannot read the filter ids, set the engine options or subscribe, every filter stays installed, the failure does not change what `ApplyRules` returns, and plexd logs `policy connection logging unavailable, logged rules are enforced without it` at Warn with `chain` and the `error`; see [Error prefixes](#error-prefixes).
+
+#### The logged filters and their ids
+
+`buildFilters` returns, beside the filters, a map of the logged ones. For every rule with a `LogTag` it holds the rule's inbound filter, `plexd <chain> #<i> inbound`, as `ConnIn` and its outbound filter, `plexd <chain> #<i> outbound`, as `ConnOut`, with ` v6` appended at the IPv6 layers, in each family the rule is installed for, so a tagged rule without addresses has four entries, two per family. Forward filters are never in the map: the forward layers are not ALE layers, so a forwarded flow has no authorization to report, and a Windows node logs `in` and `out` but no `forward` connection. The relay probe permits are not in it either, since they belong to no rule.
+
+An event names its filter by the runtime filter id the engine assigned when the filter was added. `github.com/tailscale/wf` does not give plexd that id. It declares the union of `rawContext` and `providerContextKey` in `FWPM_FILTER0` as two fields, so it reads every field behind the union 8 bytes off and reports a wrong `Rule.KernelID`, which run [43271551927](https://github.com/plexsphere/plexd/actions/runs/43271551927) measured. Its `AddRule` discards the id `FwpmFilterAdd0` returns. plexd therefore reads the ids through its own layout of `FWPM_FILTER0`. After an apply with a logged rule, `FilterIDs` opens a session of its own, enumerates every filter of the engine with `FwpmFilterEnum0`, 100 at a time, and returns each filter's id by its key. An error there reads `policy: wfp: list filters:`. A logged filter whose id is missing or 0 reads `policy: wfp: list filters: want a distinct runtime id for each of <n> logged filters, got <m>`. After either, the chain holds no logged filter.
+
+The controller keeps two maps per chain, keyed by filter id: the one of the apply made last, and the one of the apply before, so an event that arrives just after an apply can still name a filter of the apply before. `FlushChain` makes the current map the previous one. An event is attributed to a rule by the filter it names, never by its addresses.
+
+#### Reading the events
+
+The subscription runs on the session plexd opens for the [engine options](#the-engine-options). It has no template, so it subscribes to every event, and its callback receives `FWPM_NET_EVENT5`. plexd keeps an IPv4 or IPv6 classify-allow event, type 6, and reads the filter id, the protocol, the addresses and the ports from it. An IPv4 address is a `UINT32` in host byte order, an IPv6 address 16 bytes in network order. For `ConnIn` the source is the remote side and `DstPort` the local port, for `ConnOut` the source is the local side and `DstPort` the remote port. Both ports are 0 unless the protocol is TCP or UDP. The engine reports one event per ALE authorization: one per TCP connection, and one per UDP or other flow, for its first datagram.
+
+Run [43612480437](https://github.com/plexsphere/plexd/actions/runs/43612480437) on `windows-latest`, Windows Server 2025 build 26100, measured that `FwpmNetEventSubscribe4` delivers one classify-allow event per connection under plexd's own filter id, 2 to 126 ms after the event's time stamp, and that it delivered all 50,000 events of a burst of 50,000 UDP flows sent in 3.7 s. `FwpmNetEventSubscribe1`, `2` and `3` received only the drop events there. The engine's event buffer, which `FwpmNetEventEnum2` reads, kept about 1,500 of the 50,000, so plexd does not read it. The subscription reports no lost events, so the Windows backend never calls `ConnSink.Lost`.
+
+plexd resolves the procedures of `fwpuclnt.dll` through `windows.NewLazySystemDLL`, and resolves every procedure a function needs before it calls the first one, so a missing one fails before a handle is open. On a `fwpuclnt.dll` without `FwpmNetEventSubscribe4`, connection logging is unavailable: the session for the [engine options](#the-engine-options) fails to open before any option changes, plexd logs the Warn line with an `error` that names the procedure, and the logged rules stay enforced. Microsoft's page for the function names no minimum Windows version.
+
+After a filter change the engine reports every live flow again, with `reauthReason` 0x5, and under filter id 0 once plexd's filters are gone. Every apply replaces the filters, so plexd drops an event with a `reauthReason` other than 0, which would otherwise log every live connection again at each reconcile. It also drops an event with `isLoopback` set. A connection open before its rule was logged is therefore not reported. While a logged rule is applied, the engine calls plexd for every connection it permits on the host, not only on the mesh adapter. The callback makes two comparisons and two map reads per chain, in the current maps first and then in the previous ones, before it drops an event under a filter that is not a logged one of plexd's, and the `ConnLogger`'s [rate limit](./network-policy.md#rate-limit) bounds the lines.
+
+#### The engine options
+
+Windows records classify-allow events only while two options of the filter engine say so: `collect_net_events`, and `match_any_keywords` with the keyword `FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW`, 0x10. Both apply to the whole host, and the setting persists across reboots. While it is on, Windows records every connection it permits at an ALE layer on the host, not only the ones plexd's filters permit. plexd therefore sets the options only while the applied ruleset holds a logged rule, and puts the host's own values back when no logged rule is left.
+
+plexd reads and sets the options with `FwpmEngineGetOption0` and `FwpmEngineSetOption0`, through a session it opens with `FwpmEngineOpen0` and no `FWPM_SESSION0`. That session is not dynamic, because the engine refuses `FwpmEngineSetOption0` inside a dynamic session. It adds no object, so the options are the only thing it leaves behind when the process ends.
+
+After an apply that leaves a chain holding a logged filter, plexd:
+
+1. reads both options;
+2. when `wfp-allow-events.json` does not exist in `data_dir` (`%ProgramData%\plexd\data` by default; see [Platform defaults](../core/configuration.md#platform-defaults)), writes the values it read to that file, atomically and with mode `0600`, before it changes anything;
+3. sets `collect_net_events` to 1 when it is 0, and adds the keyword bit to `match_any_keywords` when the bit is clear. When it changed either, it logs `wfp allow-event collection enabled` at Info with `previous_keywords`;
+4. subscribes, unless it already has.
+
+A host that holds `collect_net_events` 1 and `match_any_keywords` 0x1 gets this record, and its `match_any_keywords` becomes 0x11:
+
+```json
+{"collect_net_events":1,"match_any_keywords":1}
+```
+
+A record that already exists is kept as it is. It is the one an earlier apply of this run wrote, or one a run that crashed with the option set left behind, and either way it holds the host's setting. Without a state directory plexd sets nothing, and the `error` reads `policy: wfp: allow events: no state directory`. When one of the steps fails, plexd logs the Warn line and restores at once, so the host is not left recording events nobody reads.
+
+The restore unsubscribes and reads the record. Without a record it changes nothing. Otherwise it clears the keyword bit when the record lacks it and the engine holds it, and sets `collect_net_events` to 0 when the record holds 0 and the engine does not. Every other bit of `match_any_keywords` stays as it is. It then closes its session, deletes the record and logs `wfp allow-event collection restored` at Info. The record goes last, so on any error it stays, and the next restore tries again. A record that is not valid JSON is logged at Warn as `policy: wfp: allow-event record unreadable` with `error`, and read as `collect_net_events` 1 and `match_any_keywords` 0: plexd clears the keyword it sets and leaves collection on. plexd writes a record only before it sets the keyword, so the keyword being plexd's is the likelier reading, and a record that never parses would otherwise keep the option set for good.
+
+| When | How plexd restores |
+|---|---|
+| No logged rule is left | An apply after which no chain holds a logged filter restores, as does `DeleteChain` of the last chain that held one. With enforcement enabled, the baseline apply at start holds no logged rule, so it restores too |
+| At shutdown | `Enforcer.Teardown` calls `FlushChain` and `DeleteChain`. `DeleteChain` restores for a chain it does not hold too, so a shutdown retries a restore that failed at start |
+| At the next start | `plexd up` hands the controller `data_dir` through `SetStateDir` before it builds the `Enforcer`, and `SetStateDir` restores from a record it finds there. It does so with `policy.enabled: false` too, which applies no ruleset |
+| After a failed enable | The restore runs at once |
+
+A restore that fails, in any of these, is logged at Warn as `policy: wfp: restore allow-event collection` with `error`. `FlushChain` leaves the options alone.
+
+A release before this one does not read the record. A node downgraded after a crash keeps the option set, and starting this release once restores it from the record, which the earlier release leaves in `data_dir`. `plexd uninstall` restores nothing itself. After a crash, `plexd uninstall --purge` deletes the record with `data_dir` and leaves the option set.
 
 ### Drop counters on Windows
 
@@ -356,7 +410,20 @@ Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<o
 | Deleting a chain's filters | `policy: wfp: apply rules: delete stale filters:`, `policy: wfp: flush chain "<chain>":`, `policy: wfp: delete chain "<chain>":` |
 | Closing the session | `policy: wfp: probe: close session:`, `policy: wfp: delete chain: close session:` |
 
-The connection logging failures are logged, never returned, so they do not change what `ApplyRules` returns. An open of the [pflog](#pflog) reader fails with `policy: pf: pflog:`, and Windows names `policy: wfp: connection logging is not available on Windows`, each as the `error` of `policy connection logging unavailable, logged rules are enforced without it`.
+The connection logging failures are logged, never returned, so they do not change what `ApplyRules` returns. An open of the [pflog](#pflog) reader fails with `policy: pf: pflog:`. On Windows, reading the filter ids fails with `policy: wfp: list filters:`, and setting the engine options or subscribing fails with `policy: wfp: allow events:`. Each is the `error` of `policy connection logging unavailable, logged rules are enforced without it`. A failed restore of the engine options also reads `policy: wfp: allow events:`, as the `error` of `policy: wfp: restore allow-event collection`; see [Logged rules on Windows](#logged-rules-on-windows).
+
+| Logged failure on Windows | Prefix |
+|---|---|
+| Reading the filter ids | `policy: wfp: list filters:`, and `policy: wfp: list filters: want a distinct runtime id for each of <n> logged filters, got <m>` for a logged filter without an id or with the id 0 |
+| No state directory | `policy: wfp: allow events: no state directory` |
+| Opening the session for the engine options | `policy: wfp: allow events: open session:` |
+| Reading an option | `policy: wfp: allow events: read collect_net_events:`, `policy: wfp: allow events: read match_any_keywords:` |
+| Setting an option | `policy: wfp: allow events: set collect_net_events:`, `policy: wfp: allow events: set match_any_keywords:` |
+| Writing, reading and deleting the record | `policy: wfp: allow events: record options:`, `policy: wfp: allow events: read record:`, `policy: wfp: allow events: delete record:` |
+| The subscription | `policy: wfp: allow events: subscribe:`, `policy: wfp: allow events: unsubscribe:` |
+| Closing the session | `policy: wfp: allow events: close session:` |
+
+Inside these, a failed call of the filter engine reads `<procedure>: <error>`, such as `FwpmNetEventSubscribe4: <error>`. A call that reads or sets an engine option also names the option's number, 0 for `collect_net_events` and 1 for `match_any_keywords`, as in `FwpmEngineSetOption0(1): <error>`.
 
 | NAT failure | Prefix |
 |---|---|
@@ -399,6 +466,10 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `wfp rollback delete failed` (`Error`) | `filter`, `error` |
 | `policy connection logging unavailable, logged rules are enforced without it` (`Warn`, pf and WFP) | `error`, and `chain` on WFP |
 | `policy connection log reader stopped` (`Warn`, pf) | `error` |
+| `wfp allow-event collection enabled` (`Info`) | `previous_keywords` |
+| `wfp allow-event collection restored` (`Info`) | none |
+| `policy: wfp: restore allow-event collection` (`Warn`) | `error` |
+| `policy: wfp: allow-event record unreadable` (`Warn`) | `error` |
 
 | Message (`component=bridge`) | Keys |
 |---|---|
@@ -410,7 +481,7 @@ All entries carry `component=policy` for the filter operations and `component=br
 
 `count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger: every rule yields an inbound and an outbound filter per family, some a forward filter too, and every interface two relay probe permits. Three of the lines above `Debug` concern the forward path and the rollback. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
 
-The other two concern [connection logging](./network-policy.md#connection-logging). `policy connection logging unavailable, logged rules are enforced without it` is the line all three backends share, logged once per apply with a logged rule when the backend cannot report its connections, which on Windows is every such apply. `policy connection log reader stopped` reports a pflog reader that ended on a read error. The connection lines themselves, and the minute summary, come from the `ConnLogger`.
+The other six concern [connection logging](./network-policy.md#connection-logging). `policy connection logging unavailable, logged rules are enforced without it` is the line all three backends share, logged once per apply with a logged rule when the backend cannot report its connections. On Windows that is an apply whose filter ids plexd cannot read, or whose engine options or subscription it cannot set up, such as on a node without a state directory or with a `fwpuclnt.dll` that lacks `FwpmNetEventSubscribe4`. `policy connection log reader stopped` reports a pflog reader that ended on a read error. `wfp allow-event collection enabled` reports that plexd changed the filter engine's options, with `previous_keywords`, the `match_any_keywords` it found, and `wfp allow-event collection restored` that it put the recorded values back and deleted `wfp-allow-events.json`. `policy: wfp: restore allow-event collection` reports a restore that failed, which keeps the record for the next try, and `policy: wfp: allow-event record unreadable` a record that is not valid JSON, which plexd reads as `collect_net_events` 1 and `match_any_keywords` 0; see [Logged rules on Windows](#logged-rules-on-windows). The connection lines themselves, and the minute summary, come from the `ConnLogger`.
 
 ## Tests
 
@@ -420,9 +491,14 @@ Both controllers reach the operating system through seams, so every rendered rul
 
 The drop counters have unit tests on macOS too. `TestPFController_RenderRuleLines` checks that both `block` lines end in `label "plexd-default-deny"` and that no `pass` line carries a label. `TestPFController_DropCounts` feeds the recording runner `pfctl -sl` output: it sums fields 3 and 4 of two label lines, ignores a line of another label, and returns an error containing `policy: pf: drop counts` for a label line with three fields, a non-numeric count, an output without a label line, a `pfctl` exit status 1, and a chain the controller does not hold.
 
-The connection logging code has unit tests of its own. On macOS they pin the lines `renderRule` returns for a tagged rule of each protocol, the line numbers `render` maps to tags, `parsePflogRecord` over a hand-built `pfloghdr`, and that a reader which fails to open makes `ApplyRules` load the anchor without `log` and log the Warn line. On Windows a unit test pins that a logged rule gets the filters an untagged one gets and that every apply holding one logs the Warn line.
+The connection logging code has unit tests of its own. On macOS they pin the lines `renderRule` returns for a tagged rule of each protocol, the line numbers `render` maps to tags, `parsePflogRecord` over a hand-built `pfloghdr`, and that a reader which fails to open makes `ApplyRules` load the anchor without `log` and log the Warn line. On Windows the fake engine also implements `FilterIDs`: it gives each filter it adds a distinct id and can be armed to fail through `filterIDsErr`. No unit test opens a real net event session on the elevated runner: `newTestWFPController` replaces `openNetEvents`, and the tests of the engine options wire a `fakeNetEvents`, which holds both options in memory and records every `setOption`. With them:
 
-Six tests drive the real host and are gated:
+- `TestWFPController_BuildFilters_LoggedMap` checks that `buildFilters` maps the inbound filter of each logged rule as `ConnIn` and its outbound filter as `ConnOut`, in each family the rule is installed in, that it leaves the forward filters, the relay probe permits and every filter of an untagged rule out, and that a ruleset without a tag yields an empty map and the filters it yields untagged.
+- `TestWFPController_ApplyRules_LogFilters` checks that after an apply the controller knows each logged filter by the id `FilterIDs` returned, that a `FilterIDs` error or an id of 0 logs the Warn line while every filter stays installed, and that without a sink the controller neither lists the filters nor opens a session and logs no Warn line.
+- `TestWFPController_EnableAllowEvents` checks that the first enable writes the record before it sets anything and then sets only what is off, that a second call writes, sets and logs nothing and does not subscribe again, and that a record already there is kept byte for byte. `TestWFPController_RestoreAllowEvents` checks that the restore clears the keyword only when the record holds it clear, turns collection off only when the record holds it off, leaves the bits others set, deletes the record and closes the session, and that it reads a record that is not valid JSON as collection on and the keyword clear. `TestWFPController_SetStateDir_RestoresCrashRecord` checks that `SetStateDir` on a new controller restores from a crash record, and that a directory without a record opens no session.
+- `TestNetEventLayouts` pins the sizes and offsets of plexd's own layouts on a 64-bit build, among them `fwpmFilter0` at 200 bytes with `FilterID` at 176 and `fwpmNetEvent5` at 152 bytes with `Type` at 136 and `ClassifyAllow` at 144. `TestParseNetEvent` reads an IPv4 and an IPv6 event and refuses an event of another type, one without its classify-allow part and one of neither family. `TestOnNetEvent_DispatchesByKey` checks that the callback finds the handler by the context the subscription named and returns 0 each time. `TestWFPController_AllowEventConversion` checks the `ConnEvent` an event under an inbound or an outbound filter becomes, and that a reauthorization, a loopback event and an event under a filter that is not a logged one of plexd's are dropped.
+
+Seven tests drive the real host and are gated:
 
 | Test | Gate | Locally |
 |---|---|---|
@@ -432,6 +508,7 @@ Six tests drive the real host and are gated:
 | `TestWFPController_Real` (`wfp_windows_test.go`) | `PLEXD_TEST_REAL_WFP=1` and an elevated token | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run '^TestWFPController_Real$' ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealNAT` (`netnat_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealNAT ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealTraffic` (`tuntraffic_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealTraffic ./internal/policy/` from an elevated shell, with every Windows Firewall profile off |
+| `TestWFPController_RealConnLog` (`tuntraffic_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealConnLog ./internal/policy/` from an elevated shell, with every Windows Firewall profile off |
 
 `TestPFController_Real` loads an anchor naming `plexd99`, an interface no host has, with an IPv6 rule and the default deny among its rules, takes the pf reference, reads the filter and nat rules back with `pfctl -a com.apple/plexd -s rules` and `-s nat`, and finds the `inet6` rule and a block rule without an address there. In pfctl's printed form it also finds a `keep state` outbound line, a `flags A/A` mirror, both ICMP mirrors, `block drop out quick on plexd99 from (plexd99) to any`, and the relay probe line as the only `pass out` line from `(plexd99)`. It then deletes the chain and asserts the anchor is empty and the token released. A host that had pf disabled is left disabled. The variable gates it in addition to the effective uid, so `sudo go test ./...` on a developer's Mac does not enable pf on their host.
 
@@ -462,7 +539,7 @@ and checks that:
 
 The SYN-ACK, the echo and the echo reply are replies to what r0 to r2 let in, so the checks prove each platform's reply path: connection tracking on Linux, the mirrors on macOS and the ALE flow on Windows. The drop check proves that `DropCounts` reads the default deny's counters on the real kernel, and on macOS it is the proof of the `pfctl -sl` column layout; see [Drop counters](#drop-counters). When the test ends it closes the device, which ends its reader, before it deletes the chain. The Windows Firewall blocks the unsolicited packets the test injects on its own, so the CI step turns every firewall profile off first with `Set-NetFirewallProfile -All -Enabled False`. plexd's filters sit in a sublayer of their own and do not depend on the Windows Firewall.
 
-`TestPFController_RealConnLog` and Linux's `TestNftablesController_RealConnLog` build the same harness, through `newTunTestHarness`, and run `runTunConnLogChecks` (`tunconnlog_test.go`). It sets a recording sink through `ConnReporter`, so the events it checks come from the backend's reader as the kernel reported them, and applies, in chain `plexd-logtest`:
+`TestPFController_RealConnLog`, `TestWFPController_RealConnLog` and Linux's `TestNftablesController_RealConnLog` build the same harness, through `newTunTestHarness`, and run `runTunConnLogChecks` (`tunconnlog_test.go`). It sets a recording sink through `ConnReporter`, so the events it checks come from the backend's reader as the kernel reported them, and applies, in chain `plexd-logtest`:
 
 ```text
 r0 tcp 10.255.247.2/32 → 10.255.247.1/32 port 7001  LogTag "7/0"
@@ -476,10 +553,12 @@ and checks that:
 
 - a SYN from P:41001 to N:7001 draws a SYN-ACK and exactly one event `{"7/0", in, P, N, 6, 41001, 7001}` within 3 s, and no second event within 2 s;
 - a SYN from P:41002 to N:7003, which the untagged r3 allows, draws a SYN-ACK and no event within 2 s;
-- a datagram from P:41003 to N:7002 comes back and yields one event `{"7/1", in, P, N, 17, 41003, 7002}`. A second datagram on the same ports after the echo yields a second event on macOS, where `tunUDPLogsEveryPacket` holds, and none within 2 s on Linux;
+- a datagram from P:41003 to N:7002 comes back and yields one event `{"7/1", in, P, N, 17, 41003, 7002}`. A second datagram on the same ports after the echo yields a second event on macOS, where `tunUDPLogsEveryPacket` holds, and none within 2 s on Linux and Windows;
 - a dial from N to P:7006 puts a SYN on the device and yields at least one event `{"7/2", out, N, P, 6, <any port>, 7006}`, and no event with another tag;
 - after a re-apply with r0 untagged, a SYN from P:41004 to N:7001 draws a SYN-ACK and no event within 2 s.
 
 The checks end with `DeleteChain("plexd-logtest")`, and the cleanup deletes the chain only when a check failed before that. `TestPFController_RealConnLog` also finds `pflog0` after the first tagged apply, and its events prove the line numbers of [Logged rules](#logged-rules).
 
-CI runs all six; see [CI Workflow](../development/ci-workflow.md).
+On Windows `tunUDPLogsEveryPacket` is false, because the engine authorizes a UDP flow once, and the events `TestWFPController_RealConnLog` checks prove the filter ids of [Logged rules on Windows](#logged-rules-on-windows). The engine options it turns on belong to the whole host and outlive the process. Before the checks the test reads both through a session of its own and stops when the keyword is already set, and a cleanup puts both back to those starting values whatever the test's result. The test hands the controller `t.TempDir()` through `SetStateDir` and wraps it in `wfpLoggedApplyHook`, which embeds the `*WFPController` and, after each successful `ApplyRules` with a tagged rule, checks that the keyword bit is set, that `collect_net_events` is not 0, and that `wfp-allow-events.json` holds the starting values. After the checks' `DeleteChain` it finds both options at their starting values and no record. It then sets the keyword and writes the record as a crashed run would, and checks that `SetStateDir` with the same directory on a new controller puts the starting values back and deletes the record.
+
+CI runs all seven; see [CI Workflow](../development/ci-workflow.md).

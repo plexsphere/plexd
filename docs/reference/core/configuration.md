@@ -456,8 +456,11 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > `policy connection logging unavailable, logged rules are enforced without it` and
 > enforces the rules without logging them. On Linux without `journalctl`, as in a
 > container, plexd forwards the connection lines to the control plane, and its other lines
-> stay unforwarded as before. Windows enforces logged rules without logging their
-> connections, and every apply that holds one logs that line; see
+> stay unforwarded as before. A Windows node logs the connections too, except those it
+> forwards. It turns a host-wide filter engine option on while a logged rule is applied,
+> records the host's previous setting in `wfp-allow-events.json` under `data_dir` before it
+> does, and puts that setting back when no logged rule is left, at shutdown, and at the
+> next start after a crash; see
 > [Logged rules on Windows](../networking/pf-wfp-firewall.md#logged-rules-on-windows).
 
 Source: `internal/policy/config.go`

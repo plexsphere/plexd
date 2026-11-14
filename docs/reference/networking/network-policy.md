@@ -135,7 +135,7 @@ type FirewallController interface {
 
 ### ConnReporter
 
-A backend that can report the connections its logged rules admit also implements `ConnReporter`. The Linux and macOS backends do; the Windows one does not, see [Logged rules on Windows](./pf-wfp-firewall.md#logged-rules-on-windows). `NewEnforcer` hands such a backend the Enforcer's `ConnLogger` as its sink, and the backend's reader hands the sink one `ConnEvent` per connection.
+A backend that can report the connections its logged rules admit also implements `ConnReporter`. The Linux, macOS and Windows backends all do; see [Per platform](#per-platform) for what each one reads. `NewEnforcer` hands such a backend the Enforcer's `ConnLogger` as its sink, and the backend's reader hands the sink one `ConnEvent` per connection.
 
 ```go
 type ConnReporter interface {
@@ -414,7 +414,7 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 - On all three platforms the rules govern mesh traffic addressed to the node itself, the mesh traffic it forwards, and what the node's own sockets send over the mesh. A node therefore rejects unsolicited mesh traffic to its own addresses until a rule allows it, and it drops what it sends to a mesh address until a rule allows that too; see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern). On Linux the replies to a connection the node, or a host behind it, opened pass through connection tracking without a rule of their own, and so do the replies the node sends to a connection the policy let in; see [Connection Tracking](./nftables-firewall.md#connection-tracking). On macOS only TCP keeps state: the node's own TCP connections keep their replies, and the replies to what a rule lets in leave through stateless mirror lines. On Windows those replies leave through the ALE flow the inbound accept authorized.
 - What the node forwards into the mesh is not filtered on its way out: traffic from a user-access client, a site-to-site peer or a host behind a bridge, and on Linux a container or Pod masqueraded onto the node's mesh address. On Linux the output chain also lets out unfiltered what leaves the mesh interface from a source that is not one of its addresses, such as a Pod's packet IPVS sends to a Service endpoint behind the mesh; see [Connection Tracking](./nftables-firewall.md#connection-tracking).
 - plexd's relay liveness probe, UDP to port 9 (`RelayProbePort`), leaves the mesh interface without a rule on every platform; see [Relay liveness probe](./wireguard.md#relay-liveness-probe).
-- A rule with `log: true` makes plexd log each connection it allows, at a bounded rate, on Linux and macOS; Windows enforces it without logging; see [Connection logging](#connection-logging).
+- A rule with `log: true` makes plexd log each connection it allows, at a bounded rate, on Linux, macOS and Windows; Windows does not log the connections it forwards; see [Connection logging](#connection-logging).
 - Every rule is an allow and rule order carries no meaning. The default stance is **deny-all**: the ruleset always ends with a default-deny rule that covers IPv4 and IPv6, and a `null` policy applies the default-deny-only ruleset.
 - Rules may name IPv4 or IPv6 prefixes on Linux, macOS and Windows. A peer's allowed IPs are its IPv4 mesh address alone today, so an IPv6 rule governs IPv6 traffic only once the mesh carries it.
 - Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped, not node-ID references.
@@ -423,7 +423,7 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 
 ## Connection logging
 
-A rule with `log: true` makes plexd write one line to its own log for each connection the rule allows, on Linux and macOS:
+A rule with `log: true` makes plexd write one line to its own log for each connection the rule allows, on Linux, macOS and Windows:
 
 ```text
 time=2026-11-12T10:00:00.000Z level=INFO msg="policy rule allowed connection" component=policy revision_id=0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c4 rule=0 direction=in protocol=tcp src=10.99.0.3 dst=10.99.0.1 dst_port=7001
@@ -460,19 +460,19 @@ DECISION: the logged rules go ahead of the unlogged ones. Every rule is an allow
 
 Each backend reads its kernel's own report and hands one `ConnEvent` per match to the `ConnLogger`:
 
-| | Linux | macOS |
-|---|---|---|
-| Kernel source | nftables `log group 28772` in front of each logged rule, read over NFLOG | `log` on pf lines, read from `pflog0` through `/dev/bpf` |
-| First packet only | `ct state new`; an unanswered flow's later packets are still new | TCP: a `flags S/SA` line in, `keep state` out; UDP, ICMP and other protocols: every packet |
-| Directions | `in`, `forward`, `out` from the NFLOG hook | `out` from pf's direction; `in`, or `forward` when the destination is no address of the Mac |
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Kernel source | nftables `log group 28772` in front of each logged rule, read over NFLOG | `log` on pf lines, read from `pflog0` through `/dev/bpf` | WFP classify-allow net events, delivered by `FwpmNetEventSubscribe4` |
+| First packet only | `ct state new`; an unanswered flow's later packets are still new | TCP: a `flags S/SA` line in, `keep state` out; UDP, ICMP and other protocols: every packet | One event per ALE authorization: one per TCP connection and one per UDP or other flow. A connection open before its rule was logged is not reported |
+| Directions | `in`, `forward`, `out` from the NFLOG hook | `out` from pf's direction; `in`, or `forward` when the destination is no address of the Mac | `in` from the filter at `ALE_AUTH_RECV_ACCEPT`, `out` from the filter at `ALE_AUTH_CONNECT` |
 
 On macOS a UDP, ICMP or other non-TCP flow yields one line per packet, and on Linux a flow yields one line per packet until its first reply, both within the rate limit below. The backend pages describe each reader: [nftables Firewall Controller](./nftables-firewall.md#connection-logging) and [pflog](./pf-wfp-firewall.md#pflog).
 
-Windows enforces a logged rule like any other and logs none of its connections. Every apply that holds a logged rule logs the line under [When logging is unavailable](#when-logging-is-unavailable), with the `error` `policy: wfp: connection logging is not available on Windows`; see [Logged rules on Windows](./pf-wfp-firewall.md#logged-rules-on-windows).
+On Windows plexd attributes each event to a rule by the filter that permitted it, never by its addresses. It logs no connection the node forwards: the forward layers are not ALE layers, so a forwarded flow has no authorization to report. The filter engine records permitted connections only while a host-wide engine option is on. plexd sets `collect_net_events` and the keyword `FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW` in `match_any_keywords` only while the applied ruleset holds a logged rule. It writes the host's previous values to `wfp-allow-events.json` under `data_dir` first, and restores them when no logged rule is left, at shutdown, and at the next start after a crash. While the option is on, Windows records every connection it permits on the host, not only those on the mesh adapter; see [Logged rules on Windows](./pf-wfp-firewall.md#logged-rules-on-windows).
 
 ### Rate limit
 
-plexd writes at most 5 connection lines a second, with a burst of 50. At the default `log_fwd.report_interval` of 30 s that is at most 200 lines a batch, half of the forwarder's buffer of twice `batch_size`. A line beyond the limit is dropped and counted as rate limited. A record a reader knows it missed, through a full NFLOG socket on Linux or a BPF drop on macOS, is counted as lost. Once a minute, when either count is above 0, plexd logs at Warn
+plexd writes at most 5 connection lines a second, with a burst of 50. At the default `log_fwd.report_interval` of 30 s that is at most 200 lines a batch, half of the forwarder's buffer of twice `batch_size`. A line beyond the limit is dropped and counted as rate limited. A record a reader knows it missed, through a full NFLOG socket on Linux or a BPF drop on macOS, is counted as lost. Windows reports no lost records: the `FwpmNetEventSubscribe4` subscription has no loss indicator. On the `windows-latest` runner it delivered all 50,000 events of a burst of 50,000 UDP flows sent in 3.7 s. Once a minute, when either count is above 0, plexd logs at Warn
 
 ```text
 level=WARN msg="policy connection lines dropped" component=policy rate_limited=10 lost=3
@@ -488,13 +488,13 @@ Logging never blocks enforcement. A backend whose reader cannot start installs t
 level=WARN msg="policy connection logging unavailable, logged rules are enforced without it" component=policy error="..."
 ```
 
-The rules still pass and drop the same traffic, and no line names them. The `error` names the cause, such as another process bound to NFLOG group 28772 on Linux or no free BPF device on macOS. On Windows it is `policy: wfp: connection logging is not available on Windows`, for every apply that holds a logged rule. On Linux and macOS a reader that started and then fails logs `policy connection log reader stopped` at Warn with `error`, and the next apply with a logged rule opens a new one.
+The rules still pass and drop the same traffic, and no line names them. The `error` names the cause, such as another process bound to NFLOG group 28772 on Linux or no free BPF device on macOS. On Windows the line also carries `chain`, and the causes include no state directory (`policy: wfp: allow events: no state directory`), an engine option plexd could not read or set (an `error` that starts `policy: wfp: allow events: read` or `policy: wfp: allow events: set`), a `fwpuclnt.dll` without `FwpmNetEventSubscribe4`, which the `error` names, or filter ids plexd could not read (`policy: wfp: list filters`). When turning the option on fails, plexd restores the host's previous values at once. On Linux and macOS a reader that started and then fails logs `policy connection log reader stopped` at Warn with `error`, and the next apply with a logged rule opens a new one.
 
 The `ConnLogger` drops an event it cannot attribute and logs it at Debug with `tag`: `policy connection event names no logged rule` when the tag belongs to neither the ruleset applied last nor the one before, and `policy connection event does not match its rule` when the rule's addresses, protocol and port do not match the event.
 
 ### Where the lines go
 
-A connection line is a record of plexd's own log, so it lands where plexd's other lines do: the journal on Linux and `/Library/Logs/plexd/plexd.log` on macOS. Log forwarding carries it to the control plane from there, as it carries every other plexd line.
+A connection line is a record of plexd's own log, so it lands where plexd's other lines do: the journal on Linux, `/Library/Logs/plexd/plexd.log` on macOS and the Application Event Log, provider `plexd`, on Windows. Log forwarding carries it to the control plane from there, as it carries every other plexd line.
 
 On Linux without `journalctl`, as in the Docker image, the Kubernetes DaemonSet and OpenWRT, plexd has no source for its own output. There, with `log_fwd.enabled`, `plexd up` creates a [`QueueSource`](../observability/log-forwarding.md#queuesource) and passes its `Add` to `ConnLogger.ForwardTo`, so the connection lines and the minute summary reach the control plane. plexd's other lines stay on stderr there, as before. On every platform `plexd up` runs `ConnLogger.Run` beside the log forwarder.
 
