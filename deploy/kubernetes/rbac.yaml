@@ -18,12 +18,6 @@ rules:
   - apiGroups: ["plexd.plexsphere.com"]
     resources: ["plexdhooks"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["plexd.plexsphere.com"]
-    resources: ["plexdhooks/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch"]
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
@@ -39,6 +33,46 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: plexd
+subjects:
+  - kind: ServiceAccount
+    name: plexd
+    namespace: plexd-system
+---
+# Runs a dispatched PlexdHook as one Job per execution. The grants are
+# namespaced because plexd creates its Jobs only in its own namespace, where it
+# lists PlexdHooks, and a cluster-wide pods/log grant would let one node's agent
+# read the log of every pod in the cluster.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: plexd-hook-runner
+  namespace: plexd-system
+  labels:
+    app.kubernetes.io/name: plexd
+    app.kubernetes.io/part-of: plexsphere
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: plexd-hook-runner
+  namespace: plexd-system
+  labels:
+    app.kubernetes.io/name: plexd
+    app.kubernetes.io/part-of: plexsphere
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: plexd-hook-runner
 subjects:
   - kind: ServiceAccount
     name: plexd
