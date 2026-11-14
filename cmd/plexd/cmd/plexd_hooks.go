@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/kubernetes"
@@ -292,4 +293,41 @@ func plexdHookVersions(hooks []kubernetes.PlexdHook) []plexdHookVersion {
 		return strings.Compare(a.name, b.name)
 	})
 	return versions
+}
+
+// newPlexdHookRunner builds the runner the executor runs a dispatched PlexdHook
+// through: one Kubernetes Job per execution, in the ServiceAccount's namespace,
+// pinned to the node the pod runs on. Outside a cluster it returns nil without
+// a word, and the executor keeps rejecting a plexd_hook entry as
+// unsupported_action_type. Inside one, a pod that lacks what a Job needs (a
+// namespace, its node's name, an API server client) logs one warning and gets
+// no runner either, so boot carries on with every other action kind.
+//
+// Every nil it returns is the interface's own, never a nil *HookJobRunner
+// inside it: the executor tells "no runner" by comparing the interface with
+// nil.
+func newPlexdHookRunner(env *kubernetes.KubernetesEnvironment, nodeID string, outputLimit int64, logger *slog.Logger) actions.PlexdHookRunner {
+	if env == nil || !env.InCluster {
+		return nil
+	}
+	namespace := strings.TrimSpace(env.Namespace)
+	if namespace == "" {
+		logger.Warn("plexd hook runs disabled: the ServiceAccount namespace is empty")
+		return nil
+	}
+	if env.NodeName == "" {
+		logger.Warn("plexd hook runs disabled: MY_NODE_NAME is not set")
+		return nil
+	}
+	client, err := kubernetes.NewInClusterJobClient(env)
+	if err != nil {
+		logger.Warn("plexd hook runs disabled", "error", err)
+		return nil
+	}
+	return kubernetes.NewHookJobRunner(client, kubernetes.HookJobConfig{
+		Namespace:   namespace,
+		NodeName:    env.NodeName,
+		NodeID:      nodeID,
+		OutputLimit: outputLimit,
+	}, logger)
 }
