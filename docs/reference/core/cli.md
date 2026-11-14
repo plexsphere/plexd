@@ -55,7 +55,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 7. Create reconciler with handlers for WireGuard, policy, and bridge reconciliation
 8. Create heartbeat service with subsystem status enrichment and key-rotation callbacks; its credential-refused callback is set in step 12, once the node API server exists
 9. Create integrity store + verifier
-10. Create action executor, register 11 built-in actions, register the action dispatcher on the reconciler, list the `PlexdHook` resources in a pod's namespace, build the capability reporter
+10. Create action executor, register 11 built-in actions, register the action dispatcher on the reconciler, list the `PlexdHook` resources in a pod's namespace, build the capability reporter. In a pod, also build the PlexdHook runner that runs a dispatched `PlexdHook` as a Job, and hand it to the executor; a pod with an empty ServiceAccount namespace, without `MY_NODE_NAME`, or whose Job client cannot be built logs a `plexd hook runs disabled` warning and runs no PlexdHook
 11. Create hook watcher, then run its first scan of `hooks_dir` and wait for it, for at most 10 seconds
 12. Create node API server, wire reconcile handler
 13. Create metrics collectors + manager

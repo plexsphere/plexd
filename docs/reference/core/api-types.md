@@ -669,7 +669,7 @@ callback URL and **no** hook checksum.
 | Field         | Type             | JSON Tag         | Description                                            |
 |---------------|------------------|------------------|--------------------------------------------------------|
 | `ExecutionID` | `string`         | `"execution_id"` | Execution identifier                                   |
-| `Action`      | `string`         | `"action"`       | Action name (builtin or hook)                          |
+| `Action`      | `string`         | `"action"`       | Action name: a builtin, a hook, or a PlexdHook's `metadata.name` |
 | `Type`        | `string`         | `"type"`         | One of the `ActionKind*` values                        |
 | `Parameters`  | `map[string]json.RawMessage` | `"parameters"` | Action parameters, each held as raw JSON so a large integer keeps every digit; nullable, a JSON `null` decodes to a nil map |
 | `Status`      | `string`         | `"status"`       | `pending`, `ack`, or `started`                         |
@@ -683,6 +683,7 @@ callback URL and **no** hook checksum.
 |---------------------|-----------|----------------------------------------|
 | `ActionKindBuiltin` | `builtin` | Dispatches an action built into plexd  |
 | `ActionKindHook`    | `hook`    | Dispatches a hook registered by the node |
+| `ActionKindPlexdHook` | `plexd_hook` | Dispatches a PlexdHook resource of the node's cluster, run as a Kubernetes Job (see [Kubernetes CRD Hooks](../actions/remote-actions-hooks.md#kubernetes-crd-hooks)) |
 
 **Pull-only execution status**
 

@@ -6,7 +6,7 @@ feature: PXD-0022
 
 # Kubernetes DaemonSet Deployment Reference
 
-Reference documentation for deploying plexd as a Kubernetes DaemonSet. Covers environment detection, configuration, CRD controller, audit log reader, authentication, and manifest structure.
+Reference documentation for deploying plexd as a Kubernetes DaemonSet. Covers environment detection, configuration, CRD controller, the PlexdHook inventory and Job runner, audit log reader, authentication, and manifest structure.
 
 ## KubernetesEnvironment
 
@@ -114,11 +114,10 @@ type KubeClient interface {
     CreateSecret(ctx context.Context, secret *KubeSecret) error
     UpdateSecret(ctx context.Context, secret *KubeSecret) error
     DeleteSecret(ctx context.Context, namespace, name string) error
-    WatchPlexdHooks(ctx context.Context, namespace string) (<-chan PlexdHookEvent, error)
-    UpdatePlexdHookStatus(ctx context.Context, hook *PlexdHook) error
-    CreateJob(ctx context.Context, job *PlexdJob) error
 }
 ```
+
+The PlexdHook calls are not part of it: [HookLister](#hooklister) lists and watches the resources, and [JobClient](#jobclient) runs them.
 
 ### Sentinel errors
 
@@ -292,7 +291,124 @@ The event channel delivers `ADDED`, `MODIFIED`, and `DELETED` frames with the me
 
 ### PlexdHook inventory
 
-`plexd up` runs `DefaultDetector.Detect()` before it builds the capability reporter. In a pod it lists the `PlexdHook` resources in the ServiceAccount's namespace with a 10-second budget and reports the digest-pinned ones as `plexd_hooks`. A goroutine then watches those resources for as long as the agent runs and reports the list again when it changes (see [PlexdHook CRD](../actions/plexdhook-crd.md#keeping-the-list-current)). The existing `plexdhooks` `get, list, watch` grant in the `plexd` ClusterRole covers both the list and the watch, so no RBAC change is needed. Outside a cluster the step costs one environment variable check and no watch runs. Inside one, a missing grant, a missing CRD, a timeout, or an unreachable API server at boot logs one warning, and the first manifest goes out without `plexd_hooks`. The node boots either way, and the list reaches the control plane once a later list succeeds.
+`plexd up` runs `DefaultDetector.Detect()` before it builds the capability reporter. In a pod it lists the `PlexdHook` resources in the ServiceAccount's namespace with a 10-second budget and reports the digest-pinned ones as `plexd_hooks`. A goroutine then watches those resources for as long as the agent runs and reports the list again when it changes (see [PlexdHook CRD](../actions/plexdhook-crd.md#keeping-the-list-current)). The `plexdhooks` `get, list, watch` grant in the `plexd` ClusterRole covers both the list and the watch. Outside a cluster the step costs one environment variable check and no watch runs. Inside one, a missing grant, a missing CRD, a timeout, or an unreachable API server at boot logs one warning, and the first manifest goes out without `plexd_hooks`. The node boots either way, and the list reaches the control plane once a later list succeeds.
+
+Right after the inventory, `plexd up` builds the [PlexdHook runner](#wiring-in-plexd-up), which runs a dispatched hook. The inventory itself only reads and starts no Job.
+
+## JobClient
+
+Reads a PlexdHook, creates, reads, and deletes the Jobs of its runs, and reads their pods, through the API server. Nothing else in plexd writes to the cluster for a PlexdHook.
+
+```go
+func NewInClusterJobClient(env *KubernetesEnvironment) (*JobClient, error)
+```
+
+`JobClient` and `HookLister` embed the unexported `apiServer`, which holds the base URL, the token path, and the HTTP client. `newAPIServer(host, port, caPath string, env *KubernetesEnvironment)` builds it, so the connection rules under [HookLister](#hooklister) hold for both: the same environment variables, cluster CA, TLS minimum, transport timeouts, and token read on every call.
+
+| Method | Request | Notes |
+|---|---|---|
+| `GetPlexdHook(ctx, namespace, name) (*PlexdHook, error)` | `GET /apis/plexd.plexsphere.com/v1alpha1/namespaces/{namespace}/plexdhooks/{name}` | The metadata is unnested as in a list. `404` wraps `ErrNotFound` |
+| `CreateJob(ctx, namespace string, job *HookJob) error` | `POST /apis/batch/v1/namespaces/{namespace}/jobs` | `409` wraps `ErrAlreadyExists` |
+| `GetJob(ctx, namespace, name) (JobState, error)` | `GET /apis/batch/v1/namespaces/{namespace}/jobs/{name}` | `JobState` from the conditions of type `Complete` and `Failed` with status `True`. The `FailureTarget` condition, which comes ahead of `Failed`, is ignored |
+| `DeleteJob(ctx, namespace, name) error` | `DELETE /apis/batch/v1/namespaces/{namespace}/jobs/{name}` with the body `{"propagationPolicy":"Background"}` | `404` is nil |
+| `ListJobPods(ctx, namespace, jobName) ([]JobPod, error)` | `GET /api/v1/namespaces/{namespace}/pods?labelSelector=job-name%3D{jobName}` | An empty list is an empty slice. `ExitCode` and `WaitingReason` come from the `hook` container's `state.terminated.exitCode` and `state.waiting.reason` |
+| `PodLog(ctx, namespace, pod string, limitBytes int64) (string, error)` | `GET /api/v1/namespaces/{namespace}/pods/{pod}/log?container=hook&limitBytes={n}` | Returns the first `n` bytes of the log |
+
+```go
+type JobState struct {
+    Complete, Failed bool
+    Reason, Message  string
+}
+
+type JobPod struct {
+    Name          string
+    CreatedAt     time.Time
+    ExitCode      *int
+    WaitingReason string
+}
+```
+
+`HookJob` is a struct with `batch/v1` JSON tags for exactly the [Job document](../actions/plexdhook-crd.md#the-job) plexd creates. Every name in a path goes through `url.PathEscape`.
+
+Each method makes its request through `apiServer.do(ctx, what, method, path, rawQuery, body)`, where `what` names the call, such as `create job in "plexd-system"`:
+
+| Response | Result |
+|---|---|
+| Token unreadable | `kubernetes: <what>: read service account token: <cause>` |
+| Transport error | `kubernetes: <what>: <cause>` |
+| Any `2xx` | The response, for the method to decode |
+| `401`, `403` | `kubernetes: <what>: status <code>: kubernetes: unauthorized`, wrapping `ErrUnauthorized` |
+| `404` | `kubernetes: <what>: status 404: kubernetes: resource not found`, wrapping `ErrNotFound` |
+| `409` | `kubernetes: <what>: status 409: kubernetes: resource already exists`, wrapping `ErrAlreadyExists` |
+| Any other status | `kubernetes: <what>: unexpected status <code>: <message>`, where the message is the first 512 bytes of the `message` of the `metav1.Status` body, or `kubernetes: <what>: unexpected status <code>` when the body is not a `metav1.Status` with a message |
+
+`HookLister` keeps its own list and watch requests, so its error texts are unchanged.
+
+## HookJobRunner
+
+Implements `actions.PlexdHookRunner` (see [Remote Actions and Hooks](../actions/remote-actions-hooks.md#kubernetes-crd-hooks)) over an unexported interface that holds the six `JobClient` methods. `internal/kubernetes` imports `internal/actions` for the interface's types; nothing under `internal/actions` imports `internal/kubernetes`.
+
+```go
+type HookJobConfig struct {
+    Namespace   string // the ServiceAccount's namespace
+    NodeName    string // MY_NODE_NAME
+    NodeID      string // plexd's node id
+    OutputLimit int64  // actions.max_output_bytes
+}
+
+func NewHookJobRunner(client hookJobAPI, cfg HookJobConfig, logger *slog.Logger) *HookJobRunner
+```
+
+The logger carries `component=plexdhook-jobs`. `Start`, `Wait`, and `Stop` address the Job as `hookJobName(cfg.NodeID, executionID)`: `plexdhook-` and the first 32 hex characters of the SHA-256 over the node id, one zero byte, and the execution id.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `hookJobPollInterval` | `2s` | Time between two reads of the Job in `Wait` |
+| `hookJobBackstop` | `30s` | Added to the run deadline for the Job's `activeDeadlineSeconds` |
+| `hookJobRequestTimeout` | `10s` | Budget of each API call |
+| `hookJobTTLSeconds` | `3600` | The Job's `ttlSecondsAfterFinished` |
+
+The runner holds them in fields, so a test can shorten them.
+
+### Start
+
+1. `GetPlexdHook`. `ErrNotFound` becomes `actions.ErrPlexdHookNotFound`, and any other error is wrapped as `get plexd hook: <cause>`
+2. `PlexdHookSpec.ImageDigest()`, the check the capability manifest uses too. An image without a `sha256` digest fails with `plexd hook image is not pinned by a sha256 digest: <image>`
+3. A NUL character in a parameter name or value, from the resource or from the dispatch, fails with `plexd hook parameter <name> contains a NUL character`
+4. `CreateJob` with the [Job document](../actions/plexdhook-crd.md#the-job). `ErrAlreadyExists` is nil, and any other error is wrapped as `create job: <cause>`
+5. Log `plexd hook job created` at info with `execution_id`, `hook`, `job`, and `deadline_seconds`
+
+### Wait
+
+`Wait(ctx, executionID, bound)` calls `GetJob` at once and then every `hookJobPollInterval`. At most `actions.max_concurrent` runs exist at a time, so the API server sees one read per run every 2 seconds, 2.5 a second at the default of 5.
+
+| `GetJob` answers | Result |
+|---|---|
+| `Complete` | Collect, and return `Succeeded` |
+| `Failed` with reason `DeadlineExceeded` | `TimedOut` with no exit code and no output: the Job controller has deleted the pods |
+| `Failed` with another reason | Collect. Without an exit code, `Reason` is `plexd hook job failed: <reason>: <message>` |
+| `ErrNotFound` | `actions.ErrPlexdHookJobNotFound` |
+| Any other error | Log `plexd hook job status read failed` at warn, once per streak of failures, and keep reading |
+
+When `bound` has elapsed since `Wait` began, it calls `GetJob` once more, because the last read may be a poll interval old, and handles a Job that ended in that time by the table above. Otherwise it collects. A newest pod whose `hook` container has an exit code finished after the last read: `Wait` returns it as finished, `Succeeded` when the exit code is 0, and does not delete the Job. Anything else calls `DeleteJob` and returns `TimedOut`, with `Reason` `hook container never started: <WaitingReason>` when the newest pod is waiting, and `hook container never started` when the Job has no pod. A delete that fails logs `plexd hook job delete failed` at warn; the backstop still ends the Job. When `ctx` ends, `Wait` returns `ctx.Err()` and leaves the Job alone. So does a collect or a delete after the decision that fails because `ctx` ended: the executor then takes its cancel or shutdown path, instead of reporting a result without its exit code or log.
+
+Collect is `ListJobPods`, the pod with the newest `CreatedAt`, its `ExitCode`, and `PodLog` with `OutputLimit + 1`, so the executor sees an over-limit log and marks the cut. A list or log read that fails logs `plexd hook output unavailable` at warn and yields a result without output.
+
+### Stop
+
+`Stop(ctx, executionID)` collects, then calls `DeleteJob`, and returns the log. The collect runs under at most half of what is left of `ctx`, so a log read the API server does not answer cannot spend the time the delete needs. A delete that fails is returned wrapped.
+
+### Wiring in plexd up
+
+`plexd up` builds the runner with `newPlexdHookRunner(env *kubernetes.KubernetesEnvironment, nodeID string, outputLimit int64, logger *slog.Logger) actions.PlexdHookRunner` in `cmd/plexd/cmd/plexd_hooks.go`, right after the [PlexdHook inventory](#plexdhook-inventory) and before it registers the action dispatcher, and hands it to the executor with `SetPlexdHookRunner`. Outside a cluster it returns nil and logs nothing. Inside one it logs one warning and returns nil:
+
+| Condition | Warning |
+|---|---|
+| The ServiceAccount namespace is empty | `plexd hook runs disabled: the ServiceAccount namespace is empty` |
+| `MY_NODE_NAME` is not set | `plexd hook runs disabled: MY_NODE_NAME is not set` |
+| `NewInClusterJobClient` fails | `plexd hook runs disabled`, with `error` |
+
+Without a runner, a `plexd_hook` dispatch is rejected with `unsupported_action_type`, and a `started` one is reported lost after a restart. The DaemonSet sets `MY_NODE_NAME` through the downward API.
 
 ## Kubernetes manifests
 
@@ -304,7 +420,7 @@ All manifests are in `deploy/kubernetes/`.
 | `crds/plexdnodestate-crd.yaml` | `CustomResourceDefinition` (PlexdNodeState) |
 | `crds/plexdhook-crd.yaml`     | `CustomResourceDefinition` (PlexdHook)      |
 | `serviceaccount.yaml`   | `ServiceAccount`                             |
-| `rbac.yaml`             | `ClusterRole` + `ClusterRoleBinding` + consumer roles |
+| `rbac.yaml`             | `ClusterRole` + `ClusterRoleBinding`, `Role` + `RoleBinding` `plexd-hook-runner`, consumer roles |
 | `daemonset.yaml`        | `DaemonSet` with host networking and capabilities |
 | `secret.yaml`           | Example `Secret` template for bootstrap token |
 
@@ -318,9 +434,27 @@ The `plexd` ClusterRole grants:
 | `plexd.plexsphere.com` | `plexdnodestates/status`  | get, patch, update                             |
 | (core)                 | `secrets`                 | create, get, update, delete                    |
 | `plexd.plexsphere.com` | `plexdhooks`              | get, list, watch                               |
-| `plexd.plexsphere.com` | `plexdhooks/status`       | get, update, patch                             |
-| `batch`                | `jobs`                    | create, get, list, watch                       |
 | `authentication.k8s.io`| `tokenreviews`            | create                                         |
+
+The `plexd-hook-runner` Role in `plexd-system`, bound to the `plexd` ServiceAccount by the RoleBinding of the same name, grants what a [PlexdHook run](../actions/plexdhook-crd.md#running-a-hook) needs:
+
+| API Group | Resource   | Verbs               |
+|-----------|------------|---------------------|
+| `batch`   | `jobs`     | create, get, delete |
+| (core)    | `pods`     | list                |
+| (core)    | `pods/log` | get                 |
+
+The Job grants are namespaced, because plexd creates Jobs only in the namespace where it lists PlexdHooks, and a cluster-wide `pods/log` grant would let one Node's agent read the log of every pod in the cluster. plexd writes no PlexdHook status and holds no `plexdhooks/status` grant.
+
+#### Upgrading an existing deployment
+
+An existing deployment applies the new `deploy/kubernetes/rbac.yaml` with the release:
+
+```sh
+kubectl apply -f deploy/kubernetes/rbac.yaml
+```
+
+Until it does, the `plexd` ClusterRole still holds the old cluster-wide `batch` `jobs` grant (`create, get, list, watch`), and the Role does not exist. A PlexdHook run then still creates its Job and reports the Job's status, but without the container's exit code or output, because plexd can neither list the Job's pods nor read their log. A cancel request cannot delete the Job: plexd logs `plexd hook job delete failed`, and the Job runs on until it ends or its `activeDeadlineSeconds` passes.
 
 Consumer RBAC roles:
 
@@ -372,7 +506,7 @@ Consumer RBAC roles:
 ## See also
 
 - [Kubernetes Deployment Guide](../../how-to/kubernetes-deployment.md) — Step-by-step deployment guide
-- [PlexdHook CRD Reference](../actions/plexdhook-crd.md) — Hook execution via Kubernetes Jobs
+- [PlexdHook CRD Reference](../actions/plexdhook-crd.md) — PlexdHook resources, each dispatch run as a Kubernetes Job
 - [Audit Forwarding Reference](../observability/audit-forwarding.md) — Audit data collection and forwarding
 - [Local Node API Reference](../core/nodeapi.md) — Node state API
 - [Registration Reference](../core/registration.md) — Node registration
