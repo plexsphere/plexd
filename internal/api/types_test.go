@@ -1585,6 +1585,24 @@ func TestTypesNodeStateExecution_CancelRequestedAt(t *testing.T) {
 	})
 }
 
+// TestTypesNodeStateExecution_PlexdHookType pins the wire value the control
+// plane dispatches a PlexdHook with. A typo in the constant would turn every
+// such dispatch into unsupported_action_type.
+func TestTypesNodeStateExecution_PlexdHookType(t *testing.T) {
+	const body = `{"execution_id":"exec-1","action":"e2e-pinned","type":"plexd_hook","parameters":{"count":3},` +
+		`"status":"pending","requested_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z"}`
+	var got NodeStateExecution
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Type != ActionKindPlexdHook {
+		t.Errorf("Type = %q, want %q", got.Type, ActionKindPlexdHook)
+	}
+	if got.Action != "e2e-pinned" {
+		t.Errorf("Action = %q, want the PlexdHook's metadata.name %q", got.Action, "e2e-pinned")
+	}
+}
+
 func TestTypesNodeStateSession(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	tests := []struct {

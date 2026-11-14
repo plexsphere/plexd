@@ -63,12 +63,13 @@ type Dispatcher struct {
 	logger   *slog.Logger
 
 	// handled is the set of execution ids this dispatcher has already settled —
-	// dispatched, rejected, expired, or reported lost. A settled id is a no-op
-	// on every later pull until the entry drains from the block, which is also
-	// the signal to forget it again. It is only ever a hint that an entry needs
-	// no further work: the executor, not this set, is authoritative on whether a
-	// run is still in flight. A cancel request is forwarded before this set is
-	// consulted, because the run it stops is one whose id the set holds.
+	// dispatched, resumed, rejected, expired, or reported lost. A settled id is
+	// a no-op on every later pull until the entry drains from the block, which
+	// is also the signal to forget it again. It is only ever a hint that an
+	// entry needs no further work: the executor, not this set, is authoritative
+	// on whether a run is still in flight. A cancel request is forwarded before
+	// this set is consulted, because the run it stops is one whose id the set
+	// holds.
 	handled map[string]struct{}
 
 	// deferrals counts, per execution id, the passes on which the orphan report
@@ -223,17 +224,41 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 
 		case api.ExecutionStatusStarted:
 			// The control plane holds the execution at started but this agent
-			// keeps no run state across a restart. Actions are not idempotent,
-			// so the run is reported lost rather than repeated. The report is
-			// the execution's only transition out of started and outlives the
-			// pass, so — like the run above — it gets the cycle context rather
-			// than the budget. An undelivered report leaves the entry unsettled:
-			// marking it handled anyway would drop the report for the life of
-			// the process and strand the execution at started until it expires.
-			// That retry is capped, because an entry left unsettled is retried
-			// at the head of the block on every pull: past maxDeferrals passes
-			// the report is abandoned rather than allowed to spend the budget
-			// ahead of the entries queued behind it.
+			// keeps no run state across a restart. A plexd_hook run is the
+			// exception: its Job outlives the agent, so the executor resumes
+			// it and follows the Job to its end. The resumed run gets the
+			// cycle context like the run above. A cancel request the entry
+			// carries is forwarded once the run is held again, in this pass,
+			// because the forward ahead of the pass found no run to stop. A
+			// deferral is local backpressure, so the entry is retried on the
+			// next pull without counting toward maxDeferrals.
+			//
+			// DECISION: resuming does not check actions.enabled. It starts
+			// nothing: it follows a Job that already runs and reports its real
+			// outcome, where reporting it lost would leave that Job running
+			// unobserved.
+			switch err := d.executor.Resume(ctx, d.nodeID, entry); {
+			case err == nil:
+				d.handled[entry.ExecutionID] = struct{}{}
+				if entry.CancelRequestedAt != nil {
+					d.forwardCancel(entry)
+				}
+				continue
+			case errors.Is(err, ErrDispatchDeferred):
+				continue
+			}
+
+			// Any other run did not survive the restart. Actions are not
+			// idempotent, so it is reported lost rather than repeated. The
+			// report is the execution's only transition out of started and
+			// outlives the pass, so, like the run above, it gets the cycle
+			// context rather than the budget. An undelivered report leaves the
+			// entry unsettled: marking it handled anyway would drop the report
+			// for the life of the process and strand the execution at started
+			// until it expires. That retry is capped, because an entry left
+			// unsettled is retried at the head of the block on every pull: past
+			// maxDeferrals passes the report is abandoned rather than allowed
+			// to spend the budget ahead of the entries queued behind it.
 			if err := d.executor.FailOrphan(ctx, d.nodeID, entry.ExecutionID); err != nil {
 				d.deferrals[entry.ExecutionID]++
 				if d.deferrals[entry.ExecutionID] < maxDeferrals {
@@ -280,8 +305,9 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 // per id. It sends no callback: the run reports cancelled through its own
 // terminal report once its context ends, or its real outcome when it finished
 // first. A request for a run the executor does not hold is left to the pass,
-// which reports a started entry lost, as after a restart, and never starts a
-// waiting one.
+// which resumes a started plexd_hook entry and forwards the request to it
+// then, reports any other started entry lost, as after a restart, and never
+// starts a waiting one.
 func (d *Dispatcher) forwardCancel(entry api.NodeStateExecution) {
 	if _, forwarded := d.cancelled[entry.ExecutionID]; forwarded {
 		return

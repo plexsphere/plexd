@@ -146,6 +146,14 @@ type Executor struct {
 	wg       sync.WaitGroup
 	active   map[string]context.CancelFunc // executionID → cancel
 	builtins map[string]builtinEntry       // action name → builtin
+	// plexdHooks runs a plexd_hook entry. It is nil outside a cluster, and
+	// Execute then rejects such an entry as unsupported_action_type.
+	plexdHooks PlexdHookRunner
+	// cancelRequested holds the id of every run Cancel stopped, until the run
+	// releases its active slot. A run whose context ended reads it to tell a
+	// cancel from a shutdown, which a PlexdHook run answers differently: its
+	// Job outlives the agent, so a shutdown leaves it running.
+	cancelRequested map[string]struct{}
 	// localHooks is the snapshot of hooks_dir, as the hooks_dir watcher last
 	// reported it.
 	localHooks []api.HookInfo
@@ -167,14 +175,15 @@ type Executor struct {
 // NewExecutor creates an Executor with the given configuration, reporter, verifier, and logger.
 func NewExecutor(cfg Config, reporter ActionReporter, verifier HookVerifier, logger *slog.Logger) *Executor {
 	return &Executor{
-		cfg:         cfg,
-		reporter:    reporter,
-		verifier:    verifier,
-		logger:      logger.With("component", "actions"),
-		active:      make(map[string]context.CancelFunc),
-		builtins:    make(map[string]builtinEntry),
-		pinned:      make(map[string]string),
-		rolloutPins: make(map[string]rolloutPin),
+		cfg:             cfg,
+		reporter:        reporter,
+		verifier:        verifier,
+		logger:          logger.With("component", "actions"),
+		active:          make(map[string]context.CancelFunc),
+		builtins:        make(map[string]builtinEntry),
+		cancelRequested: make(map[string]struct{}),
+		pinned:          make(map[string]string),
+		rolloutPins:     make(map[string]rolloutPin),
 	}
 }
 
@@ -402,19 +411,9 @@ func (e *Executor) IsActive(executionID string) bool {
 func (e *Executor) Execute(ctx context.Context, nodeID string, entry api.NodeStateExecution) error {
 	e.mu.Lock()
 
-	if e.shuttingDown {
+	if reason := e.backpressure(entry.ExecutionID); reason != "" {
 		e.mu.Unlock()
-		return e.deferDispatch(entry, "shutting_down")
-	}
-
-	if _, exists := e.active[entry.ExecutionID]; exists {
-		e.mu.Unlock()
-		return e.deferDispatch(entry, "already_active")
-	}
-
-	if len(e.active) >= e.cfg.MaxConcurrent {
-		e.mu.Unlock()
-		return e.deferDispatch(entry, "max_concurrent_reached")
+		return e.deferDispatch(entry, reason)
 	}
 
 	// The declared type picks the registry: a builtin never resolves against a
@@ -423,12 +422,23 @@ func (e *Executor) Execute(ctx context.Context, nodeID string, entry api.NodeSta
 	// is reported as such rather than as unknown_action: the action itself may
 	// well be registered, and naming the wrong cause sends the operator auditing
 	// the action registry instead of the type field.
+	//
+	// A plexd_hook entry is known whenever a runner is set: whether the
+	// PlexdHook exists is an API server call, which the run goroutine makes so
+	// that none runs on the reconcile goroutine. Without a runner the node
+	// cannot run the kind at all, which is what unsupported_action_type says.
 	var known bool
 	switch entry.Type {
 	case api.ActionKindBuiltin:
 		_, known = e.builtins[entry.Action]
 	case api.ActionKindHook:
 		_, known = lookupHook(e.hooks, entry.Action)
+	case api.ActionKindPlexdHook:
+		if e.plexdHooks == nil {
+			e.mu.Unlock()
+			return e.reject(ctx, nodeID, entry, "unsupported_action_type")
+		}
+		known = true
 	default:
 		e.mu.Unlock()
 		return e.reject(ctx, nodeID, entry, "unsupported_action_type")
@@ -443,10 +453,7 @@ func (e *Executor) Execute(ctx context.Context, nodeID string, entry api.NodeSta
 	e.mu.Unlock()
 
 	if err := e.claim(ctx, nodeID, entry); err != nil {
-		cancel()
-		e.mu.Lock()
-		delete(e.active, entry.ExecutionID)
-		e.mu.Unlock()
+		e.releaseRun(entry.ExecutionID, cancel)
 		if errors.Is(err, errClaimRefused) {
 			return nil
 		}
@@ -458,6 +465,10 @@ func (e *Executor) Execute(ctx context.Context, nodeID string, entry api.NodeSta
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
+		if entry.Type == api.ActionKindPlexdHook {
+			e.runPlexdHook(actionCtx, nodeID, entry, params, cancel, false)
+			return
+		}
 		e.runAction(actionCtx, nodeID, entry, params, cancel)
 	}()
 	return nil
@@ -506,6 +517,23 @@ func (e *Executor) claim(ctx context.Context, nodeID string, entry api.NodeState
 		}
 	}
 	return nil
+}
+
+// backpressure returns why the executor cannot take a run under executionID
+// right now, or "" when it can: shutdown, a run already in flight under the
+// same id, or every concurrency slot taken. Execute and Resume defer on it
+// alike. The caller holds mu.
+func (e *Executor) backpressure(executionID string) string {
+	if e.shuttingDown {
+		return "shutting_down"
+	}
+	if _, exists := e.active[executionID]; exists {
+		return "already_active"
+	}
+	if len(e.active) >= e.cfg.MaxConcurrent {
+		return "max_concurrent_reached"
+	}
+	return ""
 }
 
 // deferDispatch logs a deferral and returns the sentinel. A deferral is
@@ -585,6 +613,10 @@ func (e *Executor) Shutdown(_ context.Context) {
 // The run still sends its own terminal report. A run whose result is already
 // computed when Cancel lands reports its real outcome, because that report leg
 // runs on a context detached from the action's.
+//
+// Cancel records the id in cancelRequested before it ends the context, so a
+// PlexdHook run that sees its context end knows it was cancelled, not shut
+// down, and deletes its Job.
 func (e *Executor) Cancel(executionID string) bool {
 	if executionID == "" {
 		return false
@@ -592,6 +624,9 @@ func (e *Executor) Cancel(executionID string) bool {
 
 	e.mu.Lock()
 	cancel, found := e.active[executionID]
+	if found {
+		e.cancelRequested[executionID] = struct{}{}
+	}
 	e.mu.Unlock()
 
 	if found {
@@ -743,34 +778,65 @@ func runBound(remaining, declared, ceiling time.Duration) (bound time.Duration, 
 	return bound, label, capped
 }
 
-func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeStateExecution, params map[string]string, cancel context.CancelFunc) {
-	defer func() {
-		cancel()
-		e.mu.Lock()
-		delete(e.active, entry.ExecutionID)
-		e.mu.Unlock()
-	}()
+// releaseRun ends a run's context and frees its active slot, together with a
+// cancel request Cancel recorded for it. Every run goroutine defers it, and
+// Execute calls it for a claim that did not go through.
+func (e *Executor) releaseRun(executionID string, cancel context.CancelFunc) {
+	cancel()
+	e.mu.Lock()
+	delete(e.active, executionID)
+	delete(e.cancelRequested, executionID)
+	e.mu.Unlock()
+}
 
-	defer func() {
-		if r := recover(); r != nil {
-			stack := debug.Stack()
-			e.logger.Error("panic in action execution",
-				"execution_id", entry.ExecutionID,
-				"panic", fmt.Sprintf("%v", r),
-				"stack", string(stack),
-			)
-			terminal := api.ExecutionCallbackRequest{
-				Status: api.ExecutionStatusFailed,
-				Error:  fmt.Sprintf("panic: %v", r),
-			}
-			if _, err := e.reporter.ExecutionCallback(ctx, nodeID, entry.ExecutionID, terminal); err != nil {
-				e.logger.Warn("failed to send panic terminal callback",
-					"execution_id", entry.ExecutionID,
-					"error", err,
-				)
-			}
-		}
-	}()
+// reportPanic stops a panic of a run goroutine and reports the run failed with
+// the panic's value. A run goroutine defers it directly, because recover stops
+// a panic only when the deferred function calls it itself.
+func (e *Executor) reportPanic(ctx context.Context, nodeID, executionID string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	stack := debug.Stack()
+	e.logger.Error("panic in action execution",
+		"execution_id", executionID,
+		"panic", fmt.Sprintf("%v", r),
+		"stack", string(stack),
+	)
+	terminal := api.ExecutionCallbackRequest{
+		Status: api.ExecutionStatusFailed,
+		Error:  fmt.Sprintf("panic: %v", r),
+	}
+	if _, err := e.reporter.ExecutionCallback(ctx, nodeID, executionID, terminal); err != nil {
+		e.logger.Warn("failed to send panic terminal callback",
+			"execution_id", executionID,
+			"error", err,
+		)
+	}
+}
+
+// failLapsed reports failed with deadlineLapsedError for a run whose deadline
+// ran out before it started. The report leg is detached from ctx, as every
+// terminal report is.
+func (e *Executor) failLapsed(ctx context.Context, nodeID string, entry api.NodeStateExecution) {
+	e.logger.Warn("execution deadline lapsed before the run started",
+		"execution_id", entry.ExecutionID,
+		"expires_at", entry.ExpiresAt,
+	)
+	lapsedCtx, cancelLapsed := context.WithTimeout(context.WithoutCancel(ctx), terminalReportTimeout)
+	defer cancelLapsed()
+	// Nothing is left to do with an undelivered report here: sendTerminal has
+	// logged it and spent its retries, and this goroutine is the last owner
+	// of the run. The control plane expires the execution instead.
+	_ = e.sendTerminal(lapsedCtx, nodeID, entry.ExecutionID, api.ExecutionCallbackRequest{
+		Status: api.ExecutionStatusFailed,
+		Error:  deadlineLapsedError,
+	})
+}
+
+func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeStateExecution, params map[string]string, cancel context.CancelFunc) {
+	defer e.releaseRun(entry.ExecutionID, cancel)
+	defer e.reportPanic(ctx, nodeID, entry.ExecutionID)
 
 	// The entry carries an absolute deadline, not a relative timeout: the run
 	// gets whatever is left of it, cut to the hook's declared timeout and to the
@@ -783,19 +849,7 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 	// recorded, so the execution still owes its terminal callback.
 	remaining := time.Until(entry.ExpiresAt)
 	if remaining <= 0 {
-		e.logger.Warn("execution deadline lapsed before the run started",
-			"execution_id", entry.ExecutionID,
-			"expires_at", entry.ExpiresAt,
-		)
-		lapsedCtx, cancelLapsed := context.WithTimeout(context.WithoutCancel(ctx), terminalReportTimeout)
-		defer cancelLapsed()
-		// Nothing is left to do with an undelivered report here: sendTerminal has
-		// logged it and spent its retries, and this goroutine is the last owner
-		// of the run. The control plane expires the execution instead.
-		_ = e.sendTerminal(lapsedCtx, nodeID, entry.ExecutionID, api.ExecutionCallbackRequest{
-			Status: api.ExecutionStatusFailed,
-			Error:  deadlineLapsedError,
-		})
+		e.failLapsed(ctx, nodeID, entry)
 		return
 	}
 

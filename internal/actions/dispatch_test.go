@@ -847,3 +847,184 @@ func TestDispatcher_DrainPrunesCancelled(t *testing.T) {
 		t.Error("deferrals still holds the drained id")
 	}
 }
+
+// A plexd_hook run outlives the agent in its Job, so a started entry of one is
+// followed to its end instead of reported lost: no Start, no claim callback,
+// and the outcome the Job had.
+func TestDispatcher_StartedPlexdHookResumed(t *testing.T) {
+	runner := newFakePlexdHookRunner()
+	runner.result = PlexdHookResult{Succeeded: true, ExitCode: intPtr(0), Output: "slow-done\n"}
+	reporter := &mockReporter{}
+	exec, logs := newPlexdHookExecutor(t, Config{}, reporter, runner)
+	d := NewDispatcher(exec, "node-1", testLogger())
+	entry := startedPlexdHookExec("exec-hook-resume", "e2e-slow")
+
+	d.Handle(context.Background(), snapshot(entry))
+	waitFor(t, 5*time.Second, func() bool { return exec.ActiveCount() == 0 })
+	// The entry stays in the block until the report drains it.
+	d.Handle(context.Background(), snapshot(entry))
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusSucceeded})
+	wantExitCode(t, cbs[0], intPtr(0))
+	if got := decodeInline(t, cbs[0].Output); got != "slow-done\n" {
+		t.Errorf("inline output = %q, want the Job's log", got)
+	}
+
+	starts, waits, stops := runner.calls()
+	if len(starts) != 0 {
+		t.Errorf("Start calls = %+v, want none for a resumed run", starts)
+	}
+	if len(waits) != 1 || waits[0].executionID != entry.ExecutionID {
+		t.Fatalf("Wait calls = %+v, want one for %s", waits, entry.ExecutionID)
+	}
+	if waits[0].bound != DefaultMaxActionTimeout {
+		t.Errorf("Wait bound = %v, want the max_action_timeout ceiling %v", waits[0].bound, DefaultMaxActionTimeout)
+	}
+	if len(stops) != 0 {
+		t.Errorf("Stop calls = %+v, want none", stops)
+	}
+	if _, settled := d.handled[entry.ExecutionID]; !settled {
+		t.Error("the resumed entry was not marked handled")
+	}
+	lines := logs.lines("resuming plexd hook run after a restart")
+	if len(lines) != 1 {
+		t.Fatalf("resume lines = %d, want 1", len(lines))
+	}
+	if lines[0].level != slog.LevelInfo || lines[0].attrs["execution_id"] != entry.ExecutionID || lines[0].attrs["action"] != "e2e-slow" {
+		t.Errorf("resume line = %v at %v, want info with execution_id and action", lines[0].attrs, lines[0].level)
+	}
+}
+
+// A resumed run whose Job is gone did not survive the restart after all.
+func TestDispatcher_ResumedPlexdHookWithoutJobReportedLost(t *testing.T) {
+	runner := newFakePlexdHookRunner()
+	runner.waitErr = ErrPlexdHookJobNotFound
+	reporter := &mockReporter{}
+	exec, _ := newPlexdHookExecutor(t, Config{}, reporter, runner)
+	d := NewDispatcher(exec, "node-1", testLogger())
+
+	d.Handle(context.Background(), snapshot(startedPlexdHookExec("exec-hook-gone", "e2e-slow")))
+	waitFor(t, 5*time.Second, func() bool { return exec.ActiveCount() == 0 })
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusFailed})
+	if cbs[0].Error != "execution lost to an agent restart" {
+		t.Errorf("terminal error = %q, want %q", cbs[0].Error, "execution lost to an agent restart")
+	}
+	wantExitCode(t, cbs[0], nil)
+}
+
+// A resume is a run like any other and waits for a free slot. The wait is
+// backpressure, not an undelivered report, so it never counts toward the
+// maxDeferrals cap that would drop the entry.
+func TestDispatcher_ResumeDeferredUnderMaxConcurrent(t *testing.T) {
+	runner := newFakePlexdHookRunner()
+	runner.result = PlexdHookResult{Succeeded: true, ExitCode: intPtr(0)}
+	reporter := &mockReporter{}
+	exec, _ := newPlexdHookExecutor(t, Config{MaxConcurrent: 1}, reporter, runner)
+	started := make(chan struct{}, 1)
+	release := newLatch(t)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, release.ch))
+	mustExecute(t, exec, "node-1", pendingExec("exec-occupier", "test.block"))
+	waitStarted(t, started)
+
+	d := NewDispatcher(exec, "node-1", testLogger())
+	entry := startedPlexdHookExec("exec-hook-waiting", "e2e-slow")
+	for pass := 1; pass <= maxDeferrals+1; pass++ {
+		d.Handle(context.Background(), snapshot(entry))
+		if _, settled := d.handled[entry.ExecutionID]; settled {
+			t.Fatalf("entry settled on pass %d while every slot was taken", pass)
+		}
+	}
+	if len(d.deferrals) != 0 {
+		t.Errorf("deferrals = %v, want none counted for backpressure", d.deferrals)
+	}
+	assertStatuses(t, reporter.getCallbacks(), []string{api.ExecutionStatusAck, api.ExecutionStatusStarted})
+	runner.wantNoRunnerCalls(t)
+
+	// Once the slot is free, the next pull resumes it.
+	release.open()
+	waitFor(t, 5*time.Second, func() bool { return exec.ActiveCount() == 0 })
+	d.Handle(context.Background(), snapshot(entry))
+	waitFor(t, 5*time.Second, func() bool { return exec.ActiveCount() == 0 })
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded,
+		api.ExecutionStatusSucceeded,
+	})
+}
+
+// The cancel forward ahead of the pass finds no run for an entry not yet
+// resumed. The pass forwards it once the run is held again, so the Job is
+// stopped in the same pass.
+func TestDispatcher_ResumedPlexdHookCancelledInSamePass(t *testing.T) {
+	runner := newFakePlexdHookRunner()
+	runner.waitBlocks = true
+	runner.stopOutput = "slow-started\n"
+	reporter := &mockReporter{}
+	exec, _ := newPlexdHookExecutor(t, Config{}, reporter, runner)
+	d := NewDispatcher(exec, "node-1", testLogger())
+	entry := withCancelRequest(startedPlexdHookExec("exec-hook-resume-cancel", "e2e-slow"))
+
+	d.Handle(context.Background(), snapshot(entry))
+	waitFor(t, 5*time.Second, func() bool { return exec.ActiveCount() == 0 })
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusCancelled})
+	if cbs[0].Error != "" {
+		t.Errorf("terminal error = %q, want empty for a cancel", cbs[0].Error)
+	}
+	if got := decodeInline(t, cbs[0].Output); got != "slow-started\n" {
+		t.Errorf("inline output = %q, want the log Stop read", got)
+	}
+	starts, _, stops := runner.calls()
+	if len(starts) != 0 {
+		t.Errorf("Start calls = %+v, want none for a resumed run", starts)
+	}
+	if len(stops) != 1 {
+		t.Errorf("Stop calls = %d, want 1", len(stops))
+	}
+	if _, forwarded := d.cancelled[entry.ExecutionID]; !forwarded {
+		t.Error("the cancel request was not recorded as forwarded")
+	}
+}
+
+// Only a plexd_hook run can be resumed, and only through a runner. Every
+// other started entry is still reported lost.
+func TestDispatcher_StartedEntryNotResumableReportedLost(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		entryType string
+		runner    bool
+	}{
+		{name: "hook entry", entryType: api.ActionKindHook, runner: true},
+		{name: "plexd_hook entry without a runner", entryType: api.ActionKindPlexdHook},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := newFakePlexdHookRunner()
+			reporter := &mockReporter{}
+			var set *fakePlexdHookRunner
+			if tc.runner {
+				set = runner
+			}
+			exec, _ := newPlexdHookExecutor(t, Config{}, reporter, set)
+			d := NewDispatcher(exec, "node-1", testLogger())
+			entry := startedPlexdHookExec("exec-not-resumable", "deploy")
+			entry.Type = tc.entryType
+
+			d.Handle(context.Background(), snapshot(entry))
+
+			cbs := reporter.getCallbacks()
+			assertStatuses(t, cbs, []string{api.ExecutionStatusFailed})
+			if cbs[0].Error != orphanedRunError {
+				t.Errorf("terminal error = %q, want %q", cbs[0].Error, orphanedRunError)
+			}
+			if got := exec.ActiveCount(); got != 0 {
+				t.Errorf("active count = %d, want 0", got)
+			}
+			runner.wantNoRunnerCalls(t)
+		})
+	}
+}
