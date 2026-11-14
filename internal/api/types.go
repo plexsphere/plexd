@@ -605,12 +605,15 @@ type NodeStateExecution struct {
 	CancelRequestedAt *time.Time                 `json:"cancel_requested_at,omitempty"`
 }
 
-// The two legal values of a NodeStateExecution.Type.
+// The three legal values of a NodeStateExecution.Type.
 const (
 	// ActionKindBuiltin dispatches an action built into plexd.
 	ActionKindBuiltin = "builtin"
 	// ActionKindHook dispatches a hook registered by the node.
 	ActionKindHook = "hook"
+	// ActionKindPlexdHook dispatches a PlexdHook resource of the node's
+	// cluster. The entry's Action is the resource's metadata.name.
+	ActionKindPlexdHook = "plexd_hook"
 )
 
 // Execution status observed only on the pull block.

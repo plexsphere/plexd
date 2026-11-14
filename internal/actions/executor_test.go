@@ -1165,36 +1165,42 @@ func TestExecutor_CallbackLegsGetIndependentBudgets(t *testing.T) {
 
 // TestExecutor_UnsupportedActionType checks that a type outside the roster is
 // reported as such. Reporting unknown_action would send the operator auditing
-// the action registry, where the action may well be registered.
+// the action registry, where the action may well be registered. A plexd_hook
+// entry on an executor without a PlexdHook runner is one this node cannot run
+// either, so it is reported the same way.
 func TestExecutor_UnsupportedActionType(t *testing.T) {
-	reporter := &mockReporter{}
-	verifier := &mockVerifier{ok: true}
-	exec := newTestExecutor(Config{}, reporter, verifier)
+	for _, entryType := range []string{"container", api.ActionKindPlexdHook} {
+		t.Run(entryType, func(t *testing.T) {
+			reporter := &mockReporter{}
+			verifier := &mockVerifier{ok: true}
+			exec := newTestExecutor(Config{}, reporter, verifier)
 
-	ran := make(chan struct{}, 1)
-	exec.RegisterBuiltin("test.echo", "Echo action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
-		ran <- struct{}{}
-		return "hello", "", 0, nil
-	})
+			ran := make(chan struct{}, 1)
+			exec.RegisterBuiltin("test.echo", "Echo action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+				ran <- struct{}{}
+				return "hello", "", 0, nil
+			})
 
-	entry := pendingExec("exec-bad-type", "test.echo")
-	entry.Type = "container"
-	mustExecute(t, exec, "node-1", entry)
+			entry := pendingExec("exec-bad-type", "test.echo")
+			entry.Type = entryType
+			mustExecute(t, exec, "node-1", entry)
 
-	select {
-	case <-ran:
-		t.Fatal("action ran for an unsupported type")
-	case <-time.After(100 * time.Millisecond):
-	}
+			select {
+			case <-ran:
+				t.Fatal("action ran for an unsupported type")
+			case <-time.After(100 * time.Millisecond):
+			}
 
-	cbs := reporter.getCallbacks()
-	assertStatuses(t, cbs, []string{
-		api.ExecutionStatusAck,
-		api.ExecutionStatusStarted,
-		api.ExecutionStatusFailed,
-	})
-	if got := cbs[len(cbs)-1].Error; got != "unsupported_action_type" {
-		t.Errorf("terminal error = %q, want %q", got, "unsupported_action_type")
+			cbs := reporter.getCallbacks()
+			assertStatuses(t, cbs, []string{
+				api.ExecutionStatusAck,
+				api.ExecutionStatusStarted,
+				api.ExecutionStatusFailed,
+			})
+			if got := cbs[len(cbs)-1].Error; got != "unsupported_action_type" {
+				t.Errorf("terminal error = %q, want %q", got, "unsupported_action_type")
+			}
+		})
 	}
 }
 
@@ -2062,6 +2068,99 @@ func TestExecutor_CancelWithoutRun(t *testing.T) {
 	}
 	if cbs := reporter.getCallbacks(); len(cbs) != 0 {
 		t.Errorf("callbacks = %v, want none", cbs)
+	}
+	if got := cancelRequests(exec); got != 0 {
+		t.Errorf("cancel requests = %d, want none recorded for a run the executor does not hold", got)
+	}
+}
+
+// cancelRequests returns how many cancel requests the executor holds.
+func cancelRequests(e *Executor) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.cancelRequested)
+}
+
+// A cancel request lives as long as the run it stopped. Left behind, it would
+// make a later run under the same id read a shutdown as a cancel.
+func TestExecutor_CancelRequestForgottenWhenRunEnds(t *testing.T) {
+	reporter := &mockReporter{}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	started := make(chan struct{}, 1)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, newLatch(t).ch))
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-cancel-forgotten", "test.block"))
+	waitStarted(t, started)
+	if !exec.Cancel("exec-cancel-forgotten") {
+		t.Fatal("Cancel() = false, want true for a run in flight")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	if got := cancelRequests(exec); got != 0 {
+		t.Errorf("cancel requests = %d after the run ended, want none", got)
+	}
+}
+
+// ackHoldingReporter is a mockReporter that holds the ack callback until the
+// test opens release and then fails it with a transport error, so a test can
+// act on an execution whose claim is in flight and then fails.
+type ackHoldingReporter struct {
+	mockReporter
+	held    chan struct{}
+	release *latch
+}
+
+func (r *ackHoldingReporter) ExecutionCallback(ctx context.Context, nodeID, executionID string, req api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error) {
+	if req.Status == api.ExecutionStatusAck {
+		close(r.held)
+		<-r.release.ch
+		return nil, errors.New("connection reset")
+	}
+	return r.mockReporter.ExecutionCallback(ctx, nodeID, executionID, req)
+}
+
+// A cancel that lands while the claim is in flight finds the execution in the
+// executor. When the claim then fails, the execution leaves the executor
+// without a run, and its cancel request goes with it.
+func TestExecutor_CancelRequestForgottenWhenClaimFails(t *testing.T) {
+	reporter := &ackHoldingReporter{held: make(chan struct{}), release: newLatch(t)}
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	exec := NewExecutor(cfg, reporter, &mockVerifier{ok: true}, testLogger())
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+		return "hello", "", 0, nil
+	})
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- exec.Execute(context.Background(), "node-1", pendingExec("exec-claim-fails", "test.echo"))
+	}()
+	select {
+	case <-reporter.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ack callback never arrived")
+	}
+
+	if !exec.Cancel("exec-claim-fails") {
+		t.Fatal("Cancel() = false, want true for an execution whose claim is in flight")
+	}
+	reporter.release.open()
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrDispatchDeferred) {
+			t.Fatalf("Execute = %v, want ErrDispatchDeferred for a failed claim", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute did not return")
+	}
+	if got := exec.ActiveCount(); got != 0 {
+		t.Errorf("active count = %d, want 0 after a failed claim", got)
+	}
+	if got := cancelRequests(exec); got != 0 {
+		t.Errorf("cancel requests = %d after a failed claim, want none", got)
 	}
 }
 
