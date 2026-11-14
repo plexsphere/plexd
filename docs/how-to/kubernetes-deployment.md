@@ -68,6 +68,7 @@ This creates:
 - `plexd` ServiceAccount in `plexd-system`
 - `plexd` ClusterRole with permissions for CRD management, Secrets, and TokenReview
 - `plexd` ClusterRoleBinding
+- `plexd-hook-runner` Role and RoleBinding in `plexd-system`, which let plexd run a dispatched PlexdHook as a Job in its own namespace
 - Consumer roles: `plexd-state-reader`, `plexd-state-reporter`, `plexd-secrets-reader`, `plexd-hook-reader`
 
 Verify:

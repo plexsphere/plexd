@@ -6,7 +6,7 @@ feature: PXD-0019
 
 # Remote Actions and Hooks
 
-The `internal/actions` package enables platform-triggered remote action execution on plexd mesh nodes. It supports built-in operations (diagnostics, connectivity checks) and custom hook scripts with SHA-256 integrity verification. Action results are reported back to the control plane.
+The `internal/actions` package enables platform-triggered remote action execution on plexd mesh nodes. It supports built-in operations (diagnostics, connectivity checks), custom hook scripts with SHA-256 integrity verification, and, in a pod, [PlexdHook resources](#kubernetes-crd-hooks) run as Kubernetes Jobs. Action results are reported back to the control plane.
 
 ## Delivery Model
 
@@ -41,7 +41,8 @@ Control Plane
      │ 6. status pending/ack  → Executor.Execute  │
      │    (cancel requested   → not started)      │
      │    (actions disabled   → reject)           │
-     │ 7. status started      → FailOrphan        │
+     │ 7. status started      → Resume a          │
+     │    plexd_hook entry, else FailOrphan       │
      └──────────┬─────────────────────────────────┘
                 │ status pending | ack
                 ▼
@@ -54,12 +55,15 @@ Control Plane
      │ 1. shuttingDown / active id / MaxConcurrent    │
      │    → ErrDispatchDeferred (no callback, retry)  │
      │ 2. Look up action in the registry the entry's  │
-     │    type names → unknown_action rejects, an     │
-     │    unknown type → unsupported_action_type      │
+     │    type names → unknown_action rejects; a      │
+     │    plexd_hook entry is looked up by its run.   │
+     │    Another type, or plexd_hook with no runner  │
+     │    → unsupported_action_type                   │
      │ 3. Claim: post ack (only when status is        │
      │    pending), then started — both before the run│
      └──────────┬─────────────────────────────────────┘
-                │ if accepted
+                │ if accepted; a plexd_hook entry runs
+                │ runPlexdHook instead (Kubernetes CRD Hooks)
                 ▼
         ┌───────────────┐
         │  goroutine    │
@@ -167,7 +171,8 @@ Each entry of the block is evaluated in block order. The first row is checked fo
 | `status` is `pending` or `ack`, `cancel_requested_at` is set | Not started and marked settled, logged at warn, whatever `Config.Enabled` says | none |
 | `status` is `pending` or `ack`, `Config.Enabled` is `false` | Fail-fast rejection with `error=actions_disabled`           | `ack` → `started` → `failed` |
 | `status` is `pending` or `ack`               | `Executor.Execute`                                                       | see [Execute Flow](#execute-flow) |
-| `status` is `started`                        | `Executor.FailOrphan`: the run was lost to an agent restart; an undelivered report is retried on the next pull, at most 5 times | `failed`  |
+| `status` is `started`, `type` is `plexd_hook`, and a PlexdHook runner is set | `Executor.Resume` follows the run's Job and marks the id settled; a `cancel_requested_at` on the entry is forwarded in the same pass. While shutting down, with the id active, or at `MaxConcurrent`, the entry waits for the next pull, with no deferral counted (see [Resume After a Restart](#resume-after-a-restart)) | the terminal the Job's outcome maps to |
+| `status` is `started`, any other entry       | `Executor.FailOrphan`: the run was lost to an agent restart; an undelivered report is retried on the next pull, at most 5 times | `failed`  |
 | any other `status`                            | Logged at warn and marked settled                                        | none      |
 
 There is no `timeout` wire status: a lapsed entry is dropped without a callback because the control plane sets the timeout itself.
@@ -182,7 +187,7 @@ The budget gates which entries the pass *starts*, never how long a settlement al
 
 ### Handled Set
 
-The dispatcher keeps a set of settled execution ids — dispatched, rejected, expired, or reported lost — so a re-observed entry is a no-op. An id is forgotten the moment its entry drains from the block: the control plane only drains a settled execution, so the id can never be re-observed. That bounds the set by the size of the block.
+The dispatcher keeps a set of settled execution ids (dispatched, resumed, rejected, expired, or reported lost), so a re-observed entry is a no-op. An id is forgotten the moment its entry drains from the block: the control plane only drains a settled execution, so the id can never be re-observed. That bounds the set by the size of the block.
 
 The set is a hint, not the run state. `Executor.IsActive` is authoritative on whether a run is still in flight, and the dispatcher consults it before doing anything else with an entry: a block that transiently omits an entry prunes its id, and without that check the next pull would report a live run lost or dispatch it a second time.
 
@@ -204,11 +209,21 @@ plexd keeps no execution state across a restart, so the entry's `status` is what
 |--------------------|--------------------------------------------------------|--------------------------------------------------------------------|
 | `pending`          | Dispatched, never acknowledged                         | Run it; `ack` is the first callback                                 |
 | `ack`              | Acknowledged before the restart, never started         | Run it **without** re-acking; `started` is the first callback       |
-| `started`          | The run was in flight and did not survive the restart  | Report `failed` with `error=execution lost to an agent restart`; **never** re-execute |
+| `started`          | The run was in flight when the agent stopped           | A `plexd_hook` entry is resumed: plexd follows its Job and reports the Job's outcome. Every other entry is reported `failed` with `error=execution lost to an agent restart`; **never** re-execute |
 
-Actions are not idempotent, which is why a `started` entry is reported lost rather than repeated. `started` → `failed` is a legal edge, so the single terminal callback settles the execution.
+Actions are not idempotent, which is why a `started` entry is never run again. A built-in or a script hook died with the agent, so its entry is reported lost; `started` → `failed` is a legal edge, so the single terminal callback settles the execution. A PlexdHook's Job did not die with the agent: a [shutdown](#shutdown) leaves it running, and the next agent process follows it instead of reporting it lost.
 
-A `started` entry that carries `cancel_requested_at` is reported lost the same way, as `failed` with `error=execution lost to an agent restart`, not as `cancelled`. The contract keeps `cancelled` for a run the node stopped, and this process stopped nothing.
+The dispatcher's `started` case calls `Executor.Resume` first and acts on what it returns:
+
+| `Resume` returns | Dispatcher's move |
+|---|---|
+| `nil` | The id is marked settled. `Resume` took an active slot, logged `resuming plexd hook run after a restart` at info, and started following the Job. When the entry carries `cancel_requested_at`, the cancel is forwarded in the same pass, so the resumed run deletes the Job and reports `cancelled` |
+| `ErrDispatchDeferred` | Shutting down, the id already active, or `MaxConcurrent` reached. The entry is left for the next pull, as often as it takes: no deferral is counted, so the 5-pass cap of an undelivered orphan report does not apply |
+| not resumable | The entry is not of type `plexd_hook`, or no PlexdHook runner is set, as on a host or in a pod whose runner could not be built. `FailOrphan` reports it lost |
+
+A resumed run creates nothing and sends no `ack` or `started`, because the entry is at `started` already. Its run deadline is computed afresh, as for a new run: what is left of `expires_at`, capped by `MaxActionTimeout` from the moment of the resume. When that ceiling capped the original run, the Job's `activeDeadlineSeconds`, set from the original deadline, usually ends it first, and the run reports a timeout without its log. It sends only the terminal the Job's outcome maps to (see [Kubernetes CRD Hooks](#kubernetes-crd-hooks)). A Job that is gone reports `failed` with `error=execution lost to an agent restart`. `Resume` does not check `Config.Enabled`: it starts nothing, and reporting the Job lost would leave a run that is still going unobserved.
+
+A `started` entry that carries `cancel_requested_at` and cannot be resumed is reported lost the same way, as `failed` with `error=execution lost to an agent restart`, not as `cancelled`. The contract keeps `cancelled` for a run the node stopped, and this process stopped nothing.
 
 ## Executor
 
@@ -239,7 +254,9 @@ Logger is tagged with `component=actions`.
 | `SwapRolloutHook` | `(name string, version int, checksum string, swap func() error) error`          | Run `swap` under the swap lock, then pin `name` to `version` and the hex `checksum`. A `swap` that succeeds also gives the hook's entry in the rollout snapshot that `checksum`. A nil `swap` pins alone; a failed one leaves the pin as it was |
 | `RemoveRolloutHook` | `(name string, remove func() error) error`                                    | Run `remove` under the swap lock, then drop the pin of `name`. A failed `remove` leaves the pin as it was |
 | `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins, sorted by name, and the merged hook list for reporting |
+| `SetPlexdHookRunner` | `(r PlexdHookRunner)`                                                        | Set the runner a `plexd_hook` entry runs through. `plexd up` calls it once, in a pod, before the reconciler starts. Without a runner such an entry is rejected with `unsupported_action_type` |
 | `Execute`         | `(ctx context.Context, nodeID string, entry api.NodeStateExecution) error`      | Main entry point for action execution                |
+| `Resume`          | `(ctx context.Context, nodeID string, entry api.NodeStateExecution) error`      | Follow the Job of a `started` `plexd_hook` entry after an agent restart (see [Resume After a Restart](#resume-after-a-restart)) |
 | `FailOrphan`      | `(ctx context.Context, nodeID, executionID string)`                             | Report a run lost to an agent restart as `failed`    |
 | `Cancel`          | `(executionID string) bool`                                                      | Stop that execution's run on a cancel request; false when no such run is active (see [Cancel](#cancel)) |
 | `Shutdown`        | `(ctx context.Context)`                                                         | Cancel all running executions, reject new ones       |
@@ -253,10 +270,10 @@ Logger is tagged with `component=actions`.
 1. **Check shutting down**: if `shuttingDown`, defer with `reason=shutting_down`
 2. **Check duplicate**: if the execution id is already active, defer with `reason=already_active`
 3. **Check concurrency**: if `len(active) >= MaxConcurrent`, defer with `reason=max_concurrent_reached`
-4. **Look up action**: the entry's `type` picks the registry — `builtin` resolves **only** against the builtins map, `hook` **only** against the merged hook list, which holds the hooks in `hooks_dir` and the pinned [rolled-out hooks](#rolled-out-hooks). A mistyped entry is unresolvable rather than silently routed to the other kind
-5. **Unknown action**: reject with `reason=unknown_action`; a `type` outside `builtin`/`hook` rejects with `reason=unsupported_action_type`, because the action itself may well be registered and naming the wrong cause sends the operator auditing the action registry instead of the `type` field
+4. **Look up action**: the entry's `type` picks the registry. `builtin` resolves **only** against the builtins map, `hook` **only** against the merged hook list, which holds the hooks in `hooks_dir` and the pinned [rolled-out hooks](#rolled-out-hooks). A mistyped entry is unresolvable rather than silently routed to the other kind. A `plexd_hook` entry is looked up nowhere here: with a PlexdHook runner set, it counts as known, and its run looks the PlexdHook up, so no Kubernetes call runs on the reconcile goroutine (see [Kubernetes CRD Hooks](#kubernetes-crd-hooks))
+5. **Unknown action**: reject with `reason=unknown_action`. A `type` outside `builtin`, `hook`, and `plexd_hook`, or a `plexd_hook` entry with no PlexdHook runner set, rejects with `reason=unsupported_action_type`, because the action itself may well be registered and naming the wrong cause sends the operator auditing the action registry instead of the `type` field
 6. **Claim**: post `ExecutionCallbackRequest{Status: "ack"}` — but only when the entry's `status` is `pending`, since an entry the pull already reports at `ack` has that transition recorded and repeating it would be a non-terminal self-edge answered `409` — then post `{Status: "started"}`. Both legs run **synchronously, before the run**, under a 5s deadline for the whole handshake
-7. **Execute**: launch goroutine calling `runAction` with timeout context
+7. **Execute**: launch goroutine calling `runAction` with timeout context, or `runPlexdHook` for a `plexd_hook` entry
 
 `started` is a hard precondition for running, which is what keeps the pull's `ack` status unambiguous: an entry the block still reports at `ack` has not executed, so redelivering it after a restart cannot repeat a non-idempotent action. A transient failure on either leg therefore aborts the dispatch with `ErrDispatchDeferred` — nothing runs, the execution stays where the control plane had it, and the next pull redelivers it.
 
@@ -375,8 +392,8 @@ Upstream integrity — whether this node should run this hook at all — is the 
 
 1. Sets `shuttingDown = true` under mutex
 2. Collects all active cancel functions
-3. Calls each cancel function to cancel running contexts
-4. Subsequent `Execute` calls return `ErrDispatchDeferred` with `reason=shutting_down`, so the pull redelivers them to the next agent process
+3. Calls each cancel function to cancel running contexts. A PlexdHook run then leaves its Job running: it logs `leaving the plexd hook job running; the next agent start resumes it` at info and sends no callback, so the entry stays at `started` and the next agent process [resumes](#resume-after-a-restart) it. A script hook is killed because it is plexd's child process; a Job is not
+4. Subsequent `Execute` and `Resume` calls return `ErrDispatchDeferred` with `reason=shutting_down`, so the pull redelivers them to the next agent process
 
 ### Cancel
 
@@ -384,7 +401,7 @@ Upstream integrity — whether this node should run this hook at all — is the 
 func (e *Executor) Cancel(executionID string) bool
 ```
 
-`Cancel` stops one run on a cancel request. It reads the run's cancel function from the active map under the mutex, calls it after unlocking, and reports whether it found one. An empty or unknown id returns false and does nothing. A second call for the same run does nothing more, because a cancel function is idempotent. `Cancel` leaves `shuttingDown` alone, so other dispatches go on.
+`Cancel` stops one run on a cancel request. It reads the run's cancel function from the active map under the mutex, records the id as cancel-requested, calls the function after unlocking, and reports whether it found one. The record is how a PlexdHook run tells a cancel request, which deletes its Job, from a [shutdown](#shutdown), which leaves the Job running; it goes when the run leaves the active map. An empty or unknown id returns false and does nothing. A second call for the same run does nothing more, because a cancel function is idempotent. `Cancel` leaves `shuttingDown` alone, so other dispatches go on.
 
 The dispatcher calls it for an entry that carries `cancel_requested_at` (see [Handled Set](#handled-set)). `Cancel` sends no callback, and the run's own terminal callback says how the run ended:
 
@@ -393,6 +410,7 @@ The dispatcher calls it for an entry that carries `cancel_requested_at` (see [Ha
 | A running hook | Its process group is killed with `SIGKILL`, with no grace period (see [Process Group](#process-group)). `cancelled` with exit code -1 and the output captured so far, inline or uploaded by the 16 KiB rule |
 | A running built-in that reports the stop | `cancelled`, with the output the built-in returned (see [Built-in Actions](#built-in-actions)) |
 | A running built-in that does not watch its context | The built-in finishes, and the run reports its real outcome |
+| A PlexdHook run, while plexd creates or follows its Job | plexd reads the pod's log so far and deletes the Job, under a budget of 10 seconds. `cancelled` with that log, inline or uploaded by the 16 KiB rule. A delete that fails logs `plexd hook job delete failed` and reports `cancelled` without output (see [Kubernetes CRD Hooks](#kubernetes-crd-hooks)) |
 | A run whose result is already computed | Its real outcome, because the report leg is detached from the action context. The dispatcher still logs `cancel requested; stopping the run` |
 
 `cancelled` carries an empty `error`. The control plane takes `cancelled` from `started` only, from a node that stopped the run at its own shutdown or on a cancel request. A run that finished first reports its real outcome, and a run whose report never lands ends at the Execution's timeout. A `cancelled` report gets the retries of any terminal callback and is not sent again on a later pull.
@@ -1196,9 +1214,9 @@ The terminal callback carries one of three statuses, chosen by `terminalOutcome`
 
 | Status      | Meaning                                                                                       |
 |-------------|-----------------------------------------------------------------------------------------------|
-| `succeeded` | Action completed with exit code 0                                                              |
-| `failed`    | Non-zero exit, a timeout (`error="action timed out"`, or with the limit after a colon, as in `"action timed out: hook timeout 30s"`; see [Run Deadline](#run-deadline)), a refused hook (`error` starts with `hook refused: `), or a run error (message in `error`). A built-in that reports a stop and reaches its deadline carries `error="action timed out"`, or `"action timed out: max_action_timeout <d>"` when the ceiling set the deadline (see [Built-in Actions](#built-in-actions)) |
-| `cancelled` | The action context was cancelled, at `Shutdown` or on a [cancel request](#cancel), and the run ended with an error: a killed hook, or a built-in that reports the stop. `error` is empty |
+| `succeeded` | Action completed with exit code 0. A PlexdHook's Job completed; its exit code is 0 when plexd could not read one |
+| `failed`    | Non-zero exit, a timeout (`error="action timed out"`, or with the limit after a colon, as in `"action timed out: hook timeout 30s"`; see [Run Deadline](#run-deadline)), a refused hook (`error` starts with `hook refused: `), or a run error (message in `error`). A built-in that reports a stop and reaches its deadline carries `error="action timed out"`, or `"action timed out: max_action_timeout <d>"` when the ceiling set the deadline (see [Built-in Actions](#built-in-actions)). A PlexdHook run fails when its Job fails, times out, or is deleted before it finished, or when its Job cannot be created (see [Kubernetes CRD Hooks](#kubernetes-crd-hooks)) |
+| `cancelled` | The action context was cancelled, at `Shutdown` or on a [cancel request](#cancel), and the run ended with an error: a killed hook, or a built-in that reports the stop. A PlexdHook run reports it on a cancel request only, once plexd read the log and asked to delete its Job; at `Shutdown` it leaves the Job running and reports nothing. `error` is empty |
 
 ## Rejection Reasons
 
@@ -1207,7 +1225,7 @@ Three reasons reach the control plane, each as the `error` of the `failed` termi
 | Reason                    | Trigger                                                                     |
 |---------------------------|------------------------------------------------------------------------------|
 | `unknown_action`          | Action name not in the registry the entry's `type` names                      |
-| `unsupported_action_type` | `type` outside `builtin`/`hook` — the action itself may well be registered    |
+| `unsupported_action_type` | `type` outside `builtin`, `hook`, and `plexd_hook`, or `plexd_hook` with no PlexdHook runner set, as on every plexd outside a pod. The action itself may well be registered |
 | `actions_disabled`        | `Config.Enabled` is `false`                                                   |
 
 Three more are **deferral** reasons: they are logged locally at warn and produce **no callback at all**, because the pull redelivers the entry.
@@ -1246,11 +1264,15 @@ type NodeStateExecution struct {
 ### ActionKind constants
 
 ```go
+// The three legal values of a NodeStateExecution.Type.
 const (
     // ActionKindBuiltin dispatches an action built into plexd.
     ActionKindBuiltin = "builtin"
     // ActionKindHook dispatches a hook registered by the node.
     ActionKindHook = "hook"
+    // ActionKindPlexdHook dispatches a PlexdHook resource of the node's
+    // cluster. The entry's Action is the resource's metadata.name.
+    ActionKindPlexdHook = "plexd_hook"
 )
 ```
 
@@ -1393,6 +1415,14 @@ exec.RegisterBuiltin("mesh.reconnect", "Reconnect mesh", nil, actions.MeshReconn
 exec.RegisterBuiltin("config.dump", "Dump config", nil, actions.ConfigDump(configProvider))
 exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", snapshotParams, actions.LogsSnapshot(logProvider))
 
+// 3a. In a pod, give the executor the PlexdHook runner, once and before the
+//     reconciler starts. kubeEnv is the result of DefaultDetector.Detect().
+//     newPlexdHookRunner returns nil outside a cluster, and logs a warning
+//     and returns nil when the runner cannot be built
+if runner := newPlexdHookRunner(kubeEnv, nodeID, cfg.MaxOutputBytes, logger); runner != nil {
+    exec.SetPlexdHookRunner(runner)
+}
+
 // 4. Create the rollout installer. signingVerifier is the *api.Ed25519Verifier
 //    that checks envelopes. An error leaves rolled-out hooks off and installer
 //    nil, not the agent
@@ -1487,9 +1517,13 @@ exec.Shutdown(ctx)
 | Backpressure (shutting down, id already active, `MaxConcurrent` saturated) | No callback; the next pull redelivers the entry |
 | Actions disabled             | Fail-fast: the legal sequence to a `failed` terminal with `error=actions_disabled` |
 | Unknown action               | Fail-fast: the legal sequence to a `failed` terminal with `error=unknown_action`   |
-| `type` outside `builtin`/`hook` | Fail-fast: the legal sequence to a `failed` terminal with `error=unsupported_action_type` |
+| `type` outside `builtin`, `hook`, and `plexd_hook`, or `plexd_hook` with no PlexdHook runner | Fail-fast: the legal sequence to a `failed` terminal with `error=unsupported_action_type` |
 | Deadline lapsed during the claim handshake | `failed` terminal with `error=execution deadline lapsed before the run started`; nothing runs |
-| Run lost to an agent restart | One `failed` terminal with `error=execution lost to an agent restart`; never re-executed |
+| Run lost to an agent restart | One `failed` terminal with `error=execution lost to an agent restart`; never re-executed. A `plexd_hook` entry is [resumed](#resume-after-a-restart) instead, and reported lost only when its Job is gone |
+| No PlexdHook of the entry's `action` in plexd's namespace | `ack` + `started`, then `failed` terminal with `error=unknown_action` |
+| PlexdHook image without a `sha256` digest | `ack` + `started`, then `failed` terminal with `error=plexd hook image is not pinned by a sha256 digest: <image>`; no Job is created |
+| PlexdHook Job fails, times out, or is deleted | `failed` terminal mapped from the Job (see [Kubernetes CRD Hooks](#kubernetes-crd-hooks)) |
+| Agent shutdown during a PlexdHook run | No callback; the Job keeps running and the next agent process resumes it |
 | Orphan report undelivered    | Retried on the next pull, at most 5 passes; then logged at error level and left to server-side expiry |
 | Hook file missing            | `ack` + `started`, then `failed` terminal with `error` carrying the run error (e.g. `hook not found: <name>`) |
 | Hook integrity failure       | `failed` terminal with the integrity error message |
@@ -1523,6 +1557,9 @@ All log entries use `component=actions`.
 | `Info`  | execution expired; leaving the timeout to the control plane | `execution_id`, `action`, `expires_at` |
 | `Info`  | Action completed              | `execution_id`, `status`, `duration`        |
 | `Info`  | cancel requested; stopping the run | `execution_id`, `action`, `cancel_requested_at` |
+| `Info`  | resuming plexd hook run after a restart | `execution_id`, `action`           |
+| `Info`  | leaving the plexd hook job running; the next agent start resumes it | `execution_id` |
+| `Warn`  | plexd hook job delete failed  | `execution_id`, `error`                     |
 | `Warn`  | dispatch deferred             | `execution_id`, `action`, `reason`          |
 | `Warn`  | Action rejected               | `execution_id`, `action`, `reason`          |
 | `Warn`  | execution lost to an agent restart; reporting failed | `execution_id`       |
@@ -1544,6 +1581,8 @@ All log entries use `component=actions`.
 | `Error` | claim callback refused; aborting execution | `execution_id`, `status`, `error` |
 | `Error` | callback refused for rejected execution | `execution_id`, `status`, `error` |
 | `Error` | panic in action execution     | `execution_id`, `panic`, `stack`            |
+
+The PlexdHook runner's own lines carry `component=plexdhook-jobs` and are listed under [PlexdHook CRD](plexdhook-crd.md#run-log-lines).
 
 ## Dispatch Delivery: the `executions` block
 
@@ -1571,8 +1610,8 @@ never `null`) and ordered by `requested_at`, then `execution_id`.
 | Field | Type | Description |
 |---|---|---|
 | `execution_id` | string | Unique identifier for this execution |
-| `action` | string | Action name (e.g. `diagnostics.collect`, `backup`) |
-| `type` | string | `builtin` or `hook`; selects the registry the name is resolved against |
+| `action` | string | Action name (e.g. `diagnostics.collect`, `backup`), or a PlexdHook's `metadata.name` |
+| `type` | string | `builtin`, `hook`, or `plexd_hook`; selects the registry the name is resolved against, or for `plexd_hook` the [PlexdHook resource](#kubernetes-crd-hooks) in plexd's namespace |
 | `parameters` | object | Parameters passed to the action; nullable |
 | `status` | string | `pending`, `ack`, or `started` — the status the control plane currently holds |
 | `requested_at` | timestamp | When the control plane dispatched the execution |
@@ -1647,7 +1686,9 @@ the entry.
 ### Orphaned run
 
 An entry the pull reports at `started` belonged to a run that did not survive an
-agent restart. plexd posts one terminal callback and never re-executes it:
+agent restart. plexd posts one terminal callback and never re-executes it. A
+`plexd_hook` entry is [resumed](#resume-after-a-restart) instead, and gets this
+callback only when its Job is gone:
 
 ```json
 { "status": "failed", "error": "execution lost to an agent restart" }
@@ -1992,74 +2033,137 @@ The PlexdHook watch's lines are listed under
 
 ## Kubernetes CRD Hooks
 
-When plexd runs as a DaemonSet in Kubernetes, hooks are defined as `PlexdHook` custom resources instead of script files. On dispatching a hook execution, plexd creates a Kubernetes Job on the target node.
+When plexd runs as a DaemonSet in Kubernetes, a hook can also be a `PlexdHook` custom resource in plexd's namespace instead of a script file. The control plane dispatches one as an entry with `type` `plexd_hook`, whose `action` is the resource's `metadata.name` and whose `parameters` are the dispatch's own. plexd runs it as one Job per execution and Node, pinned to its own Node, and reports the Job's outcome and the pod's log through the execution callback. Creating a resource runs nothing. The [PlexdHook CRD](plexdhook-crd.md#running-a-hook) reference gives every field of the Job and the reason for it, and the Role the run needs.
+
+The executor runs the entry through a `PlexdHookRunner`, which `plexd up` builds in a pod and hands over with `SetPlexdHookRunner`. Without one, as on every plexd outside a pod, the entry is rejected with `unsupported_action_type`. `internal/actions` defines the seam, and `internal/kubernetes` implements it as `HookJobRunner` (see [Kubernetes Deployment](../deployment/kubernetes-deployment.md#hookjobrunner)):
+
+```go
+type PlexdHookRun struct {
+    ExecutionID string
+    Hook        string            // the PlexdHook's metadata.name: the entry's action
+    Parameters  map[string]string // the dispatch's parameters, through flattenParams
+    Deadline    time.Duration     // the run's bound
+}
+
+type PlexdHookResult struct {
+    Succeeded bool
+    ExitCode  *int   // the hook container's exit code; nil when it never terminated
+    TimedOut  bool
+    Reason    string // why a run without an exit code failed
+    Output    string // the pod's log
+}
+
+type PlexdHookRunner interface {
+    // Start creates the run's Job. A Job that already exists is not an error.
+    Start(ctx context.Context, run PlexdHookRun) error
+    // Wait returns once the Job is over, or deletes it when bound runs out.
+    Wait(ctx context.Context, executionID string, bound time.Duration) (PlexdHookResult, error)
+    // Stop reads the log so far and deletes the Job.
+    Stop(ctx context.Context, executionID string) (output string, err error)
+}
+
+var ErrPlexdHookNotFound = errors.New("actions: plexd hook not found")
+var ErrPlexdHookJobNotFound = errors.New("actions: plexd hook job not found")
+```
+
+### runPlexdHook (goroutine)
+
+`runPlexdHook` takes the place of [`runAction`](#runaction-goroutine) for a `plexd_hook` entry, with the same release of the active slot and the same panic report:
+
+1. Settle a lapsed deadline: a fresh run whose claim used up what was left of `expires_at` reports `failed` with `error=execution deadline lapsed before the run started` and creates no Job
+2. Derive the run deadline with `runBound(time.Until(expires_at), 0, MaxActionTimeout)`, as for every action kind (see [Run Deadline](#run-deadline)). A resumed run counts a lapsed `expires_at` as nothing left
+3. A fresh run calls `Start` with that deadline. `ErrPlexdHookNotFound` reports `failed` with `error=unknown_action`. Any other error reports `failed` with the error's text and no exit code. A [resumed](#resume-after-a-restart) run skips this step
+4. `Wait` follows the Job until it is over, or, when the deadline passes, reads the Job once more and then reads its log and deletes it unless the hook container has already ended. When the ceiling set the deadline, plexd logs `run deadline capped by max_action_timeout` at warn, with `requested` set to what was left of `expires_at`
+5. Build the terminal callback from the result by the [table below](#result-mapping), with the pod's log as output, send it on a context detached from the run's, as `runAction` does, and log `action completed`
+
+When the run's context ends during `Start` or `Wait`, plexd checks whether `Cancel` recorded the id. A [cancel request](#cancel) calls `Stop` under a budget of 10 seconds and reports `cancelled` with the log `Stop` read and an empty `error`. A [shutdown](#shutdown) leaves the Job running and reports nothing. A result `Wait` returned without an error is reported as it is, even when the context ended meanwhile. A read or delete of `Wait`'s own that the ended context cut short returns the context's error, so it takes the same two paths.
+
+No step runs on the reconcile goroutine, so a PlexdHook that does not exist ends as `ack`, `started`, `failed` with `error=unknown_action`, the same three callbacks the rejection walk sends for an unknown script hook.
 
 ### Generated Job YAML
 
-When an executions entry with `action: hooks/db-backup` is dispatched, plexd creates:
+The PlexdHook `db-backup` names the image `registry.example.com/tools/pg-backup@sha256:<64 lowercase hex>`, the command `/usr/local/bin/pg-backup.sh`, the parameter `compress=true`, and no `privileged`. A dispatch of it with `{"bucket": "s3://backups/prod"}` and a run deadline of 300 seconds, to the Node `node-abc123`, whose plexd pod runs on the Kubernetes node `worker-03`, creates:
 
 ```yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: plexd-db-backup-exec-a1b2c3d4
+  name: plexdhook-<first 32 hex of sha256(node id, 0x00, execution id)>
   namespace: plexd-system
   labels:
-    plexd.plexsphere.com/hook: db-backup
+    app.kubernetes.io/managed-by: plexd
+  annotations:
     plexd.plexsphere.com/execution-id: exec_a1b2c3d4
+    plexd.plexsphere.com/node-id: node-abc123
+    plexd.plexsphere.com/hook: db-backup
   ownerReferences:
     - apiVersion: plexd.plexsphere.com/v1alpha1
       kind: PlexdHook
       name: db-backup
+      uid: <uid of the PlexdHook>
+      controller: true
+      blockOwnerDeletion: false
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 600
+  activeDeadlineSeconds: 330
+  ttlSecondsAfterFinished: 3600
   template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: plexd
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: worker-03
-      serviceAccountName: plexd-hook-runner
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [worker-03]
       containers:
-        - name: backup
-          image: registry.example.com/tools/pg-backup:2.1@sha256:abc123...
+        - name: hook
+          image: registry.example.com/tools/pg-backup@sha256:<64 lowercase hex>
           command: ["/usr/local/bin/pg-backup.sh"]
           env:
+            - name: PLEXD_EXECUTION_ID
+              value: exec_a1b2c3d4
+            - name: PLEXD_HOOK_NAME
+              value: db-backup
+            - name: PLEXD_NODE_ID
+              value: node-abc123
             - name: PLEXD_PARAM_BUCKET
-              value: "s3://backups/prod"
+              value: s3://backups/prod
             - name: PLEXD_PARAM_COMPRESS
               value: "true"
-            - name: PLEXD_EXECUTION_ID
-              value: "exec_a1b2c3d4"
-            - name: PLEXD_ACTION_NAME
-              value: "db-backup"
-          resources:
-            limits:
-              cpu: "1"
-              memory: 512Mi
-          volumeMounts:
-            - name: pgdata
-              mountPath: /var/lib/postgresql
-              readOnly: true
-      volumes:
-        - name: pgdata
-          hostPath:
-            path: /var/lib/postgresql
-      restartPolicy: Never
+          securityContext:
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
 ```
 
-plexd pins the Job to the target node via `nodeSelector`, injects parameters as `PLEXD_PARAM_*` environment variables, and sets an `ownerReference` to the `PlexdHook` CR for garbage collection.
+plexd pins the Job to its own Node with a required node affinity on the node's name, passes the parameters as `PLEXD_PARAM_*` variables, a dispatch parameter overriding the resource's value of the same name, mounts no ServiceAccount token, and sets an `ownerReference` to the PlexdHook, so deleting the resource deletes its Jobs. `activeDeadlineSeconds` is the run deadline plus 30 seconds, a backstop for a deadline that passes while no agent runs; plexd enforces the deadline itself. The Job sets no resource limits and mounts no volumes, because the CRD has no field for either. plexd refuses an image without a `sha256` digest before it creates anything.
 
 ### Result Mapping
 
-plexd watches the Job and maps its status to the action callback:
+plexd reads the Job at once and then every 2 seconds, and maps what `Wait` returns to the terminal callback:
 
-| Job Condition | Callback Status | Notes |
-|---|---|---|
-| Succeeded | `succeeded` | Exit code 0 |
-| Failed | `failed` | Exit code from container termination state |
-| `activeDeadlineSeconds` exceeded | `failed` with `error="action timed out"` | Job killed by Kubernetes; there is no node-reported `timeout` status |
+| `Wait` returns | The Job | Callback Status | `exit_code` | `error` |
+|---|---|---|---|---|
+| `Succeeded` | `Complete` | `succeeded` | The `hook` container's exit code, or 0 when none was read | empty |
+| `TimedOut` | Deleted by plexd at the run deadline, or `Failed` with reason `DeadlineExceeded` | `failed` | omitted | `action timed out`, then `: max_action_timeout <d>` when the ceiling set the deadline, then `; <Reason>` when the result carries one, such as `; hook container never started: ImagePullBackOff` |
+| neither, with `ExitCode` | `Failed` | `failed` | `ExitCode` | empty, as for a script hook that exits non-zero |
+| neither, without `ExitCode` | `Failed` | `failed` | omitted | `Reason`: `plexd hook job failed: <reason>: <message>` |
+| `ErrPlexdHookJobNotFound` on a resumed run | Gone | `failed` | omitted | `execution lost to an agent restart` |
+| `ErrPlexdHookJobNotFound` on a fresh run | Gone | `failed` | omitted | `plexd hook job deleted before it finished` |
+| any other error, with the run's context alive | | `failed` | omitted | The error's text |
 
-Stdout and stderr are captured from the pod logs via the Kubernetes API.
+There is no node-reported `timeout` status: a Job the deadline ends reports `failed`. Every `error` of this path is cut to 1024 bytes on a rune boundary; the contract allows 4096 code points, and a kubelet image pull message alone runs to several hundred bytes.
+
+The output is the pod's log, read through the Kubernetes API with `limitBytes` set to `MaxOutputBytes` plus one, so a longer log is cut to `MaxOutputBytes` and ends in `...[truncated]`. It travels inline up to 16 KiB and through the [upload leg](#terminal-with-uploaded-output) above that, and an empty log sends no `output`. A Job that `activeDeadlineSeconds` ended has no log left to read, because the Job controller deletes its pods at once; a run plexd ended at the deadline carries the log it read before the delete.
 
 ## Security Considerations
 
@@ -2068,9 +2172,9 @@ Stdout and stderr are captured from the pod logs via the Kubernetes API.
 - **Signature verification** -- Every SSE event carries `issued_at` (max staleness: 5 minutes) and is verified with a kid-indexed Ed25519 signature selected by the envelope's `key_id`. Signature and staleness checks are applied uniformly to all event types; there is no nonce.
 - **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
 - **Symlink protection** -- Hook paths are resolved and validated to prevent symlink escape outside the configured hooks directory.
-- **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered a hand-placed hook (the dispatch carries no checksum), or against the checksum the pull delivered for a rolled-out hook, which plexd verified under the Domain signature before it installed the script. Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
-- **Resource isolation** -- Script hooks run directly on the host as plexd's user, with no CPU or memory limit from plexd. plexd implements sandbox level `none` only and refuses a hook that declares any other (see [Sandbox Options](sandbox-options.md)), and it kills a hook's whole process group at the run deadline. On Kubernetes, hooks always run as separate Pods with native resource limits.
-- **CRD privilege control** -- Kubernetes hooks requiring host-level access (`hostPID`, `hostNetwork`, `privileged`) must declare `privileged: true` in the `PlexdHook` spec. The platform can enforce approval policies.
+- **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered a hand-placed hook (the dispatch carries no checksum), or against the checksum the pull delivered for a rolled-out hook, which plexd verified under the Domain signature before it installed the script. Binary checksums are reported continuously. On Kubernetes, a PlexdHook's image digest serves as its checksum: plexd reports only a hook whose image is pinned by a `sha256` digest (`@sha256:...`) and refuses to run any other. The pull entry carries no digest, so plexd runs the image the resource names when it creates the Job, and the next manifest reports a changed one as drift.
+- **Resource isolation** -- Script hooks run directly on the host as plexd's user, with no CPU or memory limit from plexd. plexd implements sandbox level `none` only and refuses a hook that declares any other (see [Sandbox Options](sandbox-options.md)), and it kills a hook's whole process group at the run deadline. On Kubernetes, a PlexdHook runs in a pod of its own, in a Job pinned to plexd's Node, with no ServiceAccount token and, unless it sets `privileged: true`, a read-only root filesystem and every capability dropped. plexd sets no CPU or memory limit on it either, because the CRD has no field for one.
+- **CRD privilege control** -- A PlexdHook's container runs privileged only when its spec sets `privileged: true`. plexd never sets `hostPID`, `hostNetwork`, or a host volume on the Job, and does not veto the field: under managed push, the control plane's `domain#manage` gate decides who may set it. plexd's Job grants are a Role in its own namespace, so it can create Jobs and read pod logs there and nowhere else.
 - **Session token scoping** -- JWTs are bound to a specific node (`node_id` claim) and a specific set of actions (`actions` claim). Tokens cannot be used on other nodes or for unauthorized actions.
 - **Session revocation** -- A verified `session_revoked` SSE event closes the live session its payload names at once, reports the `terminated_by` the payload's `revoke_reason` maps to on that session's `session_ended` row (`operator_revoke` for an operator-driven reason, `ttl_expired` or `idle_timeout` for the control plane's sweeper), and then triggers a reconcile. When a session ends, the control plane also drops its entry from the `sessions` block of the state pull; the next reconcile observes the absence and tears down a session that is still open, so the drain stays the teardown for a revocation whose event never arrives.
 - **Local emergency access** -- `plexd actions run --local` requires root or plexd user, bypasses JWT authorization, but is logged as `local_emergency` and reported to the control plane.

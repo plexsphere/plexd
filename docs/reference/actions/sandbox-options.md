@@ -45,33 +45,52 @@ Whatever user plexd runs as, the hook file and its sidecar must be owned by root
 
 | | Script Hooks (bare-metal/VM) | CRD Hooks (Kubernetes) |
 |---|---|---|
-| Definition | Executable file in `hooks_dir`, optional `<name>.json` sidecar | `PlexdHook` custom resource |
-| Isolation | None: runs on the host as plexd's user (level `none` only) | Always a separate Pod |
-| Integrity | SHA-256 file checksum | Image digest (`@sha256:...`) |
-| Cleanup | plexd kills the hook's process group at the run deadline | Kubernetes GC via ownerReference + TTL |
-| Observability | stdout/stderr capture | Native Pod logs + Events |
-| Secrets | Environment variables from plexd | Native Kubernetes Secrets/ConfigMaps |
-| Resource Limits | None set by plexd | Native Kubernetes `resources` |
-| Access Control | Hook file and sidecar owned by root, not group- or other-writable | Kubernetes RBAC + ServiceAccount |
-| Host Access | Whatever plexd's user has | `privileged: true` + securityContext |
+| Definition | Executable file in `hooks_dir`, optional `<name>.json` sidecar | `PlexdHook` custom resource in plexd's namespace, run only when the control plane dispatches it |
+| Isolation | None: runs on the host as plexd's user (level `none` only) | A pod of its own, in one Job per execution pinned to plexd's Node. Unless `privileged: true`, a read-only root filesystem and every capability dropped |
+| Integrity | SHA-256 file checksum | Image pinned by a `sha256` digest (`@sha256:...`); plexd refuses any other image |
+| Cleanup | plexd kills the hook's process group at the run deadline | plexd reads the log and deletes the Job at the run deadline or on a cancel request, and `activeDeadlineSeconds` ends it 30 seconds later as a backstop. A finished Job stays for an hour (`ttlSecondsAfterFinished: 3600`), and deleting the PlexdHook deletes its Jobs through the owner reference |
+| Observability | stdout/stderr capture | The `hook` container's exit code and log in the execution callback; the Job and its pod stay an hour for `kubectl` |
+| Secrets | Environment variables from plexd | None: the pod mounts no ServiceAccount token and no volume, and plexd adds only the `PLEXD_*` variables. Kubernetes still injects its service variables, such as `KUBERNETES_SERVICE_HOST` |
+| Resource Limits | None set by plexd | None set by plexd: the CRD has no field for them |
+| Access Control | Hook file and sidecar owned by root, not group- or other-writable | Whoever may write `PlexdHook` resources in plexd's namespace, and under managed push the control plane's `domain#manage` gate. The hook pod holds no credentials for the Kubernetes API |
+| Host Access | Whatever plexd's user has | A privileged container with `privileged: true`; plexd sets no `hostPID`, `hostNetwork`, or host volume |
+
+See [PlexdHook CRD](plexdhook-crd.md#running-a-hook) for the Job plexd creates.
 
 ## RBAC for CRD Hooks
 
-The plexd DaemonSet ServiceAccount needs additional permissions for CRD-based hooks:
+plexd reads PlexdHook resources through the `plexdhooks` `get, list, watch` grant of its `plexd` ClusterRole. Running one needs the Role `plexd-hook-runner` in plexd's namespace and the RoleBinding of the same name, both in `deploy/kubernetes/rbac.yaml`, shown here without their labels:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: plexd-hooks
+  name: plexd-hook-runner
+  namespace: plexd-system
 rules:
-  - apiGroups: ["plexd.plexsphere.com"]
-    resources: ["plexdhooks"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "delete"]
+    verbs: ["create", "get", "delete"]
   - apiGroups: [""]
-    resources: ["pods", "pods/log"]
-    verbs: ["get", "list", "watch"]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: plexd-hook-runner
+  namespace: plexd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: plexd-hook-runner
+subjects:
+  - kind: ServiceAccount
+    name: plexd
+    namespace: plexd-system
 ```
+
+The grants are namespaced. plexd creates Jobs only in the namespace where it lists PlexdHooks, and a cluster-wide `pods/log` grant would let one Node's agent read the log of every pod in the cluster. The `plexd` ClusterRole holds no Job grant and no `plexdhooks/status` grant, because plexd writes no PlexdHook status. See [PlexdHook CRD](plexdhook-crd.md#rbac-permissions) for what each grant is used for.
