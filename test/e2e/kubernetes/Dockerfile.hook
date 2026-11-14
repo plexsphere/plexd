@@ -1,0 +1,10 @@
+# Hook image for the Kubernetes e2e suite's PlexdHook fixtures. The suite runs
+# each dispatched PlexdHook as a Job on the kind node, so the image has to be on
+# the node already: busybox gives the hooks /bin/sh, echo and sleep.
+#
+# DECISION: the image is built here rather than pulled. kind load docker-image
+# refuses a pulled multi-platform image on a docker host with the containerd
+# image store, and accepts a locally built single-platform one. The LABEL makes
+# the build produce an image of its own instead of the base image as pulled.
+FROM busybox:1.37.0-musl
+LABEL org.opencontainers.image.description="plexd Kubernetes e2e PlexdHook fixture"
