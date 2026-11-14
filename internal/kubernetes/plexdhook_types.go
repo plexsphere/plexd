@@ -1,7 +1,20 @@
 // Package kubernetes provides Kubernetes environment detection and integration.
 package kubernetes
 
-import "time"
+import (
+	"regexp"
+	"strings"
+	"time"
+)
+
+// defaultHookImage is the container image a PlexdHook without a jobTemplate
+// names. It carries no digest, so such a hook is neither reported in the
+// capability manifest nor run.
+const defaultHookImage = "busybox:latest"
+
+// imageDigestRe matches the one image digest form the contract accepts in a
+// plexd_hooks entry, and the one a PlexdHook's image must carry to run.
+var imageDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // PlexdHookSpec holds the spec fields of a PlexdHook CRD resource.
 type PlexdHookSpec struct {
@@ -9,6 +22,34 @@ type PlexdHookSpec struct {
 	JobTemplate *PlexdHookJobTemplate  `json:"jobTemplate,omitempty"`
 	Parameters  []PlexdHookParam       `json:"parameters,omitempty"`
 	Privileged  bool                   `json:"privileged,omitempty"`
+}
+
+// Image returns the container image a hook with this spec runs: the job
+// template's image, or defaultHookImage when the template or its image is
+// absent.
+func (s PlexdHookSpec) Image() string {
+	if s.JobTemplate != nil && s.JobTemplate.Image != "" {
+		return s.JobTemplate.Image
+	}
+	return defaultHookImage
+}
+
+// ImageDigest returns the digest after the last `@` of Image, and whether it is
+// a canonical sha256 digest. plexd has no registry access to resolve a tag, so
+// only a hook whose image is pinned this way is reported in the capability
+// manifest and run. Both ask this method, so the manifest cannot report a hook
+// the runner refuses, or the other way round.
+func (s PlexdHookSpec) ImageDigest() (string, bool) {
+	image := s.Image()
+	at := strings.LastIndex(image, "@")
+	if at < 0 {
+		return "", false
+	}
+	digest := image[at+1:]
+	if !imageDigestRe.MatchString(digest) {
+		return "", false
+	}
+	return digest, true
 }
 
 // PlexdHookJobTemplate holds the job template for a PlexdHook.
