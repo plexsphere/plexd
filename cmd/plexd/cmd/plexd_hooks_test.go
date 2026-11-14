@@ -1253,3 +1253,89 @@ func TestPlexdHookInventory_StreamsEndingEarlyKeepBackingOff(t *testing.T) {
 		t.Errorf("lists after boot = %d, want the one after each open, %d", lists-1, cycles)
 	}
 }
+
+// A pod that cannot run a Job gets no runner, so the executor keeps rejecting a
+// plexd_hook entry as unsupported_action_type, and boot goes on. Outside a
+// cluster that is the normal case and says nothing; inside one, each cause is
+// one warning. The API server address is cleared for the whole test, so no case
+// can reach a cluster the test happens to run in, and the last case fails on it.
+func TestNewPlexdHookRunner(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+	noAPIServer := &kubernetes.KubernetesEnvironment{
+		InCluster:           true,
+		Namespace:           "plexd-system\n",
+		NodeName:            "node-1",
+		ServiceAccountToken: "/token",
+	}
+	_, clientErr := kubernetes.NewInClusterJobClient(noAPIServer)
+	if clientErr == nil {
+		t.Fatal("NewInClusterJobClient succeeded without KUBERNETES_SERVICE_HOST")
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  *kubernetes.KubernetesEnvironment
+		// wantWarning is the one record expected, at Warn; empty means none at
+		// all. wantError is that record's error attribute, empty for none.
+		wantWarning string
+		wantError   string
+	}{
+		{name: "no environment"},
+		{name: "outside a cluster", env: &kubernetes.KubernetesEnvironment{Namespace: "plexd-system", NodeName: "node-1"}},
+		{
+			name:        "empty namespace",
+			env:         &kubernetes.KubernetesEnvironment{InCluster: true, NodeName: "node-1", ServiceAccountToken: "/token"},
+			wantWarning: "plexd hook runs disabled: the ServiceAccount namespace is empty",
+		},
+		{
+			name:        "blank namespace",
+			env:         &kubernetes.KubernetesEnvironment{InCluster: true, Namespace: " \n", NodeName: "node-1", ServiceAccountToken: "/token"},
+			wantWarning: "plexd hook runs disabled: the ServiceAccount namespace is empty",
+		},
+		{
+			name:        "empty node name",
+			env:         &kubernetes.KubernetesEnvironment{InCluster: true, Namespace: "plexd-system", ServiceAccountToken: "/token"},
+			wantWarning: "plexd hook runs disabled: MY_NODE_NAME is not set",
+		},
+		{
+			name:        "no API server",
+			env:         noAPIServer,
+			wantWarning: "plexd hook runs disabled",
+			wantError:   clientErr.Error(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := newRecordingHandler()
+			runner := newPlexdHookRunner(tc.env, "node-id-1", 1<<20, slog.New(rec))
+
+			// A typed nil inside the interface would compare unequal to nil and
+			// pass the executor's "runner != nil" test.
+			if runner != nil {
+				t.Errorf("runner = %#v, want a nil interface", runner)
+			}
+
+			rec.mu.Lock()
+			records := append([]loggedRecord(nil), rec.records...)
+			rec.mu.Unlock()
+
+			if tc.wantWarning == "" {
+				if len(records) != 0 {
+					t.Errorf("logged %+v, want nothing", records)
+				}
+				return
+			}
+			if len(records) != 1 {
+				t.Fatalf("logged %+v, want the one warning %q", records, tc.wantWarning)
+			}
+			got := records[0]
+			if got.level != slog.LevelWarn || got.msg != tc.wantWarning {
+				t.Errorf("logged %v %q, want %v %q", got.level, got.msg, slog.LevelWarn, tc.wantWarning)
+			}
+			if got.attrs["error"] != tc.wantError {
+				t.Errorf("error attr = %q, want %q", got.attrs["error"], tc.wantError)
+			}
+		})
+	}
+}

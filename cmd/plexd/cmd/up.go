@@ -12,7 +12,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -837,7 +836,10 @@ func runAgent(ctx context.Context) error {
 	// contract's 128-action and 64-parameter caps. plexd_hooks carries the
 	// PlexdHook resources a pod finds in its ServiceAccount's namespace, kept
 	// current by plexdHooks. Outside a cluster that costs one environment lookup,
-	// and a failed boot list only leaves the key off.
+	// and a failed boot list only leaves the key off. The same detection gives a
+	// pod the PlexdHook runner, which runs a dispatched plexd_hook entry as a
+	// Kubernetes Job on the pod's node; everywhere else the executor has none and
+	// rejects such an entry as unsupported_action_type.
 	//
 	// The reporter calls this closure on every attempt, so a retry sends the
 	// newest content. The exception is a manifest the control plane refuses for
@@ -847,6 +849,11 @@ func runAgent(ctx context.Context) error {
 	// first manifest.
 	kubeEnv := (&kubernetes.DefaultDetector{Logger: logger}).Detect()
 	plexdHooks := newPlexdHookInventory(ctx, kubeEnv, newInClusterHookLister, logger)
+	// Set once, here, before the dispatcher is registered below, so no entry
+	// reaches the executor ahead of its runner.
+	if runner := newPlexdHookRunner(kubeEnv, identity.NodeID, cfg.Actions.MaxOutputBytes, logger); runner != nil {
+		executor.SetPlexdHookRunner(runner)
+	}
 	capabilityReporter := agent.NewCapabilityReporter(identity.NodeID, client, func() api.CapabilityManifestRequest {
 		capsActions, capsHooks := executor.Capabilities()
 		// nil leaves the key off, which the control plane stores as no errors.
@@ -2363,10 +2370,6 @@ const (
 // is refused whole with 422 plexd_hooks_too_many.
 const maxPlexdHooks = 128
 
-// imageDigestRe matches the one image digest form the contract accepts in a
-// plexd_hooks entry.
-var imageDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-
 // plexdHookLister lists and watches the PlexdHook resources in one namespace;
 // kubernetes.HookLister is the production implementation.
 type plexdHookLister interface {
@@ -2389,17 +2392,19 @@ func newInClusterHookLister(env *kubernetes.KubernetesEnvironment) (plexdHookLis
 // warning, because one entry the control plane refuses costs the whole
 // manifest.
 //
-//   - image_digest is the digest after the last `@` of the image the controller
-//     runs for the hook. plexd has no registry access to resolve a tag, so a hook
-//     whose image is not pinned by a canonical sha256 digest (the busybox:latest
-//     default included) is dropped.
+//   - image_digest is what PlexdHookSpec.ImageDigest finds after the last `@` of
+//     the image the hook's Job runs. plexd has no registry access to resolve a
+//     tag, so a hook whose image is not pinned by a canonical sha256 digest (the
+//     busybox:latest default included) is dropped. The runner refuses such a
+//     hook through the same method, so the manifest and the runner cannot
+//     disagree on which images are pinned.
 //   - parameters folds the spec's name/value list into a map; a repeated name
 //     keeps the later value. A hook with a NUL in a parameter's name or value is
 //     dropped: the control plane stores parameters as jsonb, which cannot hold
 //     one, so it would answer every PUT with a 500, and the inventory would keep
 //     sending that resource until someone deleted it.
-//   - sandbox mirrors the controller, which runs every hook that is not
-//     privileged with a read-only root filesystem and all capabilities dropped.
+//   - sandbox mirrors the Job, which runs every hook that is not privileged
+//     with a read-only root filesystem and all capabilities dropped.
 //   - timeout_seconds stays unset: the CRD has no field to fill it from.
 //
 // Resource names are unique within the one namespace listed, so entries cannot
@@ -2412,11 +2417,8 @@ func discoveredPlexdHooks(hooks []kubernetes.PlexdHook, logger *slog.Logger) []a
 	out := make([]api.DiscoveredPlexdHook, 0, len(hooks))
 	for _, h := range hooks {
 		image := h.Spec.Image()
-		digest := ""
-		if at := strings.LastIndex(image, "@"); at >= 0 {
-			digest = image[at+1:]
-		}
-		if !imageDigestRe.MatchString(digest) {
+		digest, pinned := h.Spec.ImageDigest()
+		if !pinned {
 			logger.Warn("plexd hook omitted from the capability manifest",
 				"hook", h.Name, "image", image, "reason", "image is not pinned by a sha256 digest")
 			continue
