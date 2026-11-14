@@ -2,6 +2,7 @@ package kubernetes
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -263,5 +264,60 @@ func TestPlexdHookEvent_JSONRoundTrip(t *testing.T) {
 	}
 	if got.Hook.Spec.HookName != hook.Spec.HookName {
 		t.Errorf("Hook.Spec.HookName = %q, want %q", got.Hook.Spec.HookName, hook.Spec.HookName)
+	}
+}
+
+func TestPlexdHookSpec_Image(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec PlexdHookSpec
+		want string
+	}{
+		{name: "template image", spec: PlexdHookSpec{JobTemplate: &PlexdHookJobTemplate{Image: "registry.example/backup:1.4"}}, want: "registry.example/backup:1.4"},
+		{name: "no template", spec: PlexdHookSpec{}, want: defaultHookImage},
+		{name: "template without image", spec: PlexdHookSpec{JobTemplate: &PlexdHookJobTemplate{Command: []string{"/bin/true"}}}, want: defaultHookImage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.spec.Image(); got != tc.want {
+				t.Errorf("Image() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// The value is written out, so a change to the default shows up here.
+	if defaultHookImage != "busybox:latest" {
+		t.Errorf("defaultHookImage = %q, want busybox:latest", defaultHookImage)
+	}
+}
+
+func TestPlexdHookSpec_ImageDigest(t *testing.T) {
+	const digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	for _, tc := range []struct {
+		name, image string
+		noTemplate  bool
+		want        string
+		wantOK      bool
+	}{
+		{name: "pinned", image: "registry.example/backup@" + digest, want: digest, wantOK: true},
+		{name: "tag and digest", image: "registry.example/backup:1.4@" + digest, want: digest, wantOK: true},
+		{name: "registry with port", image: "registry.example:5000/backup@" + digest, want: digest, wantOK: true},
+		{name: "digest after the last @", image: "registry.example/b@ckup@" + digest, want: digest, wantOK: true},
+		{name: "tag", image: "registry.example/backup:1.4"},
+		{name: "default image", noTemplate: true},
+		{name: "upper case hex", image: "registry.example/backup@" + strings.ToUpper(digest)},
+		{name: "short digest", image: "registry.example/backup@" + digest[:len(digest)-1]},
+		{name: "sha512", image: "registry.example/backup@sha512:" + strings.Repeat("0", 128)},
+		{name: "digest followed by a tag", image: "registry.example/backup@" + digest + ":1.4"},
+		{name: "empty after @", image: "registry.example/backup@"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := PlexdHookSpec{JobTemplate: &PlexdHookJobTemplate{Image: tc.image}}
+			if tc.noTemplate {
+				spec.JobTemplate = nil
+			}
+			got, ok := spec.ImageDigest()
+			if got != tc.want || ok != tc.wantOK {
+				t.Errorf("ImageDigest() = %q, %v; want %q, %v", got, ok, tc.want, tc.wantOK)
+			}
+		})
 	}
 }
