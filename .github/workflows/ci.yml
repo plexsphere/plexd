@@ -151,13 +151,19 @@ jobs:
       # Administrator. The runner has it, so the gate is this variable for the
       # same reason as above: without one the tests would install real filters
       # inside the ordinary step. The NAT test uses a prefix no adapter carries.
-      # The traffic test creates a Wintun adapter and injects unsolicited
-      # packets into it, which the Windows Firewall would block on its own, so
-      # the step turns every firewall profile off first. plexd's filters live
-      # in a sublayer of their own and do not depend on the Windows Firewall.
-      # The traffic test is the only proof of what plexd's filters let out and
-      # back in on Windows, so the step fails unless its PASS line is in the
-      # output: a skip would pass otherwise.
+      # The traffic test TestWFPController_RealTraffic and the connection-log
+      # test TestWFPController_RealConnLog each create a Wintun adapter and
+      # inject unsolicited packets into it, which the Windows Firewall would
+      # block on its own, so the step turns every firewall profile off first.
+      # plexd's filters live in a sublayer of their own and do not depend on
+      # the Windows Firewall. The connection-log test turns on the filter
+      # engine's classify-allow net events, a setting of the whole host that
+      # outlives the process, and checks that the controller puts the host's
+      # setting back, also after a simulated crash. The traffic test is the
+      # only proof of what plexd's filters let out and back in on Windows, and
+      # the connection-log test the only proof that the engine reports what
+      # plexd's logged filters permit, so the step fails unless both PASS
+      # lines are in the output: a skip would pass otherwise.
       - name: Run real WFP tests
         if: runner.os == 'Windows'
         env:
@@ -165,10 +171,14 @@ jobs:
         run: |
           Set-NetFirewallProfile -All -Enabled False
           $out = Join-Path $env:RUNNER_TEMP 'real-wfp.txt'
-          go test -race -count=1 -v -run '^TestWFPController_Real(NAT|Traffic)?$' ./internal/policy/ | Tee-Object -FilePath $out
+          go test -race -count=1 -v -run '^TestWFPController_Real(NAT|Traffic|ConnLog)?$' ./internal/policy/ | Tee-Object -FilePath $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWFPController_RealTraffic ')) {
             Write-Error 'TestWFPController_RealTraffic did not pass'
+            exit 1
+          }
+          if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWFPController_RealConnLog ')) {
+            Write-Error 'TestWFPController_RealConnLog did not pass'
             exit 1
           }
 
