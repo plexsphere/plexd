@@ -2,37 +2,24 @@ package kubernetes
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
-	"time"
 )
 
 // plexdHookListPath is the collection path of the PlexdHook resources in one
 // namespace; %s takes the path-escaped namespace name.
 const plexdHookListPath = "/apis/plexd.plexsphere.com/v1alpha1/namespaces/%s/plexdhooks"
 
-// plexdHookTransportTimeout bounds the TLS handshake and the wait for response
-// headers on every request. The client has no overall timeout and a watch runs
-// under a context of minutes, so without this bound a stalled API server would
-// hold an open for all of that time with nothing to report it.
-const plexdHookTransportTimeout = 10 * time.Second
-
 // HookLister reads PlexdHook resources through the Kubernetes API server with
 // the pod's ServiceAccount credentials. ListPlexdHooks is one GET,
 // WatchPlexdHooks is one GET held open as a stream, and neither ever writes.
 type HookLister struct {
-	baseURL   string
-	tokenPath string
-	client    *http.Client
+	apiServer
 }
 
 // NewInClusterHookLister builds a HookLister for the API server a pod reaches
@@ -47,39 +34,15 @@ func NewInClusterHookLister(env *KubernetesEnvironment) (*HookLister, error) {
 }
 
 // newHookLister is NewInClusterHookLister with the API server address and the
-// CA bundle path supplied, so a test can point it at a fake API server.
-//
-// A CA bundle that cannot be read or holds no certificate is an error here
-// rather than a fallback to the system roots: the API server's certificate
-// chains to the cluster CA, so that fallback only fails later, as a TLS error
-// that no longer names the cause.
+// CA bundle path supplied, so a test can point it at a fake API server. The
+// connection is newAPIServer's, whose errors it prefixes with the client's
+// name.
 func newHookLister(host, port, caPath string, env *KubernetesEnvironment) (*HookLister, error) {
-	if host == "" || port == "" {
-		return nil, errors.New("kubernetes: hook lister: KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must both be set")
-	}
-	if env == nil || env.ServiceAccountToken == "" {
-		return nil, errors.New("kubernetes: hook lister: no service account token path")
-	}
-	caPEM, err := os.ReadFile(caPath)
+	srv, err := newAPIServer(host, port, caPath, env)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes: hook lister: read cluster CA: %w", err)
+		return nil, fmt.Errorf("kubernetes: hook lister: %w", err)
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("kubernetes: hook lister: no certificate in cluster CA bundle %s", caPath)
-	}
-
-	return &HookLister{
-		baseURL:   "https://" + net.JoinHostPort(host, port),
-		tokenPath: env.ServiceAccountToken,
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool},
-				TLSHandshakeTimeout:   plexdHookTransportTimeout,
-				ResponseHeaderTimeout: plexdHookTransportTimeout,
-			},
-		},
-	}, nil
+	return &HookLister{apiServer: *srv}, nil
 }
 
 // ListPlexdHooks returns the PlexdHook resources in namespace, or an empty
