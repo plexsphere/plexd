@@ -10,6 +10,9 @@
 #   - Periodic loop verification (heartbeat/metrics/logs/audit counters >= 2)
 #   - Pod restart resilience (delete pod, verify re-registration)
 #   - Action execution via the state pull's executions block (ack/started/terminal callbacks)
+#   - PlexdHook dispatch: a dispatched PlexdHook runs as a Job pinned to the node
+#     (success with a parameter override, a non-zero exit, a run resumed after
+#     a pod restart, a cancel), and plexd's Job grants end at its namespace
 #   - Heartbeat-triggered reconcile via RotateKeys flag
 #   - Deeper body validation (metrics, capabilities fields)
 #   - Shipped liveness/readiness probes stay active; a final phase asserts no
@@ -27,6 +30,10 @@ MOCKAPI_MANIFEST="${MANIFEST_DIR}/mock-api-manifests.yaml"
 DAEMONSET_DIR="${REPO_ROOT}/deploy/kubernetes"
 MOCKAPI_DOCKERFILE="${REPO_ROOT}/test/e2e/mockapi/Dockerfile"
 PLEXD_DOCKERFILE="${REPO_ROOT}/deploy/docker/Dockerfile"
+HOOK_DOCKERFILE="${SCRIPT_DIR}/Dockerfile.hook"
+# The kind node's container, for the step that aliases the hook image in its
+# containerd.
+KIND_NODE="${CLUSTER_NAME}-control-plane"
 PF_PID=""
 TEST_FAILED=1
 
@@ -87,6 +94,10 @@ print_diagnostics() {
     echo "--- Diagnostics ---"
     echo "==> Pod status:"
     kubectl -n "${NAMESPACE}" get pods -o wide 2>/dev/null || true
+    echo "==> PlexdHook Jobs and their pods:"
+    kubectl -n "${NAMESPACE}" get jobs,pods -o wide 2>/dev/null || true
+    echo "==> PlexdHook Job descriptions:"
+    kubectl -n "${NAMESPACE}" describe jobs 2>/dev/null || true
     echo "==> DaemonSet description:"
     kubectl -n "${NAMESPACE}" describe daemonset/plexd 2>/dev/null || true
     echo "==> plexd logs:"
@@ -171,9 +182,38 @@ docker build -f "${MOCKAPI_DOCKERFILE}" -t mockapi:e2e "${REPO_ROOT}"
 echo "=== Building plexd image ==="
 docker build -f "${PLEXD_DOCKERFILE}" -t plexd:e2e "${REPO_ROOT}"
 
+echo "=== Building PlexdHook image ==="
+docker build -f "${HOOK_DOCKERFILE}" -t plexd-hook:e2e "${SCRIPT_DIR}"
+
 echo "=== Loading images into kind ==="
 kind load docker-image mockapi:e2e --name "${CLUSTER_NAME}"
 kind load docker-image plexd:e2e --name "${CLUSTER_NAME}"
+kind load docker-image plexd-hook:e2e --name "${CLUSTER_NAME}"
+
+# A PlexdHook names its image by digest: plexd reports and runs only a hook
+# pinned that way. The digest is the one the node's containerd holds for the
+# loaded image, and the image gets a digest alias there, because containerd
+# finds a loaded image by its tag only: without the alias the kubelet tries to
+# pull the digest reference from Docker Hub, where it does not exist.
+#
+# DECISION: the digest is the image's target in ctr images ls rather than the
+# repoDigests entry crictl inspecti prints. ctr is on every kind node, and
+# repoDigests can name an import-<date>@ reference instead of the image.
+echo "=== Pinning the PlexdHook image by its digest on the node ==="
+PINNED_HOOK_DIGEST=$(docker exec "${KIND_NODE}" ctr -n k8s.io images ls "name==docker.io/library/plexd-hook:e2e" \
+    | awk 'NR==2 {print $3}' || true)
+if ! [[ "${PINNED_HOOK_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "FAIL: the node's containerd holds no sha256 digest for docker.io/library/plexd-hook:e2e (got '${PINNED_HOOK_DIGEST}')"
+    docker exec "${KIND_NODE}" ctr -n k8s.io images ls 2>&1 || true
+    exit 1
+fi
+if ! docker exec "${KIND_NODE}" ctr -n k8s.io images tag \
+    docker.io/library/plexd-hook:e2e "docker.io/library/plexd-hook@${PINNED_HOOK_DIGEST}"; then
+    echo "FAIL: could not alias docker.io/library/plexd-hook:e2e as docker.io/library/plexd-hook@${PINNED_HOOK_DIGEST} on the node"
+    exit 1
+fi
+HOOK_IMAGE="docker.io/library/plexd-hook@${PINNED_HOOK_DIGEST}"
+echo "  PlexdHook image: ${HOOK_IMAGE}"
 
 # --- Apply manifests ---
 echo "=== Creating namespace '${NAMESPACE}' ==="
@@ -191,9 +231,11 @@ kubectl wait --for=condition=Established crd/plexdhooks.plexd.plexsphere.com --t
 # Two PlexdHooks for the list plexd takes at boot, created before the DaemonSet
 # so the first manifest already sees them. A third follows after Phase 3 while
 # plexd runs, for the watch that keeps the list current. Only the digest-pinned
-# one can be reported; the tag-pinned one must stay out of plexd_hooks. Nothing
-# runs them: plexd up starts no PlexdHook controller.
-PINNED_HOOK_DIGEST="sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+# one can be reported; the tag-pinned one must stay out of plexd_hooks. Creating
+# them runs nothing: plexd runs a PlexdHook only when a dispatch names it, and
+# the PlexdHook dispatch phase after Phase 5 dispatches e2e-pinned. Its script
+# prints what the Job's environment carries. The heredoc expands HOOK_IMAGE, so
+# each of the script's own variables is escaped to reach the YAML as written.
 echo "=== Creating PlexdHook fixtures ==="
 kubectl -n "${NAMESPACE}" apply -f - <<HOOKEOF
 apiVersion: plexd.plexsphere.com/v1alpha1
@@ -203,7 +245,10 @@ metadata:
 spec:
   hookName: e2e-pinned
   jobTemplate:
-    image: busybox@${PINNED_HOOK_DIGEST}
+    image: ${HOOK_IMAGE}
+    command: ["/bin/sh", "-c"]
+    args:
+      - 'echo "target=\$PLEXD_PARAM_TARGET retention=\$PLEXD_PARAM_RETENTION count=\$PLEXD_PARAM_COUNT hook=\$PLEXD_HOOK_NAME exec=\$PLEXD_EXECUTION_ID"'
   parameters:
     - name: retention
       value: 7d
@@ -224,10 +269,11 @@ echo "=== Applying ServiceAccount ==="
 sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/serviceaccount.yaml" \
     | kubectl apply -f -
 
+# The same sed as the ServiceAccount's moves the Role and RoleBinding that run
+# PlexdHook Jobs into the test namespace, and the binding subjects with them.
 echo "=== Applying RBAC ==="
-kubectl apply -f "${DAEMONSET_DIR}/rbac.yaml"
-kubectl patch clusterrolebinding plexd --type=json \
-    -p="[{\"op\":\"replace\",\"path\":\"/subjects/0/namespace\",\"value\":\"${NAMESPACE}\"}]"
+sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/rbac.yaml" \
+    | kubectl apply -f -
 
 echo "=== Creating bootstrap secret ==="
 kubectl -n "${NAMESPACE}" create secret generic plexd-bootstrap \
@@ -605,7 +651,7 @@ metadata:
 spec:
   hookName: e2e-late
   jobTemplate:
-    image: busybox@${PINNED_HOOK_DIGEST}
+    image: ${HOOK_IMAGE}
 HOOKEOF
 wait_for_plexd_hooks "PlexdHook e2e-late reached plexd_hooks beside e2e-pinned" '
     ([.plexd_hooks[]?.name] | sort) == ["e2e-late", "e2e-pinned"]
@@ -854,6 +900,411 @@ else
 fi
 
 echo "=== Phase 5 PASSED: action execution ==="
+
+# ===================================================================
+# PlexdHook dispatch
+# ===================================================================
+# plexd runs a dispatched PlexdHook as one Job per execution, pinned to its own
+# node, and reports the Job's outcome and the hook container's log through the
+# execution callback. A dispatch is an executions entry of type plexd_hook whose
+# action names the PlexdHook, made the way Phase 5 makes its own: the entry is
+# spliced into the live snapshot, posted to configure-state, and followed by a
+# nudge. The numbered steps run in order, and each starts from what the one
+# before it left.
+echo "=== Testing PlexdHook dispatch ==="
+
+# The filter a terminal callback body meets, whatever its outcome.
+TERMINAL_CALLBACK='.status == "succeeded" or .status == "failed" or .status == "cancelled"'
+
+# hook_dispatch_fail prints a FAIL line and the diagnostics and ends the run.
+# Args: <message>. It exits the shell it runs in, so no helper that calls it
+# runs inside a command substitution.
+hook_dispatch_fail() {
+    echo "FAIL: $1"
+    print_diagnostics
+    exit 1
+}
+
+# hook_entries prints a one-entry executions block that dispatches a PlexdHook.
+# Args: <execution-id> <PlexdHook name> <parameters-json> [<cancel_requested_at>].
+# The entry is pending, as the control plane holds a fresh dispatch, and
+# expires_at is far enough out that it is never served as lapsed.
+hook_entries() {
+    local exec_id=$1 hook=$2 params=$3 cancel_at=${4:-}
+    jq -cn --arg id "${exec_id}" --arg hook "${hook}" --argjson params "${params}" --arg cancel "${cancel_at}" '
+        [{
+            execution_id: $id,
+            action: $hook,
+            type: "plexd_hook",
+            parameters: $params,
+            status: "pending",
+            requested_at: "2026-01-01T00:00:00Z",
+            expires_at: "2099-01-01T00:00:00Z"
+        } + (if $cancel == "" then {} else {cancel_requested_at: $cancel} end)]'
+}
+
+# configure_hook_executions replaces the snapshot's executions block and nudges
+# the agent into an immediate pull. Args: <tag> <executions-json-array>. As in
+# Phase 5, configure-state replaces the whole snapshot fixture, so the block is
+# spliced into the live snapshot and every other block travels back verbatim.
+# The tag keeps the nudge envelope's id unique per call.
+configure_hook_executions() {
+    local tag=$1 entries=$2
+    local snapshot spliced status payload
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        hook_dispatch_fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson e "${entries}" '.executions = $e') \
+        || hook_dispatch_fail "[${tag}] could not splice the executions block ${entries} into the live snapshot"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        hook_dispatch_fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+
+    payload=$(jq -cn --arg id "evt-e2e-nudge-${tag}" \
+        '{id: $id, type: "node_state_updated", scope: "node", payload: {node_id: "e2e-k8s-node"}}')
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        hook_dispatch_fail "[${tag}] executions nudge injection returned status ${status}, want 204"
+    fi
+    echo "  ${tag}: executions block configured and the agent nudged"
+}
+
+# read_callback_count sets CB_COUNT to the mock's execution_callback_count. A
+# read that yields no number fails the run, so a baseline is never empty.
+read_callback_count() {
+    CB_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    case "${CB_COUNT}" in
+        '' | *[!0-9]*) hook_dispatch_fail "could not read execution_callback_count (got '${CB_COUNT}')" ;;
+    esac
+}
+
+# wait_for_hook_callback polls every 2 seconds until the mock has accepted a
+# given number of callbacks past the baseline and the last captured body meets
+# a jq filter. Args: <step> <baseline> <accepted> <timeout-seconds> <jq filter>.
+# The mock captures a callback it refuses with 409 too, so the filter says what
+# the agent sent, and the counter, which moves only on acceptance, says it
+# landed. Every other entry the earlier dispatches left is terminal and no
+# longer served, so the last body is this dispatch's. It is left in CB_BODY,
+# and the count in CB_COUNT.
+wait_for_hook_callback() {
+    local step=$1 baseline=$2 accepted=$3 timeout=$4 filter=$5
+    local elapsed=0
+    while :; do
+        CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+        CB_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+        if [ "${CB_COUNT:-0}" -ge $((baseline + accepted)) ] \
+            && printf '%s' "${CB_BODY}" | jq -e "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${step}] execution_callback_count went from ${baseline} to ${CB_COUNT} (>= +${accepted}) and the last body holds ${filter}, after ${elapsed}s"
+            return 0
+        fi
+        if [ "${elapsed}" -ge "${timeout}" ]; then
+            hook_dispatch_fail "[${step}] the last callback did not reach ${filter} within ${timeout}s (execution_callback_count ${CB_COUNT:-0}, want >= $((baseline + accepted)); body: ${CB_BODY})"
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+}
+
+# expect_callback checks CB_BODY, the body wait_for_hook_callback left, against
+# a jq filter. Args: <step> <what> <jq filter>. A failure prints the body and
+# its output decoded.
+expect_callback() {
+    local step=$1 what=$2 filter=$3
+    if printf '%s' "${CB_BODY}" | jq -e "${filter}" >/dev/null 2>&1; then
+        echo "  PASS: [${step}] ${what}"
+        return 0
+    fi
+    hook_dispatch_fail "[${step}] want ${what} (body: ${CB_BODY}; output: $(printf '%s' "${CB_BODY}" | jq -r '(.output.inline // "") | @base64d' 2>/dev/null || true))"
+}
+
+# hook_jobs prints, as a JSON array, the Jobs in the test namespace whose
+# execution-id annotation is the given execution id. A failed read prints
+# nothing, so a caller never takes it for an empty list. Args: <execution-id>.
+hook_jobs() {
+    kubectl -n "${NAMESPACE}" get jobs -o json 2>/dev/null \
+        | jq -c --arg id "$1" '[.items[] | select(.metadata.annotations["plexd.plexsphere.com/execution-id"] == $id)]' 2>/dev/null \
+        || true
+}
+
+# wait_for_hook_job polls for up to 30 seconds until exactly one Job carries
+# the execution id, and sets HOOK_JOB to its name. Args: <step> <execution-id>.
+wait_for_hook_job() {
+    local step=$1 exec_id=$2
+    local elapsed=0 jobs=""
+    while :; do
+        jobs=$(hook_jobs "${exec_id}")
+        if [ "$(printf '%s' "${jobs}" | jq 'length' 2>/dev/null || true)" = "1" ]; then
+            HOOK_JOB=$(printf '%s' "${jobs}" | jq -r '.[0].metadata.name')
+            echo "  PASS: [${step}] Job ${HOOK_JOB} carries execution id ${exec_id}, after ${elapsed}s"
+            return 0
+        fi
+        if [ "${elapsed}" -ge 30 ]; then
+            hook_dispatch_fail "[${step}] not exactly one Job carries execution id ${exec_id} within 30s (got: ${jobs})"
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+}
+
+# expect_can_i asks the API server whether plexd's ServiceAccount may make a
+# request, and compares the first word of the answer with the one wanted. can-i
+# exits non-zero on "no", so only its output is read. Args: <yes|no> <can-i
+# arguments...>.
+expect_can_i() {
+    local want=$1 answer
+    shift
+    answer=$(kubectl auth can-i "$@" --as="system:serviceaccount:${NAMESPACE}:plexd" || true)
+    answer=${answer%%[[:space:]]*}
+    if [ "${answer}" != "${want}" ]; then
+        hook_dispatch_fail "[hook grants] kubectl auth can-i $* answered '${answer}', want ${want}"
+    fi
+    echo "  PASS: [hook grants] can-i $*: ${answer}"
+}
+
+# (1) e2e-pinned has existed since before plexd started, and no dispatch has
+# named it yet, so no Job may exist: plexd runs a PlexdHook only on dispatch. A
+# read that fails is not an empty list.
+if ! JOBS_BEFORE=$(kubectl -n "${NAMESPACE}" get jobs -o name); then
+    hook_dispatch_fail "[hook no job] could not list the Jobs in ${NAMESPACE}"
+fi
+if [ -n "${JOBS_BEFORE}" ]; then
+    hook_dispatch_fail "[hook no job] Jobs exist before any PlexdHook dispatch: ${JOBS_BEFORE}"
+fi
+echo "  PASS: [hook no job] no Job exists before the first dispatch"
+
+# (2) Two more PlexdHooks on the same image: one whose container exits 3, and
+# one that runs long enough for a pod restart and a cancel to land mid-run.
+echo "=== Creating PlexdHooks e2e-fail and e2e-slow ==="
+if ! kubectl -n "${NAMESPACE}" apply -f - <<HOOKEOF
+apiVersion: plexd.plexsphere.com/v1alpha1
+kind: PlexdHook
+metadata:
+  name: e2e-fail
+spec:
+  hookName: e2e-fail
+  jobTemplate:
+    image: ${HOOK_IMAGE}
+    command: ["/bin/sh", "-c"]
+    args: ["echo boom; exit 3"]
+---
+apiVersion: plexd.plexsphere.com/v1alpha1
+kind: PlexdHook
+metadata:
+  name: e2e-slow
+spec:
+  hookName: e2e-slow
+  jobTemplate:
+    image: ${HOOK_IMAGE}
+    command: ["/bin/sh", "-c"]
+    args: ["echo slow-started; sleep 25; echo slow-done"]
+HOOKEOF
+then
+    hook_dispatch_fail "[hook fixtures] could not create PlexdHooks e2e-fail and e2e-slow"
+fi
+
+# (3) A run that succeeds. The dispatch overrides the resource's target and adds
+# count, and the hook prints what reached its environment, so the output line
+# proves the override, the default the resource keeps (retention), and the
+# three fixed variables. Three callbacks are ack, started, and the terminal.
+read_callback_count
+CB_BEFORE_HOOK=${CB_COUNT}
+configure_hook_executions "exec-e2e-k8s-hook-ok" \
+    "$(hook_entries "exec-e2e-k8s-hook-ok" "e2e-pinned" '{"target":"/srv/override","count":3}')"
+wait_for_hook_callback "hook ok" "${CB_BEFORE_HOOK}" 3 60 "${TERMINAL_CALLBACK}"
+expect_callback "hook ok" "status succeeded" '.status == "succeeded"'
+expect_callback "hook ok" "exit_code 0" '.exit_code == 0'
+expect_callback "hook ok" "no error" '(.error // "") == ""'
+expect_callback "hook ok" "the output line target=/srv/override retention=7d count=3 hook=e2e-pinned exec=exec-e2e-k8s-hook-ok" \
+    '(.output.inline // "") | @base64d | split("\n") | any(. == "target=/srv/override retention=7d count=3 hook=e2e-pinned exec=exec-e2e-k8s-hook-ok")'
+
+# The run's Job: one per execution, traceable to it and to its PlexdHook, owned
+# by the PlexdHook, pinned to the kind node by name, without a ServiceAccount
+# token, and with the backstop deadline 30 seconds past the 600-second
+# max_action_timeout that bounds a dispatch expiring in 2099.
+K8S_NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [ -z "${K8S_NODE_NAME}" ]; then
+    hook_dispatch_fail "[hook ok job] could not read the kind node's name"
+fi
+HOOK_OK_JOBS=$(hook_jobs "exec-e2e-k8s-hook-ok")
+if [ "$(printf '%s' "${HOOK_OK_JOBS}" | jq 'length' 2>/dev/null || true)" != "1" ]; then
+    hook_dispatch_fail "[hook ok job] want exactly one Job with execution id exec-e2e-k8s-hook-ok (got: ${HOOK_OK_JOBS})"
+fi
+HOOK_JOB_JSON=$(printf '%s' "${HOOK_OK_JOBS}" | jq -c '.[0]')
+echo "  PASS: [hook ok job] exactly one Job, $(printf '%s' "${HOOK_JOB_JSON}" | jq -r '.metadata.name'), carries execution id exec-e2e-k8s-hook-ok"
+
+# expect_hook_job checks HOOK_JOB_JSON against a jq filter, with $node bound to
+# the kind node's name. Args: <what> <jq filter>.
+expect_hook_job() {
+    local what=$1 filter=$2
+    if printf '%s' "${HOOK_JOB_JSON}" | jq -e --arg node "${K8S_NODE_NAME}" "${filter}" >/dev/null 2>&1; then
+        echo "  PASS: [hook ok job] ${what}"
+        return 0
+    fi
+    hook_dispatch_fail "[hook ok job] want ${what} (job: $(printf '%s' "${HOOK_JOB_JSON}" | jq -c '{annotations: .metadata.annotations, ownerReferences: .metadata.ownerReferences, spec: .spec}' 2>/dev/null || true))"
+}
+expect_hook_job "annotation execution-id exec-e2e-k8s-hook-ok" \
+    '.metadata.annotations["plexd.plexsphere.com/execution-id"] == "exec-e2e-k8s-hook-ok"'
+expect_hook_job "a non-empty node-id annotation" \
+    '(.metadata.annotations["plexd.plexsphere.com/node-id"] // "") != ""'
+expect_hook_job "annotation hook e2e-pinned" \
+    '.metadata.annotations["plexd.plexsphere.com/hook"] == "e2e-pinned"'
+expect_hook_job "an owner reference to PlexdHook e2e-pinned" \
+    '.metadata.ownerReferences[0].kind == "PlexdHook" and .metadata.ownerReferences[0].name == "e2e-pinned"'
+expect_hook_job "a required node affinity on metadata.name ${K8S_NODE_NAME}" \
+    '.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0]
+        | .key == "metadata.name" and .values == [$node]'
+expect_hook_job "automountServiceAccountToken false" \
+    '.spec.template.spec.automountServiceAccountToken == false'
+expect_hook_job "activeDeadlineSeconds 630" \
+    '.spec.activeDeadlineSeconds == 630'
+
+# (4) A run whose container exits 3 fails with that exit code and no error, as
+# a script hook that exits non-zero does, and carries what it printed.
+read_callback_count
+CB_BEFORE_HOOK=${CB_COUNT}
+configure_hook_executions "exec-e2e-k8s-hook-fail" \
+    "$(hook_entries "exec-e2e-k8s-hook-fail" "e2e-fail" 'null')"
+wait_for_hook_callback "hook fail" "${CB_BEFORE_HOOK}" 3 60 "${TERMINAL_CALLBACK}"
+expect_callback "hook fail" "status failed" '.status == "failed"'
+expect_callback "hook fail" "exit_code 3" '.exit_code == 3'
+expect_callback "hook fail" "no error" '(.error // "") == ""'
+expect_callback "hook fail" "boom in the output" '(.output.inline // "") | @base64d | contains("boom")'
+
+# (5) A run outlives the agent that started it. Once the entry is started and
+# its Job exists, the plexd pod is deleted: the agent leaves the Job running and
+# sends nothing, and its successor finds the started entry in its pull, follows
+# the same Job to its end, and reports the real outcome. Waiting for the
+# Job keeps the delete from landing between the started callback and the Job's
+# creation, which would leave the successor no Job to follow. Three callbacks in
+# all prove the restart added none.
+read_callback_count
+CB_BEFORE_HOOK=${CB_COUNT}
+configure_hook_executions "exec-e2e-k8s-hook-resume" \
+    "$(hook_entries "exec-e2e-k8s-hook-resume" "e2e-slow" 'null')"
+wait_for_hook_callback "hook resume" "${CB_BEFORE_HOOK}" 2 60 '.status == "started"'
+wait_for_hook_job "hook resume" "exec-e2e-k8s-hook-resume"
+
+OLD_PLEXD_POD=$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=plexd -o json 2>/dev/null \
+    | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | if length == 1 then .[0] else empty end' 2>/dev/null \
+    || true)
+if [ -z "${OLD_PLEXD_POD}" ]; then
+    hook_dispatch_fail "[hook resume] want exactly one plexd pod that is not being deleted"
+fi
+echo "  Deleting plexd pod ${OLD_PLEXD_POD} while Job ${HOOK_JOB} runs"
+if ! kubectl -n "${NAMESPACE}" delete pod "${OLD_PLEXD_POD}" --grace-period=10; then
+    hook_dispatch_fail "[hook resume] could not delete plexd pod ${OLD_PLEXD_POD}"
+fi
+
+RESTART_ELAPSED=0
+while :; do
+    NEW_PLEXD_POD=$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=plexd -o json 2>/dev/null \
+        | jq -r --arg old "${OLD_PLEXD_POD}" '
+            [.items[]
+                | select(.metadata.name != $old and .metadata.deletionTimestamp == null)
+                | select(.status.phase == "Running")
+                | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+                | .metadata.name]
+            | .[0] // empty' 2>/dev/null \
+        || true)
+    if [ -n "${NEW_PLEXD_POD}" ]; then
+        echo "  PASS: [hook resume] new plexd pod ${NEW_PLEXD_POD} is Running and Ready, after ${RESTART_ELAPSED}s"
+        break
+    fi
+    if [ "${RESTART_ELAPSED}" -ge 90 ]; then
+        hook_dispatch_fail "[hook resume] no new plexd pod became Running and Ready within 90s"
+    fi
+    sleep 3
+    RESTART_ELAPSED=$((RESTART_ELAPSED + 3))
+done
+
+wait_for_hook_callback "hook resume" "${CB_BEFORE_HOOK}" 3 90 "${TERMINAL_CALLBACK}"
+expect_callback "hook resume" "status succeeded" '.status == "succeeded"'
+expect_callback "hook resume" "slow-done in the output" '(.output.inline // "") | @base64d | contains("slow-done")'
+read_callback_count
+if [ "${CB_COUNT}" -ne $((CB_BEFORE_HOOK + 3)) ]; then
+    hook_dispatch_fail "[hook resume] execution_callback_count went from ${CB_BEFORE_HOOK} to ${CB_COUNT}, want exactly +3 (ack, started, terminal)"
+fi
+echo "  PASS: [hook resume] exactly three callbacks for the dispatch across the restart"
+
+# (6) A cancel request stops a running hook. The cancel waits until the hook
+# printed its first line, so the cancelled report has output to carry and the
+# request cannot land before the container ran. The same entry comes back with
+# cancel_requested_at, under a new tag so the nudge's envelope id stays unique.
+# The mock tracks it at started, so it is served that way with the field, and
+# plexd reads the log, deletes the Job, and reports cancelled.
+read_callback_count
+CB_BEFORE_HOOK=${CB_COUNT}
+configure_hook_executions "exec-e2e-k8s-hook-cancel" \
+    "$(hook_entries "exec-e2e-k8s-hook-cancel" "e2e-slow" 'null')"
+wait_for_hook_callback "hook cancel" "${CB_BEFORE_HOOK}" 2 60 '.status == "started"'
+wait_for_hook_job "hook cancel" "exec-e2e-k8s-hook-cancel"
+
+CANCEL_LOG_ELAPSED=0
+while :; do
+    CANCEL_HOOK_LOG=$(kubectl -n "${NAMESPACE}" logs "job/${HOOK_JOB}" -c hook 2>&1 || true)
+    case "${CANCEL_HOOK_LOG}" in
+        *slow-started*)
+            echo "  PASS: [hook cancel] Job ${HOOK_JOB} printed slow-started, after ${CANCEL_LOG_ELAPSED}s"
+            break
+            ;;
+    esac
+    if [ "${CANCEL_LOG_ELAPSED}" -ge 30 ]; then
+        hook_dispatch_fail "[hook cancel] Job ${HOOK_JOB} did not print slow-started within 30s (last read: ${CANCEL_HOOK_LOG})"
+    fi
+    sleep 2
+    CANCEL_LOG_ELAPSED=$((CANCEL_LOG_ELAPSED + 2))
+done
+
+configure_hook_executions "exec-e2e-k8s-hook-cancel-request" \
+    "$(hook_entries "exec-e2e-k8s-hook-cancel" "e2e-slow" 'null' "2026-01-01T00:00:01Z")"
+wait_for_hook_callback "hook cancel" "${CB_BEFORE_HOOK}" 3 60 "${TERMINAL_CALLBACK}"
+expect_callback "hook cancel" "status cancelled" '.status == "cancelled"'
+expect_callback "hook cancel" "slow-started in the output" '(.output.inline // "") | @base64d | contains("slow-started")'
+expect_callback "hook cancel" "no error" '(.error // "") == ""'
+
+CANCEL_GONE_ELAPSED=0
+while :; do
+    CANCEL_JOBS=$(hook_jobs "exec-e2e-k8s-hook-cancel")
+    if [ "${CANCEL_JOBS}" = "[]" ]; then
+        echo "  PASS: [hook cancel] no Job carries execution id exec-e2e-k8s-hook-cancel, after ${CANCEL_GONE_ELAPSED}s"
+        break
+    fi
+    if [ "${CANCEL_GONE_ELAPSED}" -ge 30 ]; then
+        hook_dispatch_fail "[hook cancel] the cancelled run's Job was not deleted within 30s (got: ${CANCEL_JOBS})"
+    fi
+    sleep 2
+    CANCEL_GONE_ELAPSED=$((CANCEL_GONE_ELAPSED + 2))
+done
+
+# (7) plexd's Job grants end at its namespace. It may create Jobs and read pod
+# logs in its own namespace only, and it writes no PlexdHook status.
+expect_can_i yes create jobs.batch -n "${NAMESPACE}"
+expect_can_i yes get pods --subresource=log -n "${NAMESPACE}"
+expect_can_i no create jobs.batch -n default
+expect_can_i no get pods --subresource=log -n kube-system
+expect_can_i no update plexdhooks.plexd.plexsphere.com --subresource=status -n "${NAMESPACE}"
+
+# (8) Cleanup: e2e-fail and e2e-slow go, and their Jobs with them through the
+# owner reference, so e2e-pinned is alone in plexd_hooks again for the
+# capability checks of the later phases.
+echo "=== Deleting PlexdHooks e2e-fail and e2e-slow ==="
+if ! kubectl -n "${NAMESPACE}" delete plexdhook e2e-fail e2e-slow; then
+    hook_dispatch_fail "[hook cleanup] could not delete PlexdHooks e2e-fail and e2e-slow"
+fi
+wait_for_plexd_hooks "PlexdHooks e2e-fail and e2e-slow left plexd_hooks and e2e-pinned remained" '
+    [.plexd_hooks[]?.name] == ["e2e-pinned"]'
+
+echo "=== PlexdHook dispatch PASSED ==="
 
 # ===================================================================
 # Phase 6: SSE event injection triggers reconciliation
@@ -1112,9 +1563,10 @@ echo "=== Phase 9 PASSED: local endpoint delivery ==="
 # ===================================================================
 echo "=== Checking probe health ==="
 
-# Phase 4 deleted the original pod, so the DaemonSet replaced it with a NEW
-# pod. A restartCount > 0 on the current pod therefore means the kubelet
-# restarted the container in place — i.e. a liveness probe failed.
+# Phase 4 and the PlexdHook dispatch phase each deleted the plexd pod, so the
+# DaemonSet replaced it with a NEW pod twice. A restartCount > 0 on the current
+# pod therefore means the kubelet restarted the container in place — i.e. a
+# liveness probe failed.
 assert_probe_health
 
 echo "=== Phase 10 PASSED: probe health ==="

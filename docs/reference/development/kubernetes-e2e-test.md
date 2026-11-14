@@ -32,6 +32,7 @@ Validates that plexd deployed as a Kubernetes DaemonSet successfully registers, 
 |-----------|-------|--------|---------|
 | `mock-api` | `mockapi:e2e` | `test/e2e/mockapi/Dockerfile` | Fixture-based mock Central API, tracks call counters |
 | `plexd` | `plexd:e2e` | `deploy/docker/Dockerfile` | Agent under test, deployed as DaemonSet |
+| PlexdHook Jobs | `plexd-hook:e2e` | `test/e2e/kubernetes/Dockerfile.hook` | Image the PlexdHook fixtures name; plexd runs it as a Job on the node when a dispatch names the hook |
 
 ## Test Phases
 
@@ -45,7 +46,11 @@ Deletes any pre-existing cluster with the same name, then creates a new kind clu
 
 ### 3. Image build and load
 
-Builds both Docker images from the repository root, then loads them into the kind cluster node with `kind load docker-image`. Both use `imagePullPolicy: Never` to avoid registry pulls.
+Builds the mock-api and plexd images from the repository root and the PlexdHook image from `test/e2e/kubernetes/Dockerfile.hook`, then loads all three into the kind cluster node with `kind load docker-image`. The mock-api and plexd pods use `imagePullPolicy: Never` to avoid registry pulls.
+
+The PlexdHook image is `busybox:1.37.0-musl` plus one `LABEL`. It is built rather than pulled because `kind load docker-image` refuses a pulled multi-platform image on a docker host with the containerd image store, and accepts a locally built single-platform one. The `LABEL` makes the build produce an image of its own instead of the base image as pulled.
+
+A PlexdHook must name its image by a `sha256` digest, and the node's containerd finds a loaded image by its tag only. The script therefore reads the digest the node holds for `docker.io/library/plexd-hook:e2e`, the third column of `ctr -n k8s.io images ls`, and fails unless it is `sha256:` followed by 64 hex characters. It then adds the digest alias with `ctr -n k8s.io images tag docker.io/library/plexd-hook:e2e docker.io/library/plexd-hook@<digest>`; without it the kubelet tries to pull the digest reference. The PlexdHook fixtures name the image as `docker.io/library/plexd-hook@<digest>`, and the capability checks compare `image_digest` with the same digest.
 
 ### 4. Manifest application
 
@@ -56,9 +61,9 @@ Manifests are applied in dependency order:
 | 1 | Namespace `plexd-e2e` | `kubectl create namespace` | Test-specific namespace |
 | 2 | PlexdNodeState CRD | `deploy/kubernetes/crds/plexdnodestate-crd.yaml` | Cluster-scoped |
 | 3 | PlexdHook CRD | `deploy/kubernetes/crds/plexdhook-crd.yaml` | Cluster-scoped; the script waits for `Established` |
-| 4 | PlexdHook fixtures | Inline heredoc | `e2e-pinned` (digest-pinned image, two parameters) and `e2e-tagged` (tag-pinned image) for the boot-time discovery; nothing runs them |
+| 4 | PlexdHook fixtures | Inline heredoc | `e2e-pinned` (the loaded hook image by digest, two parameters, a script that prints what reaches its environment) and `e2e-tagged` (tag-pinned image) for the boot-time discovery; creating them runs nothing, and the [PlexdHook dispatch](#_10-plexdhook-dispatch) phase dispatches `e2e-pinned` |
 | 5 | ServiceAccount | `deploy/kubernetes/serviceaccount.yaml` | Namespace patched via sed |
-| 6 | RBAC | `deploy/kubernetes/rbac.yaml` | ClusterRoleBinding patched to test namespace |
+| 6 | RBAC | `deploy/kubernetes/rbac.yaml` | Namespace patched via the same sed, which moves the `plexd-hook-runner` Role and the subjects of both bindings into the test namespace |
 | 7 | Bootstrap Secret | `kubectl create secret generic` | Token: `e2e-test-token` |
 | 8 | ConfigMap | `kubectl create configmap` | Inline config pointing to mock-api |
 | 9 | mock-api Deployment + Service | `test/e2e/kubernetes/mock-api-manifests.yaml` | ClusterIP on ports 8080 (HTTP) and 8443 (TLS) |
@@ -102,11 +107,26 @@ Deletes the plexd pod and waits for the DaemonSet controller to schedule a new p
 
 Note: `registration_count` does not increase because the identity persists via the `hostPath` volume at `/var/lib/plexd`. This is correct production behavior — the agent reuses its existing registration.
 
-### 10. Local endpoint delivery
+### 10. PlexdHook dispatch
+
+Runs after the script's action execution phase and checks how plexd runs a [dispatched PlexdHook](../actions/plexdhook-crd.md): as one Job per execution in plexd's namespace, pinned to its node, with the Job's outcome and the hook container's log reported through the execution callback. Each dispatch is made the way the action execution phase makes its own. The script reads the live snapshot from the state endpoint, sets `.executions` to one `pending` entry of `type: plexd_hook` whose `action` names the PlexdHook, posts the snapshot to `/test/configure-state`, and injects a `node_state_updated` event so plexd pulls at once. It then polls `execution_callback_count` and reads the last body from `/test/last-request/execution_callback`. The steps run in order:
+
+1. `kubectl get jobs` finds no Job in the namespace, although `e2e-pinned` has existed since before plexd started.
+2. The script creates `e2e-fail` (`echo boom; exit 3`) and `e2e-slow` (`echo slow-started; sleep 25; echo slow-done`) on the hook image.
+3. `exec-e2e-k8s-hook-ok` dispatches `e2e-pinned` with `{"target":"/srv/override","count":3}`. Within 60 seconds it ends `succeeded` with `exit_code` 0 and the output line `target=/srv/override retention=7d count=3 hook=e2e-pinned exec=exec-e2e-k8s-hook-ok`: the dispatch overrides the resource's `target`, and the resource's `retention` stays. Exactly one Job carries the execution id in its `plexd.plexsphere.com/execution-id` annotation. It has a non-empty `plexd.plexsphere.com/node-id` annotation, `plexd.plexsphere.com/hook: e2e-pinned`, an owner reference to the PlexdHook `e2e-pinned`, a required node affinity on `metadata.name` naming the kind node, `automountServiceAccountToken: false`, and `activeDeadlineSeconds: 630`, which is the default `max_action_timeout` of 600 seconds plus 30.
+4. `exec-e2e-k8s-hook-fail` dispatches `e2e-fail` and ends `failed` with `exit_code` 3, no `error`, and `boom` in the output.
+5. `exec-e2e-k8s-hook-resume` dispatches `e2e-slow`. Once the callback count shows `started` and the Job exists, the script deletes the plexd pod and waits up to 90 seconds for its successor to be Running and Ready. The old agent leaves the Job running, and the new one follows it to its end: within another 90 seconds the dispatch ends `succeeded` with `slow-done` in its output, after exactly three callbacks in all.
+6. `exec-e2e-k8s-hook-cancel` dispatches `e2e-slow`. Once it is `started` and `kubectl logs job/<name> -c hook` shows `slow-started`, the script posts the same entry again with `cancel_requested_at`. The dispatch ends `cancelled` with `slow-started` in its output and no `error`, and within 30 seconds no Job carries its execution id.
+7. `kubectl auth can-i --as=system:serviceaccount:plexd-e2e:plexd` answers yes to `create jobs.batch` and `get pods --subresource=log` in `plexd-e2e`, and no to `create jobs.batch -n default`, `get pods --subresource=log -n kube-system`, and `update plexdhooks.plexd.plexsphere.com --subresource=status`.
+8. The script deletes `e2e-fail` and `e2e-slow` and waits up to 30 seconds until `plexd_hooks` lists `e2e-pinned` alone again, so the capability checks of the later phases hold.
+
+Every failure prints a `FAIL` line and the diagnostics and ends the run.
+
+### 11. Local endpoint delivery
 
 Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). Validates that the local endpoint credential chain works in Kubernetes: NSK from registration → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to `mock-api.plexd-e2e:8443`.
 
-### 11. Cleanup
+### 12. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It kills the port-forward process, prints diagnostics, and deletes the kind cluster.
 
@@ -129,7 +149,7 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
 }
 ```
 
-The test passes when all seven platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
+The test passes when all seven platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 11):
 
 | Counter | Meaning |
 |---------|---------|
@@ -231,6 +251,16 @@ Common causes:
 - ConfigMap not mounted — check that the plexd pod has `/etc/plexd/config.yaml` with the correct `api.base_url`.
 - Missing bootstrap token — the `PLEXD_BOOTSTRAP_TOKEN` env var must resolve from the `plexd-bootstrap` Secret.
 
+**PlexdHook dispatch fails:**
+
+```bash
+kubectl -n plexd-e2e get jobs,pods -o wide
+kubectl -n plexd-e2e describe jobs
+kubectl -n plexd-e2e logs job/<name> -c hook
+```
+
+A hook pod waiting in `ErrImagePull` or `ImagePullBackOff` means the kubelet tried to pull the hook image: the digest alias described under [Image build and load](#_3-image-build-and-load) is missing on the node.
+
 **Port-forward not reachable:**
 
 The script waits 2 seconds after starting the port-forward. If `curl` fails, check that mock-api is healthy:
@@ -254,6 +284,8 @@ On any failure, the `print_diagnostics` function outputs:
 | Command | Purpose |
 |---------|---------|
 | `kubectl get pods -n plexd-e2e -o wide` | Pod status and node assignment |
+| `kubectl get jobs,pods -n plexd-e2e -o wide` | PlexdHook Jobs beside the pods they run |
+| `kubectl describe jobs -n plexd-e2e` | PlexdHook Job conditions and events |
 | `kubectl describe daemonset/plexd -n plexd-e2e` | Scheduling events and conditions |
 | `kubectl logs -l app.kubernetes.io/name=plexd --tail=50` | Recent plexd agent logs |
 | `kubectl logs -l app.kubernetes.io/name=mock-api --tail=50` | Recent mock-api server logs |
@@ -264,6 +296,7 @@ On any failure, the `print_diagnostics` function outputs:
 |------|---------|
 | `test/e2e/kubernetes/test.sh` | Orchestration script (build, deploy, assert, cleanup) |
 | `test/e2e/kubernetes/mock-api-manifests.yaml` | mock-api Deployment + ClusterIP Service |
+| `test/e2e/kubernetes/Dockerfile.hook` | PlexdHook image (`busybox:1.37.0-musl` plus a `LABEL`), built and loaded so the fixtures can name it by digest |
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
 | `test/e2e/mockapi/mockapi.go` | Mock API server with `/test/assertions` endpoint |
 | `deploy/docker/Dockerfile` | plexd production image |
