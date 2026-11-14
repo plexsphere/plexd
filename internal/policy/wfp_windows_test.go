@@ -214,6 +214,10 @@ func TestAddrMatch(t *testing.T) {
 //
 // AddRule refuses a filter at a layer wfpLayerFields does not list, or with a
 // condition on a field that layer does not have, as the real engine does.
+//
+// AddRule gives every filter a runtime id, as the engine does, and FilterIDs
+// reports it. zeroIDName makes FilterIDs report 0 for the filter of that
+// name, and filterIDsErr makes it fail.
 type fakeEngine struct {
 	sublayers []*wf.Sublayer
 	rules     map[wf.RuleID]*wf.Rule
@@ -233,6 +237,12 @@ type fakeEngine struct {
 	addRuleCalls   int
 	deleteErr      error
 	closeErr       error
+
+	filterIDs      map[wf.RuleID]uint64
+	nextFilterID   uint64
+	filterIDsErr   error
+	filterIDsCalls int
+	zeroIDName     string
 }
 
 func (e *fakeEngine) AddSublayer(sl *wf.Sublayer) error {
@@ -255,7 +265,38 @@ func (e *fakeEngine) AddRule(r *wf.Rule) error {
 	}
 	e.rules[r.ID] = r
 	e.order = append(e.order, r.ID)
+	if e.filterIDs == nil {
+		e.filterIDs = make(map[wf.RuleID]uint64)
+	}
+	// The ids start well above the counts the tests use, so a test that
+	// confuses an id with an index fails.
+	e.nextFilterID++
+	e.filterIDs[r.ID] = 70000 + e.nextFilterID
 	return nil
+}
+
+// FilterIDs returns the runtime id of every filter the fake holds.
+func (e *fakeEngine) FilterIDs() (map[wf.RuleID]uint64, error) {
+	e.filterIDsCalls++
+	if e.filterIDsErr != nil {
+		return nil, e.filterIDsErr
+	}
+	out := make(map[wf.RuleID]uint64, len(e.rules))
+	for id, r := range e.rules {
+		out[id] = e.filterIDs[id]
+		if r.Name == e.zeroIDName {
+			out[id] = 0
+		}
+	}
+	return out, nil
+}
+
+// filterID returns the runtime id the fake gave the filter it holds under
+// name, and fails when it holds none.
+func (e *fakeEngine) filterID(t *testing.T, name string) uint64 {
+	t.Helper()
+
+	return e.filterIDs[mustFilter(t, e, name).ID]
 }
 
 // DeleteRule keeps the filter when deleteErr is set, so a test sees which IDs
@@ -308,6 +349,12 @@ func newTestWFPController(t *testing.T) (*WFPController, *fakeEngine, *recording
 		return netip.MustParsePrefix("10.0.0.0/16"), nil
 	}
 	ctrl.run = runner.Run
+	// The production session changes an option of the whole host, which a
+	// unit test must never reach. A test of the allow events wires a fake.
+	ctrl.openNetEvents = func() (netEventSession, error) {
+		t.Error("the controller opened a net event session in a test that wired none")
+		return nil, errors.New("no net event session in this test")
+	}
 
 	return ctrl, engine, runner
 }
@@ -1113,7 +1160,7 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctrl, _, _ := newTestWFPController(t)
 
-			all, err := ctrl.buildFilters("plexd-mesh", []FirewallRule{tt.rule}, 1)
+			all, _, err := ctrl.buildFilters("plexd-mesh", []FirewallRule{tt.rule}, 1)
 			if err != nil {
 				t.Fatalf("buildFilters() error = %v, want nil", err)
 			}
@@ -1169,7 +1216,7 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 		{Interface: "plexd0", Protocol: "udp", Action: "deny"},
 		{Interface: "plexd0", Protocol: "udp", Action: "allow"},
 	}
-	filters, err := ctrl.buildFilters("plexd-mesh", rules, 1)
+	filters, _, err := ctrl.buildFilters("plexd-mesh", rules, 1)
 	if err != nil {
 		t.Fatalf("buildFilters() error = %v, want nil", err)
 	}
@@ -1243,7 +1290,7 @@ func TestWFPController_BuildFilters_RelayProbe(t *testing.T) {
 		{Interface: "Ethernet", Action: "deny"},
 		{Interface: "plexd0", Action: "deny"},
 	}
-	filters, err := ctrl.buildFilters("plexd-mesh", rules, 3)
+	filters, _, err := ctrl.buildFilters("plexd-mesh", rules, 3)
 	if err != nil {
 		t.Fatalf("buildFilters() error = %v, want nil", err)
 	}
@@ -1273,7 +1320,7 @@ func TestWFPController_BuildFilters_NoRules(t *testing.T) {
 	for _, rules := range [][]FirewallRule{nil, {}} {
 		ctrl, _, _ := newTestWFPController(t)
 
-		filters, err := ctrl.buildFilters("plexd-mesh", rules, 1)
+		filters, _, err := ctrl.buildFilters("plexd-mesh", rules, 1)
 		if err != nil {
 			t.Errorf("buildFilters(%#v) error = %v, want nil", rules, err)
 		}
@@ -1981,37 +2028,173 @@ func TestWFPController_Real(t *testing.T) {
 	}
 }
 
-// A logged rule is enforced like any other on Windows, and every apply that
-// holds one logs that its connections are not logged.
-func TestWFPController_ApplyRules_LoggedRulesWarn(t *testing.T) {
-	ctrl, engine, _ := newTestWFPController(t)
-	var buf bytes.Buffer
-	ctrl.logger = captureLogger(&buf)
+// taggedRules holds logged rules of each shape buildFilters handles: an IPv4
+// rule with a protocol and a port, an address-only IPv4 rule, which has a
+// forward filter, and a rule without addresses, which is installed in both
+// families with forward filters. An untagged rule and the default deny
+// follow.
+var taggedRules = []FirewallRule{
+	{Interface: "plexd0", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5", Port: 443, Protocol: "tcp", Action: "allow", LogTag: "1/0"},
+	{Interface: "plexd0", SrcIP: "10.0.0.9", DstIP: "10.1.0.0/24", Action: "allow", LogTag: "1/1"},
+	{Interface: "plexd0", Action: "allow", LogTag: "1/2"},
+	{Interface: "plexd0", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.0/24", Port: 53, Protocol: "udp", Action: "allow"},
+	{Interface: "plexd0", Action: "deny"},
+}
 
-	logged := []FirewallRule{
-		{Interface: "plexd0", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.5/32", Port: 443, Protocol: "tcp", Action: "allow", LogTag: "1/0"},
-		{Interface: "plexd0", Action: "deny"},
-	}
-	untagged := withoutLogTags(logged)
+// taggedLogFilters is what buildFilters logs of taggedRules, by filter name:
+// the inbound and the outbound filter of each logged rule in each of its
+// families, and no forward, relay probe or untagged filter.
+var taggedLogFilters = map[string]wfpLogFilter{
+	"plexd plexd-mesh #0 inbound":     {tag: "1/0", dir: ConnIn},
+	"plexd plexd-mesh #0 outbound":    {tag: "1/0", dir: ConnOut},
+	"plexd plexd-mesh #1 inbound":     {tag: "1/1", dir: ConnIn},
+	"plexd plexd-mesh #1 outbound":    {tag: "1/1", dir: ConnOut},
+	"plexd plexd-mesh #2 inbound":     {tag: "1/2", dir: ConnIn},
+	"plexd plexd-mesh #2 outbound":    {tag: "1/2", dir: ConnOut},
+	"plexd plexd-mesh #2 inbound v6":  {tag: "1/2", dir: ConnIn},
+	"plexd plexd-mesh #2 outbound v6": {tag: "1/2", dir: ConnOut},
+}
 
-	if err := ctrl.ApplyRules("plexd-mesh", untagged); err != nil {
-		t.Fatalf("ApplyRules() of untagged rules error = %v", err)
-	}
-	if strings.Contains(buf.String(), connLogUnavailable) {
-		t.Errorf("an untagged apply logged %q", buf.String())
-	}
-	untaggedFilters := len(engine.rules)
+// buildFilters names the inbound filter of each logged rule as ConnIn and its
+// outbound filter as ConnOut, in each family the rule is installed in, and
+// leaves the forward filters, the relay probe permits and every filter of an
+// untagged rule out of the map. A ruleset without a tag yields an empty map
+// and the filters it yields untagged.
+func TestWFPController_BuildFilters_LoggedMap(t *testing.T) {
+	ctrl, _, _ := newTestWFPController(t)
 
-	for range 2 {
-		if err := ctrl.ApplyRules("plexd-mesh", logged); err != nil {
-			t.Fatalf("ApplyRules() of a logged rule error = %v", err)
+	filters, logged, err := ctrl.buildFilters("plexd-mesh", taggedRules, 1)
+	if err != nil {
+		t.Fatalf("buildFilters() error = %v, want nil", err)
+	}
+	checkEngineTakes(t, filters)
+
+	got := make(map[string]wfpLogFilter)
+	forwards := 0
+	for _, f := range filters {
+		if strings.HasPrefix(f.Name, "plexd plexd-mesh #1 forward") {
+			forwards++
+		}
+		if lf, ok := logged[f.ID]; ok {
+			got[f.Name] = lf
 		}
 	}
-	const want = `level=WARN msg="policy connection logging unavailable, logged rules are enforced without it" component=policy chain=plexd-mesh error="policy: wfp: connection logging is not available on Windows"`
-	if n := strings.Count(buf.String(), want); n != 2 {
-		t.Errorf("two logged applies logged %d lines containing %q, want 2:\n%s", n, want, buf.String())
+	if forwards != 1 {
+		t.Fatalf("buildFilters() built %d forward filters for the address-only logged rule, want 1", forwards)
 	}
-	if len(engine.rules) != untaggedFilters {
-		t.Errorf("a logged apply installed %d filters, want %d, the same as without the tag", len(engine.rules), untaggedFilters)
+	if len(got) != len(logged) {
+		t.Errorf("buildFilters() logged %d filters, %d of them among the filters it built", len(logged), len(got))
 	}
+	if !maps.Equal(got, taggedLogFilters) {
+		t.Errorf("logged filters =\n%v\nwant\n%v", got, taggedLogFilters)
+	}
+
+	untagged, none, err := ctrl.buildFilters("plexd-mesh", withoutLogTags(taggedRules), 1)
+	if err != nil {
+		t.Fatalf("buildFilters() of the untagged rules error = %v, want nil", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("buildFilters() of the untagged rules logged %d filters, want none", len(none))
+	}
+	if len(untagged) != len(filters) {
+		t.Errorf("buildFilters() of the untagged rules built %d filters, want %d, the same as with the tags", len(untagged), len(filters))
+	}
+	for i := range untagged {
+		if untagged[i].Name != filters[i].Name {
+			t.Errorf("filter %d is %q untagged, %q tagged, want the same filters", i, untagged[i].Name, filters[i].Name)
+		}
+	}
+}
+
+// After an apply the controller knows each logged filter by the runtime id the
+// engine gave it, the id a net event names. A list the engine refuses, or one
+// that names a logged filter under id 0, fails the logging and not the apply:
+// the filters stay installed and the engine's options are left alone. Without
+// a sink nothing reads the events, so the controller neither lists the
+// filters nor opens a session, and logs no Warn.
+func TestWFPController_ApplyRules_LogFilters(t *testing.T) {
+	t.Run("keyed by runtime id", func(t *testing.T) {
+		f := newWFPLogFixture(t, 1, 0x11)
+		if err := f.ctrl.ApplyRules("plexd-mesh", taggedRules); err != nil {
+			t.Fatalf("ApplyRules() error = %v, want nil", err)
+		}
+		want := make(map[uint64]wfpLogFilter, len(taggedLogFilters))
+		for name, lf := range taggedLogFilters {
+			want[f.engine.filterID(t, name)] = lf
+		}
+		cl := f.ctrl.connLogs["plexd-mesh"]
+		if cl == nil {
+			t.Fatal("the controller holds no logged filters for plexd-mesh")
+		}
+		if !maps.Equal(cl.current, want) {
+			t.Errorf("logged filters by runtime id =\n%v\nwant\n%v", cl.current, want)
+		}
+		if len(cl.previous) != 0 {
+			t.Errorf("previous logged filters = %v after the first apply, want none", cl.previous)
+		}
+		if f.engine.filterIDsCalls != 1 {
+			t.Errorf("FilterIDs calls = %d, want 1", f.engine.filterIDsCalls)
+		}
+	})
+
+	for _, tt := range []struct {
+		name    string
+		arm     func(e *fakeEngine)
+		wantErr string
+	}{
+		{
+			name:    "the list fails",
+			arm:     func(e *fakeEngine) { e.filterIDsErr = errors.New("enumeration refused") },
+			wantErr: "policy: wfp: list filters: enumeration refused",
+		},
+		{
+			name:    "a logged filter has id 0",
+			arm:     func(e *fakeEngine) { e.zeroIDName = "plexd plexd-mesh #0 inbound" },
+			wantErr: "want a distinct runtime id for each of 2 logged filters, got 1",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newWFPLogFixture(t, 1, 0x1)
+			tt.arm(f.engine)
+
+			if err := f.ctrl.ApplyRules("plexd-mesh", loggedRules); err != nil {
+				t.Fatalf("ApplyRules() error = %v, want nil", err)
+			}
+			logs := f.logs.String()
+			if !strings.Contains(logs, `msg="policy connection logging unavailable, logged rules are enforced without it"`) ||
+				!strings.Contains(logs, "chain=plexd-mesh") || !strings.Contains(logs, tt.wantErr) {
+				t.Errorf("logs = %q, want %q with chain and %q", logs, connLogUnavailable, tt.wantErr)
+			}
+			if got := len(f.ctrl.chains["plexd-mesh"]); got == 0 || got != len(f.engine.rules) {
+				t.Errorf("chain plexd-mesh holds %d filters, want the %d installed", got, len(f.engine.rules))
+			}
+			if f.opens != 0 || len(f.events.sets) != 0 {
+				t.Errorf("sessions opened = %d, setOption calls = %+v, want none", f.opens, f.events.sets)
+			}
+		})
+	}
+
+	t.Run("no sink", func(t *testing.T) {
+		ctrl, engine, _ := newTestWFPController(t)
+		var buf bytes.Buffer
+		ctrl.logger = captureLogger(&buf)
+		ctrl.SetStateDir(t.TempDir())
+
+		// The logged rule names no protocol and no port, so the forward path
+		// enforces it whole and buildFilters logs no Warn of its own.
+		rules := []FirewallRule{
+			{Interface: "plexd0", SrcIP: "10.99.0.3/32", DstIP: "10.99.0.1/32", Action: "allow", LogTag: "1/0"},
+			{Interface: "plexd0", Action: "deny"},
+		}
+		if err := ctrl.ApplyRules("plexd-mesh", rules); err != nil {
+			t.Fatalf("ApplyRules() error = %v, want nil", err)
+		}
+		if engine.filterIDsCalls != 0 {
+			t.Errorf("FilterIDs calls = %d, want 0", engine.filterIDsCalls)
+		}
+		if strings.Contains(buf.String(), "level=WARN") {
+			t.Errorf("an apply without a sink logged %q, want no Warn", buf.String())
+		}
+		// newTestWFPController fails the test when openNetEvents is called.
+	})
 }

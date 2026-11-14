@@ -5,9 +5,12 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -17,10 +20,6 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-// errWFPConnLogUnavailable is the error of the connLogUnavailable line the
-// controller logs for every apply that holds a logged rule.
-var errWFPConnLogUnavailable = errors.New("policy: wfp: connection logging is not available on Windows")
-
 // wfpEngine is the part of *wf.Session's API the controller uses. It is a
 // seam: production opens a dynamic WFP session, tests record what would reach
 // the filter engine, which is what makes the translation testable without
@@ -29,6 +28,9 @@ type wfpEngine interface {
 	AddSublayer(*wf.Sublayer) error
 	AddRule(*wf.Rule) error
 	DeleteRule(wf.RuleID) error
+	// FilterIDs returns the runtime id of every filter in the engine by its
+	// key, the id a net event names its filter by; see wfpSession.
+	FilterIDs() (map[wf.RuleID]uint64, error)
 	Close() error
 }
 
@@ -66,46 +68,115 @@ var plexdSublayerID = wf.SublayerID(windows.GUID{
 // Filtering Platform and bridge.NATController through WinNAT. Filters live in
 // a dynamic session, so they vanish with the process; the Wintun adapter
 // vanishes with it too, so nothing arrives that they could have filtered.
+//
+// It implements ConnReporter through the engine's classify-allow net events,
+// see enableAllowEvents.
 type WFPController struct {
 	logger    *slog.Logger
 	meshIface string // configured WireGuard interface name, the NAT source prefix comes from its address
 
 	// Seams: production drives WFP, the IP Helper API and PowerShell; tests
 	// wire fakes.
-	openEngine  func() (wfpEngine, error)
-	lookupIface func(name string) (ifaceIDs, error)
-	meshPrefix  func(name string) (netip.Prefix, error)
-	run         commandRunner
+	openEngine    func() (wfpEngine, error)
+	openNetEvents func() (netEventSession, error)
+	lookupIface   func(name string) (ifaceIDs, error)
+	meshPrefix    func(name string) (netip.Prefix, error)
+	run           commandRunner
 
 	mu     sync.Mutex
 	engine wfpEngine              // nil while no chain exists
 	chains map[string][]wf.RuleID // chain -> filters installed for it
 	epoch  uint32                 // bumped per ApplyRules; the high half of every weight
+
+	// stateDir holds wfpAllowEventsFile. netEvents is open while allow-event
+	// collection is on or a restore is pending, and subscribed tells whether
+	// it delivers events to onAllowEvent. All three are guarded by mu.
+	stateDir   string
+	netEvents  netEventSession
+	subscribed bool
+
+	// logMu guards what onAllowEvent reads, which the engine calls on a
+	// thread of its own while mu may be held. Lock order: mu, then logMu.
+	logMu    sync.RWMutex
+	sink     ConnSink
+	connLogs map[string]*wfpChainLog // chain -> its logged filters by runtime id
+}
+
+// wfpLogFilter is what a logged filter reports a connection as: the tag of the
+// rule it was built from and the direction of its layer.
+type wfpLogFilter struct {
+	tag string
+	dir ConnDir
+}
+
+// wfpChainLog holds a chain's logged filters by runtime filter id: the ones of
+// the last apply and the ones of the apply before it. The engine delivers net
+// events after the connection, so an event that arrives just after an apply
+// can still name a filter of the apply before.
+type wfpChainLog struct {
+	current, previous map[uint64]wfpLogFilter
 }
 
 // NewWFPController returns a controller driving the host's filter engine, the
 // IP Helper API and PowerShell.
 func NewWFPController(logger *slog.Logger, meshIface string) *WFPController {
 	return &WFPController{
-		logger:      logger,
-		meshIface:   meshIface,
-		openEngine:  openWFPSession,
-		lookupIface: lookupWinIface,
-		meshPrefix:  meshPrefixOf,
-		run:         execCommand,
-		chains:      make(map[string][]wf.RuleID),
+		logger:        logger,
+		meshIface:     meshIface,
+		openEngine:    openWFPSession,
+		openNetEvents: openNetEventSession,
+		lookupIface:   lookupWinIface,
+		meshPrefix:    meshPrefixOf,
+		run:           execCommand,
+		chains:        make(map[string][]wf.RuleID),
+		connLogs:      make(map[string]*wfpChainLog),
 	}
+}
+
+// SetStateDir names the directory that holds wfpAllowEventsFile, plexd's
+// data_dir. Without one the controller logs no connection: it never changes
+// the engine's options without a record to restore them from.
+//
+// DECISION: SetStateDir restores from a record it finds, so the restore after
+// a crash happens at the next start also on a node with policy.enabled:
+// false, which applies no ruleset that would restore it. A failed restore is
+// logged; DeleteChain tries again at shutdown.
+func (c *WFPController) SetStateDir(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stateDir = dir
+	if dir == "" {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(dir, wfpAllowEventsFile)); errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	c.restoreAllowEventsOrWarn()
+}
+
+// SetConnSink makes the controller report the connections its logged filters
+// permit to sink. It implements ConnReporter. Without a sink the controller
+// installs logged rules as it installs any other and leaves the engine's
+// options alone.
+func (c *WFPController) SetConnSink(sink ConnSink) {
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+	c.sink = sink
 }
 
 // openWFPSession opens a dynamic session. Everything added through it is
 // removed when the session closes or the process dies, so a crashed plexd
 // leaves no filter behind that an operator would have to hunt down.
 func openWFPSession() (wfpEngine, error) {
-	return wf.New(&wf.Options{
+	s, err := wf.New(&wf.Options{
 		Name:        "plexd",
 		Description: "plexd policy enforcement",
 		Dynamic:     true,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return wfpSession{Session: s}, nil
 }
 
 // lookupWinIface resolves an interface's friendly name, the name the
@@ -397,8 +468,17 @@ func relayProbeFilters(chain string, ids ifaceIDs, epoch uint32, n int) ([]*wf.R
 // traffic to the rules below, at worst the default deny. Both directions
 // fail closed.
 //
+// The map holds the inbound filter, as ConnIn, and the outbound filter, as
+// ConnOut, of every rule with a LogTag, in each family the rule is installed
+// for.
+//
+// DECISION: a forward filter is never in the map, so Windows logs the
+// connections a node accepts and opens, not the ones it forwards (author,
+// 2026-11-12, #179). The forward layers are not ALE layers: a forwarded flow
+// has no first-packet authorization to report.
+//
 // The caller holds c.mu.
-func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch uint32) ([]*wf.Rule, error) {
+func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch uint32) ([]*wf.Rule, map[wf.RuleID]wfpLogFilter, error) {
 	// One interface is named by most rules of a chain, and every lookup is a
 	// syscall.
 	resolved := make(map[string]ifaceIDs)
@@ -410,42 +490,43 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 	widened := 0
 
 	var probes, filters []*wf.Rule
+	logged := make(map[wf.RuleID]wfpLogFilter)
 	for i, rule := range rules {
 		if err := rule.Validate(); err != nil {
-			return nil, fmt.Errorf("rule %d: %w", i, err)
+			return nil, nil, fmt.Errorf("rule %d: %w", i, err)
 		}
 		// A filter without an interface condition would govern every adapter
 		// of the host, so a default deny among the rules would cut the machine
 		// off its own networks.
 		if rule.Interface == "" {
-			return nil, fmt.Errorf("rule %d: interface name is empty", i)
+			return nil, nil, fmt.Errorf("rule %d: interface name is empty", i)
 		}
 		ids, ok := resolved[rule.Interface]
 		if !ok {
 			var err error
 			if ids, err = c.lookupIface(rule.Interface); err != nil {
-				return nil, fmt.Errorf("rule %d: lookup interface %q: %w", i, rule.Interface, err)
+				return nil, nil, fmt.Errorf("rule %d: lookup interface %q: %w", i, rule.Interface, err)
 			}
 			resolved[rule.Interface] = ids
 
 			p, err := relayProbeFilters(chain, ids, epoch, len(rules))
 			if err != nil {
-				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+				return nil, nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
 			}
 			probes = append(probes, p...)
 		}
 
 		fam, err := rule.family()
 		if err != nil {
-			return nil, fmt.Errorf("rule %d: %w", i, err)
+			return nil, nil, fmt.Errorf("rule %d: %w", i, err)
 		}
 		src, srcOK, err := wfpPrefix(rule.SrcIP)
 		if err != nil {
-			return nil, fmt.Errorf("rule %d: %w", i, err)
+			return nil, nil, fmt.Errorf("rule %d: %w", i, err)
 		}
 		dst, dstOK, err := wfpPrefix(rule.DstIP)
 		if err != nil {
-			return nil, fmt.Errorf("rule %d: %w", i, err)
+			return nil, nil, fmt.Errorf("rule %d: %w", i, err)
 		}
 
 		// WFP's block is a drop, what the nftables backend expresses as
@@ -505,7 +586,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 
 			id, err := newRuleID()
 			if err != nil {
-				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+				return nil, nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
 			}
 			filters = append(filters, &wf.Rule{
 				ID:         id,
@@ -516,6 +597,9 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 				Conditions: inbound,
 				Action:     action,
 			})
+			if rule.LogTag != "" {
+				logged[id] = wfpLogFilter{tag: rule.LogTag, dir: ConnIn}
+			}
 
 			// Windows sends a packet only from an address of the interface
 			// it leaves through, so the local interface is the outgoing
@@ -537,7 +621,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 			}
 
 			if id, err = newRuleID(); err != nil {
-				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+				return nil, nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
 			}
 			filters = append(filters, &wf.Rule{
 				ID:         id,
@@ -548,6 +632,9 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 				Conditions: outbound,
 				Action:     action,
 			})
+			if rule.LogTag != "" {
+				logged[id] = wfpLogFilter{tag: rule.LogTag, dir: ConnOut}
+			}
 
 			if !hasForward {
 				continue
@@ -562,7 +649,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 			}
 
 			if id, err = newRuleID(); err != nil {
-				return nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+				return nil, nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
 			}
 			filters = append(filters, &wf.Rule{
 				ID:         id,
@@ -602,7 +689,7 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 		)
 	}
 
-	return append(probes, filters...), nil
+	return append(probes, filters...), logged, nil
 }
 
 // deleteFilters removes the given filters and returns the ones that are still
@@ -630,6 +717,10 @@ func (c *WFPController) deleteFilters(ids []wf.RuleID) ([]wf.RuleID, error) {
 // epoch, so the chain is never unfiltered in between. A chain that was never
 // ensured is created here, as NftablesController.ApplyRules adds its chain
 // itself.
+//
+// Once the filters are in place, it records the chain's logged filters and
+// turns the engine's allow events on while any chain holds one, and back off
+// otherwise, see logFilters.
 func (c *WFPController) ApplyRules(chain string, rules []FirewallRule) error {
 	if chain == "" {
 		return errors.New("policy: wfp: apply rules: chain name is empty")
@@ -642,7 +733,7 @@ func (c *WFPController) ApplyRules(chain string, rules []FirewallRule) error {
 		return err
 	}
 
-	filters, err := c.buildFilters(chain, rules, c.epoch+1)
+	filters, logged, err := c.buildFilters(chain, rules, c.epoch+1)
 	if err != nil {
 		return fmt.Errorf("policy: wfp: apply rules: %w", err)
 	}
@@ -669,21 +760,7 @@ func (c *WFPController) ApplyRules(chain string, rules []FirewallRule) error {
 	c.chains[chain] = append(added, kept...)
 	c.epoch++
 
-	// DECISION: Windows enforces a logged rule like any other and logs none
-	// of its connections (author, 2026-11-12, #179). The filter engine
-	// records a classify-allow net event under plexd's filter for each such
-	// connection, but on windows-latest a FwpmNetEventSubscribe1
-	// subscription delivered none of them, only drop events (measured for
-	// PR #182). Reading them is left to a later change, so every apply that
-	// holds a logged rule says so with the line the other backends log when
-	// they cannot report their connections.
-	if hasLogTags(rules) {
-		c.logger.Warn(connLogUnavailable,
-			"component", "policy",
-			"chain", chain,
-			"error", errWFPConnLogUnavailable,
-		)
-	}
+	c.logFilters(chain, logged)
 
 	c.logger.Debug("wfp rules applied",
 		"component", "policy",
@@ -696,6 +773,131 @@ func (c *WFPController) ApplyRules(chain string, rules []FirewallRule) error {
 		return fmt.Errorf("policy: wfp: apply rules: delete stale filters: %w", delErr)
 	}
 	return nil
+}
+
+// logFilters records the logged filters an apply installed for chain, keyed
+// by the runtime id a net event names its filter by, and then turns the
+// engine's allow events on while any chain holds a logged filter and puts
+// them back otherwise.
+//
+// DECISION: without a sink it records none, so the controller reports
+// nothing, changes no option and logs no Warn, as the Linux backend does.
+//
+// DECISION: logging never blocks enforcement (author, 2026-11-12, #179). A
+// failure here logs connLogUnavailable, or the restore warning, and leaves
+// the error ApplyRules returns alone: the filters are installed and enforce
+// the rules either way. A failed enable restores at once, so the host is not
+// left recording events nobody reads.
+//
+// The caller holds c.mu.
+func (c *WFPController) logFilters(chain string, pending map[wf.RuleID]wfpLogFilter) {
+	c.logMu.RLock()
+	sink := c.sink
+	c.logMu.RUnlock()
+
+	var keyed map[uint64]wfpLogFilter
+	if len(pending) > 0 && sink != nil {
+		var err error
+		if keyed, err = c.keyLogFilters(pending); err != nil {
+			c.logger.Warn(connLogUnavailable,
+				"component", "policy",
+				"chain", chain,
+				"error", err,
+			)
+		}
+	}
+
+	c.logMu.Lock()
+	cl := c.connLogs[chain]
+	if cl == nil {
+		cl = &wfpChainLog{}
+		c.connLogs[chain] = cl
+	}
+	cl.previous, cl.current = cl.current, keyed
+	logging := c.holdsLogFilter()
+	c.logMu.Unlock()
+
+	if !logging {
+		c.restoreAllowEventsOrWarn()
+		return
+	}
+	if err := c.enableAllowEvents(); err != nil {
+		c.logger.Warn(connLogUnavailable,
+			"component", "policy",
+			"chain", chain,
+			"error", err,
+		)
+		c.restoreAllowEventsOrWarn()
+	}
+}
+
+// keyLogFilters reads the runtime id the engine gave each logged filter.
+// Two filters under one id, or a filter the engine does not list or lists
+// under id 0, would name a connection after the wrong rule or none, so it
+// fails rather than keep a partial map.
+//
+// The caller holds c.mu.
+func (c *WFPController) keyLogFilters(pending map[wf.RuleID]wfpLogFilter) (map[uint64]wfpLogFilter, error) {
+	ids, err := c.engine.FilterIDs()
+	if err != nil {
+		return nil, fmt.Errorf("policy: wfp: list filters: %w", err)
+	}
+	keyed := make(map[uint64]wfpLogFilter, len(pending))
+	for key, lf := range pending {
+		if id := ids[key]; id != 0 {
+			keyed[id] = lf
+		}
+	}
+	if len(keyed) != len(pending) {
+		return nil, fmt.Errorf("policy: wfp: list filters: want a distinct runtime id for each of %d logged filters, got %d",
+			len(pending), len(keyed))
+	}
+	return keyed, nil
+}
+
+// holdsLogFilter reports whether any chain holds a logged filter.
+//
+// The caller holds c.logMu.
+func (c *WFPController) holdsLogFilter() bool {
+	for _, cl := range c.connLogs {
+		if len(cl.current) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// logFilterByID looks a runtime filter id up among the logged filters of the
+// last apply of each chain, then of the apply before.
+//
+// The caller holds c.logMu.
+func (c *WFPController) logFilterByID(id uint64) (wfpLogFilter, bool) {
+	for _, cl := range c.connLogs {
+		if lf, ok := cl.current[id]; ok {
+			return lf, true
+		}
+	}
+	for _, cl := range c.connLogs {
+		if lf, ok := cl.previous[id]; ok {
+			return lf, true
+		}
+	}
+	return wfpLogFilter{}, false
+}
+
+// forgetLogFilters drops a deleted chain's logged filters and restores the
+// engine's allow-event options when no chain holds a logged filter any more.
+//
+// The caller holds c.mu.
+func (c *WFPController) forgetLogFilters(chain string) {
+	c.logMu.Lock()
+	delete(c.connLogs, chain)
+	logging := c.holdsLogFilter()
+	c.logMu.Unlock()
+
+	if !logging {
+		c.restoreAllowEventsOrWarn()
+	}
 }
 
 // FlushChain deletes the filters of the named chain but keeps the chain
@@ -719,6 +921,14 @@ func (c *WFPController) FlushChain(chain string) error {
 		return fmt.Errorf("policy: wfp: flush chain %q: %w", chain, err)
 	}
 
+	// The chain holds no logged filter any more. An event the engine still
+	// delivers for one of them finds it among the previous ones.
+	c.logMu.Lock()
+	if cl := c.connLogs[chain]; cl != nil {
+		cl.previous, cl.current = cl.current, nil
+	}
+	c.logMu.Unlock()
+
 	c.logger.Debug("wfp chain flushed",
 		"component", "policy",
 		"chain", chain,
@@ -729,12 +939,18 @@ func (c *WFPController) FlushChain(chain string) error {
 // DeleteChain deletes the filters of the named chain and forgets it. When it
 // was the last one the session is closed, which drops plexd's sublayer with
 // it. Idempotent: deleting a chain that was never ensured returns nil.
+//
+// Once no chain holds a logged filter it restores the engine's allow-event
+// options, also for a chain that was never ensured: a restore that failed at
+// start left wfpAllowEventsFile behind, and a shutdown is its last chance in
+// this run.
 func (c *WFPController) DeleteChain(chain string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	ids, ok := c.chains[chain]
 	if !ok || c.engine == nil {
+		c.forgetLogFilters(chain)
 		c.logger.Debug("wfp chain not found, nothing to delete",
 			"component", "policy",
 			"chain", chain,
@@ -749,6 +965,7 @@ func (c *WFPController) DeleteChain(chain string) error {
 		return fmt.Errorf("policy: wfp: delete chain %q: %w", chain, err)
 	}
 	delete(c.chains, chain)
+	c.forgetLogFilters(chain)
 
 	if len(c.chains) == 0 {
 		// The session is dropped even when the close failed: it is unusable
