@@ -1416,6 +1416,42 @@ func TestRunUp_PolicyPreflightAbortsBeforeRegistration(t *testing.T) {
 	}
 }
 
+// stateDirFirewallController is a failingFirewallController that also takes
+// a state directory, as the Windows controller does, and records the order of
+// the calls it gets.
+type stateDirFirewallController struct {
+	failingFirewallController
+	calls []string
+}
+
+func (f *stateDirFirewallController) SetStateDir(dir string) {
+	f.calls = append(f.calls, "SetStateDir "+dir)
+}
+
+func (f *stateDirFirewallController) Probe() error {
+	f.calls = append(f.calls, "Probe")
+	return f.err
+}
+
+// The Windows controller restores the host's WFP allow-event setting from a
+// record under data_dir at start, so plexd up hands a controller that takes a
+// state directory the configured data_dir before the pre-flight probe. A
+// controller without SetStateDir is started as before, which
+// TestRunUp_PolicyPreflightAbortsBeforeRegistration shows.
+func TestRunUp_HandsFirewallControllerDataDir(t *testing.T) {
+	apiBase, _ := countingControlPlane(t)
+	ctrl := &stateDirFirewallController{failingFirewallController: failingFirewallController{err: errors.New("operation not permitted")}}
+	useFirewallController(t, ctrl)
+	dataDir := writeUpConfig(t, apiBase, "policy:\n  chain_name: plexd-mesh\n")
+
+	if err := runUp(upCmd, nil); err == nil {
+		t.Fatal("runUp() = nil, want the pre-flight failure")
+	}
+	if want := []string{"SetStateDir " + dataDir, "Probe"}; !reflect.DeepEqual(ctrl.calls, want) {
+		t.Errorf("firewall controller calls = %q, want %q", ctrl.calls, want)
+	}
+}
+
 // policy.enabled: false is the opt-out the pre-flight failure points at, so it
 // has to survive the config merge and leave the check a no-op — including on a
 // host whose backend would fail the probe.

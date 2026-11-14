@@ -183,6 +183,14 @@ func runAgent(ctx context.Context) error {
 	// discard it: their rules take policyIface further down, which wgMgr cannot
 	// supply yet — it does not exist this early.
 	fwCtrl := firewallController(logger, cfg.WireGuard.InterfaceName)
+	// The Windows controller records the host's WFP allow-event setting under
+	// data_dir before it changes the setting, and restores it from there once
+	// no logged rule is left, at shutdown, and here, at the next start after a
+	// crash. The other backends keep no such state, so the assertion leaves
+	// them alone.
+	if s, ok := fwCtrl.(interface{ SetStateDir(dir string) }); ok {
+		s.SetStateDir(cfg.DataDir)
+	}
 	enforcer := policy.NewEnforcer(policyEngine, fwCtrl, cfg.Policy, logger)
 	if err := enforcer.Preflight(); err != nil {
 		return fmt.Errorf("plexd up: firewall baseline pre-flight: %s: %w", policyCapabilityHint, err)
