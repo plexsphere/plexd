@@ -5,6 +5,9 @@
 # registration, heartbeat, state, capabilities, metrics, logs, and audit calls.
 #
 # Extended tests:
+#   - Rate-limited registration: the mock refuses the first registration with
+#     429 token_rate_limited, and plexd names the wait on /readyz, logs it,
+#     and registers once Retry-After has passed (phase 1b)
 #   - Periodic loop verification (counters >= 2 after additional wait)
 #   - Handshake report and tunnel_health samples (skipped when WireGuard
 #     did not come up in the container)
@@ -459,8 +462,17 @@ trap cleanup EXIT
 # ===================================================================
 # Phase 1: Build and start
 # ===================================================================
-echo "=== Building and starting services ==="
-dc up --build -d
+# mock-api starts alone, so phase 1b can arm its token rate limit before plexd
+# sends its first registration. Every image is built up front and the second
+# `up` neither rebuilds nor touches mock-api: a rebuild can give the image a new
+# ID (the provenance attestation changes on every build under the containerd
+# image store), and compose recreates a container whose image changed, which
+# would start a fresh, unarmed mock.
+echo "=== Building services ==="
+dc build
+
+echo "=== Starting mock-api ==="
+dc up -d mock-api
 
 echo "=== Waiting for mock-api healthcheck ==="
 HEALTH_TIMEOUT=30
@@ -476,6 +488,26 @@ done
 
 if [ "${HEALTH_ELAPSED}" -ge "${HEALTH_TIMEOUT}" ]; then
     fail "mock-api did not become healthy within ${HEALTH_TIMEOUT}s"
+fi
+
+# Arm the token rate limit: the first registration answers 429
+# token_rate_limited with Retry-After: 15, as the control plane does when the
+# rate limit of the token's BootstrapToken policy refuses a redemption.
+RL_RETRY_AFTER=15
+echo "=== Arming the mock's token rate limit (Retry-After ${RL_RETRY_AFTER}s) ==="
+RL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "{\"rate_limit_next\":1,\"retry_after_seconds\":${RL_RETRY_AFTER}}" \
+    "http://localhost:18080/test/configure-register" 2>/dev/null || true)
+if [ "${RL_STATUS}" != "204" ]; then
+    fail "configure-register returned status ${RL_STATUS}, want 204"
+fi
+
+MOCK_CONTAINER=$(dc ps -q mock-api)
+echo "=== Starting plexd and meshpeer ==="
+dc up -d --no-build --no-deps plexd meshpeer
+if [ "$(dc ps -q mock-api)" != "${MOCK_CONTAINER}" ]; then
+    fail "starting plexd replaced the mock-api container, which drops the armed token rate limit"
 fi
 
 # ===================================================================
@@ -505,6 +537,81 @@ if [ "${EP_TTL_STATUS}" != "204" ]; then
     fail "configure-endpoint returned status ${EP_TTL_STATUS}, want 204"
 fi
 echo "  endpoint TTL set to 40s (stale_after-driven re-report cadence)"
+
+# ===================================================================
+# Phase 1b: registration waits out the token rate limit
+# ===================================================================
+# The armed mock refuses plexd's first registration with 429
+# token_rate_limited. plexd must name the wait on /readyz instead of
+# "registration pending", log it with the time of its next attempt, and
+# register once Retry-After has passed, past nothing like a retry timeout.
+# /readyz answers 503 while it waits, so the probe reads the body without
+# curl -f.
+echo "=== Testing registration on a rate-limited bootstrap token ==="
+READYZ_URL="http://localhost:19101/readyz"
+RL_READYZ_WANT="not ready: registration rate limited"
+RL_READYZ_TIMEOUT=30
+RL_READYZ_ELAPSED=0
+RL_READYZ=""
+while [ "${RL_READYZ_ELAPSED}" -lt "${RL_READYZ_TIMEOUT}" ]; do
+    RL_READYZ=$(curl -s --max-time 2 "${READYZ_URL}" 2>/dev/null || true)
+    if [ "${RL_READYZ}" = "${RL_READYZ_WANT}" ]; then
+        break
+    fi
+    sleep 1
+    RL_READYZ_ELAPSED=$((RL_READYZ_ELAPSED + 1))
+done
+if [ "${RL_READYZ}" != "${RL_READYZ_WANT}" ]; then
+    fail "/readyz did not answer '${RL_READYZ_WANT}' within ${RL_READYZ_TIMEOUT}s (last body: '${RL_READYZ}')"
+fi
+echo "  PASS: /readyz answers '${RL_READYZ_WANT}' while registration waits"
+
+RL_LOG=$(dc logs --no-log-prefix plexd 2>&1 || true)
+RL_WAIT_LINES=$(count_log_lines "${RL_LOG}" "registration rate limited by the bootstrap token policy, waiting" "retry_at=")
+if [ "${RL_WAIT_LINES}" -lt 1 ]; then
+    fail "plexd logged no 'registration rate limited by the bootstrap token policy, waiting' line with retry_at"
+fi
+echo "  PASS: plexd logged the wait with its retry_at"
+
+RL_TIMEOUT=$((RL_RETRY_AFTER * 4))
+RL_ELAPSED=0
+RL_LIMITED=0
+RL_REGISTERED=0
+while [ "${RL_ELAPSED}" -lt "${RL_TIMEOUT}" ]; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        RL_LIMITED=$(get_counter "${RESPONSE}" "registration_rate_limited_count")
+        RL_REGISTERED=$(get_counter "${RESPONSE}" "registration_count")
+        if [ "${RL_LIMITED}" -eq 1 ] && [ "${RL_REGISTERED}" -ge 2 ]; then
+            break
+        fi
+    fi
+    sleep 1
+    RL_ELAPSED=$((RL_ELAPSED + 1))
+done
+if [ "${RL_LIMITED}" -ne 1 ] || [ "${RL_REGISTERED}" -lt 2 ]; then
+    fail "after ${RL_TIMEOUT}s registration_rate_limited_count=${RL_LIMITED} (want 1) and registration_count=${RL_REGISTERED} (want >= 2)"
+fi
+echo "  PASS: one registration was rate limited and plexd registered again (registration_count=${RL_REGISTERED})"
+
+RL_SUCCESS_TIMEOUT=15
+RL_SUCCESS_ELAPSED=0
+while [ "${RL_SUCCESS_ELAPSED}" -lt "${RL_SUCCESS_TIMEOUT}" ]; do
+    RL_LOG=$(dc logs --no-log-prefix plexd 2>&1 || true)
+    if [ "$(count_log_lines "${RL_LOG}" "registration successful")" -ge 1 ]; then
+        break
+    fi
+    sleep 1
+    RL_SUCCESS_ELAPSED=$((RL_SUCCESS_ELAPSED + 1))
+done
+if [ "$(count_log_lines "${RL_LOG}" "registration successful")" -lt 1 ]; then
+    fail "plexd logged no 'registration successful' within ${RL_SUCCESS_TIMEOUT}s of the second registration"
+fi
+if [ "$(count_log_lines "${RL_LOG}" "retry timeout")" -ne 0 ]; then
+    fail "plexd logged a retry timeout while it waited out the token rate limit"
+fi
+echo "  PASS: plexd registered after the wait, with no retry timeout"
+echo "=== Phase 1b PASSED: registration waits out the token rate limit ==="
 
 # ===================================================================
 # Phase 2: Initial assertion polling (all 8 counters >= 1)

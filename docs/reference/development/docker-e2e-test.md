@@ -8,7 +8,7 @@ feature: PXD-0038
 
 Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, converges to desired state, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate three services — `mock-api` (a fixture-based mock of the Central API), `plexd` (the agent under test) and `meshpeer` (a WireGuard peer for the policy phase) — on an isolated bridge network.
 
-The test runs fourteen phases:
+Before the first phase, the script arms the mock's token rate limit and checks that plexd waits it out (script phase `1b`, see [Before Phase 1](#before-phase-1-rate-limited-registration)). The test then runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data, then that the capability manifest follows the hooks directory and each hook's sidecar while the agent runs, that a refused manifest lands short and regains its metadata with no restart, and that a failed PUT is retried (script step `10f`), then that a real hook run stops at its sidecar's timeout with its children killed and is refused for a sandbox level plexd lacks and for a group-writable hook file (script step `10g`), then that a cancel request stops a running hook with its children killed and reports `cancelled` with the output the hook printed (script step `10h`), then that a hook the control plane rolls out is installed, run, and upgraded with no restart, kept by a `null` hooks block, refused when its fetch fails verification or `hooks_dir` holds its name, restored across a restart with no fetch, refused to run once edited on disk and left edited by later pulls, and withdrawn (script step `10i`)
@@ -41,17 +41,31 @@ The test runs fourteen phases:
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
 | `mock-api` | Built from `test/e2e/mockapi/Dockerfile` | 8080 (host: 18080), 8443 (host: 18443), 53 (UDP and TCP, not published) | Returns fixture responses, tracks call counters, TLS local endpoint, DNS stub for phase `12d` |
-| `plexd` | Built from `test/e2e/docker/Dockerfile.plexd` | — | Agent under test, connects to mock-api |
+| `plexd` | Built from `test/e2e/docker/Dockerfile.plexd` | 9100 (node API, host: 19100), 9101 (health listener, `PLEXD_HEALTH_LISTEN=0.0.0.0:9101`, host: 19101) | Agent under test, connects to mock-api |
 | `meshpeer` | Built from `test/e2e/meshpeer/Dockerfile`: `alpine:3.22` with `wireguard-tools`, `iproute2`, `netcat-openbsd` and `openssl` | — | Stands in for fixture peer `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`, mesh IP `10.99.0.3`, over a real WireGuard tunnel to plexd in phase `12e`. Runs `sleep infinity` with `cap_add: NET_ADMIN` |
 
 ### Startup Ordering
 
-1. `mock-api` starts with `command: ["-addr", ":8080", "-dns-addr", ":53"]` and exposes a healthcheck on `GET /v1/health`. `-dns-addr :53` starts its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53 of the container, which phase `12d` forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds.
-2. docker compose waits for `mock-api` to become healthy (2s interval, 10 retries).
-3. `plexd` starts with `depends_on: mock-api (service_healthy)`.
-4. `meshpeer` idles on `sleep infinity`. Nothing configures it before phase `12e`.
+The script starts the services itself rather than in one `docker compose up`, so it can arm the mock before plexd registers:
+
+1. `dc build` builds every image.
+2. `dc up -d mock-api` starts the mock alone. It runs with `command: ["-addr", ":8080", "-dns-addr", ":53"]` and exposes a healthcheck on `GET /v1/health`. `-dns-addr :53` starts its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53 of the container, which phase `12d` forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The script waits for `GET /v1/health` to answer.
+3. The script arms the mock's token rate limit with `POST /test/configure-register` and `{"rate_limit_next":1,"retry_after_seconds":15}`.
+4. `dc up -d --no-build --no-deps plexd meshpeer` starts the rest. It neither rebuilds nor touches mock-api: a rebuild can give the image a new ID, since the provenance attestation changes on every build under the containerd image store, and compose would then recreate the mock without its armed limit. The script fails if the mock-api container changed. `--no-deps` also drops plexd's `depends_on: mock-api (service_healthy)` for this `up`, so what orders plexd after a healthy, armed mock is the script's own health wait (step 2) and the arm (step 3).
+5. `meshpeer` idles on `sleep infinity`. Nothing configures it before phase `12e`.
 
 ## Assertion Logic
+
+### Before Phase 1: Rate-Limited Registration
+
+Script phase `1b`. The armed mock answers plexd's first `POST /v1/register` with `429` `token_rate_limited` and `Retry-After: 15`, as the control plane does when the rate limit of the token's BootstrapToken policy refuses a redemption (see [Rate-limited bootstrap token](../core/registration.md#rate-limited-bootstrap-token)). The phase checks, in order:
+
+1. `GET http://localhost:19101/readyz` answers `not ready: registration rate limited` within 30 seconds. The answer is a `503`, so the probe reads the body without `curl -f`.
+2. The plexd log holds `registration rate limited by the bootstrap token policy, waiting` with a `retry_at` attribute.
+3. Within 60 seconds `registration_rate_limited_count` is `1` and `registration_count` is at least `2`: plexd sent the same registration again once the wait had passed.
+4. The plexd log holds `registration successful` and no `retry timeout`.
+
+The phase adds about 17 seconds to a run, the 15-second hint plus up to 1.5 seconds of spread.
 
 ### Phase 1: Counter Polling
 
@@ -59,7 +73,7 @@ The test script polls `GET http://localhost:18080/test/assertions` every 2 secon
 
 ```json
 {
-  "registration_count": 1,
+  "registration_count": 2,
   "heartbeat_count": 1,
   "state_count": 1,
   "capabilities_count": 1,

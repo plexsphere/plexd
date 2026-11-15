@@ -29,12 +29,16 @@ services:
     cap_add:
       - NET_ADMIN
     command: ["up", "--api", "http://mock-api:8080", "--config", "/etc/plexd/config.yaml"]
+    # 19101 publishes the health listener, so the suite can read /readyz
+    # while registration waits out an armed token rate limit (phase 1b).
     ports:
       - "19100:9100"
+      - "19101:9101"
     environment:
       PLEXD_BOOTSTRAP_TOKEN: psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22
       PLEXD_NODE_API_HTTP_ENABLED: "true"
       PLEXD_NODE_API_HTTP_LISTEN: "0.0.0.0:9100"
+      PLEXD_HEALTH_LISTEN: "0.0.0.0:9101"
     volumes:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
       - ./docker/nodeapi-token:/etc/plexd/nodeapi-token:ro
