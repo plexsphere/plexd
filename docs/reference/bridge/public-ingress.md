@@ -6,79 +6,93 @@ feature: PXD-0014
 
 # Public Ingress
 
-The public ingress feature extends bridge mode (`internal/bridge`) to expose mesh-internal services to public internet traffic through the bridge node. The bridge node accepts TCP connections on configured public ports and proxies them to target mesh peers. TLS can be terminated at the bridge or passed through transparently.
+Public ingress lets a bridge node publish services that run on nodes of its Domain. A client outside the mesh connects to a public TCP port of the bridge, and the bridge forwards the connection over the mesh to a port on the target node. Each published service is a rule of the `bridge.ingress` block of the bridge's state pull, which an operator authors on the bridge Resource in the control plane.
+
+The bridge opens one TCP listener per distinct listen port. A port with a rule that names no `sni_host` forwards every connection without reading it. On a port whose rules name hosts, the bridge reads the server name of each connection's TLS ClientHello and routes by it, so several HTTPS services share port 443.
 
 ## Data Flow
 
 ```
 Public Internet Clients
-(HTTP / HTTPS / TCP)
         |
-        |  TCP connection
+        |  TCP to <bridge>:<listen_port>
         v
-+---------------------------------------------------------------+
-|                        Bridge Node                              |
-|                                                                 |
-|  +-------------------+         +-------------------+           |
-|  |  TCP Listeners    |  proxy  |  Mesh WireGuard   |           |
-|  |  (per ingress     |-------->|  Interface        |           |
-|  |   rule)           |         |  (plexd0)         |           |
-|  |  :8080, :443, ... |         |                   |           |
-|  +-------------------+         +---------+---------+           |
-|         ^                                |                     |
-|         |                                v                     |
-|  +------+------------+            +------------------+           |
-|  | IngressController |            |  Mesh Peers      |           |
-|  | (TCP operations)  |            |  10.42.0.0/16    |           |
-|  +---------+---------+            +------------------+           |
-|            |                                                     |
-|    TLS terminate:                                                |
-|    tls.NewListener                                               |
-|    TLS passthrough:                                              |
-|    raw TCP forward                                               |
-|                                                                 |
-|  Control Plane --SSE--> bridge_config_updated --> reconcile      |
-|                --Rec--> IngressReconcileHandler                   |
-+-----------------------------------------------------------------+
++------------------------------------------------------------------+
+|                          Bridge Node                             |
+|                                                                  |
+|  one listener per listen port                                    |
+|  +-------------------+     plain port: forward without reading   |
+|  | :2222  (plain)    |-------------------------------+           |
+|  +-------------------+                               |           |
+|  +-------------------+     SNI port: peek the        v           |
+|  | :443   (SNI)      |---> ClientHello, match --> dial target    |
+|  +-------------------+     the server name        over plexd0    |
+|           ^                                          |           |
+|           | ingressTable per port, swapped in place  |           |
+|  IngressReconcileHandler --> IngressManager.Apply    |           |
++------------------------------------------------------|-----------+
+                                                       v
+                                         Target node <target_address>:<target_port>
 ```
 
-Traffic from public internet clients arrives on per-rule TCP listeners, is proxied via bidirectional `io.Copy` relay to the target mesh peer address, and reaches mesh-internal services. For TLS terminate mode, the bridge decrypts TLS before forwarding plaintext. For passthrough mode, raw TCP bytes are forwarded without decryption.
+The control plane delivers the block in the state pull and announces a change with a `bridge_config_updated` event, which only triggers a pull (see [SSE event handling](#sse-event-handling)). `IngressReconcileHandler` hands the block to `IngressManager.Apply`, which plans the rules, opens and closes listeners, and swaps each port's routing table.
 
-The bridge's dial to a target mesh peer is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). The policy therefore needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, and the bridge logs `bridge: ingress: dial target failed`.
+The bridge's dial to a target is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). A rule grants no allow of its own: the policy needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, and the bridge logs `bridge: ingress: dial target failed`.
 
-## Config
+## The bridge.ingress Block
 
-Ingress fields extend the existing bridge `Config` struct. Ingress requires bridge mode to be enabled (`Enabled=true`).
+The block is the control plane's `NodeStateBridgeIngress`, and each rule a `NodeStateBridgeIngressRule`. The agent contract's `## Public ingress` section in plexsphere's `docs/reference/api/plexd-agent-contract.md` defines it. The pull lists the rules by `slug` ascending:
+
+```json
+"bridge": {
+  "ingress": {
+    "rules": [
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2",
+        "slug": "apps",
+        "listen_port": 443,
+        "mode": "passthrough",
+        "sni_host": "*.apps.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+        "target_address": "10.42.0.8",
+        "target_port": 443
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4",
+        "slug": "ssh",
+        "listen_port": 2222,
+        "mode": "passthrough",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+        "target_address": "10.42.0.8",
+        "target_port": 22
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | The rule's id. The bridge tells rules apart by it |
+| `slug` | string | The rule's name within the bridge Resource; logs and listener conflicts name it |
+| `listen_port` | int | The public TCP port, 1 to 65535, on all of the node's addresses |
+| `mode` | string | `passthrough`, `terminate` or `acme` (see [Modes](#modes)) |
+| `sni_host` | string, optional | The server name the rule matches, in lowercase: an exact name, or `*.` and a suffix for one label in place of the `*`. A rule without it is the only rule on its port |
+| `target_node_id` | string | The target node. It is not dialed |
+| `target_address` | string | The target node's mesh address, IPv4 or IPv6, without brackets |
+| `target_port` | int | The port the bridge dials on the target, 1 to 65535 |
+
+The block is whole: a rule missing from a later pull is removed, and a port no rule names any more is closed. An `ingress` child that is absent or `null` closes every public listener. An `ingress` child with an empty or `null` rule list does the same.
+
+## Activation
+
+The bridge serves the block only in bridge mode with the local `bridge.ingress_enabled: true` (default `false`); `cmd/plexd/cmd/up.go` builds the ingress manager only then. Without it, the block is ignored. The block carries no `enabled` member.
 
 | Field                | Type            | Default | Description                                      |
 |----------------------|-----------------|---------|--------------------------------------------------|
-| `IngressEnabled`     | `bool`          | `false` | Whether public ingress is active                 |
-| `MaxIngressRules`    | `int`           | `20`    | Maximum number of concurrent ingress rules       |
-| `IngressDialTimeout` | `time.Duration` | `10s`   | Timeout for dialing target mesh peers            |
-
-```go
-cfg := bridge.Config{
-    Enabled:        true,
-    AccessInterface: "eth1",
-    AccessSubnets:  []string{"10.0.0.0/24"},
-    IngressEnabled: true,
-}
-cfg.ApplyDefaults() // sets MaxIngressRules, IngressDialTimeout
-if err := cfg.Validate(); err != nil {
-    log.Fatal(err)
-}
-```
-
-### Defaults
-
-`ApplyDefaults()` sets zero-valued ingress fields:
-
-| Field                | Zero Value | Default Applied                                   |
-|----------------------|------------|---------------------------------------------------|
-| `MaxIngressRules`    | `0`        | `DefaultMaxIngressRules` (`20`)                   |
-| `IngressDialTimeout` | `0`        | `DefaultIngressDialTimeout` (`10s`)               |
-
-### Validation Rules
+| `IngressEnabled`     | `bool`          | `false` | `bridge.ingress_enabled`: the local switch for public ingress |
+| `MaxIngressRules`    | `int`           | `20`    | `bridge.max_ingress_rules`: the most rules the bridge holds |
+| `IngressDialTimeout` | `time.Duration` | `10s`   | `bridge.ingress_dial_timeout`: the timeout for dialing a target |
 
 Ingress validation is skipped when `IngressEnabled` is `false`. When enabled:
 
@@ -88,9 +102,93 @@ Ingress validation is skipped when `IngressEnabled` is `false`. When enabled:
 | `MaxIngressRules`    | Must be > 0             | `bridge: config: MaxIngressRules must be positive when ingress is enabled`  |
 | `IngressDialTimeout` | Must be >= 1s           | `bridge: config: IngressDialTimeout must be at least 1s`                    |
 
+## Modes
+
+| Mode | Behavior |
+|---|---|
+| `passthrough` | Served. The bridge forwards the bytes unchanged, the TLS handshake included, so the target ends TLS |
+| `terminate` | Held and not served |
+| `acme` | Held and not served |
+
+`terminate` and `acme` end TLS at the bridge, and the block does not name yet where their certificate comes from, so the bridge serves neither mode. A `terminate` or `acme` rule is held: it keeps its `(listen_port, sni_host)` slot, so no other rule takes its host, not even a wildcard `passthrough` rule that covers it, and a connection for its host is closed. Its state reads `mode_not_served`. The local ACME settings (`bridge.acme_*`, see [ACME & SNI Routing](acme-sni.md)) serve no rule.
+
+## The Listener Plan
+
+`planIngress` walks the rules in the order the pull lists them and gives each the first reason that applies:
+
+| Order | Check | Reason | Detail |
+| --- | --- | --- | --- |
+| 1 | `id` is empty | `invalid_rule` | `id` |
+| 2 | an earlier rule has the same `id` | `duplicate_id` | |
+| 3 | `mode` is none of the three modes | `invalid_rule` | `mode` |
+| 4 | `listen_port` outside 1 to 65535 | `invalid_rule` | `listen_port` |
+| 5 | `sni_host`, lowercased: longer than 253 bytes, an empty label, or a `*` anywhere but as the whole first label of at least two; or empty on `terminate` or `acme` | `invalid_rule` | `sni_host` |
+| 6 | `target_address` is not an IP address, or carries a port, brackets or a zone | `invalid_rule` | `target_address` |
+| 7 | `target_port` outside 1 to 65535 | `invalid_rule` | `target_port` |
+| 8 | a held rule has the same port and the same host, or one of the two has no host | `listener_conflict` | slug of the holder |
+| 9 | `max_ingress_rules` rules are held already | `max_rules` | |
+| 10 | held; `mode` is `terminate` or `acme` | `mode_not_served` | |
+
+A rule that passes check 9 is held. A held `passthrough` rule is served once its port is bound. When the bind fails, the port's rules read `listen_failed`. Only a port with a held `passthrough` rule gets a listener.
+
+The control plane refuses a rule set a bridge could not serve: a second rule on a listener another rule holds answers `409 bridge_port_conflict`, and a `terminate` or `acme` rule without `sni_host` answers `400 ingress_rule_invalid`. A rule the bridge skips is therefore a defect report, not a routine path. The bridge serves the rest of the block and logs `ingress rule not served` for the rule.
+
+`target_address` is checked for syntax only. The pull is the node's authenticated configuration, and the control plane resolves the address from the target node.
+
+The reasons are the exported constants `IngressReasonInvalid`, `IngressReasonDuplicateID`, `IngressReasonListenerConflict`, `IngressReasonMaxRules`, `IngressReasonModeNotServed` and `IngressReasonListenFailed`.
+
+## Routing a Connection
+
+The accept loop of a port loads the port's routing table for each connection:
+
+- **A plain port.** The rule without `sni_host` takes every connection. The bridge reads nothing and dials the target, so a protocol whose server speaks first, such as SSH or SMTP, works as well as TLS.
+- **An SNI port.** `peekClientHello` reads the TLS ClientHello without answering it: `crypto/tls` parses it, so a hello that spans several reads or records, or that orders the server name behind a large key share, is read in full. The peek reads at most 16 KiB and waits at most 5 s. The server name is then compared with the rules' hosts case-insensitively. An exact host wins over a wildcard, and `*.example.com` matches exactly one label in place of the `*`: it matches `a.example.com` and neither `example.com` nor `a.b.example.com`. The bridge dials the matching rule's target and replays the bytes it peeked to it first.
+
+A connection that matches no served rule is closed without a byte from any target and logged at Debug, with one of these reasons:
+
+| Reason | Cause |
+|---|---|
+| `no_client_hello` | The client sent no ClientHello within 5 s or 16 KiB, closed the connection, or sent bytes that are not TLS |
+| `no_server_name` | The ClientHello carries no server name |
+| `no_matching_rule` | No rule's host matches the server name |
+| `rule_not_served` | The matching rule is a held `terminate` or `acme` rule |
+
+The level is Debug because a public port draws scanners: a line per connection at Warn would let any client fill the log and the log forwarder.
+
+The bridge dials `target_address:target_port` with `ingress_dial_timeout` and copies both ways until one side ends or the rule is removed or changed. A failed dial closes the client connection and logs `bridge: ingress: dial target failed`.
+
+## Applying the Block
+
+`Apply` makes the manager serve exactly the rules it is given:
+
+1. It returns `bridge: ingress: manager is not active` before `Setup` or after `Teardown`.
+2. It plans the rules.
+3. A route whose rule is unchanged keeps its context and its established connections. Every other planned route gets a new context. Every route of the last `Apply` that is not carried over is cancelled, which closes its connections. Other rules on the port keep theirs.
+4. For a port in the plan without a listener, it calls `IngressController.Listen(":<port>", nil)`. On an error it marks the port's rules `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on :<port>: <error>` to the result.
+5. For a port with a listener, it stores the new routing table. The listener is not rebound, also when the port changes between a plain rule and SNI rules.
+6. It closes the listener of a port that left the plan and waits for its accept loop.
+7. It returns the listen errors joined, or nil.
+
+`Apply` is idempotent: a second call with the same rules binds nothing and cancels nothing, and logs nothing again. A failed bind fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
+
+## Ports Below 1024
+
+A listen port below 1024, such as 443 or 80, needs `CAP_NET_BIND_SERVICE`. The systemd unit `plexd install` writes and `deploy/systemd/plexd.service` grant it (see [Bare-Metal Packaging](../deployment/bare-metal-packaging.md)). When the bind fails with a permission error on such a port, `bridge: ingress: listen failed` carries `hint="ports below 1024 need CAP_NET_BIND_SERVICE"`.
+
+A unit an earlier release wrote keeps `CAP_NET_ADMIN CAP_NET_RAW` until `plexd install` writes it again. Until then, this drop-in adds the capability, because systemd merges repeated capability lines:
+
+```ini
+# /etc/systemd/system/plexd.service.d/bind-service.conf
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+Run `systemctl daemon-reload` and `systemctl restart plexd` after adding it. A host firewall plexd does not manage must open the listen ports too.
+
 ## IngressController
 
-Interface abstracting TCP listener operations for ingress testability. The production implementation is provided externally; this package defines and consumes the interface.
+Interface abstracting TCP listener operations for ingress testability.
 
 ```go
 type IngressController interface {
@@ -99,132 +197,40 @@ type IngressController interface {
 }
 ```
 
-| Method   | Description                                                              |
-|----------|--------------------------------------------------------------------------|
-| `Listen` | Creates a TCP listener; wraps with `tls.NewListener` if `tlsCfg` is set |
-| `Close`  | Closes the given listener; idempotent                                    |
+| Method   | Description |
+|----------|-------------|
+| `Listen` | Creates a TCP listener on `addr`. The manager always passes a nil `tlsCfg` |
+| `Close`  | Closes the given listener; idempotent |
+
+`StdIngressController` implements it with `net.Listen`.
 
 ## IngressManager
-
-Central coordinator for public ingress lifecycle. Concurrent-safe via `sync.Mutex` — the reconcile handler and status readers may invoke methods concurrently. Active proxy connections are tracked via `atomic.Int64` for lock-free counting.
-
-### Constructor
 
 ```go
 func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager) *IngressManager
 ```
 
-### Methods
+Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
 
-| Method                 | Signature                            | Description                                                      |
-|------------------------|--------------------------------------|------------------------------------------------------------------|
-| `Setup`                | `() error`                           | Marks manager active; no-op when disabled                        |
-| `Teardown`             | `() error`                           | Closes all listeners, cancels connections; aggregates errors     |
-| `AddRule`              | `(rule api.IngressRule) error`       | Starts listener, spawns accept loop; rejects duplicates/max      |
-| `RemoveRule`           | `(ruleID string)`                    | Stops listener, waits for goroutine exit; no-op if not found     |
-| `RuleIDs`              | `() []string`                        | Returns IDs of all active rules                                  |
-| `IngressStatus`        | `() *api.IngressInfo`                | Returns status for heartbeat; nil when inactive                  |
-| `IngressCapabilities`  | `() map[string]string`               | Returns capability metadata for registration; nil when disabled  |
-
-### Lifecycle
+| Method                | Signature                                 | Description |
+|-----------------------|-------------------------------------------|-------------|
+| `Setup`               | `() error`                                | Marks the manager active; a no-op when `IngressEnabled` is `false` |
+| `Apply`               | `(rules []api.IngressRule) error`         | Serves exactly these rules (see [Applying the Block](#applying-the-block)) |
+| `RuleStates`          | `() []IngressRuleState`                   | The outcome of the last `Apply`, one entry per rule, in block order |
+| `Teardown`            | `() error`                                | Cancels every route, which closes every connection, and closes every listener; joins close errors; a no-op when inactive |
+| `IngressStatus`       | `() *api.IngressInfo`                     | The `status.ingress` report entry; nil when inactive |
+| `IngressCapabilities` | `() map[string]string`                    | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when disabled |
 
 ```go
-mgr := bridge.NewIngressManager(ingressCtrl, cfg, logger)
-
-// Setup — marks manager active
-if err := mgr.Setup(); err != nil {
-    log.Fatal(err)
-}
-
-// Add a rule (driven by the reconcile handler)
-err := mgr.AddRule(api.IngressRule{
-    RuleID:     "web-https",
-    ListenPort: 443,
-    TargetAddr: "10.42.0.5:8080",
-    Mode:       "terminate",
-    CertPEM:    certPEM,
-    KeyPEM:     keyPEM,
-})
-
-// Remove a rule
-mgr.RemoveRule("web-https")
-
-// Report status in heartbeat
-status := mgr.IngressStatus()
-
-// Capabilities for registration
-caps := mgr.IngressCapabilities()
-// {"ingress": "true", "max_ingress_rules": "20"}
-
-// Graceful shutdown
-if err := mgr.Teardown(); err != nil {
-    logger.Warn("teardown failed", "error", err)
+type IngressRuleState struct {
+    Rule   api.IngressRule
+    Served bool
+    Reason string // empty when served
+    Detail string // the field of an invalid rule, or the slug of the rule that holds the listener
 }
 ```
 
-### Setup
-
-When `IngressEnabled` is `false`, `Setup` is a no-op. When enabled, it marks the manager as active and logs the configuration.
-
-### Teardown
-
-Teardown closes all active listeners and cancels proxy connections:
-
-1. Cancel all accept loop contexts
-2. Close all listeners via `IngressController.Close`
-3. Release the mutex
-4. Wait for all accept loop goroutines to exit (via `done` channels)
-
-Errors are aggregated via `errors.Join` — cleanup continues even when individual operations fail. Calling `Teardown` when the manager is inactive is a no-op.
-
-### AddRule
-
-1. Rejects duplicate rule IDs (`rule already exists`)
-2. Rejects if `MaxIngressRules` limit is reached (`max rules reached`)
-3. For TLS terminate mode: parses `CertPEM`/`KeyPEM` via `tls.X509KeyPair`, builds `tls.Config` with `MinVersion: tls.VersionTLS12`
-4. Calls `IngressController.Listen` to create the TCP listener
-5. Spawns an `acceptLoop` goroutine with a cancellable context
-6. Tracks the rule in the internal `activeRules` map
-
-### RemoveRule
-
-1. If the rule ID is not tracked, returns immediately (no-op)
-2. Cancels the accept loop context
-3. Closes the listener via `IngressController.Close`
-4. Waits for the accept loop goroutine to exit (via `done` channel)
-
-### TCP Proxy
-
-Each accepted connection spawns a `proxyConnection` goroutine:
-
-1. Increments the atomic connection counter
-2. Dials the target address with `IngressDialTimeout`
-3. Runs two `io.Copy` goroutines for bidirectional relay
-4. On context cancellation or either copy finishing, closes both connections
-5. Decrements the connection counter on exit
-
-### TLS Modes
-
-| Mode          | Behavior                                                                           |
-|---------------|------------------------------------------------------------------------------------|
-| `passthrough` | Raw TCP bytes forwarded without decryption; no certificates required               |
-| `terminate`   | Bridge performs TLS handshake with static `tls.Config`; plaintext forwarded to target |
-| `acme`        | Automatic certificate via ACME (Let's Encrypt); requires `Hostname` on the rule   |
-
-TLS terminate mode enforces minimum TLS 1.2 via `tls.Config.MinVersion`.
-
-## SSE Event Handling
-
-There are no ingress-specific SSE handlers. The control plane emits a single
-`bridge_config_updated` event with an opaque payload; `bridge.HandleBridgeConfigUpdated`
-dispatches it to `TriggerReconcile()`, and the `IngressReconcileHandler` below
-applies the desired ingress subtree from the authoritative state snapshot.
-
-```go
-dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventBridgeConfigUpdated,
-    bridge.HandleBridgeConfigUpdated(reconciler))
-```
+`IngressStatus().RuleCount` counts the served rules, and `ConnectionCount` the connections from accept to close.
 
 ## IngressReconcileHandler
 
@@ -232,65 +238,50 @@ dispatcher.Register(api.EventBridgeConfigUpdated,
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-Returns a `reconcile.ReconcileHandler` that synchronizes ingress rules to match the desired bridge ingress subtree. The handler is **presence-aware**: a `null` `Bridge` or `null` `Ingress` child means "not populated", so it reconciles against an empty desired set and tears down stale rules.
+The handler returns nil for a nil snapshot. Otherwise it takes the rules of `desired.Bridge.Ingress`, none when `Bridge` or `Ingress` is nil, calls `mgr.Apply`, and on an error logs `ingress reconcile: apply failed` and returns it. `cmd/plexd/cmd/up.go` registers it when the ingress manager exists.
 
-1. Reads rules from `desired.Bridge.Ingress.Rules` (empty when `Bridge` or `Ingress` is nil)
-2. Builds a desired set keyed by `RuleID`
-3. Removes stale rules: current rule IDs not in the desired set
-4. Adds missing rules: desired rules not in the current set
-5. Aggregates `AddRule` errors via `errors.Join`
+## SSE Event Handling
 
-### Registration
-
-```go
-r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
-r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
-r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
-```
+There are no ingress-specific SSE handlers. The control plane emits a single `bridge_config_updated` event with an opaque payload; `bridge.HandleBridgeConfigUpdated` dispatches it to `TriggerReconcile()`, and `IngressReconcileHandler` applies the block from the authoritative state snapshot.
 
 ## API Types
 
 ### IngressConfig
 
-Pushed from the control plane in the snapshot `bridge.ingress` subtree (`api.BridgeSnapshot.Ingress`), present-but-nullable — a `null` value tears down active rules.
+`api.BridgeSnapshot.Ingress`, present-but-nullable.
 
 ```go
 type IngressConfig struct {
-    Enabled bool          `json:"enabled"`
-    Rules   []IngressRule `json:"rules"`
+    Rules []IngressRule `json:"rules"`
 }
 ```
 
 ### IngressRule
 
-Represents a single public ingress rule.
-
 ```go
 type IngressRule struct {
-    RuleID     string `json:"rule_id"`
-    ListenPort int    `json:"listen_port"`
-    TargetAddr string `json:"target_addr"`
-    Mode       string `json:"mode"`
-    CertPEM    string `json:"cert_pem,omitempty"`
-    KeyPEM     string `json:"key_pem,omitempty"`
-    Hostname   string `json:"hostname,omitempty"`
+    ID            string `json:"id"`
+    Slug          string `json:"slug"`
+    ListenPort    int    `json:"listen_port"`
+    Mode          string `json:"mode"`
+    SNIHost       string `json:"sni_host,omitempty"`
+    TargetNodeID  string `json:"target_node_id"`
+    TargetAddress string `json:"target_address"`
+    TargetPort    int    `json:"target_port"`
 }
+
+const (
+    IngressModePassthrough = "passthrough"
+    IngressModeTerminate   = "terminate"
+    IngressModeACME        = "acme"
+)
 ```
 
-| Field        | Description                                                              |
-|--------------|--------------------------------------------------------------------------|
-| `RuleID`     | Unique identifier for the rule                                          |
-| `ListenPort` | Public TCP port to listen on                                            |
-| `TargetAddr` | Mesh peer address to proxy traffic to (host:port)                       |
-| `Mode`       | TLS mode: `passthrough` (raw TCP), `terminate` (static cert), or `acme` (automatic cert) |
-| `CertPEM`    | PEM-encoded certificate for terminate mode (optional for passthrough/acme) |
-| `KeyPEM`     | PEM-encoded private key for terminate mode (optional for passthrough/acme) |
-| `Hostname`   | Hostname for ACME mode certificate provisioning (optional for other modes) |
+`IngressRule` is comparable with `==`, which is how `Apply` tells an unchanged rule from a changed one.
 
 ### IngressInfo
 
-Reported in heartbeats via `api.HeartbeatRequest.Ingress`.
+Published as the `status.ingress` report entry.
 
 ```go
 type IngressInfo struct {
@@ -301,126 +292,36 @@ type IngressInfo struct {
 }
 ```
 
-### SSE Event Constants
-
-Ingress changes are delivered through the single bridge event constant; the
-fine-grained `ingress_*` constants have been removed.
-
-| Constant                        | Value                     |
-|---------------------------------|---------------------------|
-| `api.EventBridgeConfigUpdated`  | `"bridge_config_updated"` |
-
 ## Error Prefixes
 
-| Source                             | Prefix                                              |
-|------------------------------------|------------------------------------------------------|
-| `IngressManager.AddRule` (dup)     | `bridge: ingress: rule already exists: `             |
-| `IngressManager.AddRule` (max)     | `bridge: ingress: max rules reached (`               |
-| `IngressManager.AddRule` (TLS)     | `bridge: ingress: rule <id>: load TLS certificate: ` |
-| `IngressManager.AddRule` (listen)  | `bridge: ingress: rule <id>: listen on <addr>: `     |
-| `IngressManager.Teardown` (close)  | `bridge: ingress: close rule <id>: `                 |
+| Source                            | Prefix                                         |
+|-----------------------------------|------------------------------------------------|
+| `IngressManager.Apply` (inactive) | `bridge: ingress: manager is not active`       |
+| `IngressManager.Apply` (listen)   | `bridge: ingress: listen on :<port>: `         |
+| `IngressManager.Teardown` (close) | `bridge: ingress: close listener <port>: `     |
 
 ## Logging
 
 All ingress log entries use `component=bridge`.
 
-| Level   | Event                          | Keys                                        |
-|---------|--------------------------------|---------------------------------------------|
-| `Info`  | Ingress manager started        | `max_rules`, `dial_timeout`                 |
-| `Info`  | Ingress manager stopped        | (none)                                      |
-| `Info`  | Ingress rule added             | `rule_id`, `listen_port`, `target`, `mode`  |
-| `Info`  | Ingress rule removed           | `rule_id`                                   |
-| `Error` | Dial target failed             | `rule_id`, `target`, `error`                |
-| `Error` | Close rule failed              | `rule_id`, `error`                          |
-| `Error` | Reconcile: add rule failed     | `rule_id`, `error`                          |
+| Level   | Message                                  | Keys |
+|---------|------------------------------------------|------|
+| `Info`  | `ingress manager started`                | `max_rules`, `dial_timeout` |
+| `Info`  | `ingress manager stopped`                | (none) |
+| `Info`  | `ingress listener opened`                | `listen_port` |
+| `Info`  | `ingress listener closed`                | `listen_port` |
+| `Info`  | `ingress rule added`                     | `rule_id`, `slug`, `listen_port`, `mode`, `sni_host`, `target` |
+| `Info`  | `ingress rule updated`                   | the same; an id held before with another value |
+| `Info`  | `ingress rule removed`                   | the same |
+| `Warn`  | `ingress rule not served`                | `rule_id`, `slug`, `listen_port`, `reason`, `detail`; once per rule value and reason |
+| `Debug` | `ingress connection closed`              | `listen_port`, `remote`, `server_name`, `reason` |
+| `Error` | `bridge: ingress: listen failed`         | `listen_port`, `error`, and `hint` for a permission error below port 1024 |
+| `Error` | `bridge: ingress: close listener failed` | `listen_port`, `error` |
+| `Error` | `bridge: ingress: dial target failed`    | `rule_id`, `slug`, `target`, `error` |
+| `Error` | `ingress reconcile: apply failed`        | `error` |
 
-## Integration Points
+A rule logs `ingress rule not served` once: an `Apply` that leaves its value and reason unchanged logs nothing for it.
 
-### Reconciliation Loop
+## Limits
 
-The ingress reconcile handler plugs into `internal/reconcile` alongside existing handlers:
-
-```go
-r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterDispatchHandler(policy.DispatchHandler(enforcer, "plexd0"))
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
-r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
-r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
-```
-
-### SSE Real-Time Updates
-
-The `bridge_config_updated` event triggers a full reconcile; the
-`IngressReconcileHandler` then applies the desired rule set from the state
-snapshot. There are no per-rule events.
-
-### Control Plane Types
-
-| Type                                 | Package        | Usage                                         |
-|--------------------------------------|----------------|-----------------------------------------------|
-| `api.IngressConfig`                  | `internal/api` | Desired ingress config from control plane     |
-| `api.IngressRule`                    | `internal/api` | Individual ingress rule definition            |
-| `api.IngressInfo`                    | `internal/api` | Ingress status in heartbeats                  |
-| `api.BridgeSnapshot`                 | `internal/api` | Snapshot `bridge` subtree (contains `Ingress`)|
-| `api.HeartbeatRequest`               | `internal/api` | Heartbeat payload (contains `IngressInfo`)    |
-| `api.Envelope`                       | `internal/api` | SSE event wrapper                             |
-| `api.EventBridgeConfigUpdated`       | `internal/api` | Event type `"bridge_config_updated"`          |
-
-### Heartbeat Reporting
-
-```go
-heartbeat := api.HeartbeatRequest{
-    Ingress: ingressMgr.IngressStatus(), // nil when inactive
-}
-```
-
-### Registration Capabilities
-
-```go
-caps := ingressMgr.IngressCapabilities()
-// {"ingress": "true", "max_ingress_rules": "20"}
-// nil when ingress is disabled
-```
-
-### Graceful Shutdown
-
-```go
-<-ctx.Done()
-if err := ingressMgr.Teardown(); err != nil {
-    logger.Warn("ingress teardown failed", "error", err)
-}
-```
-
-## Full Lifecycle
-
-```go
-cfg := bridge.Config{
-    Enabled:        true,
-    AccessInterface: "eth1",
-    AccessSubnets:  []string{"10.0.0.0/24"},
-    IngressEnabled: true,
-}
-cfg.ApplyDefaults()
-
-ingressMgr := bridge.NewIngressManager(ingressCtrl, cfg, logger)
-
-// Setup ingress manager
-ingressMgr.Setup()
-
-// Register the bridge SSE handler
-dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventBridgeConfigUpdated,
-    bridge.HandleBridgeConfigUpdated(reconciler))
-
-// Register reconcile handler
-r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
-
-// Run reconciler
-go r.Run(ctx, nodeID)
-
-// Graceful shutdown
-<-ctx.Done()
-ingressMgr.Teardown()
-```
+The bridge sets no connection limit and no idle timeout on a public listener. It bounds only the ClientHello peek, to 16 KiB and 5 s per connection.

@@ -711,7 +711,7 @@ therefore hands the node the new key.
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
-| `bridge.ingress` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
+| `bridge.ingress` | 1 rule, `web`: port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
 | `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
@@ -843,13 +843,16 @@ answers `applied`.
       ]
     },
     "ingress": {
-      "enabled": true,
       "rules": [
         {
-          "rule_id": "ingress-001",
+          "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+          "slug": "web",
           "listen_port": 443,
-          "target_addr": "10.99.0.2:8443",
-          "mode": "tcp"
+          "mode": "passthrough",
+          "sni_host": "web.e2e.internal",
+          "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+          "target_address": "10.99.0.2",
+          "target_port": 8443
         }
       ]
     },

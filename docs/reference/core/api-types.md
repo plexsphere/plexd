@@ -253,15 +253,15 @@ A single inclusive destination port range (`from <= to`).
 **BridgeSnapshot**
 
 Carries the four bridge subtrees. Each child is present-but-nullable; there are
-no base fields on the wire. `RelayConfig` and `RelayAssignment` follow below; the
-other inner shapes (`UserAccessConfig`, `IngressConfig`, `SiteToSiteConfig`) are
-documented under [Bridge Mode](/reference/bridge/bridge-mode).
+no base fields on the wire. `RelayConfig`, `RelayAssignment`, `IngressConfig` and
+`IngressRule` follow below; the other inner shapes (`UserAccessConfig`,
+`SiteToSiteConfig`) are documented under [Bridge Mode](/reference/bridge/bridge-mode).
 
 | Field        | Type                | JSON Tag           | Description                     |
 |--------------|---------------------|--------------------|---------------------------------|
 | `Relay`      | `*RelayConfig`      | `"relay"`          | Relay request: whether this bridge relays, on which UDP port, and the peers whose first relay it is |
 | `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access configuration       |
-| `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress configuration    |
+| `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress rules; `null` or absent closes every public listener |
 | `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site VPN configuration  |
 
 **RelayConfig**
@@ -284,6 +284,34 @@ See [NAT Relay](/reference/bridge/nat-relay).
 | `PeerNodeID`           | `string` | `"peer_node_id"`           | Node ID of a peer whose first relay is this bridge |
 | `FallbackEndpoint`     | `string` | `"fallback_endpoint"`      | Host of that peer's first relay          |
 | `FallbackEndpointPort` | `int`    | `"fallback_endpoint_port"` | Port of that peer's first relay          |
+
+**IngressConfig**
+
+The `bridge.ingress` block, the control plane's `NodeStateBridgeIngress`. A
+bridge serves it only when its local `bridge.ingress_enabled` is true; the block
+is applied whole. See [Public Ingress](/reference/bridge/public-ingress).
+
+| Field   | Type            | JSON Tag  | Description                                |
+|---------|-----------------|-----------|--------------------------------------------|
+| `Rules` | `[]IngressRule` | `"rules"` | Every rule of the bridge Resource, by slug ascending |
+
+**IngressRule**
+
+One rule of the block, the control plane's `NodeStateBridgeIngressRule`.
+`IngressModePassthrough`, `IngressModeTerminate` and `IngressModeACME` name its
+modes; a bridge serves only `passthrough` until the block names a certificate
+source.
+
+| Field           | Type     | JSON Tag                 | Description                                  |
+|-----------------|----------|--------------------------|----------------------------------------------|
+| `ID`            | `string` | `"id"`                   | Rule id                                      |
+| `Slug`          | `string` | `"slug"`                 | Rule name within the bridge Resource         |
+| `ListenPort`    | `int`    | `"listen_port"`          | Public TCP port, 1 to 65535                  |
+| `Mode`          | `string` | `"mode"`                 | `passthrough`, `terminate` or `acme`         |
+| `SNIHost`       | `string` | `"sni_host,omitempty"`   | Server name the rule matches, exact or `*.` plus a suffix; empty for the only rule on its port |
+| `TargetNodeID`  | `string` | `"target_node_id"`       | Target node; not dialed                      |
+| `TargetAddress` | `string` | `"target_address"`       | Target node's mesh address, IPv4 or IPv6, without brackets |
+| `TargetPort`    | `int`    | `"target_port"`          | Port dialed on the target, 1 to 65535        |
 
 **NodeStateBlock**
 

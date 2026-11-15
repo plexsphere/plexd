@@ -236,7 +236,7 @@ The forwarding resolvers are the ones the forwarding setting of the Node's Proje
 | Direction | Protocol | Port | Destination | Purpose |
 |---|---|---|---|---|
 | Inbound | UDP | pulled `listen_port` | NAT relay clients | WireGuard relay for nodes behind symmetric NAT, when `bridge.relay_enabled` is true and the control plane enables the relay. The control plane sets the port per bridge, in the state pull's `bridge.relay.listen_port`. See [NAT Relay](../reference/bridge/nat-relay.md) |
-| Inbound | TCP/443 | 443 | Public internet | Public ingress (if `ingress.enabled`) |
+| Inbound | TCP | pulled `listen_port` of each ingress rule | Public internet | Public ingress, when `bridge.ingress_enabled` is true: one listener per distinct `listen_port` of the state pull's `bridge.ingress` rules, such as 443. See [Public Ingress](../reference/bridge/public-ingress.md) |
 | Inbound | UDP/51821 | 51821 | User access clients | WireGuard user access (if configured) |
 | Outbound | UDP/varies | - | Site-to-site peers | VPN tunnels to external networks |
 

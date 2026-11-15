@@ -499,8 +499,8 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `access_subnets` | []string | — | Subnets routable via the access interface |
 | `enable_nat` | bool | `true` | Enable NAT masquerading on the access interface. On macOS the masquerade is a `nat` rule in plexd's pf anchor; on Windows a WinNAT object scoped to the mesh prefix, which translates mesh-sourced traffic only. See [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat) |
 | `relay_enabled` | bool | `false` | Local consent to relay WireGuard for NAT traversal. The relay listens only when this is `true` and the state pull's `bridge.relay` block carries `enabled: true`, on the block's `listen_port`. Requires `enabled: true`. See [NAT Relay](../bridge/nat-relay.md#consent) |
-| `ingress_enabled` | bool | `false` | Enable public ingress |
-| `max_ingress_rules` | int | `20` | Maximum ingress rules |
+| `ingress_enabled` | bool | `false` | Local switch for public ingress. A bridge serves the state pull's `bridge.ingress` block only when this is `true`. Requires `enabled: true`. See [Public Ingress](../bridge/public-ingress.md) |
+| `max_ingress_rules` | int | `20` | The most ingress rules the bridge holds; a rule past the bound is not served, with the reason `max_rules` |
 | `ingress_dial_timeout` | duration | `10s` | Timeout for dialing backend targets |
 | `user_access_enabled` | bool | `false` | Enable user access VPN integration |
 | `user_access_interface_name` | string | `wg-access` | WireGuard interface for user access |
