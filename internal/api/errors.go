@@ -386,6 +386,22 @@ func IsHookMetadataRefused(err error) bool {
 	}
 }
 
+// IsTokenRateLimited reports whether err is the control plane's refusal of a
+// registration by the rate limit of the token's BootstrapToken policy: a 429
+// carrying the token_rate_limited problem code.
+//
+// The answer is a verdict on the token, not on the caller: the token is valid,
+// the refusal did not count as a redemption, and the same request succeeds once
+// its Retry-After has passed. The per-IP limiter of the same route answers 429
+// rate_limited before any token is looked up, so that 429, and one without a
+// code, is false here.
+func IsTokenRateLimited(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) &&
+		apiErr.StatusCode == http.StatusTooManyRequests &&
+		apiErr.Code == "token_rate_limited"
+}
+
 // maxErrorBody is the maximum number of bytes read from an error response body.
 const maxErrorBody = 4096
 

@@ -685,6 +685,32 @@ func TestIsEventBusNotProvisioned(t *testing.T) {
 	}
 }
 
+func TestIsTokenRateLimited(t *testing.T) {
+	limited := &APIError{StatusCode: 429, Code: "token_rate_limited"}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"429 with the token rate-limit code", limited, true},
+		{"wrapped 429 with the token rate-limit code", fmt.Errorf("x: %w", limited), true},
+		// The per-IP limiter of the unauthenticated seam answers before any
+		// token is looked up, so its 429 says nothing about the token.
+		{"429 from the per-IP limiter", &APIError{StatusCode: 429, Code: "rate_limited"}, false},
+		{"429 without a code", &APIError{StatusCode: 429}, false},
+		{"403 with the token rate-limit code", &APIError{StatusCode: 403, Code: "token_rate_limited"}, false},
+		{"non-API error", errors.New("x"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTokenRateLimited(tt.err); got != tt.want {
+				t.Errorf("IsTokenRateLimited(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsHandshakeReportNotServed(t *testing.T) {
 	tests := []struct {
 		name string
