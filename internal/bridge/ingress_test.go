@@ -1,499 +1,400 @@
 package bridge
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"fmt"
-	"math/big"
+	"errors"
 	"net"
+	"os"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
-	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
 // ---------------------------------------------------------------------------
 // IngressManager tests
 // ---------------------------------------------------------------------------
 
-func TestIngressManager_Setup_Disabled(t *testing.T) {
-	ctrl := &mockIngressController{}
+func ingressTestConfig(enabled bool) Config {
 	cfg := Config{
-		Enabled:        true,
+		Enabled:         true,
 		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: false,
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  enabled,
 	}
 	cfg.ApplyDefaults()
+	return cfg
+}
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
+// newActiveIngressManager returns a set-up manager whose teardown runs when the
+// test ends.
+func newActiveIngressManager(t *testing.T, ctrl IngressController) (*IngressManager, *relayLog) {
+	t.Helper()
+	logger, logs := newRelayLogger()
+	mgr := NewIngressManager(ctrl, ingressTestConfig(true), logger, nil)
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Teardown() })
+	return mgr, logs
+}
+
+// ingressRule returns a passthrough rule to 127.0.0.1 on targetPort.
+func ingressRule(slug string, port int, host string, targetPort int) api.IngressRule {
+	return api.IngressRule{
+		ID:            "id-" + slug,
+		Slug:          slug,
+		ListenPort:    port,
+		Mode:          api.IngressModePassthrough,
+		SNIHost:       host,
+		TargetNodeID:  "node-" + slug,
+		TargetAddress: "127.0.0.1",
+		TargetPort:    targetPort,
+	}
+}
+
+// fourRules returns three SNI rules on 443 and a plain rule on 7022.
+func fourRules() []api.IngressRule {
+	return []api.IngressRule{
+		ingressRule("a", 443, "a.example.com", 9441),
+		ingressRule("b", 443, "b.example.com", 9442),
+		ingressRule("wild", 443, "*.apps.example.com", 9443),
+		ingressRule("plain", 7022, "", 9022),
+	}
+}
+
+// logLines counts the log lines that carry every needle.
+func logLines(logs *relayLog, needles ...string) int {
+	n := 0
+	for _, line := range strings.Split(logs.String(), "\n") {
+		ok := true
+		for _, needle := range needles {
+			if !strings.Contains(line, needle) {
+				ok = false
+				break
+			}
+		}
+		if ok && line != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// stateOf returns the state of the rule with the given slug.
+func stateOf(t *testing.T, mgr *IngressManager, slug string) IngressRuleState {
+	t.Helper()
+	for _, st := range mgr.RuleStates() {
+		if st.Rule.Slug == slug {
+			return st
+		}
+	}
+	t.Fatalf("no state for rule %s in %+v", slug, mgr.RuleStates())
+	return IngressRuleState{}
+}
+
+func TestIngressManager_Setup_Disabled(t *testing.T) {
+	mgr := NewIngressManager(&mockIngressController{}, ingressTestConfig(false), discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-
-	// Manager should not be active.
 	if mgr.IngressStatus() != nil {
 		t.Error("IngressStatus should be nil when disabled")
 	}
 }
 
 func TestIngressManager_Setup_Enabled(t *testing.T) {
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
+	mgr, _ := newActiveIngressManager(t, &mockIngressController{})
 
 	status := mgr.IngressStatus()
 	if status == nil {
 		t.Fatal("IngressStatus should not be nil when active")
 	}
-	if !status.Enabled {
-		t.Error("Enabled should be true")
-	}
-	if status.RuleCount != 0 {
-		t.Errorf("RuleCount = %d, want 0", status.RuleCount)
-	}
-	if status.ConnectionCount != 0 {
-		t.Errorf("ConnectionCount = %d, want 0", status.ConnectionCount)
+	if !status.Enabled || status.RuleCount != 0 || status.ConnectionCount != 0 {
+		t.Errorf("IngressStatus = %+v, want enabled with no rules and no connections", status)
 	}
 }
 
-func TestIngressManager_AddRule_StartsListener(t *testing.T) {
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
+func TestIngressManager_Apply_OneListenerPerPort(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	mgr, _ := newActiveIngressManager(t, ctrl)
+
+	if err := mgr.Apply(fourRules()); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
+	calls := ctrl.ingressCallsFor("Listen")
+	if got := ctrl.listenAddrs(); len(got) != 2 || got[0] != ":443" || got[1] != ":7022" {
+		t.Fatalf("Listen addresses = %v, want [:443 :7022]", got)
 	}
-
-	rule := api.IngressRule{
-		RuleID:     "rule-1",
-		ListenPort: 0, // Use port 0 for ephemeral port
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-
-	// Override listenFn to use port 0 for testing
-	ctrl.listenFn = func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-		return net.Listen("tcp", "127.0.0.1:0")
-	}
-
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule: %v", err)
-	}
-
-	// Verify Listen was called.
-	listenCalls := ctrl.ingressCallsFor("Listen")
-	if len(listenCalls) != 1 {
-		t.Fatalf("expected 1 Listen call, got %d", len(listenCalls))
-	}
-
-	// Verify rule is tracked.
-	ids := mgr.RuleIDs()
-	if len(ids) != 1 || ids[0] != "rule-1" {
-		t.Errorf("RuleIDs = %v, want [rule-1]", ids)
-	}
-
-	// Verify status reflects the rule.
-	status := mgr.IngressStatus()
-	if status == nil || status.RuleCount != 1 {
-		t.Errorf("RuleCount = %v, want 1", status)
-	}
-
-	// Cleanup.
-	_ = mgr.Teardown()
-}
-
-func TestIngressManager_AddRule_DuplicateRejects(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	rule := api.IngressRule{
-		RuleID:     "rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("first AddRule: %v", err)
-	}
-
-	err := mgr.AddRule(rule)
-	if err == nil {
-		t.Fatal("AddRule should return error for duplicate rule ID")
-	}
-
-	// Cleanup.
-	_ = mgr.Teardown()
-}
-
-func TestIngressManager_AddRule_MaxRulesReject(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-		MaxIngressRules: 2,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Add up to max.
-	for i := 0; i < 2; i++ {
-		rule := api.IngressRule{
-			RuleID:     fmt.Sprintf("rule-%d", i),
-			ListenPort: 0,
-			TargetAddr: "10.0.0.5:8080",
-			Mode:       "tcp",
-		}
-		if err := mgr.AddRule(rule); err != nil {
-			t.Fatalf("AddRule %d: %v", i, err)
+	for _, c := range calls {
+		if cfg, _ := c.Args[1].(*tls.Config); cfg != nil {
+			t.Errorf("Listen(%v) got a tls.Config, want nil", c.Args[0])
 		}
 	}
-
-	// Third should fail.
-	err := mgr.AddRule(api.IngressRule{
-		RuleID:     "rule-extra",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	})
-	if err == nil {
-		t.Fatal("AddRule should return error when max rules reached")
+	if got := mgr.IngressStatus().RuleCount; got != 4 {
+		t.Errorf("RuleCount = %d, want 4", got)
 	}
 
-	// Cleanup.
-	_ = mgr.Teardown()
-}
-
-func TestIngressManager_RemoveRule_StopsListener(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
+	rules := fourRules()
+	rules[1].Mode = api.IngressModeTerminate
+	if err := mgr.Apply(rules); err != nil {
+		t.Fatalf("Apply with a terminate rule: %v", err)
 	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
+	if got := mgr.IngressStatus().RuleCount; got != 3 {
+		t.Errorf("RuleCount with a terminate rule = %d, want 3", got)
 	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	rule := api.IngressRule{
-		RuleID:     "rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule: %v", err)
-	}
-	ctrl.resetIngress()
-
-	mgr.RemoveRule("rule-1")
-
-	// Verify Close was called.
-	closeCalls := ctrl.ingressCallsFor("Close")
-	if len(closeCalls) != 1 {
-		t.Fatalf("expected 1 Close call, got %d", len(closeCalls))
-	}
-
-	// Verify rule is no longer tracked.
-	ids := mgr.RuleIDs()
-	if len(ids) != 0 {
-		t.Errorf("RuleIDs = %v, want empty", ids)
-	}
-
-	status := mgr.IngressStatus()
-	if status == nil || status.RuleCount != 0 {
-		t.Errorf("RuleCount = %v, want 0", status)
+	if got := len(ctrl.ingressCallsFor("Listen")); got != 2 {
+		t.Errorf("Listen calls = %d, want still 2", got)
 	}
 }
 
-func TestIngressManager_RemoveRule_NonexistentNoop(t *testing.T) {
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
+func TestIngressManager_Apply_Idempotent(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	mgr, logs := newActiveIngressManager(t, ctrl)
+
+	rules := fourRules()
+	rules[1].Mode = api.IngressModeTerminate
+	if err := mgr.Apply(rules); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
+	if err := mgr.Apply(rules); err != nil {
+		t.Fatalf("second Apply: %v", err)
 	}
 
-	// Remove non-existent rule should not panic or call Close.
-	mgr.RemoveRule("nonexistent")
-
-	closeCalls := ctrl.ingressCallsFor("Close")
-	if len(closeCalls) != 0 {
-		t.Errorf("Close should not be called for non-existent rule, got %d calls", len(closeCalls))
+	if got := len(ctrl.ingressCallsFor("Listen")); got != 2 {
+		t.Errorf("Listen calls = %d, want 2", got)
+	}
+	if got := len(ctrl.ingressCallsFor("Close")); got != 0 {
+		t.Errorf("Close calls = %d, want 0", got)
+	}
+	if got := logLines(logs, `msg="ingress rule not served"`); got != 1 {
+		t.Errorf("%d 'ingress rule not served' lines, want 1:\n%s", got, logs.String())
+	}
+	if got := logLines(logs, `msg="ingress rule added"`); got != 4 {
+		t.Errorf("%d 'ingress rule added' lines, want 4:\n%s", got, logs.String())
 	}
 }
 
-func TestIngressManager_Teardown(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
+func TestIngressManager_Apply_EmptyClosesEverything(t *testing.T) {
+	for name, empty := range map[string][]api.IngressRule{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := newLoopbackIngressController(t)
+			mgr, logs := newActiveIngressManager(t, ctrl)
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
+			if err := mgr.Apply(fourRules()); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			addr := ctrl.addr(443)
+			if err := mgr.Apply(empty); err != nil {
+				t.Fatalf("Apply(%s): %v", name, err)
+			}
 
+			if got := len(ctrl.ingressCallsFor("Close")); got != 2 {
+				t.Errorf("Close calls = %d, want 2", got)
+			}
+			if states := mgr.RuleStates(); len(states) != 0 {
+				t.Errorf("RuleStates = %+v, want empty", states)
+			}
+			if got := mgr.IngressStatus().RuleCount; got != 0 {
+				t.Errorf("RuleCount = %d, want 0", got)
+			}
+			if conn, err := net.Dial("tcp", addr); err == nil {
+				_ = conn.Close()
+				t.Errorf("dial %s succeeded after the listener closed", addr)
+			}
+			if got := logLines(logs, `msg="ingress rule removed"`); got != 4 {
+				t.Errorf("%d 'ingress rule removed' lines, want 4:\n%s", got, logs.String())
+			}
+			for _, port := range []string{"443", "7022"} {
+				if got := logLines(logs, `msg="ingress listener closed"`, "listen_port="+port); got != 1 {
+					t.Errorf("%d 'ingress listener closed' lines for %s, want 1", got, port)
+				}
+			}
+		})
+	}
+}
+
+func TestIngressManager_Apply_NotActive(t *testing.T) {
+	mgr := NewIngressManager(newLoopbackIngressController(t), ingressTestConfig(true), discardLogger(), nil)
+
+	const want = "bridge: ingress: manager is not active"
+	if err := mgr.Apply(fourRules()); err == nil || err.Error() != want {
+		t.Errorf("Apply before Setup = %v, want %q", err, want)
+	}
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-
-	// Add two rules so teardown has work to do.
-	for i := 0; i < 2; i++ {
-		rule := api.IngressRule{
-			RuleID:     fmt.Sprintf("rule-%d", i),
-			ListenPort: 0,
-			TargetAddr: "10.0.0.5:8080",
-			Mode:       "tcp",
-		}
-		if err := mgr.AddRule(rule); err != nil {
-			t.Fatalf("AddRule %d: %v", i, err)
-		}
-	}
-	ctrl.resetIngress()
-
 	if err := mgr.Teardown(); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
+	if err := mgr.Apply(fourRules()); err == nil || err.Error() != want {
+		t.Errorf("Apply after Teardown = %v, want %q", err, want)
+	}
+}
 
-	// Verify Close was called for both rules.
-	closeCalls := ctrl.ingressCallsFor("Close")
-	if len(closeCalls) != 2 {
-		t.Errorf("expected 2 Close calls, got %d", len(closeCalls))
+func TestIngressManager_Apply_ListenFailureIsRetried(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	ctrl.failListen(443, syscall.EADDRINUSE)
+	mgr, logs := newActiveIngressManager(t, ctrl)
+
+	err := mgr.Apply(fourRules())
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("Apply = %v, want an error that wraps EADDRINUSE", err)
+	}
+	if !strings.HasPrefix(err.Error(), "bridge: ingress: listen on :443:") {
+		t.Errorf("Apply = %q, want the prefix %q", err, "bridge: ingress: listen on :443:")
+	}
+	for _, slug := range []string{"a", "b", "wild"} {
+		if st := stateOf(t, mgr, slug); st.Served || st.Reason != IngressReasonListenFailed {
+			t.Errorf("rule %s: served, reason = %v, %q, want false, %q", slug, st.Served, st.Reason, IngressReasonListenFailed)
+		}
+	}
+	if st := stateOf(t, mgr, "plain"); !st.Served {
+		t.Errorf("rule plain = %+v, want served", st)
+	}
+	if got := logLines(logs, `msg="bridge: ingress: listen failed"`, "listen_port=443"); got != 1 {
+		t.Errorf("%d 'listen failed' lines for 443, want 1:\n%s", got, logs.String())
 	}
 
-	// Status should be nil after teardown.
-	if mgr.IngressStatus() != nil {
-		t.Error("IngressStatus should be nil after teardown")
+	ctrl.failListen(443, nil)
+	if err := mgr.Apply(fourRules()); err != nil {
+		t.Fatalf("Apply after the port freed up: %v", err)
 	}
+	if got := ctrl.listenAddrs(); len(got) != 3 || got[2] != ":443" {
+		t.Errorf("Listen addresses = %v, want a third call for :443", got)
+	}
+	for _, slug := range []string{"a", "b", "wild", "plain"} {
+		if st := stateOf(t, mgr, slug); !st.Served {
+			t.Errorf("rule %s = %+v, want served", slug, st)
+		}
+	}
+}
 
-	// RuleIDs should be empty.
-	if ids := mgr.RuleIDs(); len(ids) != 0 {
-		t.Errorf("RuleIDs should be empty after teardown, got %v", ids)
+func TestIngressManager_Apply_ListenPermissionHint(t *testing.T) {
+	permErr := &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EACCES)}
+	for _, tc := range []struct {
+		port     int
+		wantHint bool
+	}{
+		{port: 443, wantHint: true},
+		{port: 8443, wantHint: false},
+	} {
+		t.Run(strconv.Itoa(tc.port), func(t *testing.T) {
+			ctrl := newLoopbackIngressController(t)
+			ctrl.failListen(tc.port, permErr)
+			mgr, logs := newActiveIngressManager(t, ctrl)
+
+			if err := mgr.Apply([]api.IngressRule{ingressRule("web", tc.port, "", 9000)}); err == nil {
+				t.Fatal("Apply = nil, want the listen error")
+			}
+			port := "listen_port=" + strconv.Itoa(tc.port)
+			if got := logLines(logs, `msg="bridge: ingress: listen failed"`, port); got != 1 {
+				t.Fatalf("%d 'listen failed' lines, want 1:\n%s", got, logs.String())
+			}
+			hint := logLines(logs, `msg="bridge: ingress: listen failed"`, port, `hint="ports below 1024 need CAP_NET_BIND_SERVICE"`)
+			if (hint == 1) != tc.wantHint {
+				t.Errorf("hint on the line = %v, want %v:\n%s", hint == 1, tc.wantHint, logs.String())
+			}
+		})
+	}
+}
+
+func TestIngressManager_CloseErrorDropsThePort(t *testing.T) {
+	closeErr := errors.New("close failed")
+
+	t.Run("Apply", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		mgr, logs := newActiveIngressManager(t, ctrl)
+		if err := mgr.Apply([]api.IngressRule{ingressRule("web", 443, "", 9000)}); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		addr := ctrl.addr(443)
+
+		ctrl.setCloseErr(closeErr)
+		if err := mgr.Apply(nil); err != nil {
+			t.Fatalf("Apply(nil): %v", err)
+		}
+		if got := logLines(logs, `msg="bridge: ingress: close listener failed"`, "listen_port=443", "error="); got != 1 {
+			t.Errorf("%d 'close listener failed' lines, want 1:\n%s", got, logs.String())
+		}
+		if conn, err := net.Dial("tcp", addr); err == nil {
+			_ = conn.Close()
+			t.Errorf("dial %s succeeded, want the port dropped", addr)
+		}
+		ctrl.setCloseErr(nil)
+		if err := mgr.Apply([]api.IngressRule{ingressRule("web", 443, "", 9000)}); err != nil {
+			t.Fatalf("Apply again: %v", err)
+		}
+		if got := len(ctrl.ingressCallsFor("Listen")); got != 2 {
+			t.Errorf("Listen calls = %d, want 2: the dropped port binds again", got)
+		}
+	})
+
+	t.Run("Teardown", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		mgr, _ := newActiveIngressManager(t, ctrl)
+		if err := mgr.Apply([]api.IngressRule{ingressRule("web", 443, "", 9000)}); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		ctrl.setCloseErr(closeErr)
+
+		err := mgr.Teardown()
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("Teardown = %v, want it to wrap the close error", err)
+		}
+		if !strings.HasPrefix(err.Error(), "bridge: ingress: close listener 443:") {
+			t.Errorf("Teardown = %q, want the prefix %q", err, "bridge: ingress: close listener 443:")
+		}
+		if mgr.IngressStatus() != nil {
+			t.Error("IngressStatus should be nil after Teardown")
+		}
+	})
+}
+
+func TestIngressManager_Apply_PlainToSNIAndBack(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	mgr, _ := newActiveIngressManager(t, ctrl)
+
+	plain := []api.IngressRule{ingressRule("plain", 443, "", 9000)}
+	sni := []api.IngressRule{
+		ingressRule("a", 443, "a.example.com", 9441),
+		ingressRule("b", 443, "b.example.com", 9442),
+	}
+	for i, rules := range [][]api.IngressRule{plain, sni, plain} {
+		if err := mgr.Apply(rules); err != nil {
+			t.Fatalf("Apply %d: %v", i, err)
+		}
+	}
+	if got := len(ctrl.ingressCallsFor("Listen")); got != 1 {
+		t.Errorf("Listen calls = %d, want 1", got)
+	}
+	if got := len(ctrl.ingressCallsFor("Close")); got != 0 {
+		t.Errorf("Close calls = %d, want 0", got)
+	}
+	if st := stateOf(t, mgr, "plain"); !st.Served {
+		t.Errorf("rule plain = %+v, want served", st)
 	}
 }
 
 func TestIngressManager_Teardown_Idempotent(t *testing.T) {
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: false,
+	mgr, _ := newActiveIngressManager(t, newLoopbackIngressController(t))
+	if err := mgr.Apply(fourRules()); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	// Teardown when not active should return nil.
 	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("first Teardown: %v", err)
+		t.Fatalf("Teardown: %v", err)
 	}
 	if err := mgr.Teardown(); err != nil {
 		t.Fatalf("second Teardown: %v", err)
 	}
-
-	if len(ctrl.ingressCallsFor("Close")) != 0 {
-		t.Error("Close should not be called when not active")
-	}
-}
-
-// errorListener wraps a net.Listener so that Close always returns an error
-// but still actually closes the underlying listener.
-type errorListener struct {
-	net.Listener
-	closeErr error
-}
-
-func (e *errorListener) Close() error {
-	e.Listener.Close()
-	return e.closeErr
-}
-
-func TestIngressManager_Teardown_AggregatesErrors(t *testing.T) {
-	injectedErr := fmt.Errorf("injected close error")
-
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				return nil, err
-			}
-			// Wrap listener so Close returns an error but still closes.
-			return &errorListener{Listener: ln, closeErr: injectedErr}, nil
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	rule := api.IngressRule{
-		RuleID:     "rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule: %v", err)
-	}
-
-	err := mgr.Teardown()
-	if err == nil {
-		t.Fatal("Teardown should return aggregated errors")
-	}
-
-	// Despite errors, manager should be marked inactive.
-	if mgr.IngressStatus() != nil {
-		t.Error("IngressStatus should be nil after teardown even with errors")
-	}
-}
-
-func TestIngressManager_IngressStatus_Active(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Add a rule.
-	rule := api.IngressRule{
-		RuleID:     "rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule: %v", err)
-	}
-
-	status := mgr.IngressStatus()
-	if status == nil {
-		t.Fatal("IngressStatus should not be nil when active")
-	}
-	if !status.Enabled {
-		t.Error("Enabled should be true")
-	}
-	if status.RuleCount != 1 {
-		t.Errorf("RuleCount = %d, want 1", status.RuleCount)
-	}
-	if status.ConnectionCount != 0 {
-		t.Errorf("ConnectionCount = %d, want 0", status.ConnectionCount)
-	}
-
-	// Cleanup.
-	_ = mgr.Teardown()
 }
 
 func TestIngressManager_IngressStatus_Inactive(t *testing.T) {
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: false,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
+	mgr := NewIngressManager(&mockIngressController{}, ingressTestConfig(false), discardLogger(), nil)
 
 	if status := mgr.IngressStatus(); status != nil {
 		t.Errorf("IngressStatus should be nil when not active, got %+v", status)
@@ -502,16 +403,7 @@ func TestIngressManager_IngressStatus_Inactive(t *testing.T) {
 
 func TestIngressManager_IngressCapabilities(t *testing.T) {
 	t.Run("enabled", func(t *testing.T) {
-		ctrl := &mockIngressController{}
-		cfg := Config{
-			Enabled:        true,
-			AccessInterface: "eth1",
-			AccessSubnets:  []string{"10.0.0.0/24"},
-			IngressEnabled: true,
-		}
-		cfg.ApplyDefaults()
-
-		mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
+		mgr := NewIngressManager(&mockIngressController{}, ingressTestConfig(true), discardLogger(), nil)
 
 		caps := mgr.IngressCapabilities()
 		if caps == nil {
@@ -526,16 +418,7 @@ func TestIngressManager_IngressCapabilities(t *testing.T) {
 	})
 
 	t.Run("disabled", func(t *testing.T) {
-		ctrl := &mockIngressController{}
-		cfg := Config{
-			Enabled:        true,
-			AccessInterface: "eth1",
-			AccessSubnets:  []string{"10.0.0.0/24"},
-			IngressEnabled: false,
-		}
-		cfg.ApplyDefaults()
-
-		mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
+		mgr := NewIngressManager(&mockIngressController{}, ingressTestConfig(false), discardLogger(), nil)
 
 		if caps := mgr.IngressCapabilities(); caps != nil {
 			t.Errorf("IngressCapabilities should be nil when disabled, got %v", caps)
@@ -543,459 +426,63 @@ func TestIngressManager_IngressCapabilities(t *testing.T) {
 	})
 }
 
-func TestIngressManager_AddRule_TLSTerminate_InvalidCert(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	rule := api.IngressRule{
-		RuleID:     "tls-rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:443",
-		Mode:       "terminate",
-		CertPEM:    "not-a-valid-cert",
-		KeyPEM:     "not-a-valid-key",
-	}
-
-	err := mgr.AddRule(rule)
-	if err == nil {
-		t.Fatal("AddRule should return error for invalid TLS cert/key")
-	}
-
-	// Verify no listener was created (Listen should not be called since TLS parse fails first).
-	listenCalls := ctrl.ingressCallsFor("Listen")
-	if len(listenCalls) != 0 {
-		t.Errorf("Listen should not be called when TLS cert is invalid, got %d calls", len(listenCalls))
-	}
-}
-
 // ---------------------------------------------------------------------------
-// TLS terminate mode with valid cert
+// IngressReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-func TestIngressManager_AddRule_TLSTerminate_ValidCert(t *testing.T) {
-	certPEM, keyPEM := generateSelfSignedCert(t)
+func TestIngressReconcileHandler(t *testing.T) {
+	withRules := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Rules: fourRules()}}}
 
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			if tlsCfg == nil {
-				t.Error("expected non-nil TLS config for terminate mode")
+	t.Run("nil snapshot", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		mgr, _ := newActiveIngressManager(t, ctrl)
+		handler := IngressReconcileHandler(mgr, discardLogger())
+		if err := handler(t.Context(), withRules, reconcile.StateDiff{}); err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		if err := handler(t.Context(), nil, reconcile.StateDiff{}); err != nil {
+			t.Fatalf("handler(nil) = %v, want nil", err)
+		}
+		if got := len(mgr.RuleStates()); got != 4 {
+			t.Errorf("%d rule states after a nil snapshot, want the 4 kept", got)
+		}
+	})
+
+	for name, desired := range map[string]*api.NodeStateSnapshot{
+		"nil Bridge":  {},
+		"nil Ingress": {Bridge: &api.BridgeSnapshot{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := newLoopbackIngressController(t)
+			mgr, _ := newActiveIngressManager(t, ctrl)
+			handler := IngressReconcileHandler(mgr, discardLogger())
+			if err := handler(t.Context(), withRules, reconcile.StateDiff{}); err != nil {
+				t.Fatalf("handler: %v", err)
 			}
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:        true,
-		AccessInterface: "eth1",
-		AccessSubnets:  []string{"10.0.0.0/24"},
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	rule := api.IngressRule{
-		RuleID:     "tls-rule-valid",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:443",
-		Mode:       "terminate",
-		CertPEM:    certPEM,
-		KeyPEM:     keyPEM,
-	}
-
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule with valid TLS cert: %v", err)
-	}
-
-	listenCalls := ctrl.ingressCallsFor("Listen")
-	if len(listenCalls) != 1 {
-		t.Fatalf("expected 1 Listen call, got %d", len(listenCalls))
-	}
-
-	// Cleanup.
-	_ = mgr.Teardown()
-}
-
-func TestIngressManager_AddRule_InactiveRejects(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	// Do NOT call Setup — manager is inactive.
-	rule := api.IngressRule{
-		RuleID:     "rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-
-	err := mgr.AddRule(rule)
-	if err == nil {
-		t.Fatal("AddRule should return error when manager is inactive")
-	}
-
-	// Verify no listener was created.
-	if len(ctrl.ingressCallsFor("Listen")) != 0 {
-		t.Error("Listen should not be called when manager is inactive")
-	}
-}
-
-func TestIngressManager_RemoveRule_InactiveNoop(t *testing.T) {
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	// Do NOT call Setup — manager is inactive.
-	// Should not panic or call Close.
-	mgr.RemoveRule("any-rule")
-
-	if len(ctrl.ingressCallsFor("Close")) != 0 {
-		t.Error("Close should not be called when manager is inactive")
-	}
-}
-
-func TestIngressManager_GetRule(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	defer func() { _ = mgr.Teardown() }()
-
-	rule := api.IngressRule{
-		RuleID:     "rule-get",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "tcp",
-	}
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule: %v", err)
-	}
-
-	got, ok := mgr.GetRule("rule-get")
-	if !ok {
-		t.Fatal("GetRule should return true for existing rule")
-	}
-	if got != rule {
-		t.Errorf("GetRule = %+v, want %+v", got, rule)
-	}
-
-	_, ok = mgr.GetRule("nonexistent")
-	if ok {
-		t.Error("GetRule should return false for non-existent rule")
-	}
-}
-
-// generateSelfSignedCert creates a self-signed certificate for testing.
-func generateSelfSignedCert(t *testing.T) (certPEM string, keyPEM string) {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "test"},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour),
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create certificate: %v", err)
-	}
-
-	certBlock := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatalf("marshal key: %v", err)
-	}
-
-	keyBlock := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-
-	return string(certBlock), string(keyBlock)
-}
-
-// ---------------------------------------------------------------------------
-// ACME mode tests
-// ---------------------------------------------------------------------------
-
-func TestIngressManager_AddRule_ACMEMode(t *testing.T) {
-	tmpDir := t.TempDir()
-	acmeCfg := ACMEConfig{
-		Enabled:          true,
-		CacheDir:         tmpDir,
-		AllowedHosts:     []string{"example.com"},
-		ACMEDirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
-	}
-	am := NewACMEManager(acmeCfg, discardLogger())
-	if err := am.Setup(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = am.Teardown() }()
-
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			if tlsCfg == nil {
-				t.Error("expected non-nil TLS config for acme mode")
+			if err := handler(t.Context(), desired, reconcile.StateDiff{}); err != nil {
+				t.Fatalf("handler(%s): %v", name, err)
 			}
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), am)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	defer func() { _ = mgr.Teardown() }()
-
-	rule := api.IngressRule{
-		RuleID:     "acme-rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:443",
-		Mode:       "acme",
-		Hostname:   "example.com",
+			if got := len(mgr.RuleStates()); got != 0 {
+				t.Errorf("%d rule states, want none", got)
+			}
+			if got := len(ctrl.ingressCallsFor("Close")); got != 2 {
+				t.Errorf("Close calls = %d, want 2", got)
+			}
+		})
 	}
 
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule with ACME mode: %v", err)
-	}
+	t.Run("failed bind", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		ctrl.failListen(443, syscall.EADDRINUSE)
+		mgr, _ := newActiveIngressManager(t, ctrl)
+		logger, logs := newRelayLogger()
+		handler := IngressReconcileHandler(mgr, logger)
 
-	// Verify Listen was called.
-	listenCalls := ctrl.ingressCallsFor("Listen")
-	if len(listenCalls) != 1 {
-		t.Fatalf("expected 1 Listen call, got %d", len(listenCalls))
-	}
-
-	// Verify rule is tracked.
-	ids := mgr.RuleIDs()
-	if len(ids) != 1 || ids[0] != "acme-rule-1" {
-		t.Errorf("RuleIDs = %v, want [acme-rule-1]", ids)
-	}
-
-	got, ok := mgr.GetRule("acme-rule-1")
-	if !ok {
-		t.Fatal("GetRule should return true for acme-rule-1")
-	}
-	if got.Mode != "acme" {
-		t.Errorf("Mode = %q, want %q", got.Mode, "acme")
-	}
-	if got.Hostname != "example.com" {
-		t.Errorf("Hostname = %q, want %q", got.Hostname, "example.com")
-	}
-}
-
-func TestIngressManager_AddRule_ACMEMode_NoManager(t *testing.T) {
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	defer func() { _ = mgr.Teardown() }()
-
-	rule := api.IngressRule{
-		RuleID:     "acme-no-mgr",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:443",
-		Mode:       "acme",
-		Hostname:   "example.com",
-	}
-
-	err := mgr.AddRule(rule)
-	if err == nil {
-		t.Fatal("AddRule should return error when ACMEManager is nil")
-	}
-	if !strings.Contains(err.Error(), "ACME mode requires ACMEManager") {
-		t.Errorf("error = %q, want substring %q", err, "ACME mode requires ACMEManager")
-	}
-
-	// Verify no listener was created.
-	if len(ctrl.ingressCallsFor("Listen")) != 0 {
-		t.Error("Listen should not be called when ACMEManager is nil")
-	}
-}
-
-func TestIngressManager_AddRule_ACMEMode_NoHostname(t *testing.T) {
-	tmpDir := t.TempDir()
-	acmeCfg := ACMEConfig{
-		Enabled:          true,
-		CacheDir:         tmpDir,
-		AllowedHosts:     []string{"example.com"},
-		ACMEDirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
-	}
-	am := NewACMEManager(acmeCfg, discardLogger())
-	if err := am.Setup(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = am.Teardown() }()
-
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), am)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	defer func() { _ = mgr.Teardown() }()
-
-	rule := api.IngressRule{
-		RuleID:     "acme-no-host",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:443",
-		Mode:       "acme",
-		Hostname:   "",
-	}
-
-	err := mgr.AddRule(rule)
-	if err == nil {
-		t.Fatal("AddRule should return error when hostname is empty for acme mode")
-	}
-	if !strings.Contains(err.Error(), "hostname is required") {
-		t.Errorf("error = %q, want substring %q", err, "hostname is required")
-	}
-
-	// Verify no listener was created.
-	if len(ctrl.ingressCallsFor("Listen")) != 0 {
-		t.Error("Listen should not be called when hostname is empty")
-	}
-}
-
-func TestIngressManager_AddRule_ACMEMode_InactiveACME(t *testing.T) {
-	acmeCfg := ACMEConfig{
-		Enabled:          false,
-		CacheDir:         t.TempDir(),
-		AllowedHosts:     []string{"example.com"},
-		ACMEDirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
-	}
-	am := NewACMEManager(acmeCfg, discardLogger())
-	// Call Setup — but since Enabled=false, the manager stays inactive.
-	if err := am.Setup(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = am.Teardown() }()
-
-	ctrl := &mockIngressController{
-		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
-		},
-	}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), am)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	defer func() { _ = mgr.Teardown() }()
-
-	rule := api.IngressRule{
-		RuleID:     "acme-inactive",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:443",
-		Mode:       "acme",
-		Hostname:   "example.com",
-	}
-
-	err := mgr.AddRule(rule)
-	if err == nil {
-		t.Fatal("AddRule should return error when ACME manager is not active")
-	}
-	if !strings.Contains(err.Error(), "ACME manager is not active") {
-		t.Errorf("error = %q, want substring %q", err, "ACME manager is not active")
-	}
-
-	// Verify no listener was created.
-	if len(ctrl.ingressCallsFor("Listen")) != 0 {
-		t.Error("Listen should not be called when ACME manager is inactive")
-	}
+		if err := handler(t.Context(), withRules, reconcile.StateDiff{}); !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("handler = %v, want the bind error", err)
+		}
+		if got := logLines(logs, `msg="ingress reconcile: apply failed"`); got != 1 {
+			t.Errorf("%d 'apply failed' lines, want 1:\n%s", got, logs.String())
+		}
+	})
 }

@@ -1,17 +1,14 @@
-// Integration tests — ACME and SNI with Ingress
+// Integration tests — ACME with Ingress
 
 package bridge
 
 import (
-	"context"
 	"crypto/tls"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
-	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
 // ---------------------------------------------------------------------------
@@ -134,201 +131,55 @@ func TestACMEIntegration_SetupValidation(t *testing.T) {
 	})
 }
 
-// TestACMEIntegration_IngressWithACMEMode wires IngressManager with ACMEManager
-// and verifies that ACME mode rules are added and removed correctly.
-func TestACMEIntegration_IngressWithACMEMode(t *testing.T) {
-	// Create and setup ACMEManager.
-	acmeCfg := ACMEConfig{
+// TestACMEIntegration_ACMERuleIsHeldNotServed applies an acme rule with an
+// active ACMEManager: the block names no certificate source yet, so the rule
+// is held and not served, and its port opens no listener.
+func TestACMEIntegration_ACMERuleIsHeldNotServed(t *testing.T) {
+	acmeMgr := NewACMEManager(ACMEConfig{
 		Enabled:      true,
 		CacheDir:     t.TempDir(),
 		AllowedHosts: []string{"example.com"},
 		Email:        "admin@example.com",
-	}
-	acmeMgr := NewACMEManager(acmeCfg, discardLogger())
+	}, discardLogger())
 	if err := acmeMgr.Setup(); err != nil {
 		t.Fatalf("ACME Setup: %v", err)
 	}
+	defer func() { _ = acmeMgr.Teardown() }()
 
-	// Create IngressManager with ACMEManager.
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		IngressEnabled: true,
-	}
+	ctrl := newLoopbackIngressController(t)
+	cfg := Config{Enabled: true, IngressEnabled: true}
 	cfg.ApplyDefaults()
-
 	mgr := NewIngressManager(ctrl, cfg, discardLogger(), acmeMgr)
-
-	// Setup IngressManager.
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Ingress Setup: %v", err)
 	}
-	ctrl.resetIngress()
+	defer func() { _ = mgr.Teardown() }()
 
-	// AddRule with Mode="acme" succeeds.
 	rule := api.IngressRule{
-		RuleID:     "acme-rule-1",
-		ListenPort: 0,
-		TargetAddr: "10.0.0.5:8080",
-		Mode:       "acme",
-		Hostname:   "example.com",
+		ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+		Slug:          "api",
+		ListenPort:    443,
+		Mode:          api.IngressModeACME,
+		SNIHost:       "example.com",
+		TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		TargetAddress: "10.0.0.5",
+		TargetPort:    8080,
 	}
-	if err := mgr.AddRule(rule); err != nil {
-		t.Fatalf("AddRule: %v", err)
-	}
-
-	// Verify the listener was created (Listen was called with a non-nil TLS config).
-	listenCalls := ctrl.ingressCallsFor("Listen")
-	if len(listenCalls) != 1 {
-		t.Fatalf("Listen calls = %d, want 1", len(listenCalls))
-	}
-	if listenCalls[0].Args[1] == nil {
-		t.Error("Listen should have been called with non-nil TLS config for ACME mode")
+	if err := mgr.Apply([]api.IngressRule{rule}); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
 
-	// Verify the rule is tracked.
-	ids := mgr.RuleIDs()
-	if len(ids) != 1 || ids[0] != "acme-rule-1" {
-		t.Errorf("RuleIDs = %v, want [acme-rule-1]", ids)
+	states := mgr.RuleStates()
+	if len(states) != 1 || states[0].Served || states[0].Reason != IngressReasonModeNotServed {
+		t.Fatalf("RuleStates = %+v, want one state with reason %q", states, IngressReasonModeNotServed)
 	}
-
-	// RemoveRule works.
-	mgr.RemoveRule("acme-rule-1")
-	if len(mgr.RuleIDs()) != 0 {
-		t.Errorf("RuleIDs after remove = %v, want empty", mgr.RuleIDs())
+	if got := len(ctrl.ingressCallsFor("Listen")); got != 0 {
+		t.Errorf("Listen calls = %d, want 0", got)
 	}
-
-	closeCalls := ctrl.ingressCallsFor("Close")
-	if len(closeCalls) != 1 {
-		t.Errorf("Close calls = %d, want 1", len(closeCalls))
+	status := mgr.IngressStatus()
+	if status.RuleCount != 0 || !status.ACMEEnabled {
+		t.Errorf("IngressStatus = %+v, want no served rule and ACMEEnabled", status)
 	}
-
-	// Teardown both managers.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Ingress Teardown: %v", err)
-	}
-	if err := acmeMgr.Teardown(); err != nil {
-		t.Fatalf("ACME Teardown: %v", err)
-	}
-}
-
-// TestACMEIntegration_IngressACMEModeErrors tests error cases for ACME mode
-// in IngressManager.
-func TestACMEIntegration_IngressACMEModeErrors(t *testing.T) {
-	// AddRule with Mode="acme" when ACMEManager is nil.
-	t.Run("nil_acme_manager", func(t *testing.T) {
-		ctrl := &mockIngressController{}
-		cfg := Config{
-			Enabled:        true,
-			IngressEnabled: true,
-		}
-		cfg.ApplyDefaults()
-
-		mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
-		if err := mgr.Setup(); err != nil {
-			t.Fatalf("Setup: %v", err)
-		}
-
-		rule := api.IngressRule{
-			RuleID:     "acme-nil-1",
-			ListenPort: 0,
-			TargetAddr: "10.0.0.5:8080",
-			Mode:       "acme",
-			Hostname:   "example.com",
-		}
-		err := mgr.AddRule(rule)
-		if err == nil {
-			t.Fatal("AddRule should return error when ACMEManager is nil")
-		}
-		if !strings.Contains(err.Error(), "ACME mode requires ACMEManager") {
-			t.Errorf("error = %q, want to contain %q", err.Error(), "ACME mode requires ACMEManager")
-		}
-
-		_ = mgr.Teardown()
-	})
-
-	// AddRule with Mode="acme" when hostname is empty.
-	t.Run("empty_hostname", func(t *testing.T) {
-		acmeCfg := ACMEConfig{
-			Enabled:      true,
-			CacheDir:     t.TempDir(),
-			AllowedHosts: []string{"example.com"},
-		}
-		acmeMgr := NewACMEManager(acmeCfg, discardLogger())
-		if err := acmeMgr.Setup(); err != nil {
-			t.Fatalf("ACME Setup: %v", err)
-		}
-
-		ctrl := &mockIngressController{}
-		cfg := Config{
-			Enabled:        true,
-			IngressEnabled: true,
-		}
-		cfg.ApplyDefaults()
-
-		mgr := NewIngressManager(ctrl, cfg, discardLogger(), acmeMgr)
-		if err := mgr.Setup(); err != nil {
-			t.Fatalf("Setup: %v", err)
-		}
-
-		rule := api.IngressRule{
-			RuleID:     "acme-no-host-1",
-			ListenPort: 0,
-			TargetAddr: "10.0.0.5:8080",
-			Mode:       "acme",
-			Hostname:   "",
-		}
-		err := mgr.AddRule(rule)
-		if err == nil {
-			t.Fatal("AddRule should return error when hostname is empty")
-		}
-		if !strings.Contains(err.Error(), "hostname is required for ACME mode") {
-			t.Errorf("error = %q, want to contain %q", err.Error(), "hostname is required for ACME mode")
-		}
-
-		_ = mgr.Teardown()
-		_ = acmeMgr.Teardown()
-	})
-
-	// AddRule with Mode="acme" when ACME manager is not active (not Setup).
-	t.Run("acme_not_active", func(t *testing.T) {
-		acmeCfg := ACMEConfig{
-			Enabled:      true,
-			CacheDir:     t.TempDir(),
-			AllowedHosts: []string{"example.com"},
-		}
-		// Create but do NOT Setup — manager is not active.
-		acmeMgr := NewACMEManager(acmeCfg, discardLogger())
-
-		ctrl := &mockIngressController{}
-		cfg := Config{
-			Enabled:        true,
-			IngressEnabled: true,
-		}
-		cfg.ApplyDefaults()
-
-		mgr := NewIngressManager(ctrl, cfg, discardLogger(), acmeMgr)
-		if err := mgr.Setup(); err != nil {
-			t.Fatalf("Setup: %v", err)
-		}
-
-		rule := api.IngressRule{
-			RuleID:     "acme-inactive-1",
-			ListenPort: 0,
-			TargetAddr: "10.0.0.5:8080",
-			Mode:       "acme",
-			Hostname:   "example.com",
-		}
-		err := mgr.AddRule(rule)
-		if err == nil {
-			t.Fatal("AddRule should return error when ACME manager is not active")
-		}
-		if !strings.Contains(err.Error(), "ACME manager is not active") {
-			t.Errorf("error = %q, want to contain %q", err.Error(), "ACME manager is not active")
-		}
-
-		_ = mgr.Teardown()
-	})
 }
 
 // TestACMEIntegration_TLSConfigProperties tests that TLSConfig returns a
@@ -423,111 +274,4 @@ func TestACMEIntegration_ConcurrentTLSConfigAccess(t *testing.T) {
 
 	// Cleanup.
 	_ = mgr.Teardown()
-}
-
-// TestACMEIntegration_IngressReconcileWithACME wires IngressManager with
-// ACMEManager and a real Reconciler. Verifies that reconciliation correctly
-// adds ACME mode rules, then updates them when state changes.
-func TestACMEIntegration_IngressReconcileWithACME(t *testing.T) {
-	// Create and setup ACMEManager.
-	acmeCfg := ACMEConfig{
-		Enabled:      true,
-		CacheDir:     t.TempDir(),
-		AllowedHosts: []string{"app.example.com", "api.example.com"},
-		Email:        "admin@example.com",
-	}
-	acmeMgr := NewACMEManager(acmeCfg, discardLogger())
-	if err := acmeMgr.Setup(); err != nil {
-		t.Fatalf("ACME Setup: %v", err)
-	}
-
-	// Create IngressManager with ACMEManager.
-	ctrl := &mockIngressController{}
-	cfg := Config{
-		Enabled:        true,
-		IngressEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), acmeMgr)
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Ingress Setup: %v", err)
-	}
-	ctrl.resetIngress()
-
-	// Initial state: one ACME ingress rule.
-	state1 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			Ingress: &api.IngressConfig{
-				Enabled: true,
-				Rules: []api.IngressRule{
-					{
-						RuleID:     "acme-reconcile-1",
-						ListenPort: 0,
-						TargetAddr: "10.0.0.5:8080",
-						Mode:       "acme",
-						Hostname:   "app.example.com",
-					},
-				},
-			},
-		},
-	}
-	fetcher := &integrationStateFetcher{state: state1}
-
-	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, discardLogger())
-	rec.RegisterHandler(IngressReconcileHandler(mgr, discardLogger()))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- rec.Run(ctx, "node-acme") }()
-
-	// Wait for initial cycle: acme-reconcile-1 should be added (1 Listen call).
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ctrl.ingressCallsFor("Listen")) >= 1
-	})
-
-	ids := mgr.RuleIDs()
-	if len(ids) != 1 || ids[0] != "acme-reconcile-1" {
-		t.Errorf("RuleIDs after initial reconcile = %v, want [acme-reconcile-1]", ids)
-	}
-
-	// Update state: remove acme-reconcile-1, add acme-reconcile-2.
-	state2 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			Ingress: &api.IngressConfig{
-				Enabled: true,
-				Rules: []api.IngressRule{
-					{
-						RuleID:     "acme-reconcile-2",
-						ListenPort: 0,
-						TargetAddr: "10.0.0.6:9090",
-						Mode:       "acme",
-						Hostname:   "api.example.com",
-					},
-				},
-			},
-		},
-	}
-	fetcher.setState(state2)
-	rec.TriggerReconcile()
-
-	// Wait for: 1 Close (acme-reconcile-1 removed) + 1 more Listen (acme-reconcile-2 added).
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ctrl.ingressCallsFor("Listen")) >= 2 &&
-			len(ctrl.ingressCallsFor("Close")) >= 1
-	})
-
-	ids = mgr.RuleIDs()
-	if len(ids) != 1 || ids[0] != "acme-reconcile-2" {
-		t.Errorf("RuleIDs after second reconcile = %v, want [acme-reconcile-2]", ids)
-	}
-
-	cancel()
-	<-done
-
-	// Clean up any remaining listeners/goroutines.
-	_ = mgr.Teardown()
-	_ = acmeMgr.Teardown()
 }

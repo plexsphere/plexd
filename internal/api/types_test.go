@@ -2020,73 +2020,186 @@ func TestTypesUserAccessInfo(t *testing.T) {
 
 func TestIngressConfig_JSONRoundTrip(t *testing.T) {
 	orig := IngressConfig{
-		Enabled: true,
 		Rules: []IngressRule{
 			{
-				RuleID:     "rule-001",
-				ListenPort: 443,
-				TargetAddr: "10.42.0.5:8443",
-				Mode:       "passthrough",
+				ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+				Slug:          "web",
+				ListenPort:    443,
+				Mode:          IngressModePassthrough,
+				SNIHost:       "web.example.com",
+				TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+				TargetAddress: "10.42.0.5",
+				TargetPort:    8443,
 			},
 			{
-				RuleID:     "rule-002",
-				ListenPort: 8080,
-				TargetAddr: "10.42.0.6:80",
-				Mode:       "terminate",
-				CertPEM:    "-----BEGIN CERTIFICATE-----\nMIIB...",
-				KeyPEM:     "-----BEGIN PRIVATE KEY-----\nMIIE...",
+				ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2",
+				Slug:          "ssh",
+				ListenPort:    2222,
+				Mode:          IngressModePassthrough,
+				TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+				TargetAddress: "fd00::7",
+				TargetPort:    22,
 			},
 		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Verify snake_case keys.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"enabled", "rules"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
+	if _, ok := raw["rules"]; !ok {
+		t.Error(`expected JSON key "rules"`)
+	}
+	if _, ok := raw["enabled"]; ok {
+		t.Errorf(`unexpected JSON key "enabled", got: %s`, data)
 	}
 }
 
 func TestIngressRule_JSONRoundTrip(t *testing.T) {
-	// With CertPEM and KeyPEM set.
 	orig := IngressRule{
-		RuleID:     "rule-001",
-		ListenPort: 443,
-		TargetAddr: "10.42.0.5:8443",
-		Mode:       "terminate",
-		CertPEM:    "-----BEGIN CERTIFICATE-----\nMIIB...",
-		KeyPEM:     "-----BEGIN PRIVATE KEY-----\nMIIE...",
+		ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+		Slug:          "web",
+		ListenPort:    443,
+		Mode:          IngressModeTerminate,
+		SNIHost:       "web.example.com",
+		TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		TargetAddress: "10.42.0.5",
+		TargetPort:    8443,
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Verify snake_case keys.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"rule_id", "listen_port", "target_addr", "mode", "cert_pem", "key_pem"} {
+	for _, key := range []string{"id", "slug", "listen_port", "mode", "sni_host", "target_node_id", "target_address", "target_port"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
 	}
 
-	// CertPEM and KeyPEM should be omitted when empty.
-	orig.CertPEM = ""
-	orig.KeyPEM = ""
+	// A rule without a host emits no sni_host key.
+	orig.Mode = IngressModePassthrough
+	orig.SNIHost = ""
 	data2, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data2); strings.Contains(s, `"cert_pem"`) {
-		t.Errorf("cert_pem should be omitted when empty, got: %s", s)
+	if s := string(data2); strings.Contains(s, `"sni_host"`) {
+		t.Errorf("sni_host should be omitted when empty, got: %s", s)
 	}
-	if s := string(data2); strings.Contains(s, `"key_pem"`) {
-		t.Errorf("key_pem should be omitted when empty, got: %s", s)
+
+	// A rule in the shape before the control plane's rule model decodes
+	// without an error, into a rule with an empty ID.
+	var old IngressRule
+	if err := json.Unmarshal([]byte(`{"rule_id":"ingress-001","listen_port":443,"target_addr":"10.99.0.2:8443","mode":"tcp","hostname":"app.example.com","cert_pem":"-----BEGIN CERTIFICATE-----"}`), &old); err != nil {
+		t.Fatalf("decode old shape: %v", err)
+	}
+	if old.ID != "" {
+		t.Errorf("ID = %q, want empty", old.ID)
+	}
+}
+
+// TestIngressConfig_DecodesContractBlock decodes the example block of the
+// agent contract's Public ingress section (plexsphere/plexsphere@c50e616,
+// docs/reference/api/plexd-agent-contract.md).
+func TestIngressConfig_DecodesContractBlock(t *testing.T) {
+	const block = `{
+  "ingress": {
+    "rules": [
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+        "slug": "api",
+        "listen_port": 443,
+        "mode": "acme",
+        "sni_host": "api.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "target_address": "10.42.0.7",
+        "target_port": 8443
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2",
+        "slug": "apps",
+        "listen_port": 443,
+        "mode": "passthrough",
+        "sni_host": "*.apps.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+        "target_address": "10.42.0.8",
+        "target_port": 443
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3",
+        "slug": "mqtt",
+        "listen_port": 8883,
+        "mode": "terminate",
+        "sni_host": "mqtt.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "target_address": "10.42.0.7",
+        "target_port": 1883
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4",
+        "slug": "ssh",
+        "listen_port": 2222,
+        "mode": "passthrough",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+        "target_address": "10.42.0.8",
+        "target_port": 22
+      }
+    ]
+  }
+}`
+	var bridge BridgeSnapshot
+	if err := json.Unmarshal([]byte(block), &bridge); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if bridge.Ingress == nil {
+		t.Fatal("Ingress is nil")
+	}
+	want := []IngressRule{
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", Slug: "mqtt", ListenPort: 8883, Mode: IngressModeTerminate, SNIHost: "mqtt.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 1883},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", Slug: "ssh", ListenPort: 2222, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 22},
+	}
+	requireEqual(t, want, bridge.Ingress.Rules)
+	if got := bridge.Ingress.Rules[3]; got.Slug != "ssh" || got.SNIHost != "" {
+		t.Errorf("rule ssh = %+v, want an empty SNIHost", got)
+	}
+}
+
+// TestBridgeSnapshot_IngressPresence decodes an absent and a null ingress
+// child into a nil Ingress, and an empty or null rule list into a non-nil
+// Ingress without rules.
+func TestBridgeSnapshot_IngressPresence(t *testing.T) {
+	for _, tc := range []struct {
+		body    string
+		wantNil bool
+	}{
+		{body: `{"ingress":null}`, wantNil: true},
+		{body: `{}`, wantNil: true},
+		{body: `{"ingress":{"rules":[]}}`, wantNil: false},
+		{body: `{"ingress":{"rules":null}}`, wantNil: false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			var bridge BridgeSnapshot
+			if err := json.Unmarshal([]byte(tc.body), &bridge); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if tc.wantNil {
+				if bridge.Ingress != nil {
+					t.Errorf("Ingress = %+v, want nil", bridge.Ingress)
+				}
+				return
+			}
+			if bridge.Ingress == nil {
+				t.Fatal("Ingress is nil, want a block")
+			}
+			if len(bridge.Ingress.Rules) != 0 {
+				t.Errorf("Rules = %+v, want none", bridge.Ingress.Rules)
+			}
+		})
 	}
 }
 
@@ -2301,35 +2414,6 @@ func TestSiteToSiteInfo_TunnelProviderNames_JSONRoundTrip(t *testing.T) {
 	data2, _ := roundTrip(t, orig)
 	if s := string(data2); strings.Contains(s, `"tunnel_provider_names"`) {
 		t.Errorf("tunnel_provider_names should be omitted when nil, got: %s", s)
-	}
-}
-
-func TestIngressRule_Hostname_JSONRoundTrip(t *testing.T) {
-	// With Hostname set (ACME mode).
-	orig := IngressRule{
-		RuleID:     "rule-acme-001",
-		ListenPort: 443,
-		TargetAddr: "10.42.0.5:8443",
-		Mode:       "acme",
-		Hostname:   "app.example.com",
-	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify hostname key present.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["hostname"]; !ok {
-		t.Errorf("expected JSON key %q", "hostname")
-	}
-
-	// Hostname should be omitted when empty.
-	orig.Hostname = ""
-	data2, _ := roundTrip(t, orig)
-	if s := string(data2); strings.Contains(s, `"hostname"`) {
-		t.Errorf("hostname should be omitted when empty, got: %s", s)
 	}
 }
 

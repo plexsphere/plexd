@@ -2,12 +2,14 @@ package bridge
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -16,32 +18,60 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// activeRule holds the state of a running ingress rule.
-type activeRule struct {
-	rule     api.IngressRule
-	listener net.Listener
-	cancel   context.CancelFunc
-	done     chan struct{} // closed when accept loop exits
+// lowPortHint is logged with a listen failure that a missing
+// CAP_NET_BIND_SERVICE explains.
+const lowPortHint = "ports below 1024 need CAP_NET_BIND_SERVICE"
+
+// The reasons a connection is closed without reaching a target.
+const (
+	connReasonNoClientHello = "no_client_hello"
+	connReasonNoServerName  = "no_server_name"
+	connReasonNoMatch       = "no_matching_rule"
+	connReasonNotServed     = "rule_not_served"
+)
+
+// ingressListener is the one TCP listener of a listen port and the table its
+// accept loop routes by.
+type ingressListener struct {
+	port  int
+	ln    net.Listener
+	table atomic.Pointer[ingressTable]
+	done  chan struct{} // closed when the accept loop exits
 }
 
-// IngressManager manages public ingress — TCP listeners that proxy traffic
-// to mesh-internal services via a bridge node.
+// notServedKey identifies a "rule not served" line already logged.
+type notServedKey struct {
+	rule   api.IngressRule
+	reason string
+}
+
+// IngressManager serves public ingress: one TCP listener per listen port of the
+// bridge.ingress block, routing each connection to the target of its rule.
 // IngressManager is concurrent-safe via mu.
 type IngressManager struct {
 	ctrl        IngressController
 	cfg         Config
 	logger      *slog.Logger
 	dialTimeout time.Duration
+	peekTimeout time.Duration
 	acme        *ACMEManager // optional, may be nil
 
-	// mu protects active, activeRules from concurrent access by
-	// SSE event handlers and the reconcile loop.
+	// mu protects the fields below from concurrent access by the reconcile
+	// loop and status readers.
 	mu sync.Mutex
 
-	// tracked state
-	active      bool
-	activeRules map[string]*activeRule // keyed by rule ID
-	connCount   atomic.Int64          // total active proxy connections across all rules
+	active bool
+	// ctx is the parent of every route's context and is cancelled by
+	// Teardown, which closes every connection, also one still in its peek.
+	ctx       context.Context
+	cancel    context.CancelFunc
+	listeners map[int]*ingressListener
+	states    []IngressRuleState
+	held      map[string]api.IngressRule // the held rules of the last Apply, by id
+	heldOrder []string                   // their ids, in block order
+	notServed map[notServedKey]struct{}  // the "rule not served" lines of the last Apply
+
+	connCount atomic.Int64 // connections from accept to close, across all ports
 }
 
 // NewIngressManager creates a new IngressManager.
@@ -52,8 +82,9 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 		cfg:         cfg,
 		logger:      logger,
 		dialTimeout: cfg.IngressDialTimeout,
+		peekTimeout: sniPeekTimeout,
 		acme:        acme,
-		activeRules: make(map[string]*activeRule),
+		listeners:   make(map[int]*ingressListener),
 	}
 }
 
@@ -68,6 +99,7 @@ func (m *IngressManager) Setup() error {
 	}
 
 	m.active = true
+	m.ctx, m.cancel = context.WithCancel(context.Background())
 
 	m.logger.Info("ingress manager started",
 		"component", "bridge",
@@ -78,9 +110,9 @@ func (m *IngressManager) Setup() error {
 	return nil
 }
 
-// Teardown closes all active listeners and cancels proxy connections.
-// Errors are aggregated — cleanup continues even when individual operations fail.
-// Idempotent: calling Teardown when inactive returns nil.
+// Teardown cancels every route, which closes every connection, and closes
+// every listener. Errors are aggregated; cleanup continues past a failed
+// close. Idempotent: calling Teardown when inactive returns nil.
 func (m *IngressManager) Teardown() error {
 	m.mu.Lock()
 
@@ -89,26 +121,27 @@ func (m *IngressManager) Teardown() error {
 		return nil
 	}
 
+	m.cancel()
 	var errs []error
-	doneChans := make([]chan struct{}, 0, len(m.activeRules))
-
-	for id, ar := range m.activeRules {
-		doneChans = append(doneChans, ar.done)
-		// Cancel accept loop and proxy connections.
-		ar.cancel()
-		// Close the listener.
-		if err := m.ctrl.Close(ar.listener); err != nil {
-			errs = append(errs, fmt.Errorf("bridge: ingress: close rule %s: %w", id, err))
+	closed := m.sortedListeners()
+	for _, l := range closed {
+		if err := m.closeListener(l); err != nil {
+			errs = append(errs, fmt.Errorf("bridge: ingress: close listener %d: %w", l.port, err))
 		}
 	}
 
 	m.active = false
-	m.activeRules = make(map[string]*activeRule)
+	m.listeners = make(map[int]*ingressListener)
+	m.states = nil
+	m.held = nil
+	m.heldOrder = nil
+	m.notServed = nil
 	m.mu.Unlock()
 
-	// Wait for all accept loop goroutines to exit outside the lock.
-	for _, done := range doneChans {
-		<-done
+	// Wait for the accept loops outside the lock.
+	for _, l := range closed {
+		<-l.done
+		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port)
 	}
 
 	if len(errs) == 0 {
@@ -120,193 +153,300 @@ func (m *IngressManager) Teardown() error {
 	return errors.Join(errs...)
 }
 
-// AddRule adds an ingress rule and starts a TCP listener for it.
-// Returns an error if the manager is inactive, the rule ID already exists,
-// or the maximum rule count is reached.
-func (m *IngressManager) AddRule(rule api.IngressRule) error {
+// Apply makes the manager serve exactly the given rules.
+//
+// It plans the block, opens a listener for each port in the plan that has
+// none, swaps the routing table of every other port in place, and closes the
+// listeners of ports the plan no longer names. A route whose rule is unchanged
+// keeps its context and its connections; every other route of the last Apply
+// is cancelled, which closes its connections. A failed bind marks the port's
+// rules listen_failed and is retried by the next Apply; the other ports are
+// served. The result joins the bind errors and is nil when there are none.
+func (m *IngressManager) Apply(rules []api.IngressRule) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if !m.active {
-		return fmt.Errorf("bridge: ingress: manager is not active")
+		m.mu.Unlock()
+		return errors.New("bridge: ingress: manager is not active")
 	}
 
-	if _, ok := m.activeRules[rule.RuleID]; ok {
-		return fmt.Errorf("bridge: ingress: rule already exists: %s", rule.RuleID)
+	plan := planIngress(rules, m.cfg.MaxIngressRules)
+
+	// Carry the routes of unchanged rules over, with their contexts, and give
+	// every other planned route a new one.
+	current := make(map[string]*ingressRoute)
+	for _, l := range m.listeners {
+		for _, r := range l.table.Load().routes() {
+			current[r.rule.ID] = r
+		}
 	}
-	if len(m.activeRules) >= m.cfg.MaxIngressRules {
-		return fmt.Errorf("bridge: ingress: max rules reached (%d)", m.cfg.MaxIngressRules)
+	carried := make(map[*ingressRoute]struct{})
+	for _, t := range plan.tables {
+		for _, r := range t.routes() {
+			if old, ok := current[r.rule.ID]; ok && old.rule == r.rule {
+				r.ctx, r.cancel = old.ctx, old.cancel
+				carried[old] = struct{}{}
+				continue
+			}
+			r.ctx, r.cancel = context.WithCancel(m.ctx)
+		}
+	}
+	for _, old := range current {
+		if _, ok := carried[old]; !ok {
+			old.cancel()
+		}
 	}
 
-	// Build TLS config for terminate or acme mode.
-	var tlsCfg *tls.Config
-	switch rule.Mode {
-	case "terminate":
-		cert, err := tls.X509KeyPair([]byte(rule.CertPEM), []byte(rule.KeyPEM))
+	var errs []error
+	failed := make(map[int]struct{})
+	for _, port := range slices.Sorted(maps.Keys(plan.tables)) {
+		t := plan.tables[port]
+		if l, ok := m.listeners[port]; ok {
+			l.table.Store(t)
+			continue
+		}
+		addr := ":" + strconv.Itoa(port)
+		ln, err := m.ctrl.Listen(addr, nil)
 		if err != nil {
-			return fmt.Errorf("bridge: ingress: rule %s: load TLS certificate: %w", rule.RuleID, err)
+			failed[port] = struct{}{}
+			for _, r := range t.routes() {
+				r.cancel()
+			}
+			attrs := []any{"component", "bridge", "listen_port", port, "error", err}
+			if port < 1024 && errors.Is(err, fs.ErrPermission) {
+				attrs = append(attrs, "hint", lowPortHint)
+			}
+			m.logger.Error("bridge: ingress: listen failed", attrs...)
+			errs = append(errs, fmt.Errorf("bridge: ingress: listen on %s: %w", addr, err))
+			continue
 		}
-		tlsCfg = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-	case "acme":
-		if m.acme == nil {
-			return fmt.Errorf("bridge: ingress: rule %s: ACME mode requires ACMEManager", rule.RuleID)
-		}
-		if rule.Hostname == "" {
-			return fmt.Errorf("bridge: ingress: rule %s: hostname is required for ACME mode", rule.RuleID)
-		}
-		tlsCfg = m.acme.TLSConfig()
-		if tlsCfg == nil {
-			return fmt.Errorf("bridge: ingress: rule %s: ACME manager is not active", rule.RuleID)
-		}
+		l := &ingressListener{port: port, ln: ln, done: make(chan struct{})}
+		l.table.Store(t)
+		m.listeners[port] = l
+		go m.acceptLoop(m.ctx, l)
+		m.logger.Info("ingress listener opened", "component", "bridge", "listen_port", port)
 	}
 
-	addr := ":" + strconv.Itoa(rule.ListenPort)
-	ln, err := m.ctrl.Listen(addr, tlsCfg)
-	if err != nil {
-		return fmt.Errorf("bridge: ingress: rule %s: listen on %s: %w", rule.RuleID, addr, err)
+	var closed []*ingressListener
+	for _, l := range m.sortedListeners() {
+		if _, ok := plan.tables[l.port]; ok {
+			continue
+		}
+		delete(m.listeners, l.port)
+		if err := m.closeListener(l); err != nil {
+			m.logger.Error("bridge: ingress: close listener failed",
+				"component", "bridge",
+				"listen_port", l.port,
+				"error", err,
+			)
+		}
+		closed = append(closed, l)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	ar := &activeRule{
-		rule:     rule,
-		listener: ln,
-		cancel:   cancel,
-		done:     make(chan struct{}),
+	for i := range plan.states {
+		st := &plan.states[i]
+		if _, ok := failed[st.Rule.ListenPort]; ok && st.Served {
+			st.Served = false
+			st.Reason = IngressReasonListenFailed
+		}
 	}
-
-	m.activeRules[rule.RuleID] = ar
-
-	// Start accept loop in a goroutine.
-	go m.acceptLoop(ctx, ar)
-
-	m.logger.Info("ingress rule added",
-		"component", "bridge",
-		"rule_id", rule.RuleID,
-		"listen_port", rule.ListenPort,
-		"target", rule.TargetAddr,
-		"mode", rule.Mode,
-	)
-
-	return nil
-}
-
-// RemoveRule stops the listener for the given rule ID and removes it.
-// Removing a non-existent rule or calling on an inactive manager is a no-op.
-func (m *IngressManager) RemoveRule(ruleID string) {
-	m.mu.Lock()
-	if !m.active {
-		m.mu.Unlock()
-		return
-	}
-	ar, ok := m.activeRules[ruleID]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-	delete(m.activeRules, ruleID)
+	m.logRuleChanges(plan.states)
+	m.states = plan.states
 	m.mu.Unlock()
 
-	ar.cancel()
-	if err := m.ctrl.Close(ar.listener); err != nil {
-		m.logger.Error("bridge: ingress: close rule failed",
+	// Wait for the accept loops of closed listeners outside the lock.
+	for _, l := range closed {
+		<-l.done
+		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port)
+	}
+
+	return errors.Join(errs...)
+}
+
+// logRuleChanges logs the held rules that were added, updated or removed
+// since the last Apply, and each rule not served whose value or reason
+// changed since then. The caller holds mu.
+func (m *IngressManager) logRuleChanges(states []IngressRuleState) {
+	held := make(map[string]api.IngressRule)
+	var order []string
+	notServed := make(map[notServedKey]struct{})
+
+	for _, st := range states {
+		r := st.Rule
+		if st.Served || st.Reason == IngressReasonModeNotServed || st.Reason == IngressReasonListenFailed {
+			held[r.ID] = r
+			order = append(order, r.ID)
+			if old, ok := m.held[r.ID]; !ok {
+				m.logRule("ingress rule added", r)
+			} else if old != r {
+				m.logRule("ingress rule updated", r)
+			}
+		}
+		if st.Reason == "" {
+			continue
+		}
+		key := notServedKey{rule: r, reason: st.Reason}
+		notServed[key] = struct{}{}
+		if _, ok := m.notServed[key]; ok {
+			continue
+		}
+		m.logger.Warn("ingress rule not served",
 			"component", "bridge",
-			"rule_id", ruleID,
-			"error", err,
+			"rule_id", r.ID,
+			"slug", r.Slug,
+			"listen_port", r.ListenPort,
+			"reason", st.Reason,
+			"detail", st.Detail,
 		)
 	}
-	// Wait for the accept loop goroutine to exit.
-	<-ar.done
+	for _, id := range m.heldOrder {
+		if _, ok := held[id]; !ok {
+			m.logRule("ingress rule removed", m.held[id])
+		}
+	}
 
-	m.logger.Info("ingress rule removed",
+	m.held = held
+	m.heldOrder = order
+	m.notServed = notServed
+}
+
+func (m *IngressManager) logRule(msg string, r api.IngressRule) {
+	m.logger.Info(msg,
 		"component", "bridge",
-		"rule_id", ruleID,
+		"rule_id", r.ID,
+		"slug", r.Slug,
+		"listen_port", r.ListenPort,
+		"mode", r.Mode,
+		"sni_host", r.SNIHost,
+		"target", net.JoinHostPort(r.TargetAddress, strconv.Itoa(r.TargetPort)),
 	)
 }
 
-// GetRule returns the IngressRule for the given ID and true if it exists,
-// or a zero value and false otherwise.
-func (m *IngressManager) GetRule(ruleID string) (api.IngressRule, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ar, ok := m.activeRules[ruleID]
-	if !ok {
-		return api.IngressRule{}, false
+// sortedListeners returns the listeners by port. The caller holds mu.
+func (m *IngressManager) sortedListeners() []*ingressListener {
+	out := make([]*ingressListener, 0, len(m.listeners))
+	for _, port := range slices.Sorted(maps.Keys(m.listeners)) {
+		out = append(out, m.listeners[port])
 	}
-	return ar.rule, true
+	return out
 }
 
-// RuleIDs returns the IDs of all active rules.
-func (m *IngressManager) RuleIDs() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ids := make([]string, 0, len(m.activeRules))
-	for id := range m.activeRules {
-		ids = append(ids, id)
+// closeListener closes a listener through the controller. When the controller
+// fails, the listener is closed directly, so its accept loop ends and the port
+// is dropped either way; the controller's error is returned.
+func (m *IngressManager) closeListener(l *ingressListener) error {
+	err := m.ctrl.Close(l.ln)
+	if err != nil {
+		_ = l.ln.Close()
 	}
-	return ids
+	return err
 }
 
-// acceptLoop accepts connections on the listener and proxies them to the target.
-func (m *IngressManager) acceptLoop(ctx context.Context, ar *activeRule) {
-	defer close(ar.done)
+// RuleStates returns the outcome of the last Apply, one entry per rule.
+func (m *IngressManager) RuleStates() []IngressRuleState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.states)
+}
+
+// acceptLoop accepts the connections of one listener until it is closed.
+func (m *IngressManager) acceptLoop(ctx context.Context, l *ingressListener) {
+	defer close(l.done)
 	for {
-		conn, err := ar.listener.Accept()
+		conn, err := l.ln.Accept()
 		if err != nil {
-			// Context cancelled (clean shutdown) or listener closed.
 			return
 		}
-
 		m.connCount.Add(1)
-		go m.proxyConnection(ctx, ar.rule, conn)
+		go m.serveConn(ctx, l, conn)
 	}
 }
 
-// proxyConnection dials the target and relays data bidirectionally.
-func (m *IngressManager) proxyConnection(ctx context.Context, rule api.IngressRule, clientConn net.Conn) {
-	defer func() {
-		clientConn.Close()
-		m.connCount.Add(-1)
-	}()
+// serveConn routes one connection by the table its port holds now: to the
+// plain rule without reading, or by the server name of its ClientHello.
+func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn net.Conn) {
+	defer m.connCount.Add(-1)
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
-	// Dial the target with timeout.
+	table := l.table.Load()
+	route := table.plain
+	var peeked []byte
+	if route == nil {
+		name, p, err := peekClientHello(conn, m.peekTimeout)
+		var reason string
+		switch {
+		case err != nil:
+			reason = connReasonNoClientHello
+		case name == "":
+			reason = connReasonNoServerName
+		default:
+			route = table.match(name)
+			switch {
+			case route == nil:
+				reason = connReasonNoMatch
+			case !route.served:
+				reason = connReasonNotServed
+			}
+		}
+		if reason != "" {
+			m.logger.Debug("ingress connection closed",
+				"component", "bridge",
+				"listen_port", l.port,
+				"remote", conn.RemoteAddr().String(),
+				"server_name", name,
+				"reason", reason,
+			)
+			return
+		}
+		peeked = p
+	}
+
+	m.proxy(route, conn, peeked)
+}
+
+// proxy dials the route's target, replays the peeked bytes to it, and copies
+// both ways until one side ends or the route is cancelled.
+func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []byte) {
 	dialer := net.Dialer{Timeout: m.dialTimeout}
-	targetConn, err := dialer.DialContext(ctx, "tcp", rule.TargetAddr)
+	target, err := dialer.DialContext(route.ctx, "tcp", route.target)
 	if err != nil {
 		m.logger.Error("bridge: ingress: dial target failed",
 			"component", "bridge",
-			"rule_id", rule.RuleID,
-			"target", rule.TargetAddr,
+			"rule_id", route.rule.ID,
+			"slug", route.rule.Slug,
+			"target", route.target,
 			"error", err,
 		)
 		return
 	}
-	defer targetConn.Close()
 
-	// Bidirectional copy — spawn both directions before select.
+	var src io.Reader = client
+	if len(peeked) > 0 {
+		src = newPeekConn(client, peeked)
+	}
+
 	clientToTarget := make(chan struct{})
 	go func() {
 		defer close(clientToTarget)
-		_, _ = io.Copy(targetConn, clientConn)
+		_, _ = io.Copy(target, src)
 	}()
-
 	targetToClient := make(chan struct{})
 	go func() {
 		defer close(targetToClient)
-		_, _ = io.Copy(clientConn, targetConn)
+		_, _ = io.Copy(client, target)
 	}()
 
-	// When context is cancelled or either copy finishes, close both sides.
 	select {
-	case <-ctx.Done():
+	case <-route.ctx.Done():
 	case <-clientToTarget:
 	case <-targetToClient:
 	}
+	_ = target.Close()
+	_ = client.Close()
+	<-clientToTarget
+	<-targetToClient
 }
 
 // IngressStatus returns ingress status for heartbeat reporting.
@@ -318,9 +458,15 @@ func (m *IngressManager) IngressStatus() *api.IngressInfo {
 	if !m.active {
 		return nil
 	}
+	served := 0
+	for _, st := range m.states {
+		if st.Served {
+			served++
+		}
+	}
 	return &api.IngressInfo{
 		Enabled:         true,
-		RuleCount:       len(m.activeRules),
+		RuleCount:       served,
 		ConnectionCount: int(m.connCount.Load()),
 		ACMEEnabled:     m.acme != nil,
 	}

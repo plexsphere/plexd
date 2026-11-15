@@ -74,13 +74,11 @@ func RelayReconcileHandler(relay *Relay, status *RelayStatusTracker, logger *slo
 	}
 }
 
-// IngressReconcileHandler returns a reconcile.ReconcileHandler that updates
-// ingress rules when the desired bridge ingress subtree changes. It diffs the
-// desired rules against the currently active rules: adding missing rules,
-// removing stale rules, and restarting changed rules (same ID, different
-// config). The handler is presence-aware: a nil Bridge or nil Ingress child
-// means "not populated", so it reconciles against an empty desired set and
-// tears down stale rules.
+// IngressReconcileHandler returns a reconcile.ReconcileHandler that applies
+// the desired bridge.ingress block whole. A nil Bridge or nil Ingress child
+// applies no rules, which closes every listener. A failed bind fails the
+// reconcile cycle, so the reconciler keeps its snapshot and the next pull
+// tries the bind again.
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler {
 	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
 		if desired == nil {
@@ -92,51 +90,14 @@ func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile
 			rules = desired.Bridge.Ingress.Rules
 		}
 
-		// Build desired set for diffing.
-		desiredSet := make(map[string]api.IngressRule, len(rules))
-		for _, r := range rules {
-			desiredSet[r.RuleID] = r
+		if err := mgr.Apply(rules); err != nil {
+			logger.Error("ingress reconcile: apply failed",
+				"component", "bridge",
+				"error", err,
+			)
+			return err
 		}
-
-		currentIDs := mgr.RuleIDs()
-		currentSet := make(map[string]struct{}, len(currentIDs))
-		for _, id := range currentIDs {
-			currentSet[id] = struct{}{}
-		}
-
-		// Remove stale rules (present locally but not in desired state)
-		// and detect changed rules (same ID, different config).
-		for _, id := range currentIDs {
-			desiredRule, inDesired := desiredSet[id]
-			if !inDesired {
-				// Stale rule — remove.
-				mgr.RemoveRule(id)
-				continue
-			}
-			// Check if the rule config changed (requires restart).
-			currentRule, ok := mgr.GetRule(id)
-			if ok && currentRule != desiredRule {
-				mgr.RemoveRule(id)
-				delete(currentSet, id) // mark for re-add below
-			}
-		}
-
-		// Add missing and changed rules.
-		var errs []error
-		for _, rule := range rules {
-			if _, ok := currentSet[rule.RuleID]; ok {
-				continue
-			}
-			if err := mgr.AddRule(rule); err != nil {
-				logger.Error("ingress reconcile: add rule failed",
-					"rule_id", rule.RuleID,
-					"error", err,
-				)
-				errs = append(errs, err)
-			}
-		}
-
-		return errors.Join(errs...)
+		return nil
 	}
 }
 

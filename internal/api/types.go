@@ -1593,24 +1593,37 @@ type UserAccessInfo struct {
 // Public Ingress
 // ---------------------------------------------------------------------------
 
-// IngressConfig is the ingress configuration pushed from the control plane.
+// IngressConfig is the bridge.ingress block of the state pull, the control
+// plane's NodeStateBridgeIngress.
 type IngressConfig struct {
-	Enabled bool          `json:"enabled"`
-	Rules   []IngressRule `json:"rules"`
+	Rules []IngressRule `json:"rules"`
 }
 
-// IngressRule represents a single public ingress rule.
+// IngressRule is one rule of the block, the control plane's
+// NodeStateBridgeIngressRule.
 type IngressRule struct {
-	RuleID     string `json:"rule_id"`
+	ID         string `json:"id"`
+	Slug       string `json:"slug"`
 	ListenPort int    `json:"listen_port"`
-	TargetAddr string `json:"target_addr"`
-	// Mode is the TLS handling mode: "tcp" (passthrough), "terminate" (static cert),
-	// or "acme" (automatic certificate via ACME).
-	Mode     string `json:"mode"`
-	CertPEM  string `json:"cert_pem,omitempty"`
-	KeyPEM   string `json:"key_pem,omitempty"`
-	Hostname string `json:"hostname,omitempty"`
+	// Mode is IngressModePassthrough, IngressModeTerminate or IngressModeACME.
+	Mode string `json:"mode"`
+	// SNIHost is the server name the rule matches on a shared port, exact or
+	// a wildcard of one left-most label. A rule without it is the only rule on
+	// its port.
+	SNIHost      string `json:"sni_host,omitempty"`
+	TargetNodeID string `json:"target_node_id"`
+	// TargetAddress is the target node's mesh address, IPv4 or IPv6, without
+	// brackets.
+	TargetAddress string `json:"target_address"`
+	TargetPort    int    `json:"target_port"`
 }
+
+// The modes of an ingress rule.
+const (
+	IngressModePassthrough = "passthrough"
+	IngressModeTerminate   = "terminate"
+	IngressModeACME        = "acme"
+)
 
 // IngressInfo is the ingress status reported by the node in heartbeats.
 type IngressInfo struct {

@@ -8341,24 +8341,21 @@ func TestState_ReturnsIngressChild(t *testing.T) {
 		t.Fatal("Bridge.Ingress is nil")
 	}
 	ing := state.Bridge.Ingress
-	if !ing.Enabled {
-		t.Error("Ingress.Enabled = false, want true")
-	}
 	if len(ing.Rules) != 1 {
 		t.Fatalf("len(Ingress.Rules) = %d, want 1", len(ing.Rules))
 	}
-	rule := ing.Rules[0]
-	if rule.RuleID == "" {
-		t.Error("Ingress.Rules[0].RuleID is empty")
+	want := api.IngressRule{
+		ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+		Slug:          "web",
+		ListenPort:    443,
+		Mode:          api.IngressModePassthrough,
+		SNIHost:       "web.e2e.internal",
+		TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		TargetAddress: "10.99.0.2",
+		TargetPort:    8443,
 	}
-	if rule.ListenPort == 0 {
-		t.Error("Ingress.Rules[0].ListenPort = 0")
-	}
-	if rule.TargetAddr == "" {
-		t.Error("Ingress.Rules[0].TargetAddr is empty")
-	}
-	if rule.Mode == "" {
-		t.Error("Ingress.Rules[0].Mode is empty")
+	if got := ing.Rules[0]; got != want {
+		t.Errorf("Ingress.Rules[0] = %+v, want %+v", got, want)
 	}
 }
 

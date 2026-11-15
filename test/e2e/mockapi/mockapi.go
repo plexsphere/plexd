@@ -445,14 +445,18 @@ func newStateFixture() api.NodeStateSnapshot {
 					},
 				},
 			},
+			// The one ingress rule targets peer ...a0b1 on its mesh IP.
 			Ingress: &api.IngressConfig{
-				Enabled: true,
 				Rules: []api.IngressRule{
 					{
-						RuleID:     "ingress-001",
-						ListenPort: 443,
-						TargetAddr: "10.99.0.2:8443",
-						Mode:       "tcp",
+						ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+						Slug:          "web",
+						ListenPort:    443,
+						Mode:          api.IngressModePassthrough,
+						SNIHost:       "web.e2e.internal",
+						TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+						TargetAddress: "10.99.0.2",
+						TargetPort:    8443,
 					},
 				},
 			},
