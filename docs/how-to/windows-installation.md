@@ -167,7 +167,7 @@ plexd writes the embedded driver next to its own binary before creating the firs
 policy enforcement needs Administrator
 ```
 
-plexd checks that it can enforce policy *before* it spends its one-shot bootstrap token. Run it elevated or as the LocalSystem service. To run the node without enforcement instead, set `policy.enabled: false` in `config.yaml`.
+plexd checks that it can enforce policy *before* it spends a redemption of its bootstrap token. Run it elevated or as the LocalSystem service. To run the node without enforcement instead, set `policy.enabled: false` in `config.yaml`.
 
 ### The service restarts every five seconds
 

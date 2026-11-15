@@ -15,7 +15,7 @@ local state against the desired state.
 
 ## Key Capabilities
 
-- **Self-Registration** with one-time bootstrap tokens (Cloud-Init, K8s Secret, or manual enrollment)
+- **Self-Registration** with bootstrap tokens (Cloud-Init, K8s Secret, or manual enrollment)
 - **Mesh Connectivity** via direct encrypted WireGuard tunnels between authorized peers
 - **NAT Traversal** with STUN endpoint discovery and bridge-node relay fallback
 - **Policy Enforcement** through peer visibility filtering and local firewall rules

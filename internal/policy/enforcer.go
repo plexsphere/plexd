@@ -194,8 +194,8 @@ func untagged(r FirewallRule) int {
 // Preflight reports whether this node can enforce policy at all, without
 // changing any kernel state. It answers the question the first
 // ApplyFirewallRules would otherwise answer — but that call happens after
-// registration has spent a one-shot bootstrap token, so a node that can never
-// install a chain has to learn it here instead.
+// registration has spent a redemption of its bootstrap token, so a node that
+// can never install a chain has to learn it here instead.
 //
 // The two no-op paths of ApplyFirewallRules are no-ops here as well: with
 // enforcement disabled or no firewall backend compiled in, there is no

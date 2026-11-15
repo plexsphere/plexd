@@ -183,7 +183,7 @@ policy: pf: probe: the main ruleset does not reference anchor "com.apple/*"; res
 policy: pf: probe: the main ruleset does not reference nat-anchor "com.apple/*"; restore /etc/pf.conf and run pfctl -f /etc/pf.conf
 ```
 
-`Enforcer.Preflight` calls `Probe` before `plexd up` registers, so a node that cannot enforce exits before it spends its one-shot bootstrap token. `AddNATMasquerade` calls it too, on its first use. `Preflight` returns early with `policy.enabled: false` — the configuration an operator picks who wants bridge routing without enforcement — and without that second call a missing `nat-anchor` line would leave the bridge loading a `nat` rule the kernel never evaluates, with every `pfctl` invocation reporting success and mesh traffic still leaving the Mac untranslated.
+`Enforcer.Preflight` calls `Probe` before `plexd up` registers, so a node that cannot enforce exits before it spends a redemption of its bootstrap token. `AddNATMasquerade` calls it too, on its first use. `Preflight` returns early with `policy.enabled: false` — the configuration an operator picks who wants bridge routing without enforcement — and without that second call a missing `nat-anchor` line would leave the bridge loading a `nat` rule the kernel never evaluates, with every `pfctl` invocation reporting success and mesh traffic still leaving the Mac untranslated.
 
 ### Interface names
 

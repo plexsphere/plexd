@@ -1380,10 +1380,11 @@ func useFirewallController(t *testing.T, ctrl policy.FirewallController) *string
 }
 
 // A node that cannot install the deny-by-default baseline has to fail before it
-// registers: registration spends a one-shot bootstrap token and creates an
-// upstream identity, and where data_dir is ephemeral neither survives the
-// restart — leaving a node the control plane knows about, a token nobody can
-// reuse, and a container crash-looping on the same fatal step.
+// registers: registration spends a redemption of the bootstrap token and
+// creates an upstream identity, and where data_dir is ephemeral the restart
+// loses the local identity — leaving a node the control plane knows about, a
+// token that may be gone or at its redemption limit, and a container
+// crash-looping on the same fatal step.
 func TestRunUp_PolicyPreflightAbortsBeforeRegistration(t *testing.T) {
 	apiBase, requests := countingControlPlane(t)
 	probeErr := errors.New("operation not permitted")

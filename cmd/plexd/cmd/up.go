@@ -166,13 +166,13 @@ func runAgent(ctx context.Context) error {
 	// 2a. Build the policy enforcer and pre-flight its firewall backend before
 	// anything reaches the control plane. Installing the deny-by-default
 	// baseline is fatal (step 5c) but happens after registration, which spends a
-	// one-shot bootstrap token and persists the identity the control plane hands
-	// back — so without this check a node that can never install a chain claims
-	// an identity it will never use, and then crash-loops on the same step
-	// forever. Where data_dir is ephemeral (a Pod without a persistent volume, a
-	// fresh VM image) the restart has no identity to reload and no unspent token
-	// to register with either, which strands the deployment until an operator
-	// issues a new one.
+	// redemption of the bootstrap token and persists the identity the control
+	// plane hands back — so without this check a node that can never install a
+	// chain claims an identity it will never use, and then crash-loops on the
+	// same step forever. Where data_dir is ephemeral (a Pod without a persistent
+	// volume, a fresh VM image) the restart has no identity to reload and may
+	// have no token it can still register with, which strands the deployment
+	// until an operator provides one.
 	//
 	// The probe changes no kernel state and is a no-op whenever the baseline
 	// install would be one, so this is an early exit for the fatal case only —

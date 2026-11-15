@@ -6,7 +6,7 @@ feature: PXD-0002
 
 # Registration
 
-The `internal/registration` package handles node self-registration and bootstrap authentication with the Plexsphere control plane. It resolves a one-time bootstrap token, generates a Curve25519 keypair, registers with the control plane, persists the resulting identity, and manages auth token lifecycle.
+The `internal/registration` package handles node self-registration and bootstrap authentication with the Plexsphere control plane. It resolves a bootstrap token, generates a Curve25519 keypair, registers with the control plane, persists the resulting identity, and manages auth token lifecycle.
 
 ## Config
 
@@ -327,15 +327,15 @@ sequenceDiagram
 
 The control plane returns errors as RFC 9457 `application/problem+json`. plexd
 classifies each failure on its HTTP status and optional machine-readable `code`
-member (via `api.ClassifyError`); unknown codes are tolerated. The bootstrap
-token is **never consumed on an error branch** — a stopped or retried attempt
-leaves the token spendable.
+member (via `api.ClassifyError`); unknown codes are tolerated. No error answer
+counts as a **redemption** of the bootstrap token, so a stopped or retried
+attempt leaves the token as it was.
 
 | Status | Problem `code`(s) | plexd behavior |
 |--------|-------------------|----------------|
 | `400` | `public_key_invalid` (or none) | Stop — invalid request |
 | `401` | — | Stop — bootstrap token rejected |
-| `403` | `kind_mismatch`, `project_mismatch`, `token_consumed`, `token_expired`, `token_revoked`, `nonce_collision` | Stop — terminal denial |
+| `403` | `kind_mismatch`, `project_mismatch`, `token_consumed`, `token_expired`, `token_revoked`, `nonce_collision` | Stop — terminal denial; `token_consumed` means the token reached the redemption limit of its BootstrapToken policy |
 | `404` | `resource_not_found` | Stop — resource unresolved |
 | `409` | — | Stop |
 | `422` | — | Stop — invariant violation |

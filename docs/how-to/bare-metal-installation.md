@@ -181,7 +181,7 @@ sudo plexd install
 sudo systemctl restart plexd
 ```
 
-A node that logged `failed to delete token file` has already registered, and plexd runs token cleanup only while it registers, so the spent token is still on disk. Remove it once, from outside the unit's sandbox:
+A node that logged `failed to delete token file` has already registered, and plexd runs token cleanup only while it registers, so the token is still on disk. It may still be valid under its BootstrapToken policy, because a reusable token admits further redemptions. Remove it once, from outside the unit's sandbox:
 
 ```sh
 sudo rm -f /etc/plexd/bootstrap-token

@@ -203,7 +203,7 @@ The log carries `creating a utun device requires root`. plexd was started withou
 policy enforcement needs root and a pf main ruleset that references anchor "com.apple/*"
 ```
 
-plexd checks that it can enforce policy *before* it spends its one-shot bootstrap token. Either the process is not root, or `/etc/pf.conf` no longer references the wildcard anchors. Restore the file and reload it:
+plexd checks that it can enforce policy *before* it spends a redemption of its bootstrap token. Either the process is not root, or `/etc/pf.conf` no longer references the wildcard anchors. Restore the file and reload it:
 
 ```sh
 sudo pfctl -f /etc/pf.conf

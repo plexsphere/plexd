@@ -16,7 +16,7 @@ During registration, the control plane provisions the node with several cryptogr
 - **Pre-Shared Keys (PSK)** -- per-peer-pair post-quantum defense layer
 - **Node Secret Key (NSK)** -- AES-256-GCM secret decryption
 - **Ed25519 signing public key** -- SSE event and JWT verification
-- **Bootstrap token** -- one-time registration credential (its file is removed after use, or emptied where it cannot be removed)
+- **Bootstrap token** -- registration credential whose validity the control plane's BootstrapToken policy decides (its file is removed after use, or emptied where it cannot be removed)
 
 ## Storage Location
 
@@ -38,7 +38,7 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 | `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Decrypts secret values fetched from the control plane | Control plane, issued during registration |
 | `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration and carried by the state pull's `signing_key` block |
 | `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, `signing_key_id`, and `signing_public_key` | Control plane registration response; the two signing fields are rewritten from the state pull |
-| (bootstrap token file) | Bootstrap token | N/A | One-time authentication for initial registration | Provisioned externally (file, env var, or metadata service) |
+| (bootstrap token file) | Bootstrap token | N/A | Authentication for initial registration (validity set by its BootstrapToken policy) | Provisioned externally (file, env var, or metadata service) |
 
 ### Curve25519 Private Key
 
@@ -98,9 +98,9 @@ type SigningKeyRotation struct {
 
 ### Bootstrap Token
 
-The bootstrap token is a one-time credential used to authenticate the initial registration request. It can be sourced from a file (`/etc/plexd/bootstrap-token` on Linux; see [Platform defaults](configuration.md#platform-defaults)), an environment variable (`PLEXD_BOOTSTRAP_TOKEN`), a direct value, or a cloud metadata service.
+The bootstrap token is a credential used to authenticate the initial registration request. It can be sourced from a file (`/etc/plexd/bootstrap-token` on Linux; see [Platform defaults](configuration.md#platform-defaults)), an environment variable (`PLEXD_BOOTSTRAP_TOKEN`), a direct value, or a cloud metadata service. The control plane, not plexd, decides how often and how long a token is valid, through the BootstrapToken policy the token was issued under. Under a Project's default BootstrapToken policy a token is single-use and lives at most 24 hours; many Nodes may present the same token as often as its BootstrapToken policy allows.
 
-The token is **removed from disk immediately after successful registration** to prevent reuse. Under plexd's systemd unit `/etc` is read-only and only the token file itself is writable, so the unlink fails and the file is emptied instead; the resolver skips an empty file:
+The token is **removed from disk immediately after successful registration**, so this copy of it cannot be presented again. Under plexd's systemd unit `/etc` is read-only and only the token file itself is writable, so the unlink fails and the file is emptied instead; the resolver skips an empty file:
 
 ```go
 // 9. Delete token file if applicable.
@@ -199,7 +199,7 @@ The event updates the verifier in memory only. A later pull that carries a diffe
 - **File permissions**: all key files use `0600`; the data directory uses `0700`. Only the plexd process owner can read key material.
 - **Atomic writes**: `fsutil.WriteFileAtomic` ensures that a crash during a write never leaves a corrupted or partial key file on disk.
 - **No plaintext secret caching**: secrets are decrypted in memory on demand via the NSK. No plaintext secret values are persisted to disk.
-- **One-time bootstrap token**: the token is deleted after registration, limiting the window for token theft and replay.
+- **Bootstrap token removed after registration**: plexd removes its own copy of the token after registration, limiting the window for stealing it from the disk; the token's BootstrapToken policy on the control plane decides how often and how long the token can be redeemed.
 - **Transition period for signing keys**: during a rotation announced by a `signing_key_rotated` event that names the previous key and a deadline, both old and new signing keys are accepted, preventing event verification failures during rollover. After the transition expires, only the new key is trusted. A key installed from the state pull has no transition period: it replaces the current key, because a node trusts exactly one Domain key.
 - **PSK as post-quantum layer**: even if the Curve25519 key exchange is compromised (e.g., by a future quantum computer), the per-peer PSK provides an additional symmetric encryption layer that protects captured traffic.
 - **NSK rotation invalidates old ciphertext**: after NSK rotation, secrets encrypted with the old key cannot be decrypted by the node. The control plane re-encrypts with the new NSK.

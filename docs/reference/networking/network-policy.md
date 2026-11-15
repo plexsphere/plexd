@@ -257,7 +257,7 @@ Before the backend gets the rules, `ApplyFirewallRules` tags the logged ones and
 
 `plexd up` calls `Preflight` before it registers, and aborts startup on an error.
 
-The check exists because the baseline install is fatal but happens *after* registration, which spends a one-shot bootstrap token and persists the identity the control plane hands back. Without it, a node that can never install a chain claims an identity it will never use and then crash-loops on the same step; where `data_dir` is ephemeral, the restart has neither an identity to reload nor an unspent token to register with.
+The check exists because the baseline install is fatal but happens *after* registration, which spends a redemption of the bootstrap token and persists the identity the control plane hands back. Without it, a node that can never install a chain claims an identity it will never use and then crash-loops on the same step; where `data_dir` is ephemeral, the restart has no identity to reload, and may have no token left to register with (plexd removed or emptied its token file) or one its BootstrapToken policy no longer admits.
 
 `Preflight` mirrors the no-op paths of `ApplyFirewallRules` exactly — with enforcement disabled or no backend compiled in there is no enforcement to be unable to perform — and it never mutates kernel state, so a node that goes on to fail startup for another reason leaves nothing behind.
 

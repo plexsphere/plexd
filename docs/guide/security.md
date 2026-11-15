@@ -6,7 +6,7 @@ title: Security & Trust Model
 
 ## Security Overview
 
-- **Bootstrap tokens** are one-time-use with a short TTL. They are deleted from disk after successful registration.
+- **Bootstrap tokens** are valid as often and as long as the BootstrapToken policy they were issued under on the control plane allows. Under a Project's default BootstrapToken policy a token is single-use and lives at most 24 hours. plexd deletes its token file from disk after successful registration, or empties it where it cannot be deleted.
 - **Private keys** are generated during registration and stored in `/var/lib/plexd/` on Linux, and under the platform data directory on macOS and Windows (see [Platform defaults](../reference/core/configuration.md#platform-defaults)). They never leave the node.
 - **Control plane communication** is TLS-encrypted (HTTPS). The agent validates the server certificate. Every SSE event is additionally signed with the control plane's Ed25519 key and verified by the agent before processing.
 - **Mesh traffic** is encrypted end-to-end via WireGuard.
@@ -22,7 +22,7 @@ plexd uses WireGuard's [Noise_IKpsk2](https://www.wireguard.com/protocol/) hands
 ### Trust Chain
 
 ```
-Bootstrap Token (one-time, short TTL)
+Bootstrap Token (BootstrapToken policy; single-use, short-lived by default)
         │
         ▼
    Control Plane  ──── Trust anchor: distributes public keys, PSKs,
@@ -48,7 +48,7 @@ sequenceDiagram
 
     C->>C: Generate Curve25519 keypair
     C->>CP: POST /v1/register<br/>{token, public_key, hostname, metadata, capabilities}
-    CP->>CP: Validate token (one-time)
+    CP->>CP: Validate token (redemption under its BootstrapToken policy)
     CP->>CP: Assign mesh IP (10.100.x.x)
     CP->>CP: Store public key
     CP->>CP: Generate PSK per peer pair
@@ -201,7 +201,7 @@ WireGuard needs the same PSK on both ends of a tunnel, and a [NAT relay](../refe
 |---|---|---|
 | Control plane compromised | Attacker has signing key - can forge SSE events and inject malicious peers | PSK layer for mesh traffic; signing key rotation to limit exposure window; admin-side integrity monitoring; nodes log all applied events for forensic analysis |
 | Node compromised | Attacker has private key and NSK of one node | Force-remove node, trigger key rotation + PSK refresh on all affected peers; rotate NSK to prevent decryption of future secrets; secrets are not cached so no plaintext on disk to exfiltrate |
-| Bootstrap token stolen | Attacker could register a rogue node | One-time-use + short TTL limits the attack window |
+| Bootstrap token stolen | Attacker could register a rogue node | The token's BootstrapToken policy bounds the attack: by default a token is single-use and lives at most 24 hours; a reusable token is bounded by the redemption limit, maximum lifetime and rate limit its BootstrapToken policy sets, and revoking it on the control plane refuses every further redemption |
 | MITM during registration | Could intercept public key exchange and signing key | TLS + server certificate validation on all control plane communication |
 | MITM on SSE stream | Could inject forged events (peer changes, action requests, key rotations) | Ed25519 signature verification on every event; TLS as first layer; forged events rejected without valid signature |
 | Signing key compromised | Attacker can forge SSE events until key is rotated | Operator rotates the Domain's signing key; every node installs the incoming key from its next state pull, within one reconcile interval, and refuses envelopes signed with the old key at once (a pull install keeps no grace window) |

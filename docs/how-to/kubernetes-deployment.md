@@ -339,7 +339,7 @@ enforcement: policy: preflight: policy: nftables: probe: netlink receive:
 operation not permitted
 ```
 
-The check runs before registration on purpose: it consumes a one-shot bootstrap token and allocates a node upstream, so a pod that can never install the firewall baseline must not claim an identity it will never use. Nothing was spent — fix the capability and the same token still works.
+The check runs before registration on purpose: it spends a redemption of the bootstrap token and allocates a node upstream, so a pod that can never install the firewall baseline must not claim an identity it will never use. Nothing was spent — fix the capability and the same token still works.
 
 Confirm what the container actually got:
 

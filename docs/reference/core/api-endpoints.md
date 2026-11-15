@@ -37,7 +37,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 
 ### POST /v1/register
 
-Unauthenticated (`security: []`): the one-time bootstrap token travels in the
+Unauthenticated (`security: []`): the bootstrap token travels in the
 request body, not an `Authorization` header. plexd sends no `Authorization`
 header for this call.
 
@@ -83,14 +83,14 @@ back to the header, and reads neither from a response that is not
 `application/problem+json`. plexd classifies each failure on the HTTP status and
 `code`; unknown codes are tolerated. plexd carries the id it read into the error
 string of the failed call, so an operator can quote it against the control-plane
-log. The bootstrap token is **never consumed on an error branch**.
+log. No error answer counts as a **redemption** of the bootstrap token.
 
 | Status | Problem `code`(s) | Meaning | plexd behavior |
 |---|---|---|---|
 | `201 Created` | — | Registration successful | — |
 | `400 Bad Request` | `public_key_invalid` (or none) | Malformed public key, or an undecodable body | Stop |
 | `401 Unauthorized` | — | Bootstrap token rejected | Stop |
-| `403 Forbidden` | `kind_mismatch`, `project_mismatch`, `token_consumed`, `token_expired`, `token_revoked`, `nonce_collision` | Terminal denial: wrong token kind or project, spent/expired/revoked token, or replayed nonce | Stop |
+| `403 Forbidden` | `kind_mismatch`, `project_mismatch`, `token_consumed`, `token_expired`, `token_revoked`, `nonce_collision` | Terminal denial: wrong token kind or project, token that reached its redemption limit, expired/revoked token, or replayed nonce | Stop |
 | `404 Not Found` | `resource_not_found` | Resource handle could not be resolved | Stop |
 | `409 Conflict` | — | Conflicting registration | Stop |
 | `422 Unprocessable Entity` | — | Request invariant violation (empty/oversized field, non-UUID `project_id`) | Stop |
