@@ -6,6 +6,10 @@
 # peers it with plexd, and probes plexd's policy enforcement through the tunnel
 # with nc. openssl derives the PSK, ss tells when a listener is up. Like the
 # plexd container it needs CAP_NET_ADMIN and the host's wireguard module.
+#
+# The systemd suite's public ingress phase runs the same image, without
+# CAP_NET_ADMIN, as the ingress rules' target: openssl serves TLS on three
+# ports, nc writes a banner, and both tools probe the bridge.
 FROM alpine:3.22
 
 RUN apk add --no-cache wireguard-tools iproute2 netcat-openbsd openssl

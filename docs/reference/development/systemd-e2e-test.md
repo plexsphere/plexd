@@ -6,26 +6,27 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, then verifies clean shutdown.
 
 ## Container Topology
 
 ```
-┌──────────────┐       ┌─────────────────────────┐
-│   mock-api   │◄──────│   systemd container     │
-│  :8080 (HTTP)│       │  (Ubuntu 24.04)         │
-│  :8443 (TLS) │       │  systemd PID 1          │
-│  /v1/health  │       │  plexd.service managed   │
-└──────────────┘       └─────────────────────────┘
-        │                          │
-        └──── plexd-systemd-e2e ───┘
-              (Docker network)
+┌──────────────┐       ┌─────────────────────────┐       ┌──────────────────────┐
+│   mock-api   │◄──────│   systemd container     │──────►│ ingress target       │
+│  :8080 (HTTP)│       │  (Ubuntu 24.04)         │       │  :9441-9443 (TLS)    │
+│  :8443 (TLS) │       │  systemd PID 1          │◄──────│  :9022 (banner)      │
+│  /v1/health  │       │  plexd.service managed  │ probes│  openssl, nc         │
+└──────────────┘       └─────────────────────────┘       └──────────────────────┘
+        │                          │                                │
+        └──────────────────── plexd-systemd-e2e ────────────────────┘
+                              (Docker network)
 ```
 
 | Container | Image | Source | Purpose |
 |-----------|-------|--------|---------|
 | `plexd-e2e-mockapi` | `mockapi:e2e-systemd` | `test/e2e/mockapi/Dockerfile` | Fixture-based mock Central API, tracks call counters, answers DNS on port 53 |
 | `plexd-e2e-systemd` | `plexd-systemd:e2e` | `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 with systemd as PID 1, runs plexd as a real service |
+| `plexd-e2e-ingress-target` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | Alpine with `openssl` and `netcat-openbsd`; started by phase 16, serves the ingress rules' targets and runs the probes |
 
 The systemd image installs `dbus` and `systemd-resolved` next to `systemd`, `systemd-sysv`, `curl`, `ca-certificates`, `jq`, `openssh-client`, and `sshpass`. Both install enabled, so the container boots with a system bus and its own systemd-resolved, which plexd registers its mesh DNS resolver with. Docker mounts its own `/etc/resolv.conf` (`nameserver 127.0.0.11`) over the one the package would link, so systemd-resolved runs in foreign mode with Docker's DNS as its global server, `nsswitch.conf` keeps `hosts: files dns`, and the mesh DNS phases ask systemd-resolved directly with `resolvectl`. Every `resolvectl` call runs inside the container through `docker exec` and reaches the container's systemd-resolved, never the host's.
 
@@ -124,13 +125,47 @@ The stop also takes the mesh DNS registration with it. Right after `systemctl st
 
 The phase reads `/etc/plexd/config.yaml`, fails if a line already starts with `dns:`, appends `dns: {enabled: false}` as a block, and runs `systemctl restart plexd`. The journal of the new process must hold `mesh dns disabled by dns.enabled` within 30 seconds, and must not hold `mesh dns listening`. The phase then waits for `state_count` to grow past its value after the restart, for up to 60 seconds from the restart, so a pull carrying the `dns` block reached the new process. `resolvectl status plexd0` must then exit 0 and show no DNS server, and `resolvectl domain plexd0` must list no domain. The restart's stop reverted the registration of the run before, and a disabled resolver registers nothing.
 
-### 16. Shutdown verification
+### 16. Public ingress on a bridge
 
-Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. It runs with the opt-out of phase 15 in place.
+The phase turns the node into a bridge that serves the `bridge.ingress` block of its state pull (see [Public Ingress](../bridge/public-ingress.md)). No other e2e suite runs bridge mode: the Docker suite's plexd container cannot write the forwarding sysctl without `--privileged`.
 
-### 17. Cleanup
+1. **Target.** It builds `test/e2e/meshpeer/Dockerfile` as `plexd-ingress-target:e2e` and starts it as `plexd-e2e-ingress-target` on `plexd-systemd-e2e`. Inside it, `openssl req` creates self-signed certificates for `a.ingress.e2e.test`, `b.ingress.e2e.test` and `wild.ingress.e2e.test`, three `openssl s_server -4 -www` instances serve them on 9441, 9442 and 9443, and a loop of `printf 'plexd-e2e-banner\n' | nc -N -l 9022` writes the banner to each client first. The phase waits up to 10 seconds until `ss -ltn` shows all four ports.
+2. **Rules.** `configure_ingress <tag> <rules-json>` reads the live snapshot, sets `.bridge` to `{relay: null, user_access: null, ingress: {rules: <rules>}, site_to_site: null}`, or `ingress: null` for the rules `null`, posts it to `POST /test/configure-state`, and injects a `node_state_updated` event, the way `configure_sessions` configures its block. Every rule targets the target container's address:
 
-The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes both containers and the Docker network.
+   | Slug | Listen port | Mode | SNI host | Target port |
+   | --- | --- | --- | --- | --- |
+   | `plain` | 7022 | `passthrough` | none | 9022 |
+   | `tls-a` | 443 | `passthrough` | `a.ingress.e2e.test` | 9441 |
+   | `tls-b` | 443 | `passthrough` | `b.ingress.e2e.test` | 9442 |
+   | `tls-term` | 443 | `terminate` | `t.ingress.e2e.test` | 9441 |
+   | `tls-wild` | 443 | `passthrough` | `*.apps.ingress.e2e.test` | 9443 |
+
+3. **Port floor.** It writes `1024` to `/proc/sys/net/ipv4/ip_unprivileged_port_start` in the systemd container and reads it back. Docker sets that floor to `0` in a container, which would hide a unit without `CAP_NET_BIND_SERVICE`.
+4. **Bridge mode.** It fails if `/etc/plexd/config.yaml` already has a line that starts with `mode:` or `bridge:`, appends the block below, and runs `systemctl restart plexd`.
+5. **Listeners.** Within 60 seconds the journal of the new process (`plexd[<MainPID>]:`) must hold `ingress listener opened` for `listen_port=443` and for `listen_port=7022`, exactly once each, `ingress manager started`, and `ingress rule not served` with `slug=tls-term` and `reason=mode_not_served`. The port floor must still read `1024`.
+6. **Routing.** From the target container, `openssl s_client -connect <bridge>:443 -servername <name>` piped into `openssl x509 -noout -subject` must print the certificate of `a.ingress.e2e.test` for `a.ingress.e2e.test`, of `b.ingress.e2e.test` for `b.ingress.e2e.test`, and of `wild.ingress.e2e.test` for `x.apps.ingress.e2e.test`. The names `t.ingress.e2e.test` (the terminate rule), `none.ingress.e2e.test` and `x.y.apps.ingress.e2e.test`, and a handshake with `-noservername`, must print no certificate. `nc -w 5 <bridge> 7022 </dev/null` must print `plexd-e2e-banner`: the bridge forwards the plain port without reading.
+7. **A changed rule.** It serves `tls-b` with target port 9441 and polls for up to 60 seconds until `b.ingress.e2e.test` receives the certificate of `a.ingress.e2e.test`. The journal must still hold one `ingress listener opened` line for 443: the table of the port changes without a second bind.
+8. **A removed block.** It serves `"ingress": null` and polls for up to 60 seconds until `nc -z` to 443 and to 7022 of the bridge are refused. The journal must hold `ingress listener closed` for both ports.
+
+The block phase 16 appends:
+
+```yaml
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth0
+  access_subnets: ["198.18.100.0/24"]
+  enable_nat: false
+  ingress_enabled: true
+```
+
+### 17. Shutdown verification
+
+Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. It runs with the opt-out of phase 15 and the bridge mode of phase 16 in place.
+
+### 18. Cleanup
+
+The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the three containers and the Docker network.
 
 ## Assertion Logic
 
@@ -216,6 +251,8 @@ dns:
   enabled: false
 ```
 
+It sets no `mode` key either, so plexd runs as a node until phase 16 appends the bridge block shown there.
+
 ## Configuration Variables
 
 | Variable | Default | Description |
@@ -293,12 +330,23 @@ Common causes:
 - No `plexd0`: WireGuard did not come up, and plexd logs `wireguard unavailable, mesh dns not started`.
 - No `DNS Servers:` line on `plexd0`: look for `mesh dns not registered, systemd-resolved is not usable` or `mesh dns registration failed` in the journal; `systemctl status systemd-resolved dbus` shows whether both run.
 
+**An ingress probe fails:**
+
+```bash
+docker exec plexd-e2e-systemd journalctl -u plexd --no-pager | grep -E 'ingress|bridge'
+docker exec plexd-e2e-ingress-target ss -ltn
+```
+
+Common causes:
+- plexd restarts in a loop after the bridge block: `plexd up: bridge setup` in the journal names the failing step, usually the forwarding sysctl or the route for `access_subnets` on `eth0`.
+- `bridge: ingress: listen failed` with `hint="ports below 1024 need CAP_NET_BIND_SERVICE"`: the unit in the container lacks the capability.
+
 **Leftover containers from previous run:**
 
 The script performs pre-cleanup, but if issues persist:
 
 ```bash
-docker rm -f plexd-e2e-mockapi plexd-e2e-systemd
+docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target
 docker network rm plexd-systemd-e2e
 ```
 
@@ -328,6 +376,7 @@ On any failure, the `print_diagnostics` function outputs:
 | `test/e2e/systemd/.dockerignore` | Prevents unnecessary files in Docker context |
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
 | `test/e2e/mockapi/mockapi.go` | Mock API server with `/test/assertions` endpoint |
+| `test/e2e/meshpeer/Dockerfile` | Alpine image with `openssl` and `netcat-openbsd`; phase 16 runs it as the ingress target |
 | `deploy/systemd/plexd.service` | Production unit file (copied verbatim into container) |
 | `deploy/systemd/plexd-session-helper.socket`, `deploy/systemd/plexd-session-helper@.service` | Session helper units (copied verbatim into container) |
 | `Makefile` | `test-e2e-systemd` target |

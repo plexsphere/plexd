@@ -26,6 +26,10 @@
 #   - Start after a reboot cleared /run/plexd, with the registration gone
 #     while plexd is stopped and back after the start
 #   - Mesh DNS opt-out with dns.enabled: false
+#   - Public ingress on a bridge: one listener per listen port, TLS server
+#     names routed to their targets on a shared port 443, a plain port whose
+#     target speaks first, a terminate rule held and not served, a changed
+#     target and a removed block, under the unit's CAP_NET_BIND_SERVICE
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -36,6 +40,8 @@ MOCKAPI_CONTAINER="plexd-e2e-mockapi"
 SYSTEMD_CONTAINER="plexd-e2e-systemd"
 MOCKAPI_IMAGE="mockapi:e2e-systemd"
 SYSTEMD_IMAGE="plexd-systemd:e2e"
+INGRESS_TARGET_CONTAINER="plexd-e2e-ingress-target"
+INGRESS_TARGET_IMAGE="plexd-ingress-target:e2e"
 TIMEOUT="${TIMEOUT:-60}"
 TEST_FAILED=1
 # Set while the mesh DNS phase holds the mock API container paused, so a
@@ -146,6 +152,7 @@ cleanup() {
     fi
     docker rm -f "${MOCKAPI_CONTAINER}" 2>/dev/null || true
     docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
+    docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
     docker network rm "${NETWORK_NAME}" 2>/dev/null || true
     rm -f "${REPO_ROOT}/plexd-linux-amd64"
 }
@@ -163,6 +170,7 @@ done
 echo "=== Removing pre-existing containers and network (if any) ==="
 docker rm -f "${MOCKAPI_CONTAINER}" 2>/dev/null || true
 docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
+docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
 docker network rm "${NETWORK_NAME}" 2>/dev/null || true
 
 # --- Build images ---
@@ -2192,6 +2200,256 @@ else
     fail "resolvectl domain ${MESH_IFACE} exited ${LINK_DOMAINS_RC} and lists '${LINK_DOMAINS}', want exit 0 and no domain"
 fi
 echo "=== Mesh DNS opt-out PASSED ==="
+
+# --- Public ingress on a bridge ---
+# The restart below turns this node into a bridge with ingress_enabled, and
+# the mock serves a bridge.ingress block whose rules target a container on the
+# suite's network: three openssl s_server instances with certificates of their
+# own and a plain TCP server that writes a banner first. The probes run from
+# that container against the systemd container's address on the network,
+# which is outside the mesh. Docker sets net.ipv4.ip_unprivileged_port_start
+# to 0 in a container, so the phase sets it back to 1024 first: port 443 then
+# binds only through the unit's CAP_NET_BIND_SERVICE.
+echo "=== Testing public ingress on a bridge ==="
+docker build -f "${REPO_ROOT}/test/e2e/meshpeer/Dockerfile" -t "${INGRESS_TARGET_IMAGE}" "${REPO_ROOT}/test/e2e/meshpeer"
+docker run -d --name "${INGRESS_TARGET_CONTAINER}" --network "${NETWORK_NAME}" "${INGRESS_TARGET_IMAGE}" >/dev/null
+
+# container_ip <container> prints the container's address on the suite's
+# network.
+container_ip() {
+    docker inspect -f "{{(index .NetworkSettings.Networks \"${NETWORK_NAME}\").IPAddress}}" "$1"
+}
+INGRESS_TARGET_IP=$(container_ip "${INGRESS_TARGET_CONTAINER}")
+BRIDGE_IP=$(container_ip "${SYSTEMD_CONTAINER}")
+if [ -z "${INGRESS_TARGET_IP}" ] || [ -z "${BRIDGE_IP}" ]; then
+    fail "could not read the addresses of ${INGRESS_TARGET_CONTAINER} ('${INGRESS_TARGET_IP}') and ${SYSTEMD_CONTAINER} ('${BRIDGE_IP}')"
+fi
+echo "  target ${INGRESS_TARGET_IP}, bridge ${BRIDGE_IP}"
+
+docker exec "${INGRESS_TARGET_CONTAINER}" sh -c '
+    set -e
+    mkdir -p /srv/ingress
+    for h in a b wild; do
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -subj "/CN=${h}.ingress.e2e.test" -keyout "/srv/ingress/${h}.key" -out "/srv/ingress/${h}.pem" 2>/dev/null
+    done' || fail "could not create the target's certificates"
+for spec in 9441:a 9442:b 9443:wild; do
+    docker exec -d "${INGRESS_TARGET_CONTAINER}" openssl s_server -4 -accept "${spec%%:*}" \
+        -cert "/srv/ingress/${spec#*:}.pem" -key "/srv/ingress/${spec#*:}.key" -www
+done
+docker exec -d "${INGRESS_TARGET_CONTAINER}" sh -c 'while true; do printf "plexd-e2e-banner\n" | nc -N -l 9022; done'
+TARGET_START=${SECONDS}
+until TARGET_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -ltn 2>&1) \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9441 "*) ;; *) false ;; esac \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9442 "*) ;; *) false ;; esac \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9443 "*) ;; *) false ;; esac \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9022 "*) ;; *) false ;; esac; do
+    if [ $((SECONDS - TARGET_START)) -ge 10 ]; then
+        echo "${TARGET_LISTEN}"
+        fail "the target's servers did not listen on 9441, 9442, 9443 and 9022 within 10s"
+    fi
+    sleep 1
+done
+echo "  PASS: the target listens on 9441, 9442, 9443 (TLS) and 9022 (banner)"
+
+# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port>
+# renders one rule of the block, targeting the target container.
+ingress_rule() {
+    jq -cn --arg id "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1$1" --arg slug "$2" --argjson port "$3" \
+        --arg mode "$4" --arg host "$5" --arg addr "${INGRESS_TARGET_IP}" --argjson tport "$6" \
+        '{id: $id, slug: $slug, listen_port: $port, mode: $mode}
+         + (if $host == "" then {} else {sni_host: $host} end)
+         + {target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", target_address: $addr, target_port: $tport}'
+}
+
+# ingress_rules <target port of tls-b> renders the phase's five rules, in slug
+# order as the control plane lists them.
+ingress_rules() {
+    printf '%s\n' \
+        "$(ingress_rule f1 plain 7022 passthrough "" 9022)" \
+        "$(ingress_rule f2 tls-a 443 passthrough a.ingress.e2e.test 9441)" \
+        "$(ingress_rule f3 tls-b 443 passthrough b.ingress.e2e.test "$1")" \
+        "$(ingress_rule f4 tls-term 443 terminate t.ingress.e2e.test 9441)" \
+        "$(ingress_rule f5 tls-wild 443 passthrough '*.apps.ingress.e2e.test' 9443)" | jq -cs .
+}
+
+# configure_ingress <tag> <rules-json or null> serves a bridge block with only
+# an ingress child, or with "ingress": null, and nudges plexd into a pull, the
+# way configure_sessions configures its block.
+configure_ingress() {
+    local tag=$1 rules=$2 snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson r "${rules}" \
+        '.bridge = {relay: null, user_access: null, ingress: (if $r == null then null else {rules: $r} end), site_to_site: null}')
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-ingress-nudge-${tag}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] ingress nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# ingress_subject <server name, or - for none> prints the subject of the
+# certificate port 443 of the bridge presents to a handshake with that server
+# name, and nothing when the handshake yields no certificate.
+ingress_subject() {
+    docker exec "${INGRESS_TARGET_CONTAINER}" sh -c '
+        if [ "$2" = "-" ]; then sni="-noservername"; else sni="-servername $2"; fi
+        timeout 10 openssl s_client -connect "$1:443" $sni </dev/null 2>/dev/null | openssl x509 -noout -subject 2>/dev/null' \
+        _ "${BRIDGE_IP}" "$1" || true
+}
+
+# ingress_refused <port> succeeds when a connection to the port of the bridge
+# is refused.
+ingress_refused() {
+    ! docker exec "${INGRESS_TARGET_CONTAINER}" nc -z -w 3 "${BRIDGE_IP}" "$1" 2>/dev/null
+}
+
+configure_ingress serve "$(ingress_rules 9442)"
+echo "  the mock serves the rules plain, tls-a, tls-b, tls-term and tls-wild"
+
+docker exec "${SYSTEMD_CONTAINER}" sh -c 'echo 1024 > /proc/sys/net/ipv4/ip_unprivileged_port_start' \
+    || fail "could not write net.ipv4.ip_unprivileged_port_start"
+PORT_FLOOR=$(docker exec "${SYSTEMD_CONTAINER}" cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
+if [ "${PORT_FLOOR}" = "1024" ]; then
+    echo "  PASS: net.ipv4.ip_unprivileged_port_start reads 1024"
+else
+    fail "net.ipv4.ip_unprivileged_port_start reads '${PORT_FLOOR}', want 1024"
+fi
+
+INGRESS_CONFIG=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/config.yaml 2>&1) || fail "could not read /etc/plexd/config.yaml: ${INGRESS_CONFIG}"
+while IFS= read -r line; do
+    case "${line}" in
+        mode:* | bridge:*) fail "/etc/plexd/config.yaml already has the line '${line}', so the bridge block cannot be appended" ;;
+    esac
+done <<< "${INGRESS_CONFIG}"
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'cat >> /etc/plexd/config.yaml <<EOF
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth0
+  access_subnets: ["198.18.100.0/24"]
+  enable_nat: false
+  ingress_enabled: true
+EOF' || fail "could not append the bridge block to /etc/plexd/config.yaml"
+echo "  mode: bridge with bridge.ingress_enabled appended to /etc/plexd/config.yaml"
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+INGRESS_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+
+# The journal lines of the restarted process only.
+ingress_journal() {
+    INGRESS_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) || fail "journalctl -u plexd failed: ${INGRESS_JOURNAL}"
+}
+INGRESS_START=${SECONDS}
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=443" \
+        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=7022" \
+        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"' "slug=tls-term"; then
+        break
+    fi
+    if [ $((SECONDS - INGRESS_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not open the listeners of 443 and 7022 and hold tls-term within 60s of the restart"
+    fi
+    sleep 2
+done
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress manager started"'; then
+    echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress manager started'"
+else
+    fail "plexd[${INGRESS_PID}] logged no 'ingress manager started'"
+fi
+for port in 443 7022; do
+    OPENED=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=${port}")
+    if [ "${OPENED}" -eq 1 ]; then
+        echo "  PASS: plexd[${INGRESS_PID}] logged one 'ingress listener opened' for port ${port}"
+    else
+        fail "plexd[${INGRESS_PID}] logged ${OPENED} 'ingress listener opened' lines for port ${port}, want 1"
+    fi
+done
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"' "slug=tls-term" "reason=mode_not_served"; then
+    echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress rule not served' for tls-term with reason=mode_not_served"
+else
+    fail "plexd[${INGRESS_PID}] logged no 'ingress rule not served' line for tls-term with reason=mode_not_served"
+fi
+PORT_FLOOR=$(docker exec "${SYSTEMD_CONTAINER}" cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
+if [ "${PORT_FLOOR}" = "1024" ]; then
+    echo "  PASS: port 443 bound while net.ipv4.ip_unprivileged_port_start reads 1024"
+else
+    fail "net.ipv4.ip_unprivileged_port_start reads '${PORT_FLOOR}' after the restart, want 1024"
+fi
+
+for spec in a.ingress.e2e.test=a.ingress.e2e.test b.ingress.e2e.test=b.ingress.e2e.test x.apps.ingress.e2e.test=wild.ingress.e2e.test; do
+    name=${spec%%=*}
+    want=${spec#*=}
+    subject=$(ingress_subject "${name}")
+    case "${subject}" in
+        "subject=CN=${want}" | "subject=CN = ${want}") echo "  PASS: server name ${name} received the certificate of ${want}" ;;
+        *) fail "server name ${name} received '${subject}', want the certificate of ${want}" ;;
+    esac
+done
+for name in t.ingress.e2e.test none.ingress.e2e.test x.y.apps.ingress.e2e.test -; do
+    subject=$(ingress_subject "${name}")
+    if [ -z "${subject}" ]; then
+        echo "  PASS: server name ${name} received no certificate"
+    else
+        fail "server name ${name} received '${subject}', want no certificate"
+    fi
+done
+BANNER=$(docker exec "${INGRESS_TARGET_CONTAINER}" sh -c 'timeout 10 nc -w 5 "$1" 7022 </dev/null' _ "${BRIDGE_IP}" 2>&1 || true)
+if [ "${BANNER}" = "plexd-e2e-banner" ]; then
+    echo "  PASS: a client that sends nothing to port 7022 read plexd-e2e-banner"
+else
+    fail "a client that sends nothing to port 7022 read '${BANNER}', want plexd-e2e-banner"
+fi
+
+# A changed rule swaps the table of 443 in place, without a second bind.
+configure_ingress retarget "$(ingress_rules 9441)"
+CHANGE_START=${SECONDS}
+until [ "$(ingress_subject b.ingress.e2e.test)" = "subject=CN=a.ingress.e2e.test" ]; do
+    if [ $((SECONDS - CHANGE_START)) -ge 60 ]; then
+        fail "server name b.ingress.e2e.test did not receive the certificate of a.ingress.e2e.test within 60s of tls-b moving to 9441"
+    fi
+    sleep 2
+done
+echo "  PASS: after tls-b moved to 9441, b.ingress.e2e.test received the certificate of a.ingress.e2e.test"
+ingress_journal
+OPENED=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=443")
+if [ "${OPENED}" -eq 1 ]; then
+    echo "  PASS: plexd[${INGRESS_PID}] still logged one 'ingress listener opened' for port 443"
+else
+    fail "plexd[${INGRESS_PID}] logged ${OPENED} 'ingress listener opened' lines for port 443 after the change, want 1"
+fi
+
+# An ingress child of null closes every public listener.
+configure_ingress remove null
+REMOVE_START=${SECONDS}
+until ingress_refused 443 && ingress_refused 7022; do
+    if [ $((SECONDS - REMOVE_START)) -ge 60 ]; then
+        fail "ports 443 and 7022 of the bridge still accepted connections 60s after the block was served as null"
+    fi
+    sleep 2
+done
+echo "  PASS: connections to 443 and 7022 are refused after the block was served as null"
+ingress_journal
+for port in 443 7022; do
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener closed"' "listen_port=${port}"; then
+        echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress listener closed' for port ${port}"
+    else
+        fail "plexd[${INGRESS_PID}] logged no 'ingress listener closed' for port ${port}"
+    fi
+done
+echo "=== Public ingress on a bridge PASSED ==="
 
 # --- Clean shutdown verification ---
 echo "=== Stopping plexd service ==="
