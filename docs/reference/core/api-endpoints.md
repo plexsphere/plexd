@@ -94,7 +94,8 @@ log. The bootstrap token is **never consumed on an error branch**.
 | `404 Not Found` | `resource_not_found` | Resource handle could not be resolved | Stop |
 | `409 Conflict` | — | Conflicting registration | Stop |
 | `422 Unprocessable Entity` | — | Request invariant violation (empty/oversized field, non-UUID `project_id`) | Stop |
-| `429 Too Many Requests` | — | Rate limited | Retry, honoring `Retry-After` |
+| `429 Too Many Requests` | `token_rate_limited` | The rate limit of the token's BootstrapToken policy refused this redemption; the token is valid and the refusal did not count as a redemption | Wait `Retry-After` with no time limit, then send the same request again (see [Rate-limited bootstrap token](registration.md#rate-limited-bootstrap-token)) |
+| `429 Too Many Requests` | any other, or none | Rate limited, for example by the per-IP limiter's `rate_limited` before any token is looked up | Retry within `max_retry_duration`, honoring `Retry-After` |
 | `503 Service Unavailable` | `pool_exhausted`, `subrange_exhausted`, `allocator_contention` | Address allocation temporarily unavailable | Retry with backoff |
 | `500 Internal Server Error` | — | Server error | Retry with backoff |
 

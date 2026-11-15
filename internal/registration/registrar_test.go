@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -330,8 +331,8 @@ func TestRegistrar_ClearsAuthHeaderOnReRegistration(t *testing.T) {
 
 // The nonce is what lets the control plane recognise a retry of a request it
 // may already have committed. A fresh nonce per attempt makes every retry a
-// brand-new registration, so a lost 201 response would consume the one-time
-// bootstrap token twice and strand an allocated node ID and mesh IP.
+// brand-new registration, so a lost 201 response would spend two redemptions
+// of the bootstrap token and strand an allocated node ID and mesh IP.
 func TestRegistrar_NonceStableAcrossRetries(t *testing.T) {
 	var reqCount atomic.Int32
 	var mu sync.Mutex
@@ -1493,23 +1494,297 @@ func TestRegistrar_KeepsLegacyRawNSKIdentity(t *testing.T) {
 
 // Retry-After is server-controlled and unbounded, and the retry deadline is
 // only checked between attempts — so the sleep itself must be capped, or one
-// "Retry-After: 86400" parks registration for a day.
+// "Retry-After: 86400" parks registration for a day. That holds for every 429
+// but token_rate_limited: the per-IP limiter's rate_limited, and a 429 without
+// a code, say nothing about the token and keep the budget.
 func TestRegistrar_RetryAfterCappedByMaxRetryDuration(t *testing.T) {
-	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Retry-After", "86400")
-		writeProblem(w, http.StatusTooManyRequests, "", "rate limited")
-	})
+	for _, code := range []string{"", "rate_limited"} {
+		t.Run("code="+code, func(t *testing.T) {
+			_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Retry-After", "86400")
+				writeProblem(w, http.StatusTooManyRequests, code, "rate limited")
+			})
 
-	const maxRetry = 5 * time.Second
+			const maxRetry = 5 * time.Second
+			clk := &recordingClock{fakeClock: newFakeClock()}
+			reg := NewRegistrar(client, Config{
+				DataDir:          t.TempDir(),
+				TokenValue:       "token",
+				ProjectID:        testProjectID,
+				ResourceHandle:   testResourceHandle,
+				MaxRetryDuration: maxRetry,
+			}, discardLogger())
+			reg.SetClock(clk)
+
+			_, err := reg.Register(context.Background())
+			if err == nil {
+				t.Fatal("Register: expected retry timeout error, got nil")
+			}
+			if !strings.Contains(err.Error(), "retry timeout") {
+				t.Errorf("error = %q, want to contain %q", err.Error(), "retry timeout")
+			}
+
+			delays := clk.Delays()
+			if len(delays) == 0 {
+				t.Fatal("no retry delay recorded")
+			}
+			for i, d := range delays {
+				if d > maxRetry {
+					t.Errorf("delay[%d] = %v, want <= MaxRetryDuration (%v)", i, d, maxRetry)
+				}
+			}
+		})
+	}
+}
+
+// rateLimitedRequests records what a tokenRateLimitedServer was sent.
+type rateLimitedRequests struct {
+	count      atomic.Int32
+	mu         sync.Mutex
+	nonces     []string
+	publicKeys []string
+}
+
+func (r *rateLimitedRequests) seen() (nonces, publicKeys []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.nonces...), append([]string(nil), r.publicKeys...)
+}
+
+// tokenRateLimitedServer answers the first limited registrations with 429
+// token_rate_limited, the refusal of the rate limit of the token's
+// BootstrapToken policy, and every later one with after. retryAfter is sent as
+// the Retry-After header unless it is empty. A nil after answers 201.
+func tokenRateLimitedServer(t *testing.T, limited int, retryAfter string, after http.HandlerFunc) (*api.ControlPlane, *rateLimitedRequests) {
+	t.Helper()
+	if after == nil {
+		after = successHandler(t)
+	}
+	reqs := &rateLimitedRequests{}
+	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var body api.RegisterRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		reqs.mu.Lock()
+		reqs.nonces = append(reqs.nonces, body.Nonce)
+		reqs.publicKeys = append(reqs.publicKeys, body.PublicKey)
+		reqs.mu.Unlock()
+		if int(reqs.count.Add(1)) > limited {
+			after(w, r)
+			return
+		}
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		writeProblem(w, http.StatusTooManyRequests, "token_rate_limited",
+			"POST /v1/register: the BootstrapToken was redeemed as often as the rate limit of its bootstrap token policy allows")
+	})
+	return client, reqs
+}
+
+// assertDelayIn fails unless delay lies in [lo, hi].
+func assertDelayIn(t *testing.T, i int, delay, lo, hi time.Duration) {
+	t.Helper()
+	if delay < lo || delay > hi {
+		t.Errorf("delay[%d] = %v, want in [%v, %v]", i, delay, lo, hi)
+	}
+}
+
+// A token rate-limited by its BootstrapToken policy is valid and the control
+// plane is answering, so registration waits the whole Retry-After even when it
+// is far beyond max_retry_duration, and asks again with the same request: the
+// refusal did not count as a redemption, so the same nonce can still succeed.
+func TestRegistrar_TokenRateLimitWaitsPastMaxRetryDuration(t *testing.T) {
+	client, reqs := tokenRateLimitedServer(t, 2, "3600", nil)
+
 	clk := &recordingClock{fakeClock: newFakeClock()}
 	reg := NewRegistrar(client, Config{
 		DataDir:          t.TempDir(),
 		TokenValue:       "token",
 		ProjectID:        testProjectID,
 		ResourceHandle:   testResourceHandle,
-		MaxRetryDuration: maxRetry,
+		MaxRetryDuration: 5 * time.Second,
 	}, discardLogger())
 	reg.SetClock(clk)
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if got := reqs.count.Load(); got != 3 {
+		t.Fatalf("request count = %d, want 3", got)
+	}
+	nonces, keys := reqs.seen()
+	for i := 1; i < len(nonces); i++ {
+		if nonces[i] != nonces[0] {
+			t.Errorf("request %d nonce = %q, want %q (the first attempt's)", i+1, nonces[i], nonces[0])
+		}
+		if keys[i] != keys[0] {
+			t.Errorf("request %d public_key = %q, want %q (the first attempt's)", i+1, keys[i], keys[0])
+		}
+	}
+
+	delays := clk.Delays()
+	if len(delays) != 2 {
+		t.Fatalf("recorded %d delays (%v), want 2", len(delays), delays)
+	}
+	for i, d := range delays {
+		assertDelayIn(t, i, d, 3600*time.Second, 3630*time.Second)
+	}
+}
+
+// Without a usable hint the wait falls back to the backoff interval, doubling
+// from 1s. A Retry-After of 0, one that is not an integer, a negative one, and
+// one so large that its conversion to a duration wraps to a few hundred
+// nanoseconds all count as no hint: registration never waits less than a
+// second, so a broken header cannot turn the wait into a busy loop.
+func TestRegistrar_TokenRateLimitWithoutRetryAfterBacksOff(t *testing.T) {
+	for _, retryAfter := range []string{"", "0", "soon", "-5", "20211507185753197"} {
+		t.Run("Retry-After="+retryAfter, func(t *testing.T) {
+			client, reqs := tokenRateLimitedServer(t, 3, retryAfter, nil)
+
+			clk := &recordingClock{fakeClock: newFakeClock()}
+			reg := NewRegistrar(client, Config{
+				DataDir:          t.TempDir(),
+				TokenValue:       "token",
+				ProjectID:        testProjectID,
+				ResourceHandle:   testResourceHandle,
+				MaxRetryDuration: 30 * time.Second,
+			}, discardLogger())
+			reg.SetClock(clk)
+
+			if _, err := reg.Register(context.Background()); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			if got := reqs.count.Load(); got != 4 {
+				t.Fatalf("request count = %d, want 4", got)
+			}
+
+			delays := clk.Delays()
+			if len(delays) != 3 {
+				t.Fatalf("recorded %d delays (%v), want 3", len(delays), delays)
+			}
+			assertDelayIn(t, 0, delays[0], 1*time.Second, 1100*time.Millisecond)
+			assertDelayIn(t, 1, delays[1], 2*time.Second, 2200*time.Millisecond)
+			assertDelayIn(t, 2, delays[2], 4*time.Second, 4400*time.Millisecond)
+		})
+	}
+}
+
+// The longest window a BootstrapToken policy can state is 720 hours, so a
+// hint beyond it is clamped rather than parking registration for months.
+func TestRegistrar_TokenRateLimitClampsRetryAfter(t *testing.T) {
+	client, _ := tokenRateLimitedServer(t, 1, "5184000", nil)
+
+	clk := &recordingClock{fakeClock: newFakeClock()}
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "token",
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 5 * time.Second,
+	}, discardLogger())
+	reg.SetClock(clk)
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	delays := clk.Delays()
+	if len(delays) != 1 {
+		t.Fatalf("recorded %d delays (%v), want 1", len(delays), delays)
+	}
+	assertDelayIn(t, 0, delays[0], 720*time.Hour, 720*time.Hour+30*time.Second)
+}
+
+// Nodes that share a token are told to come back at the same instant, so each
+// wait grows by a random amount: over many waits on the same hint, not one is
+// shorter than the hint, none is longer than its tenth or 30s allows, and they
+// are not all the bare hint.
+func TestRegistrar_TokenRateLimitSpreadsWaits(t *testing.T) {
+	const waits = 20
+	client, _ := tokenRateLimitedServer(t, waits, "3600", nil)
+
+	clk := &recordingClock{fakeClock: newFakeClock()}
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "token",
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 5 * time.Second,
+	}, discardLogger())
+	reg.SetClock(clk)
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	delays := clk.Delays()
+	if len(delays) != waits {
+		t.Fatalf("recorded %d delays, want %d", len(delays), waits)
+	}
+	spread := false
+	for i, d := range delays {
+		assertDelayIn(t, i, d, 3600*time.Second, 3630*time.Second)
+		if d > 3600*time.Second {
+			spread = true
+		}
+	}
+	if !spread {
+		t.Errorf("all %d waits were exactly the 3600s hint, want them spread: %v", waits, delays)
+	}
+}
+
+func TestTokenRateLimitSpread(t *testing.T) {
+	for _, tt := range []struct {
+		delay time.Duration
+		limit time.Duration
+	}{
+		{3600 * time.Second, 30 * time.Second},
+		{720 * time.Hour, 30 * time.Second},
+		{5 * time.Second, 500 * time.Millisecond},
+		{time.Second, 100 * time.Millisecond},
+	} {
+		t.Run(tt.delay.String(), func(t *testing.T) {
+			positive := false
+			for range 300 {
+				got := tokenRateLimitSpread(tt.delay)
+				if got < 0 || got > tt.limit {
+					t.Fatalf("tokenRateLimitSpread(%v) = %v, want in [0, %v]", tt.delay, got, tt.limit)
+				}
+				if got > 0 {
+					positive = true
+				}
+			}
+			if !positive {
+				t.Errorf("tokenRateLimitSpread(%v) was 0 in 300 draws, want a spread", tt.delay)
+			}
+		})
+	}
+	for _, delay := range []time.Duration{0, 9 * time.Nanosecond, -time.Second} {
+		if got := tokenRateLimitSpread(delay); got != 0 {
+			t.Errorf("tokenRateLimitSpread(%v) = %v, want 0", delay, got)
+		}
+	}
+}
+
+// The budget starts again after each rate-limit wait. A control plane that
+// then fails transiently gets the whole max_retry_duration, measured from the
+// end of the wait: with a 5s budget the 503 backoff of 1s, 2s and 4s (±25%)
+// fits four attempts before the budget runs out on the fifth request overall.
+func TestRegistrar_TokenRateLimitRestartsRetryBudget(t *testing.T) {
+	client, reqs := tokenRateLimitedServer(t, 1, "600", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("service unavailable"))
+	})
+
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "token",
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 5 * time.Second,
+	}, discardLogger())
+	reg.SetClock(newFakeClock())
 
 	_, err := reg.Register(context.Background())
 	if err == nil {
@@ -1518,15 +1793,233 @@ func TestRegistrar_RetryAfterCappedByMaxRetryDuration(t *testing.T) {
 	if !strings.Contains(err.Error(), "retry timeout") {
 		t.Errorf("error = %q, want to contain %q", err.Error(), "retry timeout")
 	}
-
-	delays := clk.Delays()
-	if len(delays) == 0 {
-		t.Fatal("no retry delay recorded")
+	if !errors.Is(err, api.ErrServer) {
+		t.Errorf("errors.Is(err, api.ErrServer) = false for %v, want the last 503 wrapped", err)
 	}
-	for i, d := range delays {
-		if d > maxRetry {
-			t.Errorf("delay[%d] = %v, want <= MaxRetryDuration (%v)", i, d, maxRetry)
+	if got := reqs.count.Load(); got != 5 {
+		t.Errorf("request count = %d, want 5 (one 429, then four 503s inside the restarted budget)", got)
+	}
+}
+
+// The rate-limit branch runs before the budget check. A control plane that
+// fails transiently until the 5s budget is spent and then answers
+// token_rate_limited is waited out, not given up on: the 503 backoff of 1s, 2s
+// and 4s (±25%) puts the fourth request past the budget, and that request is
+// the 429.
+func TestRegistrar_TokenRateLimitAfterSpentBudgetIsWaited(t *testing.T) {
+	var reqCount atomic.Int32
+	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch n := reqCount.Add(1); {
+		case n <= 3:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("service unavailable"))
+		case n == 4:
+			w.Header().Set("Retry-After", "60")
+			writeProblem(w, http.StatusTooManyRequests, "token_rate_limited", "rate limited by the bootstrap token policy")
+		default:
+			successHandler(t)(w, r)
 		}
+	})
+
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "token",
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 5 * time.Second,
+	}, discardLogger())
+	reg.SetClock(newFakeClock())
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v, want the 429 after the spent budget waited out", err)
+	}
+	if got := reqCount.Load(); got != 5 {
+		t.Errorf("request count = %d, want 5", got)
+	}
+}
+
+// A cancelled context ends the rate-limit wait at once, however long the hint.
+func TestRegistrar_TokenRateLimitContextCancelled(t *testing.T) {
+	client, reqs := tokenRateLimitedServer(t, 1, "3600", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "token",
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 5 * time.Second,
+	}, discardLogger())
+	reg.SetClock(&cancellingClock{cancel: cancel})
+
+	_, err := reg.Register(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Register error = %v, want context.Canceled", err)
+	}
+	if got := reqs.count.Load(); got != 1 {
+		t.Errorf("request count = %d, want 1", got)
+	}
+}
+
+// The observer sees each wait start and end, also when the context ends it, so
+// the health listener's mark never outlives the wait it names.
+func TestRegistrar_TokenRateLimitObserver(t *testing.T) {
+	newRegistrar := func(t *testing.T, client *api.ControlPlane) *Registrar {
+		return NewRegistrar(client, Config{
+			DataDir:          t.TempDir(),
+			TokenValue:       "token",
+			ProjectID:        testProjectID,
+			ResourceHandle:   testResourceHandle,
+			MaxRetryDuration: 5 * time.Second,
+		}, discardLogger())
+	}
+
+	t.Run("two waits, then registered", func(t *testing.T) {
+		client, _ := tokenRateLimitedServer(t, 2, "10", nil)
+		reg := newRegistrar(t, client)
+		reg.SetClock(newFakeClock())
+		var seen []bool
+		reg.SetRateLimitObserver(func(limited bool) { seen = append(seen, limited) })
+
+		if _, err := reg.Register(context.Background()); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if want := []bool{true, false, true, false}; !slices.Equal(seen, want) {
+			t.Errorf("observer saw %v, want %v", seen, want)
+		}
+	})
+
+	t.Run("wait ended by the context", func(t *testing.T) {
+		client, _ := tokenRateLimitedServer(t, 1, "10", nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		reg := newRegistrar(t, client)
+		reg.SetClock(&cancellingClock{cancel: cancel})
+		var seen []bool
+		reg.SetRateLimitObserver(func(limited bool) { seen = append(seen, limited) })
+
+		if _, err := reg.Register(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Register error = %v, want context.Canceled", err)
+		}
+		if want := []bool{true, false}; !slices.Equal(seen, want) {
+			t.Errorf("observer saw %v, want %v", seen, want)
+		}
+	})
+
+	t.Run("no observer", func(t *testing.T) {
+		client, _ := tokenRateLimitedServer(t, 2, "10", nil)
+		reg := newRegistrar(t, client)
+		reg.SetClock(newFakeClock())
+
+		if _, err := reg.Register(context.Background()); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+	})
+}
+
+// Each wait is one Warn record an operator can act on: when plexd asks again,
+// and why. It is not the generic retry line, and it never carries the token.
+// The clock starts at a fixed instant in a zone other than UTC, so retry_at is
+// checked for its value and its zone, not only for its format.
+func TestRegistrar_TokenRateLimitLogsWait(t *testing.T) {
+	const token = "psb_test_e2eproject_node_ratelimitedsecretvalue"
+	client, _ := tokenRateLimitedServer(t, 2, "10", nil)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	start := time.Date(2026, 11, 15, 12, 0, 0, 0, time.FixedZone("UTC+1", 3600))
+	clk := &fakeClock{now: start}
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       token,
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 5 * time.Second,
+	}, logger)
+	reg.SetClock(clk)
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	const msg = "registration rate limited by the bootstrap token policy, waiting"
+	var waits []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not JSON: %q: %v", line, err)
+		}
+		switch rec["msg"] {
+		case msg:
+			waits = append(waits, rec)
+		case "registration attempt failed, retrying":
+			t.Errorf("a rate-limit wait logged the generic retry line: %v", rec)
+		}
+	}
+	if len(waits) != 2 {
+		t.Fatalf("logged %d %q records, want 2 (one per wait):\n%s", len(waits), msg, buf.String())
+	}
+	// The JSON handler writes a duration as integer nanoseconds.
+	waitStart := start
+	for i, rec := range waits {
+		if rec["level"] != "WARN" {
+			t.Errorf("wait %d level = %v, want WARN", i+1, rec["level"])
+		}
+		for _, key := range []string{"attempt", "retry_after", "delay", "retry_at", "error"} {
+			if _, ok := rec[key]; !ok {
+				t.Errorf("wait %d lacks the %q attribute: %v", i+1, key, rec)
+			}
+		}
+		if got, want := rec["attempt"], float64(i+1); got != want {
+			t.Errorf("wait %d attempt = %v, want %v", i+1, got, want)
+		}
+		if got, want := rec["retry_after"], float64(10*time.Second); got != want {
+			t.Errorf("wait %d retry_after = %v, want %v (the 10s hint)", i+1, got, want)
+		}
+		delayNanos, ok := rec["delay"].(float64)
+		if !ok {
+			t.Fatalf("wait %d delay = %v, want a duration", i+1, rec["delay"])
+		}
+		delay := time.Duration(delayNanos)
+		retryAt, ok := rec["retry_at"].(string)
+		if !ok {
+			t.Fatalf("wait %d retry_at = %v, want an RFC 3339 string", i+1, rec["retry_at"])
+		}
+		if want := waitStart.Add(delay).UTC().Format(time.RFC3339); retryAt != want {
+			t.Errorf("wait %d retry_at = %q, want %q (the clock when the wait starts, plus its delay, in UTC)", i+1, retryAt, want)
+		}
+		waitStart = waitStart.Add(delay)
+	}
+	if strings.Contains(buf.String(), token) {
+		t.Errorf("the log carries the bootstrap token:\n%s", buf.String())
+	}
+}
+
+// A token at its redemption limit stays a final refusal: one attempt, no wait.
+func TestRegistrar_403TokenConsumedStops(t *testing.T) {
+	var reqCount atomic.Int32
+	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		writeProblem(w, http.StatusForbidden, "token_consumed",
+			"POST /v1/register: the BootstrapToken has reached the redemption limit of its bootstrap token policy.")
+	})
+
+	reg := NewRegistrar(client, Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "boot-token",
+		ProjectID:        testProjectID,
+		ResourceHandle:   testResourceHandle,
+		MaxRetryDuration: 30 * time.Second,
+	}, discardLogger())
+	reg.SetClock(newFakeClock())
+
+	_, err := reg.Register(context.Background())
+	if !errors.Is(err, api.ErrForbidden) {
+		t.Errorf("Register error = %v, want errors.Is(err, api.ErrForbidden)", err)
+	}
+	if got := reqCount.Load(); got != 1 {
+		t.Errorf("request count = %d, want 1 (no retry on token_consumed)", got)
 	}
 }
 

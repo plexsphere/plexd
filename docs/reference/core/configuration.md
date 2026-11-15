@@ -103,7 +103,7 @@ Node registration and bootstrap authentication.
 | `use_metadata` | bool | `false` | Enable the cloud metadata service (IMDS) as a fallback source for registration inputs |
 | `metadata_token_path` | string | `/plexd/bootstrap-token` | Metadata key path for the bootstrap token (e.g. IMDS) |
 | `metadata_timeout` | duration | `2s` | Maximum time to wait for a metadata service response |
-| `max_retry_duration` | duration | `5m` | Maximum duration to retry registration |
+| `max_retry_duration` | duration | `5m` | Maximum duration to retry registration. A wait on a `429 token_rate_limited` answer does not count, and the budget starts again after it (see [Rate-limited bootstrap token](registration.md#rate-limited-bootstrap-token)) |
 
 > `data_dir` is propagated from the top-level `data_dir` at runtime. It does not appear in the YAML.
 

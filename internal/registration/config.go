@@ -51,7 +51,9 @@ type Config struct {
 	// Default: 2s
 	MetadataTimeout time.Duration `yaml:"metadata_timeout"`
 
-	// MaxRetryDuration is the maximum duration to retry registration.
+	// MaxRetryDuration is the maximum duration to retry registration. A wait on
+	// a 429 token_rate_limited answer does not count against it, and the
+	// budget starts again once such a wait has passed.
 	// Default: 5m
 	MaxRetryDuration time.Duration `yaml:"max_retry_duration"`
 }

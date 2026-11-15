@@ -24,7 +24,7 @@ The `internal/registration` package handles node self-registration and bootstrap
 | `UseMetadata`                     | `bool`          | `false`                        | Enable cloud metadata source for registration inputs|
 | `MetadataTokenPath`               | `string`        | `/plexd/bootstrap-token`       | Metadata key path for bootstrap token      |
 | `MetadataTimeout`                 | `time.Duration` | `2s`                           | Timeout for metadata service requests      |
-| `MaxRetryDuration`                | `time.Duration` | `5m`                           | Maximum retry duration for transient errors|
+| `MaxRetryDuration`                | `time.Duration` | `5m`                           | Maximum retry duration for transient errors; a wait on `429 token_rate_limited` does not count|
 
 ```go
 cfg := registration.Config{
@@ -265,9 +265,9 @@ func NewRegistrar(client *api.ControlPlane, cfg Config, logger *slog.Logger) *Re
 
 - Applies config defaults
 - Logger tagged with `component=registration`
-- Optional: call `SetMetadataProvider`, `SetClock` after construction (the
-  `plexd up` / `plexd join` commands call `SetMetadataProvider` for you when
-  `use_metadata` is enabled)
+- Optional: call `SetMetadataProvider`, `SetClock`, `SetRateLimitObserver`
+  after construction (the `plexd up` / `plexd join` commands call
+  `SetMetadataProvider` for you when `use_metadata` is enabled)
 
 ### Register
 
@@ -299,7 +299,7 @@ sequenceDiagram
         R->>R: Fail fast if project_id or resource_handle missing
         R->>CP: SetAuthToken("") (register is unauthenticated)
         R->>R: One nonce for the whole registration
-        loop Retry with backoff (max 5m)
+        loop Retry with backoff (max 5m, rate-limit waits excluded)
             R->>CP: POST /v1/register (bootstrap token in body)
         end
         CP-->>R: node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot, domain_mesh_cidr
@@ -317,7 +317,7 @@ sequenceDiagram
 5. **Resolve registration inputs** — `project_id`, `resource_handle`, and `requested_resource_id` via `ResolveValue` (direct config value, else IMDS). Each required input is checked as soon as it resolves, so a missing `project_id` fails before the later metadata lookups run
 6. **Fail fast** — return an error before any HTTP call if `project_id` or `resource_handle` is empty
 7. **Clear the auth token** — `client.SetAuthToken("")`. `POST /v1/register` is unauthenticated (`security: []`); the bootstrap token travels in the request body. Clearing also drops a stale NSK on the re-registration path. The previous token is restored unless registration completes, so a failed re-registration does not leave the shared client unauthenticated.
-8. **POST /v1/register with retry** — one UUIDv4 nonce per logical registration, reused across attempts; exponential backoff on transient errors. The nonce is replay protection, not an idempotency key: a nonce the control plane has already recorded is answered with `403 nonce_collision`, so retrying a request that may already have been committed is denied rather than granted a second node. The nonce is never persisted — after a restart it could only produce that denial, so a fresh registration starts with a fresh nonce
+8. **POST /v1/register with retry** — one UUIDv4 nonce per logical registration, reused across attempts; exponential backoff on transient errors, and a wait without a time limit on `429 token_rate_limited` (see [Rate-limited bootstrap token](#rate-limited-bootstrap-token)). The nonce is replay protection, not an idempotency key: a nonce the control plane has already recorded is answered with `403 nonce_collision`, so retrying a request that may already have been committed is denied rather than granted a second node. The nonce is never persisted — after a restart it could only produce that denial, so a fresh registration starts with a fresh nonce
 9. **Build NodeIdentity** from response + private key — `nsk` must decode from standard-padded base64 to a 32-byte AES-256-GCM key, or registration fails before anything is persisted
 10. **Persist identity** atomically to data directory
 11. **Remove token file** if token was file-based. When the unlink fails, the file is truncated to zero bytes and `token file emptied, it could not be removed` is logged at Info; only when that fails too is `failed to delete token file` logged at Warn, with `truncate_error`. A file that is already gone logs nothing, and no outcome is fatal
@@ -339,7 +339,8 @@ leaves the token spendable.
 | `404` | `resource_not_found` | Stop — resource unresolved |
 | `409` | — | Stop |
 | `422` | — | Stop — invariant violation |
-| `429` | — | Retry, honoring the `Retry-After` header |
+| `429` | `token_rate_limited` | Wait the `Retry-After` header with no time limit, then send the same request again (see [Rate-limited bootstrap token](#rate-limited-bootstrap-token)) |
+| `429` | any other, or none | Retry, honoring the `Retry-After` header within `Config.MaxRetryDuration` |
 | `503` | `pool_exhausted`, `subrange_exhausted`, `allocator_contention` | Retry with backoff |
 | `500` | — | Retry with backoff |
 | Network / transport error | — | Retry with backoff |
@@ -352,7 +353,23 @@ Backoff parameters (consistent with `internal/api/ReconnectEngine`):
 | Multiplier        | 2x     |
 | Max interval      | 60s    |
 | Jitter            | ±25%   |
-| Timeout           | `Config.MaxRetryDuration` (default 5m) |
+| Timeout           | `Config.MaxRetryDuration` (default 5m); a `429 token_rate_limited` wait does not count, and the budget restarts after it |
+
+#### Rate-limited bootstrap token
+
+A BootstrapToken policy on the control plane can limit how often one token is redeemed, for example once per hour. A registration over that limit answers `429` with the problem code `token_rate_limited` and a `Retry-After` header in whole seconds. The token is valid and the refusal did not count as a redemption, so plexd waits and then sends the same request again, with the same nonce and public key:
+
+- The wait is the `Retry-After` value. A hint below one second (an absent, zero, negative or non-integer header, or an oversized one whose conversion to a duration wraps below a second) counts as none, and the wait is the backoff interval instead, 1s doubling up to 60s.
+- A hint above 720 hours, the longest window a BootstrapToken policy can state, is cut to 720 hours.
+- Each wait grows by a random amount of up to a tenth of it, at most 30 seconds, so Nodes that share a token do not all ask again in the same second. The wait is never shortened.
+- The wait does not count against `Config.MaxRetryDuration`, and the budget starts again when the wait ends. A registration goes through as many waits as the policy asks for.
+- Each wait logs one Warn line, `registration rate limited by the bootstrap token policy, waiting`, with `attempt`, `retry_after` (the hint, `0s` when absent), `delay` (the wait), `retry_at` (when plexd asks again, in UTC, RFC 3339) and `error`. The token never appears in it.
+- The function passed to `SetRateLimitObserver` is called with `true` when a wait starts and with `false` when it ends, whether its time passed or the context ended it.
+- A cancelled context ends the wait at once.
+
+Restarting plexd asks again at once, with a fresh nonce, and the control plane answers with the hint that holds then. That is the way to pick up a policy the Project administrator loosened in the meantime. `plexd join` waits the same way and reports the wait in its log only.
+
+A `429` with any other code, such as the per-IP limiter's `rate_limited`, or with none, says nothing about the token and keeps the budget: its wait is capped at what is left of `Config.MaxRetryDuration`.
 
 ### IsRegistered
 
