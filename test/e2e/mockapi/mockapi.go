@@ -67,6 +67,9 @@ type AssertionCounters struct {
 	// SessionActivityRejectedCount counts the liveness refusals (404/409) of the
 	// session activity endpoint. A structural 400 counts nowhere.
 	SessionActivityRejectedCount int64 `json:"session_activity_rejected_count"`
+	// RegisterRateLimitedCount counts the registrations an armed token rate
+	// limit refused (POST /test/configure-register).
+	RegisterRateLimitedCount int64 `json:"registration_rate_limited_count"`
 	// SessionActiveCount counts the accepted tcp session_active rows. They count
 	// on no other counter, because the control plane records them only as a
 	// last-active touch.
@@ -118,6 +121,9 @@ type Server struct {
 	SessionConnectWait time.Duration
 
 	registerCount                  atomic.Int64
+	registerRateLimitNext          atomic.Int64
+	registerRetryAfterSeconds      atomic.Int64
+	registerRateLimitedCount       atomic.Int64
 	heartbeatCount                 atomic.Int64
 	stateCount                     atomic.Int64
 	keyRotateCount                 atomic.Int64
@@ -296,6 +302,7 @@ func New() *Server {
 	}
 	s.secretCurrentVersion.Store(1)
 	s.secretRetryAfterSeconds.Store(1)
+	s.registerRetryAfterSeconds.Store(1)
 	s.registerRoutes()
 	return s
 }
@@ -319,6 +326,7 @@ func (s *Server) Assertions() AssertionCounters {
 		EndpointCandidatesCount:        s.endpointCandidatesCount.Load(),
 		SecretsCount:                   s.secretsCount.Load(),
 		SecretsRateLimitedCount:        s.secretsRateLimitedCount.Load(),
+		RegisterRateLimitedCount:       s.registerRateLimitedCount.Load(),
 		ReportPutCount:                 s.reportPutCount.Load(),
 		ReportDeleteCount:              s.reportDeleteCount.Load(),
 		ExecutionCallbackCount:         s.executionCallbackCount.Load(),
@@ -653,6 +661,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/configure-endpoint", s.handleConfigureEndpoint)
 	s.mux.HandleFunc("POST /test/configure-capabilities", s.handleConfigureCapabilities)
 	s.mux.HandleFunc("POST /test/configure-secrets", s.handleConfigureSecrets)
+	s.mux.HandleFunc("POST /test/configure-register", s.handleConfigureRegister)
 	s.mux.HandleFunc("POST /test/configure-hook-versions", s.handleConfigureHookVersions)
 	s.mux.HandleFunc("POST /test/configure-events", s.handleConfigureEvents)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
@@ -691,6 +700,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-endpoint", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-secrets", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-register", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-hook-versions", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
@@ -782,6 +792,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // registration contract from issue #18: success is 201, and every denial is an
 // RFC 9457 application/problem+json body mirroring the platform taxonomy. The
 // bootstrap token is consumed (its nonce recorded) only on the 201 branch.
+// While POST /test/configure-register has armed a token rate limit, a
+// registration whose token passed the token-state checks is refused with 429
+// token_rate_limited instead, as the control plane refuses one over the rate
+// limit of the token's BootstrapToken policy.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.registerCount.Add(1)
 
@@ -856,13 +870,33 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Project match (403).
+	// 5. Armed token rate limit (429). Exactly the next registerRateLimitNext
+	// registrations past the token-state checks are refused, as the control
+	// plane refuses a redemption over the rate limit of the token's
+	// BootstrapToken policy. The CompareAndSwap decrement keeps the "exactly
+	// N" guarantee under concurrent registrations, Retry-After is set before
+	// writeProblem writes the status, and no nonce is recorded: the refusal
+	// is not a redemption, so the same request succeeds afterwards.
+	for {
+		n := s.registerRateLimitNext.Load()
+		if n <= 0 {
+			break
+		}
+		if s.registerRateLimitNext.CompareAndSwap(n, n-1) {
+			s.registerRateLimitedCount.Add(1)
+			w.Header().Set("Retry-After", strconv.FormatInt(s.registerRetryAfterSeconds.Load(), 10))
+			writeProblem(w, r, http.StatusTooManyRequests, "token_rate_limited", "bootstrap_token rate limited by its bootstrap token policy")
+			return
+		}
+	}
+
+	// 6. Project match (403).
 	if req.ProjectID != mockProjectID {
 		writeProblem(w, r, http.StatusForbidden, "project_mismatch", "project_id does not match the bootstrap token")
 		return
 	}
 
-	// 6. Nonce replay (403).
+	// 7. Nonce replay (403).
 	nonceKey := req.ProjectID + "|" + req.Nonce
 	s.consumedNoncesMu.Lock()
 	_, replayed := s.consumedNonces[nonceKey]
@@ -872,13 +906,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 7. Resource resolution (404).
+	// 8. Resource resolution (404).
 	if req.ResourceHandle == "unknown-resource" {
 		writeProblem(w, r, http.StatusNotFound, "resource_not_found", "resource handle could not be resolved")
 		return
 	}
 
-	// 8. Magic handles for allocator/server failures.
+	// 9. Magic handles for allocator/server failures.
 	switch req.ResourceHandle {
 	case "exhausted-pool":
 		writeProblem(w, r, http.StatusServiceUnavailable, "pool_exhausted", "address pool exhausted")
@@ -894,8 +928,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 9. Success (201). Claim the nonce only here — the token is never consumed
-	// on any error branch. Check-and-set under one lock: the read in step 6 is
+	// 10. Success (201). Claim the nonce only here — the token is never consumed
+	// on any error branch. Check-and-set under one lock: the read in step 7 is
 	// a fast path, so two concurrent registrations sharing a nonce would
 	// otherwise both observe it free and both be granted an identity.
 	s.consumedNoncesMu.Lock()
@@ -4048,6 +4082,37 @@ func (s *Server) handleConfigureCapabilities(w http.ResponseWriter, r *http.Requ
 	}
 	s.capabilitiesFailNext.Store(body.FailNext)
 	s.capabilitiesRefuseMetadata.Store(body.RefuseHookMetadata)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleConfigureRegister handles POST /test/configure-register. It arms the
+// register handler's token rate limit: rate_limit_next is how many of the
+// next registrations answer 429 token_rate_limited, and retry_after_seconds is
+// the Retry-After those answers carry. Each field is applied only when > 0,
+// so a partial body leaves the other dial untouched. Decoding is strict: an
+// unknown field, a body that is not JSON, and an empty body are a 400.
+func (s *Server) handleConfigureRegister(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("configure_register", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var body struct {
+		RateLimitNext     int64 `json:"rate_limit_next"`
+		RetryAfterSeconds int64 `json:"retry_after_seconds"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if body.RetryAfterSeconds > 0 {
+		s.registerRetryAfterSeconds.Store(body.RetryAfterSeconds)
+	}
+	if body.RateLimitNext > 0 {
+		s.registerRateLimitNext.Store(body.RateLimitNext)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

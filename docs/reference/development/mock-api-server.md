@@ -192,11 +192,12 @@ first failure:
 2. **Invariants** → `422` (no `code`): empty `bootstrap_token`, `nonce`, or `resource_handle`; a `project_id` that is empty, the zero UUID, or not a UUID; any field longer than 4096 characters.
 3. **Public key** → `400` `public_key_invalid` if `public_key` fails `^[A-Za-z0-9+/]{43}=$` or decodes to the all-zero key.
 4. **Bootstrap token** → `403`: malformed token (fails `^psb_[a-z]+_[a-z2-7]+_(node|bridge)_[a-z2-7]{20,}$`) has no `code`; a `bridge`-kind token yields `kind_mismatch`; a trailing random segment containing `consumed`, `expired`, or `revoked` yields `token_consumed`, `token_expired`, or `token_revoked`.
-5. **Project match** → `403` `project_mismatch` if `project_id` is not the mock project UUID.
-6. **Nonce replay** → `403` `nonce_collision` if `(project_id, nonce)` was already recorded on a prior `201`.
-7. **Resource resolution** → `404` `resource_not_found` for the reserved handle `unknown-resource`.
-8. **Allocator / server triggers** → magic resource handles (below).
-9. **Success** → `201` with the fixture below; the nonce is recorded.
+5. **Armed token rate limit** → `429` `token_rate_limited` with a `Retry-After` header while [`POST /test/configure-register`](#post-test-configure-register) has armed it, as the control plane refuses a redemption over the rate limit of the token's BootstrapToken policy. Each such answer spends one armed refusal and increments `registration_rate_limited_count`; no nonce is recorded, so the same request succeeds once the armed refusals are spent.
+6. **Project match** → `403` `project_mismatch` if `project_id` is not the mock project UUID.
+7. **Nonce replay** → `403` `nonce_collision` if `(project_id, nonce)` was already recorded on a prior `201`.
+8. **Resource resolution** → `404` `resource_not_found` for the reserved handle `unknown-resource`.
+9. **Allocator / server triggers** → magic resource handles (below).
+10. **Success** → `201` with the fixture below; the nonce is recorded.
 
 **Magic triggers.** Reserved inputs force specific branches:
 
@@ -1329,6 +1330,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "audit_count": 0,
   "session_activity_count": 0,
   "session_activity_rejected_count": 0,
+  "registration_rate_limited_count": 0,
   "session_active_count": 0,
   "session_connection_count": 0,
   "session_connection_rejected_count": 0,
@@ -1609,6 +1611,33 @@ untouched.
 - Request body is captured and retrievable via `GET /test/last-request/configure_secrets`.
 
 **Error:** Returns `400` if the body is not valid JSON or contains an unknown field. Returns `405` if the HTTP method is not `POST`.
+
+### `POST /test/configure-register`
+
+Arms the token rate limit of [`POST /v1/register`](#post-v1-register): the count
+of upcoming registrations that answer `429` `token_rate_limited`
+(`rate_limit_next`), and the `Retry-After` seconds those answers carry
+(`retry_after_seconds`). Lets a test drive plexd's wait on a bootstrap token
+that the rate limit of its BootstrapToken policy refuses, without a control
+plane.
+
+**Request body:** strict-decoded: an unknown field is a `400`. Each field is
+applied only when greater than 0, so a partial body leaves the other dial
+untouched.
+
+```json
+{ "rate_limit_next": 1, "retry_after_seconds": 15 }
+```
+
+**Response:** `204 No Content`.
+
+**Behavior:**
+
+- `rate_limit_next` — arms the **next N** registrations that pass the token-state checks (step 5 of the register validation order) to answer `429` `token_rate_limited`. It is decremented exactly once per refused registration, also under concurrent requests, and each refusal increments `registration_rate_limited_count`. A refused registration records no nonce.
+- `retry_after_seconds` — the value written into the `Retry-After` header of those answers. Defaults to `1`.
+- Request body is captured and retrievable via `GET /test/last-request/configure_register`.
+
+**Error:** Returns `400` if the body is empty, is not valid JSON, or contains an unknown field, and arms nothing. Returns `405` if the HTTP method is not `POST`.
 
 ### `POST /test/configure-hook-versions`
 
@@ -1919,6 +1948,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
 | `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted rows only, tcp `session_active` rows excepted) |
 | `session_activity_rejected_count` | `POST /v1/nodes/{id}/sessions/{sid}` (liveness refusals only: `404` / `409`) |
+| `registration_rate_limited_count` | `POST /v1/register` (`429` `token_rate_limited` answers of an armed token rate limit only) |
 | `session_active_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted tcp `session_active` rows only, which count on no other counter) |
 | `session_connection_count` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (connections delivered to a relay) |
 | `session_connection_rejected_count` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (`404` / `409` / `426` answers) |

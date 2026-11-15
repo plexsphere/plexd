@@ -210,7 +210,9 @@ var localCounterFields = map[string]bool{
 // completing rotation, which n identical unarmed submissions cannot reach.
 // ExecutionUploadCount advances only through the presign-then-PUT leg, which the
 // flat fan-out does not drive uniformly. SecretsRateLimitedCount advances only
-// while the secret rate limit is armed, which the flat fan-out never arms.
+// while the secret rate limit is armed, which the flat fan-out never arms, and
+// RegisterRateLimitedCount only while the token rate limit of
+// POST /test/configure-register is armed, which it never arms either.
 // EventsRequestCount advances only on GET .../events, which the flat fan-out
 // never opens. UnauthorizedCount advances only when the bearer gate refuses a
 // request, and a run in which it moves at all is a failing run — the tests that
@@ -222,6 +224,7 @@ var statefulCounterFields = map[string]bool{
 	"KeyRotateCount":                 true,
 	"ExecutionUploadCount":           true,
 	"SecretsRateLimitedCount":        true,
+	"RegisterRateLimitedCount":       true,
 	"EventsRequestCount":             true,
 	"UnauthorizedCount":              true,
 	"SessionActivityRejectedCount":   true,
@@ -698,6 +701,126 @@ func TestRegister_WrongMethod_Returns405(t *testing.T) {
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// postRegister sends a register body built from m and returns the response.
+func postRegister(t *testing.T, baseURL string, m map[string]any) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return doRequest(t, http.MethodPost, baseURL+"/v1/register", string(body))
+}
+
+// An armed token rate limit refuses exactly the next N valid registrations
+// with the control plane's 429 token_rate_limited and the armed Retry-After,
+// and like the control plane it records nothing: the refused nonce succeeds
+// once the budget is spent. A token-state denial comes first and spends none.
+func TestRegister_RateLimit(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	cfg := doRequest(t, http.MethodPost, ts.URL+"/test/configure-register", `{"rate_limit_next":2,"retry_after_seconds":7}`)
+	cfg.Body.Close()
+	if cfg.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-register status = %d, want %d", cfg.StatusCode, http.StatusNoContent)
+	}
+
+	assertLimited := func(t *testing.T, i int, m map[string]any) {
+		t.Helper()
+		resp := postRegister(t, ts.URL, m)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("registration %d status = %d, want %d", i, resp.StatusCode, http.StatusTooManyRequests)
+		}
+		if got := resp.Header.Get("Retry-After"); got != "7" {
+			t.Errorf("registration %d Retry-After = %q, want %q", i, got, "7")
+		}
+		if code := problemCode(t, resp); code != "token_rate_limited" {
+			t.Errorf("registration %d code = %q, want %q", i, code, "token_rate_limited")
+		}
+	}
+
+	first := validRegisterFields()
+	assertLimited(t, 1, first)
+
+	consumed := validRegisterFields()
+	consumed["bootstrap_token"] = "psb_test_e2eproject_node_consumedaaaaaaaaaaaaaa"
+	resp := postRegister(t, ts.URL, consumed)
+	if resp.StatusCode != http.StatusForbidden {
+		resp.Body.Close()
+		t.Fatalf("consumed-token status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if code := problemCode(t, resp); code != "token_consumed" {
+		t.Errorf("consumed-token code = %q, want %q", code, "token_consumed")
+	}
+	resp.Body.Close()
+
+	assertLimited(t, 2, validRegisterFields())
+
+	resp = postRegister(t, ts.URL, first)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("registration with the first refused nonce after the budget: status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+
+	if got := getAssertions(t, ts.URL).RegisterRateLimitedCount; got != 2 {
+		t.Errorf("registration_rate_limited_count = %d, want 2", got)
+	}
+
+	t.Run("never armed", func(t *testing.T) {
+		_, fresh := newTestServer(t)
+		resp := postRegister(t, fresh.URL, validRegisterFields())
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+		}
+		if got := getAssertions(t, fresh.URL).RegisterRateLimitedCount; got != 0 {
+			t.Errorf("registration_rate_limited_count = %d, want 0", got)
+		}
+	})
+}
+
+// POST /test/configure-register decodes strictly. A body it refuses, and an
+// empty object, arm nothing.
+func TestConfigureRegister_Validation(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	for _, tt := range []struct {
+		name, body string
+		want       int
+	}{
+		{"empty object", `{}`, http.StatusNoContent},
+		{"zero-length body", "", http.StatusBadRequest},
+		{"unknown field", `{"rate_limit_next":1,"retry_after":5}`, http.StatusBadRequest},
+		{"not JSON", `rate_limit_next=1`, http.StatusBadRequest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-register", tt.body)
+			resp.Body.Close()
+			if resp.StatusCode != tt.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.want)
+			}
+		})
+	}
+
+	resp := postRegister(t, ts.URL, validRegisterFields())
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("register status after the refused bodies = %d, want %d (nothing armed)", resp.StatusCode, http.StatusCreated)
+	}
+	if got := getAssertions(t, ts.URL).RegisterRateLimitedCount; got != 0 {
+		t.Errorf("registration_rate_limited_count = %d, want 0", got)
+	}
+
+	wrong, err := http.Get(ts.URL + "/test/configure-register")
+	if err != nil {
+		t.Fatalf("GET /test/configure-register: %v", err)
+	}
+	wrong.Body.Close()
+	if wrong.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET status = %d, want %d", wrong.StatusCode, http.StatusMethodNotAllowed)
 	}
 }
 
