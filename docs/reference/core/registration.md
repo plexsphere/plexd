@@ -364,7 +364,7 @@ A BootstrapToken policy on the control plane can limit how often one token is re
 - Each wait grows by a random amount of up to a tenth of it, at most 30 seconds, so Nodes that share a token do not all ask again in the same second. The wait is never shortened.
 - The wait does not count against `Config.MaxRetryDuration`, and the budget starts again when the wait ends. A registration goes through as many waits as the policy asks for.
 - Each wait logs one Warn line, `registration rate limited by the bootstrap token policy, waiting`, with `attempt`, `retry_after` (the hint, `0s` when absent), `delay` (the wait), `retry_at` (when plexd asks again, in UTC, RFC 3339) and `error`. The token never appears in it.
-- The function passed to `SetRateLimitObserver` is called with `true` when a wait starts and with `false` when it ends, whether its time passed or the context ended it.
+- The function passed to `SetRateLimitObserver` is called with `true` when a wait starts and with `false` when it ends, whether its time passed or the context ended it. `plexd up` passes the health listener's mark, so `/readyz` answers `not ready: registration rate limited` during each wait (see [health](configuration.md#health)).
 - A cancelled context ends the wait at once.
 
 Restarting plexd asks again at once, with a fresh nonce, and the control plane answers with the hint that holds then. That is the way to pick up a policy the Project administrator loosened in the meantime. `plexd join` waits the same way and reports the wait in its log only.

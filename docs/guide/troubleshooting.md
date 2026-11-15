@@ -34,6 +34,10 @@ plexd logs     # View service logs
 
 Verify that the bootstrap token has not expired and that the node can reach the control plane API (`PLEXD_API`).
 
+Until registration completes the node API is not up, so `plexd status` reports that the agent is not running; the log and `/readyz` say what registration is doing.
+
+A log line `registration rate limited by the bootstrap token policy, waiting` does not mean the enrolment is broken. The bootstrap token is valid, and the BootstrapToken policy it was issued under limits how often it is redeemed, for example once per hour for a fleet that shares one token. plexd waits until the `retry_at` time the line names and then registers again on its own, as often as the policy asks; no action is needed. Meanwhile `/readyz` on the health listener answers `not ready: registration rate limited` (`curl -s http://127.0.0.1:9101/readyz` with the default `health.listen`). When the Project administrator loosens the policy, restart plexd to ask again at once instead of waiting.
+
 ## Node removed from the control plane
 
 ```bash

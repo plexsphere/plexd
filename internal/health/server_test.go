@@ -130,6 +130,53 @@ func TestReadyz_Transitions(t *testing.T) {
 	}
 }
 
+// A registration waiting out the rate limit of its bootstrap token's
+// BootstrapToken policy gets a reason of its own, so an operator can tell it
+// from one that is slow or failing. The mark is read only while the node is
+// unregistered: once it is registered, the later conditions take over.
+func TestReadyz_RegistrationRateLimited(t *testing.T) {
+	srv := NewServer(Config{}, testLogger())
+	h := srv.Handler()
+
+	steps := []struct {
+		name       string
+		transition func()
+		wantBody   string
+	}{
+		{
+			name:       "a rate-limit wait starts",
+			transition: func() { srv.SetRegistrationRateLimited(true) },
+			wantBody:   "not ready: registration rate limited\n",
+		},
+		{
+			name:       "the wait ends and the next attempt is in flight",
+			transition: func() { srv.SetRegistrationRateLimited(false) },
+			wantBody:   "not ready: registration pending\n",
+		},
+		{
+			name: "registered while the mark is still set",
+			transition: func() {
+				srv.SetRegistrationRateLimited(true)
+				srv.SetRegistered()
+			},
+			wantBody: "not ready: data plane not configured\n",
+		},
+	}
+
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			step.transition()
+			status, body := probe(t, h, "/readyz")
+			if status != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want %d", status, http.StatusServiceUnavailable)
+			}
+			if body != step.wantBody {
+				t.Errorf("body = %q, want %q", body, step.wantBody)
+			}
+		})
+	}
+}
+
 // TestReadyz_DataPlaneCheckIsRepeated guards against a latched data-plane
 // readiness. SetDataPlaneReady records the initial bring-up, but the WireGuard
 // interface is kernel state that other actors delete afterwards — and a node

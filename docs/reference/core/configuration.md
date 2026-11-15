@@ -169,12 +169,15 @@ Dedicated listener for the unauthenticated Kubernetes probe endpoints `/healthz`
 
 | Condition | `503` body when unmet |
 |-----------|-----------------------|
+| Registration is not waiting out the rate limit of its bootstrap token | `not ready: registration rate limited` |
 | The node holds a registered identity | `not ready: registration pending` |
 | The WireGuard interface is up and the deny-by-default firewall baseline is installed | `not ready: data plane not configured` |
 | The WireGuard interface is still present and up | `not ready: data plane lost` |
 | The control plane accepts the node's credential | `not ready: node credential refused` |
 | Event delivery to the control plane is working | `not ready: event delivery stopped` or `not ready: event delivery degraded` |
 | Every long-running subsystem is still running | `not ready: subsystem stopped` |
+
+`not ready: registration rate limited` means the control plane answered the last registration attempt with `429 token_rate_limited`: the bootstrap token is valid, but the rate limit of its BootstrapToken policy admits no further redemption yet, and plexd waits for the time the answer named (see [Rate-limited bootstrap token](registration.md#rate-limited-bootstrap-token)). While the next attempt is in flight the body reads `not ready: registration pending` again.
 
 WireGuard setup failure is non-fatal — the agent logs a warning and keeps running — so the data-plane condition is what keeps such a node out of rotation instead of letting it report ready without a tunnel. On Kubernetes this also stops a DaemonSet rolling update from marching across the fleet when a kernel or capability regression breaks WireGuard everywhere.
 

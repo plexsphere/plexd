@@ -1904,6 +1904,91 @@ func TestRunUp_HealthListenFromEnvIsServed(t *testing.T) {
 	}
 }
 
+// While registration waits out a 429 token_rate_limited answer, /readyz names
+// the wait instead of "registration pending", so an operator probing a booting
+// Node can tell a rate-limited enrolment from a broken one. writeUpConfig's 1s
+// max_retry_duration is shorter than the 2s hint, so the second request coming
+// at least 2s after the first also proves the retry budget no longer cuts the
+// wait short in the running daemon.
+func TestRunUp_ReadyzNamesARateLimitedRegistration(t *testing.T) {
+	var requests atomic.Int32
+	var arrivedMu sync.Mutex
+	var arrived []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		arrivedMu.Lock()
+		arrived = append(arrived, time.Now())
+		arrivedMu.Unlock()
+		if requests.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"type":"about:blank","title":"BootstrapToken Rate Limited","status":429,"code":"token_rate_limited","detail":"POST /v1/register: retry after the interval in the Retry-After header."}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	useFirewallController(t, &failingFirewallController{err: errors.New("operation not permitted")})
+	writeUpConfig(t, srv.URL, "policy:\n  enabled: false\n")
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	t.Setenv("PLEXD_HEALTH_ENABLED", "true")
+	t.Setenv("PLEXD_HEALTH_LISTEN", addr)
+
+	upErr := make(chan error, 1)
+	go func() { upErr <- runUp(upCmd, nil) }()
+
+	const want = "not ready: registration rate limited\n"
+	client := &http.Client{Timeout: time.Second}
+	var bodies []string
+	deadline := time.Now().Add(10 * time.Second)
+	seen := false
+	for !seen && time.Now().Before(deadline) {
+		resp, err := client.Get("http://" + addr + "/readyz")
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			body := string(b)
+			if body == want {
+				seen = true
+				break
+			}
+			if len(bodies) == 0 || bodies[len(bodies)-1] != body {
+				bodies = append(bodies, body)
+			}
+		}
+		select {
+		case err := <-upErr:
+			// runUp ended before the probe saw the reason; put the result
+			// back for the assertions below.
+			upErr <- err
+			deadline = time.Now()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if !seen {
+		t.Errorf("GET %s/readyz never answered %q within 10s; bodies seen: %q", addr, want, bodies)
+	}
+
+	select {
+	case err := <-upErr:
+		if err == nil || !strings.Contains(err.Error(), "registration") {
+			t.Errorf("runUp() error = %v, want the registration failure of the second attempt", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runUp did not return after the second registration attempt")
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("control plane received %d register requests, want 2 (the 429, then the 400)", got)
+	}
+	arrivedMu.Lock()
+	gap := arrived[1].Sub(arrived[0])
+	arrivedMu.Unlock()
+	if gap < 2*time.Second {
+		t.Errorf("second register request came %v after the first, want at least the 2s Retry-After (the 1s budget must not cut the wait)", gap)
+	}
+}
+
 // The failure mode the variable is verbatim for: an address the kernel refuses
 // surfaces through the bind error, which names the address, rather than
 // through a validation path that would have to guess at the cause.

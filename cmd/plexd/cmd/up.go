@@ -245,6 +245,12 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
+	// While registration waits out the rate limit of its bootstrap token,
+	// /readyz names the wait instead of "registration pending".
+	if healthSrv != nil {
+		registrar.SetRateLimitObserver(healthSrv.SetRegistrationRateLimited)
+	}
+
 	identity, err := registrar.Register(ctx)
 	if err != nil {
 		return fmt.Errorf("plexd up: registration: %w", err)

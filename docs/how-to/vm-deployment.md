@@ -201,6 +201,16 @@ Common issues:
 - **Invalid token**: The bootstrap token is expired or malformed. Generate a new token from the control plane.
 - **curl not found**: The minimal template assumes `curl` is installed. Use the full template (which installs `curl` via `packages`) or ensure `curl` is in the base image.
 
+### Registration waits on a rate-limited token
+
+VMs built from one image or template often share one bootstrap token. When the token's BootstrapToken policy carries a rate limit, the control plane admits only as many registrations per window as the policy allows and tells the others when to try again. The install succeeds, and on a VM that has to wait the plexd log shows:
+
+```
+level=WARN msg="registration rate limited by the bootstrap token policy, waiting" ... retry_at=2026-11-15T12:00:07Z ...
+```
+
+plexd waits until `retry_at` and registers on its own; the VM needs nothing else. To enrol faster, ask the Project administrator for a policy with a higher rate limit, or give each VM its own token.
+
 ### IMDS token not found
 
 If using metadata-based token delivery and plexd reports "no bootstrap token found":

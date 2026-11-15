@@ -68,6 +68,10 @@ const (
 	bodyDeliveryDegraded    = "not ready: event delivery degraded\n"
 	bodySubsystemStopped    = "not ready: subsystem stopped\n"
 
+	// bodyRegistrationRateLimited replaces bodyRegistrationPending while
+	// registration waits out the rate limit of its bootstrap token.
+	bodyRegistrationRateLimited = "not ready: registration rate limited\n"
+
 	contentTypePlain = "text/plain; charset=utf-8"
 )
 
@@ -90,6 +94,10 @@ type Server struct {
 	deliveryStopped   bool
 	subsystemStopped  bool
 	mode              api.DeliveryMode
+
+	// registrationRateLimited is set while registration waits out a 429
+	// token_rate_limited answer; see SetRegistrationRateLimited.
+	registrationRateLimited bool
 }
 
 // NewServer creates a new Server. Config defaults are applied automatically.
@@ -117,6 +125,22 @@ func (s *Server) SetRegistered() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.registered = true
+}
+
+// SetRegistrationRateLimited records whether registration is waiting out the
+// rate limit of its bootstrap token's BootstrapToken policy: the control plane
+// answered 429 token_rate_limited and plexd waits for the time its Retry-After
+// names. The registrar sets it when such a wait starts and clears it when the
+// wait ends, so between two waits, while the next attempt is in flight,
+// readiness reads "registration pending" again. Once the node is registered
+// the mark is not read.
+//
+// It logs nothing: the registrar logs each wait with the time of the next
+// attempt, which the unauthenticated probe body must not carry.
+func (s *Server) SetRegistrationRateLimited(limited bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registrationRateLimited = limited
 }
 
 // SetDataPlaneReady marks the mesh data plane as established: the WireGuard
@@ -253,16 +277,22 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // node without a data plane is not serving regardless of how its event stream
 // is doing. A refused credential comes before event delivery because the event
 // stream fails on the same refusal and, once the polling-fallback window
-// passes, reports degraded delivery, which would hide the cause.
+// passes, reports degraded delivery, which would hide the cause. An
+// unregistered node that is waiting out the rate limit of its bootstrap token
+// says so instead of "registration pending", so a rate-limited enrolment reads
+// differently from a slow or failing one.
 func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	registered, dataPlaneReady := s.registered, s.dataPlaneReady
+	registrationRateLimited := s.registrationRateLimited
 	dataPlaneLost, credentialRefused := s.dataPlaneLost, s.credentialRefused
 	deliveryStopped, subsystemStopped := s.deliveryStopped, s.subsystemStopped
 	mode := s.mode
 	s.mu.Unlock()
 
 	switch {
+	case !registered && registrationRateLimited:
+		writePlain(w, http.StatusServiceUnavailable, bodyRegistrationRateLimited)
 	case !registered:
 		writePlain(w, http.StatusServiceUnavailable, bodyRegistrationPending)
 	case !dataPlaneReady:
