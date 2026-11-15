@@ -63,8 +63,8 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 |             | `RestartSec`             | `5s`                                     | Delay between restarts                       |
 |             | `LimitNOFILE`            | `65536`                                  | File descriptor limit for WireGuard tunnels  |
 |             | `EnvironmentFile`        | `-{ConfigDir}/environment`               | Optional environment file (dash = optional)  |
-|             | `AmbientCapabilities`    | `CAP_NET_ADMIN CAP_NET_RAW`              | Network capabilities for WireGuard and ICMP  |
-|             | `CapabilityBoundingSet`  | `CAP_NET_ADMIN CAP_NET_RAW`              | Limit capabilities to required set           |
+|             | `AmbientCapabilities`    | `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` | Network capabilities for WireGuard, ICMP and public ingress ports below 1024 |
+|             | `CapabilityBoundingSet`  | `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` | Limit capabilities to required set   |
 |             | `ProtectSystem`          | `full`                                   | Make /usr, /boot, /efi and /etc read-only    |
 |             | `ProtectHome`            | `true`                                   | Make /home, /root, /run/user inaccessible    |
 |             | `ReadWritePaths`         | `-{DataDir} -{RunDir} -{ConfigDir}/bootstrap-token` | Allow writes to the data and runtime dirs and the bootstrap token file |
@@ -74,6 +74,21 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 `systemctl enable --now plexd` therefore enables the helper socket and starts it
 with plexd. The sandbox directives stay: the session helper is what runs outside
 them.
+
+`CAP_NET_BIND_SERVICE` lets a bridge bind a [public ingress](../bridge/public-ingress.md)
+rule's listen port below 1024, such as 443 or 80. A unit an earlier release
+wrote keeps `CAP_NET_ADMIN CAP_NET_RAW` until `plexd install` writes it again;
+until then, a drop-in adds the capability, because systemd merges repeated
+capability lines:
+
+```ini
+# /etc/systemd/system/plexd.service.d/bind-service.conf
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+Run `systemctl daemon-reload` and `systemctl restart plexd` after adding it.
 
 `/etc` stays read-only for plexd on purpose. The session helper trusts
 `config.yaml` and the signing key it pins at `{ConfigDir}/session-signing-key`

@@ -53,11 +53,11 @@ func TestGenerateUnitFile_SecurityHardening(t *testing.T) {
 	if !strings.Contains(output, "ProtectHome=true") {
 		t.Error("output missing ProtectHome=true")
 	}
-	if !strings.Contains(output, "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW") {
-		t.Error("output missing AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW")
+	if !strings.Contains(output, "\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n") {
+		t.Error("output missing AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE")
 	}
-	if !strings.Contains(output, "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW") {
-		t.Error("output missing CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW")
+	if !strings.Contains(output, "\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n") {
+		t.Error("output missing CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE")
 	}
 }
 
@@ -181,7 +181,7 @@ func TestGenerateUnitFile_SessionHelperSocketDependency(t *testing.T) {
 		// The sandbox stays: the helper is what runs outside it.
 		"ProtectSystem=full",
 		"ProtectHome=true",
-		"CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+		"CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
 	} {
 		if !strings.Contains(output, "\n"+line+"\n") {
 			t.Errorf("unit file missing %q, got:\n%s", line, output)

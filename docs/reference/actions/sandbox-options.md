@@ -35,7 +35,7 @@ Under plexd's systemd unit that user is root, held to the unit's limits:
 
 | Unit setting | What it means for a hook |
 |---|---|
-| `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW` | Root keeps these two capabilities and no other |
+| `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` | Root keeps these three capabilities and no other, so a hook can also bind a port below 1024 |
 | `ProtectSystem=full` | `/usr`, the boot loader directories, and `/etc` are read-only, apart from the paths the unit lists in `ReadWritePaths` |
 | `ProtectHome=true` | `/home`, `/root`, and `/run/user` are empty and cannot be reached |
 
