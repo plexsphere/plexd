@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -79,12 +80,12 @@ func TestPeekClientHello_ServerName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conn, rec, stop := startTLSClient(t, &tls.Config{ServerName: "App.Example.com"}, tc.chunk)
 
-			name, peeked, err := peekClientHello(conn, 2*time.Second)
+			hello, peeked, err := peekClientHello(conn, 2*time.Second)
 			if err != nil {
 				t.Fatalf("peekClientHello: %v", err)
 			}
-			if name != "App.Example.com" {
-				t.Errorf("server name = %q, want %q", name, "App.Example.com")
+			if hello.ServerName != "App.Example.com" {
+				t.Errorf("server name = %q, want %q", hello.ServerName, "App.Example.com")
 			}
 			if len(peeked) <= 1024 {
 				t.Errorf("peeked %d bytes, want a ClientHello above 1,024 bytes", len(peeked))
@@ -100,15 +101,40 @@ func TestPeekClientHello_ServerName(t *testing.T) {
 func TestPeekClientHello_NoSNI(t *testing.T) {
 	conn, _, _ := startTLSClient(t, &tls.Config{InsecureSkipVerify: true}, 0)
 
-	name, peeked, err := peekClientHello(conn, 2*time.Second)
+	hello, peeked, err := peekClientHello(conn, 2*time.Second)
 	if err != nil {
 		t.Fatalf("peekClientHello: %v", err)
 	}
-	if name != "" {
-		t.Errorf("server name = %q, want empty", name)
+	if hello.ServerName != "" {
+		t.Errorf("server name = %q, want empty", hello.ServerName)
 	}
 	if len(peeked) == 0 {
 		t.Error("peeked no bytes")
+	}
+}
+
+func TestPeekClientHello_ALPN(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offers []string
+	}{
+		{name: "h2 and http/1.1", offers: []string{"h2", "http/1.1"}},
+		{name: "none"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, _, _ := startTLSClient(t, &tls.Config{ServerName: "app.example.com", NextProtos: tc.offers}, 0)
+
+			hello, _, err := peekClientHello(conn, 2*time.Second)
+			if err != nil {
+				t.Fatalf("peekClientHello: %v", err)
+			}
+			if !slices.Equal(hello.ALPN, tc.offers) {
+				t.Errorf("ALPN = %q, want %q", hello.ALPN, tc.offers)
+			}
+			if tc.offers == nil && hello.ALPN != nil {
+				t.Errorf("ALPN = %#v, want nil", hello.ALPN)
+			}
+		})
 	}
 }
 

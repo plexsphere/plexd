@@ -465,6 +465,39 @@ bridge:
 	}
 }
 
+// TestParseConfig_RemovedACMEKeys pins that a file written for an older plexd
+// keeps loading: an acme rule takes its directory and contact from the state
+// pull and needs no local switch, and the keys that set them locally now have
+// no effect.
+func TestParseConfig_RemovedACMEKeys(t *testing.T) {
+	yaml := `
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth1
+  access_subnets: ["10.0.0.0/24"]
+  ingress_enabled: true
+  acme_enabled: true
+  acme_allowed_hosts: ["app.example.com"]
+  acme_email: ops@example.com
+  acme_directory_url: https://acme-staging-v02.api.letsencrypt.org/directory
+`
+	path := writeTemp(t, yaml)
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	if !cfg.Bridge.IngressEnabled {
+		t.Error("Bridge.IngressEnabled = false, want true")
+	}
+	if err := cfg.Bridge.Validate(); err != nil {
+		t.Errorf("Bridge.Validate() = %v, want nil", err)
+	}
+}
+
 func TestParseConfig_AbsentFile(t *testing.T) {
 	// The DaemonSet mounts the config as optional, so a missing file must yield
 	// a defaulted config that flags and environment overrides can complete.

@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -585,24 +586,22 @@ func runAgent(ctx context.Context) error {
 			return fmt.Errorf("plexd up: bridge setup: %w", err)
 		}
 
-		// ACME manager (before ingress, which may need TLS config).
-		if cfg.Bridge.ACMEEnabled {
-			acmeMgr = bridge.NewACMEManager(bridge.ACMEConfig{
-				Enabled:          cfg.Bridge.ACMEEnabled,
-				CacheDir:         cfg.Bridge.ACMECacheDir,
-				AllowedHosts:     cfg.Bridge.ACMEAllowedHosts,
-				Email:            cfg.Bridge.ACMEEmail,
-				ACMEDirectoryURL: cfg.Bridge.ACMEDirectoryURL,
-			}, logger)
-			if err := acmeMgr.Setup(); err != nil {
-				return fmt.Errorf("plexd up: acme setup: %w", err)
-			}
-		}
-
-		// Ingress manager.
+		// Ingress manager, with the ACME account its acme rules share and the
+		// fetch of its terminate rules' certificates. The state pull configures
+		// the account; it holds none until a block names an acme rule.
 		if cfg.Bridge.IngressEnabled {
+			acmeDir := cfg.Bridge.ACMECacheDir
+			if acmeDir == "" {
+				acmeDir = filepath.Join(cfg.DataDir, "acme")
+			}
+			acmeMgr = bridge.NewACMEManager(bridge.ACMEConfig{CacheDir: acmeDir}, logger)
+			ingressNSK, err := identity.SecretKey()
+			if err != nil {
+				return fmt.Errorf("plexd up: %w", err)
+			}
+			certs := ingressCertFetcher{client: client, nodeID: identity.NodeID, nsk: ingressNSK}
 			ingressCtrl := bridge.NewStdIngressController(logger)
-			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr)
+			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr, certs)
 			if err := ingressMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: ingress setup: %w", err)
 			}
@@ -1129,6 +1128,10 @@ func runAgent(ctx context.Context) error {
 	if bridgeMgr != nil {
 		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
+			// A rotated certificate Secret changes only the secrets block,
+			// which reports no drift, so the inventory reaches the manager on
+			// every successful pull, ahead of the reconcile handlers.
+			reconciler.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
 			reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		}
 		if userAccessMgr != nil {

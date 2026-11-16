@@ -4,6 +4,8 @@ package bridge
 
 import (
 	"crypto/tls"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,263 +17,134 @@ import (
 // Integration tests — ACME with Ingress
 // ---------------------------------------------------------------------------
 
-// TestACMEIntegration_ManagerLifecycle tests ACMEManager standalone lifecycle:
-// Setup -> Active -> TLSConfig -> AllowedHosts -> Teardown -> inactive.
-func TestACMEIntegration_ManagerLifecycle(t *testing.T) {
-	cfg := ACMEConfig{
-		Enabled:      true,
-		CacheDir:     t.TempDir(),
-		AllowedHosts: []string{"example.com", "www.example.com"},
-		Email:        "admin@example.com",
-	}
-
-	mgr := NewACMEManager(cfg, discardLogger())
-
-	// Setup succeeds.
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Active() returns true after Setup.
-	if !mgr.Active() {
-		t.Fatal("should be active after Setup")
-	}
-
-	// TLSConfig() returns non-nil with GetCertificate set.
-	tlsCfg := mgr.TLSConfig()
-	if tlsCfg == nil {
-		t.Fatal("TLSConfig should not be nil after Setup")
-	}
-	if tlsCfg.GetCertificate == nil {
-		t.Error("TLSConfig.GetCertificate should be set")
-	}
-
-	// AllowedHosts() returns the configured hosts.
-	hosts := mgr.AllowedHosts()
-	if len(hosts) != 2 {
-		t.Fatalf("AllowedHosts len = %d, want 2", len(hosts))
-	}
-	if hosts[0] != "example.com" || hosts[1] != "www.example.com" {
-		t.Errorf("AllowedHosts = %v, want [example.com www.example.com]", hosts)
-	}
-
-	// Teardown succeeds.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-
-	// Active() returns false after Teardown.
-	if mgr.Active() {
-		t.Error("should not be active after Teardown")
-	}
-
-	// TLSConfig() returns nil after Teardown.
-	if mgr.TLSConfig() != nil {
-		t.Error("TLSConfig should be nil after Teardown")
-	}
-
-	// Second teardown is no-op.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("second Teardown: %v", err)
-	}
-}
-
-// TestACMEIntegration_SetupValidation tests ACMEManager setup validation for
-// various invalid configurations.
-func TestACMEIntegration_SetupValidation(t *testing.T) {
-	// Enabled=false: Setup is no-op, Active()=false.
-	t.Run("disabled", func(t *testing.T) {
-		cfg := ACMEConfig{
-			Enabled: false,
-		}
-		mgr := NewACMEManager(cfg, discardLogger())
-
-		if err := mgr.Setup(); err != nil {
-			t.Fatalf("Setup: %v", err)
-		}
-		if mgr.Active() {
-			t.Error("manager should not be active when disabled")
-		}
-	})
-
-	// Empty CacheDir: Setup returns error.
-	t.Run("empty_cache_dir", func(t *testing.T) {
-		cfg := ACMEConfig{
-			Enabled:      true,
-			CacheDir:     "",
-			AllowedHosts: []string{"example.com"},
-		}
-		mgr := NewACMEManager(cfg, discardLogger())
-
-		err := mgr.Setup()
-		if err == nil {
-			t.Fatal("Setup should return error for empty CacheDir")
-		}
-		if mgr.Active() {
-			t.Error("manager should not be active after failed Setup")
-		}
-	})
-
-	// Empty AllowedHosts: Setup returns error.
-	t.Run("empty_allowed_hosts", func(t *testing.T) {
-		cfg := ACMEConfig{
-			Enabled:      true,
-			CacheDir:     t.TempDir(),
-			AllowedHosts: []string{},
-		}
-		mgr := NewACMEManager(cfg, discardLogger())
-
-		err := mgr.Setup()
-		if err == nil {
-			t.Fatal("Setup should return error for empty AllowedHosts")
-		}
-		if mgr.Active() {
-			t.Error("manager should not be active after failed Setup")
-		}
-	})
-}
-
-// TestACMEIntegration_ACMERuleIsHeldNotServed applies an acme rule with an
-// active ACMEManager: the block names no certificate source yet, so the rule
-// is held and not served, and its port opens no listener.
-func TestACMEIntegration_ACMERuleIsHeldNotServed(t *testing.T) {
-	acmeMgr := NewACMEManager(ACMEConfig{
-		Enabled:      true,
-		CacheDir:     t.TempDir(),
-		AllowedHosts: []string{"example.com"},
-		Email:        "admin@example.com",
-	}, discardLogger())
-	if err := acmeMgr.Setup(); err != nil {
-		t.Fatalf("ACME Setup: %v", err)
-	}
-	defer func() { _ = acmeMgr.Teardown() }()
-
+// TestACMEIntegration_ApplyConfiguresTheAccount applies a block with an acme
+// rule: the account becomes active for the rule's host, asks the block's
+// directory for the host's certificate ahead of a client, and keeps its key
+// in the cache directory. A block without the rule retires the account.
+func TestACMEIntegration_ApplyConfiguresTheAccount(t *testing.T) {
 	ctrl := newLoopbackIngressController(t)
-	cfg := Config{Enabled: true, IngressEnabled: true}
-	cfg.ApplyDefaults()
-	mgr := NewIngressManager(ctrl, cfg, discardLogger(), acmeMgr)
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Ingress Setup: %v", err)
+	fx := newIngressFixture(t, ctrl)
+	block := api.IngressConfig{
+		Rules: []api.IngressRule{acmeRule("acme", 8443, "acme.example.com", 9000)},
+		ACME:  testACME,
 	}
-	defer func() { _ = mgr.Teardown() }()
-
-	rule := api.IngressRule{
-		ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
-		Slug:          "api",
-		ListenPort:    443,
-		Mode:          api.IngressModeACME,
-		SNIHost:       "example.com",
-		TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
-		TargetAddress: "10.0.0.5",
-		TargetPort:    8080,
-	}
-	if err := mgr.Apply([]api.IngressRule{rule}); err != nil {
+	if err := fx.mgr.Apply(t.Context(), block); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	states := mgr.RuleStates()
-	if len(states) != 1 || states[0].Served || states[0].Reason != IngressReasonModeNotServed {
-		t.Fatalf("RuleStates = %+v, want one state with reason %q", states, IngressReasonModeNotServed)
+	if !fx.acme.Active() || !fx.acme.HasHost("acme.example.com") {
+		t.Fatalf("ACME account active, has the host = %v, %v, want true, true", fx.acme.Active(), fx.acme.HasHost("acme.example.com"))
 	}
-	if got := len(ctrl.ingressCallsFor("Listen")); got != 0 {
-		t.Errorf("Listen calls = %d, want 0", got)
+	if s := fx.mgr.IngressStatus(); !s.ACMEEnabled {
+		t.Errorf("IngressStatus = %+v, want ACMEEnabled", s)
 	}
-	status := mgr.IngressStatus()
-	if status.RuleCount != 0 || !status.ACMEEnabled {
-		t.Errorf("IngressStatus = %+v, want no served rule and ACMEEnabled", status)
+	fx.logs.waitFor(t, `msg="bridge: acme: obtain certificate failed" component=bridge sni_host=acme.example.com`, 1)
+	if got := fx.transport.requests(); len(got) == 0 || got[0] != testACME.DirectoryURL {
+		t.Errorf("requests = %v, want the first to %s", got, testACME.DirectoryURL)
+	}
+	if _, err := os.Stat(filepath.Join(fx.acme.cfg.CacheDir, "acme_account+key")); err != nil {
+		t.Errorf("account key in the cache directory: %v", err)
+	}
+	if got := logLines(fx.logs, `msg="acme account configured"`, "directory_url="+testACME.DirectoryURL, "contact=true", "hosts=1"); got != 1 {
+		t.Errorf("%d 'acme account configured' lines, want 1:\n%s", got, fx.logs.String())
+	}
+
+	if err := fx.mgr.Apply(t.Context(), rulesBlock()); err != nil {
+		t.Fatalf("Apply without the acme rule: %v", err)
+	}
+	if fx.acme.Active() || fx.acme.HasHost("acme.example.com") {
+		t.Error("the ACME account is active without an acme rule, want it retired")
+	}
+	if s := fx.mgr.IngressStatus(); s.ACMEEnabled {
+		t.Errorf("IngressStatus = %+v, want ACMEEnabled false", s)
 	}
 }
 
-// TestACMEIntegration_TLSConfigProperties tests that TLSConfig returns a
-// properly configured *tls.Config.
-func TestACMEIntegration_TLSConfigProperties(t *testing.T) {
-	cfg := ACMEConfig{
-		Enabled:      true,
-		CacheDir:     t.TempDir(),
-		AllowedHosts: []string{"example.com"},
-		Email:        "admin@example.com",
-	}
-
-	mgr := NewACMEManager(cfg, discardLogger())
-	if err := mgr.Setup(); err != nil {
+// TestACMEIntegration_DirectoryNotAllowed refuses a directory that
+// bridge.acme_directory_urls does not list: the acme rule is held and not
+// served, no account is configured and port 443 does not open.
+func TestACMEIntegration_DirectoryNotAllowed(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	cfg := ingressTestConfig(true)
+	cfg.ACMEDirectoryURLs = []string{"https://ca.example/dir"}
+	fx := buildIngressFixture(t, ctrl, cfg)
+	if err := fx.mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-
-	tlsCfg := mgr.TLSConfig()
-	if tlsCfg == nil {
-		t.Fatal("TLSConfig should not be nil after Setup")
+	const other = "https://other.invalid/dir"
+	if err := fx.mgr.Apply(t.Context(), api.IngressConfig{
+		Rules: []api.IngressRule{acmeRule("acme", 8443, "acme.example.com", 9000)},
+		ACME:  &api.IngressACME{DirectoryURL: other},
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
 
-	// Verify MinVersion = tls.VersionTLS12.
-	if tlsCfg.MinVersion != tls.VersionTLS12 {
-		t.Errorf("MinVersion = %d, want %d (TLS 1.2)", tlsCfg.MinVersion, tls.VersionTLS12)
+	if st := stateOf(t, fx.mgr, "acme"); st.Served || st.Reason != IngressReasonACMEDirectoryNotAllowed || st.Detail != other {
+		t.Errorf("acme rule = %+v, want %q with the URL", st, IngressReasonACMEDirectoryNotAllowed)
 	}
-
-	// Verify GetCertificate is non-nil (it's the autocert.Manager's GetCertificate).
-	if tlsCfg.GetCertificate == nil {
-		t.Error("GetCertificate should be set")
+	if fx.acme.Active() {
+		t.Error("the ACME account is active for a directory the bridge does not accept")
 	}
-
-	// Cleanup.
-	_ = mgr.Teardown()
+	if got := ctrl.listenAddrs(); len(got) != 1 || got[0] != ":8443" {
+		t.Errorf("Listen addresses = %v, want [:8443]", got)
+	}
+	if got := fx.transport.requests(); len(got) != 0 {
+		t.Errorf("requests = %v, want none", got)
+	}
+	if got := logLines(fx.logs, `msg="ingress rule not served"`, "slug=acme", "reason=acme_directory_not_allowed"); got != 1 {
+		t.Errorf("%d 'ingress rule not served' lines, want 1:\n%s", got, fx.logs.String())
+	}
 }
 
-// TestACMEIntegration_ConcurrentTLSConfigAccess exercises concurrent access
-// to ACMEManager methods to verify no data races. Run with -race.
-func TestACMEIntegration_ConcurrentTLSConfigAccess(t *testing.T) {
-	cfg := ACMEConfig{
-		Enabled:      true,
-		CacheDir:     t.TempDir(),
-		AllowedHosts: []string{"example.com", "app.example.com"},
-		Email:        "admin@example.com",
-		// Use a non-routable ACME directory URL to prevent real HTTP
-		// connections that would leak HTTP/2 goroutines (detected by goleak).
-		ACMEDirectoryURL: "https://192.0.2.1:1/directory",
-	}
-
-	mgr := NewACMEManager(cfg, discardLogger())
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
+// TestACMEIntegration_ConcurrentAccess reads the manager from several
+// goroutines while the account is configured and retired, to catch data races.
+// Run with -race.
+func TestACMEIntegration_ConcurrentAccess(t *testing.T) {
+	mgr, _, _ := newTestACMEManager(t)
+	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			// TLSConfig() — should not race.
-			tlsCfg := mgr.TLSConfig()
-			if tlsCfg == nil {
-				t.Error("TLSConfig should not be nil while active")
+	for range 8 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = mgr.HasHost("a.example.com")
+				_ = mgr.Active()
+				// The hello carries no server name, so autocert refuses it
+				// before it reads its cache or the network. Never pass a nil
+				// hello: autocert dereferences it, and on windows/amd64 the
+				// access violation that raises can corrupt the heap
+				// (golang/go#81238).
+				cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
+				if cert != nil || err == nil ||
+					(err.Error() != "bridge: acme: no account is configured" && !strings.HasPrefix(err.Error(), "acme/autocert: ")) {
+					t.Errorf("GetCertificate(empty hello) = %v, %v; want nil and a bridge or autocert error", cert, err)
+					return
+				}
 			}
-
-			// Active() — should not race.
-			if !mgr.Active() {
-				t.Error("Active should be true while active")
-			}
-
-			// AllowedHosts() — should not race.
-			hosts := mgr.AllowedHosts()
-			if len(hosts) != 2 {
-				t.Errorf("AllowedHosts len = %d, want 2", len(hosts))
-			}
-
-			// GetCertificate() — should not race. The hello carries no
-			// server name, so autocert refuses it before it reads its
-			// cache or the network. Never pass a nil hello: autocert
-			// dereferences it, and on windows/amd64 the access
-			// violation that raises can corrupt the heap
-			// (golang/go#81238).
-			cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
-			if cert != nil || err == nil || !strings.HasPrefix(err.Error(), "acme/autocert: ") {
-				t.Errorf("GetCertificate(empty hello) = %v, %v; want nil and an acme/autocert error", cert, err)
-			}
-		}()
+		})
 	}
 
+	settings := []*api.IngressACME{
+		{DirectoryURL: "https://one.example/dir"},
+		{DirectoryURL: "https://two.example/dir", ContactEmail: "ops@example.com"},
+	}
+	for i := range 20 {
+		switch i % 3 {
+		case 0:
+			mgr.Configure(settings[i%2], []string{"a.example.com", "b.example.com"})
+		case 1:
+			mgr.Configure(settings[i%2], []string{"a.example.com"})
+		default:
+			mgr.Configure(nil, nil)
+		}
+	}
+	close(stop)
 	wg.Wait()
-
-	// Cleanup.
-	_ = mgr.Teardown()
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
 }

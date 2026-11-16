@@ -104,22 +104,13 @@ type Config struct {
 	// Supported values: "ipsec", "openvpn". Empty means WireGuard-only.
 	TunnelProviders []string `yaml:"tunnel_providers"`
 
-	// ACMEEnabled controls whether ACME certificate management is active for ingress.
-	// Default: false. Requires IngressEnabled=true.
-	ACMEEnabled bool `yaml:"acme_enabled"`
-
-	// ACMECacheDir is the directory for caching ACME certificates.
+	// ACMECacheDir is the directory that holds the ACME account key and the
+	// certificates of the acme rules. Empty means <data_dir>/acme.
 	ACMECacheDir string `yaml:"acme_cache_dir"`
 
-	// ACMEAllowedHosts is the whitelist of hostnames for ACME certificate issuance.
-	ACMEAllowedHosts []string `yaml:"acme_allowed_hosts"`
-
-	// ACMEEmail is the contact email for the ACME account.
-	ACMEEmail string `yaml:"acme_email"`
-
-	// ACMEDirectoryURL overrides the default ACME directory URL.
-	// Empty means the default (Let's Encrypt production).
-	ACMEDirectoryURL string `yaml:"acme_directory_url"`
+	// ACMEDirectoryURLs bounds the ACME directories the bridge accepts from the
+	// state pull's bridge.ingress.acme member. Empty accepts any https directory.
+	ACMEDirectoryURLs []string `yaml:"acme_directory_urls"`
 }
 
 // BoolPtr returns a pointer to the given bool value.
@@ -162,9 +153,15 @@ func (c *Config) ApplyDefaults() {
 	}
 }
 
-// Validate checks that configuration values are acceptable.
-// When bridge mode is disabled, validation is skipped.
+// Validate checks that configuration values are acceptable. When bridge mode
+// is disabled, validation is skipped, except for acme_directory_urls, which is
+// checked whatever the other settings say.
 func (c *Config) Validate() error {
+	for _, u := range c.ACMEDirectoryURLs {
+		if !ValidACMEDirectoryURL(u) {
+			return fmt.Errorf("bridge: config: acme_directory_urls: %q is not an absolute https URL", u)
+		}
+	}
 	if c.RelayEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: relay requires bridge mode to be enabled")
 	}
@@ -224,17 +221,6 @@ func (c *Config) Validate() error {
 			// valid
 		default:
 			return fmt.Errorf("bridge: config: unsupported TunnelProvider %q", tp)
-		}
-	}
-	if c.ACMEEnabled {
-		if !c.IngressEnabled {
-			return fmt.Errorf("bridge: config: ACME requires ingress to be enabled")
-		}
-		if c.ACMECacheDir == "" {
-			return fmt.Errorf("bridge: config: ACMECacheDir is required when ACME is enabled")
-		}
-		if len(c.ACMEAllowedHosts) == 0 {
-			return fmt.Errorf("bridge: config: at least one ACMEAllowedHosts is required when ACME is enabled")
 		}
 	}
 	if c.SiteToSiteEnabled {

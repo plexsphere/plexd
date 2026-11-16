@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"time"
 )
 
@@ -26,22 +27,31 @@ var errClientHelloPeeked = errors.New("bridge: ingress: client hello peeked")
 // bytes.
 var errSNIPeekLimit = errors.New("bridge: ingress: client hello exceeds the peek limit")
 
+// clientHello is what the bridge routes a TLS connection by: the server name
+// of its ClientHello and the ALPN protocols it offers, in the client's order.
+// ALPN is nil when the client offers none.
+type clientHello struct {
+	ServerName string
+	ALPN       []string
+}
+
 // peekClientHello reads the client's TLS ClientHello from conn without
-// answering it and returns its server name and the bytes it read.
+// answering it and returns its server name, its ALPN protocols and the bytes
+// it read.
 //
 // crypto/tls parses the hello, so a hello that spans several reads or records
 // and a server name behind any other extension are read in full. The bytes
 // come back also on an error, and the caller replays them to the target
 // through newPeekConn. An empty server name with a nil error is a hello
 // without SNI.
-func peekClientHello(conn net.Conn, timeout time.Duration) (serverName string, peeked []byte, err error) {
+func peekClientHello(conn net.Conn, timeout time.Duration) (hello clientHello, peeked []byte, err error) {
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return "", nil, err
+		return clientHello{}, nil, err
 	}
 	rec := &recordingConn{Conn: conn}
 	cfg := &tls.Config{
-		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			serverName = hello.ServerName
+		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			hello = clientHello{ServerName: info.ServerName, ALPN: slices.Clone(info.SupportedProtos)}
 			return nil, errClientHelloPeeked
 		},
 	}
@@ -50,12 +60,12 @@ func peekClientHello(conn net.Conn, timeout time.Duration) (serverName string, p
 		if err == nil {
 			err = errors.New("bridge: ingress: handshake completed without a client hello")
 		}
-		return "", rec.buf.Bytes(), err
+		return clientHello{}, rec.buf.Bytes(), err
 	}
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return "", rec.buf.Bytes(), err
+		return clientHello{}, rec.buf.Bytes(), err
 	}
-	return serverName, rec.buf.Bytes(), nil
+	return hello, rec.buf.Bytes(), nil
 }
 
 // recordingConn records every byte read from the connection and discards

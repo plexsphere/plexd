@@ -74,23 +74,40 @@ func RelayReconcileHandler(relay *Relay, status *RelayStatusTracker, logger *slo
 	}
 }
 
+// IngressSecretInventoryHandler returns a reconcile.DispatchHandler that hands
+// the secret inventory of every successful pull to the ingress manager, which
+// loads, replaces or drops the certificates of its terminate rules. A pull
+// whose only change is the secrets block reports no drift, so no reconcile
+// handler would see a rotation. A nil Secrets block, a control plane that did
+// not say this time, keeps the inventory the manager holds. Dispatch handlers
+// run before the reconcile handlers, so a cycle that brings a new rule and its
+// Secret hands the inventory over first.
+func IngressSecretInventoryHandler(mgr *IngressManager) reconcile.DispatchHandler {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot) {
+		if desired == nil || desired.Secrets == nil {
+			return
+		}
+		mgr.SyncSecretInventory(ctx, *desired.Secrets)
+	}
+}
+
 // IngressReconcileHandler returns a reconcile.ReconcileHandler that applies
-// the desired bridge.ingress block whole. A nil Bridge or nil Ingress child
-// applies no rules, which closes every listener. A failed bind fails the
-// reconcile cycle, so the reconciler keeps its snapshot and the next pull
-// tries the bind again.
+// the desired bridge.ingress block whole, its acme member included. A nil
+// Bridge or nil Ingress child applies the zero block, which closes every
+// listener. A failed bind fails the reconcile cycle, so the reconciler keeps
+// its snapshot and the next pull tries the bind again.
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
 		if desired == nil {
 			return nil
 		}
 
-		var rules []api.IngressRule
+		var block api.IngressConfig
 		if desired.Bridge != nil && desired.Bridge.Ingress != nil {
-			rules = desired.Bridge.Ingress.Rules
+			block = *desired.Bridge.Ingress
 		}
 
-		if err := mgr.Apply(rules); err != nil {
+		if err := mgr.Apply(ctx, block); err != nil {
 			logger.Error("ingress reconcile: apply failed",
 				"component", "bridge",
 				"error", err,
