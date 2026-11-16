@@ -139,14 +139,16 @@ the start:
   control character. The `200` answer derives the status against the policy
   block the fixture serves, so the agent's report reads `applied` only when
   it echoes that block. See [the route](#put-v1-nodes-id-policy-status).
-- **`PUT /v1/nodes/{id}/ingress-status`** caps the body at 4 KiB
+- **`PUT /v1/nodes/{id}/ingress-status`** caps the body at 256 KiB
   (`413 ingress_status_body_too_large`) and strict-decodes it into a
-  mock-local struct whose `state` is a pointer. It answers
-  `400 malformed_ingress_status` for a body that is empty or not one JSON
-  object, an unknown member (`rules` included), data after the report, a
-  missing or `null` `state` (`detail` `state is missing`), and a `state`
-  outside `enabled` and `opted_out` (`detail`
-  `state is not one of enabled and opted_out`). See
+  mock-local struct whose `state` is a pointer, then each rule entry on its
+  own. It answers `400 malformed_ingress_status` for a body that is empty or
+  not one JSON object, an unknown member, data after the report, a missing or
+  `null` `state` (`detail` `state is missing`), a `state` outside `enabled`
+  and `opted_out` (`detail` `state is not one of enabled and opted_out`),
+  more than 1,024 entries, and an entry whose member breaks its own rule; and
+  `400 invalid_ingress_status` for an opted-out report with entries, a
+  repeated `id` and an entry that breaks the presence rules. See
   [the route](#put-v1-nodes-id-ingress-status).
 - **`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`** answers
   `403 node_id_mismatch` for an `id` other than the registered node, then
@@ -603,8 +605,9 @@ The report is not stored: the mock keeps only the captured body.
 
 Enforces the ingress status report contract (`PutNodeIngressStatus`, the
 "Ingress status" section of the control plane's
-`docs/reference/api/plexd-agent-contract.md`): a 4 KiB body cap, strict JSON
-decoding, and the two states. `handleIngressStatus` captures the body under
+`docs/reference/api/plexd-agent-contract.md` at plexsphere/plexsphere@16f468b):
+a 256 KiB body cap, strict JSON decoding, the two states, and the rules of
+each rule entry. `handleIngressStatus` captures the body under
 `ingress-status`, so `GET /test/last-request/ingress-status` returns the bytes
 of the last report, and decodes it into a mock-local struct whose `state` is a
 `*string`, so a missing or `null` state is told apart from an empty one. The
@@ -614,14 +617,23 @@ passes.
 
 **Validation order.** The handler returns at the first failure:
 
-1. **Body size** → `413` `ingress_status_body_too_large` if the body exceeds 4 KiB (4,096 bytes), read through `http.MaxBytesReader`.
-2. **Body decode** → `400` `malformed_ingress_status` if the body is empty, is not one JSON object, carries an unknown member, or data after the report. A `rules` member is an unknown member.
+1. **Body size** → `413` `ingress_status_body_too_large` if the body exceeds 256 KiB (262,144 bytes), read through `http.MaxBytesReader`.
+2. **Body decode** → `400` `malformed_ingress_status` if the body is empty, is not one JSON object, carries an unknown member, or data after the report. The entries of `rules` stay undecoded here.
 3. **State** → `400` `malformed_ingress_status` with the `detail` `state is missing` if `state` is missing or `null`, and with the `detail` `state is not one of enabled and opted_out` for any value but `enabled` and `opted_out`.
+4. **Entries** → `400` `malformed_ingress_status` with the `detail` `rules carries more than 1024 entries`; then, for each entry in order, decoded on its own with unknown members refused into a struct of pointer members: `rules[i] is not a valid rule entry` for an entry that is no object, carries an unknown member or a member of the wrong JSON type, and otherwise `rules[i]` followed by the first broken member rule, in the order `.id is not a rule id` (missing, or failing `api.ValidIngressRuleID`), `.listener is not one of listening and not_listening` (missing or another value), `.listener_reason is not a reason token`, `.certificate is not one of not_required, ready and not_ready`, `.certificate_reason is not a reason token`, `.dial is not one of none, succeeded and failed`, `.dial_reason is not a reason token` and `.dial_age_seconds is outside 0..2147483647`. Reasons are checked with `api.ValidIngressReason`.
+5. **Consistency** → `400` `invalid_ingress_status` with the `detail` `an opted-out bridge reports no rules`; then, for each entry, `rules[i].id repeats rules[j].id` (compared without case), and for the first broken row of the presence rules, in the order `listener_reason`, `certificate`, `certificate_reason`, `dial`, `dial_reason`, `dial_age_seconds`, `rules[i] carries <member> while <facet> is <value>` or `rules[i] misses <member> while <facet> is <value>`.
+
+A `rules` of `null` or `[]` is a report without entries. The details are the control plane's sentences, except the one for an entry that is no valid rule entry, which the control plane splits by cause. The mock accepts canonical ids only, which is narrower than the control plane's parser and wide enough for what plexd sends.
 
 **Request body:**
 
 ```json
-{ "state": "enabled" }
+{
+  "state": "enabled",
+  "rules": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", "listener": "not_listening", "listener_reason": "listen_failed" }
+  ]
+}
 ```
 
 **Response:** `200 OK`

@@ -246,12 +246,15 @@ func NewEnforcer(
 | `DropCounts`        | `() (packets, bytes uint64, ok bool)`                         | What the installed ruleset's default deny dropped since it was installed; see [DropCounts](#dropcounts) |
 | `Teardown`          | `() error`                                                    | Flushes and deletes firewall chain; safe with nil firewall. Clears the record of the installed and the applied ruleset, and closes the Enforcer: a later `Sync` or `ApplyFirewallRules` touches the backend no more |
 | `ConnLogger`        | `() *ConnLogger`                                              | The logger that writes a line for each connection a logged rule admits; see [Connection logging](#connection-logging) |
+| `AdmitsTCPDial`     | `(src netip.Addr, dst netip.AddrPort) (admitted, enforced bool)` | Whether the ruleset the backend holds lets a socket of the node send TCP from `src`, the node's mesh address, to `dst`; see below |
 
 The `bool` exists so callers cannot log an enforcement that never happened: both no-op paths return `(false, nil)`, which is indistinguishable from a successful apply on the error value alone.
 
 Before the backend gets the rules, `ApplyFirewallRules` tags the logged ones and moves them ahead of the others; see [Log tags and rule order](#log-tags-and-rule-order).
 
 `Sync`, `ApplyFirewallRules`, `Teardown` and `DropCounts` hold one lock across their backend calls, so the record always describes what the backend holds, and `Status` reads it under the same lock.
+
+`AdmitsTCPDial` enforces nothing: the kernel does. It answers from the rule list of the last apply the backend accepted, which `ApplyFirewallRules` keeps beside the policy it records, so a refused apply leaves the answer of the ruleset still in force, and a pull that `Sync` adopts without a kernel call carries the same fingerprint and so the same rules. It returns `admitted` when one `allow` rule matches `ConnEvent{Src: src, Dst: dst.Addr(), Protocol: tcp, DstPort: dst.Port()}`, as the connection logger matches an event; the default deny alone, which the startup baseline and a pull with `policy: null` install, admits nothing. `enforced` is false, and `admitted` true, while enforcement is disabled, no backend exists, no ruleset is installed, or the Enforcer is closed. The bridge's ingress manager asks it after a dial to a target failed, to report the dial as `policy_denied` (see [Rule Entries](../bridge/public-ingress.md#rule-entries)).
 
 ### Preflight
 

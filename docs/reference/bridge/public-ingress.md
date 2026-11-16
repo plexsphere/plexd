@@ -45,7 +45,7 @@ Public Internet Clients
 
 The control plane delivers the block in the state pull and announces a change with a `bridge_config_updated` event, which only triggers a pull (see [SSE event handling](#sse-event-handling)). `IngressReconcileHandler` hands the block to `IngressManager.Apply`, which plans the rules, opens and closes listeners, swaps each port's routing table, and then configures the ACME account. `IngressSecretInventoryHandler` hands the pull's secret inventory to `IngressManager.SyncSecretInventory` on every successful pull, which loads, replaces and drops the certificates of the `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). The certificates of the `acme` rules come from `ACMEManager` (see [ACME and SNI Routing](acme-sni.md)).
 
-The bridge's dial to a target is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). A rule grants no allow of its own: the policy needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, and the bridge logs `bridge: ingress: dial target failed`.
+The bridge's dial to a target is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). A rule grants no allow of its own: the policy needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, the bridge logs `bridge: ingress: dial target failed` with `reason=policy_denied`, and the rule's entry in the [ingress status report](#rule-entries) reads `dial` `failed` with `dial_reason` `policy_denied`.
 
 ## The bridge.ingress Block
 
@@ -316,7 +316,9 @@ A connection that matches no served rule is closed without a byte from any targe
 
 The level is Debug because a public port draws scanners: a line per connection at Warn would let any client fill the log and the log forwarder.
 
-The bridge dials `target_address:target_port` with `ingress_dial_timeout` and copies both ways, the plaintext of a terminated session included, until one side ends or the rule is removed or changed. A failed dial closes the client connection and logs `bridge: ingress: dial target failed`.
+The bridge dials `target_address:target_port` with `ingress_dial_timeout` and copies both ways, the plaintext of a terminated session included, until one side ends or the rule is removed or changed. A failed dial closes the client connection and logs `bridge: ingress: dial target failed` with the dial's `reason`.
+
+Right after each dial, the manager records its outcome per rule id, with the target it dialled and the time on its clock, and the ingress status report reads it as the rule's `dial` (see [Rule Entries](#rule-entries)). A dial whose route was cancelled meanwhile, because the rule changed or was removed or the manager stopped, records nothing, and its error, `context.Canceled` or a failure of a target the rule no longer names, is not classified. `Apply` drops the records of rules it no longer holds and `Teardown` drops them all, so the manager holds at most `bridge.max_ingress_rules` records. A connection costs one lock and one map write more for the record.
 
 ### TLS Termination
 
@@ -398,6 +400,9 @@ Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
 | `Apply`               | `(ctx context.Context, block api.IngressConfig) error`      | Serves exactly this block (see [Applying the Block](#applying-the-block)) |
 | `SyncSecretInventory` | `(ctx context.Context, inventory []api.NodeStateSecret)`    | Takes the pull's secret inventory and loads, replaces or drops the certificates of the held `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)); a no-op when inactive |
 | `RuleStates`          | `() []IngressRuleState`                                     | The outcome of the last `Apply`, one entry per rule, in block order, with each `terminate` rule's certificate state |
+| `RuleReports`         | `() []IngressRuleReport`                                    | What the ingress status report says per rule: listener, certificate and last dial (see [Rule Entries](#rule-entries)); nil when inactive |
+| `ReportChanged`       | `() <-chan struct{}`                                        | Signalled, without blocking, when what `RuleReports` returns may have changed; capacity 1 |
+| `SetDialPolicy`       | `(p IngressDialPolicy)`                                     | Sets the policy that names a failed dial `policy_denied`; called before `Setup`. Without one, no dial reads `policy_denied` |
 | `Teardown`            | `() error`                                                  | Cancels every route, which closes every connection, closes every listener, and forgets the inventory and every certificate; joins close errors; a no-op when inactive |
 | `IngressStatus`       | `() *api.IngressInfo`                                       | The `status.ingress` report entry; nil when inactive |
 | `IngressCapabilities` | `() map[string]string`                                      | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when `IngressOptedOut()` is true |
@@ -413,6 +418,26 @@ type IngressRuleState struct {
 ```
 
 `logRuleChanges` reads the unexported `held`, so a held rule with a reason, such as an `acme` rule whose directory is refused, still logs `ingress rule added` and `ingress rule removed`.
+
+```go
+type IngressRuleReport struct {
+    RuleID            string
+    Listener          string    // api.IngressListener*
+    ListenerReason    string
+    Certificate       string    // api.IngressCertificate*; empty when the rule does not listen
+    CertificateReason string
+    Dial              string    // api.IngressDial*; empty when the rule does not listen
+    DialReason        string
+    DialAt            time.Time // zero unless Dial is succeeded or failed
+}
+
+// IngressDialPolicy tells whether the node's compiled policy blocks a TCP dial to target.
+type IngressDialPolicy interface {
+    DialDenied(target netip.AddrPort) bool
+}
+```
+
+`NewIngressManager` registers with `ACMEManager.OnIssuedChange`, so an `acme` rule's certificate state signals `ReportChanged`. `plexd up` sets the dial policy before `Setup` from `cmd/plexd/cmd/ingress_policy.go`: `ingressDialPolicy` asks `Enforcer.AdmitsTCPDial` with the node's mesh address when a UDP connect to the target picks that address as its source. A mesh address that does not parse leaves the policy unset and logs the Warn `ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error`.
 
 `IngressStatus().RuleCount` counts the served rules with the certificate state applied, so a `terminate` rule counts only while it has a certificate. `ConnectionCount` counts the connections from accept to close. `ACMEEnabled` reads `ACMEManager.Active()`: it is true exactly while the last `Apply` ended with an `acme` rule without a reason. An `acme` rule whose port failed to bind reads `listen_failed` and does not count.
 
@@ -457,7 +482,7 @@ reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger)) /
 
 ## Ingress Status Report
 
-A bridge reports whether its local configuration serves public ingress with [`PUT /v1/nodes/{node_id}/ingress-status`](../core/api-endpoints.md#ingress-status), so the control plane refuses an ingress rule that no listener would serve. Without the report, a Project operator who writes a rule for a bridge whose host opted out gets `201` and a bridge that never listens. Every node in bridge mode reports, whether or not it opts out, and a node outside bridge mode sends nothing. No configuration key turns the report on or off: a bridge reports at its `heartbeat.interval`.
+A bridge reports with [`PUT /v1/nodes/{node_id}/ingress-status`](../core/api-endpoints.md#ingress-status) whether its local configuration serves public ingress, so the control plane refuses an ingress rule that no listener would serve, and how each ingress rule fares: whether its listener is up, whether its certificate is in place, and how the last dial to its target ended. Without the report, a Project operator who writes a rule for a bridge whose host opted out gets `201` and a bridge that never listens, and an operator whose published service is unreachable has to read the bridge's journal to learn why. Every node in bridge mode reports, whether or not it opts out, and a node outside bridge mode sends nothing. No configuration key turns the report on or off.
 
 ### Reported States
 
@@ -466,7 +491,55 @@ A bridge reports whether its local configuration serves public ingress with [`PU
 | `enabled` | absent or `true` | The bridge serves the rules the pull enables |
 | `opted_out` | `false` | The bridge built no ingress manager and opens no public listener whatever the pull says |
 
-The state follows from the local configuration alone, which plexd reads once per start, so one process always reports the same state. The report carries the state and no entry per rule: a bridge that holds a rule it cannot serve still reports `enabled`.
+The state follows from the local configuration alone, which plexd reads once per start, so one process always reports the same state. A report of `opted_out` carries the state alone.
+
+### Rule Entries
+
+An `enabled` report carries `rules`: one entry per rule of the last applied block, in the order of the pull, built from `IngressManager.RuleReports`. Each member after `listener` is sent exactly when the facet before it calls for it:
+
+| Member | Values | Present |
+|---|---|---|
+| `id` | the rule's `id` from the pull | always |
+| `listener` | `listening` or `not_listening` | always |
+| `listener_reason` | a reason token | exactly when `listener` is `not_listening` |
+| `certificate` | `not_required`, `ready` or `not_ready` | exactly when `listener` is `listening` |
+| `certificate_reason` | a reason token | exactly when `certificate` is `not_ready` |
+| `dial` | `none`, `succeeded` or `failed` | exactly when `listener` is `listening` |
+| `dial_reason` | a reason token | exactly when `dial` is `failed` |
+| `dial_age_seconds` | whole seconds from the dial to the report, floored, from 0 to 2147483647 | exactly when `dial` is `succeeded` or `failed` |
+
+A rule whose `id` is no UUID in canonical form, or is the zero UUID, has no entry, and neither has a rule whose `id` an earlier rule of the block carried, compared without case. The control plane refuses a whole report for one such entry, and the refused report would take the bridge's `state` with it. Both rules read `invalid_rule` or `duplicate_id` in the Warn `ingress rule not served`. A report carries no `detail`: a Secret name, a directory URL, a slug and an error text stay in the bridge's log.
+
+The listener is read from the ports the last `Apply` bound, not from the rule's reason:
+
+| Rule after the last `Apply` | `listener` | `listener_reason` |
+| --- | --- | --- |
+| not held | `not_listening` | its reason: `invalid_rule`, `listener_conflict` or `max_rules` |
+| held, and its listen port is not bound | `not_listening` | `listen_failed` |
+| held, and its listen port is bound | `listening` | none |
+
+A held `acme` rule with a reason of the plan, such as `acme_directory_invalid`, on a port that failed to bind reads `listen_failed`. For a rule that listens:
+
+| Rule | `certificate` | `certificate_reason` |
+| --- | --- | --- |
+| `passthrough` | `not_required` | none |
+| `terminate`, certificate loaded | `ready` | none |
+| `terminate`, no certificate loaded | `not_ready` | `certificate_secret_not_listed`, `certificate_fetch_failed` or `certificate_invalid`, as `RuleStates` reads it |
+| `acme` with a reason of the plan | `not_ready` | `acme_directory_invalid`, `acme_directory_not_allowed` or `acme_challenge_port_taken` |
+| `acme`, `ACMEManager.Issued` true for its host | `ready` | none |
+| `acme` otherwise | `not_ready` | `acme_not_issued` |
+
+`acme_not_issued` reads until the last certificate request for the host succeeds: the obtain ahead of the first client or a client handshake (see [Obtaining a Certificate](acme-sni.md#obtaining-a-certificate)). A host whose obtain failed keeps it until a client's handshake makes `autocert` ask again and succeed; plexd does not retry an issuance on its own.
+
+The dial is the last one a client connection caused to the rule's target (see [Routing a Connection](#routing-a-connection)). The bridge never dials a target on its own to test it, so `dial` reads `none` until the first connection to a rule, and a failed dial stays the rule's state until a later client's dial succeeds. A rule whose target changed reads `none`, and so does a rule removed and applied again. The reason of a failed dial is the first of these that applies:
+
+1. `policy_denied`: the dial policy says the node's compiled policy blocks a TCP dial to the target (see below).
+2. `timeout`: the dial did not complete within `bridge.ingress_dial_timeout`, or failed with a timeout error (`WSAETIMEDOUT` on Windows).
+3. `refused`: the target's host refused the connection (`ECONNREFUSED`, `WSAECONNREFUSED`).
+4. `unreachable`: no route reaches the target's host or network (`EHOSTUNREACH`, `ENETUNREACH`, and their Winsock names).
+5. `other`.
+
+A rule grants no allow of its own, so the likeliest failure of a correct rule is a missing Policy for the bridge's dial, and its fix is in the control plane. On the bridge that failure looks like any other failed dial: the nftables backend ends a denied packet in a drop verdict, so the socket gets no error that names the policy, and what a blocked dial fails with differs by backend. `plexd up` therefore gives the manager a dial policy, which checks a failed dial against the ruleset the Enforcer installed, in user space, after the failure: `Enforcer.AdmitsTCPDial` (see [network policy](../networking/network-policy.md#methods)). The check applies only when the kernel would send the dial from the node's mesh address, which a UDP connect to the target tells without sending a packet. A target outside the mesh, the mesh address itself and a target no route reaches never read `policy_denied`. The kernel stays the only place that enforces: the bridge dials as before, and the check only names the reason. A failed dial costs one UDP socket and one pass over the installed rules; a dial that succeeds costs neither.
 
 ### Reporter
 
@@ -477,22 +550,40 @@ type IngressStatusClient interface {
     ReportIngressStatus(ctx context.Context, nodeID string, req api.IngressStatusRequest) (*api.IngressStatusResponse, error)
 }
 
-func NewIngressStatusReporter(interval time.Duration, nodeID string, client IngressStatusClient, optedOut bool, logger *slog.Logger) *IngressStatusReporter
+// IngressRuleReportSource is the part of *IngressManager the reporter reads.
+type IngressRuleReportSource interface {
+    RuleReports() []IngressRuleReport
+    ReportChanged() <-chan struct{}
+}
+
+func NewIngressStatusReporter(interval time.Duration, nodeID string, client IngressStatusClient,
+    optedOut bool, rules IngressRuleReportSource, logger *slog.Logger) *IngressStatusReporter
 func (r *IngressStatusReporter) Run(ctx context.Context) error // returns nil when ctx is done
 ```
 
-`*api.ControlPlane` satisfies `IngressStatusClient`. The state is fixed at construction: `api.IngressStateOptedOut` when `optedOut` is true, `api.IngressStateEnabled` otherwise. A non-positive `interval` becomes 30 s, the default `heartbeat.interval`. The reporter's logger carries `component=bridge`. `Run` logs `ingress status: reporter started` with `interval` and `state`, sends one report at once, then one on every tick of the interval, and returns nil when `ctx` is done, without a last send.
+`*api.ControlPlane` satisfies `IngressStatusClient`. The state is fixed at construction: `api.IngressStateOptedOut` when `optedOut` is true, `api.IngressStateEnabled` otherwise. `rules` is nil on an opted-out bridge. A non-positive `interval` becomes 30 s, the default `heartbeat.interval`. The reporter's logger carries `component=bridge`.
 
-The type carries four decisions:
+`Run` logs `ingress status: reporter started` with `interval` and `state`, sends one report at once, and then:
 
-- **The send at start.** The reporter sends at once, without waiting for a state pull, unlike the [relay status reporter](nat-relay.md#reporter), which waits for its reconcile handler: the relay's state comes from the pull, the ingress state from the configuration, which plexd has read by then. Because plexd reads the configuration once per start (it handles SIGTERM and SIGINT only), the send after each start is the report "on every change of its setting" that the contract asks for.
-- **No retry within a tick.** The body never changes, so a failed send is not retried before the next tick. An opt-out whose first send fails reaches the control plane at most one interval later, and the bridge is closed the whole time.
-- **No shutdown report.** The report is sticky, and a stopped bridge keeps the state its configuration gives it, so the reporter sends nothing when `ctx` ends.
-- **The report never gates serving.** A bridge serves as the pull says while a send fails or the control plane does not serve the operation, as the contract requires.
+- **On a change.** When `ReportChanged` signals, it builds the report and does nothing when its entries equal those of the last accepted report, `dial_age_seconds` ignored. Otherwise it sends when at least 5 s (`ingressStatusChangeGap`) have passed since the last on-change send, and arms one timer for the rest of the 5 s when they have not; the timer builds, compares and sends the same way, with the entries as they are then. An on-change send restarts the interval. Only on-change sends count for the 5 s; the send at start and the tick sends do not.
+- **On a tick.** It drops a pending change signal and the timer, and sends.
+- **When `ctx` is done.** It returns nil and sends nothing.
 
-The cost is one `PUT` with a body of at most 21 bytes per bridge and interval, and the control plane writes nothing for a report that repeats the stored state.
+The manager signals `ReportChanged` liberally, without blocking, and the reporter compares before it sends: at the end of every `Apply`, every certificate load and `Teardown`, when the ACME manager's issued hosts change, and when a dial record changes its outcome or reason. A moving dial age alone triggers no report.
 
-Step 17d of `plexd up` starts `bridge.NewIngressStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.IngressOptedOut(), logger)` in a goroutine under the shutdown `WaitGroup`, beside the relay status reporter, whenever bridge mode runs. `statusInterval` is `heartbeat.interval`. The shutdown sequence needs no step of its own: the reporter ends with `ctx`.
+A manager that reports more than 1,024 rules has the first 1,024 sent, in order, and the reporter logs the Warn `ingress status: more rules than a report carries, reporting the first 1024` with `rules` once on entering that state.
+
+The type carries five decisions:
+
+- **The send at start.** The reporter sends at once, without waiting for a state pull, unlike the [relay status reporter](nat-relay.md#reporter), which waits for its reconcile handler: the relay's state comes from the pull, the ingress state from the configuration, which plexd has read by then. Because plexd reads the configuration once per start (it handles SIGTERM and SIGINT only), the send after each start is the report "on every change of its setting" that the contract asks for. That report carries no entries, because no pull is applied yet; the first `Apply` signals a change, and the entries follow at once.
+- **The 5 s bound.** Dial outcomes follow public connections. Without the bound, a target that alternates between failing and answering would cost one request per flip.
+- **No retry within a tick.** A failed send is not retried before the next tick. The last accepted report stays what it was, so the tick, or the next change, sends the state and the entries as they are then. An opt-out whose first send fails reaches the control plane at most one interval later, and the bridge is closed the whole time.
+- **No shutdown report.** The state is sticky, and a stopped bridge keeps the state its configuration gives it, so the reporter sends nothing when `ctx` ends. Its rule entries read `stale` once its reports stop.
+- **The report never gates serving.** A bridge serves as the pull says while a send fails or the control plane does not serve the operation, as the contract requires. The reporter only reads the ingress manager.
+
+A bridge sends at most one report per 5 s on change and one per interval, each under 250 bytes per entry.
+
+Step 17d of `plexd up` starts `bridge.NewIngressStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.IngressOptedOut(), ingressRules, logger)` in a goroutine under the shutdown `WaitGroup`, beside the relay status reporter, whenever bridge mode runs. `statusInterval` is `heartbeat.interval`. `ingressRules` is the ingress manager, or an untyped nil on a bridge that opts out: a nil `*IngressManager` in the interface would not compare equal to nil. The shutdown sequence needs no step of its own: the reporter ends with `ctx`.
 
 ### Answers
 
@@ -500,16 +591,20 @@ No answer stops the loop, and none touches the listeners:
 
 | Answer | Reporter behavior |
 |--------|-------------------|
-| `200 OK` | Debug `ingress status: accepted` with `state` and `accepted_at` on every accepted send. Info `ingress status: reported` with `state` for the first accepted send. After a not-served phase, one Info `ingress status: control plane accepts ingress status reports` |
+| `200 OK` | Debug `ingress status: accepted` with `state`, `rules` (the number of entries sent) and `accepted_at` on every accepted send. Info `ingress status: reported` with `state` and `rules` for the first accepted send. After a not-served phase, one Info `ingress status: control plane accepts ingress status reports` |
 | `404` with any code but `ingress_status_node_gone`, or `501 ingress_status_not_provisioned` | The control plane does not serve the report, as `api.IsIngressStatusNotServed` classifies it. Info `ingress status: control plane does not accept ingress status reports, retrying every interval` with `status` and `code`, once on entering that state. plexd keeps reporting every interval and keeps serving as the pull says |
 | `404 ingress_status_node_gone` | The node was removed while the request ran. Warn `ingress status: rejected, this node was removed` with `code` on every send. It does not enter the not-served state |
 | `api.ErrCredentialRefused` | Debug `ingress status: send failed` with `error`. The heartbeat parked the agent on a refused credential and names the cause once |
 | Any error after `ctx` ended | Nothing, because that is the shutdown |
-| Anything else, `400 malformed_ingress_status` and `context.DeadlineExceeded` included | Warn `ingress status: send failed` with `error` |
+| Anything else, `400 malformed_ingress_status`, `400 invalid_ingress_status`, `413 ingress_status_body_too_large` and `context.DeadlineExceeded` included | Warn `ingress status: send failed` with `error`, on every send |
+
+A control plane that predates `rules` answers `400 malformed_ingress_status` to every `enabled` report with entries, as an unknown member. plexd has no fallback: the control plane is upgraded before the agent, and the Warn names the code.
 
 ### What the Control Plane Does
 
-The control plane keeps the latest report per node and never ages it, so a bridge that reported `opted_out` and went offline stays opted out until it reports `enabled`. A report that repeats the stored state changes nothing. While a bridge's report reads `opted_out`, the control plane answers a create or an update of an ingress rule on its bridge Resource with `409 bridge_ingress_opted_out`. It keeps the rules stored before the opt-out and keeps delivering them in the `bridge.ingress` block with `enabled: true`. The opted-out bridge ignores them and logs the Warn `ingress: the control plane enables public ingress, but bridge.ingress_enabled is false`, and it serves them again once a restart without the opt-out makes it report `enabled`. A delete of a rule stays allowed. A bridge that never reported reads `not_reported` and accepts rules. A node reports only for itself, so a leaked NSK can block rule writes on its own bridge Resource and on no other. A control plane that predates the report answers `404`, and plexd keeps serving as the pull says. See [Ingress status](https://github.com/plexsphere/plexsphere/blob/8458a7db47d0f38f4e6d49705a30f20ab94b367a/docs/reference/api/plexd-agent-contract.md#ingress-status) in plexsphere's agent contract.
+The control plane keeps the latest state per node and never ages it, so a bridge that reported `opted_out` and went offline stays opted out until it reports `enabled`. A report that repeats the stored state changes nothing. While a bridge's report reads `opted_out`, the control plane answers a create or an update of an ingress rule on its bridge Resource with `409 bridge_ingress_opted_out`. It keeps the rules stored before the opt-out and keeps delivering them in the `bridge.ingress` block with `enabled: true`. The opted-out bridge ignores them and logs the Warn `ingress: the control plane enables public ingress, but bridge.ingress_enabled is false`, and it serves them again once a restart without the opt-out makes it report `enabled`. A delete of a rule stays allowed. A bridge that never reported reads `not_reported` and accepts rules. A node reports only for itself, so a leaked NSK can block rule writes on its own bridge Resource and on no other. A control plane that predates the report answers `404`, and plexd keeps serving as the pull says.
+
+Each report replaces the rule entries of the one before, and the control plane dates each dial on its own clock, as the receive time minus `dial_age_seconds`. It derives each rule's status from the latest report; a bridge that has not reported for three heartbeat intervals has its rules read `stale`, and a rule the report does not name reads `not_reported`. See [Ingress status](https://github.com/plexsphere/plexsphere/blob/16f468bfc58128dd46f06e64196bf9b71e146986/docs/reference/api/plexd-agent-contract.md#ingress-status) in plexsphere's agent contract.
 
 ## SSE Event Handling
 
@@ -615,18 +710,20 @@ All ingress log entries use `component=bridge`, the reporter's included. `bridge
 | `Warn`  | `ingress: the state pull carries rules but does not enable public ingress, closing every listener` | `rules`; once per change of the pulled `bridge` block |
 | `Warn`  | `ingress: the control plane enables public ingress, but bridge.ingress_enabled is false` | `rules`; once per change of the pulled `bridge` block, on a bridge that opts out |
 | `Info`  | `ingress status: reporter started`       | `interval`, `state` |
-| `Info`  | `ingress status: reported`               | `state`; logged for the first accepted send |
+| `Info`  | `ingress status: reported`               | `state`, `rules`; logged for the first accepted send |
 | `Info`  | `ingress status: control plane does not accept ingress status reports, retrying every interval` | `status`, `code`; logged on entering the not-served state only |
 | `Info`  | `ingress status: control plane accepts ingress status reports` | (none); logged once after a not-served phase |
 | `Warn`  | `ingress status: rejected, this node was removed` | `code`; logged on every send |
 | `Warn`  | `ingress status: send failed`            | `error` |
-| `Debug` | `ingress status: accepted`               | `state`, `accepted_at` |
+| `Warn`  | `ingress status: more rules than a report carries, reporting the first 1024` | `rules`; once on entering that state |
+| `Warn`  | `ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error` | `mesh_ip`, `error`; logged by step 5e of `plexd up` |
+| `Debug` | `ingress status: accepted`               | `state`, `rules`, `accepted_at` |
 | `Debug` | `ingress status: send failed`            | `error`; logged instead of the Warn while the client holds a refused credential (`api.ErrCredentialRefused`) |
 | `Debug` | `ingress connection closed`              | `listen_port`, `remote`, `server_name`, `reason` |
 | `Debug` | `ingress acme challenge answered`        | `server_name`, `remote`, `error` |
 | `Error` | `bridge: ingress: listen failed`         | `listen_port`, `error`, and `hint` for a permission error below port 1024 |
 | `Error` | `bridge: ingress: close listener failed` | `listen_port`, `error` |
-| `Error` | `bridge: ingress: dial target failed`    | `rule_id`, `slug`, `target`, `error` |
+| `Error` | `bridge: ingress: dial target failed`    | `rule_id`, `slug`, `target`, `reason`, `error`; `reason` is absent for a dial whose route was cancelled meanwhile |
 | `Error` | `ingress reconcile: apply failed`        | `error` |
 
 A rule logs `ingress rule not served` once: an `Apply` that leaves its value and reason unchanged logs nothing for it. The line carries the reasons of the plan. A `terminate` rule's certificate state is logged by the `ingress certificate` lines instead. The ACME account's lines are listed in [ACME and SNI Routing](acme-sni.md#logging).

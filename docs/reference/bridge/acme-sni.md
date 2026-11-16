@@ -93,6 +93,8 @@ func (m *ACMEManager) Configure(settings *api.IngressACME, hosts []string)
 func (m *ACMEManager) HasHost(serverName string) bool
 func (m *ACMEManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error)
 func (m *ACMEManager) Active() bool
+func (m *ACMEManager) Issued(host string) bool
+func (m *ACMEManager) OnIssuedChange(fn func())
 func (m *ACMEManager) Teardown() error
 ```
 
@@ -102,7 +104,11 @@ func (m *ACMEManager) Teardown() error
 | `HasHost`        | Whether the server name is a host of the active account; false when no account is active |
 | `GetCertificate` | The certificate for a ClientHello, from the active `autocert.Manager`, which also answers the TLS-ALPN-01 challenge; `bridge: acme: no account is configured` when no manager is active |
 | `Active`         | Whether an account is active: true exactly while the last `IngressManager.Apply` ended with an `acme` rule without a reason. An `acme` rule whose port failed to bind reads `listen_failed` and does not count |
+| `Issued`         | Whether an account is active and the last certificate request for the host, in any case, succeeded; see below |
+| `OnIssuedChange` | Registers the function called when a request changes whether a host of the active account is issued. `NewIngressManager` registers the signal of its `ReportChanged` |
 | `Teardown`       | Retires the active manager and waits at most 10 s for the certificate requests in flight (see [Teardown](#teardown)); idempotent, returns nil |
+
+After each call into `autocert`, or into the test hook that replaces it, for a ClientHello that is no TLS-ALPN-01 challenge (its `SupportedProtos` do not hold `acme-tls/1`), the manager records the outcome on the account: a certificate marks the lowercase server name issued, an error unmarks it. Both the obtain ahead of the first client and every client handshake count; a challenge hello does not. When the set changed and the account is still the active one, the manager calls the registered function outside its lock. A new account starts with no host issued, so a changed directory reads `acme_not_issued` until the certificate is obtained again, from the cache directory or the CA. The [ingress status report](public-ingress.md#rule-entries) reads `Issued` for an `acme` rule's certificate: `ready` while it is true, and `not_ready` with `acme_not_issued` otherwise. A host whose obtain failed stays `acme_not_issued` until a client's handshake makes `autocert` ask again and succeed: the bridge does not retry an issuance on its own.
 
 `Setup`, `TLSConfig` and `AllowedHosts` are removed. In bridge mode `plexd up` builds the manager unless the bridge opts out of public ingress with `bridge.ingress_enabled: false`, as `bridge.NewACMEManager(bridge.ACMEConfig{CacheDir: dir}, logger)`, and hands it to `NewIngressManager`. A bridge that opts out builds neither manager (see [Activation](public-ingress.md#activation)). The manager holds no account until a state pull's block names an `acme` rule. `IngressManager.Apply` calls `Configure` after it binds the ports, with the block's `acme` member and the hosts of the `acme` rules that end the `Apply` without a reason. An `acme` rule whose port failed to bind (`listen_failed`) does not keep the account, and port 443 is bound before the account asks the CA for a certificate (see [Applying the Block](public-ingress.md#applying-the-block)). The ingress manager is torn down before the ACME manager.
 

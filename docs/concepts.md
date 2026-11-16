@@ -115,7 +115,7 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 
 The bridge's NAT relay is not a startup goroutine. In bridge mode with `bridge.relay_enabled` set, the reconciler's `RelayReconcileHandler` starts it on the first cycle whose state pull enables it, and stops it when a pull disables it or the bridge tears down (see [NAT Relay](reference/bridge/nat-relay.md#relayreconcilehandler)).
 
-In bridge mode `plexd up` also starts the ingress status reporter, whether or not the bridge opts out of public ingress. It sends `PUT /v1/nodes/{node_id}/ingress-status` once at start and then once per `heartbeat.interval`, with `opted_out` when `bridge.ingress_enabled` is `false` and `enabled` otherwise, and ends with the context, without a report at shutdown (see [Ingress Status Report](reference/bridge/public-ingress.md#ingress-status-report)).
+In bridge mode `plexd up` also starts the ingress status reporter, whether or not the bridge opts out of public ingress. It sends `PUT /v1/nodes/{node_id}/ingress-status` once at start, on every change of an ingress rule's listener, certificate or last dial at most once per 5 s, and once per `heartbeat.interval`, with `opted_out` when `bridge.ingress_enabled` is `false`, and otherwise `enabled` with one entry per ingress rule. It ends with the context, without a report at shutdown (see [Ingress Status Report](reference/bridge/public-ingress.md#ingress-status-report)).
 
 ## Shutdown Sequence
 

@@ -1183,23 +1183,44 @@ receive time, so plexd builds a fresh request for every attempt.
 ### `PUT /v1/nodes/{node_id}/ingress-status`
 
 Whether a bridge's local configuration serves public ingress, which the control
-plane reads to refuse an ingress rule that no listener would serve. The
-control plane keeps the latest report per node and never ages it. The handler
-decodes with unknown members refused. See
-[Control Plane API Endpoints](api-endpoints.md#ingress-status) for the wire
-example and error taxonomy, and
+plane reads to refuse an ingress rule that no listener would serve, and the
+state of each ingress rule. The control plane keeps the latest state per node
+and never ages it, and each report replaces the rule entries of the one before.
+The handler decodes with unknown members refused, of the report and of each
+entry. See [Control Plane API Endpoints](api-endpoints.md#ingress-status) for
+the wire example and error taxonomy, and
 [Public Ingress](../bridge/public-ingress.md#ingress-status-report) for how
-plexd derives the state.
+plexd derives the state and each entry.
 
 **IngressStatusRequest**
 
-| Field   | Type     | JSON Tag  | Description                              |
-|---------|----------|-----------|------------------------------------------|
-| `State` | `string` | `"state"` | One of the `IngressState*` constants     |
+| Field   | Type                  | JSON Tag            | Description                              |
+|---------|-----------------------|---------------------|------------------------------------------|
+| `State` | `string`              | `"state"`           | One of the `IngressState*` constants     |
+| `Rules` | `[]IngressStatusRule` | `"rules,omitempty"` | One entry per reported rule, in the order of the pull, at most `MaxIngressStatusRules`; nil omits the member, which reads as no entries |
 
-A missing, `null` or unknown state, an unknown member and data after the
-report answer `400 malformed_ingress_status`. `ReportIngressStatus` checks
-none of this and sends the request as passed.
+**IngressStatusRule**, the control plane's `IngressStatusReportRule`. Each
+member after `Listener` is sent exactly when the facet before it calls for it,
+and `omitempty` drops an empty one, so a caller leaves every member it must not
+send empty:
+
+| Field               | Type     | JSON Tag                        | Description |
+|---------------------|----------|---------------------------------|-------------|
+| `ID`                | `string` | `"id"`                          | The rule's `id` from the pull, a UUID other than the zero UUID |
+| `Listener`          | `string` | `"listener"`                    | One of the `IngressListener*` constants |
+| `ListenerReason`    | `string` | `"listener_reason,omitempty"`   | A reason token; exactly when `Listener` is `not_listening` |
+| `Certificate`       | `string` | `"certificate,omitempty"`       | One of the `IngressCertificate*` constants; exactly when `Listener` is `listening` |
+| `CertificateReason` | `string` | `"certificate_reason,omitempty"` | A reason token; exactly when `Certificate` is `not_ready` |
+| `Dial`              | `string` | `"dial,omitempty"`              | One of the `IngressDial*` constants; exactly when `Listener` is `listening` |
+| `DialReason`        | `string` | `"dial_reason,omitempty"`       | A reason token; exactly when `Dial` is `failed` |
+| `DialAgeSeconds`    | `*int64` | `"dial_age_seconds,omitempty"`  | Whole seconds from the dial to the report, 0 to `MaxIngressStatusDialAgeSeconds`; exactly when `Dial` is `succeeded` or `failed`. A pointer, because 0 is a valid age |
+
+A missing, `null` or unknown state, an unknown member, data after the report,
+more than `MaxIngressStatusRules` entries, and an entry with a malformed id or
+a value outside its member's rule answer `400 malformed_ingress_status`; an
+opted-out report with entries, a repeated id and an entry that breaks the
+presence rules answer `400 invalid_ingress_status`. `ReportIngressStatus`
+checks none of this and sends the request as passed.
 
 **IngressStatusResponse** (`200 OK`)
 
@@ -1213,6 +1234,23 @@ none of this and sends the request as passed.
 |------------------------|---------------|------------------------------------------------------|
 | `IngressStateEnabled`  | `"enabled"`   | The bridge's local configuration serves the public ingress rules the state pull enables: `bridge.ingress_enabled` is absent or `true` |
 | `IngressStateOptedOut` | `"opted_out"` | The bridge's local configuration, `bridge.ingress_enabled: false`, rules public ingress out: it opens no public listener whatever the pull says |
+| `IngressListenerListening` | `"listening"` | The rule's listen port is bound |
+| `IngressListenerNotListening` | `"not_listening"` | The bridge does not listen for the rule; `ListenerReason` says why |
+| `IngressCertificateNotRequired` | `"not_required"` | A `passthrough` rule, which needs no certificate at the bridge |
+| `IngressCertificateReady` | `"ready"` | A `terminate` or `acme` rule whose certificate is in place |
+| `IngressCertificateNotReady` | `"not_ready"` | A `terminate` or `acme` rule without its certificate; `CertificateReason` says why |
+| `IngressDialNone` | `"none"` | No client connection has dialled the rule's target yet |
+| `IngressDialSucceeded` | `"succeeded"` | The last dial reached the target |
+| `IngressDialFailed` | `"failed"` | The last dial failed; `DialReason` says why |
+| `MaxIngressStatusRules` | `1024` | The most entries one report carries |
+| `MaxIngressStatusDialAgeSeconds` | `2147483647` | The ceiling of `dial_age_seconds`, the largest signed 32-bit integer |
+
+**Validators**
+
+| Function | Description |
+|----------|-------------|
+| `ValidIngressRuleID(s string) bool` | `s` is a UUID in canonical form, groups of 8, 4, 4, 4 and 12 hex digits in either case joined by hyphens, other than the zero UUID. Written by hand: `github.com/google/uuid` stays an indirect dependency |
+| `ValidIngressReason(s string) bool` | `s` matches `^[a-z][a-z0-9_]{0,62}$` |
 
 ## Policy Status
 
