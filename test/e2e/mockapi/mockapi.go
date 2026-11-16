@@ -86,6 +86,7 @@ type AssertionCounters struct {
 	IntegrityViolationCount       int64 `json:"integrity_violation_count"`
 	HandshakeReportCount          int64 `json:"handshake_report_count"`
 	PolicyStatusCount             int64 `json:"policy_status_count"`
+	IngressStatusCount            int64 `json:"ingress_status_count"`
 	EdgePSKCount                  int64 `json:"edge_psk_count"`
 	HookFetchCount                int64 `json:"hook_fetch_count"`
 	InjectEventCount              int64 `json:"inject_event_count"`
@@ -153,6 +154,7 @@ type Server struct {
 	integrityViolationCount        atomic.Int64
 	handshakeReportCount           atomic.Int64
 	policyStatusCount              atomic.Int64
+	ingressStatusCount             atomic.Int64
 	edgePSKCount                   atomic.Int64
 	hookFetchCount                 atomic.Int64
 	injectEventCount               atomic.Int64
@@ -350,6 +352,7 @@ func (s *Server) Assertions() AssertionCounters {
 		IntegrityViolationCount:        s.integrityViolationCount.Load(),
 		HandshakeReportCount:           s.handshakeReportCount.Load(),
 		PolicyStatusCount:              s.policyStatusCount.Load(),
+		IngressStatusCount:             s.ingressStatusCount.Load(),
 		EdgePSKCount:                   s.edgePSKCount.Load(),
 		HookFetchCount:                 s.hookFetchCount.Load(),
 		InjectEventCount:               s.injectEventCount.Load(),
@@ -452,8 +455,11 @@ func newStateFixture() api.NodeStateSnapshot {
 					},
 				},
 			},
-			// The one ingress rule targets peer ...a0b1 on its mesh IP.
+			// The one ingress rule targets peer ...a0b1 on its mesh IP. The
+			// block carries enabled, as every block the control plane sends
+			// does.
 			Ingress: &api.IngressConfig{
+				Enabled: true,
 				Rules: []api.IngressRule{
 					{
 						ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
@@ -658,6 +664,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/policy-status", s.handlePolicyStatus)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/ingress-status", s.handleIngressStatus)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/hooks/{name}/versions/{version}", s.handleHookVersion)
 
@@ -702,6 +709,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/policy-status", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/ingress-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/hooks/{name}/versions/{version}", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
@@ -3673,6 +3681,97 @@ func (s *Server) derivePolicyStatus(req *policyStatusBody) string {
 		return nodePolicyApplied
 	default:
 		return nodePolicyPending
+	}
+}
+
+// maxIngressStatusBody is the contract's 4 KiB cap on an ingress status
+// report, the mock's own copy of the number.
+const maxIngressStatusBody = 4096
+
+// handleIngressStatus handles PUT /v1/nodes/{id}/ingress-status, the bridge's
+// report of whether its local configuration serves public ingress. It enforces
+// the contract's gates in order: the 4 KiB body cap (413
+// ingress_status_body_too_large), the strict decode of decodeIngressStatus and
+// the state rule of checkIngressStatus, both of which answer 400
+// malformed_ingress_status. The 200 answer carries accepted_at. Every answer of
+// the handler carries Cache-Control: no-store, as the contract asks. The
+// counter increments only on the 200. As for policy-status, the bearer gate is
+// the only check of the node: the path id is not compared with it.
+//
+// The decode target is mock-local rather than api.IngressStatusRequest, for the
+// reason handlePolicyStatus gives: the agent's struct turns a missing or null
+// state into the empty string, while the mock's pointer keeps it missing, so an
+// agent that drops the member is refused with the detail the control plane
+// writes for it.
+func (s *Server) handleIngressStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, maxIngressStatusBody)
+	// The cap lies below maxCapturedBody, so the read of captureBody reaches
+	// the byte that trips the MaxBytesReader, and no drain is needed to tell a
+	// body at the cap from a longer one.
+	data, err := s.captureBody("ingress-status", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "ingress_status_body_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte ingress status cap.", maxIngressStatusBody))
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_ingress_status", "invalid request body")
+		return
+	}
+
+	req, err := decodeIngressStatus(data)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_ingress_status",
+			"request body is not a valid ingress status report: "+err.Error())
+		return
+	}
+	if detail := checkIngressStatus(req); detail != "" {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_ingress_status", detail)
+		return
+	}
+
+	s.ingressStatusCount.Add(1)
+	writeJSON(w, http.StatusOK, api.IngressStatusResponse{AcceptedAt: time.Now().UTC()})
+}
+
+// ingressStatusBody is the mock's reading of an ingress status report. State is
+// a pointer, so a missing or null state decodes to nil and reads as missing, as
+// the contract has it.
+type ingressStatusBody struct {
+	State *string `json:"state"`
+}
+
+// decodeIngressStatus strict-decodes the body as exactly one ingress status
+// report: a JSON object without unknown members and with nothing after it.
+func decodeIngressStatus(data []byte) (*ingressStatusBody, error) {
+	var req *ingressStatusBody
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, errors.New("the body is null, not a JSON object")
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("the body carries data after the report")
+	}
+	return req, nil
+}
+
+// checkIngressStatus runs the contract's state rule over a decoded report and
+// returns the detail of the breach, or "" when the report is valid. The detail
+// never quotes the state the agent sent.
+func checkIngressStatus(req *ingressStatusBody) string {
+	switch {
+	case req.State == nil:
+		return "state is missing"
+	case *req.State != api.IngressStateEnabled && *req.State != api.IngressStateOptedOut:
+		return "state is not one of enabled and opted_out"
+	default:
+		return ""
 	}
 }
 

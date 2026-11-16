@@ -2012,6 +2012,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/policy-status", policyStatusBody(t, fixturePolicyReport()))
 	resp.Body.Close()
+	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/ingress-status", ingressStatusBody(t, api.IngressStateEnabled))
+	resp.Body.Close()
 	// The hook version fetch serves only a version the hooks block lists.
 	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
 	resp = doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1), "")
@@ -2084,6 +2086,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.PolicyStatusCount != 1 {
 		t.Errorf("policy_status_count = %d, want 1", a.PolicyStatusCount)
 	}
+	if a.IngressStatusCount != 1 {
+		t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
+	}
 	if a.HookFetchCount != 1 {
 		t.Errorf("hook_fetch_count = %d, want 1", a.HookFetchCount)
 	}
@@ -2138,6 +2143,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
 		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
 		{http.MethodPut, "/v1/nodes/node-1/policy-status", policyStatusBody(t, fixturePolicyReport())},
+		{http.MethodPut, "/v1/nodes/node-1/ingress-status", ingressStatusBody(t, api.IngressStateOptedOut)},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/peers/" + testFixturePeerB1 + "/psk", ""},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/hooks/conc-hook/versions/1", ""},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
@@ -5992,6 +5998,272 @@ func TestPolicyStatus_RequiresBearerEnvelope(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Ingress status report endpoint (issue #191)
+// ---------------------------------------------------------------------------
+
+// ingressStatusPath is PUT /v1/nodes/{mockNode}/ingress-status.
+const ingressStatusPath = "/v1/nodes/" + testMockNodeID + "/ingress-status"
+
+// ingressStatusBody renders a report in plexd's own wire type, so the tests
+// also prove that the mock accepts what the agent's encoder produces.
+func ingressStatusBody(t *testing.T, state string) string {
+	t.Helper()
+	data, err := json.Marshal(api.IngressStatusRequest{State: state})
+	if err != nil {
+		t.Fatalf("marshal ingress status report: %v", err)
+	}
+	return string(data)
+}
+
+// decodeIngressStatusReceipt strict-decodes a 200 ingress status answer.
+func decodeIngressStatusReceipt(t *testing.T, resp *http.Response) api.IngressStatusResponse {
+	t.Helper()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+	}
+	var receipt api.IngressStatusResponse
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&receipt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	return receipt
+}
+
+// TestIngressStatus_AcceptsBothStates sends each of the contract's two states
+// once. Each is answered 200 with a fresh accepted_at, and each is counted.
+func TestIngressStatus_AcceptsBothStates(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	for _, state := range []string{api.IngressStateEnabled, api.IngressStateOptedOut} {
+		func() {
+			before := time.Now().UTC()
+			resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, ingressStatusBody(t, state))
+			defer resp.Body.Close()
+			receipt := decodeIngressStatusReceipt(t, resp)
+			after := time.Now().UTC()
+
+			if receipt.AcceptedAt.Before(before) || receipt.AcceptedAt.After(after) {
+				t.Errorf("state %s: accepted_at = %v, want between %v and %v", state, receipt.AcceptedAt, before, after)
+			}
+		}()
+	}
+
+	if a := getAssertions(t, ts.URL); a.IngressStatusCount != 2 {
+		t.Errorf("ingress_status_count = %d, want 2", a.IngressStatusCount)
+	}
+}
+
+// TestIngressStatus_DenialTaxonomy walks the contract's one 400 code. What the
+// JSON decoder refuses answers malformed_ingress_status with a detail naming
+// the decode error; a missing or null state and a state outside the two answer
+// it with the contract's fixed details. A refused report is never counted.
+func TestIngressStatus_DenialTaxonomy(t *testing.T) {
+	const (
+		decodeDetail  = "request body is not a valid ingress status report: "
+		missingDetail = "state is missing"
+		outsideDetail = "state is not one of enabled and opted_out"
+	)
+
+	tests := []struct {
+		name       string
+		body       string
+		wantDetail string // the exact detail; "" asks for a decode error's detail
+	}{
+		{"empty body", "", ""},
+		{"empty object", `{}`, missingDetail},
+		{"state null", `{"state":null}`, missingDetail},
+		{"state outside the two", `{"state":"paused"}`, outsideDetail},
+		{"unknown member", `{"state":"enabled","rules":[]}`, ""},
+		{"trailing data", `{"state":"enabled"}{}`, ""},
+		{"not json", "not-json", ""},
+		{"null body", "null", ""},
+		{"an array", `[{"state":"enabled"}]`, ""},
+		{"a string", `"enabled"`, ""},
+		{"state of the wrong type", `{"state":true}`, ""},
+		{"empty state", `{"state":""}`, outsideDetail},
+		{"state in another case", `{"state":"Enabled"}`, outsideDetail},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, body)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+			if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+			}
+
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if problem["code"] != "malformed_ingress_status" {
+				t.Errorf("code = %v, want %q (detail: %v)", problem["code"], "malformed_ingress_status", problem["detail"])
+			}
+			detail, _ := problem["detail"].(string)
+			switch {
+			case tt.wantDetail != "" && detail != tt.wantDetail:
+				t.Errorf("detail = %q, want %q", detail, tt.wantDetail)
+			case tt.wantDetail == "" && (!strings.HasPrefix(detail, decodeDetail) || detail == decodeDetail):
+				t.Errorf("detail = %q, want %q followed by the decode error", detail, decodeDetail)
+			}
+			if problem["instance"] != ingressStatusPath {
+				t.Errorf("instance = %v, want %q", problem["instance"], ingressStatusPath)
+			}
+
+			// A refused report must not be counted as accepted.
+			if a := getAssertions(t, ts.URL); a.IngressStatusCount != 0 {
+				t.Errorf("ingress_status_count = %d, want 0", a.IngressStatusCount)
+			}
+		})
+	}
+}
+
+// The 4 KiB cap is inclusive and exact, and it is judged before the decode.
+func TestIngressStatus_BodyCap(t *testing.T) {
+	const capBytes = 4096
+	padded := func(n int) string {
+		body := ingressStatusBody(t, api.IngressStateEnabled)
+		return body + strings.Repeat(" ", n-len(body))
+	}
+
+	t.Run("exactly 4 KiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, padded(capBytes))
+		defer resp.Body.Close()
+		decodeIngressStatusReceipt(t, resp)
+		if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
+			t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{"one byte more is refused", padded(capBytes + 1)},
+		{"the cap is judged before the decode", strings.Repeat("x", capBytes+1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, tt.body)
+			defer resp.Body.Close()
+			if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+			}
+			assertProblem(t, resp, http.StatusRequestEntityTooLarge, "ingress_status_body_too_large")
+			if a := getAssertions(t, ts.URL); a.IngressStatusCount != 0 {
+				t.Errorf("ingress_status_count = %d, want 0", a.IngressStatusCount)
+			}
+		})
+	}
+}
+
+// The body is captured under ingress-status, which is what the systemd e2e run
+// reads back to check the bridge's report. Before any report there is nothing
+// to read.
+func TestIngressStatus_CapturesRequestBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	none, err := http.Get(ts.URL + "/test/last-request/ingress-status")
+	if err != nil {
+		t.Fatalf("GET last-request/ingress-status: %v", err)
+	}
+	none.Body.Close()
+	if none.StatusCode != http.StatusNotFound {
+		t.Errorf("before any report: status = %d, want %d", none.StatusCode, http.StatusNotFound)
+	}
+
+	for _, state := range []string{api.IngressStateEnabled, api.IngressStateOptedOut} {
+		body := ingressStatusBody(t, state)
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
+		decodeIngressStatusReceipt(t, resp)
+		resp.Body.Close()
+
+		if got := string(getCapturedBody(t, ts.URL, "ingress-status")); got != body {
+			t.Errorf("captured body = %s, want %s", got, body)
+		}
+	}
+}
+
+func TestIngressStatus_WrongMethod_Returns405(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, method, ts.URL+ingressStatusPath, ingressStatusBody(t, api.IngressStateEnabled))
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+			}
+			if a := getAssertions(t, ts.URL); a.IngressStatusCount != 0 {
+				t.Errorf("ingress_status_count = %d, want 0", a.IngressStatusCount)
+			}
+		})
+	}
+}
+
+// The route sits behind the bearer-envelope gate like every node route: a
+// report without the envelope, or with any other credential, is a 401
+// unauthorized that reaches neither the handler nor its counter.
+func TestIngressStatus_RequiresBearerEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"no header", ""},
+		{"wrong credential", "Bearer wrong-token-value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockapi.New()
+			ts := httptest.NewServer(srv.Handler())
+			t.Cleanup(ts.Close)
+
+			req, err := http.NewRequest(http.MethodPut, ts.URL+ingressStatusPath, strings.NewReader(ingressStatusBody(t, api.IngressStateEnabled)))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("PUT ingress-status: %v", err)
+			}
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusUnauthorized, "unauthorized")
+
+			a := srv.Assertions()
+			if a.UnauthorizedCount != 1 {
+				t.Errorf("unauthorized_count = %d, want 1", a.UnauthorizedCount)
+			}
+			if a.IngressStatusCount != 0 {
+				t.Errorf("ingress_status_count = %d, want 0", a.IngressStatusCount)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Execution callback endpoint (issue #22)
 // ---------------------------------------------------------------------------
 
@@ -8443,6 +8715,9 @@ func TestState_ReturnsIngressChild(t *testing.T) {
 		t.Fatal("Bridge.Ingress is nil")
 	}
 	ing := state.Bridge.Ingress
+	if !ing.Enabled {
+		t.Error("Ingress.Enabled = false, want true")
+	}
 	if len(ing.Rules) != 1 {
 		t.Fatalf("len(Ingress.Rules) = %d, want 1", len(ing.Rules))
 	}
