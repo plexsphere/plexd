@@ -513,13 +513,12 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `site_to_site_listen_port` | int | `51823` | Base listen port for site-to-site tunnels |
 | `max_site_to_site_tunnels` | int | `10` | Maximum site-to-site tunnels |
 | `tunnel_providers` | []string | — | Tunnel provider types for site-to-site: `ipsec`, `openvpn`. Empty means WireGuard-only. |
-| `acme_enabled` | bool | `false` | Enable ACME TLS certificate management |
-| `acme_cache_dir` | string | — | Directory for ACME certificate caching |
-| `acme_allowed_hosts` | []string | — | Hostnames allowed for ACME certificates |
-| `acme_email` | string | — | ACME account contact email |
-| `acme_directory_url` | string | — | Override ACME directory URL (default: Let's Encrypt production) |
+| `acme_cache_dir` | string | `<data_dir>/acme` | Directory of the ACME account key and of the certificates the bridge obtains for `acme` ingress rules; empty means `<data_dir>/acme`. See [The Cache Directory](../bridge/acme-sni.md#the-cache-directory) |
+| `acme_directory_urls` | []string | — | The ACME directories the bridge accepts from the state pull's `bridge.ingress.acme` member; empty accepts any https directory. Every entry must be an absolute https URL, also with ingress disabled. See [The ACME Account](../bridge/acme-sni.md#the-acme-account) |
 
 The keys `relay_listen_port`, `max_relay_sessions` and `session_ttl` are removed: the relay's port comes from the state pull, and the relay keeps no session cap or session TTL. A config file that still sets them keeps loading, because unknown keys are ignored, and they have no effect. See [NAT Relay](../bridge/nat-relay.md).
+
+The keys `acme_enabled`, `acme_allowed_hosts`, `acme_email` and `acme_directory_url` are removed as well: an `acme` ingress rule needs no local switch, and the state pull's `bridge.ingress` block names the hosts, the contact and the directory. A config file that still sets them keeps loading, because unknown keys are ignored, and they have no effect. See [ACME and SNI Routing](../bridge/acme-sni.md#local-configuration).
 
 Source: `internal/bridge/config.go`
 
@@ -733,7 +732,8 @@ dns:
 #   ingress_enabled: false
 #   user_access_enabled: false
 #   site_to_site_enabled: false
-#   acme_enabled: false
+#   acme_cache_dir: ""       # empty = <data_dir>/acme
+#   acme_directory_urls: []  # empty accepts any https ACME directory
 ```
 
 ## See Also

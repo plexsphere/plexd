@@ -262,6 +262,7 @@ r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 r.RegisterDispatchHandler(policy.DispatchHandler(enforcer, "plexd0"))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger)) // relay may be nil
 r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger))
+r.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 ```

@@ -1215,12 +1215,19 @@ drift. A node outside bridge mode ignores the block. See
 `slug` ascending. A bridge serves them only when its local
 [`bridge.ingress_enabled`](configuration.md#bridge) is true. Each rule carries
 `id`, `slug`, `listen_port`, `mode` (`passthrough`, `terminate` or `acme`), an
-optional `sni_host`, `target_node_id`, `target_address` and `target_port`. The
+optional `sni_host`, `target_node_id`, `target_address` and `target_port`, and a
+`terminate` rule also `certificate_secret_name`, the Secret of the bridge's
+Project that holds its certificate chain and key. The block's `acme` member,
+present exactly when a rule has mode `acme`, carries the `directory_url` and the
+optional `contact_email` of the ACME account the `acme` rules share. The
 bridge opens one TCP listener per distinct `listen_port`, forwards a port whose
 rule names no `sni_host` without reading the stream, and routes a port whose
 rules name hosts by the server name of each connection's TLS ClientHello to
-`target_address:target_port`. It serves `passthrough` rules only: the block
-names no certificate source for `terminate` or `acme` yet. The block is whole,
+`target_address:target_port`. A `passthrough` rule forwards the TLS session
+unchanged. A `terminate` rule ends TLS with the certificate of its Secret, which
+the bridge fetches in the version the `secrets` block lists, and an `acme` rule
+with a certificate the bridge obtains at `directory_url`; both forward
+plaintext to the target. The block is whole,
 so a rule missing from a later pull is removed, and a `null` block closes every
 public listener. A failed bind fails the reconcile cycle, and the next pull
 retries it. A node outside bridge mode ignores the block. See

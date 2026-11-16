@@ -291,16 +291,30 @@ The `bridge.ingress` block, the control plane's `NodeStateBridgeIngress`. A
 bridge serves it only when its local `bridge.ingress_enabled` is true; the block
 is applied whole. See [Public Ingress](/reference/bridge/public-ingress).
 
-| Field   | Type            | JSON Tag  | Description                                |
-|---------|-----------------|-----------|--------------------------------------------|
-| `Rules` | `[]IngressRule` | `"rules"` | Every rule of the bridge Resource, by slug ascending |
+| Field   | Type            | JSON Tag           | Description                                |
+|---------|-----------------|--------------------|--------------------------------------------|
+| `Rules` | `[]IngressRule` | `"rules"`          | Every rule of the bridge Resource, by slug ascending |
+| `ACME`  | `*IngressACME`  | `"acme,omitempty"` | The ACME account the block's `acme` rules share, the control plane's `NodeStateBridgeIngressACME`; present exactly when a rule has mode `acme`, nil otherwise |
+
+**IngressACME**
+
+The ACME account of a bridge's `acme` rules. A bridge accepts only an absolute
+https `DirectoryURL`, and only one its local `bridge.acme_directory_urls` lists
+when that list is not empty. See
+[ACME and SNI Routing](/reference/bridge/acme-sni).
+
+| Field          | Type     | JSON Tag                    | Description                                  |
+|----------------|----------|-----------------------------|----------------------------------------------|
+| `DirectoryURL` | `string` | `"directory_url"`           | ACME directory (RFC 8555) the bridge registers its account at |
+| `ContactEmail` | `string` | `"contact_email,omitempty"` | Contact the account registers with; empty for none |
 
 **IngressRule**
 
 One rule of the block, the control plane's `NodeStateBridgeIngressRule`.
 `IngressModePassthrough`, `IngressModeTerminate` and `IngressModeACME` name its
-modes; a bridge serves only `passthrough` until the block names a certificate
-source.
+modes, and a bridge serves all three: a `terminate` rule ends TLS with the
+certificate of the Secret `CertificateSecretName` names, and an `acme` rule with
+a certificate the bridge obtains from the account of the block's `ACME` member.
 
 | Field           | Type     | JSON Tag                 | Description                                  |
 |-----------------|----------|--------------------------|----------------------------------------------|
@@ -312,6 +326,7 @@ source.
 | `TargetNodeID`  | `string` | `"target_node_id"`       | Target node; not dialed                      |
 | `TargetAddress` | `string` | `"target_address"`       | Target node's mesh address, IPv4 or IPv6, without brackets |
 | `TargetPort`    | `int`    | `"target_port"`          | Port dialed on the target, 1 to 65535        |
+| `CertificateSecretName` | `string` | `"certificate_secret_name,omitempty"` | Secret of the bridge's Project that holds a `terminate` rule's certificate chain and key, one PEM document; empty on every other mode. The bridge fetches it in the version the pull's `secrets` block lists. See [Certificates from the Secret Store](/reference/bridge/public-ingress#certificates-from-the-secret-store) |
 
 **NodeStateBlock**
 
