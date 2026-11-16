@@ -591,7 +591,10 @@ func runAgent(ctx context.Context) error {
 		// with bridge.ingress_enabled: false. An opted-out bridge builds
 		// neither manager, so nothing in this process can bind a public port,
 		// whatever the pull says. The state pull configures the account; it
-		// holds none until a block names an acme rule.
+		// holds none until a block names an acme rule. The dial policy reads
+		// the Enforcer's installed ruleset after a dial to a target failed,
+		// to report the failure as policy_denied when the policy blocks it;
+		// it enforces nothing.
 		if !cfg.Bridge.IngressOptedOut() {
 			acmeDir := cfg.Bridge.ACMECacheDir
 			if acmeDir == "" {
@@ -605,6 +608,15 @@ func runAgent(ctx context.Context) error {
 			certs := ingressCertFetcher{client: client, nodeID: identity.NodeID, nsk: ingressNSK}
 			ingressCtrl := bridge.NewStdIngressController(logger)
 			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr, certs)
+			if dialPolicy, err := newIngressDialPolicy(enforcer, identity.MeshIP); err != nil {
+				logger.Warn("ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error",
+					"component", "bridge",
+					"mesh_ip", identity.MeshIP,
+					"error", err,
+				)
+			} else {
+				ingressMgr.SetDialPolicy(dialPolicy)
+			}
 			if err := ingressMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: ingress setup: %w", err)
 			}
