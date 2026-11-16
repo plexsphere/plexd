@@ -4107,6 +4107,108 @@ func TestSecrets_ConfigureCurrentVersion(t *testing.T) {
 	}
 }
 
+// configureSecrets posts body to POST /test/configure-secrets and fails the
+// test unless the answer has the status want.
+func configureSecrets(t *testing.T, baseURL, body string, want int) {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-secrets", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != want {
+		t.Fatalf("configure-secrets %s: status = %d, want %d", body, resp.StatusCode, want)
+	}
+}
+
+// fetchSecret fetches /v1/nodes/node-1/secrets/<key>, where key may carry a
+// ?version selector, requires a 200, and returns the served
+// X-Plexsphere-Secret-Version and the plaintext the envelope opens to under
+// the mock's NSK.
+func fetchSecret(t *testing.T, srv *mockapi.Server, baseURL, key string) (version, plaintext string) {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/v1/nodes/node-1/secrets/" + key)
+	if err != nil {
+		t.Fatalf("GET secrets/%s: %v", key, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET secrets/%s: status = %d, want %d", key, resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("GET secrets/%s: read body: %v", key, err)
+	}
+	plaintext, err = nodeapi.DecryptSecret(srv.NSK(), body)
+	if err != nil {
+		t.Fatalf("GET secrets/%s: DecryptSecret: %v", key, err)
+	}
+	return resp.Header.Get("X-Plexsphere-Secret-Version"), plaintext
+}
+
+func TestSecrets_NamedSecretServesItsValueAtItsVersion(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	configureSecrets(t, ts.URL, `{"secrets":[{"name":"tls","version":2,"value":"v"}]}`, http.StatusNoContent)
+
+	// An unversioned fetch and ?version=2 both serve the value at version 2.
+	for _, key := range []string{"tls", "tls?version=2"} {
+		version, plaintext := fetchSecret(t, srv, ts.URL, key)
+		if version != "2" {
+			t.Errorf("%s: X-Plexsphere-Secret-Version = %q, want %q", key, version, "2")
+		}
+		if plaintext != "v" {
+			t.Errorf("%s: decrypted = %q, want %q", key, plaintext, "v")
+		}
+	}
+
+	// A named Secret holds one version: ?version=1 is a 404 although it lies
+	// below the served one.
+	older, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/tls?version=1")
+	if err != nil {
+		t.Fatalf("GET secrets/tls?version=1: %v", err)
+	}
+	defer older.Body.Close()
+	if older.StatusCode != http.StatusNotFound {
+		t.Fatalf("?version=1 status = %d, want %d", older.StatusCode, http.StatusNotFound)
+	}
+	if code := problemCode(t, older); code != "secret_version_not_found" {
+		t.Errorf("?version=1 code = %q, want %q", code, "secret_version_not_found")
+	}
+
+	// A name outside the set keeps the fixture answer.
+	if _, plaintext := fetchSecret(t, srv, ts.URL, "db-password"); plaintext != srv.ExpectedBearerToken() {
+		t.Errorf("db-password: decrypted = %q, want the fixture token %q", plaintext, srv.ExpectedBearerToken())
+	}
+}
+
+func TestSecrets_NamedSecretsChangeOnlyWithTheMember(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	configureSecrets(t, ts.URL, `{"secrets":[{"name":"tls","version":2,"value":"v"}]}`, http.StatusNoContent)
+
+	// A body without the member leaves the set alone.
+	configureSecrets(t, ts.URL, `{}`, http.StatusNoContent)
+	if version, plaintext := fetchSecret(t, srv, ts.URL, "tls"); version != "2" || plaintext != "v" {
+		t.Errorf("after {}: tls = version %q, %q; want version %q, %q", version, plaintext, "2", "v")
+	}
+
+	// An empty member clears the set, so tls gets the fixture answer again.
+	configureSecrets(t, ts.URL, `{"secrets":[]}`, http.StatusNoContent)
+	if version, plaintext := fetchSecret(t, srv, ts.URL, "tls"); version != "1" || plaintext != srv.ExpectedBearerToken() {
+		t.Errorf("after {\"secrets\":[]}: tls = version %q, %q; want version %q, the fixture token %q",
+			version, plaintext, "1", srv.ExpectedBearerToken())
+	}
+}
+
+func TestSecrets_ConfigureInvalidNamedSecretReturns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	for _, body := range []string{
+		`{"secrets":[{"name":"Tls","version":1,"value":"v"}]}`,
+		`{"secrets":[{"name":"tls","version":0,"value":"v"}]}`,
+	} {
+		configureSecrets(t, ts.URL, body, http.StatusBadRequest)
+	}
+}
+
 func TestSecrets_RateLimit(t *testing.T) {
 	_, ts := newTestServer(t)
 

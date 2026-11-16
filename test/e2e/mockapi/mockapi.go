@@ -260,6 +260,13 @@ type Server struct {
 	hookVersions        map[hookVersionKey]publishedHookVersion
 	hookVersionFailNext atomic.Int64
 
+	// Named Secrets (issue #190). POST /test/configure-secrets replaces
+	// namedSecrets whole when its body carries the secrets member, guarded by
+	// namedSecretsMu. A fetch of a name in the set serves that Secret's value
+	// at its own version; every other name gets the fixture answer.
+	namedSecretsMu sync.RWMutex
+	namedSecrets   map[string]namedSecret
+
 	mux *http.ServeMux
 }
 
@@ -1848,9 +1855,12 @@ func candidateEndpoint(c string) bool {
 }
 
 // handleSecrets handles GET /v1/nodes/{id}/secrets/{key}. It validates the key
-// against secretKeyRe, honours an optional ?version=N selector bounded by the
-// current version, and serves the raw AES-256-GCM envelope as an octet-stream
-// body with the version and KID in response headers.
+// against secretKeyRe and serves the raw AES-256-GCM envelope as an
+// octet-stream body with the version and KID in response headers. A key that
+// names a Secret POST /test/configure-secrets configured is served that
+// Secret's value at its own version, and an optional ?version=N selector must
+// equal that version. Every other key is served the fixture bearer token, and
+// the selector is bounded by the current version.
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if !secretKeyRe.MatchString(key) {
@@ -1888,7 +1898,19 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if requested > 0 {
+	s.namedSecretsMu.RLock()
+	secret, named := s.namedSecrets[key]
+	s.namedSecretsMu.RUnlock()
+	plaintext := s.expectedBearerToken
+	switch {
+	case named:
+		// A named Secret holds exactly one version.
+		if requested > 0 && requested != secret.version {
+			writeProblem(w, r, http.StatusNotFound, "secret_version_not_found", "no such secret version")
+			return
+		}
+		version, plaintext = secret.version, secret.value
+	case requested > 0:
 		if requested > s.secretCurrentVersion.Load() {
 			writeProblem(w, r, http.StatusNotFound, "secret_version_not_found", "no such secret version")
 			return
@@ -1896,7 +1918,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 		version = requested
 	}
 
-	envelope := encryptSecret(s.nsk, s.expectedBearerToken)
+	envelope := encryptSecret(s.nsk, plaintext)
 	s.secretsCount.Add(1)
 	w.Header().Set("X-Plexsphere-Secret-Version", strconv.FormatInt(version, 10))
 	w.Header().Set("X-Plexsphere-Secret-KID", mockSecretKID)
@@ -2086,6 +2108,21 @@ const mockSecretKID = "e2e-nsk-kid-1"
 // secretKeyRe is a mock-local copy of the control-plane secret name grammar.
 // A name outside it is a 404 secret_not_found.
 var secretKeyRe = regexp.MustCompile("^[a-z][a-z0-9_-]{0,62}$")
+
+// namedSecret is one Secret POST /test/configure-secrets configured: the one
+// version the fetch serves and the plaintext it seals under the NSK.
+type namedSecret struct {
+	version int64
+	value   string
+}
+
+// namedSecretConfig is one entry of the secrets member of
+// POST /test/configure-secrets.
+type namedSecretConfig struct {
+	Name    string `json:"name"`
+	Version int64  `json:"version"`
+	Value   string `json:"value"`
+}
 
 // reportKeyRe is a mock-local copy of the control-plane per-key report grammar:
 // a lowercase-leading key of 1..128 chars over [a-z0-9._-]. A key outside it is
@@ -4122,8 +4159,14 @@ func (s *Server) handleConfigureRegister(w http.ResponseWriter, r *http.Request)
 
 // handleConfigureSecrets handles POST /test/configure-secrets. It arms the
 // secret handler's served version and rate-limit dials from an optional JSON
-// body; each field is applied only when > 0, so a partial body leaves the
-// other dials untouched. Decoding is strict: an unknown field is a 400.
+// body; each dial is applied only when > 0, so a partial body leaves the
+// other dials untouched. A body that carries the secrets member replaces the
+// whole set of named Secrets, so [] clears it, and a body without it (or with
+// null) leaves the set alone.
+//
+// Decoding is strict. An unknown field, or a secrets entry with a name outside
+// secretKeyRe, a version below 1 or a name listed before it, is a 400 and
+// changes nothing.
 func (s *Server) handleConfigureSecrets(w http.ResponseWriter, r *http.Request) {
 	data, err := s.captureBody("configure_secrets", r)
 	if err != nil {
@@ -4131,15 +4174,32 @@ func (s *Server) handleConfigureSecrets(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body struct {
-		CurrentVersion    int64 `json:"current_version"`
-		RateLimitNext     int64 `json:"rate_limit_next"`
-		RetryAfterSeconds int64 `json:"retry_after_seconds"`
+		CurrentVersion    int64                `json:"current_version"`
+		RateLimitNext     int64                `json:"rate_limit_next"`
+		RetryAfterSeconds int64                `json:"retry_after_seconds"`
+		Secrets           *[]namedSecretConfig `json:"secrets"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
+	}
+
+	// Every entry is checked before the set or a dial changes.
+	if body.Secrets != nil {
+		named := make(map[string]namedSecret, len(*body.Secrets))
+		for _, c := range *body.Secrets {
+			_, dup := named[c.Name]
+			if !secretKeyRe.MatchString(c.Name) || c.Version < 1 || dup {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+				return
+			}
+			named[c.Name] = namedSecret{version: c.Version, value: c.Value}
+		}
+		s.namedSecretsMu.Lock()
+		s.namedSecrets = named
+		s.namedSecretsMu.Unlock()
 	}
 	if body.CurrentVersion > 0 {
 		s.secretCurrentVersion.Store(body.CurrentVersion)

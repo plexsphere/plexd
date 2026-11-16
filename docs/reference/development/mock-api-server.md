@@ -1592,28 +1592,39 @@ report and its fallback to the short manifest entry.
 
 Arms the dials the secret handler reads: the served `current_version`, the count
 of upcoming fetches that answer a `429` (`rate_limit_next`), and the
-`Retry-After` seconds those `429`s carry (`retry_after_seconds`). Lets a test
-exercise version selection and the armed rate-limit path without a live secret
-backend.
+`Retry-After` seconds those `429`s carry (`retry_after_seconds`). It also
+replaces the named Secrets (`secrets`), each served with a value and a version
+of its own. Lets a test exercise version selection, the armed rate-limit path
+and a Secret whose value plexd reads, such as a certificate, without a live
+secret backend.
 
-**Request body:** strict-decoded — an unknown field is a `400`. Each field is
-applied only when greater than 0, so a partial body leaves the other dials
-untouched.
+**Request body:** strict-decoded — an unknown field, also inside a `secrets`
+entry, is a `400`. Each dial is applied only when greater than 0, so a partial
+body leaves the other dials untouched.
 
 ```json
-{ "current_version": 3, "rate_limit_next": 2, "retry_after_seconds": 5 }
+{
+  "current_version": 3,
+  "rate_limit_next": 2,
+  "retry_after_seconds": 5,
+  "secrets": [
+    { "name": "tls-term", "version": 1, "value": "-----BEGIN CERTIFICATE-----\n..." }
+  ]
+}
 ```
 
 **Response:** `204 No Content`.
 
 **Behavior:**
 
-- `current_version` — the version served in `X-Plexsphere-Secret-Version` and the ceiling a `?version=N` selector is checked against (a higher `?version` yields `404` `secret_version_not_found`).
-- `rate_limit_next` — arms the **next N** fetches to answer `429` `per_node_rate_limited` with a `Retry-After` header, decremented exactly once per fetch so that exactly N fetches are limited; each armed response increments `secrets_rate_limited_count`.
+- `current_version` — the version served in `X-Plexsphere-Secret-Version` for a name outside the named Secrets, and the ceiling its `?version=N` selector is checked against (a higher `?version` yields `404` `secret_version_not_found`).
+- `rate_limit_next` — arms the **next N** fetches to answer `429` `per_node_rate_limited` with a `Retry-After` header, decremented exactly once per fetch so that exactly N fetches are limited; each armed response increments `secrets_rate_limited_count`. A fetch of a named Secret spends the count like any other.
 - `retry_after_seconds` — the value written into the `Retry-After` header of those armed `429`s.
+- `secrets` — a body that carries the member replaces the whole set of named Secrets, so `[]` clears it; a body without it, or with `null`, leaves the set alone. Each entry's `name` must match `^[a-z][a-z0-9_-]{0,62}$`, its `version` must be at least 1, and a name may appear once per call. `value` is the Secret's plaintext.
+- A fetch of a named Secret serves its `value` sealed under the NSK, with the entry's `version` in `X-Plexsphere-Secret-Version`. A `?version=N` equal to that version serves the same; any other `N` yields `404` `secret_version_not_found`. Every other name keeps the fixture answer, the bearer token at `current_version`.
 - Request body is captured and retrievable via `GET /test/last-request/configure_secrets`.
 
-**Error:** Returns `400` if the body is not valid JSON or contains an unknown field. Returns `405` if the HTTP method is not `POST`.
+**Error:** Returns `400` with `{"error": "invalid request body"}` if the body is not valid JSON, contains an unknown field, or carries a `secrets` entry with a name off the grammar, a version below 1, or a name listed before it. A `400` changes neither the set nor a dial. Returns `405` if the HTTP method is not `POST`.
 
 ### `POST /test/configure-register`
 
@@ -1873,7 +1884,7 @@ Accepts an audit payload on the local endpoint. Requires Bearer token authentica
 The expected bearer token (`e2e-local-bearer-token`) is provisioned through the same credential chain that plexd uses in production:
 
 1. **Registration** — `POST /v1/register` returns `nsk` as 44-char standard-padded base64; plexd decodes it into the 32-byte AES-256-GCM key
-2. **Secret fetch** — `GET /v1/nodes/{id}/secrets/{key}` returns the raw AES-256-GCM envelope (`<12-byte nonce> || <ciphertext + 16-byte GCM tag>`) as an `application/octet-stream` body, with the version and KID (`e2e-nsk-kid-1`) in the `X-Plexsphere-Secret-Version` / `X-Plexsphere-Secret-KID` headers and `Cache-Control: no-store`
+2. **Secret fetch** — `GET /v1/nodes/{id}/secrets/{key}` returns the raw AES-256-GCM envelope (`<12-byte nonce> || <ciphertext + 16-byte GCM tag>`) as an `application/octet-stream` body, with the version and KID (`e2e-nsk-kid-1`) in the `X-Plexsphere-Secret-Version` / `X-Plexsphere-Secret-KID` headers and `Cache-Control: no-store`. The envelope seals the bearer token for every key except a named Secret of [`POST /test/configure-secrets`](#post-test-configure-secrets), which is served its own value and version
 3. **Decryption** — plexd opens the envelope with `nodeapi.DecryptSecret(nsk, envelope)` to recover the bearer token
 4. **Authentication** — plexd sends `Authorization: Bearer e2e-local-bearer-token` on each request to the local endpoint
 
