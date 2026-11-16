@@ -2,10 +2,12 @@ package bridge
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -358,5 +360,23 @@ func TestIngressReasons_AreReasonTokens(t *testing.T) {
 		if api.ValidIngressReason(s) {
 			t.Errorf("api.ValidIngressReason(%q) = true, want false", s)
 		}
+	}
+}
+
+// TestRuleReports_CarryNoSecretName builds the report of a terminate rule
+// whose Secret the inventory does not list: the body names the reason and
+// not the Secret, which stays in the bridge's log.
+func TestRuleReports_CarryNoSecretName(t *testing.T) {
+	fx := newIngressFixture(t, newLoopbackIngressController(t))
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(terminateRule("term", 443, "t.example.com", "tls-term", 9000), reportID("a1")))); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	req := buildIngressStatusRequest(api.IngressStateEnabled, fx.mgr.RuleReports(), time.Now())
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), IngressReasonCertificateSecretNotListed) || strings.Contains(string(body), "tls-term") {
+		t.Errorf("body = %s, want %s and not the Secret name tls-term", body, IngressReasonCertificateSecretNotListed)
 	}
 }

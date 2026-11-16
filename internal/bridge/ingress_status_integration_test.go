@@ -21,11 +21,11 @@ const testIngressStatusNSK = "test-nsk"
 // ingressStatusControlPlane is an httptest control plane serving
 // PUT /v1/nodes/{node_id}/ingress-status with the gates the contract,
 // plexsphere/plexsphere docs/reference/api/plexd-agent-contract.md, puts on
-// it: the NSK bearer, the node, a 4096-byte body cap, a strict decode that
-// refuses unknown members and data after the report, and a state that is
-// present and one of the two the contract names. It answers 200 with its own
-// receive time as accepted_at and records the body, and counts every 400 it
-// answers.
+// it: the NSK bearer, the node, a 256 KiB body cap, a strict decode that
+// refuses unknown members of the report and of each rule entry, a member of
+// the wrong type, and data after the report, and a state that is present and
+// one of the two the contract names. It answers 200 with its own receive time
+// as accepted_at and records the body, and counts every 400 it answers.
 type ingressStatusControlPlane struct {
 	srv      *httptest.Server
 	client   *api.ControlPlane
@@ -35,11 +35,28 @@ type ingressStatusControlPlane struct {
 	refused []string
 }
 
-// ingressStatusWire is the report as the control plane decodes it: state is a
-// pointer, so an absent or null one stays nil.
+// ingressStatusWire is the report as the control plane decodes it: every
+// member is a pointer, so an absent or null one stays nil.
 type ingressStatusWire struct {
-	State *string `json:"state"`
+	State *string                  `json:"state"`
+	Rules *[]ingressStatusWireRule `json:"rules"`
 }
+
+// ingressStatusWireRule is one rule entry as the control plane decodes it. A
+// dial_age_seconds that is not an integer fails the decode.
+type ingressStatusWireRule struct {
+	ID                *string `json:"id"`
+	Listener          *string `json:"listener"`
+	ListenerReason    *string `json:"listener_reason"`
+	Certificate       *string `json:"certificate"`
+	CertificateReason *string `json:"certificate_reason"`
+	Dial              *string `json:"dial"`
+	DialReason        *string `json:"dial_reason"`
+	DialAgeSeconds    *int64  `json:"dial_age_seconds"`
+}
+
+// maxIngressStatusWireBody is the contract's cap on a report body.
+const maxIngressStatusWireBody = 256 << 10
 
 func newIngressStatusControlPlane(t *testing.T) *ingressStatusControlPlane {
 	t.Helper()
@@ -79,7 +96,7 @@ func (cp *ingressStatusControlPlane) serve(w http.ResponseWriter, r *http.Reques
 		cp.problem(w, http.StatusForbidden, "node_id_mismatch", "the bearer belongs to another node")
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxIngressStatusWireBody))
 	if err != nil {
 		cp.problem(w, http.StatusRequestEntityTooLarge, "ingress_status_body_too_large", err.Error())
 		return
@@ -96,17 +113,13 @@ func (cp *ingressStatusControlPlane) serve(w http.ResponseWriter, r *http.Reques
 
 // ingressStatusMalformed returns why the contract answers 400
 // malformed_ingress_status for body, or "" when it does not: a body that is not
-// one JSON object, an unknown member, data after the report, a missing or null
-// state, or a state that is neither enabled nor opted_out.
+// one JSON object, an unknown member of the report or of a rule entry, a
+// member of the wrong type, data after the report, a missing or null state,
+// or a state that is neither enabled nor opted_out.
 func ingressStatusMalformed(body []byte) string {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	var report ingressStatusWire
-	if err := dec.Decode(&report); err != nil {
+	report, err := decodeIngressStatusWire(body)
+	if err != nil {
 		return err.Error()
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return "data after the report"
 	}
 	if report.State == nil {
 		return "state is missing"
@@ -117,6 +130,21 @@ func ingressStatusMalformed(body []byte) string {
 		return "state is not one of enabled and opted_out"
 	}
 	return ""
+}
+
+// decodeIngressStatusWire strict-decodes body as exactly one report: unknown
+// members, of the report and of each entry, and data after it are errors.
+func decodeIngressStatusWire(body []byte) (ingressStatusWire, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	var report ingressStatusWire
+	if err := dec.Decode(&report); err != nil {
+		return ingressStatusWire{}, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return ingressStatusWire{}, errors.New("data after the report")
+	}
+	return report, nil
 }
 
 // wantBody waits up to 2 s for the next accepted body and fails the test
@@ -159,7 +187,7 @@ func TestIngressStatusIntegration_ReportsBothStatesOverTheWire(t *testing.T) {
 	} {
 		t.Run(tc.want, func(t *testing.T) {
 			cp := newIngressStatusControlPlane(t)
-			reporter := NewIngressStatusReporter(time.Hour, testIngressNodeID, cp.client, tc.optedOut, discardLogger())
+			reporter := NewIngressStatusReporter(time.Hour, testIngressNodeID, cp.client, tc.optedOut, nil, discardLogger())
 			stop := startIngressStatusReporter(t, reporter)
 
 			cp.wantBody(t, "start", tc.want)
@@ -181,10 +209,11 @@ func TestIngressStatusIntegration_ReportsBothStatesOverTheWire(t *testing.T) {
 			{`{}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":null}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"paused"}`, http.StatusBadRequest, "malformed_ingress_status"},
-			{`{"state":"enabled","rules":[]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","up":true}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","dial_age_seconds":1.5}]}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled"}{}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`["enabled"]`, http.StatusBadRequest, "malformed_ingress_status"},
-			{`{"state":"enabled"}` + strings.Repeat(" ", 4097-len(`{"state":"enabled"}`)), http.StatusRequestEntityTooLarge, "ingress_status_body_too_large"},
+			{`{"state":"enabled"}` + strings.Repeat(" ", maxIngressStatusWireBody+1-len(`{"state":"enabled"}`)), http.StatusRequestEntityTooLarge, "ingress_status_body_too_large"},
 		}
 		for _, tt := range tests {
 			req, err := http.NewRequest(http.MethodPut, cp.srv.URL+"/v1/nodes/"+testIngressNodeID+"/ingress-status", strings.NewReader(tt.body))
@@ -206,4 +235,61 @@ func TestIngressStatusIntegration_ReportsBothStatesOverTheWire(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestIngressStatusIntegration_ReportsRuleEntriesOverTheWire sends three rule
+// entries through the real client: the control plane decodes them strictly
+// and reads each id, its facets and an integer dial age.
+func TestIngressStatusIntegration_ReportsRuleEntriesOverTheWire(t *testing.T) {
+	cp := newIngressStatusControlPlane(t)
+	failed := dialledReport(reportID("a1"), api.IngressDialFailed, IngressDialReasonPolicyDenied, time.Now().Add(-12*time.Second))
+	failed.Certificate = api.IngressCertificateReady
+	notReady := listeningReport(reportID("b2"))
+	notReady.Certificate, notReady.CertificateReason = api.IngressCertificateNotReady, IngressReasonCertificateSecretNotListed
+	down := IngressRuleReport{RuleID: reportID("c3"), Listener: api.IngressListenerNotListening, ListenerReason: IngressReasonListenFailed}
+	source := &fakeRuleSource{reports: []IngressRuleReport{failed, notReady, down}, changed: make(chan struct{}, 1)}
+
+	reporter := NewIngressStatusReporter(time.Hour, testIngressNodeID, cp.client, false, source, discardLogger())
+	stop := startIngressStatusReporter(t, reporter)
+	var body string
+	select {
+	case body = <-cp.accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no report accepted within 2s")
+	}
+	stop()
+	cp.wantNoMore(t)
+
+	report, err := decodeIngressStatusWire([]byte(body))
+	if err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	if report.Rules == nil || len(*report.Rules) != 3 {
+		t.Fatalf("rules of %s, want three entries", body)
+	}
+	str := func(p *string) string {
+		if p == nil {
+			return "<absent>"
+		}
+		return *p
+	}
+	type entry struct{ id, listener, listenerReason, certificate, certificateReason, dial, dialReason string }
+	want := []entry{
+		{reportID("a1"), "listening", "<absent>", "ready", "<absent>", "failed", "policy_denied"},
+		{reportID("b2"), "listening", "<absent>", "not_ready", "certificate_secret_not_listed", "none", "<absent>"},
+		{reportID("c3"), "not_listening", "listen_failed", "<absent>", "<absent>", "<absent>", "<absent>"},
+	}
+	for i, e := range *report.Rules {
+		got := entry{str(e.ID), str(e.Listener), str(e.ListenerReason), str(e.Certificate), str(e.CertificateReason), str(e.Dial), str(e.DialReason)}
+		if got != want[i] {
+			t.Errorf("entry %d = %+v, want %+v", i, got, want[i])
+		}
+	}
+	rules := *report.Rules
+	if age := rules[0].DialAgeSeconds; age == nil || *age < 12 || *age > 14 {
+		t.Errorf("dial_age_seconds of the failed dial = %v, want an integer of about 12", age)
+	}
+	if rules[1].DialAgeSeconds != nil || rules[2].DialAgeSeconds != nil {
+		t.Errorf("entries without a dial carry dial_age_seconds: %s", body)
+	}
 }

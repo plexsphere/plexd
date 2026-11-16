@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -15,39 +16,69 @@ type IngressStatusClient interface {
 	ReportIngressStatus(ctx context.Context, nodeID string, req api.IngressStatusRequest) (*api.IngressStatusResponse, error)
 }
 
-// IngressStatusReporter sends whether the bridge's local configuration serves
-// public ingress to PUT /v1/nodes/{node_id}/ingress-status: enabled, or
-// opted_out when bridge.ingress_enabled is false. It sends once when it starts
-// and again once per interval. The control plane keeps the latest report per
-// node and refuses ingress rule creates and updates on a bridge whose report
-// reads opted_out.
+// IngressRuleReportSource is the part of *IngressManager the reporter reads.
+type IngressRuleReportSource interface {
+	RuleReports() []IngressRuleReport
+	ReportChanged() <-chan struct{}
+}
+
+// ingressStatusChangeGap is the shortest time between two on-change sends.
+const ingressStatusChangeGap = 5 * time.Second
+
+// IngressStatusReporter sends to PUT /v1/nodes/{node_id}/ingress-status whether
+// the bridge's local configuration serves public ingress, enabled or
+// opted_out when bridge.ingress_enabled is false, and on an enabled bridge
+// one entry per ingress rule as the ingress manager reports it: its listener,
+// its certificate and the last dial to its target. It sends once when it
+// starts, again when the entries change, and once per interval. The control
+// plane keeps the latest state per node and refuses ingress rule creates and
+// updates on a bridge whose report reads opted_out; each report replaces the
+// rule entries of the one before.
 //
 // DECISION: the reporter sends at once when it starts, without waiting for a
 // pull. The state comes from the local configuration and is known before the
 // first pull, unlike the relay's, which only the relay handler knows. plexd
 // reads its configuration once per start, so the send after each start covers
-// every change of the setting.
+// every change of the setting. That send carries no entries, because no pull
+// is applied yet; the first Apply signals a change, and the entries follow at
+// once.
 //
-// DECISION: a failed send is never retried within its tick. The body never
-// changes, so the next tick sends the same report, at most one interval later.
-// An opt-out whose first send fails reaches the control plane at most one
-// interval late, and the bridge opens no public listener the whole time.
+// DECISION: a change sends only when its entries differ from those of the
+// last accepted report, the dial age ignored, and at most once per
+// ingressStatusChangeGap; a change inside the gap is sent when the gap ends,
+// with the entries as they are then. Dial outcomes follow public connections,
+// so without the bound a target that alternates between failing and
+// answering would cost one request per flip. An on-change send restarts the
+// interval, as the relay status reporter's does. A moving dial age alone
+// sends nothing; the tick carries it.
 //
-// DECISION: nothing is sent at shutdown. The control plane keeps the report and
+// DECISION: a failed send is never retried within its tick. The last
+// accepted report stays what it was, so the next tick, or the next change,
+// sends the state and the entries as they are then, at most one interval
+// later. An opt-out whose first send fails reaches the control plane at most
+// one interval late, and the bridge opens no public listener the whole time.
+//
+// DECISION: nothing is sent at shutdown. The control plane keeps the state and
 // never ages it, and a stopped bridge keeps the state its configuration gives
-// it, so there is nothing to withdraw.
+// it, so there is nothing to withdraw; its rule entries read stale once its
+// reports stop.
 //
 // DECISION: the report never gates serving. A bridge serves as the pull says
 // while the report fails or the control plane does not serve the operation, as
 // the contract, plexsphere/plexsphere docs/reference/api/plexd-agent-contract.md,
-// requires. Nothing the reporter learns reaches the ingress manager or the
-// reconcile handler.
+// requires. The reporter only reads the ingress manager; nothing it learns
+// reaches the manager or the reconcile handler.
 type IngressStatusReporter struct {
 	interval time.Duration
 	nodeID   string
 	client   IngressStatusClient
-	state    string // one of the api.IngressState* constants
+	state    string                  // one of the api.IngressState* constants
+	rules    IngressRuleReportSource // nil on an opted-out bridge
 	logger   *slog.Logger
+
+	// now is the clock dial ages and the change gap are measured on;
+	// time.Now outside tests.
+	now func() time.Time
 
 	// The fields below are owned by the Run loop and never read concurrently.
 
@@ -55,16 +86,26 @@ type IngressStatusReporter struct {
 	// ingress status reports, so that state is logged once on entry and once
 	// on exit rather than on every send.
 	notServed bool
-	// reported tells whether the control plane accepted a report yet.
+	// reported tells whether the control plane accepted a report yet, and
+	// accepted holds the entries of the last report it accepted.
 	reported bool
+	accepted []api.IngressStatusRule
+	// truncated is set while the manager reports more rules than a report
+	// carries, so the Warn is logged once on entering that state.
+	truncated bool
+	// lastChange is when the last on-change send went out; zero before one.
+	lastChange time.Time
 }
 
 // NewIngressStatusReporter creates an IngressStatusReporter that reports for
-// nodeID through client the state optedOut gives: opted_out when it is true,
-// enabled otherwise. A non-positive interval becomes 30 s, the value of
+// nodeID through client the state optedOut gives, opted_out when it is true
+// and enabled otherwise, and on an enabled bridge the rule entries rules
+// reports. rules is nil on an opted-out bridge; a caller passes an untyped
+// nil, since a nil *IngressManager in the interface does not compare equal to
+// nil. A non-positive interval becomes 30 s, the value of
 // agent.DefaultHeartbeatInterval, because the report's cadence is the
 // heartbeat interval.
-func NewIngressStatusReporter(interval time.Duration, nodeID string, client IngressStatusClient, optedOut bool, logger *slog.Logger) *IngressStatusReporter {
+func NewIngressStatusReporter(interval time.Duration, nodeID string, client IngressStatusClient, optedOut bool, rules IngressRuleReportSource, logger *slog.Logger) *IngressStatusReporter {
 	if interval <= 0 {
 		interval = defaultRelayStatusInterval
 	}
@@ -77,34 +118,158 @@ func NewIngressStatusReporter(interval time.Duration, nodeID string, client Ingr
 		nodeID:   nodeID,
 		client:   client,
 		state:    state,
+		rules:    rules,
 		logger:   logger.With("component", "bridge"),
+		now:      time.Now,
 	}
 }
 
-// Run sends the state at once and then on every tick of the interval until ctx
-// is done, and returns nil without a last send. No answer ends the
-// loop: a control plane that does not serve the operation yet is asked again
-// every interval, so an upgrade is picked up without a restart.
+// Run sends the report at once, on every change of the rule entries, bounded
+// by ingressStatusChangeGap, and on every tick of the interval until ctx is
+// done, and returns nil without a last send. No answer ends the loop: a
+// control plane that does not serve the operation yet is asked again every
+// interval, so an upgrade is picked up without a restart.
 func (r *IngressStatusReporter) Run(ctx context.Context) error {
 	r.logger.Info("ingress status: reporter started", "interval", r.interval, "state", r.state)
 
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
+	var changed <-chan struct{}
+	if r.rules != nil {
+		changed = r.rules.ReportChanged()
+	}
+	// gap is armed while a change waits for the end of the change gap.
+	var gap *time.Timer
+	var gapEnd <-chan time.Time
+	disarm := func() {
+		if gap != nil {
+			gap.Stop()
+			gap, gapEnd = nil, nil
+		}
+	}
+	defer disarm()
 
 	r.reportOnce(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-changed:
+			if gapEnd != nil {
+				// The armed timer sends the entries as they are when it fires.
+				continue
+			}
+			if wait := r.lastChange.Add(ingressStatusChangeGap).Sub(r.now()); !r.lastChange.IsZero() && wait > 0 {
+				if req := r.build(); !r.sameAsAccepted(req) {
+					gap = time.NewTimer(wait)
+					gapEnd = gap.C
+				}
+				continue
+			}
+			if r.reportChange(ctx) {
+				ticker.Reset(r.interval)
+			}
+		case <-gapEnd:
+			gap, gapEnd = nil, nil
+			if r.reportChange(ctx) {
+				ticker.Reset(r.interval)
+			}
 		case <-ticker.C:
+			// This send reads the latest entries, so a change signal pending
+			// beside the tick, and a change waiting for the gap, are spent
+			// here.
+			select {
+			case <-changed:
+			default:
+			}
+			disarm()
 			r.reportOnce(ctx)
 		}
 	}
 }
 
-// reportOnce sends the state once.
+// reportChange sends the report when its entries differ from those of the
+// last accepted report, and reports whether it sent.
+func (r *IngressStatusReporter) reportChange(ctx context.Context) bool {
+	req := r.build()
+	if r.sameAsAccepted(req) {
+		return false
+	}
+	r.lastChange = r.now()
+	r.send(ctx, req)
+	return true
+}
+
+// build returns the report as it is now, and logs the Warn about the rules a
+// report cannot carry once on entering that state.
+func (r *IngressStatusReporter) build() api.IngressStatusRequest {
+	var reports []IngressRuleReport
+	if r.rules != nil && r.state == api.IngressStateEnabled {
+		reports = r.rules.RuleReports()
+	}
+	switch {
+	case len(reports) <= api.MaxIngressStatusRules:
+		r.truncated = false
+	case !r.truncated:
+		r.logger.Warn("ingress status: more rules than a report carries, reporting the first 1024", "rules", len(reports))
+		r.truncated = true
+	}
+	return buildIngressStatusRequest(r.state, reports, r.now())
+}
+
+// sameAsAccepted reports whether req carries the entries of the last accepted
+// report, the dial age ignored.
+func (r *IngressStatusReporter) sameAsAccepted(req api.IngressStatusRequest) bool {
+	return r.reported && slices.EqualFunc(req.Rules, r.accepted, func(a, b api.IngressStatusRule) bool {
+		a.DialAgeSeconds, b.DialAgeSeconds = nil, nil
+		return a == b
+	})
+}
+
+// buildIngressStatusRequest turns the state and the rule reports into the
+// report body at now. It returns the state alone for opted_out and for no
+// reports, and otherwise maps the first api.MaxIngressStatusRules reports in
+// order. DialAgeSeconds is set exactly when Dial is succeeded or failed: now
+// minus DialAt in whole seconds, floored, clamped to 0 when DialAt postdates
+// now and to api.MaxIngressStatusDialAgeSeconds above it.
+func buildIngressStatusRequest(state string, reports []IngressRuleReport, now time.Time) api.IngressStatusRequest {
+	req := api.IngressStatusRequest{State: state}
+	if state == api.IngressStateOptedOut || len(reports) == 0 {
+		return req
+	}
+	reports = reports[:min(len(reports), api.MaxIngressStatusRules)]
+	req.Rules = make([]api.IngressStatusRule, len(reports))
+	for i, rep := range reports {
+		entry := api.IngressStatusRule{
+			ID:                rep.RuleID,
+			Listener:          rep.Listener,
+			ListenerReason:    rep.ListenerReason,
+			Certificate:       rep.Certificate,
+			CertificateReason: rep.CertificateReason,
+			Dial:              rep.Dial,
+			DialReason:        rep.DialReason,
+		}
+		if rep.Dial == api.IngressDialSucceeded || rep.Dial == api.IngressDialFailed {
+			// Integer division floors here because the clamped age is not
+			// negative.
+			secs := int64(max(now.Sub(rep.DialAt), 0) / time.Second)
+			secs = min(secs, api.MaxIngressStatusDialAgeSeconds)
+			entry.DialAgeSeconds = &secs
+		}
+		req.Rules[i] = entry
+	}
+	return req
+}
+
+// reportOnce sends the report as it is now once.
 func (r *IngressStatusReporter) reportOnce(ctx context.Context) {
-	resp, err := r.client.ReportIngressStatus(ctx, r.nodeID, api.IngressStatusRequest{State: r.state})
+	r.send(ctx, r.build())
+}
+
+// send sends req once and, when the control plane accepts it, keeps its
+// entries as the last accepted ones.
+func (r *IngressStatusReporter) send(ctx context.Context, req api.IngressStatusRequest) {
+	resp, err := r.client.ReportIngressStatus(ctx, r.nodeID, req)
 	if err != nil {
 		r.logSendError(ctx, err)
 		return
@@ -115,10 +280,11 @@ func (r *IngressStatusReporter) reportOnce(ctx context.Context) {
 		r.notServed = false
 	}
 	if !r.reported {
-		r.logger.Info("ingress status: reported", "state", r.state)
+		r.logger.Info("ingress status: reported", "state", r.state, "rules", len(req.Rules))
 		r.reported = true
 	}
-	r.logger.Debug("ingress status: accepted", "state", r.state, "accepted_at", resp.AcceptedAt)
+	r.accepted = req.Rules
+	r.logger.Debug("ingress status: accepted", "state", r.state, "rules", len(req.Rules), "accepted_at", resp.AcceptedAt)
 }
 
 // logSendError logs a failed send at the level its cause deserves. An error

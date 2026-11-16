@@ -1305,10 +1305,12 @@ func runAgent(ctx context.Context) error {
 	// needs no WireGuard device. Cancelling ctx makes it send a last stopped
 	// report, bounded by 5 s, and the wg.Wait of the shutdown sequence waits
 	// for it. The ingress status reporter sends whether this bridge opts out
-	// of public ingress, at once and then at the heartbeat's interval, and
-	// sends nothing at shutdown: the control plane keeps the report, and what
-	// it says never gates what the ingress handler serves. A node outside
-	// bridge mode starts neither.
+	// of public ingress and, unless it does, the listener, certificate and
+	// last dial of each ingress rule the ingress manager reports: at once, on
+	// every change of the rule entries at most once per 5 s, and at the
+	// heartbeat's interval. It sends nothing at shutdown: the control plane
+	// keeps the report, and what it says never gates what the ingress handler
+	// serves. A node outside bridge mode starts neither.
 	if bridgeMgr != nil {
 		relayStatusReporter := bridge.NewRelayStatusReporter(statusInterval, identity.NodeID, client, bridgeMgr.RelayStatusTracker(), logger)
 		wg.Add(1)
@@ -1317,7 +1319,14 @@ func runAgent(ctx context.Context) error {
 			_ = relayStatusReporter.Run(ctx)
 		}()
 
-		ingressStatusReporter := bridge.NewIngressStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.IngressOptedOut(), logger)
+		// An opted-out bridge has no ingress manager. It passes an untyped nil:
+		// a nil *bridge.IngressManager in the interface would not compare
+		// equal to nil.
+		var ingressRules bridge.IngressRuleReportSource
+		if ingressMgr != nil {
+			ingressRules = ingressMgr
+		}
+		ingressStatusReporter := bridge.NewIngressStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.IngressOptedOut(), ingressRules, logger)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

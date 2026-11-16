@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -106,7 +107,7 @@ func TestIngressStatusReporter_SendsItsStateAtStart(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				client := &fakeIngressStatusClient{}
 				logger, logs := newRelayLogger()
-				r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, tc.optedOut, logger)
+				r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, tc.optedOut, nil, logger)
 
 				startIngressStatusReporter(t, r)
 				synctest.Wait()
@@ -139,7 +140,7 @@ func TestIngressStatusReporter_ResendsEveryTick(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const interval = 10 * time.Millisecond
 		client := &fakeIngressStatusClient{}
-		r := NewIngressStatusReporter(interval, testIngressNodeID, client, true, discardLogger())
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, true, nil, discardLogger())
 
 		startIngressStatusReporter(t, r)
 		time.Sleep(2*interval + interval/2)
@@ -164,7 +165,7 @@ func TestNewIngressStatusReporter_NonPositiveIntervalRunsAtDefault(t *testing.T)
 				client := &fakeIngressStatusClient{}
 				logger, logs := newRelayLogger()
 
-				r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, logger)
+				r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, nil, logger)
 				if r.interval != 30*time.Second {
 					t.Errorf("interval = %v, want 30s", r.interval)
 				}
@@ -196,7 +197,7 @@ func TestIngressStatusReporter_FailedSendIsNotRetriedWithinItsTick(t *testing.T)
 		const interval = time.Minute
 		client := &fakeIngressStatusClient{errs: []error{context.DeadlineExceeded}}
 		logger, logs := newRelayLogger()
-		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, logger)
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, nil, logger)
 
 		startIngressStatusReporter(t, r)
 		synctest.Wait()
@@ -236,7 +237,7 @@ func TestIngressStatusReporter_FailedSendIsNotRetriedWithinItsTick(t *testing.T)
 func TestIngressStatusReporter_NoSendAtShutdown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := &fakeIngressStatusClient{}
-		r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, true, discardLogger())
+		r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, true, nil, discardLogger())
 
 		stop := startIngressStatusReporter(t, r)
 		synctest.Wait()
@@ -277,7 +278,7 @@ func TestIngressStatusReporter_NotServedLoggedOnTransitions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &fakeIngressStatusClient{errs: []error{tt.err, tt.err, tt.err}}
 			logger, logs := newRelayLogger()
-			r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, logger)
+			r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, nil, logger)
 			ctx := context.Background()
 
 			for range 3 {
@@ -321,7 +322,7 @@ func TestIngressStatusReporter_NodeGoneWarnsOnEverySend(t *testing.T) {
 	gone := &api.APIError{StatusCode: 404, Code: "ingress_status_node_gone"}
 	client := &fakeIngressStatusClient{errs: []error{gone, gone}}
 	logger, logs := newRelayLogger()
-	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, logger)
+	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, nil, logger)
 
 	for range 2 {
 		r.reportOnce(context.Background())
@@ -350,7 +351,7 @@ func TestIngressStatusReporter_SendFailuresWarn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &fakeIngressStatusClient{errs: []error{tt.err}}
 			logger, logs := newRelayLogger()
-			r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, logger)
+			r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, nil, logger)
 
 			r.reportOnce(context.Background())
 
@@ -376,7 +377,7 @@ func TestIngressStatusReporter_SendFailuresWarn(t *testing.T) {
 func TestIngressStatusReporter_RefusedCredentialLoggedAtDebug(t *testing.T) {
 	client := &fakeIngressStatusClient{errs: []error{fmt.Errorf("x: %w", api.ErrCredentialRefused)}}
 	logger, logs := newRelayLogger()
-	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, logger)
+	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, nil, logger)
 
 	r.reportOnce(context.Background())
 
@@ -394,7 +395,7 @@ func TestIngressStatusReporter_RefusedCredentialLoggedAtDebug(t *testing.T) {
 func TestIngressStatusReporter_CancelledSendIsNotLogged(t *testing.T) {
 	client := &fakeIngressStatusClient{errs: []error{context.Canceled}}
 	logger, logs := newRelayLogger()
-	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, logger)
+	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, nil, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -415,7 +416,7 @@ func TestIngressStatusReporter_ReportedOnceAcceptedOnEverySend(t *testing.T) {
 	)
 	client := &fakeIngressStatusClient{}
 	logger, logs := newRelayLogger()
-	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, true, logger)
+	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, true, nil, logger)
 	ctx := context.Background()
 
 	for range 3 {
@@ -428,7 +429,371 @@ func TestIngressStatusReporter_ReportedOnceAcceptedOnEverySend(t *testing.T) {
 			t.Errorf("reported log = %q, want it to contain %q", line, want)
 		}
 	}
-	if n := logs.count(`level=DEBUG msg="` + acceptedMsg + `" component=bridge state=opted_out accepted_at=2026-10-30T10:15:30.123Z`); n != 3 {
-		t.Errorf("accepted lines at Debug with the state and the receipt's accepted_at = %d over three accepted sends, want 3:\n%s", n, logs.String())
+	if n := logs.count(`level=DEBUG msg="` + acceptedMsg + `" component=bridge state=opted_out rules=0 accepted_at=2026-10-30T10:15:30.123Z`); n != 3 {
+		t.Errorf("accepted lines at Debug with the state, the rule count and the receipt's accepted_at = %d over three accepted sends, want 3:\n%s", n, logs.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Rule entries
+// ---------------------------------------------------------------------------
+
+// fakeRuleSource is an IngressRuleReportSource whose reports a test sets. It
+// is built inside the synctest bubble that uses it, since its channel belongs
+// to the bubble that made it.
+type fakeRuleSource struct {
+	mu      sync.Mutex
+	reports []IngressRuleReport
+	changed chan struct{}
+}
+
+func newFakeRuleSource(reports ...IngressRuleReport) *fakeRuleSource {
+	return &fakeRuleSource{reports: reports, changed: make(chan struct{}, 1)}
+}
+
+func (s *fakeRuleSource) RuleReports() []IngressRuleReport {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.reports)
+}
+
+func (s *fakeRuleSource) ReportChanged() <-chan struct{} { return s.changed }
+
+// store replaces the reports without a signal.
+func (s *fakeRuleSource) store(reports ...IngressRuleReport) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reports = reports
+}
+
+// set replaces the reports and signals the change.
+func (s *fakeRuleSource) set(reports ...IngressRuleReport) {
+	s.store(reports...)
+	select {
+	case s.changed <- struct{}{}:
+	default:
+	}
+}
+
+// listeningReport returns the report of a passthrough rule that listens and
+// whose target nobody dialled.
+func listeningReport(id string) IngressRuleReport {
+	return IngressRuleReport{RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired, Dial: api.IngressDialNone}
+}
+
+// dialledReport returns the report of a passthrough rule whose last dial had
+// the outcome dial, with reason, at at.
+func dialledReport(id, dial, reason string, at time.Time) IngressRuleReport {
+	r := listeningReport(id)
+	r.Dial, r.DialReason, r.DialAt = dial, reason, at
+	return r
+}
+
+// entryIDs returns the ids of a report's entries, in order.
+func entryIDs(req api.IngressStatusRequest) []string {
+	var ids []string
+	for _, e := range req.Rules {
+		ids = append(ids, e.ID)
+	}
+	return ids
+}
+
+func TestIngressStatusReporter_SourceWithoutReportsSendsTheStateAlone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, newFakeRuleSource(), discardLogger())
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+
+		_, reqs := client.recorded()
+		if len(reqs) != 1 {
+			t.Fatalf("reports after the start = %d, want 1", len(reqs))
+		}
+		if got := mustJSON(t, reqs[0]); got != `{"state":"enabled"}` {
+			t.Errorf("body = %s, want {\"state\":\"enabled\"}", got)
+		}
+	})
+}
+
+func TestBuildIngressStatusRequest_DialAge(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	id := reportID("a1")
+	const absent = -1
+	tests := []struct {
+		name   string
+		report IngressRuleReport
+		want   int64 // absent for no member
+	}{
+		{"12.9 s ago", dialledReport(id, api.IngressDialFailed, IngressDialReasonRefused, now.Add(-12900*time.Millisecond)), 12},
+		{"after now", dialledReport(id, api.IngressDialSucceeded, "", now.Add(time.Second)), 0},
+		{"100 years ago", dialledReport(id, api.IngressDialSucceeded, "", now.AddDate(-100, 0, 0)), api.MaxIngressStatusDialAgeSeconds},
+		{"no dial", listeningReport(id), absent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := buildIngressStatusRequest(api.IngressStateEnabled, []IngressRuleReport{tt.report}, now)
+			if len(req.Rules) != 1 {
+				t.Fatalf("rules = %+v, want one entry", req.Rules)
+			}
+			got := req.Rules[0].DialAgeSeconds
+			switch {
+			case tt.want == absent && got != nil:
+				t.Errorf("DialAgeSeconds = %d, want none", *got)
+			case tt.want != absent && (got == nil || *got != tt.want):
+				t.Errorf("DialAgeSeconds = %v, want %d", got, tt.want)
+			}
+			if body := mustJSON(t, req); tt.want == absent && strings.Contains(body, "dial_age_seconds") {
+				t.Errorf("body = %s, want no dial_age_seconds", body)
+			}
+		})
+	}
+}
+
+func TestBuildIngressStatusRequest_OptedOutCarriesNoRules(t *testing.T) {
+	req := buildIngressStatusRequest(api.IngressStateOptedOut, []IngressRuleReport{listeningReport(reportID("a1"))}, time.Now())
+	if req.Rules != nil {
+		t.Errorf("rules = %+v, want none for opted_out", req.Rules)
+	}
+}
+
+func TestIngressStatusReporter_ReportsTheFirst1024Rules(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		reports := make([]IngressRuleReport, 1030)
+		for i := range reports {
+			reports[i] = listeningReport(fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", i+1))
+		}
+		client := &fakeIngressStatusClient{}
+		logger, logs := newRelayLogger()
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, newFakeRuleSource(reports...), logger)
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		time.Sleep(interval)
+		synctest.Wait()
+
+		_, reqs := client.recorded()
+		if len(reqs) != 2 {
+			t.Fatalf("reports = %d, want 2: the one at start and one tick", len(reqs))
+		}
+		var want []string
+		for _, rep := range reports[:1024] {
+			want = append(want, rep.RuleID)
+		}
+		for k, req := range reqs {
+			if got := entryIDs(req); !slices.Equal(got, want) {
+				t.Errorf("report %d holds %d entries, want the first 1024 in order", k, len(got))
+			}
+		}
+		const msg = "ingress status: more rules than a report carries, reporting the first 1024"
+		if n := logs.count(`level=WARN msg="` + msg + `" component=bridge rules=1030`); n != 1 {
+			t.Errorf("%d Warns %q with rules=1030 over two sends, want 1:\n%s", n, msg, logs.String())
+		}
+	})
+}
+
+func TestIngressStatusReporter_SendsOnChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		source := newFakeRuleSource(listeningReport(reportID("a1")))
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, source, discardLogger())
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		time.Sleep(10 * time.Second)
+		source.set(dialledReport(reportID("a1"), api.IngressDialFailed, IngressDialReasonRefused, time.Now()))
+		synctest.Wait()
+		_, reqs := client.recorded()
+		if len(reqs) != 2 {
+			t.Fatalf("reports after a change = %d, want 2: the one at start and one on change, before any tick", len(reqs))
+		}
+		if got := reqs[1].Rules; len(got) != 1 || got[0].Dial != api.IngressDialFailed {
+			t.Errorf("on-change report rules = %+v, want the failed dial", got)
+		}
+
+		// The on-change send restarted the interval.
+		time.Sleep(interval - time.Millisecond)
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Errorf("reports just before one interval after the change = %d, want 2", got)
+		}
+		time.Sleep(2 * time.Millisecond)
+		synctest.Wait()
+		if got := client.calls(); got != 3 {
+			t.Errorf("reports just after one interval after the change = %d, want 3", got)
+		}
+	})
+}
+
+func TestIngressStatusReporter_DialAgeAloneSendsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		at := time.Now()
+		source := newFakeRuleSource(dialledReport(reportID("a1"), api.IngressDialSucceeded, "", at))
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, source, discardLogger())
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		time.Sleep(10 * time.Second)
+		source.set(dialledReport(reportID("a1"), api.IngressDialSucceeded, "", at.Add(10*time.Second)))
+		synctest.Wait()
+		time.Sleep(interval - 10*time.Second - time.Millisecond)
+		synctest.Wait()
+		if got := client.calls(); got != 1 {
+			t.Errorf("reports before the tick after a change of DialAt alone = %d, want only the one at start", got)
+		}
+	})
+}
+
+func TestIngressStatusReporter_ChangesAreBoundedByTheGap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		source := newFakeRuleSource(listeningReport(reportID("a1")))
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, source, discardLogger())
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		time.Sleep(10 * time.Second)
+		source.set(dialledReport(reportID("a1"), api.IngressDialFailed, IngressDialReasonRefused, time.Now()))
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Fatalf("reports after the first change = %d, want 2", got)
+		}
+
+		time.Sleep(time.Second)
+		source.set(dialledReport(reportID("a1"), api.IngressDialSucceeded, "", time.Now()))
+		synctest.Wait()
+		time.Sleep(4*time.Second - time.Millisecond)
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Errorf("reports just before 5s after the first on-change send = %d, want still 2", got)
+		}
+		// The latest reports are the ones the timer sends.
+		source.store(dialledReport(reportID("a1"), api.IngressDialFailed, IngressDialReasonTimeout, time.Now()))
+		time.Sleep(2 * time.Millisecond)
+		synctest.Wait()
+		_, reqs := client.recorded()
+		if len(reqs) != 3 {
+			t.Fatalf("reports just after 5s after the first on-change send = %d, want 3", len(reqs))
+		}
+		if got := reqs[2].Rules; len(got) != 1 || got[0].DialReason != IngressDialReasonTimeout {
+			t.Errorf("second on-change report rules = %+v, want the latest reports (dial failed with timeout)", got)
+		}
+	})
+}
+
+func TestIngressStatusReporter_FailedOnChangeSendIsNotRetried(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		source := newFakeRuleSource(listeningReport(reportID("a1")))
+		client := &fakeIngressStatusClient{errs: []error{nil, &api.APIError{StatusCode: 400, Code: "invalid_ingress_status"}}}
+		logger, logs := newRelayLogger()
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, source, logger)
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		time.Sleep(10 * time.Second)
+		source.set(dialledReport(reportID("a1"), api.IngressDialFailed, IngressDialReasonRefused, time.Now()))
+		synctest.Wait()
+		if n := logs.count(`level=WARN msg="ingress status: send failed"`); n != 1 {
+			t.Errorf("%d Warns 'ingress status: send failed' after the refused on-change send, want 1:\n%s", n, logs.String())
+		}
+
+		time.Sleep(interval - time.Millisecond)
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Errorf("reports before the tick = %d, want 2: no retry of the refused one", got)
+		}
+		source.store(dialledReport(reportID("a1"), api.IngressDialSucceeded, "", time.Now()))
+		time.Sleep(2 * time.Millisecond)
+		synctest.Wait()
+		_, reqs := client.recorded()
+		if len(reqs) != 3 {
+			t.Fatalf("reports after the tick = %d, want 3", len(reqs))
+		}
+		if got := reqs[2].Rules; len(got) != 1 || got[0].Dial != api.IngressDialSucceeded {
+			t.Errorf("tick report rules = %+v, want the reports as they then are (dial succeeded)", got)
+		}
+	})
+}
+
+func TestIngressStatusReporter_ControlPlaneWithoutRules(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		// A manager whose port fails to bind opens no socket, so it runs
+		// inside the bubble.
+		fx := buildIngressFixture(t, &mockIngressController{listenErr: syscall.EADDRINUSE}, ingressTestConfig(true))
+		if err := fx.mgr.Setup(); err != nil {
+			t.Fatalf("Setup: %v", err)
+		}
+		_ = fx.mgr.Apply(t.Context(), rulesBlock(withID(ingressRule("web", 7022, "", 9000), reportID("a1"))))
+		drain(fx.mgr.ReportChanged())
+		before := fx.mgr.RuleReports()
+
+		malformed := &api.APIError{StatusCode: 400, Code: "malformed_ingress_status"}
+		client := &fakeIngressStatusClient{errs: slices.Repeat([]error{malformed}, 8)}
+		logger, logs := newRelayLogger()
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, fx.mgr, logger)
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		for k := 2; k <= 3; k++ {
+			time.Sleep(interval)
+			synctest.Wait()
+			if got := client.calls(); got != k {
+				t.Errorf("reports after %d intervals = %d, want %d: one per interval", k-1, got, k)
+			}
+		}
+		if n, sends := logs.count(`level=WARN msg="ingress status: send failed"`), client.calls(); n != sends {
+			t.Errorf("%d Warns 'ingress status: send failed' over %d refused sends, want one per send", n, sends)
+		}
+		if after := fx.mgr.RuleReports(); !slices.Equal(after, before) {
+			t.Errorf("RuleReports after the refused sends = %+v, want it unchanged from %+v", after, before)
+		}
+	})
+}
+
+func TestIngressStatusReporter_LogsTheRuleCount(t *testing.T) {
+	source := newFakeRuleSource(listeningReport(reportID("a1")), listeningReport(reportID("b2")), listeningReport(reportID("c3")))
+	client := &fakeIngressStatusClient{}
+	logger, logs := newRelayLogger()
+	r := NewIngressStatusReporter(time.Hour, testIngressNodeID, client, false, source, logger)
+
+	r.reportOnce(context.Background())
+
+	if n := logs.count(`level=INFO msg="ingress status: reported" component=bridge state=enabled rules=3`); n != 1 {
+		t.Errorf("Info 'ingress status: reported' with state=enabled rules=3 logged %d times, want 1:\n%s", n, logs.String())
+	}
+	if n := logs.count(`level=DEBUG msg="ingress status: accepted" component=bridge state=enabled rules=3`); n != 1 {
+		t.Errorf("Debug 'ingress status: accepted' with rules=3 logged %d times, want 1:\n%s", n, logs.String())
+	}
+}
+
+func TestIngressStatusReporter_CancelWhileTheGapTimerIsArmed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newFakeRuleSource(listeningReport(reportID("a1")))
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(time.Minute, testIngressNodeID, client, false, source, discardLogger())
+
+		stop := startIngressStatusReporter(t, r)
+		synctest.Wait()
+		source.set(dialledReport(reportID("a1"), api.IngressDialFailed, IngressDialReasonRefused, time.Now()))
+		synctest.Wait()
+		time.Sleep(time.Second)
+		source.set(dialledReport(reportID("a1"), api.IngressDialSucceeded, "", time.Now()))
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Fatalf("reports with the gap timer armed = %d, want 2", got)
+		}
+
+		stop()
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Errorf("reports after the cancel = %d, want still 2", got)
+		}
+	})
 }
