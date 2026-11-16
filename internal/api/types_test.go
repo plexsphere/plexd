@@ -3346,3 +3346,87 @@ func TestHookVersionPayload_OmitsUndeclaredFields(t *testing.T) {
 		t.Errorf("payload = %s, want %s", data, want)
 	}
 }
+
+func TestIngressStatusRequest_JSON(t *testing.T) {
+	age := func(s int64) *int64 { return &s }
+	tests := []struct {
+		name string
+		req  IngressStatusRequest
+		want string
+	}{
+		{
+			name: "no rules",
+			req:  IngressStatusRequest{State: IngressStateEnabled},
+			want: `{"state":"enabled"}`,
+		},
+		{
+			name: "a dial less than a second ago",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateNotRequired, Dial: IngressDialSucceeded, DialAgeSeconds: age(0),
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"succeeded","dial_age_seconds":0}]}`,
+		},
+		{
+			name: "no dial age",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateNotRequired, Dial: IngressDialNone,
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"none"}]}`,
+		},
+		{
+			name: "a rule that does not listen",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerNotListening, ListenerReason: "listen_failed",
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"not_listening","listener_reason":"listen_failed"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.req)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("JSON =\n  %s\nwant\n  %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidIngressRuleID(t *testing.T) {
+	const id = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1"
+	for _, s := range []string{id, strings.ToUpper(id)} {
+		if !ValidIngressRuleID(s) {
+			t.Errorf("ValidIngressRuleID(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{
+		"",
+		"id-web",
+		"00000000-0000-0000-0000-000000000000",
+		strings.ReplaceAll(id, "-", ""),
+		"{" + id + "}",
+		id[:35] + "g",
+		id[:8] + "x" + id[9:],
+	} {
+		if ValidIngressRuleID(s) {
+			t.Errorf("ValidIngressRuleID(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestValidIngressReason(t *testing.T) {
+	for _, s := range []string{"a", "listen_failed", "acme_not_issued", "x9_", "a" + strings.Repeat("b", 62)} {
+		if !ValidIngressReason(s) {
+			t.Errorf("ValidIngressReason(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "Policy Denied", "9lives", "_x", "listen-failed", "a" + strings.Repeat("b", 63)} {
+		if ValidIngressReason(s) {
+			t.Errorf("ValidIngressReason(%q) = true, want false", s)
+		}
+	}
+}

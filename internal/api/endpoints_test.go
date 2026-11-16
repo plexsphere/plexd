@@ -1346,8 +1346,30 @@ func TestReportRelayStatus_PathParametersEscaped(t *testing.T) {
 const testIngressStatusAccepted = `{"accepted_at":"2026-11-16T10:15:30.123Z"}`
 
 func TestReportIngressStatus_Success(t *testing.T) {
-	for _, state := range []string{IngressStateOptedOut, IngressStateEnabled} {
-		t.Run(state, func(t *testing.T) {
+	age := int64(12)
+	tests := []struct {
+		name     string
+		req      IngressStatusRequest
+		wantBody string
+	}{
+		{name: IngressStateOptedOut, req: IngressStatusRequest{State: IngressStateOptedOut}, wantBody: `{"state":"opted_out"}`},
+		{name: IngressStateEnabled, req: IngressStatusRequest{State: IngressStateEnabled}, wantBody: `{"state":"enabled"}`},
+		{
+			name: "enabled with rules",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{
+				{
+					ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Listener: IngressListenerListening, Certificate: IngressCertificateReady,
+					Dial: IngressDialFailed, DialReason: "policy_denied", DialAgeSeconds: &age,
+				},
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", Listener: IngressListenerNotListening, ListenerReason: "listen_failed"},
+			}},
+			wantBody: `{"state":"enabled","rules":[` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"failed","dial_reason":"policy_denied","dial_age_seconds":12},` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4","listener":"not_listening","listener_reason":"listen_failed"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			var gotMethod, gotPath, gotContentType, gotAuth string
 			var gotBody []byte
 			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1365,7 +1387,7 @@ func TestReportIngressStatus_Success(t *testing.T) {
 				_, _ = io.WriteString(w, testIngressStatusAccepted)
 			})
 
-			resp, err := client.ReportIngressStatus(context.Background(), "node-1", IngressStatusRequest{State: state})
+			resp, err := client.ReportIngressStatus(context.Background(), "node-1", tt.req)
 			if err != nil {
 				t.Fatalf("ReportIngressStatus: %v", err)
 			}
@@ -1383,9 +1405,8 @@ func TestReportIngressStatus_Success(t *testing.T) {
 				t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
 			}
 
-			wantBody := `{"state":"` + state + `"}`
-			if got := strings.TrimSpace(string(gotBody)); got != wantBody {
-				t.Errorf("request body =\n  %s\nwant\n  %s", got, wantBody)
+			if got := strings.TrimSpace(string(gotBody)); got != tt.wantBody {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, tt.wantBody)
 			}
 
 			wantAcceptedAt := time.Date(2026, 11, 16, 10, 15, 30, 123_000_000, time.UTC)

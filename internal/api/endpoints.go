@@ -243,11 +243,13 @@ func (c *ControlPlane) ReportRelayStatus(ctx context.Context, nodeID string, req
 }
 
 // ReportIngressStatus reports whether the bridge's local configuration serves
-// public ingress and returns the control plane's receipt.
+// public ingress, and the state of each ingress rule, and returns the control
+// plane's receipt.
 //
 // It validates nothing and sends the request as passed: the ingress status
-// reporter sends only the two states the contract admits, and the control
-// plane refuses any other with 400 malformed_ingress_status.
+// reporter builds only the shapes the contract admits, and the control plane
+// refuses any other with 400 malformed_ingress_status or
+// invalid_ingress_status.
 // PUT /v1/nodes/{node_id}/ingress-status
 func (c *ControlPlane) ReportIngressStatus(ctx context.Context, nodeID string, req IngressStatusRequest) (*IngressStatusResponse, error) {
 	var resp IngressStatusResponse

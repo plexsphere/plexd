@@ -1253,15 +1253,127 @@ const (
 	IngressStateOptedOut = "opted_out"
 )
 
+// The facets of an IngressStatusRule.
+const (
+	// IngressListenerListening marks a rule whose listen port is bound.
+	IngressListenerListening = "listening"
+	// IngressListenerNotListening marks a rule the bridge does not listen
+	// for; ListenerReason says why.
+	IngressListenerNotListening = "not_listening"
+
+	// IngressCertificateNotRequired marks a passthrough rule, which needs no
+	// certificate at the bridge.
+	IngressCertificateNotRequired = "not_required"
+	// IngressCertificateReady marks a terminate or acme rule whose
+	// certificate is in place.
+	IngressCertificateReady = "ready"
+	// IngressCertificateNotReady marks a terminate or acme rule without its
+	// certificate; CertificateReason says why.
+	IngressCertificateNotReady = "not_ready"
+
+	// IngressDialNone marks a rule whose target no client connection has
+	// dialled yet.
+	IngressDialNone = "none"
+	// IngressDialSucceeded marks a rule whose last dial reached its target.
+	IngressDialSucceeded = "succeeded"
+	// IngressDialFailed marks a rule whose last dial failed; DialReason says
+	// why.
+	IngressDialFailed = "failed"
+)
+
+// MaxIngressStatusRules is the contract's ceiling on the entries of one
+// ingress status report.
+const MaxIngressStatusRules = 1024
+
+// MaxIngressStatusDialAgeSeconds is the contract's ceiling on
+// dial_age_seconds, the largest signed 32-bit integer.
+const MaxIngressStatusDialAgeSeconds = 2147483647
+
 // IngressStatusRequest is the body of PUT /v1/nodes/{node_id}/ingress-status:
-// whether the bridge's local configuration serves public ingress. The control
-// plane keeps the latest report per node and never ages it, and refuses
-// ingress rule creates and updates on the bridge while it reads opted_out. A
-// missing, null or unknown state, an unknown member and data after the report
-// answer 400 malformed_ingress_status.
+// whether the bridge's local configuration serves public ingress, and how
+// each ingress rule of its pull fares. The control plane keeps the latest
+// state per node and never ages it, and refuses ingress rule creates and
+// updates on the bridge while it reads opted_out. Each report replaces the
+// rule entries of the one before it.
+//
+// A missing, null or unknown state, an unknown member, data after the report,
+// more than MaxIngressStatusRules entries, and an entry with a malformed id or
+// a value outside its member's rule answer 400 malformed_ingress_status. An
+// opted-out report with entries, an id that repeats an earlier entry, and an
+// entry that breaks the presence rules of IngressStatusRule answer 400
+// invalid_ingress_status.
 type IngressStatusRequest struct {
 	// State is one of the IngressState* constants.
 	State string `json:"state"`
+	// Rules holds one entry per reported rule, in the order of the pull; nil
+	// omits the member, which the contract reads as no entries.
+	Rules []IngressStatusRule `json:"rules,omitempty"`
+}
+
+// IngressStatusRule is one entry of rules, the control plane's
+// IngressStatusReportRule. Each member after Listener is sent exactly when the
+// facet before it calls for it: ListenerReason when Listener is not_listening;
+// Certificate and Dial when it is listening; CertificateReason when
+// Certificate is not_ready; DialReason when Dial is failed; DialAgeSeconds
+// when Dial is succeeded or failed. omitempty drops an empty member, so a
+// caller leaves every member it must not send empty.
+type IngressStatusRule struct {
+	// ID is the rule's id from the pull, a UUID other than the zero UUID.
+	ID string `json:"id"`
+	// Listener is one of the IngressListener* constants.
+	Listener       string `json:"listener"`
+	ListenerReason string `json:"listener_reason,omitempty"`
+	// Certificate is one of the IngressCertificate* constants.
+	Certificate       string `json:"certificate,omitempty"`
+	CertificateReason string `json:"certificate_reason,omitempty"`
+	// Dial is one of the IngressDial* constants.
+	Dial       string `json:"dial,omitempty"`
+	DialReason string `json:"dial_reason,omitempty"`
+	// DialAgeSeconds is the whole seconds between the dial and the report, in
+	// 0..MaxIngressStatusDialAgeSeconds. It is a pointer because 0 is a valid
+	// age, for a dial less than a second ago.
+	DialAgeSeconds *int64 `json:"dial_age_seconds,omitempty"`
+}
+
+// ValidIngressRuleID reports whether s is a UUID in canonical form, groups of
+// 8, 4, 4, 4 and 12 hex digits in either case joined by hyphens, other than
+// the zero UUID: an id the control plane accepts in an ingress status report.
+func ValidIngressRuleID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	zero := true
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if c != '-' {
+				return false
+			}
+		case c == '0':
+		case '1' <= c && c <= '9', 'a' <= c && c <= 'f', 'A' <= c && c <= 'F':
+			zero = false
+		default:
+			return false
+		}
+	}
+	return !zero
+}
+
+// ValidIngressReason reports whether s is a reason token of an ingress status
+// report: a lowercase letter, then up to 62 lowercase letters, digits and
+// underscores (^[a-z][a-z0-9_]{0,62}$).
+func ValidIngressReason(s string) bool {
+	if len(s) == 0 || len(s) > 63 || s[0] < 'a' || s[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // IngressStatusResponse is the 200 body of
