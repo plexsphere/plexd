@@ -35,9 +35,12 @@
 #     for a directory outside bridge.acme_directory_urls, a changed target and
 #     a removed block, under the unit's CAP_NET_BIND_SERVICE and without
 #     bridge.ingress_enabled; the ingress status report enabled at start and
-#     on the heartbeat interval, a block whose enabled is false closing every
-#     listener, and the opt-out with bridge.ingress_enabled: false, which
-#     opens no listener for an enabled block and reports opted_out
+#     on the heartbeat interval, with an entry per rule that follows its
+#     listener, certificate and last dial, a dial to a mesh target that the
+#     policy blocks reported as policy_denied, a block whose enabled is false
+#     closing every listener, and the opt-out with bridge.ingress_enabled:
+#     false, which opens no listener for an enabled block and reports
+#     opted_out
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -2313,12 +2316,13 @@ until PEBBLE_DIR=$(docker exec "${SYSTEMD_CONTAINER}" curl -sSf --cacert /etc/pl
 done
 echo "  PASS: https://pebble:14000/dir answers ${SYSTEMD_CONTAINER} under Pebble's test CA"
 
-# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port> [secret name]
-# renders one rule of the block, targeting the target container. A Secret
-# name becomes the rule's certificate_secret_name.
+# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port> [secret name or ""] [target address]
+# renders one rule of the block, targeting the target container unless a
+# target address is given. A Secret name becomes the rule's
+# certificate_secret_name.
 ingress_rule() {
     jq -cn --arg id "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1$1" --arg slug "$2" --argjson port "$3" \
-        --arg mode "$4" --arg host "$5" --arg addr "${INGRESS_TARGET_IP}" --argjson tport "$6" \
+        --arg mode "$4" --arg host "$5" --arg addr "${8:-${INGRESS_TARGET_IP}}" --argjson tport "$6" \
         --arg secret "${7:-}" \
         '{id: $id, slug: $slug, listen_port: $port, mode: $mode}
          + (if $host == "" then {} else {sni_host: $host} end)
@@ -2382,6 +2386,60 @@ configure_ingress() {
         "http://localhost:18080/test/inject-event" 2>/dev/null || true)
     if [ "${status}" != "204" ]; then
         fail "[${tag}] ingress nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# The ids of the phase's rules, as ingress_rule renders them.
+RULE_ID_PLAIN="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1"
+RULE_ID_TERM="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f4"
+RULE_ID_ACME="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"
+RULE_ID_MESH="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f7"
+RULE_IDS_SIX='["0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f2","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f3","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f4","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f5","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"]'
+
+# wait_ingress_report <tag> <what> <jq-filter> [<jq-option>...] reads the last
+# ingress status report the mock captured every 2 s until the filter, run by
+# jq -e with the given options (--arg and --argjson), holds for it, and leaves
+# that report in INGRESS_REPORT. It fails after 60 s with the last report it
+# read.
+wait_ingress_report() {
+    local tag=$1 what=$2 filter=$3 start=${SECONDS}
+    shift 3
+    while :; do
+        INGRESS_REPORT=$(curl -sf "http://localhost:18080/test/last-request/ingress-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+        if [ -n "${INGRESS_REPORT}" ] && printf '%s' "${INGRESS_REPORT}" | jq -e "$@" "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${tag}] the last ingress status report shows ${what}"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            fail "[${tag}] 60s on, the last ingress status report is '${INGRESS_REPORT}', want one that shows ${what}"
+        fi
+        sleep 2
+    done
+}
+
+# configure_policy <tag> <policy-json> serves the policy block of the live
+# snapshot as the given block and nudges plexd into a pull, as
+# configure_ingress does for the bridge block.
+configure_policy() {
+    local tag=$1 block=$2 snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson p "${block}" '.policy = $p')
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-policy-nudge-${tag}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] policy nudge injection returned status ${status}, want 204"
     fi
 }
 
@@ -2547,21 +2605,22 @@ else
     fail "net.ipv4.ip_unprivileged_port_start reads '${PORT_FLOOR}' after the restart, want 1024"
 fi
 
-# A bridge without ingress_enabled reports enabled after its start.
-REPORT_START=${SECONDS}
-while :; do
-    REPORT_BODY=$(curl -sf "http://localhost:18080/test/last-request/ingress-status" 2>/dev/null | jq -c . 2>/dev/null || true)
-    ingress_journal
-    if [ "${REPORT_BODY}" = '{"state":"enabled"}' ] \
-        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress status: reported"' "state=enabled"; then
-        break
-    fi
-    if [ $((SECONDS - REPORT_START)) -ge 60 ]; then
-        fail "the last ingress status report read '${REPORT_BODY}' 60s after the listeners opened, want {\"state\":\"enabled\"} and a line 'ingress status: reported' with state=enabled from plexd[${INGRESS_PID}]"
-    fi
-    sleep 2
-done
-echo "  PASS: the last ingress status report reads {\"state\":\"enabled\"} and plexd[${INGRESS_PID}] logged 'ingress status: reported' with state=enabled"
+# A bridge without ingress_enabled reports enabled after its start, and an
+# entry per rule once the block is applied: every rule listens, plain needs
+# no certificate and nobody dialled its target yet, and tls-term's
+# certificate is loaded.
+wait_ingress_report listeners "state enabled, all six rules listening, plain not_required with dial none and no dial_age_seconds, and tls-term ready" \
+    '. as $r | $r.state == "enabled"
+     and ([$ids[] | . as $id | any($r.rules[]?; .id == $id and .listener == "listening")] | all)
+     and any($r.rules[]?; .id == $plain and .certificate == "not_required" and .dial == "none" and (has("dial_age_seconds") | not))
+     and any($r.rules[]?; .id == $term and .certificate == "ready")' \
+    --argjson ids "${RULE_IDS_SIX}" --arg plain "${RULE_ID_PLAIN}" --arg term "${RULE_ID_TERM}"
+ingress_journal
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress status: reported"' "state=enabled"; then
+    echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress status: reported' with state=enabled"
+else
+    fail "plexd[${INGRESS_PID}] logged no 'ingress status: reported' with state=enabled"
+fi
 INGRESS_STATUS_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "ingress_status_count")
 case "${INGRESS_STATUS_COUNT}" in
     '' | *[!0-9]* | 0) fail "ingress_status_count reads '${INGRESS_STATUS_COUNT}' after the report was accepted, want at least 1" ;;
@@ -2583,6 +2642,9 @@ case "${SESSION_OUT}" in
         fail "the session with t.ingress.e2e.test did not read plexd-e2e-banner"
         ;;
 esac
+wait_ingress_report term-dial "tls-term's dial succeeded with a numeric dial_age_seconds" \
+    'any(.rules[]?; .id == $term and .dial == "succeeded" and (.dial_age_seconds | type) == "number")' \
+    --arg term "${RULE_ID_TERM}"
 
 # A new version replaces the certificate. The block stays the same, so only
 # the inventory of the pull changes.
@@ -2636,6 +2698,9 @@ while :; do
     sleep 2
 done
 echo "  PASS: after the inventory was served as [], plexd[${INGRESS_PID}] logged 'ingress certificate dropped' for tls-term and t.ingress.e2e.test received no certificate"
+wait_ingress_report unlist "tls-term not_ready with certificate_secret_not_listed" \
+    'any(.rules[]?; .id == $term and .certificate == "not_ready" and .certificate_reason == "certificate_secret_not_listed")' \
+    --arg term "${RULE_ID_TERM}"
 
 # tls-acme: plexd obtained its certificate from Pebble ahead of the first
 # client, after the restart.
@@ -2650,6 +2715,8 @@ while :; do
     sleep 2
 done
 echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress certificate obtained' for sni_host=acme.ingress.e2e.test"
+wait_ingress_report acme-issued "tls-acme ready" \
+    'any(.rules[]?; .id == $acme and .certificate == "ready")' --arg acme "${RULE_ID_ACME}"
 ingress_session acme.ingress.e2e.test
 case "${SESSION_ISSUER}" in
     *"Pebble Intermediate CA"*) echo "  PASS: server name acme.ingress.e2e.test received a certificate with '${SESSION_ISSUER}'" ;;
@@ -2687,6 +2754,9 @@ while :; do
     sleep 2
 done
 echo "  PASS: with https://other.invalid/dir, plexd[${INGRESS_PID}] logged 'ingress rule not served' for tls-acme with reason=acme_directory_not_allowed"
+wait_ingress_report refuse-directory "tls-acme not_ready with acme_directory_not_allowed" \
+    'any(.rules[]?; .id == $acme and .certificate == "not_ready" and .certificate_reason == "acme_directory_not_allowed")' \
+    --arg acme "${RULE_ID_ACME}"
 
 for spec in a.ingress.e2e.test=a.ingress.e2e.test b.ingress.e2e.test=b.ingress.e2e.test x.apps.ingress.e2e.test=wild.ingress.e2e.test; do
     name=${spec%%=*}
@@ -2731,6 +2801,79 @@ else
     fail "plexd[${INGRESS_PID}] logged ${OPENED} 'ingress listener opened' lines for port 443 after the change, want 1"
 fi
 
+# A dial that the policy blocks. The rule mesh targets 10.99.0.2, the mesh
+# address of the fixture's first peer, which no node answers for. The node is
+# 10.99.0.1 in 10.99.0.0/24, so the kernel sends the dial through plexd0 from
+# the mesh address, where the policy applies. Under the fixture's policy,
+# which allows 10.99.0.0/24 to itself, the dial fails for want of an answer;
+# under a policy whose only rule is the fixture's TCP 443 rule, the same dial
+# reads policy_denied.
+MESH_RULES=$(ingress_rules 9441 | jq -c --argjson m "$(ingress_rule f7 mesh 7023 passthrough "" 9022 "" 10.99.0.2)" '. + [$m] | sort_by(.slug)')
+configure_ingress mesh "${MESH_RULES}" "${PEBBLE_ACME}"
+MESH_START=${SECONDS}
+until ingress_journal && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=7023"; do
+    if [ $((SECONDS - MESH_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not open the listener of 7023 within 60s of the rule mesh being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] opened the listener of 7023 for the rule mesh"
+
+# mesh_dial connects to 7023 of the bridge from the target container and
+# returns once the bridge closes the connection, at the latest after
+# bridge.ingress_dial_timeout (10 s).
+mesh_dial() {
+    docker exec "${INGRESS_TARGET_CONTAINER}" sh -c 'timeout 30 nc -w 15 "$1" 7023 </dev/null' _ "${BRIDGE_IP}" >/dev/null 2>&1 || true
+}
+mesh_dial
+wait_ingress_report mesh-dial "mesh's dial failed with a reason other than policy_denied" \
+    'any(.rules[]?; .id == $mesh and .dial == "failed" and .dial_reason != "policy_denied")' --arg mesh "${RULE_ID_MESH}"
+echo "  the dial to 10.99.0.2:9022 under the fixture's policy reads dial_reason=$(printf '%s' "${INGRESS_REPORT}" | jq -r --arg mesh "${RULE_ID_MESH}" '.rules[] | select(.id == $mesh) | .dial_reason')"
+
+FIXTURE_POLICY=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null | jq -c '.policy' 2>/dev/null || true)
+FIXTURE_REV=$(printf '%s' "${FIXTURE_POLICY}" | jq -r '.revision_id // empty' 2>/dev/null || true)
+FIXTURE_POLICY_ID=$(printf '%s' "${FIXTURE_POLICY}" | jq -r '.revisions[0].policy_id // empty' 2>/dev/null || true)
+if [ -z "${FIXTURE_REV}" ] || [ -z "${FIXTURE_POLICY_ID}" ]; then
+    fail "the live snapshot's policy block '${FIXTURE_POLICY}' carries no revision_id or no revisions[0].policy_id"
+fi
+DENY_REV="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7"
+DENY_RULES='[{"protocol":"tcp","source_cidr":"10.99.0.0/24","destination_cidr":"0.0.0.0/0","ports":{"from":443,"to":443},"log":true}]'
+DENY_FP=$(docker exec "${INGRESS_TARGET_CONTAINER}" sh -c 'set -o pipefail; printf "%s" "$1" | openssl dgst -sha256 -binary | base64' _ "${DENY_REV}|${DENY_RULES}" 2>&1) \
+    || fail "could not compute a fingerprint in ${INGRESS_TARGET_CONTAINER}: ${DENY_FP}"
+if [ "${#DENY_FP}" -ne 44 ]; then
+    fail "${INGRESS_TARGET_CONTAINER} computed the fingerprint '${DENY_FP}', want 44 characters of base64"
+fi
+DENY_POLICY=$(jq -cn --arg r "${DENY_REV}" --arg f "${DENY_FP}" --arg p "${FIXTURE_POLICY_ID}" --argjson rules "${DENY_RULES}" \
+    '{revision_id: $r, fingerprint: $f, rules: $rules, revisions: [{policy_id: $p, revision_id: $r}]}')
+configure_policy deny "${DENY_POLICY}"
+DENY_START=${SECONDS}
+until ingress_journal && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${DENY_REV}"; do
+    if [ $((SECONDS - DENY_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'policy ruleset applied' for revision_id=${DENY_REV} within 60s of the policy being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] applied the policy whose only rule allows TCP 443"
+mesh_dial
+wait_ingress_report mesh-denied "mesh's dial failed with policy_denied" \
+    'any(.rules[]?; .id == $mesh and .dial == "failed" and .dial_reason == "policy_denied")' --arg mesh "${RULE_ID_MESH}"
+ingress_journal
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="bridge: ingress: dial target failed"' "rule_id=${RULE_ID_MESH}" "reason=policy_denied"; then
+    echo "  PASS: plexd[${INGRESS_PID}] logged 'bridge: ingress: dial target failed' for the rule mesh with reason=policy_denied"
+else
+    fail "plexd[${INGRESS_PID}] logged no 'bridge: ingress: dial target failed' with rule_id=${RULE_ID_MESH} and reason=policy_denied"
+fi
+RESTORED_BEFORE=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_REV}")
+configure_policy restore "${FIXTURE_POLICY}"
+RESTORE_START=${SECONDS}
+until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_REV}")" -gt "${RESTORED_BEFORE}" ]; do
+    if [ $((SECONDS - RESTORE_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not apply the fixture's policy revision ${FIXTURE_REV} again within 60s of it being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] applied the fixture's policy again"
+
 # An ingress child of null closes every public listener.
 configure_ingress remove null
 REMOVE_START=${SECONDS}
@@ -2750,8 +2893,13 @@ for port in 443 7022; do
     fi
 done
 
+# Without a block the report carries no entries.
+wait_ingress_report remove 'exactly {"state":"enabled"}' '. == {"state":"enabled"}'
+
 # The reporter repeats its report on the heartbeat interval, 30 s by default,
-# which the suite leaves as it is.
+# which the suite leaves as it is. The count is read after the report without
+# entries arrived: no rule changes after it, so only the interval sends again.
+INGRESS_STATUS_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "ingress_status_count")
 REPEAT_START=${SECONDS}
 while :; do
     STATUS_COUNT_NOW=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "ingress_status_count")
@@ -2759,7 +2907,7 @@ while :; do
         break
     fi
     if [ $((SECONDS - REPEAT_START)) -ge 60 ]; then
-        fail "ingress_status_count went from ${INGRESS_STATUS_COUNT} to '${STATUS_COUNT_NOW}' in the 60s after the block was served as null, want a repeated report"
+        fail "ingress_status_count went from ${INGRESS_STATUS_COUNT} to '${STATUS_COUNT_NOW}' in the 60s after the report without entries arrived, want a repeated report"
     fi
     sleep 2
 done
