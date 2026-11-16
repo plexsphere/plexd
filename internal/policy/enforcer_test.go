@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -549,5 +550,85 @@ func TestEnforcer_RevertsTheConnLoggerWhenTheApplyFails(t *testing.T) {
 	cl.mu.Unlock()
 	if !current || !previous {
 		t.Errorf("after two successful applies the logger holds 2/1: %v and previously 1/1: %v, want both", current, previous)
+	}
+}
+
+func TestEnforcer_AdmitsTCPDialWithoutEnforcement(t *testing.T) {
+	src := netip.MustParseAddr("10.99.0.1")
+	dst := netip.MustParseAddrPort("10.99.0.2:9022")
+	enforcing := Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}
+
+	disabled := NewEnforcer(NewPolicyEngine(testLogger()), &mockFirewallController{}, Config{Enabled: boolPtr(false), ChainName: "TEST-CHAIN"}, testLogger())
+	_, _ = disabled.ApplyFirewallRules(nil, "wg0")
+	noBackend := NewEnforcer(NewPolicyEngine(testLogger()), nil, enforcing, testLogger())
+	_, _ = noBackend.ApplyFirewallRules(nil, "wg0")
+	beforeApply := NewEnforcer(NewPolicyEngine(testLogger()), &mockFirewallController{}, enforcing, testLogger())
+	tornDown := NewEnforcer(NewPolicyEngine(testLogger()), &mockFirewallController{}, enforcing, testLogger())
+	if _, err := tornDown.ApplyFirewallRules(nil, "wg0"); err != nil {
+		t.Fatalf("ApplyFirewallRules: %v", err)
+	}
+	if err := tornDown.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+
+	for name, enf := range map[string]*Enforcer{
+		"enforcement disabled": disabled,
+		"nil firewall":         noBackend,
+		"before any apply":     beforeApply,
+		"after Teardown":       tornDown,
+	} {
+		if admitted, enforced := enf.AdmitsTCPDial(src, dst); !admitted || enforced {
+			t.Errorf("%s: AdmitsTCPDial = (%v, %v), want (true, false)", name, admitted, enforced)
+		}
+	}
+}
+
+func TestEnforcer_AdmitsTCPDialDefaultDenyAdmitsNothing(t *testing.T) {
+	enf := NewEnforcer(NewPolicyEngine(testLogger()), &mockFirewallController{}, Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}, testLogger())
+	if _, err := enf.ApplyFirewallRules(nil, "wg0"); err != nil {
+		t.Fatalf("ApplyFirewallRules: %v", err)
+	}
+	if admitted, enforced := enf.AdmitsTCPDial(netip.MustParseAddr("10.99.0.1"), netip.MustParseAddrPort("10.99.0.2:9022")); admitted || !enforced {
+		t.Errorf("AdmitsTCPDial = (%v, %v) under the default deny alone, want (false, true)", admitted, enforced)
+	}
+}
+
+func TestEnforcer_AdmitsTCPDialMatchesTheInstalledRules(t *testing.T) {
+	mock := &mockFirewallController{}
+	enf := NewEnforcer(NewPolicyEngine(testLogger()), mock, Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}, testLogger())
+	allow := &api.PolicySnapshot{
+		RevisionID:  "rev-1",
+		Fingerprint: "fp-1",
+		Rules: []api.PolicyRule{
+			{Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24", Ports: &api.PortRange{From: 9000, To: 9100}},
+		},
+	}
+	if _, err := enf.ApplyFirewallRules(allow, "wg0"); err != nil {
+		t.Fatalf("ApplyFirewallRules: %v", err)
+	}
+
+	src := netip.MustParseAddr("10.99.0.1")
+	tests := []struct {
+		dst          string
+		wantAdmitted bool
+	}{
+		{"10.99.0.2:9022", true},
+		{"10.99.0.2:22", false},
+		{"[fd00:99::2]:9022", false},
+	}
+	for _, tt := range tests {
+		if admitted, enforced := enf.AdmitsTCPDial(src, netip.MustParseAddrPort(tt.dst)); admitted != tt.wantAdmitted || !enforced {
+			t.Errorf("AdmitsTCPDial(%s, %s) = (%v, %v), want (%v, true)", src, tt.dst, admitted, enforced, tt.wantAdmitted)
+		}
+	}
+
+	// A ruleset the backend refuses leaves the one installed before in force,
+	// and so in the answer.
+	mock.applyRulesErr = errors.New("netlink: refused")
+	if _, err := enf.ApplyFirewallRules(nil, "wg0"); err == nil {
+		t.Fatal("ApplyFirewallRules with a refusing backend: nil error, want the refusal")
+	}
+	if admitted, enforced := enf.AdmitsTCPDial(src, netip.MustParseAddrPort("10.99.0.2:9022")); !admitted || !enforced {
+		t.Errorf("AdmitsTCPDial after a refused apply = (%v, %v), want (true, true) from the ruleset still installed", admitted, enforced)
 	}
 }

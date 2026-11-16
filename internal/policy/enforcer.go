@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"slices"
 	"sync"
 
@@ -43,6 +44,9 @@ type Enforcer struct {
 	installed    *api.PolicySnapshot
 	hasInstalled bool
 	installs     uint64
+	// installedRules is the rule list the backend holds, in the order it was
+	// handed over; set beside installed, and read by AdmitsTCPDial.
+	installedRules []FirewallRule
 
 	// closed is set by Teardown. A closed Enforcer touches the backend no
 	// more, so a pull that the reconciler dispatches while plexd shuts down
@@ -178,9 +182,37 @@ func (e *Enforcer) applyLocked(policy *api.PolicySnapshot, iface string) (bool, 
 
 	e.installed = policy.Clone()
 	e.hasInstalled = true
+	e.installedRules = fwRules
 	e.installs++
 	e.logger.Info("applied firewall rules", "count", len(fwRules), "chain", e.cfg.ChainName)
 	return true, nil
+}
+
+// AdmitsTCPDial reports whether the ruleset the backend holds lets a socket of
+// the node send TCP from src, the node's mesh address, to dst. enforced is
+// false, and admitted true, while enforcement is disabled, no backend exists,
+// no ruleset is installed, or the Enforcer is closed.
+//
+// It enforces nothing: the kernel does, and a caller uses the answer only to
+// name why a dial it already made failed. A ruleset admits the dial when one
+// of its allow rules matches the dial's addresses, protocol and destination
+// port, as FirewallRule.admits matches a connection event; the default deny
+// alone, which the startup baseline and a pull with policy: null install,
+// admits nothing.
+func (e *Enforcer) AdmitsTCPDial(src netip.Addr, dst netip.AddrPort) (admitted, enforced bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.cfg.IsEnabled() || e.firewall == nil || !e.hasInstalled || e.closed {
+		return true, false
+	}
+	ev := ConnEvent{Src: src, Dst: dst.Addr(), Protocol: ipProtoTCP, DstPort: dst.Port()}
+	for i := range e.installedRules {
+		r := &e.installedRules[i]
+		if r.Action == "allow" && r.admits(ev) {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // untagged sorts a rule without a log tag after one with a tag.
@@ -228,7 +260,7 @@ func (e *Enforcer) Teardown() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.closed = true
-	e.installed, e.hasInstalled = nil, false
+	e.installed, e.hasInstalled, e.installedRules = nil, false, nil
 	e.status.HasApplied, e.status.Applied = false, nil
 	e.clearRejectedLocked()
 	if e.firewall == nil {
