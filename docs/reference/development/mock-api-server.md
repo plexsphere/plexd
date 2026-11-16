@@ -38,7 +38,8 @@ The mock refuses what the real handlers refuse, because a fixture that accepts
 more than the contract hides exactly the defects the suite exists to catch. The
 first three gates were added after a release shipped past them; the handshake
 report, the edge PSK route, the endpoint candidates route, the hook version
-route and the policy status report were gated from the start:
+route, the policy status report and the ingress status report were gated from
+the start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** caps the body at 1 MiB
   (`413 capabilities_body_too_large`), strict-decodes a `CapabilityManifestRequest`
@@ -138,6 +139,15 @@ route and the policy status report were gated from the start:
   control character. The `200` answer derives the status against the policy
   block the fixture serves, so the agent's report reads `applied` only when
   it echoes that block. See [the route](#put-v1-nodes-id-policy-status).
+- **`PUT /v1/nodes/{id}/ingress-status`** caps the body at 4 KiB
+  (`413 ingress_status_body_too_large`) and strict-decodes it into a
+  mock-local struct whose `state` is a pointer. It answers
+  `400 malformed_ingress_status` for a body that is empty or not one JSON
+  object, an unknown member (`rules` included), data after the report, a
+  missing or `null` `state` (`detail` `state is missing`), and a `state`
+  outside `enabled` and `opted_out` (`detail`
+  `state is not one of enabled and opted_out`). See
+  [the route](#put-v1-nodes-id-ingress-status).
 - **`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`** answers
   `403 node_id_mismatch` for an `id` other than the registered node, then
   `404 hook_not_assigned` for a pair the state fixture's `hooks` block does not
@@ -589,6 +599,50 @@ The report is not stored: the mock keeps only the captured body.
 
 **Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
 
+### `PUT /v1/nodes/{id}/ingress-status`
+
+Enforces the ingress status report contract (`PutNodeIngressStatus`, the
+"Ingress status" section of the control plane's
+`docs/reference/api/plexd-agent-contract.md`): a 4 KiB body cap, strict JSON
+decoding, and the two states. `handleIngressStatus` captures the body under
+`ingress-status`, so `GET /test/last-request/ingress-status` returns the bytes
+of the last report, and decodes it into a mock-local struct whose `state` is a
+`*string`, so a missing or `null` state is told apart from an empty one. The
+handler does not compare the path `id` with the node, as the policy status
+route does not. `ingress_status_count` increments only when every check
+passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `ingress_status_body_too_large` if the body exceeds 4 KiB (4,096 bytes), read through `http.MaxBytesReader`.
+2. **Body decode** → `400` `malformed_ingress_status` if the body is empty, is not one JSON object, carries an unknown member, or data after the report. A `rules` member is an unknown member.
+3. **State** → `400` `malformed_ingress_status` with the `detail` `state is missing` if `state` is missing or `null`, and with the `detail` `state is not one of enabled and opted_out` for any value but `enabled` and `opted_out`.
+
+**Request body:**
+
+```json
+{ "state": "enabled" }
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-11-16T10:15:30Z"
+}
+```
+
+`accepted_at` is the mock's clock in UTC. The mock keeps no report and refuses
+no ingress rule: the state fixture serves whatever block
+`POST /test/configure-state` configured, whatever the node reported. It keeps
+only the captured body.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`). Every answer of the handler, the `200` and each refusal above, carries `Cache-Control: no-store`, as the contract asks.
+
+**Counter:** Increments `ingress_status_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
+
 ### `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`
 
 Serves the edge PSKs of the two fixture peers the way the control plane does:
@@ -711,7 +765,7 @@ therefore hands the node the new key.
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
-| `bridge.ingress` | 1 rule, `web`: port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
+| `bridge.ingress` | `enabled: true`, 1 rule, `web`: port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
 | `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
@@ -843,6 +897,7 @@ answers `applied`.
       ]
     },
     "ingress": {
+      "enabled": true,
       "rules": [
         {
           "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
@@ -1341,6 +1396,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "integrity_violation_count": 0,
   "handshake_report_count": 0,
   "policy_status_count": 0,
+  "ingress_status_count": 0,
   "edge_psk_count": 0,
   "hook_fetch_count": 0,
   "inject_event_count": 0,
@@ -1970,6 +2026,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
 | `policy_status_count` | `PUT /v1/nodes/{id}/policy-status` (accepted reports only, `200`) |
+| `ingress_status_count` | `PUT /v1/nodes/{id}/ingress-status` (accepted reports only, `200`) |
 | `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |
 | `hook_fetch_count` | `GET /v1/nodes/{id}/hooks/{name}/versions/{version}` (served `200` versions only) |
 | `inject_event_count` | `POST /test/inject-event` |

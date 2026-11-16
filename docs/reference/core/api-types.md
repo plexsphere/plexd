@@ -267,7 +267,7 @@ no base fields on the wire. `RelayConfig`, `RelayAssignment`, `IngressConfig` an
 **RelayConfig**
 
 The `bridge.relay` block, the control plane's `NodeStateBridgeRelay`. A bridge
-relays only when its local `bridge.relay_enabled` is true and `Enabled` is true;
+relays only when both its local `bridge.relay_enabled` and `Enabled` are true;
 it then listens on `ListenPort` and forwards among the peers of the same pull.
 See [NAT Relay](/reference/bridge/nat-relay).
 
@@ -288,13 +288,17 @@ See [NAT Relay](/reference/bridge/nat-relay).
 **IngressConfig**
 
 The `bridge.ingress` block, the control plane's `NodeStateBridgeIngress`. A
-bridge serves it only when its local `bridge.ingress_enabled` is true; the block
-is applied whole. See [Public Ingress](/reference/bridge/public-ingress).
+bridge serves its rules when `Enabled` is true and its local configuration does
+not opt out with `bridge.ingress_enabled: false`; a bridge that opts out opens
+no public listener whatever the block says and reports `opted_out` in its
+[ingress status report](#ingress-status). The block is applied whole. See
+[Public Ingress](/reference/bridge/public-ingress#activation).
 
-| Field   | Type            | JSON Tag           | Description                                |
-|---------|-----------------|--------------------|--------------------------------------------|
-| `Rules` | `[]IngressRule` | `"rules"`          | Every rule of the bridge Resource, by slug ascending |
-| `ACME`  | `*IngressACME`  | `"acme,omitempty"` | The ACME account the block's `acme` rules share, the control plane's `NodeStateBridgeIngressACME`; present exactly when a rule has mode `acme`, nil otherwise |
+| Field     | Type            | JSON Tag           | Description                                |
+|-----------|-----------------|--------------------|--------------------------------------------|
+| `Enabled` | `bool`          | `"enabled"`        | The control plane's switch, `true` on every block it delivers. A block without the member decodes to `false`, and a block with `false` opens no public listener. No `omitempty`: a zero `IngressConfig` marshals with `"enabled":false` |
+| `Rules`   | `[]IngressRule` | `"rules"`          | Every rule of the bridge Resource, by slug ascending |
+| `ACME`    | `*IngressACME`  | `"acme,omitempty"` | The ACME account the block's `acme` rules share, the control plane's `NodeStateBridgeIngressACME`; present exactly when a rule has mode `acme`, nil otherwise |
 
 **IngressACME**
 
@@ -1173,6 +1177,42 @@ receive time, so plexd builds a fresh request for every attempt.
 | `RelayStateBindFailed`       | `"bind_failed"`   | The relay socket could not be bound on `ListenPort`  |
 | `RelayStateNotConsented`     | `"not_consented"` | The pull enables a relay that `bridge.relay_enabled` does not consent to |
 | `MaxRelayStatusBoundSeconds` | `315360000`       | The contract's ceiling on `bound_seconds`, 3650 days |
+
+## Ingress Status
+
+### `PUT /v1/nodes/{node_id}/ingress-status`
+
+Whether a bridge's local configuration serves public ingress, which the control
+plane reads to refuse an ingress rule that no listener would serve. The
+control plane keeps the latest report per node and never ages it. The handler
+decodes with unknown members refused. See
+[Control Plane API Endpoints](api-endpoints.md#ingress-status) for the wire
+example and error taxonomy, and
+[Public Ingress](../bridge/public-ingress.md#ingress-status-report) for how
+plexd derives the state.
+
+**IngressStatusRequest**
+
+| Field   | Type     | JSON Tag  | Description                              |
+|---------|----------|-----------|------------------------------------------|
+| `State` | `string` | `"state"` | One of the `IngressState*` constants     |
+
+A missing, `null` or unknown state, an unknown member and data after the
+report answer `400 malformed_ingress_status`. `ReportIngressStatus` checks
+none of this and sends the request as passed.
+
+**IngressStatusResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                    |
+|--------------|-------------|-----------------|--------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time of the report |
+
+**Constants**
+
+| Constant               | Value         | Description                                          |
+|------------------------|---------------|------------------------------------------------------|
+| `IngressStateEnabled`  | `"enabled"`   | The bridge's local configuration serves the public ingress rules the state pull enables: `bridge.ingress_enabled` is absent or `true` |
+| `IngressStateOptedOut` | `"opted_out"` | The bridge's local configuration, `bridge.ingress_enabled: false`, rules public ingress out: it opens no public listener whatever the pull says |
 
 ## Policy Status
 

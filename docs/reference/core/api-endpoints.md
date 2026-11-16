@@ -32,6 +32,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 20 | `PUT` | `/v1/nodes/{node_id}/relay-status` | Relay status report (bridges) |
 | 21 | `GET` | `/v1/nodes/{node_id}/hooks/{name}/versions/{version}` | Published hook version fetch (signed envelope and script) |
 | 22 | `PUT` | `/v1/nodes/{node_id}/policy-status` | Policy status report |
+| 23 | `PUT` | `/v1/nodes/{node_id}/ingress-status` | Ingress status report (bridges) |
 
 ## Registration & Identity
 
@@ -721,6 +722,93 @@ it is false. A `501` with any other code is an ordinary failure and logged at
 Warn. No answer stops the reporter, and none touches the relay. While the
 control plane does not serve the report, plexd sends no `stopped` at shutdown.
 
+## Ingress Status
+
+### PUT /v1/nodes/{node_id}/ingress-status
+
+Reports whether a bridge's local configuration serves public ingress, so the
+control plane refuses an ingress rule that no listener would serve. While a
+bridge's report reads `opted_out`, the control plane answers a create or an
+update of an ingress rule on its bridge Resource with
+`409 bridge_ingress_opted_out`. It keeps the rules stored before the opt-out,
+keeps delivering them in the [`bridge.ingress`](#get-v1-nodes-node-id-state)
+block with `enabled: true`, and allows a delete. A bridge that never reported
+reads `not_reported` and accepts rules. See
+[Ingress Status Report](../bridge/public-ingress.md#ingress-status-report) for
+how plexd derives the state.
+
+**Request body** (`IngressStatusRequest`, at most 4 KiB) carries one member:
+
+```json
+{ "state": "opted_out" }
+```
+
+- `state`: required, one of `enabled` and `opted_out`. `enabled` means the
+  local configuration serves the rules the pull enables:
+  [`bridge.ingress_enabled`](configuration.md#bridge) is absent or `true`.
+  `opted_out` means `bridge.ingress_enabled: false`: the bridge opens no public
+  listener whatever the pull says.
+
+The control plane decodes the body with unknown members refused. A body that
+is not one JSON object, an unknown member, data after the report, a missing or
+`null` `state` and a value outside the two states each answer
+`400 malformed_ingress_status`. A missing or `null` `state` carries the
+`detail` `state is missing`, and another value
+`state is not one of enabled and opted_out`. `ReportIngressStatus` validates
+nothing, because plexd sends only the two states.
+
+**Response** (`200 OK`, `IngressStatusResponse`):
+
+```json
+{
+  "accepted_at": "2026-11-16T10:15:30.123Z"
+}
+```
+
+`accepted_at` is the server receive time. Every answer carries
+`Cache-Control: no-store`.
+
+**Cadence.** plexd reports from a loop of its own, started in bridge mode,
+whether or not the bridge opts out. It sends the report once right after each
+start, without waiting for the first state pull, and again once per `heartbeat.interval`
+(default 30s). The state comes from the local configuration, which plexd reads
+once per start, so the send after each start is the report on every change of
+the setting that the contract asks for: a changed `bridge.ingress_enabled`
+takes effect, and is reported, with the restart. A failed report is not
+retried within its tick; the next tick, at most one interval later, sends it
+again. plexd sends nothing at shutdown, and a node outside bridge mode sends
+nothing at all. The cost is one request with a body of at most 21 bytes per
+bridge and interval.
+
+**Sticky report.** The control plane keeps the latest report per node and
+never ages it, unlike the [relay status report](#relay-status), so a bridge that
+reported `opted_out` and went offline stays opted out until it reports
+`enabled`. A report that repeats the stored state changes nothing: the stored
+receive time stays that of the report that last changed the state. The report
+never gates serving: a bridge serves as the pull says while a report fails or
+the control plane does not serve the operation.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Report accepted; body is an `IngressStatusResponse` | Logged at Debug as `accepted` on every send; also at Info as `reported` for the first accepted send, and once at Info after a not-served phase |
+| `400 Bad Request` | `malformed_ingress_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), or names a `state` outside the two (`detail` `state is not one of enabled and opted_out`) | Logged at Warn as `send failed`; the next tick sends the report again |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends the report again. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends the report again |
+| `404 Not Found` | `ingress_status_node_gone` | The node was removed while the request ran | Logged at Warn as `rejected, this node was removed` on every send; plexd keeps reporting every interval |
+| `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
+| `413 Payload Too Large` | `ingress_status_body_too_large` | Body exceeds 4 KiB | Logged at Warn as `send failed`; the next tick sends the report again |
+| `500 Internal Server Error` | `internal` | Server error, for example a failed write of the report | Logged at Warn as `send failed`; the next tick sends the report again |
+| `501 Not Implemented` | `ingress_status_not_provisioned` | The control plane has not provisioned the operation: its recording service is not wired | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
+
+`api.IsIngressStatusNotServed` classifies the two not-served answers: a `404`
+with any code but `ingress_status_node_gone`, and a `501` carrying
+`ingress_status_not_provisioned`. A `404 ingress_status_node_gone` is the
+operation's own answer, a verdict on the node rather than a missing route, so
+it is false. A `501` with any other code is an ordinary failure and logged at
+Warn. No answer stops the reporter, and none touches the listeners.
+
 ## Policy Status
 
 ### PUT /v1/nodes/{node_id}/policy-status
@@ -1197,7 +1285,7 @@ See [Dial order](../networking/wireguard.md#dial-order),
 [Relay liveness probe](../networking/wireguard.md#relay-liveness-probe).
 
 `bridge.relay` asks a bridge to relay WireGuard for the pairs that hold it
-among their relays. A bridge listens only when its local
+among their relays. A bridge listens only when both its local
 [`bridge.relay_enabled`](configuration.md#bridge) is true and the block carries
 `enabled: true`. It then binds UDP `listen_port`, which is authoritative, and
 forwards among the peers of the same pull's `peers` block, routing each
@@ -1212,8 +1300,13 @@ drift. A node outside bridge mode ignores the block. See
 [NAT Relay](../bridge/nat-relay.md).
 
 `bridge.ingress` lists the public ingress rules of the bridge Resource, by
-`slug` ascending. A bridge serves them only when its local
-[`bridge.ingress_enabled`](configuration.md#bridge) is true. Each rule carries
+`slug` ascending, and carries `enabled`, the control plane's switch, which it
+sends as `true` on every block. A bridge serves the rules when `enabled` is
+true and its local configuration does not opt out with
+[`bridge.ingress_enabled: false`](configuration.md#bridge). A block whose
+`enabled` is false or absent opens no public listener, and a bridge that opts
+out opens none whatever the block says and reports `opted_out` with the
+[ingress status report](#ingress-status). Each rule carries
 `id`, `slug`, `listen_port`, `mode` (`passthrough`, `terminate` or `acme`), an
 optional `sni_host`, `target_node_id`, `target_address` and `target_port`, and a
 `terminate` rule also `certificate_secret_name`, the Secret of the bridge's

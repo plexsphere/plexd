@@ -54,6 +54,7 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
 ```json
 "bridge": {
   "ingress": {
+    "enabled": true,
     "rules": [
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
@@ -116,6 +117,8 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
 | `target_port` | int | The port the bridge dials on the target, 1 to 65535 |
 | `certificate_secret_name` | string, `terminate` only | The Secret of the bridge's Project that holds the rule's certificate chain and key, one PEM document (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). The bridge ignores it on the other modes |
 
+The `enabled` member is the control plane's switch for the block: a bridge serves the rules only when it is `true` and the bridge's local configuration does not opt out (see [Activation](#activation)). The control plane sends `true` on every block it delivers, and a bridge without rules gets no block at all.
+
 The `acme` member is the ACME account the block's `acme` rules share. The control plane sends it exactly when the block holds an `acme` rule:
 
 | Field | Type | Description |
@@ -123,27 +126,42 @@ The `acme` member is the ACME account the block's `acme` rules share. The contro
 | `directory_url` | string | The ACME directory (RFC 8555) the bridge registers its account at and orders certificates from. The bridge accepts only an absolute https URL, and only one that `bridge.acme_directory_urls` lists when that list is not empty (see [The ACME Account](acme-sni.md#the-acme-account)) |
 | `contact_email` | string, optional | The contact the account registers with. Without it the account has no contact |
 
-The block is whole: a rule missing from a later pull is removed, and a port no rule names any more is closed. An `ingress` child that is absent or `null` closes every public listener. An `ingress` child with an empty or `null` rule list does the same. A changed `acme` member or `certificate_secret_name` is bridge drift like any other change to the block.
+The block is whole: a rule missing from a later pull is removed, and a port no rule names any more is closed. An `ingress` child that is absent or `null` closes every public listener. An `ingress` child with an empty or `null` rule list does the same, and so does a block whose `enabled` is `false` or absent, whatever rules it lists. A changed `enabled`, `acme` member or `certificate_secret_name` is bridge drift like any other change to the block.
 
 ## Activation
 
-The bridge serves the block only in bridge mode with the local `bridge.ingress_enabled: true` (default `false`); `cmd/plexd/cmd/up.go` builds the ingress manager only then. Without it, the block is ignored. The block carries no `enabled` member, and an `acme` rule needs no local switch of its own.
+A bridge serves the pulled block when three conditions hold:
+
+1. It runs in bridge mode: `mode: bridge` and `bridge.enabled: true`.
+2. Its local configuration does not opt out: `bridge.ingress_enabled` is absent or `true`.
+3. The block carries `enabled: true`.
+
+The control plane sends `enabled: true` on every block, so the bridge host's configuration decides. A bridge with `bridge.ingress_enabled: false` opts out: step 5e of `plexd up` builds neither the ingress manager nor the ACME manager, so no code path can bind a public port, and the bridge opens no public listener whatever the pull says. It logs `public ingress: opted out by bridge.ingress_enabled, no public listener is opened` at start, and `bridge subsystem initialized` reads `ingress=false`. On every other bridge in bridge mode, `plexd up` builds both managers, and a block whose `enabled` is `false` or absent opens no public listener (see [IngressReconcileHandler](#ingressreconcilehandler)). An `acme` rule needs no local switch of its own.
+
+Every bridge reports which of the two its configuration says with the [ingress status report](#ingress-status-report), `enabled` or `opted_out`, and the control plane answers a rule create or update on a bridge that reported `opted_out` with `409 bridge_ingress_opted_out`. The report never gates serving. plexd reads its configuration once per start, so a changed `bridge.ingress_enabled` takes effect, and is reported, with the next restart.
+
+The control plane enables ingress by default, a bridge host opts out in its local configuration, and plexd keeps no compatibility path. Two consequences of an upgrade follow and are intended:
+
+- A bridge that upgrades without `bridge.ingress_enabled` in its configuration starts serving the rules the control plane delivers. A host that must stay closed sets `bridge.ingress_enabled: false` before it upgrades.
+- A control plane older than [plexsphere/plexsphere#1090](https://github.com/plexsphere/plexsphere/pull/1090) sends blocks without `enabled`. plexd then opens no public listener, as the contract states for a block without the member.
 
 | Field                | Type            | Default | Description                                      |
 |----------------------|-----------------|---------|--------------------------------------------------|
-| `IngressEnabled`     | `bool`          | `false` | `bridge.ingress_enabled`: the local switch for public ingress |
+| `IngressEnabled`     | `*bool`         | `true`  | `bridge.ingress_enabled`: the local switch for public ingress (nil = true). nil and `true` serve, `false` opts out and is reported as `opted_out`. `ApplyDefaults` leaves it nil, and `IngressOptedOut()` is true exactly when it is non-nil and `false` |
 | `MaxIngressRules`    | `int`           | `20`    | `bridge.max_ingress_rules`: the most rules the bridge holds |
 | `IngressDialTimeout` | `time.Duration` | `10s`   | `bridge.ingress_dial_timeout`: the timeout for dialing a target |
 | `ACMECacheDir`       | `string`        | `""`    | `bridge.acme_cache_dir`: the directory of the ACME account key and the certificates of `acme` rules; empty means `<data_dir>/acme` (see [The Cache Directory](acme-sni.md#the-cache-directory)) |
 | `ACMEDirectoryURLs`  | `[]string`      | empty   | `bridge.acme_directory_urls`: the ACME directories the bridge accepts from the block's `acme` member; empty accepts any https directory |
 
-Ingress validation is skipped when `IngressEnabled` is `false`. When enabled:
+Every reader of `IngressEnabled` outside `config.go` goes through `IngressOptedOut()`. `Validate` checks the ingress fields as follows:
 
 | Field                | Rule                    | Error Message                                                               |
 |----------------------|-------------------------|-----------------------------------------------------------------------------|
-| `IngressEnabled`     | Requires `Enabled=true` | `bridge: config: ingress requires bridge mode to be enabled`                |
-| `MaxIngressRules`    | Must be > 0             | `bridge: config: MaxIngressRules must be positive when ingress is enabled`  |
-| `IngressDialTimeout` | Must be >= 1s           | `bridge: config: IngressDialTimeout must be at least 1s`                    |
+| `IngressEnabled`     | An explicit `true` requires `Enabled=true` | `bridge: config: ingress requires bridge mode to be enabled`                |
+| `MaxIngressRules`    | Must be > 0 when `Enabled` is true and `IngressOptedOut()` is false | `bridge: config: MaxIngressRules must be positive when ingress is enabled`  |
+| `IngressDialTimeout` | Must be >= 1s when `Enabled` is true and `IngressOptedOut()` is false | `bridge: config: IngressDialTimeout must be at least 1s`                    |
+
+An absent key and an explicit `false` are valid without `Enabled`, so a node outside bridge mode loads without the key. `ParseConfig` applies the defaults before anything validates, so only an explicit bad value fails: a bridge whose configuration never enabled ingress and carries `max_ingress_rules: -1` or `ingress_dial_timeout: 500ms` fails `plexd up` with these messages until it corrects the value or sets `bridge.ingress_enabled: false`.
 
 `ACMEDirectoryURLs` is checked whether or not ingress is enabled: an entry that is not an absolute https URL fails with `bridge: config: acme_directory_urls: "<entry>" is not an absolute https URL`.
 
@@ -327,6 +345,8 @@ On port 443, a ClientHello whose ALPN list is exactly `["acme-tls/1"]` and whose
 9. It loads, replaces or drops the certificates of the held `terminate` rules with `loadCertificates` (see [Certificates from the Secret Store](#certificates-from-the-secret-store)).
 10. It returns the listen errors joined, or nil.
 
+`Apply` does not read the block's `enabled` member: [IngressReconcileHandler](#ingressreconcilehandler) hands it the zero block when the pull does not enable ingress.
+
 A second `Apply` with the same block, after one whose binds all succeeded, binds nothing, cancels nothing, keeps the ACME account as it is and logs no rule or listener line again. It is not free of side effects: its `loadCertificates` still fetches a version whose last fetch failed once that version's next attempt is due, and logs `ingress certificate loaded` when the retry succeeds (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). A failed bind fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
 
 ## Ports Below 1024
@@ -368,19 +388,19 @@ type IngressController interface {
 func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager, certs CertificateSecretFetcher) *IngressManager
 ```
 
-Neither `acme` nor `certs` may be nil. With `bridge.ingress_enabled`, `plexd up` builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`), reads the node secret key with `identity.SecretKey()` (an error fails `plexd up`), builds `ingressCertFetcher` with it, and passes the two to `NewIngressManager`.
+Neither `acme` nor `certs` may be nil. In bridge mode, unless `bridge.ingress_enabled` is `false`, `plexd up` builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`), reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`), builds `ingressCertFetcher` with it, and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress.
 
 Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
 
 | Method                | Signature                                                   | Description |
 |-----------------------|-------------------------------------------------------------|-------------|
-| `Setup`               | `() error`                                                  | Marks the manager active; a no-op when `IngressEnabled` is `false` |
+| `Setup`               | `() error`                                                  | Marks the manager active; a no-op when `IngressOptedOut()` is true |
 | `Apply`               | `(ctx context.Context, block api.IngressConfig) error`      | Serves exactly this block (see [Applying the Block](#applying-the-block)) |
 | `SyncSecretInventory` | `(ctx context.Context, inventory []api.NodeStateSecret)`    | Takes the pull's secret inventory and loads, replaces or drops the certificates of the held `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)); a no-op when inactive |
 | `RuleStates`          | `() []IngressRuleState`                                     | The outcome of the last `Apply`, one entry per rule, in block order, with each `terminate` rule's certificate state |
 | `Teardown`            | `() error`                                                  | Cancels every route, which closes every connection, closes every listener, and forgets the inventory and every certificate; joins close errors; a no-op when inactive |
 | `IngressStatus`       | `() *api.IngressInfo`                                       | The `status.ingress` report entry; nil when inactive |
-| `IngressCapabilities` | `() map[string]string`                                      | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when disabled |
+| `IngressCapabilities` | `() map[string]string`                                      | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when `IngressOptedOut()` is true |
 
 ```go
 type IngressRuleState struct {
@@ -402,7 +422,21 @@ type IngressRuleState struct {
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-The handler returns nil for a nil snapshot. Otherwise it passes its context and the whole `desired.Bridge.Ingress` block, the zero `api.IngressConfig` when `Bridge` or `Ingress` is nil, to `mgr.Apply(ctx, block)`, and on an error logs `ingress reconcile: apply failed` and returns it.
+Returns a `reconcile.ReconcileHandler` that serves the pull's `bridge.ingress` block when the block enables ingress. `mgr` is nil on a bridge that opts out with `bridge.ingress_enabled: false`, as the relay is nil on a bridge without relay consent in [`RelayReconcileHandler`](nat-relay.md#relayreconcilehandler). The handler honors the block's `enabled` member, and `Apply` serves exactly the block the handler hands it:
+
+| `mgr` | Pulled block | What the handler does |
+|---|---|---|
+| any | nil snapshot | Returns nil |
+| set | `Bridge` or `Ingress` nil | Applies the zero block |
+| set | `enabled` true | Applies the block |
+| set | `enabled` false, no rules | Applies the zero block |
+| set | `enabled` false, at least one rule | Logs the Warn `ingress: the state pull carries rules but does not enable public ingress, closing every listener` with `rules=<n>`, then applies the zero block |
+| nil | `enabled` true, at least one rule | Logs the Warn `ingress: the control plane enables public ingress, but bridge.ingress_enabled is false` with `rules=<n>`, and returns nil |
+| nil | anything else | Returns nil without a log line |
+
+`enabled` false covers a block without the member, which decodes to `false`. To apply, the handler passes its context and the block to `mgr.Apply(ctx, block)`, and on an error logs `ingress reconcile: apply failed` and returns it. A failed bind therefore fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
+
+Reconcile handlers run only on a cycle with drift, but on every such cycle: a changed peer or policy runs the handler too. The handler therefore logs its two Warn lines only when the cycle's diff has `BridgeChanged` set. `enabled` is part of the bridge block the differ compares, so a flip of `enabled` is bridge drift, and each Warn is logged once per change of the pulled `bridge` block, the first pull after every start included, because the reconciler's snapshot starts empty. A cycle in which a handler fails keeps the old snapshot, so the next cycle sees the same bridge drift and logs the Warn again. Applying the zero block is not gated: it runs on every cycle with drift, and a zero block after a zero block changes nothing.
 
 ## IngressSecretInventoryHandler
 
@@ -412,12 +446,70 @@ func IngressSecretInventoryHandler(mgr *IngressManager) reconcile.DispatchHandle
 
 The handler runs on the dispatch seam, on every successful pull, drift or not (see [DispatchHandler](../core/reconciliation.md#dispatchhandler)). It returns for a nil `desired.Secrets`, which keeps the inventory the manager holds, and otherwise calls `mgr.SyncSecretInventory(ctx, *desired.Secrets)`. A pull whose only change is the `secrets` block reports an empty diff and runs no reconcile handler, so without this handler no reconcile handler would see a Secret rotation. Dispatch handlers run before the reconcile handlers of a cycle, so a cycle that brings a new rule and its Secret hands the inventory over first, and the `Apply` of that cycle fetches the certificate.
 
-`cmd/plexd/cmd/up.go` registers both handlers when the ingress manager exists:
+`cmd/plexd/cmd/up.go` registers `IngressReconcileHandler` whenever bridge mode runs, with a nil `ingressMgr` on a bridge that opts out, and `IngressSecretInventoryHandler` only when the ingress manager exists:
 
 ```go
-reconciler.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
-reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
+if ingressMgr != nil {
+    reconciler.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
+}
+reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger)) // ingressMgr is nil on an opted-out bridge
 ```
+
+## Ingress Status Report
+
+A bridge reports whether its local configuration serves public ingress with [`PUT /v1/nodes/{node_id}/ingress-status`](../core/api-endpoints.md#ingress-status), so the control plane refuses an ingress rule that no listener would serve. Without the report, a Project operator who writes a rule for a bridge whose host opted out gets `201` and a bridge that never listens. Every node in bridge mode reports, whether or not it opts out, and a node outside bridge mode sends nothing. No configuration key turns the report on or off: a bridge reports at its `heartbeat.interval`.
+
+### Reported States
+
+| State | `bridge.ingress_enabled` | Meaning |
+|-------|--------------------------|---------|
+| `enabled` | absent or `true` | The bridge serves the rules the pull enables |
+| `opted_out` | `false` | The bridge built no ingress manager and opens no public listener whatever the pull says |
+
+The state follows from the local configuration alone, which plexd reads once per start, so one process always reports the same state. The report carries the state and no entry per rule: a bridge that holds a rule it cannot serve still reports `enabled`.
+
+### Reporter
+
+`IngressStatusReporter` (`ingress_status.go`) sends the report from a goroutine of its own.
+
+```go
+type IngressStatusClient interface {
+    ReportIngressStatus(ctx context.Context, nodeID string, req api.IngressStatusRequest) (*api.IngressStatusResponse, error)
+}
+
+func NewIngressStatusReporter(interval time.Duration, nodeID string, client IngressStatusClient, optedOut bool, logger *slog.Logger) *IngressStatusReporter
+func (r *IngressStatusReporter) Run(ctx context.Context) error // returns nil when ctx is done
+```
+
+`*api.ControlPlane` satisfies `IngressStatusClient`. The state is fixed at construction: `api.IngressStateOptedOut` when `optedOut` is true, `api.IngressStateEnabled` otherwise. A non-positive `interval` becomes 30 s, the default `heartbeat.interval`. The reporter's logger carries `component=bridge`. `Run` logs `ingress status: reporter started` with `interval` and `state`, sends one report at once, then one on every tick of the interval, and returns nil when `ctx` is done, without a last send.
+
+The type carries four decisions:
+
+- **The send at start.** The reporter sends at once, without waiting for a state pull, unlike the [relay status reporter](nat-relay.md#reporter), which waits for its reconcile handler: the relay's state comes from the pull, the ingress state from the configuration, which plexd has read by then. Because plexd reads the configuration once per start (it handles SIGTERM and SIGINT only), the send after each start is the report "on every change of its setting" that the contract asks for.
+- **No retry within a tick.** The body never changes, so a failed send is not retried before the next tick. An opt-out whose first send fails reaches the control plane at most one interval later, and the bridge is closed the whole time.
+- **No shutdown report.** The report is sticky, and a stopped bridge keeps the state its configuration gives it, so the reporter sends nothing when `ctx` ends.
+- **The report never gates serving.** A bridge serves as the pull says while a send fails or the control plane does not serve the operation, as the contract requires.
+
+The cost is one `PUT` with a body of at most 21 bytes per bridge and interval, and the control plane writes nothing for a report that repeats the stored state.
+
+Step 17d of `plexd up` starts `bridge.NewIngressStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.IngressOptedOut(), logger)` in a goroutine under the shutdown `WaitGroup`, beside the relay status reporter, whenever bridge mode runs. `statusInterval` is `heartbeat.interval`. The shutdown sequence needs no step of its own: the reporter ends with `ctx`.
+
+### Answers
+
+No answer stops the loop, and none touches the listeners:
+
+| Answer | Reporter behavior |
+|--------|-------------------|
+| `200 OK` | Debug `ingress status: accepted` with `state` and `accepted_at` on every accepted send. Info `ingress status: reported` with `state` for the first accepted send. After a not-served phase, one Info `ingress status: control plane accepts ingress status reports` |
+| `404` with any code but `ingress_status_node_gone`, or `501 ingress_status_not_provisioned` | The control plane does not serve the report, as `api.IsIngressStatusNotServed` classifies it. Info `ingress status: control plane does not accept ingress status reports, retrying every interval` with `status` and `code`, once on entering that state. plexd keeps reporting every interval and keeps serving as the pull says |
+| `404 ingress_status_node_gone` | The node was removed while the request ran. Warn `ingress status: rejected, this node was removed` with `code` on every send. It does not enter the not-served state |
+| `api.ErrCredentialRefused` | Debug `ingress status: send failed` with `error`. The heartbeat parked the agent on a refused credential and names the cause once |
+| Any error after `ctx` ended | Nothing, because that is the shutdown |
+| Anything else, `400 malformed_ingress_status` and `context.DeadlineExceeded` included | Warn `ingress status: send failed` with `error` |
+
+### What the Control Plane Does
+
+The control plane keeps the latest report per node and never ages it, so a bridge that reported `opted_out` and went offline stays opted out until it reports `enabled`. A report that repeats the stored state changes nothing. While a bridge's report reads `opted_out`, the control plane answers a create or an update of an ingress rule on its bridge Resource with `409 bridge_ingress_opted_out`. It keeps the rules stored before the opt-out and keeps delivering them in the `bridge.ingress` block with `enabled: true`. The opted-out bridge ignores them and logs the Warn `ingress: the control plane enables public ingress, but bridge.ingress_enabled is false`, and it serves them again once a restart without the opt-out makes it report `enabled`. A delete of a rule stays allowed. A bridge that never reported reads `not_reported` and accepts rules. A node reports only for itself, so a leaked NSK can block rule writes on its own bridge Resource and on no other. A control plane that predates the report answers `404`, and plexd keeps serving as the pull says. See [Ingress status](https://github.com/plexsphere/plexsphere/blob/8458a7db47d0f38f4e6d49705a30f20ab94b367a/docs/reference/api/plexd-agent-contract.md#ingress-status) in plexsphere's agent contract.
 
 ## SSE Event Handling
 
@@ -431,12 +523,19 @@ There are no ingress-specific SSE handlers. The control plane emits a single `br
 
 ```go
 type IngressConfig struct {
-    Rules []IngressRule `json:"rules"`
+    // Enabled is the control plane's switch: a bridge serves Rules only when
+    // it is true and its local configuration does not opt out. A block
+    // without the member decodes to false and opens no public listener. The
+    // control plane sends true on every block it delivers.
+    Enabled bool          `json:"enabled"`
+    Rules   []IngressRule `json:"rules"`
     // ACME is the account the block's acme rules share, the control plane's
     // NodeStateBridgeIngressACME. It is present exactly when a rule has mode acme.
     ACME *IngressACME `json:"acme,omitempty"`
 }
 ```
+
+`Enabled` carries no `omitempty`, so a zero `IngressConfig` marshals with `"enabled":false`.
 
 ### IngressACME
 
@@ -496,10 +595,11 @@ Published as the `status.ingress` report entry, each field under its snake_case 
 
 ## Logging
 
-All ingress log entries use `component=bridge`.
+All ingress log entries use `component=bridge`, the reporter's included. `bridge subsystem initialized`, which step 5e of `plexd up` logs, carries `ingress=false` on a bridge that opts out.
 
 | Level   | Message                                  | Keys |
 |---------|------------------------------------------|------|
+| `Info`  | `public ingress: opted out by bridge.ingress_enabled, no public listener is opened` | (none); logged by step 5e of `plexd up` on a bridge with `bridge.ingress_enabled: false` |
 | `Info`  | `ingress manager started`                | `max_rules`, `dial_timeout` |
 | `Info`  | `ingress manager stopped`                | (none) |
 | `Info`  | `ingress listener opened`                | `listen_port` |
@@ -512,6 +612,16 @@ All ingress log entries use `component=bridge`.
 | `Warn`  | `ingress certificate not loaded`         | `secret`, `version`, `reason`, `error`, `serving_version` (0 when none); once per secret, version and reason |
 | `Info`  | `ingress certificate dropped`            | `secret`, `version`, `reason` (`certificate_secret_not_listed` or `rule_removed`) |
 | `Warn`  | `ingress certificate does not cover the rule's host` | `rule_id`, `slug`, `sni_host`, `secret`, `version` |
+| `Warn`  | `ingress: the state pull carries rules but does not enable public ingress, closing every listener` | `rules`; once per change of the pulled `bridge` block |
+| `Warn`  | `ingress: the control plane enables public ingress, but bridge.ingress_enabled is false` | `rules`; once per change of the pulled `bridge` block, on a bridge that opts out |
+| `Info`  | `ingress status: reporter started`       | `interval`, `state` |
+| `Info`  | `ingress status: reported`               | `state`; logged for the first accepted send |
+| `Info`  | `ingress status: control plane does not accept ingress status reports, retrying every interval` | `status`, `code`; logged on entering the not-served state only |
+| `Info`  | `ingress status: control plane accepts ingress status reports` | (none); logged once after a not-served phase |
+| `Warn`  | `ingress status: rejected, this node was removed` | `code`; logged on every send |
+| `Warn`  | `ingress status: send failed`            | `error` |
+| `Debug` | `ingress status: accepted`               | `state`, `accepted_at` |
+| `Debug` | `ingress status: send failed`            | `error`; logged instead of the Warn while the client holds a refused credential (`api.ErrCredentialRefused`) |
 | `Debug` | `ingress connection closed`              | `listen_port`, `remote`, `server_name`, `reason` |
 | `Debug` | `ingress acme challenge answered`        | `server_name`, `remote`, `error` |
 | `Error` | `bridge: ingress: listen failed`         | `listen_port`, `error`, and `hint` for a permission error below port 1024 |

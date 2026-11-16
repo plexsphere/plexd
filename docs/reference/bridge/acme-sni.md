@@ -104,7 +104,7 @@ func (m *ACMEManager) Teardown() error
 | `Active`         | Whether an account is active: true exactly while the last `IngressManager.Apply` ended with an `acme` rule without a reason. An `acme` rule whose port failed to bind reads `listen_failed` and does not count |
 | `Teardown`       | Retires the active manager and waits at most 10 s for the certificate requests in flight (see [Teardown](#teardown)); idempotent, returns nil |
 
-`Setup`, `TLSConfig` and `AllowedHosts` are removed. In bridge mode `plexd up` builds the manager whenever `bridge.ingress_enabled` is true, as `bridge.NewACMEManager(bridge.ACMEConfig{CacheDir: dir}, logger)`, and hands it to `NewIngressManager`. The manager holds no account until a state pull's block names an `acme` rule. `IngressManager.Apply` calls `Configure` after it binds the ports, with the block's `acme` member and the hosts of the `acme` rules that end the `Apply` without a reason. An `acme` rule whose port failed to bind (`listen_failed`) does not keep the account, and port 443 is bound before the account asks the CA for a certificate (see [Applying the Block](public-ingress.md#applying-the-block)). The ingress manager is torn down before the ACME manager.
+`Setup`, `TLSConfig` and `AllowedHosts` are removed. In bridge mode `plexd up` builds the manager unless the bridge opts out of public ingress with `bridge.ingress_enabled: false`, as `bridge.NewACMEManager(bridge.ACMEConfig{CacheDir: dir}, logger)`, and hands it to `NewIngressManager`. A bridge that opts out builds neither manager (see [Activation](public-ingress.md#activation)). The manager holds no account until a state pull's block names an `acme` rule. `IngressManager.Apply` calls `Configure` after it binds the ports, with the block's `acme` member and the hosts of the `acme` rules that end the `Apply` without a reason. An `acme` rule whose port failed to bind (`listen_failed`) does not keep the account, and port 443 is bound before the account asks the CA for a certificate (see [Applying the Block](public-ingress.md#applying-the-block)). The ingress manager is torn down before the ACME manager.
 
 ### Configure
 
@@ -203,7 +203,6 @@ bridge:
   access_interface: eth1
   access_subnets:
     - 10.0.0.0/24
-  ingress_enabled: true
   acme_directory_urls:
     - https://acme-v02.api.letsencrypt.org/directory
 ```

@@ -82,7 +82,7 @@ flowchart TD
 5b. **Initialize NAT + Peer Exchange** — create STUN client, NAT discoverer, and peer exchanger
 5c. **Initialize Network Policy** — create policy engine, firewall controller, and enforcer
 5d. **Initialize Tunnel** — load/generate host key, create JWT verifier and mesh server
-5e. **Initialize Bridge** (bridge mode only) — create the bridge manager and run its Setup. With `bridge.ingress_enabled`, create the ACME manager over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`), read the node secret key for `ingressCertFetcher` (an error fails `plexd up`), create the ingress manager with both, and run the ingress manager's Setup. The ACME manager has no Setup and starts without an account: `IngressManager.Apply` configures it from the state pull's `bridge.ingress` block (see [ACME and SNI Routing](reference/bridge/acme-sni.md#acmemanager)). With `bridge.user_access_enabled` and `bridge.site_to_site_enabled`, create the user access and site-to-site managers and run Setup on each
+5e. **Initialize Bridge** (bridge mode only) — create the bridge manager and run its Setup. Unless `bridge.ingress_enabled` is `false`, create the ACME manager over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`), read the node secret key for `ingressCertFetcher` (an error fails `plexd up`), create the ingress manager with both, and run the ingress manager's Setup. With `bridge.ingress_enabled: false`, create neither manager and log `public ingress: opted out by bridge.ingress_enabled, no public listener is opened` (see [Activation](reference/bridge/public-ingress.md#activation)). The ACME manager has no Setup and starts without an account: `IngressManager.Apply` configures it from the state pull's `bridge.ingress` block (see [ACME and SNI Routing](reference/bridge/acme-sni.md#acmemanager)). With `bridge.user_access_enabled` and `bridge.site_to_site_enabled`, create the user access and site-to-site managers and run Setup on each
 6. **Create SSE manager** — `api.NewSSEManager()` with handlers for signing key rotation, WireGuard peer events, tunnel events, policy events, and bridge events (bridge mode)
 7. **Create reconciler** — `reconcile.NewReconciler()` with handlers for WireGuard, policy, and bridge reconciliation
 8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment and key-rotation callback; its credential-refused callback is set in step 12, once the node API server exists
@@ -114,6 +114,8 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 14. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
 
 The bridge's NAT relay is not a startup goroutine. In bridge mode with `bridge.relay_enabled` set, the reconciler's `RelayReconcileHandler` starts it on the first cycle whose state pull enables it, and stops it when a pull disables it or the bridge tears down (see [NAT Relay](reference/bridge/nat-relay.md#relayreconcilehandler)).
+
+In bridge mode `plexd up` also starts the ingress status reporter, whether or not the bridge opts out of public ingress. It sends `PUT /v1/nodes/{node_id}/ingress-status` once at start and then once per `heartbeat.interval`, with `opted_out` when `bridge.ingress_enabled` is `false` and `enabled` otherwise, and ends with the context, without a report at shutdown (see [Ingress Status Report](reference/bridge/public-ingress.md#ingress-status-report)).
 
 ## Shutdown Sequence
 
@@ -151,10 +153,10 @@ flowchart TD
 2. **`sseMgr.Shutdown()`** — close the SSE connection
 3. **`executor.Shutdown()`** — drain running actions
 4. **`meshServer.Shutdown()`** — stop tunnel SSH server and drain sessions
-5. **`ingressMgr.Teardown()`** — close ingress listeners (bridge mode)
+5. **`ingressMgr.Teardown()`** — close ingress listeners (bridge mode, unless `bridge.ingress_enabled` is `false`)
 6. **`userAccessMgr.Teardown()`** — remove user access peers and interface (bridge mode)
 7. **`s2sMgr.Teardown()`** — remove site-to-site tunnels and interfaces (bridge mode)
-8. **`acmeMgr.Teardown()`** — retire the ACME account and wait at most 10 s for its certificate requests in flight (bridge mode with `bridge.ingress_enabled`; see [Teardown](reference/bridge/acme-sni.md#teardown))
+8. **`acmeMgr.Teardown()`** — retire the ACME account and wait at most 10 s for its certificate requests in flight (bridge mode, unless `bridge.ingress_enabled` is `false`; see [Teardown](reference/bridge/acme-sni.md#teardown))
 9. **`bridgeMgr.Teardown()`** — remove bridge routes and forwarding (bridge mode)
 10. **`enforcer.Teardown()`** — remove firewall chains and rules
 11. **`wgMgr.Teardown()`** — delete WireGuard interface (last, others depend on it)
