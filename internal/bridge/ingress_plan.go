@@ -37,6 +37,11 @@ const (
 	// would take the CA's challenge connection for the acme rule's host;
 	// Detail is that rule's slug.
 	IngressReasonACMEChallengePortTaken = "acme_challenge_port_taken"
+	// IngressReasonACMENotIssued: a served acme rule whose host's last
+	// certificate request did not succeed, or was not made yet. Only the
+	// ingress status report carries it; the rule is served, and the next
+	// client handshake asks autocert again.
+	IngressReasonACMENotIssued = "acme_not_issued"
 	// IngressReasonCertificateSecretNotListed: the secret inventory does not
 	// list the Secret a terminate rule names; Detail is the Secret name.
 	IngressReasonCertificateSecretNotListed = "certificate_secret_not_listed"

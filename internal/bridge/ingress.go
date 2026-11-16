@@ -98,13 +98,17 @@ type IngressManager struct {
 	coverage  map[coverageKey]struct{} // the hosts checked against a loaded certificate
 
 	connCount atomic.Int64 // connections from accept to close, across all ports
+
+	// changed carries ReportChanged's signal; capacity 1.
+	changed chan struct{}
 }
 
 // NewIngressManager creates a new IngressManager. acme holds the account of
 // the block's acme rules and certs fetches the certificates of its terminate
-// rules; neither may be nil.
+// rules; neither may be nil. The manager registers with acme to signal
+// ReportChanged when a host's certificate is issued or lost.
 func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager, certs CertificateSecretFetcher) *IngressManager {
-	return &IngressManager{
+	m := &IngressManager{
 		ctrl:             ctrl,
 		cfg:              cfg,
 		logger:           logger,
@@ -116,7 +120,10 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 		now:              time.Now,
 		listeners:        make(map[int]*ingressListener),
 		certs:            make(map[string]*certEntry),
+		changed:          make(chan struct{}, 1),
 	}
+	acme.OnIssuedChange(m.signalReport)
+	return m
 }
 
 // Setup initializes the ingress manager.
@@ -171,6 +178,7 @@ func (m *IngressManager) Teardown() error {
 	m.inventory = nil
 	m.certs = make(map[string]*certEntry)
 	m.coverage = nil
+	m.signalReport()
 	m.mu.Unlock()
 
 	// Wait for the accept loops outside the lock.
@@ -325,6 +333,7 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 
 	m.logRuleChanges(plan.states)
 	m.states = plan.states
+	m.signalReport()
 	m.mu.Unlock()
 
 	// Wait for the accept loops of closed listeners outside the lock.

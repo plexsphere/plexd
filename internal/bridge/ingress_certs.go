@@ -214,6 +214,7 @@ func (m *IngressManager) loadCertificates(ctx context.Context) {
 
 	m.mu.Lock()
 	m.checkCoverageLocked()
+	m.signalReport()
 	m.mu.Unlock()
 }
 
