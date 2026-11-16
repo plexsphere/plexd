@@ -120,12 +120,12 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 }
 
 // Setup initializes the ingress manager.
-// When ingress is disabled this is a no-op.
+// It is a no-op when the node opts out of public ingress.
 func (m *IngressManager) Setup() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.cfg.IngressEnabled {
+	if m.cfg.IngressOptedOut() {
 		return nil
 	}
 
@@ -658,9 +658,9 @@ func (m *IngressManager) IngressStatus() *api.IngressInfo {
 }
 
 // IngressCapabilities returns capability metadata for registration.
-// Returns nil when ingress is not enabled.
+// Returns nil when the node opts out of public ingress.
 func (m *IngressManager) IngressCapabilities() map[string]string {
-	if !m.cfg.IngressEnabled {
+	if m.cfg.IngressOptedOut() {
 		return nil
 	}
 	return map[string]string{

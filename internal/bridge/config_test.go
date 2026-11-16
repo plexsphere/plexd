@@ -105,6 +105,7 @@ func TestConfig_Validate_ValidConfig(t *testing.T) {
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24", "192.168.1.0/24"},
 		EnableNAT:       BoolPtr(true),
+		IngressEnabled:  BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil for valid config, got: %v", err)
@@ -126,6 +127,7 @@ func TestConfig_Validate_RelayDisabled(t *testing.T) {
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
 		RelayEnabled:    false,
+		IngressEnabled:  BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil when relay is disabled, got: %v", err)
@@ -155,6 +157,7 @@ func TestConfig_Validate_RelayValidConfig(t *testing.T) {
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
 		RelayEnabled:    true,
+		IngressEnabled:  BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil for valid relay config, got: %v", err)
@@ -244,6 +247,7 @@ func TestConfig_Validate_UserAccessBoundaryPorts(t *testing.T) {
 				UserAccessInterfaceName: "wg-access",
 				UserAccessListenPort:   tt.port,
 				MaxAccessPeers:         50,
+				IngressEnabled:         BoolPtr(false),
 			}
 			err := cfg.Validate()
 			if tt.wantErr && err == nil {
@@ -265,6 +269,7 @@ func TestConfig_Validate_UserAccessValidConfig(t *testing.T) {
 		UserAccessInterfaceName: "wg-access",
 		UserAccessListenPort:   51822,
 		MaxAccessPeers:         50,
+		IngressEnabled:         BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil for valid user access config, got: %v", err)
@@ -327,6 +332,7 @@ func TestConfig_Validate_UserAccessDisabled(t *testing.T) {
 		AccessInterface:   "eth1",
 		AccessSubnets:     []string{"10.0.0.0/24"},
 		UserAccessEnabled: false,
+		IngressEnabled:    BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil when user access is disabled, got: %v", err)
@@ -337,8 +343,8 @@ func TestConfig_ApplyDefaults_IngressFields(t *testing.T) {
 	var cfg Config
 	cfg.ApplyDefaults()
 
-	if cfg.IngressEnabled {
-		t.Error("IngressEnabled should default to false")
+	if cfg.IngressEnabled != nil {
+		t.Errorf("IngressEnabled = %v, want it to stay nil after ApplyDefaults", *cfg.IngressEnabled)
 	}
 	if cfg.MaxIngressRules != DefaultMaxIngressRules {
 		t.Errorf("MaxIngressRules = %d, want %d", cfg.MaxIngressRules, DefaultMaxIngressRules)
@@ -348,18 +354,54 @@ func TestConfig_ApplyDefaults_IngressFields(t *testing.T) {
 	}
 }
 
+func TestConfig_IngressOptedOut(t *testing.T) {
+	tests := []struct {
+		name           string
+		ingressEnabled *bool
+		want           bool
+	}{
+		{"nil serves", nil, false},
+		{"explicit true", BoolPtr(true), false},
+		{"explicit false opts out", BoolPtr(false), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{IngressEnabled: tt.ingressEnabled}
+			if got := cfg.IngressOptedOut(); got != tt.want {
+				t.Errorf("IngressOptedOut() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// An unset switch is the default every node carries, so only an explicit true
+// is refused outside bridge mode.
 func TestConfig_Validate_IngressWithoutBridge(t *testing.T) {
-	cfg := Config{
-		Enabled:        false,
-		IngressEnabled: true,
+	tests := []struct {
+		name           string
+		ingressEnabled *bool
+		wantErr        string
+	}{
+		{"explicit true", BoolPtr(true), "bridge: config: ingress requires bridge mode to be enabled"},
+		{"nil", nil, ""},
+		{"explicit false", BoolPtr(false), ""},
 	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate should return error when ingress enabled without bridge")
-	}
-	want := "bridge: config: ingress requires bridge mode to be enabled"
-	if err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:        false,
+				IngressEnabled: tt.ingressEnabled,
+			}
+			err := cfg.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("Validate() = nil, want %q", tt.wantErr)
+			case tt.wantErr != "" && err.Error() != tt.wantErr:
+				t.Errorf("got %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -368,7 +410,7 @@ func TestConfig_Validate_IngressValidConfig(t *testing.T) {
 		Enabled:            true,
 		AccessInterface:    "eth1",
 		AccessSubnets:      []string{"10.0.0.0/24"},
-		IngressEnabled:     true,
+		IngressEnabled:     BoolPtr(true),
 		MaxIngressRules:    20,
 		IngressDialTimeout: 10 * time.Second,
 	}
@@ -377,6 +419,8 @@ func TestConfig_Validate_IngressValidConfig(t *testing.T) {
 	}
 }
 
+// A bridge serves public ingress unless it opts out, so the ingress values are
+// checked with the switch unset.
 func TestConfig_Validate_IngressInvalidMaxRules(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -391,7 +435,6 @@ func TestConfig_Validate_IngressInvalidMaxRules(t *testing.T) {
 				Enabled:            true,
 				AccessInterface:    "eth1",
 				AccessSubnets:      []string{"10.0.0.0/24"},
-				IngressEnabled:     true,
 				MaxIngressRules:    tt.maxRules,
 				IngressDialTimeout: 10 * time.Second,
 			}
@@ -412,7 +455,6 @@ func TestConfig_Validate_IngressInvalidDialTimeout(t *testing.T) {
 		Enabled:            true,
 		AccessInterface:    "eth1",
 		AccessSubnets:      []string{"10.0.0.0/24"},
-		IngressEnabled:     true,
 		MaxIngressRules:    20,
 		IngressDialTimeout: 500 * time.Millisecond,
 	}
@@ -426,15 +468,32 @@ func TestConfig_Validate_IngressInvalidDialTimeout(t *testing.T) {
 	}
 }
 
+// An opted-out bridge serves no ingress, so the values that bound it are not
+// checked: the ones the two tests above refuse validate.
 func TestConfig_Validate_IngressDisabled(t *testing.T) {
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  false,
+	tests := []struct {
+		name        string
+		maxRules    int
+		dialTimeout time.Duration
+	}{
+		{"zero rules", 0, 10 * time.Second},
+		{"negative rules", -1, 10 * time.Second},
+		{"dial timeout below 1s", 20, 500 * time.Millisecond},
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should return nil when ingress is disabled, got: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:            true,
+				AccessInterface:    "eth1",
+				AccessSubnets:      []string{"10.0.0.0/24"},
+				IngressEnabled:     BoolPtr(false),
+				MaxIngressRules:    tt.maxRules,
+				IngressDialTimeout: tt.dialTimeout,
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate should return nil when ingress is opted out, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -480,6 +539,7 @@ func TestConfig_Validate_SiteToSiteValidConfig(t *testing.T) {
 		SiteToSiteInterfacePrefix: "wg-s2s-",
 		SiteToSiteListenPort:      51823,
 		MaxSiteToSiteTunnels:      10,
+		IngressEnabled:            BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil for valid site-to-site config, got: %v", err)
@@ -504,6 +564,7 @@ func TestConfig_Validate_SiteToSiteInvalidPort(t *testing.T) {
 				SiteToSiteInterfacePrefix: "wg-s2s-",
 				SiteToSiteListenPort:      tt.port,
 				MaxSiteToSiteTunnels:      10,
+				IngressEnabled:            BoolPtr(false),
 			}
 			err := cfg.Validate()
 			if err == nil {
@@ -537,6 +598,7 @@ func TestConfig_Validate_SiteToSiteBoundaryPorts(t *testing.T) {
 				SiteToSiteInterfacePrefix: "wg-s2s-",
 				SiteToSiteListenPort:      tt.port,
 				MaxSiteToSiteTunnels:      10,
+				IngressEnabled:            BoolPtr(false),
 			}
 			err := cfg.Validate()
 			if tt.wantErr && err == nil {
@@ -567,6 +629,7 @@ func TestConfig_Validate_SiteToSiteInvalidMaxTunnels(t *testing.T) {
 				SiteToSiteInterfacePrefix: "wg-s2s-",
 				SiteToSiteListenPort:      51823,
 				MaxSiteToSiteTunnels:      tt.maxTunnels,
+				IngressEnabled:            BoolPtr(false),
 			}
 			err := cfg.Validate()
 			if err == nil {
@@ -586,6 +649,7 @@ func TestConfig_Validate_SiteToSiteDisabled(t *testing.T) {
 		AccessInterface:   "eth1",
 		AccessSubnets:     []string{"10.0.0.0/24"},
 		SiteToSiteEnabled: false,
+		IngressEnabled:    BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil when site-to-site is disabled, got: %v", err)
@@ -604,6 +668,7 @@ func TestConfig_Validate_UserAccessProviderType_Valid(t *testing.T) {
 				AccessInterface:        "eth1",
 				AccessSubnets:          []string{"10.0.0.0/24"},
 				UserAccessProviderType: pt,
+				IngressEnabled:         BoolPtr(false),
 			}
 			if err := cfg.Validate(); err != nil {
 				t.Errorf("Validate should accept provider type %q, got: %v", pt, err)
@@ -617,6 +682,7 @@ func TestConfig_Validate_UserAccessProviderType_Empty(t *testing.T) {
 		Enabled:         true,
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should accept empty provider type, got: %v", err)
@@ -650,6 +716,7 @@ func TestConfig_Validate_TunnelProviders_Valid(t *testing.T) {
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
 		TunnelProviders: []string{"ipsec", "openvpn"},
+		IngressEnabled:  BoolPtr(false),
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should accept valid tunnel providers, got: %v", err)
@@ -662,6 +729,7 @@ func TestConfig_Validate_TunnelProviders_Invalid(t *testing.T) {
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
 		TunnelProviders: []string{"ipsec", "gre"},
+		IngressEnabled:  BoolPtr(false),
 	}
 	err := cfg.Validate()
 	if err == nil {
@@ -687,7 +755,7 @@ func TestConfig_Validate_ACMEDirectoryURLs_Valid(t *testing.T) {
 				Enabled:            true,
 				AccessInterface:    "eth1",
 				AccessSubnets:      []string{"10.0.0.0/24"},
-				IngressEnabled:     true,
+				IngressEnabled:     BoolPtr(true),
 				MaxIngressRules:    20,
 				IngressDialTimeout: 10 * time.Second,
 				ACMEDirectoryURLs:  urls,
@@ -706,7 +774,7 @@ func TestConfig_Validate_ACMEDirectoryURLs_Invalid(t *testing.T) {
 			Enabled:            true,
 			AccessInterface:    "eth1",
 			AccessSubnets:      []string{"10.0.0.0/24"},
-			IngressEnabled:     true,
+			IngressEnabled:     BoolPtr(true),
 			MaxIngressRules:    20,
 			IngressDialTimeout: 10 * time.Second,
 		},
@@ -714,6 +782,7 @@ func TestConfig_Validate_ACMEDirectoryURLs_Invalid(t *testing.T) {
 			Enabled:         true,
 			AccessInterface: "eth1",
 			AccessSubnets:   []string{"10.0.0.0/24"},
+			IngressEnabled:  BoolPtr(false),
 		},
 		"bridge disabled": {},
 	} {

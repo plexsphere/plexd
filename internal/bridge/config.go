@@ -70,9 +70,12 @@ type Config struct {
 	// for the user access provider (e.g. "PLEXD_NETBIRD_SETUP_KEY").
 	SetupKeyEnv string `yaml:"setup_key_env"`
 
-	// IngressEnabled controls whether public ingress is active.
-	// Default: false. Requires Enabled=true.
-	IngressEnabled bool `yaml:"ingress_enabled"`
+	// IngressEnabled is the local switch for public ingress. nil and true serve
+	// the rules the state pull's bridge.ingress block enables; false opts the
+	// node out: plexd builds no ingress manager, opens no public listener
+	// whatever the pull says, and reports opted_out to the control plane.
+	// Default: nil, which serves. An explicit true requires Enabled=true.
+	IngressEnabled *bool `yaml:"ingress_enabled"`
 
 	// MaxIngressRules is the maximum number of concurrent ingress rules.
 	// Default: 20
@@ -124,6 +127,12 @@ func (c *Config) natEnabled() bool {
 	return *c.EnableNAT
 }
 
+// IngressOptedOut reports whether the node opts out of public ingress: true
+// exactly when IngressEnabled is set to false. An unset IngressEnabled serves.
+func (c *Config) IngressOptedOut() bool {
+	return c.IngressEnabled != nil && !*c.IngressEnabled
+}
+
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
 	// EnableNAT is handled via natEnabled(); nil means default true.
@@ -168,7 +177,10 @@ func (c *Config) Validate() error {
 	if c.UserAccessEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: user access requires bridge mode to be enabled")
 	}
-	if c.IngressEnabled && !c.Enabled {
+	// Only an explicit true is refused outside bridge mode: an unset switch is
+	// the default every node carries, and an explicit false opts out of
+	// ingress that does not run there either.
+	if c.IngressEnabled != nil && *c.IngressEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: ingress requires bridge mode to be enabled")
 	}
 	if c.SiteToSiteEnabled && !c.Enabled {
@@ -207,7 +219,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("bridge: config: unsupported UserAccessProviderType %q", c.UserAccessProviderType)
 		}
 	}
-	if c.IngressEnabled {
+	if !c.IngressOptedOut() {
 		if c.MaxIngressRules <= 0 {
 			return fmt.Errorf("bridge: config: MaxIngressRules must be positive when ingress is enabled")
 		}

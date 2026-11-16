@@ -481,13 +481,14 @@ func TestIngressIntegration_DialRefusedClosesClient(t *testing.T) {
 }
 
 // TestIngressIntegration_ReconcileAppliesTheBlock wires the manager to a real
-// Reconciler: a pulled block opens its ports, a changed block moves them, and
-// an absent block closes them.
+// Reconciler: a pulled block opens its ports, a changed block moves them, an
+// absent block closes them, and so does the same rules' block once it no
+// longer enables public ingress.
 func TestIngressIntegration_ReconcileAppliesTheBlock(t *testing.T) {
 	ctrl := newLoopbackIngressController(t)
 	mgr, _ := newActiveIngressManager(t, ctrl)
 	block := func(rules ...api.IngressRule) *api.NodeStateSnapshot {
-		return &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Rules: rules}}}
+		return &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Enabled: true, Rules: rules}}}
 	}
 	fetcher := &integrationStateFetcher{state: block(ingressRule("one", 7022, "", 9000))}
 
@@ -510,9 +511,30 @@ func TestIngressIntegration_ReconcileAppliesTheBlock(t *testing.T) {
 	rec.TriggerReconcile()
 	waitForCondition(t, 2*time.Second, func() bool { return len(ctrl.ingressCallsFor("Close")) == 3 })
 
+	enabled := block(ingressRule("two", 7023, "", 9000), ingressRule("three", 7024, "", 9000))
+	fetcher.setState(enabled)
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool { return len(ctrl.ingressCallsFor("Listen")) == 5 })
+	opened := []string{ctrl.addr(7023), ctrl.addr(7024)}
+
+	notEnabled := *enabled.Bridge.Ingress
+	notEnabled.Enabled = false
+	fetcher.setState(&api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &notEnabled}})
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool { return len(ctrl.ingressCallsFor("Close")) == 5 })
+	for _, addr := range opened {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			_ = conn.Close()
+		}
+		if !errors.Is(err, errConnRefused) {
+			t.Errorf("dial %s after the block stopped enabling ingress = %v, want it refused", addr, err)
+		}
+	}
+
 	cancel()
 	<-done
-	if got := ctrl.listenAddrs(); strings.Join(got, " ") != ":7022 :7023 :7024" {
+	if got := ctrl.listenAddrs(); strings.Join(got, " ") != ":7022 :7023 :7024 :7023 :7024" {
 		t.Errorf("Listen addresses = %v", got)
 	}
 }

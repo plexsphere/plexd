@@ -18,12 +18,14 @@ import (
 // IngressManager tests
 // ---------------------------------------------------------------------------
 
+// ingressTestConfig returns a bridge config whose ingress_enabled is set to
+// enabled, so ingressTestConfig(false) is the opted-out bridge.
 func ingressTestConfig(enabled bool) Config {
 	cfg := Config{
 		Enabled:         true,
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  enabled,
+		IngressEnabled:  BoolPtr(enabled),
 	}
 	cfg.ApplyDefaults()
 	return cfg
@@ -444,6 +446,18 @@ func TestIngressManager_IngressCapabilities(t *testing.T) {
 		}
 	})
 
+	// A bridge that sets no ingress_enabled serves public ingress.
+	t.Run("unset", func(t *testing.T) {
+		cfg := ingressTestConfig(true)
+		cfg.IngressEnabled = nil
+		mgr := buildIngressFixture(t, &mockIngressController{}, cfg).mgr
+
+		caps := mgr.IngressCapabilities()
+		if caps["ingress"] != "true" {
+			t.Errorf("ingress = %q with ingress_enabled unset, want %q", caps["ingress"], "true")
+		}
+	})
+
 	t.Run("disabled", func(t *testing.T) {
 		mgr := buildIngressFixture(t, &mockIngressController{}, ingressTestConfig(false)).mgr
 
@@ -458,7 +472,7 @@ func TestIngressManager_IngressCapabilities(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIngressReconcileHandler(t *testing.T) {
-	withRules := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Rules: fourRules()}}}
+	withRules := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Enabled: true, Rules: fourRules()}}}
 
 	t.Run("nil snapshot", func(t *testing.T) {
 		ctrl := newLoopbackIngressController(t)
@@ -476,8 +490,9 @@ func TestIngressReconcileHandler(t *testing.T) {
 	})
 
 	withACME := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{
-		Rules: append(fourRules(), acmeRule("acme", 8443, "acme.example.com", 9445)),
-		ACME:  testACME,
+		Enabled: true,
+		Rules:   append(fourRules(), acmeRule("acme", 8443, "acme.example.com", 9445)),
+		ACME:    testACME,
 	}}}
 	for name, desired := range map[string]*api.NodeStateSnapshot{
 		"nil Bridge":  {},
@@ -511,8 +526,9 @@ func TestIngressReconcileHandler(t *testing.T) {
 		handler := IngressReconcileHandler(fx.mgr, discardLogger())
 
 		invalid := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{
-			Rules: withACME.Bridge.Ingress.Rules,
-			ACME:  &api.IngressACME{DirectoryURL: "http://ca.example/dir"},
+			Enabled: true,
+			Rules:   withACME.Bridge.Ingress.Rules,
+			ACME:    &api.IngressACME{DirectoryURL: "http://ca.example/dir"},
 		}}}
 		if err := handler(t.Context(), invalid, reconcile.StateDiff{}); err != nil {
 			t.Fatalf("handler: %v", err)
@@ -544,6 +560,117 @@ func TestIngressReconcileHandler(t *testing.T) {
 		}
 		if got := logLines(logs, `msg="ingress reconcile: apply failed"`); got != 1 {
 			t.Errorf("%d 'apply failed' lines, want 1:\n%s", got, logs.String())
+		}
+	})
+
+	notEnabled := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Rules: fourRules()}}}
+	bridgeChanged := reconcile.StateDiff{BridgeChanged: true}
+
+	t.Run("not enabled", func(t *testing.T) {
+		const warn = `msg="ingress: the state pull carries rules but does not enable public ingress, closing every listener"`
+		ctrl := newLoopbackIngressController(t)
+		mgr, _ := newActiveIngressManager(t, ctrl)
+		logger, logs := newRelayLogger()
+		handler := IngressReconcileHandler(mgr, logger)
+
+		if err := handler(t.Context(), withRules, bridgeChanged); err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		if got := len(mgr.RuleStates()); got != 4 {
+			t.Fatalf("%d rule states after the enabled block, want 4", got)
+		}
+		addrs := []string{ctrl.addr(443), ctrl.addr(7022)}
+
+		if err := handler(t.Context(), notEnabled, bridgeChanged); err != nil {
+			t.Fatalf("handler(not enabled): %v", err)
+		}
+		if got := len(mgr.RuleStates()); got != 0 {
+			t.Errorf("%d rule states after the block that does not enable ingress, want 0", got)
+		}
+		if got := len(ctrl.ingressCallsFor("Close")); got != 2 {
+			t.Errorf("Close calls = %d, want 2", got)
+		}
+		for _, addr := range addrs {
+			if conn, err := net.Dial("tcp", addr); err == nil {
+				_ = conn.Close()
+				t.Errorf("dial %s succeeded after the block that does not enable ingress", addr)
+			}
+		}
+		if got := logLines(logs, "level=WARN", warn, "component=bridge", "rules=4"); got != 1 {
+			t.Errorf("%d not-enabled Warn lines with rules=4, want 1:\n%s", got, logs.String())
+		}
+
+		// A cycle without bridge drift, run for a peer or policy change,
+		// applies the block again without another Warn.
+		if err := handler(t.Context(), notEnabled, reconcile.StateDiff{}); err != nil {
+			t.Fatalf("handler(not enabled, no bridge drift): %v", err)
+		}
+		if got := logLines(logs, warn); got != 1 {
+			t.Errorf("%d not-enabled Warn lines after a cycle without bridge drift, want still 1:\n%s", got, logs.String())
+		}
+	})
+
+	t.Run("not enabled, no rules", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		mgr, _ := newActiveIngressManager(t, ctrl)
+		logger, logs := newRelayLogger()
+		handler := IngressReconcileHandler(mgr, logger)
+
+		if err := handler(t.Context(), withRules, bridgeChanged); err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		empty := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Rules: []api.IngressRule{}}}}
+		if err := handler(t.Context(), empty, bridgeChanged); err != nil {
+			t.Fatalf("handler(not enabled, no rules): %v", err)
+		}
+		if got := len(mgr.RuleStates()); got != 0 {
+			t.Errorf("%d rule states, want none", got)
+		}
+		if got := len(ctrl.ingressCallsFor("Close")); got != 2 {
+			t.Errorf("Close calls = %d, want 2: the zero block closes every listener", got)
+		}
+		if got := logLines(logs, "level=WARN"); got != 0 {
+			t.Errorf("%d Warn lines for a block without rules, want 0:\n%s", got, logs.String())
+		}
+	})
+
+	t.Run("opted out", func(t *testing.T) {
+		logger, logs := newRelayLogger()
+		handler := IngressReconcileHandler(nil, logger)
+
+		if err := handler(t.Context(), withRules, bridgeChanged); err != nil {
+			t.Fatalf("handler = %v, want nil", err)
+		}
+		const warn = `msg="ingress: the control plane enables public ingress, but bridge.ingress_enabled is false"`
+		if got := logLines(logs, "level=WARN", warn, "component=bridge", "rules=4"); got != 1 {
+			t.Errorf("%d opted-out Warn lines with rules=4, want 1:\n%s", got, logs.String())
+		}
+		if got := logLines(logs); got != 1 {
+			t.Errorf("%d log lines, want only the Warn:\n%s", got, logs.String())
+		}
+
+		for _, tc := range []struct {
+			name    string
+			desired *api.NodeStateSnapshot
+			diff    reconcile.StateDiff
+		}{
+			{"nil snapshot", nil, bridgeChanged},
+			{"nil Bridge", &api.NodeStateSnapshot{}, bridgeChanged},
+			{"nil Ingress", &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{}}, bridgeChanged},
+			{"not enabled with rules", notEnabled, bridgeChanged},
+			{"enabled without rules", &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{Enabled: true}}}, bridgeChanged},
+			{"enabled with rules, no bridge drift", withRules, reconcile.StateDiff{}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				logger, logs := newRelayLogger()
+				handler := IngressReconcileHandler(nil, logger)
+				if err := handler(t.Context(), tc.desired, tc.diff); err != nil {
+					t.Errorf("handler = %v, want nil", err)
+				}
+				if got := logs.String(); got != "" {
+					t.Errorf("logs = %q, want none", got)
+				}
+			})
 		}
 	})
 }

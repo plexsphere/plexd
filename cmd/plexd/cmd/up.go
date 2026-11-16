@@ -587,9 +587,12 @@ func runAgent(ctx context.Context) error {
 		}
 
 		// Ingress manager, with the ACME account its acme rules share and the
-		// fetch of its terminate rules' certificates. The state pull configures
-		// the account; it holds none until a block names an acme rule.
-		if cfg.Bridge.IngressEnabled {
+		// fetch of its terminate rules' certificates, unless the node opts out
+		// with bridge.ingress_enabled: false. An opted-out bridge builds
+		// neither manager, so nothing in this process can bind a public port,
+		// whatever the pull says. The state pull configures the account; it
+		// holds none until a block names an acme rule.
+		if !cfg.Bridge.IngressOptedOut() {
 			acmeDir := cfg.Bridge.ACMECacheDir
 			if acmeDir == "" {
 				acmeDir = filepath.Join(cfg.DataDir, "acme")
@@ -605,6 +608,10 @@ func runAgent(ctx context.Context) error {
 			if err := ingressMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: ingress setup: %w", err)
 			}
+		} else {
+			logger.Info("public ingress: opted out by bridge.ingress_enabled, no public listener is opened",
+				"component", "bridge",
+			)
 		}
 
 		// User access manager.
@@ -627,7 +634,7 @@ func runAgent(ctx context.Context) error {
 
 		logger.Info("bridge subsystem initialized",
 			"relay", cfg.Bridge.RelayEnabled,
-			"ingress", cfg.Bridge.IngressEnabled,
+			"ingress", !cfg.Bridge.IngressOptedOut(),
 			"user_access", cfg.Bridge.UserAccessEnabled,
 			"site_to_site", cfg.Bridge.SiteToSiteEnabled,
 		)
@@ -1124,7 +1131,10 @@ func runAgent(ctx context.Context) error {
 	// whenever bridge mode does: the state pull starts and stops the relay,
 	// and with local consent off (a nil relay) the handler says that the
 	// control plane asks for one. It records the relay's state on the
-	// manager's tracker, which the reporter of step 17d sends.
+	// manager's tracker, which the reporter of step 17d sends. The ingress
+	// handler runs whenever bridge mode does as well: it serves the block the
+	// pull enables, and on a bridge that opts out of public ingress (a nil
+	// ingress manager) it only says that the control plane enables rules.
 	if bridgeMgr != nil {
 		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
@@ -1132,8 +1142,8 @@ func runAgent(ctx context.Context) error {
 			// which reports no drift, so the inventory reaches the manager on
 			// every successful pull, ahead of the reconcile handlers.
 			reconciler.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
-			reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		}
+		reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		if userAccessMgr != nil {
 			reconciler.RegisterHandler(bridge.UserAccessReconcileHandler(userAccessMgr, logger))
 		}
@@ -1286,20 +1296,32 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
-	// 17d. Start the relay status reporter on a bridge. It sends what the
-	// relay handler records on the tracker from a goroutine of its own, so a
-	// slow control plane never delays a reconcile cycle, and it ticks at the
-	// heartbeat's interval because the control plane keeps a report in force
-	// only while it is repeated within three of them. It does not wait for
-	// wgReady: the relay binds a UDP socket of its own and needs no WireGuard
-	// device. Cancelling ctx makes it send a last stopped report, bounded by
-	// 5 s, and the wg.Wait of the shutdown sequence waits for it.
+	// 17d. Start the relay and ingress status reporters on a bridge. The relay
+	// status reporter sends what the relay handler records on the tracker from
+	// a goroutine of its own, so a slow control plane never delays a reconcile
+	// cycle, and it ticks at the heartbeat's interval because the control plane
+	// keeps a report in force only while it is repeated within three of them.
+	// It does not wait for wgReady: the relay binds a UDP socket of its own and
+	// needs no WireGuard device. Cancelling ctx makes it send a last stopped
+	// report, bounded by 5 s, and the wg.Wait of the shutdown sequence waits
+	// for it. The ingress status reporter sends whether this bridge opts out
+	// of public ingress, at once and then at the heartbeat's interval, and
+	// sends nothing at shutdown: the control plane keeps the report, and what
+	// it says never gates what the ingress handler serves. A node outside
+	// bridge mode starts neither.
 	if bridgeMgr != nil {
 		relayStatusReporter := bridge.NewRelayStatusReporter(statusInterval, identity.NodeID, client, bridgeMgr.RelayStatusTracker(), logger)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			_ = relayStatusReporter.Run(ctx)
+		}()
+
+		ingressStatusReporter := bridge.NewIngressStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.IngressOptedOut(), logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ingressStatusReporter.Run(ctx)
 		}()
 	}
 

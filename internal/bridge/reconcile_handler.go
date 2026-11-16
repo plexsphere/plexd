@@ -91,20 +91,65 @@ func IngressSecretInventoryHandler(mgr *IngressManager) reconcile.DispatchHandle
 	}
 }
 
-// IngressReconcileHandler returns a reconcile.ReconcileHandler that applies
-// the desired bridge.ingress block whole, its acme member included. A nil
-// Bridge or nil Ingress child applies the zero block, which closes every
-// listener. A failed bind fails the reconcile cycle, so the reconciler keeps
-// its snapshot and the next pull tries the bind again.
+// IngressReconcileHandler returns a reconcile.ReconcileHandler that serves the
+// desired bridge.ingress block whole, its acme member included, when the block
+// enables public ingress. mgr is nil when the node opts out of public ingress,
+// bridge.ingress_enabled: false. A nil snapshot changes nothing.
+//
+// With a manager, a block with Enabled true is applied. A nil Bridge or nil
+// Ingress child applies the zero block, which closes every listener, and so
+// does a block with Enabled false, which is also what a block without the
+// member decodes to. A block with Enabled false that carries rules is logged
+// as a Warn naming how many before the zero block is applied. A failed bind
+// fails the reconcile cycle, so the reconciler keeps its snapshot and the next
+// pull tries the bind again.
+//
+// Without a manager the handler touches nothing and returns nil. A block with
+// Enabled true and at least one rule is logged as a Warn naming how many rules
+// the local opt-out leaves unserved.
+//
+// Both Warn lines are logged only when diff.BridgeChanged is set: the
+// reconciler invokes every handler on any drift, peers and policy included,
+// and an ungated Warn would repeat on each such cycle. Each is logged once per
+// change of the pulled bridge block, which includes the first pull after every
+// start, since the reconciler's snapshot starts empty. A cycle that fails
+// keeps the old snapshot, so the next pull logs it again. Applying the zero
+// block is not gated.
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(ctx context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
 		if desired == nil {
 			return nil
 		}
 
+		var pulled *api.IngressConfig
+		if desired.Bridge != nil {
+			pulled = desired.Bridge.Ingress
+		}
+		var rules int
+		if pulled != nil {
+			rules = len(pulled.Rules)
+		}
+
+		if mgr == nil {
+			if pulled != nil && pulled.Enabled && rules > 0 && diff.BridgeChanged {
+				logger.Warn("ingress: the control plane enables public ingress, but bridge.ingress_enabled is false",
+					"component", "bridge",
+					"rules", rules,
+				)
+			}
+			return nil
+		}
+
+		// The zero block closes every listener.
 		var block api.IngressConfig
-		if desired.Bridge != nil && desired.Bridge.Ingress != nil {
-			block = *desired.Bridge.Ingress
+		switch {
+		case pulled != nil && pulled.Enabled:
+			block = *pulled
+		case rules > 0 && diff.BridgeChanged:
+			logger.Warn("ingress: the state pull carries rules but does not enable public ingress, closing every listener",
+				"component", "bridge",
+				"rules", rules,
+			)
 		}
 
 		if err := mgr.Apply(ctx, block); err != nil {

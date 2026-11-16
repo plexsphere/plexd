@@ -490,11 +490,59 @@ bridge:
 	if !found {
 		t.Error("found = false, want true for an existing file")
 	}
-	if !cfg.Bridge.IngressEnabled {
-		t.Error("Bridge.IngressEnabled = false, want true")
+	if cfg.Bridge.IngressEnabled == nil || !*cfg.Bridge.IngressEnabled {
+		t.Errorf("Bridge.IngressEnabled = %v, want a pointer to true", cfg.Bridge.IngressEnabled)
 	}
 	if err := cfg.Bridge.Validate(); err != nil {
 		t.Errorf("Bridge.Validate() = %v, want nil", err)
+	}
+}
+
+// TestParseConfig_BridgeIngressSwitch pins bridge.ingress_enabled through the
+// whole load. A bridge that sets no key serves public ingress, and
+// `ingress_enabled: false` is the host operator's only way to keep the host
+// closed, so it must survive defaulting exactly as written. A node outside
+// bridge mode carries no key and must load.
+func TestParseConfig_BridgeIngressSwitch(t *testing.T) {
+	const bridgeBlock = `
+api:
+  base_url: https://example.com
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth1
+  access_subnets: ["10.0.0.0/24"]
+`
+	tests := []struct {
+		name         string
+		yaml         string
+		wantNil      bool
+		wantOptedOut bool
+	}{
+		{name: "no ingress_enabled key", yaml: bridgeBlock, wantNil: true, wantOptedOut: false},
+		{name: "ingress_enabled false", yaml: bridgeBlock + "  ingress_enabled: false\n", wantOptedOut: true},
+		{name: "ingress_enabled true", yaml: bridgeBlock + "  ingress_enabled: true\n", wantOptedOut: false},
+		{name: "mode node without a bridge block", yaml: "api:\n  base_url: https://example.com\nmode: node\n", wantNil: true, wantOptedOut: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, found, err := ParseConfig(writeTemp(t, tt.yaml))
+			if err != nil {
+				t.Fatalf("ParseConfig: %v", err)
+			}
+			if !found {
+				t.Error("found = false, want true for an existing file")
+			}
+			if got := cfg.Bridge.IngressEnabled == nil; got != tt.wantNil {
+				t.Errorf("Bridge.IngressEnabled == nil is %v, want %v", got, tt.wantNil)
+			}
+			if got := cfg.Bridge.IngressOptedOut(); got != tt.wantOptedOut {
+				t.Errorf("Bridge.IngressOptedOut() = %v, want %v", got, tt.wantOptedOut)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
 	}
 }
 
