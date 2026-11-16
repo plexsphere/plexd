@@ -1239,6 +1239,39 @@ type RelayStatusResponse struct {
 }
 
 // ---------------------------------------------------------------------------
+// Ingress Status  PUT /v1/nodes/{node_id}/ingress-status
+// ---------------------------------------------------------------------------
+
+// Ingress states of an IngressStatusRequest.
+const (
+	// IngressStateEnabled marks a bridge whose local configuration serves the
+	// public ingress rules the state pull enables.
+	IngressStateEnabled = "enabled"
+	// IngressStateOptedOut marks a bridge whose local configuration,
+	// bridge.ingress_enabled: false, rules public ingress out: it opens no
+	// public listener whatever the pull says.
+	IngressStateOptedOut = "opted_out"
+)
+
+// IngressStatusRequest is the body of PUT /v1/nodes/{node_id}/ingress-status:
+// whether the bridge's local configuration serves public ingress. The control
+// plane keeps the latest report per node and never ages it, and refuses
+// ingress rule creates and updates on the bridge while it reads opted_out. A
+// missing, null or unknown state, an unknown member and data after the report
+// answer 400 malformed_ingress_status.
+type IngressStatusRequest struct {
+	// State is one of the IngressState* constants.
+	State string `json:"state"`
+}
+
+// IngressStatusResponse is the 200 body of
+// PUT /v1/nodes/{node_id}/ingress-status.
+type IngressStatusResponse struct {
+	// AcceptedAt is the server receive time of the report.
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// ---------------------------------------------------------------------------
 // Policy Status  PUT /v1/nodes/{node_id}/policy-status
 // ---------------------------------------------------------------------------
 
@@ -1596,7 +1629,12 @@ type UserAccessInfo struct {
 // IngressConfig is the bridge.ingress block of the state pull, the control
 // plane's NodeStateBridgeIngress.
 type IngressConfig struct {
-	Rules []IngressRule `json:"rules"`
+	// Enabled is the control plane's switch: a bridge serves Rules only when
+	// it is true and its local configuration does not opt out. A block
+	// without the member decodes to false and opens no public listener. The
+	// control plane sends true on every block it delivers.
+	Enabled bool          `json:"enabled"`
+	Rules   []IngressRule `json:"rules"`
 	// ACME is the account the block's acme rules share, the control plane's
 	// NodeStateBridgeIngressACME. It is present exactly when a rule has mode
 	// acme.

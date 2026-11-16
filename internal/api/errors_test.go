@@ -852,6 +852,34 @@ func TestIsRelayStatusNotServed(t *testing.T) {
 	}
 }
 
+func TestIsIngressStatusNotServed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// An older control plane has no route, so its router's 404 carries
+		// whatever code its not-found handler writes, or none.
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"404 with a router code", &APIError{StatusCode: 404, Code: "not_found"}, true},
+		{"wrapped 404", fmt.Errorf("report ingress status: %w", &APIError{StatusCode: 404}), true},
+		{"501 with the provisioning code", &APIError{StatusCode: 501, Code: "ingress_status_not_provisioned"}, true},
+		{"404 ingress_status_node_gone is a verdict on the node", &APIError{StatusCode: 404, Code: "ingress_status_node_gone"}, false},
+		{"501 with another surface's code", &APIError{StatusCode: 501, Code: "relay_status_not_provisioned"}, false},
+		{"500 internal", &APIError{StatusCode: 500, Code: "internal"}, false},
+		{"400 malformed_ingress_status", &APIError{StatusCode: 400, Code: "malformed_ingress_status"}, false},
+		{"io.EOF", io.EOF, false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsIngressStatusNotServed(tt.err); got != tt.want {
+				t.Errorf("IsIngressStatusNotServed(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsPolicyStatusNotServed(t *testing.T) {
 	tests := []struct {
 		name string

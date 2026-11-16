@@ -2020,6 +2020,7 @@ func TestTypesUserAccessInfo(t *testing.T) {
 
 func TestIngressConfig_JSONRoundTrip(t *testing.T) {
 	orig := IngressConfig{
+		Enabled: true,
 		Rules: []IngressRule{
 			{
 				ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
@@ -2049,11 +2050,10 @@ func TestIngressConfig_JSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := raw["rules"]; !ok {
-		t.Error(`expected JSON key "rules"`)
-	}
-	if _, ok := raw["enabled"]; ok {
-		t.Errorf(`unexpected JSON key "enabled", got: %s`, data)
+	for _, key := range []string{"enabled", "rules"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q, got: %s", key, data)
+		}
 	}
 }
 
@@ -2102,11 +2102,12 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 }
 
 // TestIngressConfig_DecodesContractBlock decodes the example block of the
-// agent contract's Public ingress section (plexsphere/plexsphere@54a9393,
+// agent contract's Public ingress section (plexsphere/plexsphere@8458a7d,
 // docs/reference/api/plexd-agent-contract.md).
 func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	const block = `{
   "ingress": {
+    "enabled": true,
     "rules": [
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
@@ -2162,6 +2163,9 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	if bridge.Ingress == nil {
 		t.Fatal("Ingress is nil")
 	}
+	if !bridge.Ingress.Enabled {
+		t.Error("Ingress.Enabled = false, want true")
+	}
 	want := []IngressRule{
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
@@ -2205,6 +2209,30 @@ func TestIngressConfig_ACMEAndSecretNamePresence(t *testing.T) {
 		if strings.Contains(string(out), key) {
 			t.Errorf("marshalled block %s carries %s, want no such key", out, key)
 		}
+	}
+}
+
+// TestIngressConfig_EnabledPresence decodes a block without enabled and one
+// with "enabled": false into a false Enabled, which opens no public listener,
+// and marshals the zero block with "enabled":false: the member is never
+// omitted.
+func TestIngressConfig_EnabledPresence(t *testing.T) {
+	for _, body := range []string{`{"rules":[]}`, `{"enabled":false,"rules":[]}`} {
+		var cfg IngressConfig
+		if err := json.Unmarshal([]byte(body), &cfg); err != nil {
+			t.Fatalf("decode %s: %v", body, err)
+		}
+		if cfg.Enabled {
+			t.Errorf("decode %s: Enabled = true, want false", body)
+		}
+	}
+
+	out, err := json.Marshal(IngressConfig{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `"enabled":false`) {
+		t.Errorf("marshalled zero block %s, want it to carry \"enabled\":false", out)
 	}
 }
 

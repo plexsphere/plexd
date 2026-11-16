@@ -1342,6 +1342,166 @@ func TestReportRelayStatus_PathParametersEscaped(t *testing.T) {
 	}
 }
 
+// testIngressStatusAccepted is a 200 body of PUT /v1/nodes/{node_id}/ingress-status.
+const testIngressStatusAccepted = `{"accepted_at":"2026-11-16T10:15:30.123Z"}`
+
+func TestReportIngressStatus_Success(t *testing.T) {
+	for _, state := range []string{IngressStateOptedOut, IngressStateEnabled} {
+		t.Run(state, func(t *testing.T) {
+			var gotMethod, gotPath, gotContentType, gotAuth string
+			var gotBody []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotContentType = r.Header.Get("Content-Type")
+				gotAuth = r.Header.Get("Authorization")
+				var err error
+				if gotBody, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, testIngressStatusAccepted)
+			})
+
+			resp, err := client.ReportIngressStatus(context.Background(), "node-1", IngressStatusRequest{State: state})
+			if err != nil {
+				t.Fatalf("ReportIngressStatus: %v", err)
+			}
+
+			if gotMethod != http.MethodPut {
+				t.Errorf("method = %s, want PUT", gotMethod)
+			}
+			if gotPath != "/v1/nodes/node-1/ingress-status" {
+				t.Errorf("path = %s, want /v1/nodes/node-1/ingress-status", gotPath)
+			}
+			if gotContentType != "application/json" {
+				t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+			}
+			if gotAuth != "Bearer test-token" {
+				t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+			}
+
+			wantBody := `{"state":"` + state + `"}`
+			if got := strings.TrimSpace(string(gotBody)); got != wantBody {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, wantBody)
+			}
+
+			wantAcceptedAt := time.Date(2026, 11, 16, 10, 15, 30, 123_000_000, time.UTC)
+			if !resp.AcceptedAt.Equal(wantAcceptedAt) {
+				t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, wantAcceptedAt)
+			}
+		})
+	}
+}
+
+// A refusal must survive the client's error mapping in the shape the reporter
+// reads: the problem code of a 400, and the bare 404 an older router writes
+// with no body, which IsIngressStatusNotServed takes for a missing surface.
+func TestReportIngressStatus_ErrorAnswers(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		contentType   string
+		body          string
+		wantCode      string
+		wantNotServed bool
+	}{
+		{"400 malformed_ingress_status", http.StatusBadRequest,
+			"application/problem+json", `{"title":"Bad Request","status":400,"detail":"state is not one of enabled and opted_out","code":"malformed_ingress_status"}`,
+			"malformed_ingress_status", false},
+		{"404 with an empty body", http.StatusNotFound,
+			"", "",
+			"", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			resp, err := client.ReportIngressStatus(context.Background(), "node-1", IngressStatusRequest{State: IngressStateEnabled})
+			if resp != nil {
+				t.Errorf("response = %+v, want nil", resp)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("errors.As failed to extract *APIError: %v", err)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", apiErr.Code, tt.wantCode)
+			}
+			if got := IsIngressStatusNotServed(err); got != tt.wantNotServed {
+				t.Errorf("IsIngressStatusNotServed(%v) = %v, want %v", err, got, tt.wantNotServed)
+			}
+		})
+	}
+}
+
+// The reporter's context ends at shutdown, possibly while a report waits on
+// a slow control plane. The call must end with it and say why.
+func TestReportIngressStatus_ContextCanceled(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	client, _ := newEndpointTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		// The server watches the connection for the client hanging up only
+		// once the request body is read, so the handler reads it before it
+		// waits, as in TestReportRelayStatus_ContextCanceled.
+		_, _ = io.Copy(io.Discard, r.Body)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(backstopContext(t))
+	defer cancel()
+	go func() {
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	resp, err := client.ReportIngressStatus(ctx, "node-1", IngressStatusRequest{State: IngressStateOptedOut})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want %v", err, context.Canceled)
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+}
+
+func TestReportIngressStatus_PathParametersEscaped(t *testing.T) {
+	// Verify the nodeID is escaped, so it cannot climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testIngressStatusAccepted)
+	})
+
+	_, err := client.ReportIngressStatus(context.Background(), "../../../etc/passwd", IngressStatusRequest{State: IngressStateEnabled})
+	if err != nil {
+		t.Fatalf("ReportIngressStatus: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/ingress-status"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 // testPolicyStatusAccepted is a 200 body of PUT /v1/nodes/{node_id}/policy-status.
 const testPolicyStatusAccepted = `{"accepted_at":"2026-11-13T10:15:30.123Z","status":"applied"}`
 

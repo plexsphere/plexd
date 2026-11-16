@@ -242,6 +242,22 @@ func (c *ControlPlane) ReportRelayStatus(ctx context.Context, nodeID string, req
 	return &resp, nil
 }
 
+// ReportIngressStatus reports whether the bridge's local configuration serves
+// public ingress and returns the control plane's receipt.
+//
+// It validates nothing and sends the request as passed: the ingress status
+// reporter sends only the two states the contract admits, and the control
+// plane refuses any other with 400 malformed_ingress_status.
+// PUT /v1/nodes/{node_id}/ingress-status
+func (c *ControlPlane) ReportIngressStatus(ctx context.Context, nodeID string, req IngressStatusRequest) (*IngressStatusResponse, error) {
+	var resp IngressStatusResponse
+	path := fmt.Sprintf("/v1/nodes/%s/ingress-status", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPut, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ReportPolicyStatus reports what the node did with the policy block of its
 // pulls and returns the control plane's receipt.
 //
