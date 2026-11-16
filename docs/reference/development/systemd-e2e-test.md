@@ -6,7 +6,7 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, then verifies clean shutdown.
 
 ## Container Topology
 
@@ -17,6 +17,13 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 │  :8443 (TLS) │       │  systemd PID 1          │◄──────│  :9022 (banner)      │
 │  /v1/health  │       │  plexd.service managed  │ probes│  openssl, nc         │
 └──────────────┘       └─────────────────────────┘       └──────────────────────┘
+        │                   │ ACME          ▲                       │
+        │                   ▼               │ TLS-ALPN-01 on :443   │
+        │              ┌─────────────────────────┐                  │
+        │              │   pebble                │                  │
+        │              │  :14000 (ACME, HTTPS)   │                  │
+        │              │  Let's Encrypt test CA  │                  │
+        │              └─────────────────────────┘                  │
         │                          │                                │
         └──────────────────── plexd-systemd-e2e ────────────────────┘
                               (Docker network)
@@ -27,6 +34,7 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 | `plexd-e2e-mockapi` | `mockapi:e2e-systemd` | `test/e2e/mockapi/Dockerfile` | Fixture-based mock Central API, tracks call counters, answers DNS on port 53 |
 | `plexd-e2e-systemd` | `plexd-systemd:e2e` | `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 with systemd as PID 1, runs plexd as a real service |
 | `plexd-e2e-ingress-target` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | Alpine with `openssl` and `netcat-openbsd`; started by phase 16, serves the ingress rules' targets and runs the probes |
+| `plexd-e2e-pebble` | `ghcr.io/letsencrypt/pebble:2.10.3`, pinned by digest | Pebble's release image, with `test/e2e/systemd/pebble-config.json` mounted | Pebble, Let's Encrypt's test CA; started by phase 16 with the network alias `pebble`, issues the certificate of the `acme` rule after it validated the bridge over TLS-ALPN-01 on port 443 |
 
 The systemd image installs `dbus` and `systemd-resolved` next to `systemd`, `systemd-sysv`, `curl`, `ca-certificates`, `jq`, `openssh-client`, and `sshpass`. Both install enabled, so the container boots with a system bus and its own systemd-resolved, which plexd registers its mesh DNS resolver with. Docker mounts its own `/etc/resolv.conf` (`nameserver 127.0.0.11`) over the one the package would link, so systemd-resolved runs in foreign mode with Docker's DNS as its global server, `nsswitch.conf` keeps `hosts: files dns`, and the mesh DNS phases ask systemd-resolved directly with `resolvectl`. Every `resolvectl` call runs inside the container through `docker exec` and reaches the container's systemd-resolved, never the host's.
 
@@ -46,7 +54,7 @@ Builds the mock-api image, the systemd container image, and cross-compiles the p
 
 ### 4. Network and container startup
 
-Creates a Docker bridge network and starts both containers on it. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
+Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
 
 ### 5. Service installation
 
@@ -127,25 +135,36 @@ The phase reads `/etc/plexd/config.yaml`, fails if a line already starts with `d
 
 ### 16. Public ingress on a bridge
 
-The phase turns the node into a bridge that serves the `bridge.ingress` block of its state pull (see [Public Ingress](../bridge/public-ingress.md)). No other e2e suite runs bridge mode: the Docker suite's plexd container cannot write the forwarding sysctl without `--privileged`.
+The phase turns the node into a bridge that serves the `bridge.ingress` block of its state pull (see [Public Ingress](../bridge/public-ingress.md) and [ACME & SNI Routing](../bridge/acme-sni.md)). No other e2e suite runs bridge mode: the Docker suite's plexd container cannot write the forwarding sysctl without `--privileged`.
 
-1. **Target.** It builds `test/e2e/meshpeer/Dockerfile` as `plexd-ingress-target:e2e` and starts it as `plexd-e2e-ingress-target` on `plexd-systemd-e2e`. Inside it, `openssl req` creates self-signed certificates for `a.ingress.e2e.test`, `b.ingress.e2e.test` and `wild.ingress.e2e.test`, three `openssl s_server -4 -www` instances serve them on 9441, 9442 and 9443, and a loop of `printf 'plexd-e2e-banner\n' | nc -N -l 9022` writes the banner to each client first. The phase waits up to 10 seconds until `ss -ltn` shows all four ports.
-2. **Rules.** `configure_ingress <tag> <rules-json>` reads the live snapshot, sets `.bridge` to `{relay: null, user_access: null, ingress: {rules: <rules>}, site_to_site: null}`, or `ingress: null` for the rules `null`, posts it to `POST /test/configure-state`, and injects a `node_state_updated` event, the way `configure_sessions` configures its block. Every rule targets the target container's address:
+1. **Target.** It builds `test/e2e/meshpeer/Dockerfile` as `plexd-ingress-target:e2e` and starts it as `plexd-e2e-ingress-target` on `plexd-systemd-e2e`. Inside it, `openssl req` creates self-signed certificates for `a.ingress.e2e.test`, `b.ingress.e2e.test` and `wild.ingress.e2e.test`, three `openssl s_server -4 -www` instances serve them on 9441, 9442 and 9443, and a loop of `printf 'plexd-e2e-banner\n' | nc -N -l 9022` writes the banner to each client first. `openssl req` also creates the two versions of the terminate rule's certificate: self-signed EC P-256 certificates for one day with the subjects `/O=v1/CN=t.ingress.e2e.test` and `/O=v2/CN=t.ingress.e2e.test` and the subject alternative name `DNS:t.ingress.e2e.test`. The phase waits up to 10 seconds until `ss -ltn` shows all four ports.
+2. **Pebble.** It starts `ghcr.io/letsencrypt/pebble:2.10.3`, pinned by digest, as `plexd-e2e-pebble` on `plexd-systemd-e2e` with the network alias `pebble`, `--add-host acme.ingress.e2e.test:<bridge>`, `PEBBLE_VA_NOSLEEP=1` and `PEBBLE_WFE_NONCEREJECT=0`, and passes `-config /test/config/plexd-e2e.json`, where `test/e2e/systemd/pebble-config.json` is mounted read-only. That file is Pebble's default `test/config/pebble-config.json` with `"tlsPort": 443`, the port its validator dials for TLS-ALPN-01. The validator resolves `acme.ingress.e2e.test` through the `/etc/hosts` of its container, which `--add-host` points at the bridge. Pebble's listener certificate names `localhost` and `pebble`, so plexd reaches the directory as `https://pebble:14000/dir`. `PEBBLE_VA_NOSLEEP=1` drops the random wait before each validation, and `PEBBLE_WFE_NONCEREJECT=0` stops Pebble from rejecting valid nonces.
+3. **Test CA.** It streams `/test/certs/pebble.minica.pem` from the Pebble container into `/etc/plexd/` of the systemd container (`docker cp <pebble>:<file> - | docker cp - <systemd>:/etc/plexd/`, with no file on the host), fails if `/etc/plexd/environment` already exists, and writes `SSL_CERT_FILE=/etc/plexd/pebble.minica.pem` into it. The shipped unit reads that file through `EnvironmentFile=-/etc/plexd/environment` at each start, so the phase writes no drop-in and runs no `systemctl daemon-reload`. The CA stays out of the system trust store, as Pebble's README asks. `curl -sSf --cacert /etc/plexd/pebble.minica.pem https://pebble:14000/dir` in the systemd container must then print the directory within 30 seconds, which proves the name and the trust.
+4. **Secret.** It reads each version's certificate and key with `docker exec … cat` into one PEM document, the certificate first, and posts version 1 as the named Secret `tls-term` to `POST /test/configure-secrets` (`{"secrets": [{"name": "tls-term", "version": 1, "value": <pem>}]}`, see [the mock API server](mock-api-server.md)), which must answer `204`. Each later post replaces that set, so the mock serves one version of `tls-term` at a time.
+5. **Rules.** `configure_ingress <tag> <rules-json> [acme-json] [secrets-json]` reads the live snapshot, sets `.bridge` to `{relay: null, user_access: null, ingress: {rules: <rules>}, site_to_site: null}`, or `ingress: null` for the rules `null`, adds `acme-json` as `ingress.acme` when it is given and not empty, and replaces the snapshot's `.secrets` with `secrets-json` when it is given; without it the live inventory is kept. It posts the result to `POST /test/configure-state` and injects a `node_state_updated` event, the way `configure_sessions` configures its block. `ingress_rule` renders one rule and takes a Secret name as an optional seventh argument, which becomes `certificate_secret_name`. Every rule targets the target container's address, and the rules are listed in slug order, as the control plane lists them:
 
-   | Slug | Listen port | Mode | SNI host | Target port |
-   | --- | --- | --- | --- | --- |
-   | `plain` | 7022 | `passthrough` | none | 9022 |
-   | `tls-a` | 443 | `passthrough` | `a.ingress.e2e.test` | 9441 |
-   | `tls-b` | 443 | `passthrough` | `b.ingress.e2e.test` | 9442 |
-   | `tls-term` | 443 | `terminate` | `t.ingress.e2e.test` | 9441 |
-   | `tls-wild` | 443 | `passthrough` | `*.apps.ingress.e2e.test` | 9443 |
+   | Slug | Listen port | Mode | SNI host | Target port | Secret |
+   | --- | --- | --- | --- | --- | --- |
+   | `plain` | 7022 | `passthrough` | none | 9022 | none |
+   | `tls-a` | 443 | `passthrough` | `a.ingress.e2e.test` | 9441 | none |
+   | `tls-acme` | 443 | `acme` | `acme.ingress.e2e.test` | 9022 | none |
+   | `tls-b` | 443 | `passthrough` | `b.ingress.e2e.test` | 9442 | none |
+   | `tls-term` | 443 | `terminate` | `t.ingress.e2e.test` | 9022 | `tls-term` |
+   | `tls-wild` | 443 | `passthrough` | `*.apps.ingress.e2e.test` | 9443 | none |
 
-3. **Port floor.** It writes `1024` to `/proc/sys/net/ipv4/ip_unprivileged_port_start` in the systemd container and reads it back. Docker sets that floor to `0` in a container, which would hide a unit without `CAP_NET_BIND_SERVICE`.
-4. **Bridge mode.** It fails if `/etc/plexd/config.yaml` already has a line that starts with `mode:` or `bridge:`, appends the block below, and runs `systemctl restart plexd`.
-5. **Listeners.** Within 60 seconds the journal of the new process (`plexd[<MainPID>]:`) must hold `ingress listener opened` for `listen_port=443` and for `listen_port=7022`, exactly once each, `ingress manager started`, and `ingress rule not served` with `slug=tls-term` and `reason=mode_not_served`. The port floor must still read `1024`.
-6. **Routing.** From the target container, `openssl s_client -connect <bridge>:443 -servername <name>` piped into `openssl x509 -noout -subject` must print the certificate of `a.ingress.e2e.test` for `a.ingress.e2e.test`, of `b.ingress.e2e.test` for `b.ingress.e2e.test`, and of `wild.ingress.e2e.test` for `x.apps.ingress.e2e.test`. The names `t.ingress.e2e.test` (the terminate rule), `none.ingress.e2e.test` and `x.y.apps.ingress.e2e.test`, and a handshake with `-noservername`, must print no certificate. `nc -w 5 <bridge> 7022 </dev/null` must print `plexd-e2e-banner`: the bridge forwards the plain port without reading.
-7. **A changed rule.** It serves `tls-b` with target port 9441 and polls for up to 60 seconds until `b.ingress.e2e.test` receives the certificate of `a.ingress.e2e.test`. The journal must still hold one `ingress listener opened` line for 443: the table of the port changes without a second bind.
-8. **A removed block.** It serves `"ingress": null` and polls for up to 60 seconds until `nc -z` to 443 and to 7022 of the bridge are refused. The journal must hold `ingress listener closed` for both ports.
+   The first block carries `"acme": {"directory_url": "https://pebble:14000/dir"}` and the inventory `[{"name": "tls-term", "version": 1}]`. `tls-term` and `tls-acme` end TLS at the bridge and forward the plaintext to the banner server on 9022.
+6. **Port floor.** It writes `1024` to `/proc/sys/net/ipv4/ip_unprivileged_port_start` in the systemd container and reads it back. Docker sets that floor to `0` in a container, which would hide a unit without `CAP_NET_BIND_SERVICE`.
+7. **Bridge mode.** It fails if `/etc/plexd/config.yaml` already has a line that starts with `mode:` or `bridge:`, appends the block below, which accepts Pebble's directory alone, and runs `systemctl restart plexd`. That is the phase's only restart: Pebble, the test CA and the environment file are in place before it.
+8. **Listeners.** Within 60 seconds the journal of the new process (`plexd[<MainPID>]:`) must hold `ingress listener opened` for `listen_port=443` and for `listen_port=7022`, exactly once each, `ingress manager started`, and `ingress certificate loaded` with `secret=tls-term` and `version=1`. The new process must log no `ingress rule not served` line: every rule of the block, the terminate and the acme rule included, is served. The port floor must still read `1024`.
+9. **Termination.** From the target container, `timeout 10 openssl s_client -connect <bridge>:443 -servername t.ingress.e2e.test -ign_eof </dev/null` prints the handshake and then the plaintext the target wrote through the session; the banner server closes after writing, which ends the session. The certificate in that output, read with `openssl x509 -noout -subject`, must have the subject `O=v1, CN=t.ingress.e2e.test`, and the output must hold `plexd-e2e-banner`.
+10. **Rotation.** It posts version 2 and serves the same block with the inventory `[{"name": "tls-term", "version": 2}]`, so only the inventory of the pull changes, and polls for up to 60 seconds until a handshake with `t.ingress.e2e.test` shows the subject with `O=v2`.
+11. **A version that does not load.** It posts version 3 with the value `not a certificate` and lists it. Within 60 seconds the journal must hold `ingress certificate not loaded` with `secret=tls-term`, `version=3`, `reason=certificate_invalid` and `serving_version=2`, and a handshake must then still show `O=v2`.
+12. **An unlisted Secret.** It serves the inventory `[]` and polls for up to 60 seconds until the journal holds `ingress certificate dropped` with `secret=tls-term` and `reason=certificate_secret_not_listed` and a handshake with `t.ingress.e2e.test` yields no certificate.
+13. **ACME.** Within 120 seconds of the restart the journal must hold `ingress certificate obtained` with `sni_host=acme.ingress.e2e.test`: plexd obtained the certificate ahead of the first client, and Pebble validated the name over TLS-ALPN-01 on port 443 of the bridge. A session with `-servername acme.ingress.e2e.test`, run as in step 9, must show an issuer that contains `Pebble Intermediate CA` (`openssl x509 -noout -issuer`; Pebble's leaf certificates carry no subject CN), and its output must hold `plexd-e2e-banner`. `/var/lib/plexd/acme` in the systemd container, `<data_dir>/acme`, where `bridge.acme_cache_dir` points when it is not set, must hold the files `acme_account+key` and `acme.ingress.e2e.test`.
+14. **A directory outside the bound.** It serves the block with `"acme": {"directory_url": "https://other.invalid/dir"}`. Within 60 seconds the journal must hold `ingress rule not served` with `slug=tls-acme` and `reason=acme_directory_not_allowed`.
+15. **Routing.** `openssl s_client -connect <bridge>:443 -servername <name>` piped into `openssl x509 -noout -subject` must print the certificate of `a.ingress.e2e.test` for `a.ingress.e2e.test`, of `b.ingress.e2e.test` for `b.ingress.e2e.test`, and of `wild.ingress.e2e.test` for `x.apps.ingress.e2e.test`. The names `none.ingress.e2e.test` and `x.y.apps.ingress.e2e.test`, and a handshake with `-noservername`, must print no certificate. `nc -w 5 <bridge> 7022 </dev/null` must print `plexd-e2e-banner`: the bridge forwards the plain port without reading.
+16. **A changed rule.** It serves `tls-b` with target port 9441, names Pebble's directory again and keeps the inventory `[]`, and polls for up to 60 seconds until `b.ingress.e2e.test` receives the certificate of `a.ingress.e2e.test`. The journal must still hold one `ingress listener opened` line for 443: the table of the port changes without a second bind.
+17. **A removed block.** It serves `"ingress": null` and polls for up to 60 seconds until `nc -z` to 443 and to 7022 of the bridge are refused. The journal must hold `ingress listener closed` for both ports.
 
 The block phase 16 appends:
 
@@ -157,15 +176,16 @@ bridge:
   access_subnets: ["198.18.100.0/24"]
   enable_nat: false
   ingress_enabled: true
+  acme_directory_urls: ["https://pebble:14000/dir"]
 ```
 
 ### 17. Shutdown verification
 
-Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. It runs with the opt-out of phase 15 and the bridge mode of phase 16 in place.
+Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. It runs with the opt-out of phase 15 and the bridge mode and environment file of phase 16 in place.
 
 ### 18. Cleanup
 
-The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the three containers and the Docker network.
+The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the four containers and the Docker network.
 
 ## Assertion Logic
 
@@ -242,7 +262,7 @@ audit_fwd:
     tls_insecure_skip_verify: true
 ```
 
-The bootstrap token is written to `/etc/plexd/bootstrap-token` (mode 0600) before the service starts; no environment file is written.
+The bootstrap token is written to `/etc/plexd/bootstrap-token` (mode 0600) before the service starts. No environment file exists until phase 16 writes `/etc/plexd/environment` with `SSL_CERT_FILE=/etc/plexd/pebble.minica.pem`, which the unit reads through `EnvironmentFile=-/etc/plexd/environment`.
 
 The config sets no `dns` key, so the mesh DNS resolver runs with its defaults, enabled on port 5354, until phase 15 appends:
 
@@ -333,20 +353,26 @@ Common causes:
 **An ingress probe fails:**
 
 ```bash
-docker exec plexd-e2e-systemd journalctl -u plexd --no-pager | grep -E 'ingress|bridge'
+docker exec plexd-e2e-systemd journalctl -u plexd --no-pager | grep -E 'ingress|bridge|acme'
 docker exec plexd-e2e-ingress-target ss -ltn
+docker exec plexd-e2e-systemd curl -sS --cacert /etc/plexd/pebble.minica.pem https://pebble:14000/dir
+docker exec plexd-e2e-systemd ls -la /var/lib/plexd/acme
+docker logs plexd-e2e-pebble
 ```
 
 Common causes:
 - plexd restarts in a loop after the bridge block: `plexd up: bridge setup` in the journal names the failing step, usually the forwarding sysctl or the route for `access_subnets` on `eth0`.
 - `bridge: ingress: listen failed` with `hint="ports below 1024 need CAP_NET_BIND_SERVICE"`: the unit in the container lacks the capability.
+- `ingress certificate not loaded` with `reason=certificate_fetch_failed` for `secret=tls-term`: the mock serves another version of the Secret than the inventory lists, or none, because the last `POST /test/configure-secrets` set another one.
+- `bridge: acme: obtain certificate failed`: its `error` names the failing ACME request. When the `curl` above fails, plexd cannot reach or trust the directory either. When Pebble's log shows a failed validation, it did not reach port 443 of the bridge under `acme.ingress.e2e.test`, which `--add-host` maps to the address of `plexd-e2e-systemd`.
+- `ingress rule not served` with `slug=tls-acme` before step 14: `reason=acme_directory_not_allowed` means the block's `directory_url` is not an entry of `bridge.acme_directory_urls`.
 
 **Leftover containers from previous run:**
 
 The script performs pre-cleanup, but if issues persist:
 
 ```bash
-docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target
+docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target plexd-e2e-pebble
 docker network rm plexd-systemd-e2e
 ```
 
@@ -358,6 +384,7 @@ On any failure, the `print_diagnostics` function outputs:
 |---------|---------|
 | `docker network inspect plexd-systemd-e2e` | Network state and connected containers |
 | `docker logs plexd-e2e-mockapi` | Mock API server logs |
+| `docker logs plexd-e2e-pebble` | Pebble's log, its stderr included: the ACME requests plexd sent and the validations of the bridge |
 | `systemctl status plexd` | Service state and recent log lines |
 | `journalctl -u plexd -n 100` | Recent plexd service logs |
 | `journalctl -u 'plexd-session-helper@*' -n 100` | Recent session helper logs |
@@ -373,6 +400,7 @@ On any failure, the `print_diagnostics` function outputs:
 |------|---------|
 | `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 systemd container image, with `dbus` and `systemd-resolved` |
 | `test/e2e/systemd/test.sh` | Orchestration script (build, install, assert, shutdown, cleanup) |
+| `test/e2e/systemd/pebble-config.json` | Pebble's default config with `"tlsPort": 443`; phase 16 mounts it into `plexd-e2e-pebble` as `/test/config/plexd-e2e.json` |
 | `test/e2e/systemd/.dockerignore` | Prevents unnecessary files in Docker context |
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
 | `test/e2e/mockapi/mockapi.go` | Mock API server with `/test/assertions` endpoint |

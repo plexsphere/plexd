@@ -28,8 +28,12 @@
 #   - Mesh DNS opt-out with dns.enabled: false
 #   - Public ingress on a bridge: one listener per listen port, TLS server
 #     names routed to their targets on a shared port 443, a plain port whose
-#     target speaks first, a terminate rule held and not served, a changed
-#     target and a removed block, under the unit's CAP_NET_BIND_SERVICE
+#     target speaks first, a terminate rule that serves the certificate of its
+#     Secret, follows a new version, keeps it when the next one does not load
+#     and drops it when the inventory no longer lists the Secret, an acme rule
+#     whose certificate Pebble issues over TLS-ALPN-01 and that is not served
+#     for a directory outside bridge.acme_directory_urls, a changed target and
+#     a removed block, under the unit's CAP_NET_BIND_SERVICE
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -42,6 +46,10 @@ MOCKAPI_IMAGE="mockapi:e2e-systemd"
 SYSTEMD_IMAGE="plexd-systemd:e2e"
 INGRESS_TARGET_CONTAINER="plexd-e2e-ingress-target"
 INGRESS_TARGET_IMAGE="plexd-ingress-target:e2e"
+# Pebble, Let's Encrypt's test CA, at release v2.10.3: the ingress phase's acme
+# rule obtains its certificate from it.
+PEBBLE_CONTAINER="plexd-e2e-pebble"
+PEBBLE_IMAGE="ghcr.io/letsencrypt/pebble:2.10.3@sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef"
 TIMEOUT="${TIMEOUT:-60}"
 TEST_FAILED=1
 # Set while the mesh DNS phase holds the mock API container paused, so a
@@ -107,6 +115,10 @@ print_diagnostics() {
     docker network inspect "${NETWORK_NAME}" 2>/dev/null || true
     echo "==> Mock-API container logs:"
     docker logs "${MOCKAPI_CONTAINER}" 2>/dev/null || true
+    # Pebble logs to stdout and writes the error that stops it at start to
+    # stderr, which docker logs prints on its own stderr.
+    echo "==> Pebble container logs:"
+    docker logs "${PEBBLE_CONTAINER}" 2>&1 || true
     echo "==> Systemd container systemctl status:"
     docker exec "${SYSTEMD_CONTAINER}" systemctl status plexd --no-pager 2>/dev/null || true
     echo "==> Systemd container journalctl plexd:"
@@ -153,6 +165,7 @@ cleanup() {
     docker rm -f "${MOCKAPI_CONTAINER}" 2>/dev/null || true
     docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
     docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
+    docker rm -f "${PEBBLE_CONTAINER}" 2>/dev/null || true
     docker network rm "${NETWORK_NAME}" 2>/dev/null || true
     rm -f "${REPO_ROOT}/plexd-linux-amd64"
 }
@@ -171,6 +184,7 @@ echo "=== Removing pre-existing containers and network (if any) ==="
 docker rm -f "${MOCKAPI_CONTAINER}" 2>/dev/null || true
 docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
 docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
+docker rm -f "${PEBBLE_CONTAINER}" 2>/dev/null || true
 docker network rm "${NETWORK_NAME}" 2>/dev/null || true
 
 # --- Build images ---
@@ -2205,11 +2219,15 @@ echo "=== Mesh DNS opt-out PASSED ==="
 # The restart below turns this node into a bridge with ingress_enabled, and
 # the mock serves a bridge.ingress block whose rules target a container on the
 # suite's network: three openssl s_server instances with certificates of their
-# own and a plain TCP server that writes a banner first. The probes run from
-# that container against the systemd container's address on the network,
-# which is outside the mesh. Docker sets net.ipv4.ip_unprivileged_port_start
-# to 0 in a container, so the phase sets it back to 1024 first: port 443 then
-# binds only through the unit's CAP_NET_BIND_SERVICE.
+# own and a plain TCP server that writes a banner first. A terminate rule ends
+# TLS at the bridge with the certificate of a Secret the mock serves, and an
+# acme rule with a certificate the bridge obtains from Pebble, which runs as a
+# container on the same network and validates the bridge over TLS-ALPN-01 on
+# port 443. The probes run from the target container against the systemd
+# container's address on the network, which is outside the mesh. Docker sets
+# net.ipv4.ip_unprivileged_port_start to 0 in a container, so the phase sets
+# it back to 1024 first: port 443 then binds only through the unit's
+# CAP_NET_BIND_SERVICE.
 echo "=== Testing public ingress on a bridge ==="
 docker build -f "${REPO_ROOT}/test/e2e/meshpeer/Dockerfile" -t "${INGRESS_TARGET_IMAGE}" "${REPO_ROOT}/test/e2e/meshpeer"
 docker run -d --name "${INGRESS_TARGET_CONTAINER}" --network "${NETWORK_NAME}" "${INGRESS_TARGET_IMAGE}" >/dev/null
@@ -2232,6 +2250,11 @@ docker exec "${INGRESS_TARGET_CONTAINER}" sh -c '
     for h in a b wild; do
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
             -subj "/CN=${h}.ingress.e2e.test" -keyout "/srv/ingress/${h}.key" -out "/srv/ingress/${h}.pem" 2>/dev/null
+    done
+    for v in v1 v2; do
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -subj "/O=${v}/CN=t.ingress.e2e.test" -addext "subjectAltName=DNS:t.ingress.e2e.test" \
+            -keyout "/srv/ingress/t-${v}.key" -out "/srv/ingress/t-${v}.pem" 2>/dev/null
     done' || fail "could not create the target's certificates"
 for spec in 9441:a 9442:b 9443:wild; do
     docker exec -d "${INGRESS_TARGET_CONTAINER}" openssl s_server -4 -accept "${spec%%:*}" \
@@ -2252,38 +2275,87 @@ until TARGET_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -ltn 2>&1) \
 done
 echo "  PASS: the target listens on 9441, 9442, 9443 (TLS) and 9022 (banner)"
 
-# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port>
-# renders one rule of the block, targeting the target container.
+# Pebble's listener certificate names localhost and pebble, so plexd reaches
+# the directory under the network alias pebble. Its validator resolves
+# acme.ingress.e2e.test through /etc/hosts, which --add-host points at the
+# bridge, and dials the tlsPort of the mounted config, 443, for TLS-ALPN-01.
+# The config is Pebble's default config with that one change.
+docker run -d --name "${PEBBLE_CONTAINER}" --network "${NETWORK_NAME}" --network-alias pebble \
+    --add-host "acme.ingress.e2e.test:${BRIDGE_IP}" \
+    -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+    -v "${SCRIPT_DIR}/pebble-config.json:/test/config/plexd-e2e.json:ro" \
+    "${PEBBLE_IMAGE}" -config /test/config/plexd-e2e.json >/dev/null
+
+# plexd trusts Pebble's test CA through SSL_CERT_FILE, which the shipped unit
+# reads from /etc/plexd/environment at each start. The CA stays out of the
+# system trust store, as Pebble's README asks.
+docker cp "${PEBBLE_CONTAINER}:/test/certs/pebble.minica.pem" - | docker cp - "${SYSTEMD_CONTAINER}:/etc/plexd/" \
+    || fail "could not copy Pebble's test CA into ${SYSTEMD_CONTAINER}:/etc/plexd/"
+if docker exec "${SYSTEMD_CONTAINER}" test -e /etc/plexd/environment; then
+    fail "/etc/plexd/environment already exists, so SSL_CERT_FILE cannot be written into it"
+fi
+docker exec "${SYSTEMD_CONTAINER}" sh -c 'printf "SSL_CERT_FILE=/etc/plexd/pebble.minica.pem\n" > /etc/plexd/environment' \
+    || fail "could not write /etc/plexd/environment"
+echo "  SSL_CERT_FILE=/etc/plexd/pebble.minica.pem written to /etc/plexd/environment"
+PEBBLE_START=${SECONDS}
+until PEBBLE_DIR=$(docker exec "${SYSTEMD_CONTAINER}" curl -sSf --cacert /etc/plexd/pebble.minica.pem https://pebble:14000/dir 2>&1) \
+    && case "${PEBBLE_DIR}" in *'"newOrder"'*) ;; *) false ;; esac; do
+    if [ $((SECONDS - PEBBLE_START)) -ge 30 ]; then
+        echo "${PEBBLE_DIR}"
+        fail "https://pebble:14000/dir did not answer ${SYSTEMD_CONTAINER} under Pebble's test CA within 30s"
+    fi
+    sleep 1
+done
+echo "  PASS: https://pebble:14000/dir answers ${SYSTEMD_CONTAINER} under Pebble's test CA"
+
+# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port> [secret name]
+# renders one rule of the block, targeting the target container. A Secret
+# name becomes the rule's certificate_secret_name.
 ingress_rule() {
     jq -cn --arg id "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1$1" --arg slug "$2" --argjson port "$3" \
         --arg mode "$4" --arg host "$5" --arg addr "${INGRESS_TARGET_IP}" --argjson tport "$6" \
+        --arg secret "${7:-}" \
         '{id: $id, slug: $slug, listen_port: $port, mode: $mode}
          + (if $host == "" then {} else {sni_host: $host} end)
-         + {target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", target_address: $addr, target_port: $tport}'
+         + {target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", target_address: $addr, target_port: $tport}
+         + (if $secret == "" then {} else {certificate_secret_name: $secret} end)'
 }
 
-# ingress_rules <target port of tls-b> renders the phase's five rules, in slug
-# order as the control plane lists them.
+# ingress_rules <target port of tls-b> renders the phase's six rules, in slug
+# order as the control plane lists them. tls-term and tls-acme end TLS at the
+# bridge and forward the plaintext to the banner server.
 ingress_rules() {
     printf '%s\n' \
         "$(ingress_rule f1 plain 7022 passthrough "" 9022)" \
         "$(ingress_rule f2 tls-a 443 passthrough a.ingress.e2e.test 9441)" \
+        "$(ingress_rule f6 tls-acme 443 acme acme.ingress.e2e.test 9022)" \
         "$(ingress_rule f3 tls-b 443 passthrough b.ingress.e2e.test "$1")" \
-        "$(ingress_rule f4 tls-term 443 terminate t.ingress.e2e.test 9441)" \
+        "$(ingress_rule f4 tls-term 443 terminate t.ingress.e2e.test 9022 tls-term)" \
         "$(ingress_rule f5 tls-wild 443 passthrough '*.apps.ingress.e2e.test' 9443)" | jq -cs .
 }
 
-# configure_ingress <tag> <rules-json or null> serves a bridge block with only
-# an ingress child, or with "ingress": null, and nudges plexd into a pull, the
-# way configure_sessions configures its block.
+# configure_ingress <tag> <rules-json or null> [acme-json] [secrets-json]
+# serves a bridge block with only an ingress child, or with "ingress": null,
+# and nudges plexd into a pull, the way configure_sessions configures its
+# block. An acme-json that is given and not empty becomes ingress.acme. A
+# secrets-json that is given replaces the snapshot's secret inventory; without
+# it the live inventory is kept, as is the rest of the live snapshot.
 configure_ingress() {
-    local tag=$1 rules=$2 snapshot spliced status
+    local tag=$1 rules=$2 acme=${3:-} secrets=${4:-} set_secrets=false snapshot spliced status
+    if [ "$#" -ge 4 ]; then
+        set_secrets=true
+    fi
     snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
     if [ -z "${snapshot}" ]; then
         fail "[${tag}] could not read the live node state snapshot"
     fi
-    spliced=$(printf '%s' "${snapshot}" | jq --argjson r "${rules}" \
-        '.bridge = {relay: null, user_access: null, ingress: (if $r == null then null else {rules: $r} end), site_to_site: null}')
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson r "${rules}" --arg acme "${acme}" \
+        --arg secrets "${secrets}" --argjson set_secrets "${set_secrets}" \
+        '.bridge = {relay: null, user_access: null,
+                    ingress: (if $r == null then null
+                              else {rules: $r} + (if $acme == "" then {} else {acme: ($acme | fromjson)} end) end),
+                    site_to_site: null}
+         | if $set_secrets then .secrets = ($secrets | fromjson) else . end')
     status=$(curl -sf -o /dev/null -w "%{http_code}" \
         -X POST -H "Content-Type: application/json" \
         -d "${spliced}" \
@@ -2310,14 +2382,65 @@ ingress_subject() {
         _ "${BRIDGE_IP}" "$1" || true
 }
 
+# ingress_session <server name> runs one TLS session with port 443 of the
+# bridge under that server name, as a client that sends nothing: -ign_eof
+# keeps it open past the end of stdin until the bridge closes it. It leaves
+# everything s_client printed in SESSION_OUT, the handshake and then the
+# plaintext the target wrote through the session, and the subject and issuer
+# of the certificate the bridge presented in SESSION_SUBJECT and
+# SESSION_ISSUER, both empty when it presented none.
+ingress_session() {
+    SESSION_OUT=$(docker exec "${INGRESS_TARGET_CONTAINER}" sh -c \
+        'timeout 10 openssl s_client -connect "$1:443" -servername "$2" -ign_eof </dev/null 2>/dev/null' \
+        _ "${BRIDGE_IP}" "$1" || true)
+    SESSION_SUBJECT=$(printf '%s\n' "${SESSION_OUT}" \
+        | docker exec -i "${INGRESS_TARGET_CONTAINER}" openssl x509 -noout -subject 2>/dev/null || true)
+    SESSION_ISSUER=$(printf '%s\n' "${SESSION_OUT}" \
+        | docker exec -i "${INGRESS_TARGET_CONTAINER}" openssl x509 -noout -issuer 2>/dev/null || true)
+}
+
+# is_term_subject <subject line> <organization> succeeds when the line is the
+# subject of the target's certificate of t.ingress.e2e.test with that
+# organization, in either spacing openssl prints.
+is_term_subject() {
+    case "$1" in
+        "subject=O=$2, CN=t.ingress.e2e.test" | "subject=O = $2, CN = t.ingress.e2e.test") return 0 ;;
+    esac
+    return 1
+}
+
+# configure_term_secret <tag> <version> <value> makes the mock serve the value
+# as the Secret tls-term at that version, the only version it serves.
+configure_term_secret() {
+    local tag=$1 body status
+    body=$(jq -cn --argjson version "$2" --arg value "$3" \
+        '{secrets: [{name: "tls-term", version: $version, value: $value}]}')
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${body}" \
+        "http://localhost:18080/test/configure-secrets" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-secrets returned status ${status}, want 204"
+    fi
+}
+
 # ingress_refused <port> succeeds when a connection to the port of the bridge
 # is refused.
 ingress_refused() {
     ! docker exec "${INGRESS_TARGET_CONTAINER}" nc -z -w 3 "${BRIDGE_IP}" "$1" 2>/dev/null
 }
 
-configure_ingress serve "$(ingress_rules 9442)"
-echo "  the mock serves the rules plain, tls-a, tls-b, tls-term and tls-wild"
+# The value of a version of tls-term is the certificate followed by its key,
+# one PEM document.
+TERM_SECRET_V1=$(docker exec "${INGRESS_TARGET_CONTAINER}" cat /srv/ingress/t-v1.pem /srv/ingress/t-v1.key) \
+    || fail "could not read the certificate and key of v1 from ${INGRESS_TARGET_CONTAINER}"
+TERM_SECRET_V2=$(docker exec "${INGRESS_TARGET_CONTAINER}" cat /srv/ingress/t-v2.pem /srv/ingress/t-v2.key) \
+    || fail "could not read the certificate and key of v2 from ${INGRESS_TARGET_CONTAINER}"
+PEBBLE_ACME='{"directory_url": "https://pebble:14000/dir"}'
+
+configure_term_secret secret-v1 1 "${TERM_SECRET_V1}"
+configure_ingress serve "$(ingress_rules 9442)" "${PEBBLE_ACME}" '[{"name": "tls-term", "version": 1}]'
+echo "  the mock serves the Secret tls-term at version 1, lists it, and serves the rules plain, tls-a, tls-acme, tls-b, tls-term and tls-wild with Pebble's directory"
 
 docker exec "${SYSTEMD_CONTAINER}" sh -c 'echo 1024 > /proc/sys/net/ipv4/ip_unprivileged_port_start' \
     || fail "could not write net.ipv4.ip_unprivileged_port_start"
@@ -2342,8 +2465,9 @@ bridge:
   access_subnets: ["198.18.100.0/24"]
   enable_nat: false
   ingress_enabled: true
+  acme_directory_urls: ["https://pebble:14000/dir"]
 EOF' || fail "could not append the bridge block to /etc/plexd/config.yaml"
-echo "  mode: bridge with bridge.ingress_enabled appended to /etc/plexd/config.yaml"
+echo "  mode: bridge with bridge.ingress_enabled and bridge.acme_directory_urls appended to /etc/plexd/config.yaml"
 docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
 INGRESS_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
 
@@ -2356,11 +2480,11 @@ while :; do
     ingress_journal
     if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=443" \
         && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=7022" \
-        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"' "slug=tls-term"; then
+        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress certificate loaded"' "secret=tls-term" "version=1"; then
         break
     fi
     if [ $((SECONDS - INGRESS_START)) -ge 60 ]; then
-        fail "plexd[${INGRESS_PID}] did not open the listeners of 443 and 7022 and hold tls-term within 60s of the restart"
+        fail "plexd[${INGRESS_PID}] did not open the listeners of 443 and 7022 and load version 1 of the Secret tls-term within 60s of the restart"
     fi
     sleep 2
 done
@@ -2377,10 +2501,13 @@ for port in 443 7022; do
         fail "plexd[${INGRESS_PID}] logged ${OPENED} 'ingress listener opened' lines for port ${port}, want 1"
     fi
 done
-if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"' "slug=tls-term" "reason=mode_not_served"; then
-    echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress rule not served' for tls-term with reason=mode_not_served"
+echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress certificate loaded' for secret=tls-term version=1"
+# Every rule of the block is served now, the terminate and the acme rule
+# included, so the restarted process logs no rule as not served.
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"'; then
+    fail "plexd[${INGRESS_PID}] logged 'ingress rule not served' for a rule of the block, want every rule served"
 else
-    fail "plexd[${INGRESS_PID}] logged no 'ingress rule not served' line for tls-term with reason=mode_not_served"
+    echo "  PASS: plexd[${INGRESS_PID}] logged no 'ingress rule not served' line"
 fi
 PORT_FLOOR=$(docker exec "${SYSTEMD_CONTAINER}" cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
 if [ "${PORT_FLOOR}" = "1024" ]; then
@@ -2388,6 +2515,126 @@ if [ "${PORT_FLOOR}" = "1024" ]; then
 else
     fail "net.ipv4.ip_unprivileged_port_start reads '${PORT_FLOOR}' after the restart, want 1024"
 fi
+
+# tls-term ends TLS with the certificate of version 1 and forwards the
+# plaintext: the banner the target writes comes through the session.
+ingress_session t.ingress.e2e.test
+if is_term_subject "${SESSION_SUBJECT}" v1; then
+    echo "  PASS: server name t.ingress.e2e.test received the certificate of version 1 (O=v1)"
+else
+    fail "server name t.ingress.e2e.test received '${SESSION_SUBJECT}', want the certificate of version 1 with O=v1"
+fi
+case "${SESSION_OUT}" in
+    *plexd-e2e-banner*) echo "  PASS: the session with t.ingress.e2e.test read plexd-e2e-banner" ;;
+    *)
+        echo "${SESSION_OUT}"
+        fail "the session with t.ingress.e2e.test did not read plexd-e2e-banner"
+        ;;
+esac
+
+# A new version replaces the certificate. The block stays the same, so only
+# the inventory of the pull changes.
+configure_term_secret secret-v2 2 "${TERM_SECRET_V2}"
+configure_ingress rotate "$(ingress_rules 9442)" "${PEBBLE_ACME}" '[{"name": "tls-term", "version": 2}]'
+ROTATE_START=${SECONDS}
+until is_term_subject "$(ingress_subject t.ingress.e2e.test)" v2; do
+    if [ $((SECONDS - ROTATE_START)) -ge 60 ]; then
+        fail "server name t.ingress.e2e.test did not receive the certificate of version 2 (O=v2) within 60s of the inventory listing it"
+    fi
+    sleep 2
+done
+echo "  PASS: after the inventory listed version 2, t.ingress.e2e.test received its certificate (O=v2)"
+
+# A version that does not load leaves the last loaded one serving.
+configure_term_secret secret-v3 3 "not a certificate"
+configure_ingress invalid "$(ingress_rules 9442)" "${PEBBLE_ACME}" '[{"name": "tls-term", "version": 3}]'
+INVALID_START=${SECONDS}
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress certificate not loaded"' \
+        "secret=tls-term" "version=3" "reason=certificate_invalid" "serving_version=2"; then
+        break
+    fi
+    if [ $((SECONDS - INVALID_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'ingress certificate not loaded' for version 3 of tls-term with reason=certificate_invalid and serving_version=2 within 60s of the inventory listing it"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress certificate not loaded' for version 3 with reason=certificate_invalid and serving_version=2"
+subject=$(ingress_subject t.ingress.e2e.test)
+if is_term_subject "${subject}" v2; then
+    echo "  PASS: server name t.ingress.e2e.test still received the certificate of version 2 (O=v2)"
+else
+    fail "server name t.ingress.e2e.test received '${subject}' after version 3 did not load, want the certificate of version 2 with O=v2"
+fi
+
+# An inventory that no longer lists the Secret drops its certificate.
+configure_ingress unlist "$(ingress_rules 9442)" "${PEBBLE_ACME}" '[]'
+UNLIST_START=${SECONDS}
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress certificate dropped"' \
+        "secret=tls-term" "reason=certificate_secret_not_listed" \
+        && [ -z "$(ingress_subject t.ingress.e2e.test)" ]; then
+        break
+    fi
+    if [ $((SECONDS - UNLIST_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not log 'ingress certificate dropped' for tls-term and stop presenting a certificate to t.ingress.e2e.test within 60s of the inventory served as []"
+    fi
+    sleep 2
+done
+echo "  PASS: after the inventory was served as [], plexd[${INGRESS_PID}] logged 'ingress certificate dropped' for tls-term and t.ingress.e2e.test received no certificate"
+
+# tls-acme: plexd obtained its certificate from Pebble ahead of the first
+# client, after the restart.
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress certificate obtained"' "sni_host=acme.ingress.e2e.test"; then
+        break
+    fi
+    if [ $((SECONDS - INGRESS_START)) -ge 120 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'ingress certificate obtained' for acme.ingress.e2e.test within 120s of the restart"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress certificate obtained' for sni_host=acme.ingress.e2e.test"
+ingress_session acme.ingress.e2e.test
+case "${SESSION_ISSUER}" in
+    *"Pebble Intermediate CA"*) echo "  PASS: server name acme.ingress.e2e.test received a certificate with '${SESSION_ISSUER}'" ;;
+    *) fail "server name acme.ingress.e2e.test received a certificate with '${SESSION_ISSUER}', want an issuer that names Pebble Intermediate CA" ;;
+esac
+case "${SESSION_OUT}" in
+    *plexd-e2e-banner*) echo "  PASS: the session with acme.ingress.e2e.test read plexd-e2e-banner" ;;
+    *)
+        echo "${SESSION_OUT}"
+        fail "the session with acme.ingress.e2e.test did not read plexd-e2e-banner"
+        ;;
+esac
+for name in acme_account+key acme.ingress.e2e.test; do
+    if docker exec "${SYSTEMD_CONTAINER}" test -f "/var/lib/plexd/acme/${name}"; then
+        echo "  PASS: /var/lib/plexd/acme holds ${name}"
+    else
+        docker exec "${SYSTEMD_CONTAINER}" ls -la /var/lib/plexd/acme 2>&1 || true
+        fail "/var/lib/plexd/acme holds no file ${name}"
+    fi
+done
+
+# A directory outside bridge.acme_directory_urls leaves the acme rule held
+# and not served.
+configure_ingress refuse-directory "$(ingress_rules 9442)" '{"directory_url": "https://other.invalid/dir"}'
+REFUSE_START=${SECONDS}
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"' \
+        "slug=tls-acme" "reason=acme_directory_not_allowed"; then
+        break
+    fi
+    if [ $((SECONDS - REFUSE_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'ingress rule not served' for tls-acme with reason=acme_directory_not_allowed within 60s of the block naming https://other.invalid/dir"
+    fi
+    sleep 2
+done
+echo "  PASS: with https://other.invalid/dir, plexd[${INGRESS_PID}] logged 'ingress rule not served' for tls-acme with reason=acme_directory_not_allowed"
 
 for spec in a.ingress.e2e.test=a.ingress.e2e.test b.ingress.e2e.test=b.ingress.e2e.test x.apps.ingress.e2e.test=wild.ingress.e2e.test; do
     name=${spec%%=*}
@@ -2398,7 +2645,7 @@ for spec in a.ingress.e2e.test=a.ingress.e2e.test b.ingress.e2e.test=b.ingress.e
         *) fail "server name ${name} received '${subject}', want the certificate of ${want}" ;;
     esac
 done
-for name in t.ingress.e2e.test none.ingress.e2e.test x.y.apps.ingress.e2e.test -; do
+for name in none.ingress.e2e.test x.y.apps.ingress.e2e.test -; do
     subject=$(ingress_subject "${name}")
     if [ -z "${subject}" ]; then
         echo "  PASS: server name ${name} received no certificate"
@@ -2413,8 +2660,9 @@ else
     fail "a client that sends nothing to port 7022 read '${BANNER}', want plexd-e2e-banner"
 fi
 
-# A changed rule swaps the table of 443 in place, without a second bind.
-configure_ingress retarget "$(ingress_rules 9441)"
+# A changed rule swaps the table of 443 in place, without a second bind. The
+# block names Pebble's directory again, and the inventory stays [].
+configure_ingress retarget "$(ingress_rules 9441)" "${PEBBLE_ACME}"
 CHANGE_START=${SECONDS}
 until [ "$(ingress_subject b.ingress.e2e.test)" = "subject=CN=a.ingress.e2e.test" ]; do
     if [ $((SECONDS - CHANGE_START)) -ge 60 ]; then
