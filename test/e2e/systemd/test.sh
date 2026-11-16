@@ -33,7 +33,11 @@
 #     and drops it when the inventory no longer lists the Secret, an acme rule
 #     whose certificate Pebble issues over TLS-ALPN-01 and that is not served
 #     for a directory outside bridge.acme_directory_urls, a changed target and
-#     a removed block, under the unit's CAP_NET_BIND_SERVICE
+#     a removed block, under the unit's CAP_NET_BIND_SERVICE and without
+#     bridge.ingress_enabled; the ingress status report enabled at start and
+#     on the heartbeat interval, a block whose enabled is false closing every
+#     listener, and the opt-out with bridge.ingress_enabled: false, which
+#     opens no listener for an enabled block and reports opted_out
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -2216,7 +2220,7 @@ fi
 echo "=== Mesh DNS opt-out PASSED ==="
 
 # --- Public ingress on a bridge ---
-# The restart below turns this node into a bridge with ingress_enabled, and
+# The restart below turns this node into a bridge without ingress_enabled, and
 # the mock serves a bridge.ingress block whose rules target a container on the
 # suite's network: three openssl s_server instances with certificates of their
 # own and a plain TCP server that writes a banner first. A terminate rule ends
@@ -2227,7 +2231,8 @@ echo "=== Mesh DNS opt-out PASSED ==="
 # container's address on the network, which is outside the mesh. Docker sets
 # net.ipv4.ip_unprivileged_port_start to 0 in a container, so the phase sets
 # it back to 1024 first: port 443 then binds only through the unit's
-# CAP_NET_BIND_SERVICE.
+# CAP_NET_BIND_SERVICE. A bridge without the key serves public ingress, and
+# the phase ends with the key set to false, the opt-out.
 echo "=== Testing public ingress on a bridge ==="
 docker build -f "${REPO_ROOT}/test/e2e/meshpeer/Dockerfile" -t "${INGRESS_TARGET_IMAGE}" "${REPO_ROOT}/test/e2e/meshpeer"
 docker run -d --name "${INGRESS_TARGET_CONTAINER}" --network "${NETWORK_NAME}" "${INGRESS_TARGET_IMAGE}" >/dev/null
@@ -2339,9 +2344,17 @@ ingress_rules() {
 # and nudges plexd into a pull, the way configure_sessions configures its
 # block. An acme-json that is given and not empty becomes ingress.acme. A
 # secrets-json that is given replaces the snapshot's secret inventory; without
-# it the live inventory is kept, as is the rest of the live snapshot.
+# it the live inventory is kept, as is the rest of the live snapshot. Every
+# ingress child that is not null carries enabled with the value of the shell
+# variable INGRESS_BLOCK_ENABLED, true or false, and true when the variable is
+# unset or empty.
 configure_ingress() {
     local tag=$1 rules=$2 acme=${3:-} secrets=${4:-} set_secrets=false snapshot spliced status
+    local enabled=${INGRESS_BLOCK_ENABLED:-true}
+    case "${enabled}" in
+        true | false) ;;
+        *) fail "[${tag}] INGRESS_BLOCK_ENABLED is '${enabled}', want true or false" ;;
+    esac
     if [ "$#" -ge 4 ]; then
         set_secrets=true
     fi
@@ -2349,11 +2362,11 @@ configure_ingress() {
     if [ -z "${snapshot}" ]; then
         fail "[${tag}] could not read the live node state snapshot"
     fi
-    spliced=$(printf '%s' "${snapshot}" | jq --argjson r "${rules}" --arg acme "${acme}" \
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson r "${rules}" --argjson enabled "${enabled}" --arg acme "${acme}" \
         --arg secrets "${secrets}" --argjson set_secrets "${set_secrets}" \
         '.bridge = {relay: null, user_access: null,
                     ingress: (if $r == null then null
-                              else {rules: $r} + (if $acme == "" then {} else {acme: ($acme | fromjson)} end) end),
+                              else {enabled: $enabled, rules: $r} + (if $acme == "" then {} else {acme: ($acme | fromjson)} end) end),
                     site_to_site: null}
          | if $set_secrets then .secrets = ($secrets | fromjson) else . end')
     status=$(curl -sf -o /dev/null -w "%{http_code}" \
@@ -2430,6 +2443,12 @@ ingress_refused() {
     ! docker exec "${INGRESS_TARGET_CONTAINER}" nc -z -w 3 "${BRIDGE_IP}" "$1" 2>/dev/null
 }
 
+# ingress_accepts <port> succeeds when a connection to the port of the bridge
+# is accepted.
+ingress_accepts() {
+    docker exec "${INGRESS_TARGET_CONTAINER}" nc -z -w 3 "${BRIDGE_IP}" "$1" 2>/dev/null
+}
+
 # The value of a version of tls-term is the certificate followed by its key,
 # one PEM document.
 TERM_SECRET_V1=$(docker exec "${INGRESS_TARGET_CONTAINER}" cat /srv/ingress/t-v1.pem /srv/ingress/t-v1.key) \
@@ -2451,6 +2470,19 @@ else
     fail "net.ipv4.ip_unprivileged_port_start reads '${PORT_FLOOR}', want 1024"
 fi
 
+# Every earlier phase ran outside bridge mode, so the node has sent no
+# ingress status report yet.
+INGRESS_ASSERTIONS=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+if ! printf '%s' "${INGRESS_ASSERTIONS}" | jq -e 'has("ingress_status_count")' >/dev/null 2>&1; then
+    fail "the assertions '${INGRESS_ASSERTIONS}' carry no ingress_status_count"
+fi
+STATUS_COUNT_BEFORE=$(get_counter "${INGRESS_ASSERTIONS}" "ingress_status_count")
+if [ "${STATUS_COUNT_BEFORE}" = "0" ]; then
+    echo "  PASS: ingress_status_count reads 0 before the bridge block is appended"
+else
+    fail "ingress_status_count reads '${STATUS_COUNT_BEFORE}' before the bridge block is appended, want 0 for a node that ran outside bridge mode"
+fi
+
 INGRESS_CONFIG=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/config.yaml 2>&1) || fail "could not read /etc/plexd/config.yaml: ${INGRESS_CONFIG}"
 while IFS= read -r line; do
     case "${line}" in
@@ -2464,10 +2496,9 @@ bridge:
   access_interface: eth0
   access_subnets: ["198.18.100.0/24"]
   enable_nat: false
-  ingress_enabled: true
   acme_directory_urls: ["https://pebble:14000/dir"]
 EOF' || fail "could not append the bridge block to /etc/plexd/config.yaml"
-echo "  mode: bridge with bridge.ingress_enabled and bridge.acme_directory_urls appended to /etc/plexd/config.yaml"
+echo "  mode: bridge with bridge.acme_directory_urls and without bridge.ingress_enabled appended to /etc/plexd/config.yaml"
 docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
 INGRESS_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
 
@@ -2515,6 +2546,27 @@ if [ "${PORT_FLOOR}" = "1024" ]; then
 else
     fail "net.ipv4.ip_unprivileged_port_start reads '${PORT_FLOOR}' after the restart, want 1024"
 fi
+
+# A bridge without ingress_enabled reports enabled after its start.
+REPORT_START=${SECONDS}
+while :; do
+    REPORT_BODY=$(curl -sf "http://localhost:18080/test/last-request/ingress-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+    ingress_journal
+    if [ "${REPORT_BODY}" = '{"state":"enabled"}' ] \
+        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress status: reported"' "state=enabled"; then
+        break
+    fi
+    if [ $((SECONDS - REPORT_START)) -ge 60 ]; then
+        fail "the last ingress status report read '${REPORT_BODY}' 60s after the listeners opened, want {\"state\":\"enabled\"} and a line 'ingress status: reported' with state=enabled from plexd[${INGRESS_PID}]"
+    fi
+    sleep 2
+done
+echo "  PASS: the last ingress status report reads {\"state\":\"enabled\"} and plexd[${INGRESS_PID}] logged 'ingress status: reported' with state=enabled"
+INGRESS_STATUS_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "ingress_status_count")
+case "${INGRESS_STATUS_COUNT}" in
+    '' | *[!0-9]* | 0) fail "ingress_status_count reads '${INGRESS_STATUS_COUNT}' after the report was accepted, want at least 1" ;;
+esac
+echo "  ingress_status_count reads ${INGRESS_STATUS_COUNT}"
 
 # tls-term ends TLS with the certificate of version 1 and forwards the
 # plaintext: the banner the target writes comes through the session.
@@ -2696,6 +2748,148 @@ for port in 443 7022; do
     else
         fail "plexd[${INGRESS_PID}] logged no 'ingress listener closed' for port ${port}"
     fi
+done
+
+# The reporter repeats its report on the heartbeat interval, 30 s by default,
+# which the suite leaves as it is.
+REPEAT_START=${SECONDS}
+while :; do
+    STATUS_COUNT_NOW=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "ingress_status_count")
+    if [ "${STATUS_COUNT_NOW}" -gt "${INGRESS_STATUS_COUNT}" ] 2>/dev/null; then
+        break
+    fi
+    if [ $((SECONDS - REPEAT_START)) -ge 60 ]; then
+        fail "ingress_status_count went from ${INGRESS_STATUS_COUNT} to '${STATUS_COUNT_NOW}' in the 60s after the block was served as null, want a repeated report"
+    fi
+    sleep 2
+done
+echo "  PASS: ingress_status_count grew from ${INGRESS_STATUS_COUNT} to ${STATUS_COUNT_NOW}, the report repeats"
+
+# A block whose enabled is false closes every listener, although it carries
+# the rules an enabled block served a moment before. The rules and the acme
+# member are the ones of the retarget step.
+configure_ingress reenable "$(ingress_rules 9441)" "${PEBBLE_ACME}"
+REENABLE_START=${SECONDS}
+until ingress_accepts 443 && ingress_accepts 7022; do
+    if [ $((SECONDS - REENABLE_START)) -ge 60 ]; then
+        fail "ports 443 and 7022 of the bridge did not accept connections within 60s of the rules being served again with enabled true"
+    fi
+    sleep 2
+done
+echo "  PASS: connections to 443 and 7022 are accepted after the rules were served again with enabled true"
+INGRESS_BLOCK_ENABLED=false
+configure_ingress not-enabled "$(ingress_rules 9441)" "${PEBBLE_ACME}"
+INGRESS_BLOCK_ENABLED=true
+NOT_ENABLED_START=${SECONDS}
+while :; do
+    ingress_journal
+    if ingress_refused 443 && ingress_refused 7022 \
+        && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" "level=WARN" \
+            'msg="ingress: the state pull carries rules but does not enable public ingress, closing every listener"' "rules=6"; then
+        break
+    fi
+    if [ $((SECONDS - NOT_ENABLED_START)) -ge 60 ]; then
+        fail "ports 443 and 7022 of the bridge did not both refuse connections, or plexd[${INGRESS_PID}] logged no Warn 'ingress: the state pull carries rules but does not enable public ingress, closing every listener' with rules=6, within 60s of the rules being served with enabled false"
+    fi
+    sleep 2
+done
+echo "  PASS: with enabled false, connections to 443 and 7022 are refused and plexd[${INGRESS_PID}] warned that the pull carries rules but does not enable public ingress (rules=6)"
+
+# bridge.ingress_enabled: false opts the bridge out. The restarted process
+# builds no ingress manager, reports opted_out and opens no listener for the
+# enabled block with rules it pulls, which it names in a Warn.
+configure_ingress enable-again "$(ingress_rules 9441)" "${PEBBLE_ACME}"
+ENABLE_AGAIN_START=${SECONDS}
+until ingress_accepts 443 && ingress_accepts 7022; do
+    if [ $((SECONDS - ENABLE_AGAIN_START)) -ge 60 ]; then
+        fail "ports 443 and 7022 of the bridge did not accept connections within 60s of the rules being served with enabled true again"
+    fi
+    sleep 2
+done
+echo "  PASS: connections to 443 and 7022 are accepted after the rules were served with enabled true again"
+INGRESS_CONFIG=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/config.yaml 2>&1) || fail "could not read /etc/plexd/config.yaml: ${INGRESS_CONFIG}"
+LAST_TOP=""
+LAST_LINE=""
+while IFS= read -r line; do
+    case "${line}" in
+        "  ingress_enabled:"*) fail "/etc/plexd/config.yaml already has the line '${line}', so the opt-out cannot be appended" ;;
+        "" | " "* | "#"*) ;;
+        *) LAST_TOP=${line} ;;
+    esac
+    if [ -n "${line}" ]; then
+        LAST_LINE=${line}
+    fi
+done <<< "${INGRESS_CONFIG}"
+case "${LAST_LINE}" in
+    " "*) ;;
+    *) fail "the last line of /etc/plexd/config.yaml is '${LAST_LINE}', want an indented line of the bridge block" ;;
+esac
+if [ "${LAST_TOP}" != "bridge:" ]; then
+    fail "the last block of /etc/plexd/config.yaml is '${LAST_TOP}', want bridge:"
+fi
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf "  ingress_enabled: false\n" >> /etc/plexd/config.yaml' \
+    || fail "could not append ingress_enabled: false to the bridge block of /etc/plexd/config.yaml"
+echo "  bridge.ingress_enabled: false appended to /etc/plexd/config.yaml"
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+INGRESS_OPTOUT_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+INGRESS_OPTOUT_START=${SECONDS}
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_OPTOUT_PID}]:" 'msg="ingress status: reported"' "state=opted_out"; then
+        break
+    fi
+    if [ $((SECONDS - INGRESS_OPTOUT_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_OPTOUT_PID}] logged no 'ingress status: reported' with state=opted_out within 60s of the restart"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_OPTOUT_PID}] logged 'ingress status: reported' with state=opted_out"
+while :; do
+    REPORT_BODY=$(curl -sf "http://localhost:18080/test/last-request/ingress-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+    if [ "${REPORT_BODY}" = '{"state":"opted_out"}' ]; then
+        break
+    fi
+    if [ $((SECONDS - INGRESS_OPTOUT_START)) -ge 60 ]; then
+        fail "the last ingress status report read '${REPORT_BODY}' 60s after the restart, want {\"state\":\"opted_out\"}"
+    fi
+    sleep 2
+done
+echo "  PASS: the last ingress status report reads {\"state\":\"opted_out\"}"
+# The Warn shows that the process pulled the enabled block with its rules.
+while :; do
+    ingress_journal
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_OPTOUT_PID}]:" "level=WARN" \
+        'msg="ingress: the control plane enables public ingress, but bridge.ingress_enabled is false"' "rules=6"; then
+        break
+    fi
+    if [ $((SECONDS - INGRESS_OPTOUT_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_OPTOUT_PID}] logged no Warn 'ingress: the control plane enables public ingress, but bridge.ingress_enabled is false' with rules=6 within 60s of the restart"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_OPTOUT_PID}] warned that the control plane enables public ingress, but bridge.ingress_enabled is false (rules=6)"
+for port in 443 7022; do
+    if ingress_refused "${port}"; then
+        echo "  PASS: a connection to port ${port} of the opted-out bridge is refused"
+    else
+        fail "port ${port} of the opted-out bridge accepted a connection after it pulled the enabled block, want it refused"
+    fi
+done
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_OPTOUT_PID}]:" 'msg="public ingress: opted out by bridge.ingress_enabled, no public listener is opened"'; then
+    echo "  PASS: plexd[${INGRESS_OPTOUT_PID}] logged 'public ingress: opted out by bridge.ingress_enabled, no public listener is opened'"
+else
+    fail "plexd[${INGRESS_OPTOUT_PID}] logged no 'public ingress: opted out by bridge.ingress_enabled, no public listener is opened'"
+fi
+if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_OPTOUT_PID}]:" 'msg="bridge subsystem initialized"' "ingress=false"; then
+    echo "  PASS: plexd[${INGRESS_OPTOUT_PID}] logged 'bridge subsystem initialized' with ingress=false"
+else
+    fail "plexd[${INGRESS_OPTOUT_PID}] logged no 'bridge subsystem initialized' with ingress=false"
+fi
+for msg in "ingress manager started" "ingress listener opened"; do
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_OPTOUT_PID}]:" "msg=\"${msg}\""; then
+        fail "plexd[${INGRESS_OPTOUT_PID}] logged '${msg}' although bridge.ingress_enabled is false"
+    fi
+    echo "  PASS: plexd[${INGRESS_OPTOUT_PID}] logged no '${msg}'"
 done
 echo "=== Public ingress on a bridge PASSED ==="
 
