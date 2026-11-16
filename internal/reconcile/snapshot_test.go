@@ -207,6 +207,39 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	}
 }
 
+// TestStateSnapshot_CopiesIngressACME proves copyIngress clones the block's
+// acme member on both Update and Get, so a stored snapshot never aliases the
+// pulled one.
+func TestStateSnapshot_CopiesIngressACME(t *testing.T) {
+	snap := NewStateSnapshot()
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Rules: []api.IngressRule{{ID: "r1", Slug: "api", ListenPort: 443, Mode: api.IngressModeACME, SNIHost: "api.example.com"}},
+				ACME:  &api.IngressACME{DirectoryURL: "https://ca.example/dir", ContactEmail: "ops@example.com"},
+			},
+		},
+	}
+	snap.Update(desired)
+
+	got := snap.Get()
+	if diff := ComputeDiff(desired, &got); diff.BridgeChanged {
+		t.Fatalf("stored ingress = %+v, want %+v", got.Bridge.Ingress, desired.Bridge.Ingress)
+	}
+
+	// Mutate the source after Update — snapshot must be unaffected.
+	desired.Bridge.Ingress.ACME.DirectoryURL = "https://mutated.example/dir"
+	if got2 := snap.Get(); got2.Bridge.Ingress.ACME.DirectoryURL != "https://ca.example/dir" {
+		t.Error("the ingress acme member was not copied on Update")
+	}
+
+	// Mutate the returned value — snapshot must be unaffected.
+	got.Bridge.Ingress.ACME.ContactEmail = "mutated@example.com"
+	if got3 := snap.Get(); got3.Bridge.Ingress.ACME.ContactEmail != "ops@example.com" {
+		t.Error("Get did not return a copy of the ingress acme member")
+	}
+}
+
 // TestStateSnapshot_CopiesRelayAssignments proves copyRelay clones the relay
 // assignments on both Update and Get, and keeps an empty list empty: a nil
 // copy of the [] a pull decodes would make ComputeDiff report bridge drift on

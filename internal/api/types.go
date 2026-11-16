@@ -1597,6 +1597,17 @@ type UserAccessInfo struct {
 // plane's NodeStateBridgeIngress.
 type IngressConfig struct {
 	Rules []IngressRule `json:"rules"`
+	// ACME is the account the block's acme rules share, the control plane's
+	// NodeStateBridgeIngressACME. It is present exactly when a rule has mode
+	// acme.
+	ACME *IngressACME `json:"acme,omitempty"`
+}
+
+// IngressACME is the ACME account of a bridge's acme rules: the directory
+// the bridge registers at, and the contact it registers with, empty for none.
+type IngressACME struct {
+	DirectoryURL string `json:"directory_url"`
+	ContactEmail string `json:"contact_email,omitempty"`
 }
 
 // IngressRule is one rule of the block, the control plane's
@@ -1616,6 +1627,10 @@ type IngressRule struct {
 	// brackets.
 	TargetAddress string `json:"target_address"`
 	TargetPort    int    `json:"target_port"`
+	// CertificateSecretName names the Secret of the bridge's Project that
+	// holds a terminate rule's certificate chain and key, one PEM document.
+	// It is empty on every other mode.
+	CertificateSecretName string `json:"certificate_secret_name,omitempty"`
 }
 
 // The modes of an ingress rule.

@@ -339,6 +339,43 @@ func TestComputeDiff_BridgeTransitions(t *testing.T) {
 	}
 }
 
+// TestComputeDiff_IngressCertificateSourceIsBridgeDrift proves a changed
+// directory_url, contact_email or certificate_secret_name is bridge drift, so
+// the ingress reconcile handler sees it.
+func TestComputeDiff_IngressCertificateSourceIsBridgeDrift(t *testing.T) {
+	block := func(dir, contact, secret string) *api.BridgeSnapshot {
+		return &api.BridgeSnapshot{Ingress: &api.IngressConfig{
+			Rules: []api.IngressRule{
+				{ID: "r1", Slug: "api", ListenPort: 443, Mode: api.IngressModeACME, SNIHost: "api.example.com"},
+				{ID: "r2", Slug: "mqtt", ListenPort: 8883, Mode: api.IngressModeTerminate, SNIHost: "mqtt.example.com", CertificateSecretName: secret},
+			},
+			ACME: &api.IngressACME{DirectoryURL: dir, ContactEmail: contact},
+		}}
+	}
+	current := block("https://ca.example/dir", "ops@example.com", "mqtt-cert")
+
+	tests := []struct {
+		name    string
+		desired *api.BridgeSnapshot
+	}{
+		{"directory_url", block("https://other.example/dir", "ops@example.com", "mqtt-cert")},
+		{"contact_email", block("https://ca.example/dir", "admin@example.com", "mqtt-cert")},
+		{"certificate_secret_name", block("https://ca.example/dir", "ops@example.com", "mqtt-cert-2")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{Bridge: tt.desired}, &api.NodeStateSnapshot{Bridge: current})
+			if !diff.BridgeChanged {
+				t.Errorf("a changed %s did not set BridgeChanged", tt.name)
+			}
+		})
+	}
+	same := block("https://ca.example/dir", "ops@example.com", "mqtt-cert")
+	if diff := ComputeDiff(&api.NodeStateSnapshot{Bridge: same}, &api.NodeStateSnapshot{Bridge: current}); diff.BridgeChanged {
+		t.Error("an unchanged block reads as bridge drift")
+	}
+}
+
 func TestComputeDiff_StateTransitions(t *testing.T) {
 	populated := &api.NodeStateBlock{Metadata: []api.StateEntry{{Key: "env", Value: "prod"}}}
 	changed := &api.NodeStateBlock{Metadata: []api.StateEntry{{Key: "env", Value: "staging"}}}
