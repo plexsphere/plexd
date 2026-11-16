@@ -33,7 +33,8 @@ type IngressRuleReport struct {
 // is not_required for passthrough; ready or not_ready with the overlay's
 // reason for terminate; and for acme, not_ready with the plan's reason when it
 // has one, ready once the ACME manager reports the host issued, and
-// acme_not_issued until then.
+// acme_not_issued until then. The dial is the last one a client connection
+// caused to the rule's current target, and none without one.
 func (m *IngressManager) RuleReports() []IngressRuleReport {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -90,13 +91,20 @@ func (m *IngressManager) ruleReportLocked(st IngressRuleState) IngressRuleReport
 		}
 	}
 	r.Dial = api.IngressDialNone
+	// A record of another target belongs to the rule before it changed.
+	if rec, ok := m.dials[st.Rule.ID]; ok && rec.target == ingressTarget(st.Rule) {
+		r.Dial, r.DialReason, r.DialAt = api.IngressDialSucceeded, "", rec.at
+		if rec.failed {
+			r.Dial, r.DialReason = api.IngressDialFailed, rec.reason
+		}
+	}
 	return r
 }
 
 // ReportChanged returns the channel the manager signals, without blocking,
 // when what RuleReports returns may have changed: at the end of every Apply,
-// every certificate load and Teardown, and when the ACME manager reports a
-// change of its issued hosts. Several signals before the reader wakes
+// every certificate load and Teardown, when the ACME manager reports a change
+// of its issued hosts, and when a dial record changes its outcome or reason. Several signals before the reader wakes
 // collapse into one. The signals are liberal; the reader compares before it
 // acts.
 func (m *IngressManager) ReportChanged() <-chan struct{} {

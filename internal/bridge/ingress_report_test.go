@@ -329,3 +329,34 @@ func TestReportChanged_Signals(t *testing.T) {
 	}
 	requireOne("Teardown")
 }
+
+func TestIngressReasons_AreReasonTokens(t *testing.T) {
+	for _, reason := range []string{
+		IngressReasonInvalid,
+		IngressReasonDuplicateID,
+		IngressReasonListenerConflict,
+		IngressReasonMaxRules,
+		IngressReasonListenFailed,
+		IngressReasonACMEDirectoryInvalid,
+		IngressReasonACMEDirectoryNotAllowed,
+		IngressReasonACMEChallengePortTaken,
+		IngressReasonCertificateSecretNotListed,
+		IngressReasonCertificateFetchFailed,
+		IngressReasonCertificateInvalid,
+		IngressReasonACMENotIssued,
+		IngressDialReasonPolicyDenied,
+		IngressDialReasonTimeout,
+		IngressDialReasonRefused,
+		IngressDialReasonUnreachable,
+		IngressDialReasonOther,
+	} {
+		if !api.ValidIngressReason(reason) {
+			t.Errorf("api.ValidIngressReason(%q) = false, want true", reason)
+		}
+	}
+	for _, s := range []string{"", "Policy Denied", "9lives", strings.Repeat("a", 64)} {
+		if api.ValidIngressReason(s) {
+			t.Errorf("api.ValidIngressReason(%q) = true, want false", s)
+		}
+	}
+}

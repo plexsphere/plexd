@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"testing"
@@ -299,4 +300,28 @@ func requireNoSignal(t *testing.T, ch <-chan struct{}, what string) {
 		t.Errorf("a signal after %s, want none", what)
 	default:
 	}
+}
+
+// fakeDialPolicy is an IngressDialPolicy that answers denied and records
+// every target it was asked about.
+type fakeDialPolicy struct {
+	mu      sync.Mutex
+	denied  bool
+	targets []netip.AddrPort
+}
+
+var _ IngressDialPolicy = (*fakeDialPolicy)(nil)
+
+func (p *fakeDialPolicy) DialDenied(target netip.AddrPort) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.targets = append(p.targets, target)
+	return p.denied
+}
+
+// asked returns every target the policy was asked about, in order.
+func (p *fakeDialPolicy) asked() []netip.AddrPort {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]netip.AddrPort(nil), p.targets...)
 }

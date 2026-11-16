@@ -2,11 +2,9 @@ package bridge
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -265,7 +263,7 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		}
 		route := &ingressRoute{
 			rule:   r,
-			target: net.JoinHostPort(r.TargetAddress, strconv.Itoa(r.TargetPort)),
+			target: ingressTarget(r),
 			served: r.Mode != api.IngressModeACME || acme.Reason == "",
 		}
 		switch {

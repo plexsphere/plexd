@@ -76,6 +76,11 @@ type IngressManager struct {
 	acme             *ACMEManager
 	fetcher          CertificateSecretFetcher
 	now              func() time.Time
+	// dial, nil in production, replaces the dial of a rule's target in tests.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// dialPolicy names a failed dial policy_denied; set before Setup, nil
+	// without one.
+	dialPolicy IngressDialPolicy
 
 	// mu protects the fields below from concurrent access by the reconcile
 	// loop, the connections and status readers.
@@ -96,6 +101,7 @@ type IngressManager struct {
 	inventory map[string]int
 	certs     map[string]*certEntry    // by the Secret name a held terminate rule names
 	coverage  map[coverageKey]struct{} // the hosts checked against a loaded certificate
+	dials     map[string]dialRecord    // the last dial of each held rule, by rule id
 
 	connCount atomic.Int64 // connections from accept to close, across all ports
 
@@ -120,6 +126,7 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 		now:              time.Now,
 		listeners:        make(map[int]*ingressListener),
 		certs:            make(map[string]*certEntry),
+		dials:            make(map[string]dialRecord),
 		changed:          make(chan struct{}, 1),
 	}
 	acme.OnIssuedChange(m.signalReport)
@@ -178,6 +185,7 @@ func (m *IngressManager) Teardown() error {
 	m.inventory = nil
 	m.certs = make(map[string]*certEntry)
 	m.coverage = nil
+	m.dials = make(map[string]dialRecord)
 	m.signalReport()
 	m.mu.Unlock()
 
@@ -333,6 +341,13 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 
 	m.logRuleChanges(plan.states)
 	m.states = plan.states
+	// Only a held rule has a route that dials, so the records stay within
+	// bridge.max_ingress_rules.
+	for id := range m.dials {
+		if _, ok := m.held[id]; !ok {
+			delete(m.dials, id)
+		}
+	}
 	m.signalReport()
 	m.mu.Unlock()
 
@@ -600,19 +615,23 @@ func (m *IngressManager) logClosed(l *ingressListener, conn net.Conn, serverName
 	)
 }
 
-// proxy dials the route's target, replays the peeked bytes to it, and copies
-// both ways until one side ends or the route is cancelled.
+// proxy dials the route's target, records the dial's outcome, replays the
+// peeked bytes to the target, and copies both ways until one side ends or the
+// route is cancelled.
 func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []byte) {
-	dialer := net.Dialer{Timeout: m.dialTimeout}
-	target, err := dialer.DialContext(route.ctx, "tcp", route.target)
+	target, err := m.dialTarget(route)
+	reason := m.recordDial(route, err)
 	if err != nil {
-		m.logger.Error("bridge: ingress: dial target failed",
+		attrs := []any{
 			"component", "bridge",
 			"rule_id", route.rule.ID,
 			"slug", route.rule.Slug,
 			"target", route.target,
-			"error", err,
-		)
+		}
+		if reason != "" {
+			attrs = append(attrs, "reason", reason)
+		}
+		m.logger.Error("bridge: ingress: dial target failed", append(attrs, "error", err)...)
 		return
 	}
 

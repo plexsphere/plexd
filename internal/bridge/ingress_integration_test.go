@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -996,5 +997,134 @@ func TestIngressIntegration_HandshakeDeadlineIsCleared(t *testing.T) {
 	requireEcho(t, acmeConn, "acme rule after the handshake timeout")
 	if n := backend.accepted.Load(); n != 2 {
 		t.Errorf("backend accepted %d connections, want 2", n)
+	}
+}
+
+// TestIngressIntegration_DialSucceededIsRecorded reports a dial that reached
+// its target at the manager's clock and signals the change once; a second
+// dial that succeeds moves the time and signals nothing.
+func TestIngressIntegration_DialSucceededIsRecorded(t *testing.T) {
+	backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+	ctrl := newLoopbackIngressController(t)
+	fx := newIngressFixture(t, ctrl)
+	clock := &relayClock{now: relayStart}
+	fx.mgr.now = clock.Now
+	id := reportID("a1")
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(backendRule(t, "web", 7022, "", backend), id))); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	changed := fx.mgr.ReportChanged()
+	drain(changed)
+
+	// The bridge records the dial before it copies, so the echo proves the
+	// record is stored.
+	requireEcho(t, connect(t, ctrl.addr(7022)), "one")
+	requireSignal(t, changed, "the first dial")
+	want := IngressRuleReport{
+		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
+		Dial: api.IngressDialSucceeded, DialAt: relayStart,
+	}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+		t.Errorf("after the first dial: report = %+v, want %+v", got, want)
+	}
+
+	clock.Add(5 * time.Second)
+	requireEcho(t, connect(t, ctrl.addr(7022)), "two")
+	want.DialAt = relayStart.Add(5 * time.Second)
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+		t.Errorf("after the second dial: report = %+v, want %+v", got, want)
+	}
+	requireNoSignal(t, changed, "a second dial that succeeded")
+}
+
+// closedPort returns a loopback port nothing listens on.
+func closedPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, p, _ := net.SplitHostPort(ln.Addr().String())
+	_ = ln.Close()
+	port, _ := strconv.Atoi(p)
+	return port
+}
+
+// TestIngressIntegration_DialRefusedIsReported reports a dial to a closed
+// port as refused, without a dial policy.
+func TestIngressIntegration_DialRefusedIsReported(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	fx := newIngressFixture(t, ctrl)
+	id := reportID("a1")
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(ingressRule("web", 7022, "", closedPort(t)), id))); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	requireClosed(t, connect(t, ctrl.addr(7022)))
+	fx.logs.waitFor(t, `msg="bridge: ingress: dial target failed"`, 1)
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got.Dial != api.IngressDialFailed || got.DialReason != IngressDialReasonRefused {
+		t.Errorf("report = %+v, want dial failed with %s", got, IngressDialReasonRefused)
+	}
+	if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "rule_id="+id, "reason=refused"); got != 1 {
+		t.Errorf("%d Error lines with rule_id=%s and reason=refused, want 1:\n%s", got, id, fx.logs.String())
+	}
+}
+
+// TestIngressIntegration_DialPolicyDeniedIsReported names a failed dial
+// policy_denied when the dial policy blocks the target.
+func TestIngressIntegration_DialPolicyDeniedIsReported(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	fx := buildIngressFixture(t, ctrl, ingressTestConfig(true))
+	policy := &fakeDialPolicy{denied: true}
+	fx.mgr.SetDialPolicy(policy)
+	if err := fx.mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	port := closedPort(t)
+	id := reportID("a1")
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(ingressRule("web", 7022, "", port), id))); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	requireClosed(t, connect(t, ctrl.addr(7022)))
+	fx.logs.waitFor(t, `msg="bridge: ingress: dial target failed"`, 1)
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got.Dial != api.IngressDialFailed || got.DialReason != IngressDialReasonPolicyDenied {
+		t.Errorf("report = %+v, want dial failed with %s", got, IngressDialReasonPolicyDenied)
+	}
+	if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "rule_id="+id, "reason=policy_denied"); got != 1 {
+		t.Errorf("%d Error lines with rule_id=%s and reason=policy_denied, want 1:\n%s", got, id, fx.logs.String())
+	}
+	if got, want := policy.asked(), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)); len(got) != 1 || got[0] != want {
+		t.Errorf("the dial policy was asked about %v, want [%s]", got, want)
+	}
+}
+
+// TestIngressIntegration_HeldPortReadsListenFailed reports a rule whose port
+// another socket holds as not listening, with listen_failed.
+func TestIngressIntegration_HeldPortReadsListenFailed(t *testing.T) {
+	holder, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer holder.Close()
+	_, p, _ := net.SplitHostPort(holder.Addr().String())
+	port, _ := strconv.Atoi(p)
+	// Bind the loopback address of the port the manager asks for, which the
+	// holder owns.
+	ctrl := &mockIngressController{listenFn: func(addr string, _ *tls.Config) (net.Listener, error) {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		return net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
+	}}
+	fx := newIngressFixture(t, ctrl)
+	id := reportID("a1")
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(ingressRule("web", port, "", 9000), id))); err == nil {
+		t.Fatalf("Apply on port %d, which another socket holds: nil error, want the bind error", port)
+	}
+	want := IngressRuleReport{RuleID: id, Listener: api.IngressListenerNotListening, ListenerReason: IngressReasonListenFailed}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+		t.Errorf("report = %+v, want %+v", got, want)
 	}
 }
