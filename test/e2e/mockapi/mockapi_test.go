@@ -6037,6 +6037,150 @@ func decodeIngressStatusReceipt(t *testing.T, resp *http.Response) api.IngressSt
 	return receipt
 }
 
+// ingressStatusRuleID returns a canonical rule id for the n-th entry.
+func ingressStatusRuleID(n int) string {
+	return fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", n+1)
+}
+
+// ingressStatusRulesBody renders a report with rule entries in plexd's own
+// wire type.
+func ingressStatusRulesBody(t *testing.T, state string, rules []api.IngressStatusRule) string {
+	t.Helper()
+	data, err := json.Marshal(api.IngressStatusRequest{State: state, Rules: rules})
+	if err != nil {
+		t.Fatalf("marshal ingress status report: %v", err)
+	}
+	return string(data)
+}
+
+// putIngressStatusProblem sends body and requires a 400 with code and detail,
+// and that the refusal was not counted.
+func putIngressStatusProblem(t *testing.T, body, code, detail string) {
+	t.Helper()
+	_, ts := newTestServer(t)
+	resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, got)
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != code || problem["detail"] != detail {
+		t.Errorf("problem = %v %q, want %s %q", problem["code"], problem["detail"], code, detail)
+	}
+	if a := getAssertions(t, ts.URL); a.IngressStatusCount != 0 {
+		t.Errorf("ingress_status_count = %d after a refusal, want 0", a.IngressStatusCount)
+	}
+}
+
+// TestIngressStatus_AcceptsNoRules reads an absent rules, a null and an empty
+// array alike: a report without entries.
+func TestIngressStatus_AcceptsNoRules(t *testing.T) {
+	_, ts := newTestServer(t)
+	for _, body := range []string{`{"state":"enabled"}`, `{"state":"enabled","rules":null}`, `{"state":"enabled","rules":[]}`} {
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
+		decodeIngressStatusReceipt(t, resp)
+		resp.Body.Close()
+	}
+	if a := getAssertions(t, ts.URL); a.IngressStatusCount != 3 {
+		t.Errorf("ingress_status_count = %d, want 3", a.IngressStatusCount)
+	}
+}
+
+// ingressStatusContractExample is the three-entry example of the agent
+// contract (plexsphere/plexsphere@16f468b docs/reference/api/plexd-agent-contract.md,
+// "Ingress status").
+const ingressStatusContractExample = `{
+  "state": "enabled",
+  "rules": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", "listener": "listening",
+      "certificate": "ready", "dial": "failed", "dial_reason": "policy_denied", "dial_age_seconds": 12 },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", "listener": "listening",
+      "certificate": "not_ready", "certificate_reason": "certificate_secret_not_listed", "dial": "none" },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", "listener": "not_listening", "listener_reason": "listen_failed" }
+  ]
+}`
+
+func TestIngressStatus_AcceptsTheContractExample(t *testing.T) {
+	_, ts := newTestServer(t)
+	resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, ingressStatusContractExample)
+	defer resp.Body.Close()
+	decodeIngressStatusReceipt(t, resp)
+	if got := string(getCapturedBody(t, ts.URL, "ingress-status")); got != ingressStatusContractExample {
+		t.Errorf("captured body = %s, want the example as sent", got)
+	}
+	if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
+		t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
+	}
+}
+
+func TestIngressStatus_MoreRulesThanAReportCarries(t *testing.T) {
+	entries := make([]api.IngressStatusRule, api.MaxIngressStatusRules+1)
+	for i := range entries {
+		entries[i] = api.IngressStatusRule{ID: ingressStatusRuleID(i), Listener: api.IngressListenerNotListening, ListenerReason: "listen_failed"}
+	}
+	putIngressStatusProblem(t, ingressStatusRulesBody(t, api.IngressStateEnabled, entries),
+		"malformed_ingress_status", "rules carries more than 1024 entries")
+}
+
+// TestIngressStatus_MalformedRuleEntries refuses an entry whose member breaks
+// its own rule with malformed_ingress_status and a detail that names the
+// entry and the member.
+func TestIngressStatus_MalformedRuleEntries(t *testing.T) {
+	const id = `"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"`
+	tests := []struct {
+		name, entry, detail string
+	}{
+		{"no id", `{"listener":"not_listening","listener_reason":"listen_failed"}`, "rules[0].id is not a rule id"},
+		{"id x", `{"id":"x","listener":"not_listening","listener_reason":"listen_failed"}`, "rules[0].id is not a rule id"},
+		{"the zero UUID", `{"id":"00000000-0000-0000-0000-000000000000","listener":"not_listening","listener_reason":"listen_failed"}`, "rules[0].id is not a rule id"},
+		{"no listener", `{` + id + `}`, "rules[0].listener is not one of listening and not_listening"},
+		{"listener up", `{` + id + `,"listener":"up"}`, "rules[0].listener is not one of listening and not_listening"},
+		{"a reason with a space", `{` + id + `,"listener":"listening","certificate":"not_required","dial":"failed","dial_reason":"Policy Denied","dial_age_seconds":1}`, "rules[0].dial_reason is not a reason token"},
+		{"a negative dial age", `{` + id + `,"listener":"listening","certificate":"not_required","dial":"failed","dial_reason":"refused","dial_age_seconds":-1}`, "rules[0].dial_age_seconds is outside 0..2147483647"},
+		{"an unknown member", `{` + id + `,"listener":"not_listening","listener_reason":"listen_failed","state":"up"}`, "rules[0] is not a valid rule entry"},
+		{"an entry that is no object", `"x"`, "rules[0] is not a valid rule entry"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putIngressStatusProblem(t, `{"state":"enabled","rules":[`+tt.entry+`]}`, "malformed_ingress_status", tt.detail)
+		})
+	}
+}
+
+// TestIngressStatus_InvalidRuleEntries refuses a report whose members
+// disagree with each other with invalid_ingress_status.
+func TestIngressStatus_InvalidRuleEntries(t *testing.T) {
+	const (
+		a = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"not_listening","listener_reason":"listen_failed"}`
+		b = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"none"}`
+	)
+	tests := []struct {
+		name, body, detail string
+	}{
+		{"an opted-out bridge with rules", `{"state":"opted_out","rules":[` + a + `]}`, "an opted-out bridge reports no rules"},
+		{"two entries with one id", `{"state":"enabled","rules":[` + a + `,` + b + `]}`, "rules[1].id repeats rules[0].id"},
+		{
+			"a listening entry without certificate",
+			`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","dial":"none"}]}`,
+			"rules[0] misses certificate while listener is listening",
+		},
+		{
+			"a not_listening entry with dial",
+			`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"not_listening","listener_reason":"listen_failed","dial":"none"}]}`,
+			"rules[0] carries dial while listener is not_listening",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putIngressStatusProblem(t, tt.body, "invalid_ingress_status", tt.detail)
+		})
+	}
+}
+
 // TestIngressStatus_AcceptsBothStates sends each of the contract's two states
 // once. Each is answered 200 with a fresh accepted_at, and each is counted.
 func TestIngressStatus_AcceptsBothStates(t *testing.T) {
@@ -6081,7 +6225,8 @@ func TestIngressStatus_DenialTaxonomy(t *testing.T) {
 		{"empty object", `{}`, missingDetail},
 		{"state null", `{"state":null}`, missingDetail},
 		{"state outside the two", `{"state":"paused"}`, outsideDetail},
-		{"unknown member", `{"state":"enabled","rules":[]}`, ""},
+		{"unknown member", `{"state":"enabled","rule":[]}`, ""},
+		{"rules of the wrong type", `{"state":"enabled","rules":{}}`, ""},
 		{"trailing data", `{"state":"enabled"}{}`, ""},
 		{"not json", "not-json", ""},
 		{"null body", "null", ""},
@@ -6135,15 +6280,15 @@ func TestIngressStatus_DenialTaxonomy(t *testing.T) {
 	}
 }
 
-// The 4 KiB cap is inclusive and exact, and it is judged before the decode.
+// The 256 KiB cap is inclusive and exact, and it is judged before the decode.
 func TestIngressStatus_BodyCap(t *testing.T) {
-	const capBytes = 4096
+	const capBytes = 256 << 10
 	padded := func(n int) string {
 		body := ingressStatusBody(t, api.IngressStateEnabled)
 		return body + strings.Repeat(" ", n-len(body))
 	}
 
-	t.Run("exactly 4 KiB is accepted", func(t *testing.T) {
+	t.Run("exactly 256 KiB is accepted", func(t *testing.T) {
 		_, ts := newTestServer(t)
 		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, padded(capBytes))
 		defer resp.Body.Close()
@@ -6151,6 +6296,23 @@ func TestIngressStatus_BodyCap(t *testing.T) {
 		if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
 			t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
 		}
+	})
+
+	// 5 KiB was over the cap before the report carried rule entries.
+	t.Run("a valid report of 5 KiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		entries := make([]api.IngressStatusRule, 0, 45)
+		for i := range 45 {
+			entries = append(entries, api.IngressStatusRule{ID: ingressStatusRuleID(i), Listener: api.IngressListenerNotListening, ListenerReason: "listen_failed"})
+		}
+		body := ingressStatusRulesBody(t, api.IngressStateEnabled, entries)
+		if len(body) > 5<<10 || len(body) <= 4<<10 {
+			t.Fatalf("the entries take %d bytes, want between 4 and 5 KiB before the padding", len(body))
+		}
+		body += strings.Repeat(" ", 5<<10-len(body))
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
+		defer resp.Body.Close()
+		decodeIngressStatusReceipt(t, resp)
 	})
 
 	for _, tt := range []struct {

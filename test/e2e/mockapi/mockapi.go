@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3684,16 +3685,17 @@ func (s *Server) derivePolicyStatus(req *policyStatusBody) string {
 	}
 }
 
-// maxIngressStatusBody is the contract's 4 KiB cap on an ingress status
+// maxIngressStatusBody is the contract's 256 KiB cap on an ingress status
 // report, the mock's own copy of the number.
-const maxIngressStatusBody = 4096
+const maxIngressStatusBody = 256 << 10
 
 // handleIngressStatus handles PUT /v1/nodes/{id}/ingress-status, the bridge's
-// report of whether its local configuration serves public ingress. It enforces
-// the contract's gates in order: the 4 KiB body cap (413
-// ingress_status_body_too_large), the strict decode of decodeIngressStatus and
-// the state rule of checkIngressStatus, both of which answer 400
-// malformed_ingress_status. The 200 answer carries accepted_at. Every answer of
+// report of whether its local configuration serves public ingress and of the
+// state of each ingress rule. It enforces the contract's gates in order: the
+// 256 KiB body cap (413 ingress_status_body_too_large), the strict decode of
+// decodeIngressStatus, which answers 400 malformed_ingress_status, and the
+// rules of checkIngressStatus, which answer 400 malformed_ingress_status or
+// invalid_ingress_status. The 200 answer carries accepted_at. Every answer of
 // the handler carries Cache-Control: no-store, as the contract asks. The
 // counter increments only on the 200. As for policy-status, the bearer gate is
 // the only check of the node: the path id is not compared with it.
@@ -3727,8 +3729,8 @@ func (s *Server) handleIngressStatus(w http.ResponseWriter, r *http.Request) {
 			"request body is not a valid ingress status report: "+err.Error())
 		return
 	}
-	if detail := checkIngressStatus(req); detail != "" {
-		writeProblem(w, r, http.StatusBadRequest, "malformed_ingress_status", detail)
+	if code, detail := checkIngressStatus(req); code != "" {
+		writeProblem(w, r, http.StatusBadRequest, code, detail)
 		return
 	}
 
@@ -3738,9 +3740,26 @@ func (s *Server) handleIngressStatus(w http.ResponseWriter, r *http.Request) {
 
 // ingressStatusBody is the mock's reading of an ingress status report. State is
 // a pointer, so a missing or null state decodes to nil and reads as missing, as
-// the contract has it.
+// the contract has it. The rule entries stay undecoded until
+// checkIngressStatus decodes each one on its own, so a detail names the entry
+// by its index; a null rules decodes to nil and reads as no entries.
 type ingressStatusBody struct {
-	State *string `json:"state"`
+	State *string            `json:"state"`
+	Rules *[]json.RawMessage `json:"rules"`
+}
+
+// ingressStatusRuleEntry is the mock's reading of one rule entry. Every member
+// is a pointer, so the presence rules can tell an omitted member from a sent
+// one; a member sent as null reads as omitted, as on the control plane.
+type ingressStatusRuleEntry struct {
+	ID                *string `json:"id"`
+	Listener          *string `json:"listener"`
+	ListenerReason    *string `json:"listener_reason"`
+	Certificate       *string `json:"certificate"`
+	CertificateReason *string `json:"certificate_reason"`
+	Dial              *string `json:"dial"`
+	DialReason        *string `json:"dial_reason"`
+	DialAgeSeconds    *int64  `json:"dial_age_seconds"`
 }
 
 // decodeIngressStatus strict-decodes the body as exactly one ingress status
@@ -3761,18 +3780,137 @@ func decodeIngressStatus(data []byte) (*ingressStatusBody, error) {
 	return req, nil
 }
 
-// checkIngressStatus runs the contract's state rule over a decoded report and
-// returns the detail of the breach, or "" when the report is valid. The detail
-// never quotes the state the agent sent.
-func checkIngressStatus(req *ingressStatusBody) string {
+// checkIngressStatus runs the contract's rules over a decoded report and
+// returns the code and detail of the first breach, or two empty strings when
+// the report is valid. The shape rules, over the state and over every rule
+// entry, answer malformed_ingress_status; then the consistency rules, an
+// opted-out report with entries, an id that repeats an earlier entry, and an
+// entry that breaks the presence rules, answer invalid_ingress_status. The
+// details are the control plane's sentences
+// (plexsphere/plexsphere@16f468b internal/transport/http/v1/ingressstatus/handler.go),
+// except that an entry that is no object, carries an unknown member or a
+// member of the wrong type reads "is not a valid rule entry". A detail never
+// quotes an id or a reason of the body. The mock accepts canonical ids only
+// (api.ValidIngressRuleID), which is narrower than the control plane's parser
+// and wide enough for what plexd sends.
+func checkIngressStatus(req *ingressStatusBody) (code, detail string) {
+	const malformed, invalid = "malformed_ingress_status", "invalid_ingress_status"
 	switch {
 	case req.State == nil:
-		return "state is missing"
+		return malformed, "state is missing"
 	case *req.State != api.IngressStateEnabled && *req.State != api.IngressStateOptedOut:
-		return "state is not one of enabled and opted_out"
-	default:
-		return ""
+		return malformed, "state is not one of enabled and opted_out"
+	case req.Rules == nil:
+		return "", ""
 	}
+	raw := *req.Rules
+	if len(raw) > api.MaxIngressStatusRules {
+		return malformed, fmt.Sprintf("rules carries more than %d entries", api.MaxIngressStatusRules)
+	}
+	entries := make([]ingressStatusRuleEntry, len(raw))
+	for i, entry := range raw {
+		dec := json.NewDecoder(bytes.NewReader(entry))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&entries[i]); err != nil {
+			return malformed, fmt.Sprintf("rules[%d] is not a valid rule entry", i)
+		}
+		if detail := checkIngressStatusRuleShape(entries[i]); detail != "" {
+			return malformed, fmt.Sprintf("rules[%d]%s", i, detail)
+		}
+	}
+
+	if *req.State == api.IngressStateOptedOut && len(entries) > 0 {
+		return invalid, "an opted-out bridge reports no rules"
+	}
+	first := make(map[string]int, len(entries))
+	for i, e := range entries {
+		// Two spellings of one UUID repeat each other.
+		id := strings.ToLower(*e.ID)
+		if j, seen := first[id]; seen {
+			return invalid, fmt.Sprintf("rules[%d].id repeats rules[%d].id", i, j)
+		}
+		first[id] = i
+		if detail := checkIngressStatusRulePresence(e); detail != "" {
+			return invalid, fmt.Sprintf("rules[%d] %s", i, detail)
+		}
+	}
+	return "", ""
+}
+
+// checkIngressStatusRuleShape applies the member rules of one rule entry in
+// the order the contract lists the members and returns the detail of the
+// first broken one, without the entry's index, or "". A member the entry
+// omits passes here unless the contract requires it.
+func checkIngressStatusRuleShape(e ingressStatusRuleEntry) string {
+	oneOf := func(v *string, values ...string) bool { return v == nil || slices.Contains(values, *v) }
+	reason := func(v *string) bool { return v == nil || api.ValidIngressReason(*v) }
+	switch {
+	case e.ID == nil || !api.ValidIngressRuleID(*e.ID):
+		return ".id is not a rule id"
+	case e.Listener == nil || !oneOf(e.Listener, api.IngressListenerListening, api.IngressListenerNotListening):
+		return ".listener is not one of listening and not_listening"
+	case !reason(e.ListenerReason):
+		return ".listener_reason is not a reason token"
+	case !oneOf(e.Certificate, api.IngressCertificateNotRequired, api.IngressCertificateReady, api.IngressCertificateNotReady):
+		return ".certificate is not one of not_required, ready and not_ready"
+	case !reason(e.CertificateReason):
+		return ".certificate_reason is not a reason token"
+	case !oneOf(e.Dial, api.IngressDialNone, api.IngressDialSucceeded, api.IngressDialFailed):
+		return ".dial is not one of none, succeeded and failed"
+	case !reason(e.DialReason):
+		return ".dial_reason is not a reason token"
+	case e.DialAgeSeconds != nil && (*e.DialAgeSeconds < 0 || *e.DialAgeSeconds > api.MaxIngressStatusDialAgeSeconds):
+		return fmt.Sprintf(".dial_age_seconds is outside 0..%d", api.MaxIngressStatusDialAgeSeconds)
+	}
+	return ""
+}
+
+// checkIngressStatusRulePresence applies the presence table of one rule entry:
+// listener_reason, certificate and dial depend on listener, certificate_reason
+// on certificate, and dial_reason and dial_age_seconds on dial, each sent
+// exactly when its facet holds the value that calls for it. The rows run in
+// that order and stop at the first broken one, so a row that depends on an
+// omitted certificate or dial runs only for a rule that does not listen, and
+// listener is the facet that decides it. It returns the sentence naming the
+// member and the facet value that decides the row, or "".
+func checkIngressStatusRulePresence(e ingressStatusRuleEntry) string {
+	value := func(v *string) string {
+		if v == nil {
+			return ""
+		}
+		return *v
+	}
+	listenerIs := "listener is " + *e.Listener
+	certificateIs, dialIs := listenerIs, listenerIs
+	if e.Certificate != nil {
+		certificateIs = "certificate is " + *e.Certificate
+	}
+	if e.Dial != nil {
+		dialIs = "dial is " + *e.Dial
+	}
+	listening := *e.Listener == api.IngressListenerListening
+	dial := value(e.Dial)
+	rows := []struct {
+		member       string
+		sent, wanted bool
+		because      string
+	}{
+		{"listener_reason", e.ListenerReason != nil, !listening, listenerIs},
+		{"certificate", e.Certificate != nil, listening, listenerIs},
+		{"certificate_reason", e.CertificateReason != nil, value(e.Certificate) == api.IngressCertificateNotReady, certificateIs},
+		{"dial", e.Dial != nil, listening, listenerIs},
+		{"dial_reason", e.DialReason != nil, dial == api.IngressDialFailed, dialIs},
+		{"dial_age_seconds", e.DialAgeSeconds != nil, dial == api.IngressDialSucceeded || dial == api.IngressDialFailed, dialIs},
+	}
+	for _, row := range rows {
+		switch {
+		case row.sent && !row.wanted:
+			return "carries " + row.member + " while " + row.because
+		case !row.sent && row.wanted:
+			return "misses " + row.member + " while " + row.because
+		}
+	}
+	return ""
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state
