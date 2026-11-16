@@ -6,12 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -424,4 +426,67 @@ func TestACMEManager_TeardownWaitIsBounded(t *testing.T) {
 	if mgr.Active() {
 		t.Error("Active = true after Teardown, want false")
 	}
+}
+
+// TestACMEManager_Issued records the outcome of every certificate request
+// that is no TLS-ALPN-01 challenge: a success marks the host issued, a later
+// failure unmarks it, and a challenge hello changes nothing. Without an
+// account, and after Teardown, no host is issued.
+func TestACMEManager_Issued(t *testing.T) {
+	mgr, _, _ := newTestACMEManager(t)
+	settings := &api.IngressACME{DirectoryURL: "https://ca.example/dir"}
+	if mgr.Issued("a.example.com") {
+		t.Error("Issued without an account = true, want false")
+	}
+
+	cert := selfSignedCert(t, "a.example.com")
+	var failA atomic.Bool
+	mgr.getCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		switch {
+		case slices.Contains(hello.SupportedProtos, acme.ALPNProto):
+			return &cert, nil
+		case hello.ServerName == "b.example.com", failA.Load():
+			return nil, errors.New("acme: order failed")
+		}
+		return &cert, nil
+	}
+	changed := make(chan struct{}, 8)
+	mgr.OnIssuedChange(func() { changed <- struct{}{} })
+
+	mgr.Configure(settings, []string{"a.example.com", "b.example.com"})
+	requireSignal(t, changed, "the obtain of a.example.com succeeded")
+	if !mgr.Issued("A.example.com") {
+		t.Error("Issued(A.example.com) after its obtain succeeded = false, want true")
+	}
+
+	// b.example.com's obtain fails, and its only successful hello offers
+	// acme-tls/1.
+	if _, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: "b.example.com", SupportedProtos: []string{acme.ALPNProto}}); err != nil {
+		t.Fatalf("GetCertificate for the challenge hello: %v", err)
+	}
+	if mgr.Issued("b.example.com") {
+		t.Error("Issued(b.example.com) after a failed obtain and a successful challenge hello = true, want false")
+	}
+
+	failA.Store(true)
+	if _, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: "a.example.com"}); err == nil {
+		t.Fatal("GetCertificate for a.example.com: nil error, want the order failure")
+	}
+	requireSignal(t, changed, "a.example.com's request failed")
+	if mgr.Issued("a.example.com") {
+		t.Error("Issued(a.example.com) after a failed request = true, want false")
+	}
+
+	failA.Store(false)
+	if _, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: "a.example.com"}); err != nil {
+		t.Fatalf("GetCertificate for a.example.com: %v", err)
+	}
+	requireSignal(t, changed, "a.example.com's request succeeded again")
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if mgr.Issued("a.example.com") {
+		t.Error("Issued(a.example.com) after Teardown = true, want false")
+	}
+	requireNoSignal(t, changed, "Teardown")
 }

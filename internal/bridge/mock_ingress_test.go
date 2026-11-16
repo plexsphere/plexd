@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -278,4 +279,24 @@ func newIngressFixture(t *testing.T, ctrl IngressController) *ingressFixture {
 		t.Fatalf("Setup: %v", err)
 	}
 	return fx
+}
+
+// requireSignal waits up to 2 s for a signal on ch.
+func requireSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no signal within 2s after %s", what)
+	}
+}
+
+// requireNoSignal fails the test if ch holds a signal now.
+func requireNoSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Errorf("a signal after %s, want none", what)
+	default:
+	}
 }

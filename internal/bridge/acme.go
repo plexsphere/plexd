@@ -72,6 +72,9 @@ type ACMEManager struct {
 	mu      sync.Mutex
 	hosts   map[string]struct{} // the lowercase sni_host of every served acme rule
 	account *acmeAccount        // nil while no account is configured
+	// onIssued is called, outside mu, when the issued hosts of the active
+	// account change; nil calls nothing.
+	onIssued func()
 
 	// obtaining counts the goroutines that obtain a certificate ahead of the
 	// first client. idle is made when the count leaves zero and closed when it
@@ -87,6 +90,9 @@ type acmeAccount struct {
 	manager  *autocert.Manager
 	client   *acme.Client
 	gate     *acmeGate
+	// issued holds the lowercase hosts whose last certificate request
+	// succeeded; guarded by ACMEManager.mu.
+	issued map[string]struct{}
 }
 
 // retire cuts the account off from the network. It is nil-safe.
@@ -198,6 +204,7 @@ func (m *ACMEManager) newAccount(settings api.IngressACME) *acmeAccount {
 		manager:  am,
 		client:   client,
 		gate:     gate,
+		issued:   make(map[string]struct{}),
 	}
 }
 
@@ -321,12 +328,69 @@ func certificateNotAfter(cert *tls.Certificate) time.Time {
 }
 
 // certificate asks acct's autocert.Manager, or the test hook, for a
-// certificate.
+// certificate. For a hello that is no TLS-ALPN-01 challenge it records the
+// outcome: a certificate marks the lowercase server name issued, an error
+// unmarks it.
 func (m *ACMEManager) certificate(acct *acmeAccount, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var cert *tls.Certificate
+	var err error
 	if m.getCertificate != nil {
-		return m.getCertificate(hello)
+		cert, err = m.getCertificate(hello)
+	} else {
+		cert, err = acct.manager.GetCertificate(hello)
 	}
-	return acct.manager.GetCertificate(hello)
+	if !slices.Contains(hello.SupportedProtos, acme.ALPNProto) {
+		m.recordIssued(acct, hello.ServerName, err == nil)
+	}
+	return cert, err
+}
+
+// recordIssued marks host issued or not on acct. When that changes the set
+// and acct is still the active account, it calls the function OnIssuedChange
+// registered, outside mu.
+func (m *ACMEManager) recordIssued(acct *acmeAccount, serverName string, issued bool) {
+	host := strings.ToLower(serverName)
+	if host == "" {
+		return
+	}
+	m.mu.Lock()
+	_, was := acct.issued[host]
+	if issued {
+		acct.issued[host] = struct{}{}
+	} else {
+		delete(acct.issued, host)
+	}
+	var notify func()
+	if was != issued && m.account == acct {
+		notify = m.onIssued
+	}
+	m.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
+}
+
+// Issued reports whether an account is configured and the last certificate
+// request for host, in any case, succeeded: the obtain ahead of the first
+// client or a client handshake, not a TLS-ALPN-01 challenge. A new account
+// starts with no host issued.
+func (m *ACMEManager) Issued(host string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.account == nil {
+		return false
+	}
+	_, ok := m.account.issued[strings.ToLower(host)]
+	return ok
+}
+
+// OnIssuedChange registers fn, which is called whenever a request changes
+// whether a host of the active account is issued. fn runs on the goroutine
+// that made the request, outside the manager's lock, and must not block.
+func (m *ACMEManager) OnIssuedChange(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onIssued = fn
 }
 
 // HasHost reports whether serverName, in any case, is the sni_host of a

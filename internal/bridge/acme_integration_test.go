@@ -39,6 +39,9 @@ func TestACMEIntegration_ApplyConfiguresTheAccount(t *testing.T) {
 		t.Errorf("IngressStatus = %+v, want ACMEEnabled", s)
 	}
 	fx.logs.waitFor(t, `msg="bridge: acme: obtain certificate failed" component=bridge sni_host=acme.example.com`, 1)
+	if fx.acme.Issued("acme.example.com") {
+		t.Error("Issued after autocert's obtain failed against the CA = true, want false")
+	}
 	if got := fx.transport.requests(); len(got) == 0 || got[0] != testACME.DirectoryURL {
 		t.Errorf("requests = %v, want the first to %s", got, testACME.DirectoryURL)
 	}
