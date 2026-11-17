@@ -37,7 +37,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: 50 * time.Millisecond,
 	}, store, reporter, slog.Default())
@@ -165,7 +165,7 @@ func TestIntegration_ConcurrentVerification(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())

@@ -82,7 +82,7 @@ func newRealVerifier(t *testing.T, violations integrity.ViolationReporter) *inte
 		t.Fatalf("new integrity store: %v", err)
 	}
 	return integrity.NewVerifier(integrity.Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     "/dev/null",
 		VerifyInterval: time.Hour,
 	}, store, violations, integrationLogger())

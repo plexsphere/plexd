@@ -2668,7 +2668,11 @@ func applyEnvOverrides(cfg *agent.AgentConfig) {
 		}
 	}
 	if v := os.Getenv("PLEXD_HOOKS_ENABLED"); v != "" {
-		cfg.Integrity.WatchEnabled = v == "true" || v == "1"
+		// "true" and "1" enable the watcher; any other non-empty value
+		// disables it. The pointer makes the result an explicit setting,
+		// which defaulting leaves alone.
+		watch := v == "true" || v == "1"
+		cfg.Integrity.WatchEnabled = &watch
 	}
 	if v := os.Getenv("PLEXD_HOOKS_DIR"); v != "" {
 		cfg.Actions.HooksDir = v
