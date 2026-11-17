@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -49,6 +50,23 @@ func SelfChecksum() (string, error) {
 		return "", fmt.Errorf("integrity: self checksum: %w", err)
 	}
 	return HashFile(exe)
+}
+
+// SelfPath returns the path of the currently running binary with every
+// symlink resolved. plexd up uses it when Config.BinaryPath is empty, so it is
+// the store key of the binary's baseline and the artifact_id of its reports:
+// an install that moves the binary to a new resolved path starts a new
+// baseline rather than raising a violation.
+func SelfPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("integrity: self path: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", fmt.Errorf("integrity: self path: %w", err)
+	}
+	return resolved, nil
 }
 
 // WireChecksum re-encodes a hex digest from HashFile into the form the control

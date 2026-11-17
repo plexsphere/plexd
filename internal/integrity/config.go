@@ -23,8 +23,9 @@ type Config struct {
 	Enabled *bool `yaml:"enabled"`
 
 	// BinaryPath is the path to the plexd binary to verify. Empty means plexd
-	// up verifies the running executable, resolved through symlinks. The
-	// path is the baseline's store key and the report's artifact_id.
+	// up verifies the running executable, resolved through symlinks
+	// (SelfPath). The path is the baseline's store key and the report's
+	// artifact_id.
 	BinaryPath string `yaml:"binary_path"`
 
 	// HooksDir is the directory containing hook scripts to verify. Empty

@@ -122,6 +122,33 @@ func TestSelfChecksum(t *testing.T) {
 	}
 }
 
+func TestSelfPath(t *testing.T) {
+	got, err := SelfPath()
+	if err != nil {
+		t.Fatalf("SelfPath() unexpected error: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() unexpected error: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(%q) unexpected error: %v", exe, err)
+	}
+	if got != want {
+		t.Errorf("SelfPath() = %q, want %q (EvalSymlinks of %q)", got, want, exe)
+	}
+
+	info, err := os.Stat(got)
+	if err != nil {
+		t.Fatalf("os.Stat(%q): %v", got, err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Errorf("SelfPath() = %q names a %v, want a regular file", got, info.Mode().Type())
+	}
+}
+
 func TestVerifyFile_MatchingChecksum(t *testing.T) {
 	p := writeTemp(t, "verify me")
 
