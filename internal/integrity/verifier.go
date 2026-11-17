@@ -294,21 +294,46 @@ func (v *Verifier) VerifyHostKey(ctx context.Context, nodeID string) error {
 	return nil
 }
 
-// Run performs periodic integrity verification for the binary, the hooks
-// directory, and the SSH host key. When the watch is enabled and HooksDir is
-// set, it also monitors the hooks directory via inotify for real-time change
-// detection. Run returns at once when verification is disabled, and otherwise
-// blocks until the context is cancelled.
+// verifyAll runs one pass of the baseline checks: the binary, the hooks
+// directory, and the SSH host key, in that order. A check that fails is logged
+// and does not stop the pass, so an unreadable binary still leaves the host key
+// checked.
+func (v *Verifier) verifyAll(ctx context.Context, nodeID string) {
+	if err := v.VerifyBinary(ctx, nodeID); err != nil {
+		v.logger.Error("binary verification failed", "error", err)
+	}
+	v.VerifyHooksDir(ctx, nodeID)
+	if err := v.VerifyHostKey(ctx, nodeID); err != nil {
+		v.logger.Error("host key verification failed", "error", err)
+	}
+}
+
+// Run verifies the binary, the hooks directory, and the SSH host key once at
+// start and then on every tick of VerifyInterval. When the watch is enabled and
+// HooksDir is set, it also monitors the hooks directory via inotify for
+// real-time change detection. Run returns at once when verification is
+// disabled, and otherwise blocks until the context is cancelled and the
+// watcher has stopped, so a caller that waits for Run waits for the watcher
+// too.
 func (v *Verifier) Run(ctx context.Context, nodeID string) error {
 	if !v.cfg.IsEnabled() {
 		v.logger.Info("integrity verification disabled")
 		return nil
 	}
 
+	var watcher sync.WaitGroup
+	defer watcher.Wait()
+
 	// Start fsnotify watcher if enabled and hooks dir is configured.
 	if v.cfg.IsWatchEnabled() && v.cfg.HooksDir != "" {
-		go v.watchHooksDir(ctx, nodeID)
+		watcher.Add(1)
+		go func() {
+			defer watcher.Done()
+			v.watchHooksDir(ctx, nodeID)
+		}()
 	}
+
+	v.verifyAll(ctx, nodeID)
 
 	ticker := time.NewTicker(v.cfg.VerifyInterval)
 	defer ticker.Stop()
@@ -318,19 +343,15 @@ func (v *Verifier) Run(ctx context.Context, nodeID string) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := v.VerifyBinary(ctx, nodeID); err != nil {
-				v.logger.Error("periodic binary verification failed", "error", err)
-			}
-			v.VerifyHooksDir(ctx, nodeID)
-			if err := v.VerifyHostKey(ctx, nodeID); err != nil {
-				v.logger.Error("periodic host key verification failed", "error", err)
-			}
+			v.verifyAll(ctx, nodeID)
 		}
 	}
 }
 
 // watchHooksDir monitors the hooks directory for file changes using fsnotify.
-// On any file modification, checksums are recomputed immediately.
+// On any file modification, checksums are recomputed after a short debounce.
+// It returns only after a debounced sweep that has already started is done,
+// so nothing it started outlives it.
 func (v *Verifier) watchHooksDir(ctx context.Context, nodeID string) {
 	if err := os.MkdirAll(v.cfg.HooksDir, 0o755); err != nil {
 		v.logger.Warn("integrity: failed to create hooks dir for watching", "path", v.cfg.HooksDir, "error", err)
@@ -350,16 +371,21 @@ func (v *Verifier) watchHooksDir(ctx context.Context, nodeID string) {
 
 	v.logger.Info("integrity: watching hooks dir for changes", "path", v.cfg.HooksDir)
 
-	// Debounce timer to coalesce rapid changes.
+	// Debounce timer to coalesce rapid changes. sweeps counts each armed
+	// timer until its sweep has run or Stop has cancelled it.
 	var debounceTimer *time.Timer
+	var sweeps sync.WaitGroup
 	const debouncePeriod = 200 * time.Millisecond
+	defer func() {
+		if debounceTimer != nil && debounceTimer.Stop() {
+			sweeps.Done()
+		}
+		sweeps.Wait()
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
 			return
 
 		case event, ok := <-watcher.Events:
@@ -377,11 +403,14 @@ func (v *Verifier) watchHooksDir(ctx context.Context, nodeID string) {
 				"op", event.Op.String(),
 			)
 
-			// Debounce: reset timer on each event.
-			if debounceTimer != nil {
-				debounceTimer.Stop()
+			// Debounce: reset timer on each event. A Stop that returns
+			// false means the sweep has started and releases sweeps itself.
+			if debounceTimer != nil && debounceTimer.Stop() {
+				sweeps.Done()
 			}
+			sweeps.Add(1)
 			debounceTimer = time.AfterFunc(debouncePeriod, func() {
+				defer sweeps.Done()
 				v.logger.Info("integrity: recomputing hook checksums after file change")
 				v.verifyHooksDir(ctx, nodeID, api.IntegrityDetectorInotify)
 			})
