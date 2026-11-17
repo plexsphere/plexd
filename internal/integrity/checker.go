@@ -27,8 +27,9 @@ type CheckResult struct {
 }
 
 // HashFile computes the SHA-256 checksum of the file at path using streaming I/O.
+// While it reads, the file can still be renamed, on Windows too (openForHash).
 func HashFile(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := openForHash(path)
 	if err != nil {
 		return "", fmt.Errorf("integrity: open %s: %w", path, err)
 	}
