@@ -12,46 +12,7 @@ Between nodes, plexd forms an encrypted WireGuard mesh for direct peer-to-peer t
 
 All communication is initiated by the node. The control plane never connects inbound to a node.
 
-```mermaid
-sequenceDiagram
-    participant N as plexd (Node)
-    participant CP as Plexsphere Control Plane
-
-    rect rgb(240, 240, 240)
-    Note over N,CP: 1. Registration (one-time)
-    N->>N: Generate Curve25519 keypair
-    N->>CP: POST /v1/register {token, public_key, hostname, capabilities}
-    CP-->>N: {node_id, mesh_ip, signing_key, NSK, peers[]}
-    N->>N: Delete bootstrap token from disk
-    end
-
-    rect rgb(240, 240, 240)
-    Note over N,CP: 2. SSE Event Stream (persistent)
-    N->>CP: GET /v1/nodes/{id}/events (SSE, Last-Event-ID)
-    CP-->>N: Ed25519-signed event envelopes
-    Note right of CP: node_state_updated, policy_updated,<br/>bridge_config_updated, rotate_keys,<br/>signing_key_rotated, ...
-    end
-
-    rect rgb(240, 240, 240)
-    Note over N,CP: 3. Heartbeat (every 30s)
-    N->>CP: POST /v1/nodes/{id}/heartbeat {client_now, binary_checksum, binary_version, nat_summary}
-    CP-->>N: 200 OK (accepted_at; optional reconcile, rotate_keys flags)
-    end
-
-    rect rgb(240, 240, 240)
-    Note over N,CP: 4. Reconciliation (every 60s)
-    N->>CP: GET /v1/nodes/{id}/state
-    CP-->>N: {peers, reachability, policy, bridge, state, reports}
-    N->>N: Diff by presence and apply corrections
-    end
-
-    rect rgb(240, 240, 240)
-    Note over N,CP: 5. Observability (periodic)
-    N->>CP: POST /v1/nodes/{id}/metrics
-    N->>CP: POST /v1/nodes/{id}/logs
-    N->>CP: POST /v1/nodes/{id}/audit
-    end
-```
+![A sequence diagram between plexd on the node and the Plexsphere control plane in five phases. Phase 1, registration, once: plexd generates a Curve25519 key pair, sends POST /v1/register with its token, public key, hostname and capabilities, receives its node ID, mesh IP, signing key, NSK and peers, and deletes the bootstrap token from disk. Phase 2, the persistent SSE event stream: plexd opens GET /v1/nodes/{id}/events with SSE and Last-Event-ID, and the control plane sends Ed25519-signed event envelopes such as node_state_updated, policy_updated, bridge_config_updated, rotate_keys and signing_key_rotated. Phase 3, the heartbeat every 30 seconds: plexd sends POST /v1/nodes/{id}/heartbeat with client_now, binary_checksum, binary_version and nat_summary, and the control plane answers 200 OK with accepted_at and the optional reconcile and rotate_keys flags. Phase 4, reconciliation every 60 seconds: plexd sends GET /v1/nodes/{id}/state, receives peers, reachability, policy, bridge, state and reports, diffs by presence and applies corrections. Phase 5, observability, periodically: plexd posts to /v1/nodes/{id}/metrics, /v1/nodes/{id}/logs and /v1/nodes/{id}/audit.](../diagrams/communication-channels.svg)
 
 ### Channel Summary
 
@@ -69,40 +30,7 @@ The SSE stream is the primary real-time channel. Reconciliation acts as a consis
 
 A node progresses through four phases from first boot to shutdown.
 
-```mermaid
-flowchart TD
-    subgraph Bootstrap
-        B1[Read config + locate bootstrap token] --> B2[Generate Curve25519 keypair]
-        B2 --> B3[POST /v1/register with token + public key]
-        B3 --> B4[Receive node_id, mesh_ip, NSK, signing key, peers]
-        B4 --> B5[Delete token from disk]
-    end
-
-    subgraph Tunnel Setup
-        B5 --> T1[Create WireGuard interface plexd0]
-        T1 --> T2[Add peers with public keys, PSKs, allowed IPs]
-        T2 --> T3[STUN discovery of public endpoint]
-        T3 --> T4[Report endpoint, receive freshness deadline]
-    end
-
-    subgraph Steady State
-        T4 --> S1[SSE event stream]
-        T4 --> S2[Heartbeat loop every 30s]
-        T4 --> S3[Reconciliation loop every 60s]
-        S2 -->|reconcile flag| S3
-        S2 -->|rotate_keys flag| S4[Key rotation]
-        T4 --> S5[Observability uploads]
-        S3 --> S6[Action dispatcher]
-        T4 --> S7[Node API server]
-    end
-
-    subgraph Shutdown
-        S1 & S2 & S3 -->|SIGTERM / SIGINT| D1[Stop accepting new work]
-        D1 --> D2[Drain in-flight actions up to 30s]
-        D2 --> D4[Tear down WireGuard interface]
-        D4 --> D5[Stop subsystems]
-    end
-```
+![The four phases of a node. Bootstrap: plexd reads its config and locates the bootstrap token, generates a Curve25519 key pair, sends POST /v1/register with the token and public key, receives its node ID, mesh IP, NSK, signing key and peers, and deletes the token from disk. Tunnel setup: it creates the WireGuard interface plexd0, adds the peers with their public keys, PSKs and allowed IPs, discovers its public endpoint with STUN, and reports the endpoint and receives a freshness deadline. Steady state: it then runs the SSE event stream, the heartbeat loop every 30 seconds, the reconciliation loop every 60 seconds, the observability uploads and the Node API server; the heartbeat's reconcile flag triggers the reconciliation loop and its rotate_keys flag a key rotation, and the reconciliation loop feeds the action dispatcher. Shutdown: a SIGTERM or SIGINT leads from the event stream, the heartbeat loop and the reconciliation loop to stopping new work, draining in-flight actions for up to 30 seconds, tearing down the WireGuard interface, and stopping the subsystems.](../diagrams/communication-node-lifecycle.svg)
 
 See [Agent Lifecycle](/guide/agent-lifecycle) for the full startup sequence and shutdown details.
 
@@ -110,48 +38,7 @@ See [Agent Lifecycle](/guide/agent-lifecycle) for the full startup sequence and 
 
 Nodes form a full-mesh WireGuard network in the `10.100.0.0/16` address space. Each node gets a unique `/32` mesh IP at registration. The control plane distributes public keys and pre-shared keys but never handles mesh traffic.
 
-```mermaid
-flowchart TD
-    subgraph CP[Plexsphere Control Plane]
-        CP1[Registration API]
-        CP2[Key & Peer Manager]
-        CP3[SSE Event Bus]
-    end
-
-    subgraph Mesh["Encrypted WireGuard Mesh (10.100.0.0/16)"]
-        N1["plexd Node A<br/>10.100.1.1"]
-        N2["plexd Node B<br/>10.100.1.2"]
-        N3["plexd Node C<br/>10.100.1.3"]
-        BR["plexd Bridge<br/>10.100.255.1"]
-
-        N1 <-->|P2P tunnel| N2
-        N1 <-->|P2P tunnel| N3
-        N1 <-->|P2P tunnel| BR
-        N2 <-->|P2P tunnel| N3
-        N2 <-->|P2P tunnel| BR
-        N3 <-->|P2P tunnel| BR
-    end
-
-    subgraph External[Bridge External Access]
-        UA[User Access<br/>Tailscale / Netbird / WireGuard]
-        PI[Public Ingress<br/>ACME + SNI routing]
-        S2S[Site-to-Site VPN<br/>Partner networks]
-    end
-
-    N1 -->|HTTPS + SSE| CP
-    N2 -->|HTTPS + SSE| CP
-    N3 -->|HTTPS + SSE| CP
-    BR -->|HTTPS + SSE| CP
-
-    BR -.->|NAT relay| UA
-    BR -.->|ingress| PI
-    BR -.->|tunnel| S2S
-
-    style BR stroke-dasharray: 5 5
-    style UA stroke-dasharray: 5 5
-    style PI stroke-dasharray: 5 5
-    style S2S stroke-dasharray: 5 5
-```
+![The Plexsphere control plane, with its registration API, key and peer manager and SSE event bus, above the encrypted WireGuard mesh in 10.100.0.0/16. In the mesh, the plexd nodes A at 10.100.1.1, B at 10.100.1.2 and C at 10.100.1.3 and a plexd bridge at 10.100.255.1 are joined pairwise by P2P tunnels, and each of the four connects to the control plane over HTTPS and SSE. Below the mesh is the bridge's external access: the bridge links to user access through Tailscale, Netbird or WireGuard, to public ingress with ACME and SNI routing, and by a tunnel to a site-to-site VPN to partner networks. The bridge and its external access are marked bridge mode: they exist in bridge mode only.](../diagrams/communication-mesh-topology.svg)
 
 Key properties of the mesh:
 
@@ -163,30 +50,7 @@ Key properties of the mesh:
 
 ## What the Mesh Enables
 
-```mermaid
-flowchart LR
-    MESH["WireGuard Mesh<br/>(all nodes)"]
-
-    MESH --> C1["P2P Communication<br/>Direct encrypted tunnels"]
-    MESH --> C2["NAT Traversal<br/>STUN + endpoint reporting"]
-    MESH --> C3["Network Policy<br/>Peer visibility rules via the host firewall"]
-    MESH --> C4["Secure Tunnels<br/>SSH-based access through mesh"]
-    MESH --> C5["Remote Actions<br/>Pull-dispatched execution"]
-    MESH --> C6["Observability<br/>Metrics, logs, audit forwarding"]
-
-    BR["Bridge Node<br/>(bridge mode only)"]
-
-    BR -.-> B1["NAT Relay<br/>UDP relay for unreachable peers"]
-    BR -.-> B2["Public Ingress<br/>ACME certs + SNI routing"]
-    BR -.-> B3["User Access<br/>Tailscale / Netbird / WireGuard"]
-    BR -.-> B4["Site-to-Site VPN<br/>Partner network connectivity"]
-
-    style BR stroke-dasharray: 5 5
-    style B1 stroke-dasharray: 5 5
-    style B2 stroke-dasharray: 5 5
-    style B3 stroke-dasharray: 5 5
-    style B4 stroke-dasharray: 5 5
-```
+![The WireGuard mesh on all nodes enables P2P communication over direct encrypted tunnels, NAT traversal with STUN and endpoint reporting, network policy as peer visibility rules through the host firewall, secure tunnels for SSH-based access through the mesh, remote actions by pull-dispatched execution, and observability with metrics, logs and audit forwarding. A bridge node, in bridge mode only, adds the NAT relay, a UDP relay for unreachable peers; public ingress with ACME certificates and SNI routing; user access through Tailscale, Netbird or WireGuard; and the site-to-site VPN for partner network connectivity.](../diagrams/communication-mesh-capabilities.svg)
 
 ### Core Capabilities (all nodes)
 

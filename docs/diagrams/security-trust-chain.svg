@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1042" height="584" viewBox="0 0 1042 584" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The chain of trust from the bootstrap token to the peer tunnels">
+<title>The chain of trust from the bootstrap token to the peer tunnels</title>
+<rect width="1042" height="584" fill="#F6F5F1"/>
+<rect x="40" y="40" width="360" height="85" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<text x="220" y="69.1" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">Bootstrap Token</text>
+<text x="220" y="90.25" font-size="17" fill="#55606E" text-anchor="middle">BootstrapToken policy;</text>
+<text x="220" y="110.65" font-size="17" fill="#55606E" text-anchor="middle">single-use, short-lived by default</text>
+<rect x="40" y="185" width="360" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="220" y="214" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<rect x="40" y="379" width="360" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="220" y="408" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Node Identity</text>
+<rect x="40" y="483" width="360" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="220" y="512" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Peer Tunnels</text>
+<polyline points="220,125 220,176" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="220,185 214,172 226,172" fill="#3A4452"/>
+<polyline points="220,229 220,370" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="220,379 214,366 226,366" fill="#3A4452"/>
+<polyline points="220,423 220,474" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="220,483 214,470 226,470" fill="#3A4452"/>
+<rect x="510" y="292" width="220" height="44" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<text x="620" y="321" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">Signing Key</text>
+<polyline points="220,314 501,314" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="510,314 497,320 497,308" fill="#3A4452"/>
+<rect x="510" y="185" width="344" height="85" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="524" y="214" font-size="20" font-weight="700" fill="#2B3440">Trust anchor</text>
+<text x="524" y="235.15" font-size="17" fill="#55606E">distributes public keys, PSKs, and its</text>
+<text x="524" y="255.55" font-size="17" fill="#55606E">own Ed25519 signing public key</text>
+<polyline points="400,207 510,207" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="780" y="286" width="222" height="61" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="794" y="312.15" font-size="17" fill="#55606E">Verifies all SSE events</text>
+<text x="794" y="332.55" font-size="17" fill="#55606E">+ session JWTs</text>
+<polyline points="730,314 780,314" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="510" y="379" width="382" height="41" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="524" y="405.15" font-size="17" fill="#55606E">Public key bound to node ID and mesh IP</text>
+<polyline points="400,401 510,401" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="510" y="483" width="258" height="61" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="524" y="509.15" font-size="17" fill="#55606E">WireGuard E2E encryption</text>
+<text x="524" y="529.55" font-size="17" fill="#55606E">(private key stays local)</text>
+<polyline points="400,505 510,505" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+</svg>

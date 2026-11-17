@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="921" height="928" viewBox="0 0 921 928" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Rotating the WireGuard key of a node">
+<title>Rotating the WireGuard key of a node</title>
+<rect width="921" height="928" fill="#F6F5F1"/>
+<rect x="40" y="40" width="102" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="91" y="69.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Client</text>
+<text x="91" y="89.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd</text>
+<rect x="516.5" y="40" width="189" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="611" y="79" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<polyline points="91,104 91,887.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="611,104 611,887.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="351" y="144.45" font-size="17" fill="#55606E" text-anchor="middle">SSE: rotate_keys (signed)</text>
+<polyline points="611,155 100,155" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="91,155 104,149 104,161" fill="#B38A00"/>
+<polyline points="91,179 127,179 127,207 100,207" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="91,207 104,201 104,213" fill="#3A4452"/>
+<text x="137" y="198.95" font-size="17" fill="#55606E">Verify signature</text>
+<polyline points="91,233 127,233 127,261 100,261" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="91,261 104,255 104,267" fill="#3A4452"/>
+<text x="137" y="252.95" font-size="17" fill="#55606E">Generate and stage new Curve25519 keypair</text>
+<text x="351" y="298.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/keys/rotate</text>
+<text x="351" y="317.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{new_public_key}</text>
+<polyline points="91,328 602,328" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="611,328 598,334 598,322" fill="#2457C5"/>
+<polyline points="611,352 647,352 647,380 620,380" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,380 624,374 624,386" fill="#3A4452"/>
+<text x="657" y="371.95" font-size="17" fill="#55606E">Store new public key</text>
+<polyline points="611,406 647,406 647,434 620,434" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,434 624,428 624,440" fill="#3A4452"/>
+<text x="657" y="425.95" font-size="17" fill="#55606E">Generate new PSKs</text>
+<polyline points="611,460 647,460 647,488 620,488" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,488 624,482 624,494" fill="#3A4452"/>
+<text x="657" y="479.95" font-size="17" fill="#55606E">Push new key to all peers</text>
+<text x="351" y="525.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{rotation_id, kid, wrap_key_version}</text>
+<polyline points="611,536 91,536" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="104,530 91,536 104,542" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="91,560 127,560 127,600.8 100,600.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="91,600.8 104,594.8 104,606.8" fill="#3A4452"/>
+<text x="137" y="576.15" font-size="17" fill="#55606E">Swap private key on disk</text>
+<text x="137" y="596.55" font-size="17" fill="#55606E">and WireGuard interface</text>
+<text x="351" y="638.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{node_id}/state</text>
+<text x="351" y="658.35" font-size="17" fill="#55606E" text-anchor="middle">(reconcile)</text>
+<polyline points="91,668.8 602,668.8" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="611,668.8 598,674.8 598,662.8" fill="#2457C5"/>
+<text x="351" y="705.25" font-size="17" fill="#55606E" text-anchor="middle">Updated peers</text>
+<polyline points="611,715.8 91,715.8" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="104,709.8 91,715.8 104,721.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="351" y="751.1" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{node_id}/peers/</text>
+<text x="351" y="770.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{peer_node_id}/psk</text>
+<text x="351" y="790.45" font-size="17" fill="#55606E" text-anchor="middle">(each peer)</text>
+<polyline points="91,800.8 602,800.8" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="611,800.8 598,806.8 598,794.8" fill="#2457C5"/>
+<text x="351" y="837.05" font-size="17" fill="#55606E" text-anchor="middle">Edge PSK envelope</text>
+<text x="351" y="857.45" font-size="17" fill="#55606E" text-anchor="middle">(sealed under the NSK)</text>
+<polyline points="611,867.8 100,867.8" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="91,867.8 104,861.8 104,873.8" fill="#B0387F"/>
+</svg>

@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1162" height="1124" viewBox="0 0 1162 1124" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The phases of a node from first boot to shutdown">
+<title>The phases of a node from first boot to shutdown</title>
+<rect width="1162" height="1124" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1082" height="184" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">Bootstrap</text>
+<rect x="64" y="96" width="172" height="104" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="150" y="134.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Read config</text>
+<text x="150" y="155.75" font-size="17" fill="#55606E" text-anchor="middle">and locate the</text>
+<text x="150" y="176.15" font-size="17" fill="#55606E" text-anchor="middle">bootstrap token</text>
+<rect x="266" y="96" width="141" height="104" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="336.5" y="134.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Generate</text>
+<text x="336.5" y="155.75" font-size="17" fill="#55606E" text-anchor="middle">Curve25519</text>
+<text x="336.5" y="176.15" font-size="17" fill="#55606E" text-anchor="middle">keypair</text>
+<rect x="437" y="96" width="211" height="104" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="542.5" y="133.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">POST /v1/register</text>
+<text x="542.5" y="153.95" font-size="17" fill="#55606E" text-anchor="middle">with token +</text>
+<text x="542.5" y="174.35" font-size="17" fill="#55606E" text-anchor="middle">public key</text>
+<rect x="678" y="96" width="200" height="104" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="778" y="125" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Receive</text>
+<text x="778" y="145.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">node_id, mesh_ip,</text>
+<text x="778" y="165.35" font-size="17" fill="#55606E" text-anchor="middle">NSK, signing key,</text>
+<text x="778" y="185.75" font-size="17" fill="#55606E" text-anchor="middle">peers</text>
+<rect x="908" y="96" width="182" height="104" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="999" y="144.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Delete token</text>
+<text x="999" y="165.95" font-size="17" fill="#55606E" text-anchor="middle">from disk</text>
+<polyline points="236,148 257,148" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="266,148 253,154 253,142" fill="#3A4452"/>
+<polyline points="407,148 428,148" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="437,148 424,154 424,142" fill="#3A4452"/>
+<polyline points="648,148 669,148" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="678,148 665,154 665,142" fill="#3A4452"/>
+<polyline points="878,148 899,148" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="908,148 895,154 895,142" fill="#3A4452"/>
+<rect x="40" y="274" width="1082" height="205" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="307.2" font-size="22" font-weight="700" fill="#2B3440">Tunnel Setup</text>
+<rect x="64" y="370" width="209" height="85" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="168.5" y="399.7" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create</text>
+<text x="168.5" y="420.85" font-size="17" fill="#55606E" text-anchor="middle">WireGuard interface</text>
+<text x="168.5" y="440.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd0</text>
+<rect x="313" y="370" width="183" height="85" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="404.5" y="399.1" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Add peers</text>
+<text x="404.5" y="420.25" font-size="17" fill="#55606E" text-anchor="middle">with public keys,</text>
+<text x="404.5" y="440.65" font-size="17" fill="#55606E" text-anchor="middle">PSKs, allowed IPs</text>
+<rect x="536" y="370" width="213" height="85" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="642.5" y="409.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">STUN discovery</text>
+<text x="642.5" y="430.45" font-size="17" fill="#55606E" text-anchor="middle">of public endpoint</text>
+<rect x="789" y="370" width="228" height="85" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="903" y="399.1" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Report endpoint,</text>
+<text x="903" y="420.25" font-size="17" fill="#55606E" text-anchor="middle">receive freshness</text>
+<text x="903" y="440.65" font-size="17" fill="#55606E" text-anchor="middle">deadline</text>
+<polyline points="273,412.5 304,412.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="313,412.5 300,418.5 300,406.5" fill="#3A4452"/>
+<polyline points="496,412.5 527,412.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="536,412.5 523,418.5 523,406.5" fill="#3A4452"/>
+<polyline points="749,412.5 780,412.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="789,412.5 776,418.5 776,406.5" fill="#3A4452"/>
+<polyline points="999,200 999,330 168.5,330 168.5,361" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="168.5,370 162.5,357 174.5,357" fill="#3A4452"/>
+<rect x="40" y="529" width="1082" height="320" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="562.2" font-size="22" font-weight="700" fill="#2B3440">Steady State</text>
+<rect x="64" y="625" width="150" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="139" y="654.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">SSE event</text>
+<text x="139" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">stream</text>
+<rect x="244" y="625" width="162" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="325" y="654.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Heartbeat</text>
+<text x="325" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">loop every 30s</text>
+<rect x="516" y="625" width="196" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="614" y="654.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Reconciliation</text>
+<text x="614" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">loop every 60s</text>
+<rect x="742" y="625" width="187" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="835.5" y="654.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Observability</text>
+<text x="835.5" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">uploads</text>
+<rect x="959" y="625" width="139" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1028.5" y="654.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Node API</text>
+<text x="1028.5" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">server</text>
+<polyline points="903,455 903,585 139,585 139,616" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="139,625 133,612 145,612" fill="#3A4452"/>
+<polyline points="903,455 903,585 325,585 325,616" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="325,625 319,612 331,612" fill="#3A4452"/>
+<polyline points="903,455 903,585 614,585 614,616" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="614,625 608,612 620,612" fill="#3A4452"/>
+<polyline points="903,455 903,585 835.5,585 835.5,616" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="835.5,625 829.5,612 841.5,612" fill="#3A4452"/>
+<polyline points="903,455 903,585 1028.5,585 1028.5,616" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1028.5,625 1022.5,612 1034.5,612" fill="#3A4452"/>
+<polyline points="406,657.5 507,657.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="516,657.5 503,663.5 503,651.5" fill="#3A4452"/>
+<text x="461" y="626.9" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">reconcile</text>
+<text x="461" y="647.05" font-size="17" fill="#55606E" text-anchor="middle">flag</text>
+<rect x="288" y="760" width="177" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="376.5" y="789" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Key rotation</text>
+<polyline points="376.5,690 376.5,751" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="376.5,760 370.5,747 382.5,747" fill="#3A4452"/>
+<text x="386.5" y="720.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">rotate_keys</text>
+<text x="386.5" y="740.55" font-size="17" fill="#55606E">flag</text>
+<rect x="560" y="760" width="126" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="623" y="789.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Action</text>
+<text x="623" y="810.45" font-size="17" fill="#55606E" text-anchor="middle">dispatcher</text>
+<polyline points="623,690 623,751" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="623,760 617,747 629,747" fill="#3A4452"/>
+<rect x="40" y="919" width="1082" height="165" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="952.2" font-size="22" font-weight="700" fill="#2B3440">Shutdown</text>
+<rect x="64" y="995" width="206" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="167" y="1024.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Stop accepting</text>
+<text x="167" y="1045.45" font-size="17" fill="#55606E" text-anchor="middle">new work</text>
+<rect x="310" y="995" width="194" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="407" y="1024.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Drain in-flight</text>
+<text x="407" y="1045.45" font-size="17" fill="#55606E" text-anchor="middle">actions up to 30s</text>
+<rect x="544" y="995" width="209" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="648.5" y="1024.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Tear down</text>
+<text x="648.5" y="1045.45" font-size="17" fill="#55606E" text-anchor="middle">WireGuard interface</text>
+<rect x="793" y="995" width="229" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="907.5" y="1034.5" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Stop subsystems</text>
+<polyline points="270,1027.5 301,1027.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="310,1027.5 297,1033.5 297,1021.5" fill="#3A4452"/>
+<polyline points="504,1027.5 535,1027.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="544,1027.5 531,1033.5 531,1021.5" fill="#3A4452"/>
+<polyline points="753,1027.5 784,1027.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="793,1027.5 780,1033.5 780,1021.5" fill="#3A4452"/>
+<polyline points="139,690 139,884 230,884 230,986" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="230,995 224,982 236,982" fill="#3A4452"/>
+<polyline points="264,690 264,884 230,884 230,986" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="230,995 224,982 236,982" fill="#3A4452"/>
+<polyline points="536,690 536,884 230,884 230,986" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="230,995 224,982 236,982" fill="#3A4452"/>
+<text x="240" y="948.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">SIGTERM / SIGINT</text>
+</svg>

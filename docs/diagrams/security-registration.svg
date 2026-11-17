@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="993" height="708" viewBox="0 0 993 708" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Registration: only the public key leaves the node">
+<title>Registration: only the public key leaves the node</title>
+<rect width="993" height="708" fill="#F6F5F1"/>
+<rect x="40" y="40" width="102" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="91" y="69.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Client</text>
+<text x="91" y="89.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd</text>
+<rect x="516.5" y="40" width="189" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="611" y="79" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<polyline points="91,104 91,667.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="611,104 611,667.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="91,132 127,132 127,160 100,160" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="91,160 104,154 104,166" fill="#3A4452"/>
+<text x="137" y="151.95" font-size="17" fill="#55606E">Generate Curve25519 keypair</text>
+<text x="351" y="197.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/register</text>
+<text x="351" y="216.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{token, public_key, hostname,</text>
+<text x="351" y="235.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">metadata, capabilities}</text>
+<polyline points="91,246 602,246" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="611,246 598,252 598,240" fill="#2457C5"/>
+<polyline points="611,270 647,270 647,310.8 620,310.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,310.8 624,304.8 624,316.8" fill="#3A4452"/>
+<text x="657" y="286.15" font-size="17" fill="#55606E">Validate token (redemption under</text>
+<text x="657" y="306.55" font-size="17" fill="#55606E">its BootstrapToken policy)</text>
+<polyline points="611,336.8 647,336.8 647,364.8 620,364.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,364.8 624,358.8 624,370.8" fill="#3A4452"/>
+<text x="657" y="356.75" font-size="17" fill="#55606E">Assign mesh IP (10.100.x.x)</text>
+<polyline points="611,390.8 647,390.8 647,418.8 620,418.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,418.8 624,412.8 624,424.8" fill="#3A4452"/>
+<text x="657" y="410.75" font-size="17" fill="#55606E">Store public key</text>
+<polyline points="611,444.8 647,444.8 647,472.8 620,472.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,472.8 624,466.8 624,478.8" fill="#3A4452"/>
+<text x="657" y="464.75" font-size="17" fill="#55606E">Generate PSK per peer pair</text>
+<polyline points="611,498.8 647,498.8 647,526.8 620,526.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="611,526.8 624,520.8 624,532.8" fill="#3A4452"/>
+<text x="657" y="518.75" font-size="17" fill="#55606E">Generate Node Secret Key (NSK)</text>
+<text x="351" y="564.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{node_id, mesh_ip, signing_public_key,</text>
+<text x="351" y="583.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">node_secret_key, peers[]}</text>
+<polyline points="611,593.8 100,593.8" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="91,593.8 104,587.8 104,599.8" fill="#B0387F"/>
+<polyline points="91,617.8 127,617.8 127,645.8 100,645.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="91,645.8 104,639.8 104,651.8" fill="#3A4452"/>
+<text x="137" y="637.75" font-size="17" fill="#55606E">Set NSK as auth token</text>
+</svg>

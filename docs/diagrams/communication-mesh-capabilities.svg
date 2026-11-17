@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="790" height="924" viewBox="0 0 790 924" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="What the mesh enables">
+<title>What the mesh enables</title>
+<rect width="790" height="924" fill="#F6F5F1"/>
+<rect x="40" y="242.5" width="230" height="65" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="155" y="271.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">WireGuard Mesh</text>
+<text x="155" y="292.95" font-size="17" fill="#55606E" text-anchor="middle">all nodes</text>
+<rect x="370" y="40" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="69.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">P2P Communication</text>
+<text x="560" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">Direct encrypted tunnels</text>
+<rect x="370" y="121" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="150.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">NAT Traversal</text>
+<text x="560" y="171.45" font-size="17" fill="#55606E" text-anchor="middle">STUN + endpoint reporting</text>
+<rect x="370" y="202" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="231.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Network Policy</text>
+<text x="560" y="252.45" font-size="17" fill="#55606E" text-anchor="middle">Peer visibility rules via the host firewall</text>
+<rect x="370" y="283" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="312.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Secure Tunnels</text>
+<text x="560" y="333.45" font-size="17" fill="#55606E" text-anchor="middle">SSH-based access through mesh</text>
+<rect x="370" y="364" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="393.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Remote Actions</text>
+<text x="560" y="414.45" font-size="17" fill="#55606E" text-anchor="middle">Pull-dispatched execution</text>
+<rect x="370" y="445" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="474.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Observability</text>
+<text x="560" y="495.45" font-size="17" fill="#55606E" text-anchor="middle">Metrics, logs, audit forwarding</text>
+<polyline points="270,275 310,275" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="310,72.5 310,477.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="310,72.5 361,72.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,72.5 357,78.5 357,66.5" fill="#3A4452"/>
+<polyline points="310,153.5 361,153.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,153.5 357,159.5 357,147.5" fill="#3A4452"/>
+<polyline points="310,234.5 361,234.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,234.5 357,240.5 357,228.5" fill="#3A4452"/>
+<polyline points="310,315.5 361,315.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,315.5 357,321.5 357,309.5" fill="#3A4452"/>
+<polyline points="310,396.5 361,396.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,396.5 357,402.5 357,390.5" fill="#3A4452"/>
+<polyline points="310,477.5 361,477.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,477.5 357,483.5 357,471.5" fill="#3A4452"/>
+<rect x="40" y="697.5" width="230" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="155" y="737" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Node</text>
+<rect x="370" y="576" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="605.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">NAT Relay</text>
+<text x="560" y="626.45" font-size="17" fill="#55606E" text-anchor="middle">UDP relay for unreachable peers</text>
+<rect x="370" y="657" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="686.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Public Ingress</text>
+<text x="560" y="707.45" font-size="17" fill="#55606E" text-anchor="middle">ACME certs + SNI routing</text>
+<rect x="370" y="738" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="767.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">User Access</text>
+<text x="560" y="788.45" font-size="17" fill="#55606E" text-anchor="middle">Tailscale / Netbird / WireGuard</text>
+<rect x="370" y="819" width="380" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="560" y="848.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Site-to-Site VPN</text>
+<text x="560" y="869.45" font-size="17" fill="#55606E" text-anchor="middle">Partner network connectivity</text>
+<polyline points="270,730 310,730" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="310,608.5 310,851.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="310,608.5 361,608.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,608.5 357,614.5 357,602.5" fill="#3A4452"/>
+<polyline points="310,689.5 361,689.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,689.5 357,695.5 357,683.5" fill="#3A4452"/>
+<polyline points="310,770.5 361,770.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,770.5 357,776.5 357,764.5" fill="#3A4452"/>
+<polyline points="310,851.5 361,851.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,851.5 357,857.5 357,845.5" fill="#3A4452"/>
+<rect x="131" y="685.5" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="194.5" y="702.75" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+</svg>

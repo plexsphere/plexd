@@ -21,41 +21,13 @@ plexd uses WireGuard's [Noise_IKpsk2](https://www.wireguard.com/protocol/) hands
 
 ### Trust Chain
 
-```
-Bootstrap Token (BootstrapToken policy; single-use, short-lived by default)
-        │
-        ▼
-   Control Plane  ──── Trust anchor: distributes public keys, PSKs,
-        │               and its own Ed25519 signing public key
-        │
-        ├──► Signing Key ──── Verifies all SSE events + session JWTs
-        │
-        ▼
-   Node Identity  ──── Public key bound to node ID and mesh IP
-        │
-        ▼
-   Peer Tunnels   ──── WireGuard E2E encryption (private key stays local)
-```
+![The chain of trust. A bootstrap token, bound by its BootstrapToken policy and single-use and short-lived by default, leads to the control plane, the trust anchor, which distributes public keys, PSKs and its own Ed25519 signing public key. The control plane leads to the signing key, which verifies all SSE events and session JWTs, and to the node identity, the public key bound to the node ID and mesh IP. The node identity leads to the peer tunnels: WireGuard end-to-end encryption, with the private key staying local.](../diagrams/security-trust-chain.svg)
 
 ### Phase 1: Registration
 
 During registration the node generates its Curve25519 key pair locally. Only the public key is sent to the control plane. The private key never leaves the node.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant CP as Control Plane
-
-    C->>C: Generate Curve25519 keypair
-    C->>CP: POST /v1/register<br/>{token, public_key, hostname, metadata, capabilities}
-    CP->>CP: Validate token (redemption under its BootstrapToken policy)
-    CP->>CP: Assign mesh IP (10.100.x.x)
-    CP->>CP: Store public key
-    CP->>CP: Generate PSK per peer pair
-    CP->>CP: Generate Node Secret Key (NSK)
-    CP-->>C: {node_id, mesh_ip, signing_public_key, node_secret_key, peers[]}
-    C->>C: Set NSK as auth token
-```
+![A sequence diagram of registration between the client, plexd, and the control plane. The client generates a Curve25519 key pair and sends POST /v1/register with its token, public key, hostname, metadata and capabilities. The control plane validates the token as a redemption under its BootstrapToken policy, assigns a mesh IP in 10.100.x.x, stores the public key, generates a PSK per peer pair, and generates the Node Secret Key, the NSK. It answers with the node ID, mesh IP, signing public key, node secret key and peers, and the client sets the NSK as its auth token.](../diagrams/security-registration.svg)
 
 ### Phase 2: Tunnel Setup
 
@@ -130,25 +102,7 @@ The state response's `secrets` block, the node's secret inventory, is likewise p
 
 Key rotation is triggered by the control plane - either on a schedule, by admin action, or in response to a compromised node. The `rotate_keys` signal arrives as a heartbeat flag or as a signed SSE event; the SSE event is verified before processing. The node stages a fresh keypair before submitting its public key, and the control plane replies with a rotation receipt (`rotation_id`, `kid`, `wrap_key_version`) rather than a peer list. The node swaps its private key only after that receipt, then picks up the new peers on the next state pull and fetches every edge PSK again (see [Pre-Shared Keys](#pre-shared-keys-psk)). A repeated signal within five minutes of the last committed rotation is skipped, so a `rotate_keys` flag the control plane keeps set until it observes the new key cannot rekey the node on every heartbeat; a rotation whose key is already staged is always resubmitted.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant CP as Control Plane
-
-    CP->>C: SSE: rotate_keys (signed)
-    C->>C: Verify signature
-    C->>C: Generate and stage new Curve25519 keypair
-    C->>CP: POST /v1/keys/rotate<br/>{new_public_key}
-    CP->>CP: Store new public key
-    CP->>CP: Generate new PSKs
-    CP->>CP: Push new key to all peers
-    CP-->>C: {rotation_id, kid, wrap_key_version}
-    C->>C: Swap private key on disk and WireGuard interface
-    C->>CP: GET /v1/nodes/{node_id}/state (reconcile)
-    CP-->>C: Updated peers
-    C->>CP: GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk (each peer)
-    CP-->>C: Edge PSK envelope (sealed under the NSK)
-```
+![A sequence diagram of a key rotation between the client, plexd, and the control plane. The control plane sends a signed rotate_keys event over SSE. The client verifies the signature, generates and stages a new Curve25519 key pair, and sends its new public key with POST /v1/keys/rotate. The control plane stores the new public key, generates new PSKs, pushes the new key to all peers, and answers with rotation_id, kid and wrap_key_version. The client swaps the private key on disk and in the WireGuard interface, reconciles with GET /v1/nodes/{node_id}/state and receives the updated peers, then requests GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk for each peer and receives the edge PSK envelope, sealed under the NSK.](../diagrams/security-key-rotation.svg)
 
 When a node is force-removed from the control plane, all peers that had a tunnel to the compromised node receive a `peer_deregistered` event followed by fresh PSKs for their remaining peer pairs.
 
@@ -156,17 +110,7 @@ When a node is force-removed from the control plane, all peers that had a tunnel
 
 The Domain's Ed25519 signing key (used for SSE event signatures and session JWTs) can be rotated independently of WireGuard mesh keys. Every state pull carries the Domain's current key in its `signing_key` block, so once an operator rotates the key, the node picks up the incoming key on its next pull, within one reconcile interval.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant CP as Control Plane
-
-    Note over CP: Operator rotates the Domain's signing key
-    C->>CP: GET /v1/nodes/{node_id}/state (reconcile)
-    CP-->>C: {..., signing_key: {key_id, public_key}}
-    C->>C: Install as the only trusted key (no grace window)
-    C->>C: Persist to signing_public_key and identity.json
-```
+![A sequence diagram of a signing key rotation. An operator rotates the Domain's signing key on the control plane. The client reconciles with GET /v1/nodes/{node_id}/state and receives the signing_key block with key_id and public_key. It installs that key as the only trusted key, with no grace window, and persists it to signing_public_key and identity.json.](../diagrams/security-signing-key-rotation.svg)
 
 plexd installs a pulled key that differs from the one it holds as the only key it trusts, and drops the old key at once: a pull install keeps no grace window. Until that pull the node refuses envelopes signed with the new key, and after it those signed with the old key. The pull carries every change those envelopes announced, so the node still converges. plexd writes the new key to the `signing_public_key` file and to `identity.json`, so a restart starts from it, and retries a failed write on every pull. plexd logs a new key as `installed signing key from state pull` with its `key_id` and `public_key`.
 

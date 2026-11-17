@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="1129" viewBox="0 0 1180 1129" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The control plane, the encrypted mesh and the bridge">
+<title>The control plane, the encrypted mesh and the bridge</title>
+<rect width="1180" height="1129" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1100" height="150" rx="12" fill="#E7EDF9" stroke="#2457C5" stroke-width="2"/>
+<text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">Plexsphere Control Plane</text>
+<rect x="190" y="104" width="260" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="320" y="133" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Registration API</text>
+<rect x="480" y="104" width="260" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="610" y="133" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Key &amp; Peer Manager</text>
+<rect x="770" y="104" width="260" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="900" y="133" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">SSE Event Bus</text>
+<rect x="40" y="300" width="1100" height="504" rx="12" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="590" y="335" font-size="22" font-weight="700" fill="#2B3440" text-anchor="middle">Encrypted WireGuard Mesh</text>
+<text x="590" y="356.65" font-size="17" fill="#55606E" text-anchor="middle">10.100.0.0/16</text>
+<rect x="190" y="400" width="220" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="300" y="429.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd Node A</text>
+<text x="300" y="449.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.100.1.1</text>
+<rect x="770" y="400" width="220" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="880" y="429.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd Node B</text>
+<text x="880" y="449.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.100.1.2</text>
+<rect x="190" y="700" width="220" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="300" y="729.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd Node C</text>
+<text x="300" y="749.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.100.1.3</text>
+<rect x="770" y="700" width="220" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="880" y="729.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd Bridge</text>
+<text x="880" y="749.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.100.255.1</text>
+<rect x="851" y="688" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="914.5" y="705.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+<polyline points="419,432 761,432" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="770,432 757,438 757,426" fill="#2F8A57"/>
+<polygon points="410,432 423,426 423,438" fill="#2F8A57"/>
+<text x="590" y="421.45" font-size="17" fill="#55606E" text-anchor="middle">P2P tunnel</text>
+<polyline points="419,732 761,732" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="770,732 757,738 757,726" fill="#2F8A57"/>
+<polygon points="410,732 423,726 423,738" fill="#2F8A57"/>
+<text x="590" y="754.45" font-size="17" fill="#55606E" text-anchor="middle">P2P tunnel</text>
+<polyline points="300,473 300,691" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="300,700 294,687 306,687" fill="#2F8A57"/>
+<polygon points="300,464 306,477 294,477" fill="#2F8A57"/>
+<text x="290" y="587.95" font-size="17" fill="#55606E" text-anchor="end">P2P tunnel</text>
+<polyline points="830,473 830,691" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="830,700 824,687 836,687" fill="#2F8A57"/>
+<polygon points="830,464 836,477 824,477" fill="#2F8A57"/>
+<text x="840" y="587.95" font-size="17" fill="#55606E">P2P tunnel</text>
+<polyline points="393.79,468.51 786.21,695.49" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="794,700 779.74,698.68 785.75,688.3" fill="#2F8A57"/>
+<polygon points="386,464 400.26,465.32 394.25,475.7" fill="#2F8A57"/>
+<polyline points="786.21,468.51 393.79,695.49" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="386,700 394.25,688.3 400.26,698.68" fill="#2F8A57"/>
+<polygon points="794,464 785.75,475.7 779.74,465.32" fill="#2F8A57"/>
+<text x="697.6" y="635.15" font-size="17" fill="#55606E">P2P tunnel</text>
+<text x="482.4" y="635.15" font-size="17" fill="#55606E" text-anchor="end">P2P tunnel</text>
+<polyline points="300,400 300,199" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="300,190 306,203 294,203" fill="#2457C5"/>
+<text x="310" y="250.95" font-size="17" fill="#55606E">HTTPS + SSE</text>
+<polyline points="880,400 880,199" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="880,190 886,203 874,203" fill="#2457C5"/>
+<text x="870" y="250.95" font-size="17" fill="#55606E" text-anchor="end">HTTPS + SSE</text>
+<polyline points="190,732 100,732 100,199" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="100,190 106,203 94,203" fill="#2457C5"/>
+<text x="110" y="250.95" font-size="17" fill="#55606E">HTTPS + SSE</text>
+<polyline points="990,732 1080,732 1080,199" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="1080,190 1086,203 1074,203" fill="#2457C5"/>
+<text x="1070" y="250.95" font-size="17" fill="#55606E" text-anchor="end">HTTPS + SSE</text>
+<rect x="40" y="884" width="1100" height="205" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="917.2" font-size="22" font-weight="700" fill="#2B3440">Bridge External Access</text>
+<rect x="100" y="994" width="300" height="65" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="250" y="1023.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">User Access</text>
+<text x="250" y="1044.45" font-size="17" fill="#55606E" text-anchor="middle">Tailscale / Netbird / WireGuard</text>
+<rect x="440" y="994" width="300" height="65" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="590" y="1023.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">Public Ingress</text>
+<text x="590" y="1044.45" font-size="17" fill="#55606E" text-anchor="middle">ACME + SNI routing</text>
+<rect x="780" y="994" width="300" height="65" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="930" y="1023.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">Site-to-Site VPN</text>
+<text x="930" y="1044.45" font-size="17" fill="#55606E" text-anchor="middle">Partner networks</text>
+<rect x="1001" y="872" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="1064.5" y="889.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+<polyline points="880,773 880,946 250,946 250,985" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="250,994 244,981 256,981" fill="#2F8A57"/>
+<polygon points="880,764 886,777 874,777" fill="#2F8A57"/>
+<text x="260" y="975.95" font-size="17" fill="#55606E">access</text>
+<polyline points="880,773 880,946 590,946 590,985" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="590,994 584,981 596,981" fill="#2F8A57"/>
+<polygon points="880,764 886,777 874,777" fill="#2F8A57"/>
+<text x="600" y="975.95" font-size="17" fill="#55606E">ingress</text>
+<polyline points="880,773 880,946 930,946 930,985" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="930,994 924,981 936,981" fill="#2F8A57"/>
+<polygon points="880,764 886,777 874,777" fill="#2F8A57"/>
+<text x="940" y="975.95" font-size="17" fill="#55606E">tunnel</text>
+</svg>
