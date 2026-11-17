@@ -295,17 +295,18 @@ func (v *Verifier) VerifyHostKey(ctx context.Context, nodeID string) error {
 }
 
 // Run performs periodic integrity verification for the binary, the hooks
-// directory, and the SSH host key. When WatchEnabled is true, it also monitors
-// the hooks directory via inotify for real-time change detection. Run blocks
-// until the context is cancelled.
+// directory, and the SSH host key. When the watch is enabled and HooksDir is
+// set, it also monitors the hooks directory via inotify for real-time change
+// detection. Run returns at once when verification is disabled, and otherwise
+// blocks until the context is cancelled.
 func (v *Verifier) Run(ctx context.Context, nodeID string) error {
-	if !v.cfg.Enabled {
+	if !v.cfg.IsEnabled() {
 		v.logger.Info("integrity verification disabled")
 		return nil
 	}
 
 	// Start fsnotify watcher if enabled and hooks dir is configured.
-	if v.cfg.WatchEnabled && v.cfg.HooksDir != "" {
+	if v.cfg.IsWatchEnabled() && v.cfg.HooksDir != "" {
 		go v.watchHooksDir(ctx, nodeID)
 	}
 

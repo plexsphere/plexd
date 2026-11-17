@@ -1047,6 +1047,53 @@ func TestApplyEnvOverrides_RolloutsEnabled(t *testing.T) {
 	})
 }
 
+// TestApplyEnvOverrides_IntegrityWatchEnabled covers PLEXD_HOOKS_ENABLED, the
+// switch for the integrity verifier's hooks-directory watcher. It keeps its
+// comparison: "true" and "1" enable, any other non-empty value disables, and
+// an empty value leaves the config file's setting alone. The result is a
+// pointer, so the explicit false survives defaulting, and the variable must
+// not reach integrity.enabled.
+func TestApplyEnvOverrides_IntegrityWatchEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		// file is the config file's watch_enabled, nil for an omitted key.
+		file *bool
+		want bool
+	}{
+		{"true over a disabled file", "true", boolPtr(false), true},
+		{"1 over a disabled file", "1", boolPtr(false), true},
+		{"false over an enabled file", "false", boolPtr(true), false},
+		{"0 over an enabled file", "0", boolPtr(true), false},
+		{"false over an omitted key", "false", nil, false},
+		// Only the two spellings enable; anything else disables.
+		{"True disables", "True", boolPtr(true), false},
+		{"yes disables", "yes", nil, false},
+		// Unset: the file's value stands.
+		{"unset keeps a disabled file", "", boolPtr(false), false},
+		{"unset keeps an enabled file", "", boolPtr(true), true},
+		{"unset keeps an omitted key", "", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLEXD_HOOKS_ENABLED", tt.value)
+			t.Setenv("PLEXD_HOOKS_DIR", "")
+
+			cfg := agent.AgentConfig{}
+			cfg.Integrity.WatchEnabled = tt.file
+			applyEnvOverrides(&cfg)
+			cfg.Integrity.ApplyDefaults()
+
+			if got := cfg.Integrity.IsWatchEnabled(); got != tt.want {
+				t.Errorf("Integrity.IsWatchEnabled() for %q = %v, want %v", tt.value, got, tt.want)
+			}
+			if cfg.Integrity.Enabled != nil {
+				t.Errorf("Integrity.Enabled = %v, want nil: PLEXD_HOOKS_ENABLED must not touch integrity.enabled", *cfg.Integrity.Enabled)
+			}
+		})
+	}
+}
+
 // TestApplyEnvOverrides_PolicyEnabled covers the override that lets a container
 // which cannot program nftables start at all: with enforcement on, `plexd up`
 // aborts on the firewall pre-flight, and without a config file this variable is

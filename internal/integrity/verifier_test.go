@@ -98,7 +98,7 @@ func TestVerifier_StartupVerification_NoBaseline(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -139,7 +139,7 @@ func TestVerifier_StartupVerification_MatchingBaseline(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -171,7 +171,7 @@ func TestVerifier_StartupVerification_MismatchedBaseline(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -208,7 +208,7 @@ func TestVerifier_VerifyHook_Matching(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     filepath.Join(dir, "plexd"),
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -237,7 +237,7 @@ func TestVerifier_VerifyHook_Mismatched(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     filepath.Join(dir, "plexd"),
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -272,7 +272,7 @@ func TestVerifier_VerifyHook_EmptyChecksum(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     filepath.Join(dir, "plexd"),
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -295,7 +295,7 @@ func TestVerifier_BinaryChecksum(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -318,7 +318,7 @@ func TestVerifier_BinaryChecksum_BeforeVerification(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     filepath.Join(dir, "plexd"),
 		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
@@ -336,7 +336,7 @@ func TestVerifier_Disabled(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled: false,
+		Enabled: boolPtr(false),
 	}, store, reporter, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -367,7 +367,7 @@ func TestVerifier_PeriodicRun_DetectsTampering(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: 50 * time.Millisecond, // short for test
 	}, store, reporter, slog.Default())
@@ -439,11 +439,11 @@ func TestVerifier_WatchHooksDir_DetectsChange(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		HooksDir:       hooksDir,
 		VerifyInterval: 1 * time.Hour, // long interval; we rely on the watcher
-		WatchEnabled:   true,
+		WatchEnabled:   boolPtr(true),
 	}, store, reporter, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -515,7 +515,7 @@ func TestVerifier_VerifyHooksDir_NoViolation(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		HooksDir:       hooksDir,
 		VerifyInterval: DefaultVerifyInterval,
@@ -551,7 +551,7 @@ func TestVerifier_VerifyHooksDir_DetectsViolation(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		HooksDir:       hooksDir,
 		VerifyInterval: DefaultVerifyInterval,
@@ -587,7 +587,7 @@ func TestVerifier_PeriodicRun_ContextCancellation(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: 1 * time.Hour, // long interval; we cancel quickly
 	}, store, reporter, slog.Default())
@@ -651,7 +651,7 @@ func TestVerifier_VerifyHooksDir_PinsWireBody(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
 		HooksDir:       hooksDir,
 		VerifyInterval: DefaultVerifyInterval,
@@ -721,7 +721,7 @@ func TestVerifier_VerifyHooksDir_DropsEntryWithUnconvertibleDigest(t *testing.T)
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
 		HooksDir:       hooksDir,
 		VerifyInterval: DefaultVerifyInterval,
@@ -776,7 +776,7 @@ func TestVerifier_VerifyHostKey_EstablishesBaseline(t *testing.T) {
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
 		HostKeyPath:    keyPath,
 		VerifyInterval: DefaultVerifyInterval,
@@ -821,7 +821,7 @@ func TestVerifier_VerifyHostKey_DetectsRotation(t *testing.T) {
 
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
 		HostKeyPath:    keyPath,
 		VerifyInterval: DefaultVerifyInterval,
@@ -865,7 +865,7 @@ func TestVerifier_VerifyHostKey_NoKeyIsNoOp(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			v := NewVerifier(Config{
-				Enabled:        true,
+				Enabled:        boolPtr(true),
 				BinaryPath:     filepath.Join(dir, "plexd"),
 				HostKeyPath:    tt.path,
 				VerifyInterval: DefaultVerifyInterval,
@@ -923,10 +923,10 @@ func newWatchTestVerifier(t *testing.T, hooksDir string, reporter *mockReporter,
 		}
 	}
 	return NewVerifier(Config{
-		Enabled:        true,
+		Enabled:        boolPtr(true),
 		HooksDir:       hooksDir,
 		VerifyInterval: time.Hour,
-		WatchEnabled:   true,
+		WatchEnabled:   boolPtr(true),
 	}, store, reporter, slog.New(slog.NewTextHandler(logs, nil)))
 }
 
