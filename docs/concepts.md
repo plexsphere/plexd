@@ -31,47 +31,7 @@ The `runUp` function in `cmd/plexd/cmd/up.go` performs initialization before ent
 
 **Initialization:**
 
-```mermaid
-flowchart TD
-    subgraph Config/Logger
-        A1[Parse config] --> A2[Set up logger]
-    end
-
-    subgraph Registration
-        A2 --> A3[Create control plane client]
-        A3 --> A4[Register node]
-        A4 --> A5[Create Ed25519 verifier]
-    end
-
-    subgraph Networking
-        A5 --> A6[Initialize WireGuard]
-        A5 --> A7[Initialize NAT + Peer Exchange]
-        A5 --> A8[Initialize Network Policy]
-        A5 --> A9[Initialize Tunnel]
-        A5 --> A10[Initialize Bridge]
-    end
-
-    subgraph Core Services
-        A6 & A7 & A8 & A9 & A10 --> A11[Create SSE manager]
-        A11 --> A12[Create reconciler]
-        A12 --> A13[Create heartbeat service]
-    end
-
-    subgraph Actions/NodeAPI
-        A13 --> A14[Create action executor + rollout installer + capability reporter + hook watchers]
-        A14 --> A15[Create node API server]
-    end
-
-    subgraph Observability
-        A15 --> A16[Create metrics collectors]
-        A16 --> A17[Create log forwarder]
-        A17 --> A18[Create audit forwarder]
-    end
-
-    A18 --> G[Launch goroutines via WaitGroup]
-
-    style A10 stroke-dasharray: 5 5
-```
+![The initialization of plexd up runs in six groups. Config and logger: parse the config, then set up the logger. Registration: create the control plane client, register the node, create the Ed25519 verifier. Networking, each step after the verifier: initialize WireGuard, NAT and peer exchange, network policy, the tunnel and, in bridge mode only, the bridge. Core services, after all five: create the SSE manager, the reconciler and the heartbeat service. Actions and node API: create the integrity store and verifier, then the action executor with the rollout installer, the capability reporter and the hook watchers, then the node API server. Observability: create the metrics collectors, the log forwarder and the audit forwarder. Last, plexd launches the goroutines via a WaitGroup.](./diagrams/architecture-startup-sequence.svg)
 
 1. **Parse config** — read YAML, apply CLI flag overrides, apply `PLEXD_*` env overrides
 2. **Set up logger** — structured `slog` logger with configured level
@@ -121,33 +81,7 @@ In bridge mode `plexd up` also starts the ingress status reporter, whether or no
 
 On SIGTERM or SIGINT:
 
-```mermaid
-flowchart TD
-    SIG[SIGTERM / SIGINT] --> C1[Cancel context]
-    C1 --> C2[SSE shutdown]
-    C1 --> C3[Drain actions]
-    C2 & C3 --> C4[Mesh server shutdown]
-
-    subgraph Bridge teardown
-        C4 --> C5[Ingress teardown]
-        C5 --> C6[User access teardown]
-        C6 --> C7[Site-to-site teardown]
-        C7 --> C8[ACME teardown]
-        C8 --> C9[Bridge teardown]
-    end
-
-    C9 --> C10[Firewall teardown]
-    C10 --> C11[WireGuard teardown]
-    C11 --> C12{WaitGroup done<br/>within 30s?}
-    C12 -->|Yes| EXIT[Exit 0]
-    C12 -->|No| FORCE[Force exit]
-
-    style C5 stroke-dasharray: 5 5
-    style C6 stroke-dasharray: 5 5
-    style C7 stroke-dasharray: 5 5
-    style C8 stroke-dasharray: 5 5
-    style C9 stroke-dasharray: 5 5
-```
+![SIGTERM or SIGINT cancels the context. The SSE shutdown and the draining of actions both follow, and both lead to the mesh server shutdown. In bridge mode the bridge teardown comes next: the ingress, user access, site-to-site, ACME and bridge teardowns, in that order. Then the firewall and WireGuard are torn down. If the WaitGroup is done within 30 seconds, plexd exits with 0; if not, it forces the exit.](./diagrams/architecture-shutdown-sequence.svg)
 
 1. **Context cancel** — the signal-notify context is cancelled, which signals all goroutines to stop
 2. **`sseMgr.Shutdown()`** — close the SSE connection

@@ -31,42 +31,7 @@ plexd runs on Linux, macOS and Windows, in node mode and in bridge mode. What ea
 
 The diagram below shows the three layers of a plexd deployment: the central control plane, the managed nodes, and the external access provided by bridge nodes.
 
-```
-                              ┌───────────────────────┐
-                              │  Plexsphere           │
-                              │  Control Plane        │
-                              └───────────┬───────────┘
-                                          │
-                            HTTPS + SSE (outbound only)
-                                          │
-       ┌──────────────┬───────────────────┼──────────────────┬──────────────┐
-       ▼              ▼                   ▼                  ▼              ▼
-┌────────────┐ ┌────────────┐      ┌────────────┐    ┌────────────┐ ┌────────────┐
-│ Bare-Metal │ │     VM     │      │     VM     │    │    K8s     │ │  Bridge /  │
-│            │ │            │      │            │    │  Cluster   │ │  Gateway   │
-└─────┬──────┘ └─────┬──────┘      └─────┬──────┘    └─────┬──────┘ └──┬──────┬──┘
-      │              │                   │                 │           │      │
-      │◄════ Encrypted Mesh (direct P2P + NAT Traversal) ═════════════►│      │
-      │              │                   │                 │           │      │
-      └──────────────┴───────────────────┴─────────────────┘      ┌────┘      └────┐
-                                                                  │                │
-                                                                  ▼                ▼
-                                                           ┌──────────┐     ┌────────────┐
-                                                           │  User    │     │  External  │
-                                                           │  Access  │     │  Traffic   │
-                                                           │          │     │            │
-                                                           │ Tailscale│     │ Public IPs │
-                                                           │ Netbird  │     │ Site-to-   │
-                                                           │ WireGuard│     │ Site VPN   │
-                                                           └────┬─────┘     └──────┬─────┘
-                                                                │                  │
-                                                                ▼                  ▼
-                                                          ┌───────────┐   ┌──────────────┐
-                                                          │ Developers│   │ Public       │
-                                                          │ Admins    │   │ Internet     │
-                                                          │ On-Call   │   │ Partner Nets │
-                                                          └───────────┘   └──────────────┘
-```
+![The plexsphere control plane is at the top. Five nodes, a bare-metal server, two VMs, a Kubernetes cluster and a bridge or gateway, connect to it over HTTPS and SSE, outbound only: the nodes initiate every connection. An encrypted mesh joins the nodes, direct peer to peer with NAT traversal. The bridge leads to user access through Tailscale, Netbird or WireGuard, which serves developers, admins and on-call staff, and to external traffic through public IPs and site-to-site VPN, which reaches the public internet and partner networks.](./diagrams/architecture-overview.svg)
 
 All communication between nodes and the control plane is **outbound-only** — nodes initiate HTTPS and SSE connections; no inbound ports or public IPs are required on the node side.
 

@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="730" viewBox="0 0 1180 730" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="High-level overview of a plexd deployment">
+<title>High-level overview of a plexd deployment</title>
+<rect width="1180" height="730" fill="#F6F5F1"/>
+<rect x="40" y="270" width="200" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="140" y="312" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bare metal</text>
+<polyline points="140,220 140,270" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<rect x="265" y="270" width="200" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="365" y="312" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">VM</text>
+<polyline points="365,220 365,270" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<rect x="490" y="270" width="200" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="590" y="312" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">VM</text>
+<polyline points="590,220 590,270" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<rect x="715" y="270" width="200" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="815" y="301.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Kubernetes</text>
+<text x="815" y="322.95" font-size="17" fill="#55606E" text-anchor="middle">cluster</text>
+<polyline points="815,220 815,270" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<rect x="940" y="270" width="200" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1040" y="301.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge</text>
+<text x="1040" y="322.95" font-size="17" fill="#55606E" text-anchor="middle">gateway</text>
+<polyline points="1040,220 1040,270" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polyline points="140,220 1040,220" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<rect x="390" y="40" width="400" height="44" rx="8" fill="#E7EDF9" stroke="#2457C5" stroke-width="2"/>
+<text x="590" y="69" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Plexsphere control plane</text>
+<polyline points="590,220 590,93" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="590,84 596,97 584,97" fill="#2457C5"/>
+<text x="600" y="147.75" font-size="17" fill="#55606E">HTTPS + SSE, outbound only:</text>
+<text x="600" y="168.15" font-size="17" fill="#55606E">the nodes initiate every connection</text>
+<polyline points="140,349 140,390 970,390 970,349" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="970,340 976,353 964,353" fill="#2F8A57"/>
+<polygon points="140,340 146,353 134,353" fill="#2F8A57"/>
+<polyline points="365,340 365,390" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polyline points="590,340 590,390" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polyline points="815,340 815,390" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<text x="365" y="412.25" font-size="17" fill="#55606E" text-anchor="middle">encrypted mesh: direct peer to peer,</text>
+<text x="365" y="432.65" font-size="17" fill="#55606E" text-anchor="middle">with NAT traversal</text>
+<rect x="630" y="470" width="220" height="85" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="740" y="499.1" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">User access</text>
+<text x="740" y="520.25" font-size="17" fill="#55606E" text-anchor="middle">Tailscale, Netbird,</text>
+<text x="740" y="540.65" font-size="17" fill="#55606E" text-anchor="middle">WireGuard</text>
+<rect x="940" y="470" width="200" height="85" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="1040" y="499.1" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">External traffic</text>
+<text x="1040" y="520.25" font-size="17" fill="#55606E" text-anchor="middle">public IPs,</text>
+<text x="1040" y="540.65" font-size="17" fill="#55606E" text-anchor="middle">site-to-site VPN</text>
+<polyline points="1015,349 1015,430 740,430 740,461" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="740,470 734,457 746,457" fill="#2F8A57"/>
+<polygon points="1015,340 1021,353 1009,353" fill="#2F8A57"/>
+<polyline points="1090,349 1090,461" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="1090,470 1084,457 1096,457" fill="#2F8A57"/>
+<polygon points="1090,340 1096,353 1084,353" fill="#2F8A57"/>
+<rect x="630" y="625" width="220" height="65" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="740" y="654.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Developers</text>
+<text x="740" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">admins, on-call</text>
+<rect x="940" y="625" width="200" height="65" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1040" y="654.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Public internet</text>
+<text x="1040" y="675.45" font-size="17" fill="#55606E" text-anchor="middle">partner networks</text>
+<polyline points="740,564 740,616" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="740,625 734,612 746,612" fill="#2F8A57"/>
+<polygon points="740,555 746,568 734,568" fill="#2F8A57"/>
+<polyline points="1040,564 1040,616" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="1040,625 1034,612 1046,612" fill="#2F8A57"/>
+<polygon points="1040,555 1046,568 1034,568" fill="#2F8A57"/>
+</svg>

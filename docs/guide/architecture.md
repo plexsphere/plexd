@@ -24,62 +24,7 @@ title: Architecture
 
 This diagram expands the [high-level overview](/) to show the control plane's internal components, the mesh IP addressing, and the bridge node's dual-interface design.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                             Plexsphere Control Plane                             │
-│                                                                                  │
-│  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐  ┌────────────────┐    │
-│  │ Registration   │  │ Key & Peer     │  │ Policy       │  │ Event Bus      │    │
-│  │ API            │  │ Manager        │  │ Engine       │  │ (SSE)          │    │
-│  └────────────────┘  └────────────────┘  └──────────────┘  └────────────────┘    │
-│                                                                                  │
-└─────────────────────────────────────┬────────────────────────────────────────────┘
-                                      │
-                            HTTPS + SSE (outbound only)
-                                      │
-         ┌────────────┬───────────────┼───────────────┬────────────────┐
-         ▼            ▼               ▼               ▼                ▼
-┌──────────────┐┌────────────┐┌────────────┐┌────────────┐  ┌───────────────────┐
-│    plexd     ││   plexd    ││   plexd    ││   plexd    │  │   plexd (Bridge)  │
-│ (Bare-Metal) ││   (VM)     ││   (VM)     ││   (K8s)    │  ├───────────────────┤
-│              ││            ││            ││            │  │                   │
-│  10.100.1.1  ││ 10.100.1.2 ││ 10.100.1.3 ││ 10.100.1.4 │  │ ┌───────────────┐ │
-└──────┬───────┘└─────┬──────┘└─────┬──────┘└─────┬──────┘  │ │   Mesh side   │ │
-       │              │             │             │         │ │  10.100.1.250 │ │
-       │              │             │             │         │ │  NAT Relay    │ │
-       │   ┌──────────┴─────────────┴─────────────┴──┐      │ └───────┬───────┘ │
-       │   │                                         │      │         │         │
-       └───┤  Encrypted WireGuard Mesh (Full Mesh)   ├──────┤         │         │
-           │                                         │      │         │         │
-           │  Every node ◄══ direct P2P ══► every    │      │ ┌───────┴───────┐ │
-           │  node. Each peer uses STUN to discover  │      │ │  Access side  │ │
-           │  its public endpoint for NAT traversal. │      │ │               │ │
-           │  Falls back to relay via Bridge when    │      │ │ ┌───────────┐ │ │
-           │  direct connectivity fails.             │      │ │ │ User      │ │ │
-           │                                         │      │ │ │ Access    │ │ │
-           └─────────────────────────────────────────┘      │ │ │ Tailscale │ │ │
-                                                            │ │ │ Netbird   │ │ │
-                                                            │ │ │ WireGuard │ │ │
-                                                            │ │ └─────┬─────┘ │ │
-                                                            │ │ ┌─────┴─────┐ │ │
-                                                            │ │ │ Public    │ │ │
-                                                            │ │ │ Ingress   │ │ │
-                                                            │ │ └─────┬─────┘ │ │
-                                                            │ │ ┌─────┴─────┐ │ │
-                                                            │ │ │ Site-to-  │ │ │
-                                                            │ │ │ Site VPN  │ │ │
-                                                            │ │ └─────┬─────┘ │ │
-                                                            │ └───────┼───────┘ │
-                                                            └─────────┼─────────┘
-                                                                      │
-                                                        ┌─────────────┼─────────────┐
-                                                        ▼             ▼             ▼
-                                                   ┌─────────┐ ┌──────────┐ ┌───────────┐
-                                                   │Developer│ │ Public   │ │ Partner / │
-                                                   │Admin    │ │ Internet │ │ Customer  │
-                                                   │On-Call  │ │ Traffic  │ │ Network   │
-                                                   └─────────┘ └──────────┘ └───────────┘
-```
+![The plexsphere control plane holds four components: the Registration API, the Key & Peer Manager, the Policy Engine and the Event Bus (SSE). Four plexd nodes, on bare metal at 10.100.1.1, on two VMs at 10.100.1.2 and 10.100.1.3 and on Kubernetes at 10.100.1.4, and a plexd bridge connect to it over HTTPS and SSE, outbound only. The four nodes join the encrypted WireGuard full mesh: every node has a direct peer-to-peer tunnel to every node, each peer uses STUN to discover its public endpoint for NAT traversal, and traffic falls back to relay via the bridge when direct connectivity fails. The bridge's mesh side, at 10.100.1.250, joins the mesh and is the NAT relay. Its access side holds user access through Tailscale, Netbird or WireGuard, public ingress, and site-to-site VPN, and serves developers, admins and on-call staff, public internet traffic, and partner or customer networks.](../diagrams/architecture-detailed.svg)
 
 **Control plane** — The four components at the top handle distinct responsibilities: the **Registration API** bootstraps new nodes, the **Key & Peer Manager** distributes WireGuard public keys and pre-shared keys, the **Policy Engine** evaluates visibility and firewall rules, and the **Event Bus (SSE)** pushes real-time update notifications (peer changes, policy updates, action requests, key rotations) to connected nodes. Those notifications are hints: the node applies the change — and picks up queued action dispatches — from its authoritative state pull.
 

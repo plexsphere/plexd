@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1184" height="617" viewBox="0 0 1184 617" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Lifecycle of the agent">
+<title>Lifecycle of the agent</title>
+<rect width="1184" height="617" fill="#F6F5F1"/>
+<rect x="40" y="40" width="182" height="84.8" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="131" y="69" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Start</text>
+<text x="131" y="90.15" font-size="17" fill="#55606E" text-anchor="middle">binary checksum</text>
+<text x="131" y="110.55" font-size="17" fill="#55606E" text-anchor="middle">hook scan</text>
+<rect x="340.33" y="40" width="132" height="84.8" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="406.33" y="89.4" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Register</text>
+<polyline points="222,82.4 331.33,82.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="340.33,82.4 327.33,88.4 327.33,76.4" fill="#3A4452"/>
+<rect x="590.67" y="40" width="238" height="84.8" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="709.67" y="89.4" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Configure tunnels</text>
+<polyline points="472.33,82.4 581.67,82.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="590.67,82.4 577.67,88.4 577.67,76.4" fill="#3A4452"/>
+<rect x="947" y="40" width="197" height="84.8" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1045.5" y="79.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">NAT discovery</text>
+<text x="1045.5" y="100.35" font-size="17" fill="#55606E" text-anchor="middle">STUN</text>
+<polyline points="828.67,82.4 938,82.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="947,82.4 934,88.4 934,76.4" fill="#3A4452"/>
+<rect x="440" y="194.8" width="704" height="382" rx="12" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="456" y="228" font-size="22" font-weight="700" fill="#2B3440">Connected</text>
+<text x="606" y="226.25" font-size="17" fill="#55606E">steady state</text>
+<polyline points="1045.5,124.8 1045.5,185.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1045.5,194.8 1039.5,181.8 1051.5,181.8" fill="#3A4452"/>
+<rect x="464" y="254.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="624" y="286.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Heartbeat</text>
+<rect x="800" y="254.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="960" y="286.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">NAT refresh</text>
+<rect x="464" y="316.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="624" y="348.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Reconcile</text>
+<rect x="800" y="316.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="960" y="348.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">SSE stream</text>
+<rect x="464" y="378.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="624" y="410.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Policy enforcement</text>
+<rect x="800" y="378.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="960" y="410.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Observe: logs, audit</text>
+<rect x="464" y="440.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="624" y="472.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Access proxy</text>
+<rect x="800" y="440.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="960" y="472.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Action dispatcher</text>
+<rect x="464" y="502.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="624" y="534.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Hook file watcher</text>
+<rect x="800" y="502.8" width="320" height="50" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="960" y="534.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Node API server</text>
+<rect x="40" y="254.8" width="150" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="115" y="283.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Shutdown</text>
+<polyline points="440,276.8 199,276.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="190,276.8 203,270.8 203,282.8" fill="#3A4452"/>
+<text x="315" y="246.05" font-size="17" fill="#55606E" text-anchor="middle">on shutdown</text>
+<text x="315" y="266.45" font-size="17" fill="#55606E" text-anchor="middle">or command</text>
+<rect x="40" y="338.8" width="360" height="143" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="54" y="364.95" font-size="17" fill="#55606E">1. Stop accepting new work</text>
+<text x="54" y="385.35" font-size="17" fill="#55606E">2. Drain in-flight executions:</text>
+<text x="54" y="405.75" font-size="17" fill="#55606E" xml:space="preserve">    up to 30 s, then cancelled</text>
+<text x="54" y="426.15" font-size="17" fill="#55606E">3. Tear down tunnels</text>
+<text x="54" y="446.55" font-size="17" fill="#55606E">4. Stop subsystems</text>
+<text x="54" y="466.95" font-size="17" fill="#55606E">The local identity is kept.</text>
+<polyline points="115,298.8 115,338.8" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+</svg>

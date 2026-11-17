@@ -6,40 +6,7 @@ title: Agent Lifecycle
 
 > For architecture diagrams and platform support, see [Architecture](/guide/architecture). For a visual overview of communication channels, see [Platform Communication & Mesh](/guide/platform-communication).
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                                                                               │
-│   ┌─────────┐    ┌──────────┐    ┌───────────┐    ┌─────────────┐             │
-│   │  Start  │    │          │    │ Configure │    │     NAT     │             │
-│   │ Binary  ├───▶│ Register ├───▶│  Tunnels  ├───▶│  Discovery  │             │
-│   │ Checksum│    │          │    │           │    │   (STUN)    │             │
-│   │ Hook    │    └──────────┘    └───────────┘    └──────┬──────┘             │
-│   │ Scan    │                                            │                    │
-│   └─────────┘                                            ▼                    │
-│                                                                               │
-│   ┌────────────┐                 ┌─────────────────────────────────────┐      │
-│   │            │  On shutdown    │            Connected                │      │
-│   │  Shutdown  │◀── or command ──┤                                     │      │
-│   │            │                 │  ┌─────────────┐ ┌───────────────┐  │      │
-│   └────────────┘                 │  │ Heartbeat   │ │ Reconcile     │  │      │
-│                                  │  │ NAT Refresh │ │ SSE Stream    │  │      │
-│   • Stop accepting new work      │  └─────────────┘ └───────────────┘  │      │
-│   • Tear down tunnels            │  ┌─────────────┐ ┌───────────────┐  │      │
-│   • Wait for in-flight           │  │ Policy      │ │ Observe       │  │      │
-│     action executions            │  │ Enforce     │ │ Logs, Audit   │  │      │
-│   • Clean up local state         │  └─────────────┘ └───────────────┘  │      │
-│                                  │  ┌─────────────┐ ┌───────────────┐  │      │
-│                                  │  │ Access      │ │ Action        │  │      │
-│                                  │  │ Proxy       │ │ Dispatcher    │  │      │
-│                                  │  └─────────────┘ └───────────────┘  │      │
-│                                  │  ┌─────────────┐ ┌───────────────┐  │      │
-│                                  │  │ Hook File   │ │ Node API      │  │      │
-│                                  │  │ Watcher     │ │ Server        │  │      │
-│                                  │  └─────────────┘ └───────────────┘  │      │
-│                                  └─────────────────────────────────────┘      │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+![The agent starts, computing the binary checksum and scanning the hooks, then registers, configures tunnels and runs NAT discovery with STUN. It then enters the connected steady state, in which it runs the heartbeat, the NAT refresh, reconciliation, the SSE stream, policy enforcement, the observation of logs and audit, the access proxy, the action dispatcher, the hook file watcher and the node API server. On shutdown or a command it moves to shutdown: it stops accepting new work, drains in-flight executions for up to 30 seconds and then cancels them, tears down the tunnels and stops its subsystems. The local identity is kept.](../diagrams/architecture-agent-lifecycle.svg)
 
 1. **Start** - Read config, locate bootstrap token, compute binary SHA-256 checksum, scan and checksum all declared hooks.
 2. **Register** - POST token to control plane, receive node identity, keys, and initial peer list. Include capabilities (binary info, available actions, hooks with checksums).
