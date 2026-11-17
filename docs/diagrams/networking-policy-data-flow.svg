@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="603" viewBox="0 0 1120 603" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="From the merged policy to the firewall and back">
+<title>From the merged policy to the firewall and back</title>
+<rect width="1120" height="603" fill="#F6F5F1"/>
+<rect x="40" y="40" width="230" height="56" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="155" y="75" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<path d="M40 210H256L270 224V290H40Z" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<path d="M256 210V224H270" fill="none" stroke="#2457C5" stroke-width="2"/>
+<text x="155" y="236.15" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1D47A6" text-anchor="middle">NodeStateSnapshot</text>
+<text x="155" y="255.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">.Policy</text>
+<text x="155" y="275.75" font-size="17" fill="#55606E" text-anchor="middle">merged block</text>
+<polyline points="155,96 155,210" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="149,197 155,210 161,197" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="165" y="158.95" font-size="17" fill="#55606E">state pull</text>
+<rect x="360" y="222" width="190" height="56" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="455" y="255.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">DispatchHandler</text>
+<polyline points="270,250 351,250" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="360,250 347,256 347,244" fill="#3A4452"/>
+<rect x="640" y="222" width="170" height="56" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="725" y="255.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">Enforcer.Sync</text>
+<polyline points="550,250 631,250" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="640,250 627,256 627,244" fill="#3A4452"/>
+<rect x="900" y="222" width="180" height="56" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="990" y="255.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">StatusReporter</text>
+<polyline points="810,250 891,250" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="900,250 887,256 887,244" fill="#3A4452"/>
+<polyline points="990,222 990,68 279,68" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="270,68 283,62 283,74" fill="#B38A00"/>
+<text x="630" y="57.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">PUT /v1/nodes/{node_id}/policy-status</text>
+<rect x="40" y="368" width="230" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="155" y="405.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">PolicyEngine</text>
+<polyline points="680,278 680,388 279,388" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="270,388 283,382 283,394" fill="#3A4452"/>
+<text x="475" y="377.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">BuildFirewallRules</text>
+<polyline points="270,412 720,412 720,278" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="726,291 720,278 714,291" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="475" y="434.45" font-size="17" fill="#55606E" text-anchor="middle">FirewallRule entries</text>
+<rect x="660" y="502" width="240" height="61" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="780" y="528.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">FirewallController</text>
+<text x="780" y="548.65" font-size="17" fill="#55606E" text-anchor="middle">nftables, pf, WFP</text>
+<polyline points="780,278 780,493" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="780,502 774,489 786,489" fill="#3A4452"/>
+<text x="790" y="405.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">ApplyRules</text>
+</svg>

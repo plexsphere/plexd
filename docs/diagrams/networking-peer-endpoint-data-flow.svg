@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1010" height="871" viewBox="0 0 1010 871" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The endpoint report loop and the state pull">
+<title>The endpoint report loop and the state pull</title>
+<rect width="1010" height="871" fill="#F6F5F1"/>
+<rect x="40" y="40" width="930" height="341" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">Outbound</text>
+<text x="197" y="71.45" font-size="17" fill="#55606E">the STUN report loop</text>
+<rect x="70" y="120" width="220" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="180" y="149.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Discoverer</text>
+<text x="180" y="170.45" font-size="17" fill="#55606E" text-anchor="middle">nat package</text>
+<rect x="580" y="120" width="220" height="65" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="690" y="149.3" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<text x="690" y="170.45" font-size="17" fill="#55606E" text-anchor="middle">api package</text>
+<polyline points="290,140.5 571,140.5" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="580,140.5 567,146.5 567,134.5" fill="#2457C5"/>
+<text x="435" y="130.1" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ReportEndpoint</text>
+<polyline points="580,164.5 290,164.5" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="303,158.5 290,164.5 303,170.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="435" y="185.9" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">stale_after</text>
+<text x="435" y="206.05" font-size="17" fill="#55606E" text-anchor="middle">deadline</text>
+<rect x="70" y="295" width="220" height="56" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="180" y="330" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">STUN Servers</text>
+<polyline points="140,185 140,286" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="140,295 134,282 146,282" fill="#2457C5"/>
+<text x="130" y="245.95" font-size="17" fill="#55606E" text-anchor="end">STUN</text>
+<polyline points="220,295 220,185" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="226,198 220,185 214,198" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="230" y="245.95" font-size="17" fill="#55606E">public endpoint</text>
+<rect x="40" y="421" width="930" height="410" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="454.2" font-size="22" font-weight="700" fill="#2B3440">Inbound</text>
+<text x="176" y="452.45" font-size="17" fill="#55606E">the reconciliation state pull</text>
+<rect x="70" y="501" width="220" height="65" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="180" y="530.3" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<text x="180" y="551.45" font-size="17" fill="#55606E" text-anchor="middle">api package</text>
+<rect x="580" y="501" width="220" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="690" y="530.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Reconciler</text>
+<text x="690" y="551.45" font-size="17" fill="#55606E" text-anchor="middle">reconcile package</text>
+<polyline points="580,521.5 299,521.5" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="290,521.5 303,515.5 303,527.5" fill="#2457C5"/>
+<text x="435" y="511.1" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{id}/state</text>
+<polyline points="290,545.5 580,545.5" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="567,551.5 580,545.5 567,539.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="435" y="567.1" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">peers[].endpoint</text>
+<polyline points="180,566 180,626 620,626 620,575" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="620,566 626,579 614,579" fill="#B38A00"/>
+<text x="400" y="647.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">peer_endpoint_changed</text>
+<text x="400" y="667.35" font-size="17" fill="#55606E" text-anchor="middle">SSE event: triggers a reconcile;</text>
+<text x="400" y="687.75" font-size="17" fill="#55606E" text-anchor="middle">the payload is never decoded</text>
+<rect x="660" y="736" width="270" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="795" y="765.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">WireGuard Manager</text>
+<text x="795" y="786.45" font-size="17" fill="#55606E" text-anchor="middle">wireguard package</text>
+<polyline points="750,566 750,727" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="750,736 744,723 756,723" fill="#3A4452"/>
+<text x="760" y="647" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">AddPeer,</text>
+<text x="760" y="666.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">UpdatePeer</text>
+</svg>

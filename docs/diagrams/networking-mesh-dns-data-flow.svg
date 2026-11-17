@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1130" height="1023" viewBox="0 0 1130 1023" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="From the dns block to the mesh DNS resolver">
+<title>From the dns block to the mesh DNS resolver</title>
+<rect width="1130" height="1023" fill="#F6F5F1"/>
+<rect x="40" y="40" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="180" y="69.4" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<text x="180" y="89.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{id}/state</text>
+<rect x="40" y="210" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="180" y="249" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Reconciler</text>
+<polyline points="130,210 130,113" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="130,104 136,117 124,117" fill="#2457C5"/>
+<polyline points="230,104 230,210" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="224,197 230,210 236,197" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="240" y="162.95" font-size="17" fill="#55606E">dns block</text>
+<rect x="420" y="210" width="260" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="550" y="238.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">meshdns.Manager</text>
+<text x="550" y="257.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Handle</text>
+<polyline points="320,242 411,242" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="420,242 407,248 407,236" fill="#3A4452"/>
+<rect x="40" y="370" width="280" height="106" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="180" y="399.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Server</text>
+<text x="180" y="420.55" font-size="17" fill="#55606E" text-anchor="middle">mesh IP:5354 on Linux</text>
+<text x="180" y="440.95" font-size="17" fill="#55606E" text-anchor="middle">127.0.0.1:5354 on macOS</text>
+<text x="180" y="461.35" font-size="17" fill="#55606E" text-anchor="middle">127.0.0.1:53 on Windows</text>
+<polyline points="450,274 450,423 329,423" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="320,423 333,417 333,429" fill="#3A4452"/>
+<text x="440" y="344.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="end">SetRecords</text>
+<text x="440" y="363.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="end">SetForwarding</text>
+<rect x="490" y="340" width="258" height="310" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<rect x="514" y="362" width="210" height="66" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="619" y="400.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ResolvedRegistrar</text>
+<rect x="850" y="362" width="240" height="66" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="970" y="391.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">systemd-resolved</text>
+<text x="970" y="412.95" font-size="17" fill="#55606E" text-anchor="middle">Linux</text>
+<polyline points="724,395 841,395" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="850,395 837,401 837,389" fill="#2457C5"/>
+<text x="787" y="384.45" font-size="17" fill="#55606E" text-anchor="middle">D-Bus</text>
+<text x="619" y="450.45" font-size="17" fill="#55606E" text-anchor="middle">or</text>
+<rect x="514" y="462" width="210" height="66" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="619" y="500.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ScutilRegistrar</text>
+<rect x="850" y="462" width="240" height="66" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="970" y="491.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">configd</text>
+<text x="970" y="512.95" font-size="17" fill="#55606E" text-anchor="middle">macOS</text>
+<polyline points="724,495 841,495" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="850,495 837,501 837,489" fill="#2457C5"/>
+<text x="787" y="484.45" font-size="17" fill="#55606E" text-anchor="middle">scutil</text>
+<text x="619" y="550.45" font-size="17" fill="#55606E" text-anchor="middle">or</text>
+<rect x="514" y="562" width="210" height="66" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="619" y="600.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">NRPTRegistrar</text>
+<rect x="850" y="562" width="240" height="66" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="970" y="591.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Dnscache</text>
+<text x="970" y="612.95" font-size="17" fill="#55606E" text-anchor="middle">Windows</text>
+<polyline points="724,595 841,595" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="850,595 837,601 837,589" fill="#2457C5"/>
+<text x="787" y="584.45" font-size="17" fill="#55606E" text-anchor="middle">registry</text>
+<polyline points="630,274 630,331" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="630,340 624,327 636,327" fill="#3A4452"/>
+<text x="640" y="312.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">Apply / Revert</text>
+<rect x="490" y="700" width="258" height="68" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="619" y="729" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">Forward zone and</text>
+<text x="619" y="753" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">catch-all resolvers</text>
+<polyline points="270,476 270,734 481,734" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="490,734 477,740 477,728" fill="#2457C5"/>
+<text x="380" y="703.25" font-size="17" fill="#55606E" text-anchor="middle">forwarded queries</text>
+<text x="380" y="723.65" font-size="17" fill="#55606E" text-anchor="middle">UDP or TCP, port 53</text>
+<rect x="40" y="898" width="420" height="85" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="250" y="927.1" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">System resolver</text>
+<text x="250" y="948.25" font-size="17" fill="#55606E" text-anchor="middle">systemd-resolved on Linux, mDNSResponder</text>
+<text x="250" y="968.65" font-size="17" fill="#55606E" text-anchor="middle">on macOS, or the DNS Client on Windows</text>
+<polyline points="110,898 110,485" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="110,476 116,489 104,489" fill="#2457C5"/>
+<text x="120" y="815.35" font-size="17" fill="#55606E">queries for the mesh zones and the forward zones,</text>
+<text x="120" y="835.75" font-size="17" fill="#55606E">and with a catch-all every name no other domain</text>
+<text x="120" y="856.15" font-size="17" fill="#55606E">matches: on Linux through the mesh interface,</text>
+<text x="120" y="876.55" font-size="17" fill="#55606E">on macOS and Windows to 127.0.0.1</text>
+</svg>

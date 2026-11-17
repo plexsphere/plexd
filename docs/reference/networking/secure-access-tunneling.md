@@ -12,39 +12,7 @@ The block is **desired state, not a delivery queue**: an entry stands for as lon
 
 ## Data Flow
 
-```
-Control Plane
-      │
-      │ GET /v1/nodes/{id}/state  →  sessions block
-      ▼
-┌─────────────────┐   ┌───────────────────┐
-│    Reconciler   │──▶│ tunnel.Dispatcher │
-│(internal/recon- │   │      Handle       │
-│      cile)      │   └─────────┬─────────┘
-└─────────────────┘             │
-                                ▼
-                        ┌───────────────┐
-                        │ SessionManager │
-                        │  CreateSession │
-                        └───────┬───────┘
-                                │
-                        ┌───────┴───────┐
-                        │    Session     │
-                        │               │
-                        │ ┌───────────┐ │
-                        │ │  Listener  │ │  ← bound to meshIP:0
-                        │ │ (TCP)     │ │
-                        │ └─────┬─────┘ │
-                        │       │       │
-                        │ ┌─────┴─────┐ │
-                        │ │ Forwarder  │ │  ← bidirectional io.Copy
-                        │ └─────┬─────┘ │
-                        └───────┼───────┘
-                                │
-                                ▼
-                         Target Host
-                         (e.g. sshd)
-```
+![The Reconciler of internal/reconcile pulls GET /v1/nodes/{id}/state from the control plane and receives the sessions block. It hands the block to the Handle method of tunnel.Dispatcher, which calls CreateSession on the SessionManager. The SessionManager creates a Session: a TCP Listener bound to meshIP:0, port 0 of the mesh IP, which leads to a Forwarder. The Forwarder copies the bytes in both directions with io.Copy between the connection and the target host, for example sshd.](../../diagrams/networking-tunnel-data-flow.svg)
 
 ### Reconciliation Sequence
 

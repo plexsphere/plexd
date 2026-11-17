@@ -415,19 +415,7 @@ The package implements RFC 5389 STUN Binding Requests with the Go standard libra
 
 ### Binding Request Format (20 bytes)
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0 0|     STUN Message Type     |         Message Length        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Magic Cookie (0x2112A442)             |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-|                     Transaction ID (96 bits)                  |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
+![A STUN Binding Request of 20 bytes in rows of 32 bits, with the bits numbered 0 to 31: two zero bits, the STUN Message Type in 14 bits and the Message Length in 16 bits; the Magic Cookie, 0x2112A442, in 32 bits; and the Transaction ID in 96 bits.](../../diagrams/networking-stun-binding-request.svg)
 
 - Message Type: `0x0001` (Binding Request)
 - Message Length: `0x0000` (no attributes)
@@ -438,25 +426,7 @@ The package implements RFC 5389 STUN Binding Requests with the Go standard libra
 
 `buildPaddedBindingRequest(transactionID, size)` builds the request of a [path MTU probe](#path-mtu-probe): a Binding Request of exactly `size` bytes, made of the 20-byte header with message length `size − 20` and one PADDING attribute (`0x0026`, RFC 5780) whose value is `size − 24` zero bytes. Callers pass only a `size` of at least 24 that is a multiple of 4; every ladder entry minus 28 is one.
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0 0|  Binding Request (0x0001) |   Message Length (size - 20)  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                   Magic Cookie (0x2112A442)                   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-|                    Transaction ID (96 bits)                   |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|        PADDING (0x0026)       |  Attribute Length (size - 24) |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-|                  Value: size - 24 zero bytes                  |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
+![A padded STUN Binding Request in rows of 32 bits, with the bits numbered 0 to 31. The header is that of the plain request: two zero bits, the message type Binding Request, 0x0001, in 14 bits, the Message Length, size − 20, in 16 bits, the Magic Cookie, 0x2112A442, in 32 bits, and the Transaction ID in 96 bits. The PADDING attribute follows: its type, 0x0026, in 16 bits, its Attribute Length, size − 24, in 16 bits, and its value of size − 24 zero bytes.](../../diagrams/networking-stun-padded-binding-request.svg)
 
 For the 1500-byte ladder entry `size` is 1472: message length 1452, attribute length 1448.
 

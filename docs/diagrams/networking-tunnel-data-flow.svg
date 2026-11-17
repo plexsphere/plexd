@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="697" viewBox="0 0 1120 697" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="From the sessions block to a forwarding listener">
+<title>From the sessions block to a forwarding listener</title>
+<rect width="1120" height="697" fill="#F6F5F1"/>
+<rect x="40" y="40" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="180" y="69.4" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<text x="180" y="89.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{id}/state</text>
+<rect x="40" y="210" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="180" y="239.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Reconciler</text>
+<text x="180" y="259.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">internal/reconcile</text>
+<polyline points="130,210 130,113" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="130,104 136,117 124,117" fill="#2457C5"/>
+<polyline points="230,104 230,210" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="224,197 230,210 236,197" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="240" y="162.95" font-size="17" fill="#55606E">sessions block</text>
+<rect x="420" y="210" width="270" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="555" y="238.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">tunnel.Dispatcher</text>
+<text x="555" y="257.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Handle</text>
+<polyline points="320,242 411,242" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="420,242 407,248 407,236" fill="#3A4452"/>
+<rect x="780" y="210" width="270" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="915" y="238.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SessionManager</text>
+<text x="915" y="257.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">CreateSession</text>
+<polyline points="690,242 771,242" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="780,242 767,248 767,236" fill="#3A4452"/>
+<rect x="390" y="344" width="690" height="178" rx="12" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="406" y="377.2" font-size="22" font-weight="700" fill="#2B3440">Session</text>
+<polyline points="915,274 915,335" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="915,344 909,331 921,331" fill="#2F8A57"/>
+<rect x="420" y="408" width="270" height="84" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="555" y="437.2" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Listener</text>
+<text x="555" y="458.35" font-size="17" fill="#55606E" text-anchor="middle">TCP</text>
+<text x="555" y="477.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">bound to meshIP:0</text>
+<rect x="780" y="408" width="270" height="84" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="915" y="437.2" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Forwarder</text>
+<text x="915" y="458.35" font-size="17" fill="#55606E" text-anchor="middle">bidirectional</text>
+<text x="915" y="477.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">io.Copy</text>
+<polyline points="690,450 771,450" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="780,450 767,456 767,444" fill="#3A4452"/>
+<rect x="780" y="592" width="270" height="65" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="915" y="621.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">Target Host</text>
+<text x="915" y="642.45" font-size="17" fill="#55606E" text-anchor="middle">e.g. sshd</text>
+<polyline points="915,501 915,583" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="915,592 909,579 921,579" fill="#2F8A57"/>
+<polygon points="915,492 921,505 909,505" fill="#2F8A57"/>
+</svg>

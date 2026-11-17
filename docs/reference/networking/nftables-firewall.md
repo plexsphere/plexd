@@ -12,24 +12,7 @@ The controller works in the table `plexd` of the `inet` family (`nftables.TableF
 
 ## Architecture
 
-```
-PolicyEngine
-     │
-     ▼
-┌──────────────┐     ┌────────────────────┐
-│ FirewallRule  │────▶│ NftablesController │
-│   (slice)    │     └────────┬───────────┘
-└──────────────┘              │
-                              ▼
-                    ┌──────────────────────────┐
-                    │  nftables (nfnl)         │
-                    │  table: plexd            │
-                    │  family: inet            │
-                    │  chains: <chain>-input   │
-                    │          <chain>-forward │
-                    │          <chain>-output  │
-                    └──────────────────────────┘
-```
+![The PolicyEngine produces a slice of FirewallRule values, which goes to the NftablesController. The controller writes to nftables over nfnl: the table plexd of the family inet, with three chains named after the configured chain name with the suffixes -input, -forward and -output.](../../diagrams/networking-nftables-architecture.svg)
 
 The `Enforcer` calls `NftablesController` methods during policy reconciliation. Each method opens a fresh netlink connection, batches operations, and commits atomically via `Flush()`. The only state the controller keeps is the sink for [connection logging](#connection-logging) and the NFLOG reader that feeds it.
 

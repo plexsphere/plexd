@@ -141,27 +141,7 @@ The adapter is created inside `Run` with the `cpClient` from the Exchanger. The 
 
 ## Data Flow
 
-```
-  Outbound (STUN report loop)
-  ┌─────────────┐   ReportEndpoint    ┌──────────────┐
-  │ Discoverer  │────────────────────▶│ Control Plane│
-  │ (nat pkg)   │◀────────────────────│ (api pkg)    │
-  └─────────────┘   stale_after        └──────────────┘
-        ▲              deadline
-        │ STUN
-  ┌─────┴───────┐
-  │ STUN Servers│
-  └─────────────┘
-
-  Inbound (reconciliation state pull)
-  ┌──────────────┐  GET /v1/nodes/{id}/state  ┌──────────────┐  AddPeer,    ┌─────────────────┐
-  │ Control Plane│───────────────────────────▶│ Reconciler   │  UpdatePeer  │ WireGuard       │
-  │ (api pkg)    │  peers[].endpoint          │ (reconcile)  │─────────────▶│ Manager         │
-  └──────┬───────┘                            └──────▲───────┘              │ (wireguard pkg) │
-         │ peer_endpoint_changed (SSE)               │                      └─────────────────┘
-         └───────────────────────────────────────────┘
-           triggers a reconcile; the payload is never decoded
-```
+![Two paths. Outbound, the STUN report loop: the Discoverer of the nat package asks the STUN servers with STUN and learns its public endpoint, reports the endpoint to the control plane, reached through the api package, with ReportEndpoint, and gets the stale_after deadline back. Inbound, the reconciliation state pull: the Reconciler of the reconcile package pulls GET /v1/nodes/{id}/state from the control plane and gets each peer's endpoint member back; a peer_endpoint_changed SSE event from the control plane triggers a reconcile, and its payload is never decoded. The Reconciler then calls AddPeer and UpdatePeer on the WireGuard Manager of the wireguard package.](../../diagrams/networking-peer-endpoint-data-flow.svg)
 
 **Outbound path** (report loop): STUN discovery produces the node's public endpoint. The Exchanger reports it to the control plane via `controlPlaneReporter` and receives a `stale_after` freshness deadline that schedules the next report. The response no longer carries peer endpoints.
 

@@ -14,25 +14,7 @@ The package integrates with `internal/reconcile` for periodic convergence and wi
 
 ## Data Flow
 
-```
-Control Plane ◀─────── PUT /v1/nodes/{node_id}/policy-status ────────┐
-      │                                                              │
-      ▼                                                              │
-┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐   ┌───┴────────────┐
-│ NodeStateSnapshot│──▶│ DispatchHandler │──▶│ Enforcer.Sync │──▶│ StatusReporter │
-│  .Policy         │   └─────────────────┘   └───────┬───────┘   └────────────────┘
-│  (merged block)  │                                 │
-└──────────────────┘                                 ▼
-                                            ┌──────────────────┐
-                                            │   PolicyEngine   │
-                                            │BuildFirewallRules│
-                                            └────────┬─────────┘
-                                                     ▼
-                                            ┌──────────────────┐
-                                            │FirewallController│
-                                            │  (nft, pf, WFP)  │
-                                            └──────────────────┘
-```
+![The control plane delivers the NodeStateSnapshot on the state pull, and its Policy member carries the merged block. The DispatchHandler hands the block to Enforcer.Sync. The Enforcer calls BuildFirewallRules of the PolicyEngine and gets FirewallRule entries back, then applies them with ApplyRules through the FirewallController, which is nftables, pf or WFP. Enforcer.Sync also leads to the StatusReporter, which reports to the control plane with PUT /v1/nodes/{node_id}/policy-status.](../../diagrams/networking-policy-data-flow.svg)
 
 The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. [`DispatchHandler`](#dispatchhandler) hands the block of every successful pull to [`Enforcer.Sync`](#sync), which compares it with its record of what the firewall holds and applies it when it is not the installed ruleset: the `PolicyEngine` converts its allow rules into `FirewallRule` entries, and the `Enforcer` applies them via the `FirewallController`. `Sync` records the outcome in the Enforcer's [`Status`](#status-and-changed): what it enforces, the block it applied, and the block its latest apply failed on, with the reason. A block it could not apply is applied again on the next pull. The [`StatusReporter`](#policy-status-report) sends that record, with the drop counters of the default deny, to the control plane, and the node API serves it as [`GET /v1/policies`](../core/nodeapi.md#get-v1-policies).
 
