@@ -10,9 +10,7 @@ The `internal/api` package provides Ed25519 signature verification for SSE event
 
 ## Architecture
 
-```
-Control Plane → SSE Stream → SSEManager → Ed25519Verifier → EventDispatcher → Handlers
-```
+![An SSE event travels from the control plane to the SSE stream, the SSEStream, and from there through the Ed25519Verifier and the EventDispatcher to the handlers. The SSEManager is not on this path: it builds the SSE stream with the verifier and the dispatcher.](../../diagrams/core-event-verification-pipeline.svg)
 
 The `EventVerifier` interface decouples verification from the SSE transport:
 

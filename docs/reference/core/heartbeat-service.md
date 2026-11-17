@@ -19,35 +19,7 @@ The `internal/agent` package implements the `HeartbeatService`, which sends peri
 
 `HeartbeatService.Run(ctx)` operates as follows:
 
-```mermaid
-sequenceDiagram
-    participant HS as HeartbeatService
-    participant CP as Control Plane
-
-    HS->>HS: Send initial heartbeat
-    loop Every 30s (configurable), or the probe delay while parked
-        HS->>HS: Build HeartbeatRequest
-        HS->>CP: POST /v1/nodes/{id}/heartbeat
-        alt 200 OK
-            CP-->>HS: HeartbeatResponse
-            opt parked
-                HS->>HS: Unpark: onCredentialRefused(false)
-            end
-            opt reconcile = true
-                HS->>HS: TriggerReconcile()
-            end
-            opt rotate_keys = true
-                HS->>HS: onRotateKeys()
-            end
-        else 401 Unauthorized
-            CP-->>HS: ErrUnauthorized
-            HS->>HS: Count the refusal, park on the third: onCredentialRefused(true)
-        else Other error
-            CP-->>HS: Error
-            HS->>HS: Log error, continue
-        end
-    end
-```
+![The heartbeat loop between the HeartbeatService and the control plane. The service sends an initial heartbeat, then loops every 30 seconds, which is configurable, or after the probe delay while it is parked. In each pass it builds a HeartbeatRequest and posts it to /v1/nodes/{id}/heartbeat. On 200 OK the control plane answers with a HeartbeatResponse: if the service is parked, it unparks by calling onCredentialRefused(false); if reconcile is true, it calls TriggerReconcile(); if rotate_keys is true, it calls onRotateKeys(). On 401 Unauthorized the service gets ErrUnauthorized, counts the refusal and parks on the third by calling onCredentialRefused(true). On any other error it logs the error and continues.](../../diagrams/core-heartbeat-loop.svg)
 
 1. Send one heartbeat immediately on start
 2. After every send, wait for the configured interval (default 30s), or for the probe delay while the service is parked (see [Credential Park](#credential-park))

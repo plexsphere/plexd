@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1030" height="1139" viewBox="0 0 1030 1139" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The heartbeat loop">
+<title>The heartbeat loop</title>
+<rect width="1030" height="1139" fill="#F6F5F1"/>
+<rect x="80" y="40" width="200" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="180" y="67.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">HeartbeatService</text>
+<rect x="755.5" y="40" width="189" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="850" y="69" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
+<polyline points="180,84 180,1098.2" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="850,84 850,1098.2" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="180,112 216,112 216,140 189,140" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,140 193,134 193,146" fill="#3A4452"/>
+<text x="226" y="131.95" font-size="17" fill="#55606E">Send initial heartbeat</text>
+<rect x="40" y="162" width="950" height="918.2" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="52" y="174" width="59" height="26" rx="13" fill="#3A4452"/>
+<text x="81.5" y="192.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">loop</text>
+<text x="194" y="192.95" font-size="17" fill="#55606E">[every 30s (configurable), or the probe delay while parked]</text>
+<polyline points="180,220 216,220 216,248 189,248" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,248 193,242 193,254" fill="#3A4452"/>
+<text x="226" y="239.95" font-size="17" fill="#55606E">Build HeartbeatRequest</text>
+<text x="515" y="285.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/heartbeat</text>
+<polyline points="180,296 841,296" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="850,296 837,302 837,290" fill="#2457C5"/>
+<rect x="56" y="316" width="918" height="752.2" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="68" y="328" width="45" height="26" rx="13" fill="#3A4452"/>
+<text x="90.5" y="346.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">alt</text>
+<text x="194" y="346.95" font-size="17" fill="#55606E">[200 OK]</text>
+<text x="515" y="385.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">HeartbeatResponse</text>
+<polyline points="850,396 180,396" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="193,390 180,396 193,402" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<rect x="72" y="416" width="886" height="113.6" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="84" y="428" width="51" height="26" rx="13" fill="#3A4452"/>
+<text x="109.5" y="446.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">opt</text>
+<text x="194" y="446.95" font-size="17" fill="#55606E">[parked]</text>
+<polyline points="180,474 216,474 216,513.6 189,513.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,513.6 193,507.6 193,519.6" fill="#3A4452"/>
+<text x="226" y="490.15" font-size="17" fill="#55606E">Unpark:</text>
+<text x="226" y="509.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">onCredentialRefused(false)</text>
+<rect x="72" y="547.6" width="886" height="102" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="84" y="559.6" width="51" height="26" rx="13" fill="#3A4452"/>
+<text x="109.5" y="577.85" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">opt</text>
+<text x="194" y="578.55" font-size="17" fill="#55606E">[reconcile = true]</text>
+<polyline points="180,605.6 216,605.6 216,633.6 189,633.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,633.6 193,627.6 193,639.6" fill="#3A4452"/>
+<text x="226" y="625.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">TriggerReconcile()</text>
+<rect x="72" y="667.6" width="886" height="102" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="84" y="679.6" width="51" height="26" rx="13" fill="#3A4452"/>
+<text x="109.5" y="697.85" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">opt</text>
+<text x="194" y="698.55" font-size="17" fill="#55606E">[rotate_keys = true]</text>
+<polyline points="180,725.6 216,725.6 216,753.6 189,753.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,753.6 193,747.6 193,759.6" fill="#3A4452"/>
+<text x="226" y="745.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">onRotateKeys()</text>
+<polyline points="56,781.6 974,781.6" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="194" y="806.05" font-size="17" fill="#55606E">[401 Unauthorized]</text>
+<text x="515" y="840.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ErrUnauthorized</text>
+<polyline points="850,850.6 180,850.6" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="193,844.6 180,850.6 193,856.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="180,874.6 216,874.6 216,914.2 189,914.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,914.2 193,908.2 193,920.2" fill="#3A4452"/>
+<text x="226" y="890.75" font-size="17" fill="#55606E">Count the refusal, park on the third:</text>
+<text x="226" y="910.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">onCredentialRefused(true)</text>
+<polyline points="56,930.2 974,930.2" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="194" y="954.65" font-size="17" fill="#55606E">[other error]</text>
+<text x="515" y="989.65" font-size="17" fill="#55606E" text-anchor="middle">Error</text>
+<polyline points="850,1000.2 180,1000.2" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="193,994.2 180,1000.2 193,1006.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="180,1024.2 216,1024.2 216,1052.2 189,1052.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="180,1052.2 193,1046.2 193,1058.2" fill="#3A4452"/>
+<text x="226" y="1044.15" font-size="17" fill="#55606E">Log error, continue</text>
+</svg>

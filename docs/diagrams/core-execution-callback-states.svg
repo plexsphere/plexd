@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1149" height="368" viewBox="0 0 1149 368" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Callback states of an action execution">
+<title>Callback states of an action execution</title>
+<rect width="1149" height="368" fill="#F6F5F1"/>
+<ellipse cx="49" cy="80" rx="9" ry="9" fill="#17202B"/>
+<rect x="109" y="52" width="170" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="194" y="85.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">pending</text>
+<rect x="349" y="52" width="170" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="434" y="85.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">ack</text>
+<rect x="589" y="52" width="190" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="684" y="85.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">started</text>
+<polyline points="58,80 100,80" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="109,80 96,86 96,74" fill="#3A4452"/>
+<polyline points="279,80 340,80" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="349,80 336,86 336,74" fill="#3A4452"/>
+<polyline points="519,80 580,80" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="589,80 576,86 576,74" fill="#3A4452"/>
+<rect x="899" y="52" width="210" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1004" y="85.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">succeeded</text>
+<rect x="1005" y="40" width="92" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="1051" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">terminal</text>
+<polyline points="779,80 890,80" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="899,80 886,86 886,74" fill="#3A4452"/>
+<rect x="899" y="162" width="210" height="56" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="1004" y="195.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A3262E" text-anchor="middle">failed</text>
+<rect x="1005" y="150" width="92" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="1051" y="167.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">terminal</text>
+<polyline points="779,80 839,80 839,190 890,190" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="899,190 886,196 886,184" fill="#3A4452"/>
+<rect x="899" y="272" width="210" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1004" y="305.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">cancelled</text>
+<rect x="1005" y="260" width="92" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="1051" y="277.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">terminal</text>
+<polyline points="779,80 839,80 839,300 890,300" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="899,300 886,306 886,294" fill="#3A4452"/>
+<polyline points="658,108 658,148 710,148 710,117" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="710,108 716,121 704,121" fill="#3A4452"/>
+<text x="684" y="170.25" font-size="17" fill="#55606E" text-anchor="middle">only to declare an</text>
+<text x="684" y="190.65" font-size="17" fill="#55606E" text-anchor="middle">over-ceiling output size</text>
+</svg>

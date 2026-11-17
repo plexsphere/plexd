@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1190" height="1039" viewBox="0 0 1190 1039" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="One reconciliation cycle">
+<title>One reconciliation cycle</title>
+<rect width="1190" height="1039" fill="#F6F5F1"/>
+<ellipse cx="525" cy="51" rx="9" ry="9" fill="#17202B"/>
+<text x="545" y="56.45" font-size="17" fill="#55606E">Tick / Trigger</text>
+<rect x="340" y="111" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="144.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">FetchState</text>
+<polyline points="525,60 525,102" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,111 519,98 531,98" fill="#3A4452"/>
+<rect x="340" y="227" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="262" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Invoke dispatch handlers</text>
+<rect x="340" y="343" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="376.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">ComputeDiff</text>
+<rect x="340" y="459" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="494" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Diff empty?</text>
+<rect x="340" y="575" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="610" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Invoke handlers sequentially</text>
+<rect x="340" y="691" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="726" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Any handler failed?</text>
+<rect x="340" y="807" width="370" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="525" y="842" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Update snapshot</text>
+<rect x="40" y="943" width="1110" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="595" y="978" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Wait for next tick</text>
+<polyline points="525,167 525,218" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,227 519,214 531,214" fill="#3A4452"/>
+<text x="535" y="202.95" font-size="17" fill="#55606E">ok</text>
+<polyline points="525,283 525,334" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,343 519,330 531,330" fill="#3A4452"/>
+<polyline points="525,399 525,450" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,459 519,446 531,446" fill="#3A4452"/>
+<polyline points="525,515 525,566" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,575 519,562 531,562" fill="#3A4452"/>
+<text x="535" y="550.95" font-size="17" fill="#55606E">no</text>
+<polyline points="525,631 525,682" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,691 519,678 531,678" fill="#3A4452"/>
+<polyline points="525,747 525,798" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,807 519,794 531,794" fill="#3A4452"/>
+<text x="535" y="782.95" font-size="17" fill="#55606E">no</text>
+<polyline points="525,863 525,934" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="525,943 519,930 531,930" fill="#3A4452"/>
+<rect x="40" y="104" width="220" height="70" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="150" y="134.75" font-size="17" fill="#A3262E" text-anchor="middle">Log warn or debug,</text>
+<text x="150" y="155.15" font-size="17" fill="#A3262E" text-anchor="middle">skip cycle</text>
+<polyline points="340,139 269,139" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="260,139 273,133 273,145" fill="#C6343C"/>
+<text x="300" y="128.45" font-size="17" fill="#55606E" text-anchor="middle">error</text>
+<polyline points="150,174 150,934" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="150,943 144,930 156,930" fill="#3A4452"/>
+<rect x="860" y="568" width="230" height="70" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="975" y="598.75" font-size="17" fill="#A3262E" text-anchor="middle">Log error, continue</text>
+<text x="975" y="619.15" font-size="17" fill="#A3262E" text-anchor="middle">next handler</text>
+<polyline points="710,591 851,591" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="860,591 847,597 847,585" fill="#C6343C"/>
+<text x="785" y="580.45" font-size="17" fill="#55606E" text-anchor="middle">handler error</text>
+<polyline points="860,615 719,615" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="710,615 723,609 723,621" fill="#3A4452"/>
+<polyline points="710,487 1120,487 1120,934" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1120,943 1114,930 1126,930" fill="#3A4452"/>
+<text x="750" y="476.45" font-size="17" fill="#55606E" text-anchor="middle">yes</text>
+<polyline points="710,719 975,719 975,934" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="975,943 969,930 981,930" fill="#3A4452"/>
+<text x="750" y="708.45" font-size="17" fill="#55606E" text-anchor="middle">yes</text>
+</svg>

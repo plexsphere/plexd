@@ -277,38 +277,7 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error)
 
 Orchestration flow:
 
-```mermaid
-sequenceDiagram
-    participant R as Registrar
-    participant TR as TokenResolver
-    participant CP as Control Plane
-    participant D as Disk
-
-    R->>D: LoadIdentity()
-    alt Identity exists
-        D-->>R: NodeIdentity
-        R->>CP: SetAuthToken(NSK)
-        R-->>R: Return (cached)
-    else Not registered
-        D-->>R: ErrNotRegistered
-        R->>TR: Resolve() (bootstrap token)
-        TR-->>R: Token + source
-        R->>R: GenerateKeypair()
-        R->>TR: ResolveValue() (project_id, resource_handle, requested_resource_id)
-        TR-->>R: values (config or IMDS)
-        R->>R: Fail fast if project_id or resource_handle missing
-        R->>CP: SetAuthToken("") (register is unauthenticated)
-        R->>R: One nonce for the whole registration
-        loop Retry with backoff (max 5m, rate-limit waits excluded)
-            R->>CP: POST /v1/register (bootstrap token in body)
-        end
-        CP-->>R: node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot, domain_mesh_cidr
-        R->>R: Build NodeIdentity
-        R->>D: SaveIdentity() (atomic write)
-        R->>D: Remove or empty token file (if file-based)
-        R->>CP: SetAuthToken(NSK)
-    end
-```
+![The registration flow between the Registrar, the TokenResolver, the control plane and the disk. The Registrar calls LoadIdentity() on the disk. If an identity exists, the disk returns the NodeIdentity, the Registrar sets the NSK as the auth token and returns the cached identity. If the node is not registered, the disk returns ErrNotRegistered. The Registrar then resolves the bootstrap token from the TokenResolver, which returns the token and its source; generates a keypair; and resolves project_id, resource_handle and requested_resource_id, which come from the config or IMDS. It fails fast if project_id or resource_handle is missing, sets an empty auth token because register is unauthenticated, and uses one nonce for the whole registration. It posts to /v1/register with the bootstrap token in the body, retrying with backoff for at most 5 minutes, rate-limit waits excluded. The control plane returns node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot and domain_mesh_cidr. The Registrar builds the NodeIdentity, saves it to the disk with an atomic write, removes or empties the token file if the token was file-based, and sets the NSK as the auth token.](../../diagrams/core-registration-flow.svg)
 
 1. **Load existing identity** — if valid, set auth token and return (idempotent)
 2. **Corrupt identity** — log warning, proceed with fresh registration

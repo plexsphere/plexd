@@ -143,23 +143,7 @@ cancel()
 
 Each cycle follows this sequence:
 
-```mermaid
-flowchart TD
-    START([Tick / Trigger]) --> FETCH[FetchState]
-    FETCH -->|error| SKIP_ERR[Log warn or debug, skip cycle]
-    FETCH -->|ok| DISPATCH[Invoke dispatch handlers]
-    DISPATCH --> DIFF[ComputeDiff]
-    DIFF --> EMPTY{Diff empty?}
-    EMPTY -->|yes| DONE([Wait for next tick])
-    EMPTY -->|no| HANDLERS[Invoke handlers sequentially]
-    HANDLERS -->|handler error| LOG_ERR[Log error, continue next handler]
-    LOG_ERR --> HANDLERS
-    HANDLERS --> FAILED{Any handler failed?}
-    FAILED -->|yes| DONE
-    FAILED -->|no| SNAPSHOT[Update snapshot]
-    SNAPSHOT --> DONE
-    SKIP_ERR --> DONE
-```
+![One reconciliation cycle. A tick or a trigger starts FetchState. On an error the cycle logs at warn or debug level, is skipped and waits for the next tick. On success it invokes the dispatch handlers and then ComputeDiff. If the diff is empty, it waits for the next tick. Otherwise it invokes the handlers sequentially; a handler error is logged and the next handler runs. If any handler failed, the cycle waits for the next tick; if none failed, it updates the snapshot and then waits for the next tick.](../../diagrams/core-reconciliation-cycle.svg)
 
 1. **FetchState** — `GET /v1/nodes/{node_id}/state` via `StateFetcher`, returning the `NodeStateSnapshot` envelope
 2. **Invoke dispatch handlers** — each called with panic recovery, in registration order. This runs on **every** successful pull, before the diff, so an unchanged snapshot still redelivers the queued entries; the empty-diff short-circuit below can never skip it

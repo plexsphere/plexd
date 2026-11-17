@@ -402,19 +402,7 @@ The server replays only sequences strictly greater than the client's `Last-Event
 
 ### State Machine
 
-```mermaid
-stateDiagram-v2
-    [*] --> Disconnected
-    Disconnected --> Connecting
-    Connecting --> Connected
-    Connecting --> Backoff : transient error or 401
-    Connecting --> PullOnly : 501 descope
-    Connected --> Connecting : connection dropped
-    Backoff --> Connecting : delay elapsed
-    Backoff --> Polling : threshold exceeded (5 min)
-    Polling --> Connecting : periodic SSE retry
-    PullOnly --> Connecting : re-probe (every SSEReprobeInterval)
-```
+![The state machine of the SSE connection. It starts in Disconnected and moves to Connecting. From Connecting it moves to Connected; to Backoff on a transient error or a 401; and to PullOnly on a 501 descope. Connected returns to Connecting when the connection drops, Backoff returns when its delay has elapsed, and PullOnly returns on a re-probe every SSEReprobeInterval. When the threshold of 5 minutes is exceeded, Backoff moves to Polling, which returns to Connecting with a periodic SSE retry.](../../diagrams/core-sse-connection-states.svg)
 
 ## SSE Parser
 

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1185" height="697" viewBox="0 0 1185 697" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="States of the SSE connection">
+<title>States of the SSE connection</title>
+<rect width="1185" height="697" fill="#F6F5F1"/>
+<rect x="40" y="239" width="950" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="515" y="274" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Connecting</text>
+<rect x="395" y="119" width="240" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="515" y="154" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Disconnected</text>
+<ellipse cx="515" cy="49" rx="9" ry="9" fill="#17202B"/>
+<polyline points="515,58 515,110" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="515,119 509,106 521,106" fill="#3A4452"/>
+<polyline points="515,175 515,230" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="515,239 509,226 521,226" fill="#3A4452"/>
+<rect x="50" y="425" width="180" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="140" y="460" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Connected</text>
+<rect x="390" y="425" width="180" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="480" y="460" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">PullOnly</text>
+<rect x="770" y="425" width="180" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="860" y="460" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Backoff</text>
+<polyline points="126,295 126,416" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="126,425 120,412 132,412" fill="#3A4452"/>
+<polyline points="154,425 154,304" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="154,295 160,308 148,308" fill="#3A4452"/>
+<text x="164" y="355.75" font-size="17" fill="#55606E">connection</text>
+<text x="164" y="376.15" font-size="17" fill="#55606E">dropped</text>
+<polyline points="466,295 466,416" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="466,425 460,412 472,412" fill="#3A4452"/>
+<polyline points="494,425 494,304" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="494,295 500,308 488,308" fill="#3A4452"/>
+<text x="456" y="365.95" font-size="17" fill="#55606E" text-anchor="end">501 descope</text>
+<text x="504" y="356.35" font-size="17" fill="#55606E">re-probe, every</text>
+<text x="504" y="375.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">SSEReprobeInterval</text>
+<polyline points="846,295 846,416" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="846,425 840,412 852,412" fill="#3A4452"/>
+<polyline points="874,425 874,304" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="874,295 880,308 868,308" fill="#3A4452"/>
+<text x="836" y="355.75" font-size="17" fill="#55606E" text-anchor="end">transient error</text>
+<text x="836" y="376.15" font-size="17" fill="#55606E" text-anchor="end">or 401</text>
+<text x="884" y="365.95" font-size="17" fill="#55606E">delay elapsed</text>
+<rect x="770" y="601" width="180" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="860" y="636" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Polling</text>
+<polyline points="860,481 860,592" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="860,601 854,588 866,588" fill="#3A4452"/>
+<text x="850" y="536.75" font-size="17" fill="#55606E" text-anchor="end">threshold exceeded</text>
+<text x="850" y="557.15" font-size="17" fill="#55606E" text-anchor="end">(5 min)</text>
+<polyline points="950,629 1050,629 1050,267 999,267" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="990,267 1003,261 1003,273" fill="#3A4452"/>
+<text x="1060" y="536.75" font-size="17" fill="#55606E">periodic</text>
+<text x="1060" y="557.15" font-size="17" fill="#55606E">SSE retry</text>
+</svg>

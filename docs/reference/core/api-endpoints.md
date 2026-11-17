@@ -1760,13 +1760,7 @@ A single callback advances an execution through a closed state machine, posted
 once per transition. The edge roster is closed and a terminal status is reachable
 **only from `started`**:
 
-```text
-pending ──▶ ack ──▶ started ──▶ succeeded
-                        │  ├──▶ failed
-                        │  └──▶ cancelled
-                        └──▶ started   (self-edge, only to declare an
-                                        over-ceiling output size)
-```
+![The callback states of an action execution. An execution starts at pending, moves to ack and then to started. From started it moves to one of three terminal states: succeeded, failed or cancelled. Started also has a transition back to itself, used only to declare an over-ceiling output size.](../../diagrams/core-execution-callback-states.svg)
 
 - `pending` — the status a freshly dispatched entry carries in the `executions`
   block. It is never reported by a node.
