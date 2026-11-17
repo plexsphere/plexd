@@ -11,18 +11,7 @@ The Linux implementation is [`NetlinkRouteController`](./netlink-route-controlle
 
 ## Architecture
 
-```
-Bridge Manager / UserAccessManager / SiteToSiteManager
-                                  │
-                 ┌────────────────┴─────────────────┐
-                 ▼                                  ▼
-┌──────────────────────────────────┐   ┌──────────────────────────┐
-│      DarwinRouteController       │   │  WindowsRouteController  │
-└──┬──────────┬────────────┬───────┘   └────┬────────────┬────────┘
-   │          │            │                │            │
-   ▼          ▼            ▼                ▼            ▼
-route(8)  sysctl(8)  PFController       winipcfg   WFPController
-```
+![The Bridge Manager, UserAccessManager and SiteToSiteManager each call DarwinRouteController or WindowsRouteController. DarwinRouteController runs route(8) and sysctl(8) and delegates to PFController. WindowsRouteController uses winipcfg and delegates to WFPController.](../../diagrams/bridge-route-controllers-macos-windows.svg)
 
 ## Constructors
 

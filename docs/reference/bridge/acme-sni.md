@@ -10,34 +10,7 @@ feature: PXD-0028
 
 ## Data Flow
 
-```
-Public Internet Clients and the ACME CA
-(HTTPS / TLS, TLS-ALPN-01)
-        |
-        |  TLS ClientHello
-        v
-+------------------------------------------------------------------+
-|                          Bridge Node                             |
-|                                                                  |
-|  IngressManager: one listener per SNI port (:443)                |
-|    -> peekClientHello: crypto/tls parses the hello,              |
-|       at most 16 KiB and 5 s, nothing is answered;               |
-|       it returns the server name and the offered ALPN            |
-|    -> on :443, ALPN exactly acme-tls/1 for a host of an          |
-|       acme rule: answer the challenge, then close                |
-|    -> ingressTable.match(server name):                           |
-|       exact host first, then a wildcard of one label             |
-|    -> passthrough rule: dial the target, replay                  |
-|       the peeked bytes, copy both ways                           |
-|    -> terminate or acme rule: TLS handshake at the               |
-|       bridge, dial the target, copy the plaintext                |
-|    -> no rule, no server name, a rule with a reason,             |
-|       or no certificate: close the connection                    |
-|                                                                  |
-|  ACMEManager: one autocert.Manager per account, DirCache         |
-|    in <data_dir>/acme, HTTPS to the block's directory_url        |
-+------------------------------------------------------------------+
-```
+![Public internet clients over HTTPS or TLS, and the ACME CA for TLS-ALPN-01, send a TLS ClientHello to IngressManager, which runs one listener per SNI port (:443). peekClientHello parses the hello with crypto/tls, reading at most 16 KiB for at most 5 s and answering nothing, and returns the server name and the offered ALPN. On :443, when the ALPN is exactly acme-tls/1 for a host of an acme rule, the bridge answers the challenge, then closes. Otherwise ingressTable.match looks up the server name, the exact host first, then a wildcard of one label. A passthrough rule dials the target, replays the peeked bytes and copies both ways. A terminate or acme rule completes a TLS handshake at the bridge, dials the target and copies the plaintext. No rule, no server name, a rule with a reason, or no certificate closes the connection. ACMEManager runs one autocert.Manager per account, keeps the DirCache in the acme directory of the data directory, and sends HTTPS to the block's directory_url at the ACME CA.](../../diagrams/bridge-acme-sni-routing.svg)
 
 When a rule's target is on a mesh peer, the bridge's dial to it is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). The policy therefore needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, and the bridge logs `bridge: ingress: dial target failed`.
 

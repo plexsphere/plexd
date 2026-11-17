@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="474" viewBox="0 0 1160 474" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The macOS and Windows route controllers and what they program">
+<title>The macOS and Windows route controllers and what they program</title>
+<rect width="1160" height="474" fill="#F6F5F1"/>
+<rect x="40" y="40" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="190" y="79" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Manager</text>
+<rect x="415" y="40" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="565" y="77.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">UserAccessManager</text>
+<rect x="790" y="40" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="940" y="77.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteManager</text>
+<rect x="40" y="370" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="130" y="407.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">route(8)</text>
+<rect x="250" y="370" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="340" y="407.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">sysctl(8)</text>
+<rect x="460" y="370" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="550" y="407.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">PFController</text>
+<rect x="730" y="370" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="820" y="407.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">winipcfg</text>
+<rect x="940" y="370" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1030" y="407.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WFPController</text>
+<rect x="190" y="210" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="340" y="247.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">DarwinRouteController</text>
+<rect x="775" y="210" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="925" y="247.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WindowsRouteController</text>
+<polyline points="190,104 190,157 340,157 340,201" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="340,210 334,197 346,197" fill="#3A4452"/>
+<polyline points="190,104 190,157 925,157 925,201" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="925,210 919,197 931,197" fill="#3A4452"/>
+<polyline points="565,104 565,157 340,157 340,201" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="340,210 334,197 346,197" fill="#3A4452"/>
+<polyline points="565,104 565,157 925,157 925,201" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="925,210 919,197 931,197" fill="#3A4452"/>
+<polyline points="940,104 940,157 340,157 340,201" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="340,210 334,197 346,197" fill="#3A4452"/>
+<polyline points="940,104 940,157 925,157 925,201" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="925,210 919,197 931,197" fill="#3A4452"/>
+<polyline points="240,274 240,322 130,322 130,361" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="130,370 124,357 136,357" fill="#2457C5"/>
+<polyline points="340,274 340,361" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="340,370 334,357 346,357" fill="#2457C5"/>
+<polyline points="440,274 440,322 550,322 550,361" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="550,370 544,357 556,357" fill="#3A4452"/>
+<polyline points="820,274 820,361" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="820,370 814,357 826,357" fill="#2457C5"/>
+<polyline points="1030,274 1030,361" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1030,370 1024,357 1036,357" fill="#3A4452"/>
+</svg>

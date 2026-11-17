@@ -12,18 +12,7 @@ The macOS and Windows implementations are described in [macOS & Windows Route Co
 
 ## Architecture
 
-```
-Bridge Manager
-       │
-       ▼
-┌────────────────────────┐
-│ NetlinkRouteController │
-└───┬──────┬──────┬──────┘
-    │      │      │
-    ▼      ▼      ▼
- netlink  sysctl  nftables
- (routes) (fwd)   (NAT)
-```
+![The Bridge Manager calls NetlinkRouteController, which programs routes through netlink, forwarding through sysctl and NAT through nftables.](../../diagrams/bridge-netlink-route-controller.svg)
 
 The `Manager` calls `NetlinkRouteController` methods during bridge setup, teardown, and route updates. Each subsystem (routing, forwarding, NAT) uses the appropriate Linux mechanism.
 

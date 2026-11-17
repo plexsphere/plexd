@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1176" height="1085" viewBox="0 0 1176 1085" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge routes a public connection to a target node">
+<title>How a bridge routes a public connection to a target node</title>
+<rect width="1176" height="1085" fill="#F6F5F1"/>
+<rect x="40" y="40" width="360" height="64" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="220" y="79" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Public internet clients</text>
+<rect x="90" y="170" width="1046" height="735" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<text x="106" y="203.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
+<text x="275" y="201.45" font-size="17" fill="#55606E">one listener per listen port</text>
+<rect x="120" y="250" width="160" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="200" y="280.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">:2222</text>
+<text x="200" y="301.15" font-size="17" fill="#55606E" text-anchor="middle">plain port</text>
+<rect x="120" y="395" width="160" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="200" y="425.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">:443</text>
+<text x="200" y="446.15" font-size="17" fill="#55606E" text-anchor="middle">SNI port</text>
+<polyline points="60,104 60,285 111,285" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="120,285 107,291 107,279" fill="#2457C5"/>
+<polyline points="60,104 60,430 111,430" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="120,430 107,436 107,424" fill="#2457C5"/>
+<text x="70" y="133.35" font-size="17" fill="#55606E">TCP to</text>
+<text x="70" y="152.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">&lt;bridge&gt;:&lt;listen_port&gt;</text>
+<rect x="320" y="390" width="266" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="453" y="425.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">peek the ClientHello,</text>
+<text x="453" y="446.15" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">match the server name</text>
+<rect x="650" y="335" width="240" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="770" y="370.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">passthrough</text>
+<text x="770" y="391.15" font-size="17" fill="#55606E" text-anchor="middle">replay the peeked bytes</text>
+<rect x="650" y="445" width="240" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="770" y="480.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">terminate, acme</text>
+<text x="770" y="501.15" font-size="17" fill="#55606E" text-anchor="middle">end TLS at the bridge</text>
+<rect x="954" y="390" width="150" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1029" y="425.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">dial target</text>
+<text x="1029" y="446.15" font-size="17" fill="#55606E" text-anchor="middle">over plexd0</text>
+<polyline points="280,430 311,430" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="320,430 307,436 307,424" fill="#3A4452"/>
+<polyline points="586,430 618,430 618,375 641,375" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="650,375 637,381 637,369" fill="#3A4452"/>
+<polyline points="586,430 618,430 618,485 641,485" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="650,485 637,491 637,479" fill="#3A4452"/>
+<polyline points="890,375 922,375 922,430 945,430" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="954,430 941,436 941,424" fill="#3A4452"/>
+<polyline points="890,485 922,485 922,430 945,430" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="954,430 941,436 941,424" fill="#3A4452"/>
+<polyline points="280,285 1029,285 1029,381" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1029,390 1023,377 1035,377" fill="#3A4452"/>
+<text x="654.5" y="274.45" font-size="17" fill="#55606E" text-anchor="middle">forward without reading</text>
+<rect x="120" y="605" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="285" y="645.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressReconcileHandler</text>
+<rect x="510" y="605" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="660" y="645.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressManager.Apply</text>
+<polyline points="450,640 501,640" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="510,640 497,646 497,634" fill="#3A4452"/>
+<polyline points="660,605 660,565 200,565 200,474" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="200,465 206,478 194,478" fill="#3A4452"/>
+<text x="430" y="554.45" font-size="17" fill="#55606E" text-anchor="middle">ingressTable per port, swapped in place</text>
+<rect x="120" y="705" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="285" y="745.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressSecretInventoryHandler</text>
+<rect x="510" y="705" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<text x="660" y="747" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">terminate certs</text>
+<polyline points="450,740 501,740" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="510,740 497,746 497,734" fill="#B0387F"/>
+<rect x="120" y="805" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="285" y="845.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ACMEManager</text>
+<rect x="510" y="805" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<text x="660" y="836.8" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">acme certs</text>
+<text x="660" y="857.95" font-size="17" fill="#55606E" text-anchor="middle">and the challenges on :443</text>
+<polyline points="450,840 501,840" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="510,840 497,846 497,834" fill="#B0387F"/>
+<rect x="786" y="975" width="350" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="961" y="1007.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Target node</text>
+<text x="961" y="1027.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&lt;target_address&gt;:&lt;target_port&gt;</text>
+<polyline points="1029,470 1029,966" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="1029,975 1023,962 1035,962" fill="#2457C5"/>
+</svg>

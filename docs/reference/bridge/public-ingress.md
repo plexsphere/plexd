@@ -12,36 +12,7 @@ The bridge opens one TCP listener per distinct listen port. A port with a rule t
 
 ## Data Flow
 
-```
-Public Internet Clients
-        |
-        |  TCP to <bridge>:<listen_port>
-        v
-+------------------------------------------------------------------+
-|                          Bridge Node                             |
-|                                                                  |
-|  one listener per listen port                                    |
-|  +-------------------+     plain port: forward without reading   |
-|  | :2222  (plain)    |-------------------------------+           |
-|  +-------------------+                               |           |
-|  +-------------------+     SNI port: peek the        |           |
-|  | :443   (SNI)      |---> ClientHello, match the    |           |
-|  +-------------------+     server name               |           |
-|           ^                  |                       |           |
-|           |                  | passthrough: replay   |           |
-|           |                  |   the peeked bytes    |           |
-|           |                  | terminate, acme: end  |           |
-|           |                  |   TLS at the bridge   v           |
-|           |                  +------------------> dial target    |
-|           |                                       over plexd0    |
-|           | ingressTable per port, swapped in place  |           |
-|  IngressReconcileHandler --> IngressManager.Apply    |           |
-|  IngressSecretInventoryHandler --> terminate certs   |           |
-|  ACMEManager --> acme certs, challenges on :443      |           |
-+------------------------------------------------------|-----------+
-                                                       v
-                                         Target node <target_address>:<target_port>
-```
+![Public internet clients open TCP connections to a listen port of the bridge node, which runs one listener per listen port. On the plain port :2222 a connection goes to the target dial without being read. On the SNI port :443 the bridge peeks the ClientHello and matches the server name; a passthrough rule replays the peeked bytes, and a terminate or acme rule ends TLS at the bridge. Both go on to dial the target over plexd0, which reaches the target address and port on the target node. IngressReconcileHandler calls IngressManager.Apply, which swaps the ingressTable of each port in place. IngressSecretInventoryHandler supplies the terminate certificates, and ACMEManager the acme certificates and the challenges on :443.](../../diagrams/bridge-public-ingress.svg)
 
 The control plane delivers the block in the state pull and announces a change with a `bridge_config_updated` event, which only triggers a pull (see [SSE event handling](#sse-event-handling)). `IngressReconcileHandler` hands the block to `IngressManager.Apply`, which plans the rules, opens and closes listeners, swaps each port's routing table, and then configures the ACME account. `IngressSecretInventoryHandler` hands the pull's secret inventory to `IngressManager.SyncSecretInventory` on every successful pull, which loads, replaces and drops the certificates of the `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). The certificates of the `acme` rules come from `ACMEManager` (see [ACME and SNI Routing](acme-sni.md)).
 

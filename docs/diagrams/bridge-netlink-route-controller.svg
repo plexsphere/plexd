@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="474" viewBox="0 0 1100 474" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The Linux route controller and what it programs">
+<title>The Linux route controller and what it programs</title>
+<rect width="1100" height="474" fill="#F6F5F1"/>
+<rect x="390" y="40" width="320" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="550" y="79" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Manager</text>
+<rect x="350" y="190" width="400" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="550" y="227.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">NetlinkRouteController</text>
+<polyline points="550,104 550,181" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="550,190 544,177 556,177" fill="#3A4452"/>
+<rect x="40" y="354" width="300" height="80" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="190" y="390.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">netlink</text>
+<text x="190" y="411.95" font-size="17" fill="#55606E" text-anchor="middle">routes</text>
+<polyline points="550,254 550,304 190,304 190,345" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="190,354 184,341 196,341" fill="#2457C5"/>
+<rect x="400" y="354" width="300" height="80" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="550" y="390.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">sysctl</text>
+<text x="550" y="411.95" font-size="17" fill="#55606E" text-anchor="middle">forwarding</text>
+<polyline points="550,254 550,304 550,304 550,345" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="550,354 544,341 556,341" fill="#2457C5"/>
+<rect x="760" y="354" width="300" height="80" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="910" y="390.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">nftables</text>
+<text x="910" y="411.95" font-size="17" fill="#55606E" text-anchor="middle">NAT</text>
+<polyline points="550,254 550,304 910,304 910,345" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="910,354 904,341 916,341" fill="#2457C5"/>
+</svg>

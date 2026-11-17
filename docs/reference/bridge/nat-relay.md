@@ -10,28 +10,7 @@ The NAT relay extends bridge mode (`internal/bridge`) to forward WireGuard betwe
 
 ## Data Flow
 
-```
-Peer A                                                        Peer B
-(behind NAT)                                            (behind NAT)
-    │  WireGuard datagram                  WireGuard datagram  ▲
-    ▼                                                           │
-┌──────────────────────────────────────────────────────────────────┐
-│                       Bridge Node (Relay)                        │
-│                                                                  │
-│  ┌─────────────────┐   ┌────────────────┐   ┌─────────────────┐  │
-│  │ UDP socket      │──▶│ parseWGMessage │──▶│ handshake:      │  │
-│  │ (pulled         │   │ type, sender   │   │   CheckMAC1 per │  │
-│  │  listen_port)   │   │ and receiver   │   │   listed peer   │  │
-│  └─────────────────┘   │ index          │   │ every message:  │  │
-│           ▲            └────────────────┘   │   indices table │  │
-│           │                                 └────────┬────────┘  │
-│           │           dispatch loop                  │           │
-│           └──────────────────────────────────────────┘           │
-│                                                                  │
-│  state pull ──▶ RelayReconcileHandler ──▶ Configure / Stop       │
-│  (bridge.relay, peers)                                           │
-└──────────────────────────────────────────────────────────────────┘
-```
+![Peer A and Peer B, each behind NAT, exchange WireGuard datagrams with the UDP socket of the relay on the bridge node, which is bound on the pulled listen_port. From the socket a datagram goes to parseWGMessage, which reads the message type and the sender and receiver index; then a handshake is checked with CheckMAC1 against each listed peer, and every message goes through the indices table; the dispatch loop leads back to the socket. Below, the state pull with bridge.relay and peers goes to RelayReconcileHandler, which calls Configure or Stop.](../../diagrams/bridge-nat-relay.svg)
 
 1. A node dials the relays as the last entries of a peer's [dial order](../networking/wireguard.md#dial-order): the peer's relay set, `fallback_endpoints`, whose first entry is its `fallback_endpoint`. The control plane lists at most 4, each on a bridge that relays: the relay of the peer's assigned bridge first, then its standby relays. A control plane that predates the set sends only `fallback_endpoint`, which makes a set of one. A candidate or direct endpoint equal to a relay is not dialed before the relays, so the relays always end the order complete and in set order. The node dials a standby only for a peer last seen connected over a relay, when that relay fails (see [Meeting on the Relay](#meeting-on-the-relay)).
 2. The relay reads every datagram from one UDP socket, bound on the `listen_port` of the bridge's state pull, and classifies it by its WireGuard header (see [Message Classification](#message-classification)).

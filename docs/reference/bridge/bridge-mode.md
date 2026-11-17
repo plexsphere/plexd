@@ -12,24 +12,7 @@ All OS-level routing and forwarding operations go through a `RouteController` in
 
 ## Data Flow
 
-```
-Mesh Peers
-    │
-    ▼
-┌──────────────┐     ┌───────────┐     ┌──────────────────┐
-│  WireGuard   │────▶│  Bridge   │────▶│  Access-Side     │
-│  Interface   │     │  Manager  │     │  Interface       │
-│  (plexd0)    │     └─────┬─────┘     │  (eth1)          │
-└──────────────┘           │           └────────┬─────────┘
-                           │                    │
-                    ┌──────┴───────┐             ▼
-                    │              │      ┌──────────────┐
-                    ▼              ▼      │  External    │
-              ┌──────────┐  ┌─────────┐  │  Network     │
-              │ IP Fwd   │  │  NAT    │  │  Subnets     │
-              │ (sysctl) │  │ (ipt)   │  └──────────────┘
-              └──────────┘  └─────────┘
-```
+![Traffic between the mesh peers and the subnets of the external network passes in both directions through the WireGuard interface plexd0, the IP forwarding and NAT of the host kernel, and the access-side interface eth1. Beside the path, the Bridge Manager carries no packets: through the RouteController it programs IP forwarding with sysctl and NAT with nftables.](../../diagrams/bridge-mode-data-flow.svg)
 
 Access-subnet routes come from **local YAML config** (`Config.AccessSubnets`), programmed by the `Manager` at bridge setup via `RouteController`. The old `bridge_config` block (`access_subnets`/`enable_nat`/`enable_forwarding`) no longer rides the state snapshot, and the top-level bridge routes reconcile handler has been removed. The snapshot's `bridge` subtree carries only the four feature children (`relay`, `user_access`, `ingress`, `site_to_site`), each reconciled by its own handler. `HandleBridgeConfigUpdated` still triggers an immediate reconciliation on `bridge_config_updated` SSE events.
 
