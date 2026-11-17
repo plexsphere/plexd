@@ -19,8 +19,9 @@ func TestMain(m *testing.M) {
 }
 
 // TestIntegration_FullLifecycle wires real files, a real Store, and a mock reporter.
-// Lifecycle: startup verification → periodic check → binary tampered → violation reported
-// → hook verified → hook tampered → violation reported.
+// Lifecycle: startup pass establishes the baseline → binary tampered → a tick
+// reports it once and adopts it → five more ticks report nothing → hook
+// verified → hook tampered → violation reported.
 func TestIntegration_FullLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	binaryContent := "plexd-binary-v1"
@@ -36,59 +37,70 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 		t.Fatalf("new store: %v", err)
 	}
 	reporter := &mockReporter{}
+	logs := &syncBuffer{}
 	v := NewVerifier(Config{
 		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		VerifyInterval: 50 * time.Millisecond,
-	}, store, reporter, slog.Default())
+	}, store, reporter, jsonLogger(logs))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// 1. Startup verification — no baseline yet.
-	if err := v.VerifyBinary(ctx, "node-integ"); err != nil {
-		t.Fatalf("startup verify: %v", err)
-	}
-	if got := v.BinaryChecksum(); got != binaryChecksum {
-		t.Fatalf("BinaryChecksum() = %q, want %q", got, binaryChecksum)
-	}
-	if got := store.Get(binaryPath); got != binaryChecksum {
-		t.Fatalf("store baseline = %q, want %q", got, binaryChecksum)
-	}
-	if viol := reporter.get(); len(viol) != 0 {
-		t.Fatalf("unexpected violations after startup: %v", viol)
-	}
-
-	// 2. Tamper the binary and start periodic loop.
-	tamperedContent := "plexd-binary-TAMPERED"
-	if err := os.WriteFile(binaryPath, []byte(tamperedContent), 0o644); err != nil {
-		t.Fatalf("tamper binary: %v", err)
-	}
 
 	done := make(chan error, 1)
 	go func() {
 		done <- v.Run(ctx, "node-integ")
 	}()
-
-	// Wait for the periodic check to detect tampering.
-	deadline := time.After(3 * time.Second)
-	for {
-		if viol := reporter.get(); len(viol) > 0 {
-			if viol[0].Kind != api.IntegrityKindBinaryChecksum {
-				t.Errorf("violation[0].Kind = %q, want %q", viol[0].Kind, api.IntegrityKindBinaryChecksum)
-			}
-			if want := wireDigest(t, binaryChecksum); viol[0].ExpectedChecksum != want {
-				t.Errorf("violation[0].ExpectedChecksum = %q, want %q", viol[0].ExpectedChecksum, want)
-			}
-			break
-		}
-		select {
-		case <-deadline:
+	// A failed wait below must not leave Run behind for goleak.
+	stopped := false
+	defer func() {
+		if !stopped {
 			cancel()
-			t.Fatal("timed out waiting for binary tampering detection")
-		default:
+			<-done
 		}
-		time.Sleep(10 * time.Millisecond)
+	}()
+
+	// 1. The startup pass establishes the baseline from an empty store.
+	waitFor(t, 3*time.Second, "the startup baseline", func() bool {
+		return store.Get(binaryPath) == binaryChecksum
+	})
+	if got := v.BinaryChecksum(); got != binaryChecksum {
+		t.Fatalf("BinaryChecksum() = %q, want %q", got, binaryChecksum)
+	}
+	if viol := reporter.get(); len(viol) != 0 {
+		t.Fatalf("unexpected violations after startup: %v", viol)
+	}
+
+	// 2. Tamper the binary under the running loop, in one rename so no tick
+	// reads a torn file.
+	tamperedContent := "plexd-binary-TAMPERED"
+	replaceAtomically(t, binaryPath, []byte(tamperedContent))
+
+	// Wait for a tick to detect the tampering.
+	waitFor(t, 3*time.Second, "the binary violation", func() bool {
+		return len(reporter.get()) > 0
+	})
+	viol := reporter.get()
+	if viol[0].Kind != api.IntegrityKindBinaryChecksum {
+		t.Errorf("violation[0].Kind = %q, want %q", viol[0].Kind, api.IntegrityKindBinaryChecksum)
+	}
+	if want := wireDigest(t, binaryChecksum); viol[0].ExpectedChecksum != want {
+		t.Errorf("violation[0].ExpectedChecksum = %q, want %q", viol[0].ExpectedChecksum, want)
+	}
+
+	// Let at least five more ticks pass over the changed binary. Each one
+	// logs either a match or a violation, so counting both counts ticks
+	// whatever they find.
+	binaryPasses := func() int {
+		return len(logRecords(t, logs, "binary verified")) +
+			len(logRecords(t, logs, "binary integrity violation"))
+	}
+	passes := binaryPasses()
+	waitFor(t, 3*time.Second, "five ticks after the violation", func() bool {
+		return binaryPasses() >= passes+5
+	})
+	if got, want := store.Get(binaryPath), sha256Hex(tamperedContent); got != want {
+		t.Errorf("store baseline = %q, want the adopted %q", got, want)
 	}
 
 	// 3. Verify a valid hook.
@@ -113,8 +125,9 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 		t.Error("expected tampered hook to fail verification")
 	}
 
-	// Should have at least 2 violations: 1 binary + 1 hook.
-	viol := reporter.get()
+	// Exactly 2 violations: the binary change, reported once across every
+	// tick that saw it, and the hook.
+	viol = reporter.get()
 	binaryViolations := 0
 	hookViolations := 0
 	for _, v := range viol {
@@ -125,8 +138,8 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 			hookViolations++
 		}
 	}
-	if binaryViolations < 1 {
-		t.Errorf("expected at least 1 binary violation, got %d", binaryViolations)
+	if binaryViolations != 1 {
+		t.Errorf("expected exactly 1 binary violation, got %d", binaryViolations)
 	}
 	if hookViolations != 1 {
 		t.Errorf("expected 1 hook violation, got %d", hookViolations)
@@ -136,6 +149,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
+		stopped = true
 		if err != nil {
 			t.Fatalf("Run error: %v", err)
 		}

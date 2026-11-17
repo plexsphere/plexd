@@ -28,10 +28,17 @@ import (
 )
 
 // mockReporter records the violations and the batches the Verifier reports.
+// violations and batches hold what it accepted; attempts holds every batch it
+// was sent, refused ones included.
 type mockReporter struct {
 	mu         sync.Mutex
 	violations []api.IntegrityViolationReport
 	batches    [][]api.IntegrityViolationReport
+	attempts   [][]api.IntegrityViolationReport
+
+	// errs is consumed one entry per call: a non-nil entry is returned and
+	// the batch is recorded as an attempt only. Calls past its end succeed.
+	errs []error
 
 	// hold, when set, runs at the start of every call, outside mu, so a test
 	// can keep a call open inside ReportViolations.
@@ -47,9 +54,26 @@ func (m *mockReporter) ReportViolations(_ context.Context, _ string, reports []a
 	if len(reports) == 0 {
 		return api.ErrIntegrityViolationsEmpty
 	}
+	m.attempts = append(m.attempts, slices.Clone(reports))
+	if len(m.errs) > 0 {
+		err := m.errs[0]
+		m.errs = m.errs[1:]
+		if err != nil {
+			return err
+		}
+	}
 	m.violations = append(m.violations, reports...)
 	m.batches = append(m.batches, slices.Clone(reports))
 	return nil
+}
+
+// getAttempts returns one entry per call, accepted or refused.
+func (m *mockReporter) getAttempts() [][]api.IntegrityViolationReport {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]api.IntegrityViolationReport, len(m.attempts))
+	copy(out, m.attempts)
+	return out
 }
 
 func (m *mockReporter) get() []api.IntegrityViolationReport {
@@ -268,6 +292,11 @@ func TestVerifier_VerifyHook_Mismatched(t *testing.T) {
 	}
 	if viol[0].DetectedBy != api.IntegrityDetectorPreDispatch {
 		t.Errorf("detected_by = %q, want %q", viol[0].DetectedBy, api.IntegrityDetectorPreDispatch)
+	}
+	// The expected value is the executor's pin, not a stored baseline, so an
+	// accepted report adopts nothing.
+	if got := store.Get(hookPath); got != "" {
+		t.Errorf("store.Get(hookPath) = %q, want empty: VerifyHook must not write the store", got)
 	}
 }
 
@@ -949,17 +978,77 @@ func TestVerifier_VerifyHooksDir_NoViolation(t *testing.T) {
 	}
 
 	reporter := &mockReporter{}
+	logs := &syncBuffer{}
 	v := NewVerifier(Config{
 		Enabled:        boolPtr(true),
 		BinaryPath:     binaryPath,
 		HooksDir:       hooksDir,
 		VerifyInterval: DefaultVerifyInterval,
-	}, store, reporter, slog.Default())
+	}, store, reporter, jsonLogger(logs))
 
 	v.VerifyHooksDir(context.Background(), "node-1")
 
-	if viol := reporter.get(); len(viol) != 0 {
-		t.Errorf("unexpected violations: %v", viol)
+	if attempts := reporter.getAttempts(); len(attempts) != 0 {
+		t.Errorf("unexpected reports: %v", attempts)
+	}
+	assertNoWarnOrError(t, logs)
+}
+
+// TestVerifier_VerifyHooksDir_EmptyOrMissingDir sweeps a hooks directory with
+// nothing in it and one that does not exist: neither is a finding.
+func TestVerifier_VerifyHooksDir_EmptyOrMissingDir(t *testing.T) {
+	tests := []struct {
+		name   string
+		create bool
+	}{
+		{"empty directory", true},
+		{"missing directory", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			hooksDir := filepath.Join(dir, "hooks")
+			if tt.create {
+				if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+			}
+			store, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("new store: %v", err)
+			}
+			reporter := &mockReporter{}
+			logs := &syncBuffer{}
+			v := NewVerifier(Config{
+				BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+				HooksDir:       hooksDir,
+				VerifyInterval: DefaultVerifyInterval,
+			}, store, reporter, jsonLogger(logs))
+
+			v.VerifyHooksDir(context.Background(), "node-1")
+
+			if attempts := reporter.getAttempts(); len(attempts) != 0 {
+				t.Errorf("unexpected reports: %v", attempts)
+			}
+			assertNoWarnOrError(t, logs)
+		})
+	}
+}
+
+// assertNoWarnOrError fails the test for any record above Info in logs.
+func assertNoWarnOrError(t *testing.T, logs *syncBuffer) {
+	t.Helper()
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if level := rec["level"]; level == "WARN" || level == "ERROR" {
+			t.Errorf("unexpected %v record: %s", level, line)
+		}
 	}
 }
 
@@ -1170,6 +1259,13 @@ func TestVerifier_VerifyHooksDir_DropsEntryWithUnconvertibleDigest(t *testing.T)
 	}
 	if viol[0].ArtifactID != goodPath {
 		t.Errorf("surviving violation = %q, want %q", viol[0].ArtifactID, goodPath)
+	}
+
+	// No later pass could report the dropped entry either, so its observed
+	// digest becomes the baseline without a report.
+	observed := sha256Hex("#!/bin/sh\necho tampered")
+	if got := store.Get(filepath.Join(hooksDir, "bad.sh")); got != observed {
+		t.Errorf("bad.sh baseline = %q, want the observed digest %q", got, observed)
 	}
 }
 
@@ -1535,5 +1631,357 @@ func TestVerifier_WatchHooksDir_CancelDuringSetupLogsNoFailure(t *testing.T) {
 	}
 	if got := logs.String(); strings.Contains(got, "failed to watch hooks dir") {
 		t.Errorf("log = %q, want no setup failure after cancellation", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Report once, then adopt
+// ---------------------------------------------------------------------------
+
+// TestVerifier_AdoptsBaselineAfterAcceptedReport runs each baseline check
+// against a mismatch with a reporter that accepts: the divergence is reported
+// once, the observed value becomes the baseline, and the next run of the check
+// has nothing to report.
+func TestVerifier_AdoptsBaselineAfterAcceptedReport(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup seeds a mismatching baseline under the returned key and
+		// returns the Config for it and the value the check will observe.
+		setup func(t *testing.T, dir string, store *Store) (cfg Config, key, observed string)
+		check func(ctx context.Context, v *Verifier) error
+	}{
+		{
+			name: "binary",
+			setup: func(t *testing.T, dir string, store *Store) (Config, string, string) {
+				binaryPath := writeTempFile(t, dir, "plexd", "binary-v2")
+				if err := store.Set(binaryPath, sha256Hex("binary-v1")); err != nil {
+					t.Fatalf("store set: %v", err)
+				}
+				return Config{BinaryPath: binaryPath}, binaryPath, sha256Hex("binary-v2")
+			},
+			check: func(ctx context.Context, v *Verifier) error {
+				return v.VerifyBinary(ctx, "node-1")
+			},
+		},
+		{
+			name: "hook in HooksDir",
+			setup: func(t *testing.T, dir string, store *Store) (Config, string, string) {
+				hooksDir := filepath.Join(dir, "hooks")
+				if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				hookPath := writeTempFile(t, hooksDir, "hook.sh", "#!/bin/sh\necho tampered")
+				if err := store.Set(hookPath, sha256Hex("#!/bin/sh\necho original")); err != nil {
+					t.Fatalf("store set: %v", err)
+				}
+				return Config{HooksDir: hooksDir}, hookPath, sha256Hex("#!/bin/sh\necho tampered")
+			},
+			check: func(ctx context.Context, v *Verifier) error {
+				v.VerifyHooksDir(ctx, "node-1")
+				return nil
+			},
+		},
+		{
+			name: "host key",
+			setup: func(t *testing.T, dir string, store *Store) (Config, string, string) {
+				keyPath, fingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+				_, oldFingerprint := writeHostKey(t, t.TempDir(), "ssh_host_ed25519_key")
+				if err := store.Set(keyPath, oldFingerprint); err != nil {
+					t.Fatalf("store set: %v", err)
+				}
+				return Config{HostKeyPath: keyPath}, keyPath, fingerprint
+			},
+			check: func(ctx context.Context, v *Verifier) error {
+				return v.VerifyHostKey(ctx, "node-1")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("new store: %v", err)
+			}
+			cfg, key, observed := tt.setup(t, dir, store)
+			cfg.VerifyInterval = DefaultVerifyInterval
+
+			reporter := &mockReporter{}
+			logs := &syncBuffer{}
+			v := NewVerifier(cfg, store, reporter, jsonLogger(logs))
+
+			if err := tt.check(context.Background(), v); err != nil {
+				t.Fatalf("check: %v", err)
+			}
+			batches := reporter.getBatches()
+			if len(batches) != 1 || len(batches[0]) != 1 || batches[0][0].ArtifactID != key {
+				t.Fatalf("batches = %+v, want one report for %s", batches, key)
+			}
+			if got := store.Get(key); got != observed {
+				t.Errorf("baseline = %q, want the observed %q", got, observed)
+			}
+			recs := logRecords(t, logs, "integrity baseline updated")
+			if len(recs) != 1 || recs[0]["path"] != key || recs[0]["level"] != "INFO" {
+				t.Errorf("baseline updated records = %v, want one at INFO with path %s", recs, key)
+			}
+
+			// The adopted baseline matches, so a second run reports nothing.
+			if err := tt.check(context.Background(), v); err != nil {
+				t.Fatalf("second check: %v", err)
+			}
+			if attempts := reporter.getAttempts(); len(attempts) != 1 {
+				t.Errorf("reports after the second run = %d, want still 1", len(attempts))
+			}
+		})
+	}
+}
+
+// TestVerifier_KeepsBaselineWhenReportFails makes the first report fail: the
+// baseline stays, so the next pass reports the same divergence again, and only
+// the accepted report moves the baseline.
+func TestVerifier_KeepsBaselineWhenReportFails(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-v2")
+	oldChecksum := sha256Hex("binary-v1")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Set(binaryPath, oldChecksum); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	reporter := &mockReporter{errs: []error{context.DeadlineExceeded}}
+	logs := &syncBuffer{}
+	v := NewVerifier(Config{
+		BinaryPath:     binaryPath,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, jsonLogger(logs))
+	ctx := context.Background()
+
+	// Pass 1: the report fails.
+	v.verifyAll(ctx, "node-1")
+	if got := len(reporter.getAttempts()); got != 1 {
+		t.Fatalf("attempts after pass 1 = %d, want 1", got)
+	}
+	recs := logRecords(t, logs, "failed to report integrity violations")
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["error"] != context.DeadlineExceeded.Error() {
+		t.Errorf("failed report records = %v, want one WARN with error %q", recs, context.DeadlineExceeded)
+	}
+	if got := store.Get(binaryPath); got != oldChecksum {
+		t.Errorf("baseline after a failed report = %q, want the old %q", got, oldChecksum)
+	}
+
+	// Pass 2: the same divergence is reported again, and accepted.
+	v.verifyAll(ctx, "node-1")
+	attempts := reporter.getAttempts()
+	if len(attempts) != 2 {
+		t.Fatalf("attempts after pass 2 = %d, want 2", len(attempts))
+	}
+	if !slices.Equal(attempts[1], attempts[0]) {
+		t.Errorf("second report = %+v, want the first one again %+v", attempts[1], attempts[0])
+	}
+	if got, want := store.Get(binaryPath), sha256Hex("binary-v2"); got != want {
+		t.Errorf("baseline after an accepted report = %q, want %q", got, want)
+	}
+
+	// Pass 3: nothing left to report.
+	v.verifyAll(ctx, "node-1")
+	if got := len(reporter.getAttempts()); got != 2 {
+		t.Errorf("attempts after pass 3 = %d, want still 2", got)
+	}
+}
+
+// TestVerifier_AdoptLogsAStoreFailure removes the store's directory before a
+// pass that finds a mismatch: the report still goes out, and the failed write
+// of the new baseline is logged.
+func TestVerifier_AdoptLogsAStoreFailure(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	binaryPath := writeTempFile(t, t.TempDir(), "plexd", "binary-v2")
+
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Set(binaryPath, sha256Hex("binary-v1")); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+	if err := os.RemoveAll(dataDir); err != nil {
+		t.Fatalf("remove data dir: %v", err)
+	}
+	// The platform's own text for creating a file in a missing directory.
+	_, probeErr := os.CreateTemp(dataDir, "probe-")
+	var pathErr *fs.PathError
+	if !errors.As(probeErr, &pathErr) {
+		t.Fatalf("os.CreateTemp in a removed dir = %v, want a *fs.PathError", probeErr)
+	}
+
+	reporter := &mockReporter{}
+	logs := &syncBuffer{}
+	v := NewVerifier(Config{
+		BinaryPath:     binaryPath,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, jsonLogger(logs))
+
+	if err := v.VerifyBinary(context.Background(), "node-1"); err != nil {
+		t.Fatalf("verify binary: %v", err)
+	}
+
+	if got := len(reporter.getBatches()); got != 1 {
+		t.Errorf("batches = %d, want 1: the report goes out before the store write", got)
+	}
+	recs := logRecords(t, logs, "failed to store integrity baseline")
+	if len(recs) != 1 {
+		t.Fatalf("failed store records = %d, want 1 (log %s)", len(recs), logs.String())
+	}
+	if recs[0]["level"] != "WARN" || recs[0]["path"] != binaryPath {
+		t.Errorf("record = %v, want WARN with path %s", recs[0], binaryPath)
+	}
+	errText, _ := recs[0]["error"].(string)
+	tmpPrefix := filepath.Join(dataDir, ".tmp-"+checksumFileName+"-")
+	if !strings.Contains(errText, tmpPrefix) || !strings.Contains(errText, pathErr.Err.Error()) {
+		t.Errorf("error = %q, want the CreateTemp error for %s* (%q)", errText, tmpPrefix, pathErr.Err.Error())
+	}
+}
+
+// TestVerifier_AdoptsPerDeliveredBatch sweeps more diverged hooks than one
+// request may carry, and lets the first request through and fails the second:
+// only the baselines of the delivered batch move.
+func TestVerifier_AdoptsPerDeliveredBatch(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	const total = api.MaxIntegrityViolationsPerBatch + 2
+	original := sha256Hex("#!/bin/sh\necho original")
+	tampered := sha256Hex("#!/bin/sh\necho tampered")
+
+	// Seed the store file directly rather than through one fsynced Set per
+	// hook. ReadDir sorts by name, so the zero-padded names are sweep order.
+	paths := make([]string, total)
+	seed := make(map[string]string, total)
+	for i := range paths {
+		paths[i] = writeTempFile(t, hooksDir, fmt.Sprintf("hook-%03d.sh", i), "#!/bin/sh\necho tampered")
+		seed[paths[i]] = original
+	}
+	data, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, checksumFileName), data, 0o600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	reporter := &mockReporter{errs: []error{nil, context.DeadlineExceeded}}
+	v := NewVerifier(Config{
+		HooksDir:       hooksDir,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.New(slog.NewTextHandler(&syncBuffer{}, nil)))
+
+	v.VerifyHooksDir(context.Background(), "node-1")
+
+	attempts := reporter.getAttempts()
+	if len(attempts) != 2 || len(attempts[0]) != api.MaxIntegrityViolationsPerBatch || len(attempts[1]) != 2 {
+		sizes := make([]int, len(attempts))
+		for i, a := range attempts {
+			sizes[i] = len(a)
+		}
+		t.Fatalf("batch sizes = %v, want [%d 2]", sizes, api.MaxIntegrityViolationsPerBatch)
+	}
+	for i, p := range paths {
+		want := tampered
+		if i >= api.MaxIntegrityViolationsPerBatch {
+			want = original
+		}
+		if got := store.Get(p); got != want {
+			t.Errorf("baseline of %s = %q, want %q", filepath.Base(p), got, want)
+		}
+	}
+}
+
+// TestVerifier_ConcurrentSweepsReportAChangeOnce holds one sweep inside
+// ReportViolations while a second sweep of the same changed hook starts, as a
+// tick and the watcher's debounced sweep can: the second must see the adopted
+// baseline, not the old one, so the change is reported once.
+func TestVerifier_ConcurrentSweepsReportAChangeOnce(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hookPath := writeTempFile(t, hooksDir, "hook.sh", "#!/bin/sh\necho tampered")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Set(hookPath, sha256Hex("#!/bin/sh\necho original")); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSweeps := func() { releaseOnce.Do(func() { close(release) }) }
+	reporter := &mockReporter{hold: func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}}
+	v := NewVerifier(Config{
+		HooksDir:       hooksDir,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.New(slog.NewTextHandler(&syncBuffer{}, nil)))
+
+	ctx := context.Background()
+	var sweeps sync.WaitGroup
+	defer func() {
+		releaseSweeps()
+		sweeps.Wait()
+	}()
+
+	sweeps.Add(1)
+	go func() {
+		defer sweeps.Done()
+		v.VerifyHooksDir(ctx, "node-1")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first sweep did not reach the reporter")
+	}
+
+	sweeps.Add(1)
+	go func() {
+		defer sweeps.Done()
+		v.verifyHooksDir(ctx, "node-1", api.IntegrityDetectorInotify)
+	}()
+	// Give the second sweep the time to read the baseline and report, which
+	// it must not do while the first is still inside ReportViolations.
+	select {
+	case <-entered:
+		t.Error("a second sweep reached the reporter while the first was still inside it")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	releaseSweeps()
+	sweeps.Wait()
+
+	if batches := reporter.getBatches(); len(batches) != 1 {
+		t.Errorf("batches = %d, want 1: one change is reported once (%+v)", len(batches), batches)
+	}
+	if got, want := store.Get(hookPath), sha256Hex("#!/bin/sh\necho tampered"); got != want {
+		t.Errorf("baseline = %q, want %q", got, want)
 	}
 }

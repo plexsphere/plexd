@@ -34,6 +34,13 @@ type Verifier struct {
 	mu             sync.Mutex
 	binaryChecksum string
 
+	// checkMu serialises the baseline checks (VerifyBinary, verifyHooksDir,
+	// VerifyHostKey) for their whole body, report included. Without it the
+	// watcher's debounced sweep and a tick could both read the old baseline
+	// and report one change twice. It is separate from mu so BinaryChecksum
+	// never waits on a network call.
+	checkMu sync.Mutex
+
 	// watchDir is a seam over fsutil.WatchDir, replaced in tests.
 	watchDir func(ctx context.Context, dir string, onRetry func(error)) (*fsnotify.Watcher, error)
 }
@@ -91,6 +98,8 @@ func (v *Verifier) checksumViolation(kind api.IntegrityViolationKind, detector a
 // splitting anything over its ceiling and sending nothing at all for an empty
 // slice. A failed delivery is logged rather than returned: the caller's job is
 // to detect tampering, and it has already logged the violation locally at Error.
+// Only VerifyHook uses it, because its expected value is the executor's pin
+// rather than a stored baseline; the baseline checks use reportAndAdopt.
 func (v *Verifier) report(ctx context.Context, nodeID string, reports []api.IntegrityViolationReport) {
 	for len(reports) > 0 {
 		n := min(len(reports), api.MaxIntegrityViolationsPerBatch)
@@ -101,10 +110,60 @@ func (v *Verifier) report(ctx context.Context, nodeID string, reports []api.Inte
 	}
 }
 
+// divergence is one mismatch against a stored baseline.
+type divergence struct {
+	report   api.IntegrityViolationReport
+	key      string // store key: the artifact's path
+	observed string // value to adopt: hex digest, or SHA256:<base64> fingerprint
+}
+
+// reportAndAdopt reports divergences to the control plane in batches the
+// contract accepts, sending nothing for an empty slice, and adopts the observed
+// value of every entry in a batch the control plane accepted as its new
+// baseline. A divergence is therefore reported once: the next pass compares
+// against what was reported. A batch that failed keeps its old baselines, so
+// the next pass reports those entries again.
+func (v *Verifier) reportAndAdopt(ctx context.Context, nodeID string, found []divergence) {
+	for len(found) > 0 {
+		n := min(len(found), api.MaxIntegrityViolationsPerBatch)
+		chunk := found[:n]
+		found = found[n:]
+
+		reports := make([]api.IntegrityViolationReport, len(chunk))
+		for i, d := range chunk {
+			reports[i] = d.report
+		}
+		if err := v.reporter.ReportViolations(ctx, nodeID, reports); err != nil {
+			v.logger.Warn("failed to report integrity violations", "count", n, "error", err)
+			continue
+		}
+		for _, d := range chunk {
+			v.adopt(d.key, d.observed)
+		}
+	}
+}
+
+// adopt makes observed the stored baseline for key. A failed write is logged:
+// Store.Set has already updated its map, so this process compares against the
+// new value, and only the next start, reading the old file, reports the
+// divergence once more.
+func (v *Verifier) adopt(key, observed string) {
+	if err := v.store.Set(key, observed); err != nil {
+		v.logger.Warn("failed to store integrity baseline", "path", key, "error", err)
+		return
+	}
+	v.logger.Info("integrity baseline updated", "path", key)
+}
+
 // VerifyBinary computes the binary checksum, compares against the stored baseline,
 // and reports a violation on mismatch. On first run (no baseline), the checksum is
-// stored as the new baseline.
+// stored as the new baseline. Once the control plane has accepted a report, the
+// observed checksum becomes the baseline, so one change is reported once; a
+// mismatch whose digests cannot be put on the wire is adopted without a report.
 func (v *Verifier) VerifyBinary(ctx context.Context, nodeID string) error {
+	v.checkMu.Lock()
+	defer v.checkMu.Unlock()
+
 	actual, err := HashFile(v.cfg.BinaryPath)
 	if err != nil {
 		v.logger.Error("binary hash failed", "path", v.cfg.BinaryPath, "error", err)
@@ -135,12 +194,16 @@ func (v *Verifier) VerifyBinary(ctx context.Context, nodeID string) error {
 		"actual_checksum", actual,
 	)
 
-	if report, ok := v.checksumViolation(
+	report, ok := v.checksumViolation(
 		api.IntegrityKindBinaryChecksum, api.IntegrityDetectorStartupScan,
 		v.cfg.BinaryPath, expected, actual,
-	); ok {
-		v.report(ctx, nodeID, []api.IntegrityViolationReport{report})
+	)
+	if !ok {
+		// No later pass could report it either.
+		v.adopt(v.cfg.BinaryPath, actual)
+		return nil
 	}
+	v.reportAndAdopt(ctx, nodeID, []divergence{{report: report, key: v.cfg.BinaryPath, observed: actual}})
 	return nil
 }
 
@@ -178,6 +241,7 @@ func (v *Verifier) VerifyHook(ctx context.Context, nodeID, hookPath, expectedChe
 // compares against stored baselines, and reports violations on mismatch.
 // Violations are attributed to the scanning detector; the fsnotify watcher
 // enters the same sweep through verifyHooksDir with the inotify detector.
+// An empty HooksDir, or one that does not exist, is a no-op.
 func (v *Verifier) VerifyHooksDir(ctx context.Context, nodeID string) {
 	v.verifyHooksDir(ctx, nodeID, api.IntegrityDetectorStartupScan)
 }
@@ -185,8 +249,12 @@ func (v *Verifier) VerifyHooksDir(ctx context.Context, nodeID string) {
 // verifyHooksDir is VerifyHooksDir with the detector the caller represents.
 // Every violation the sweep finds travels in one batch: the control plane
 // records them in a single transaction, so an operator sees one alert for one
-// tampering event rather than one per file.
+// tampering event rather than one per file. The observed checksums of a batch
+// the control plane accepted become the hooks' baselines.
 func (v *Verifier) verifyHooksDir(ctx context.Context, nodeID string, detector api.IntegrityDetector) {
+	v.checkMu.Lock()
+	defer v.checkMu.Unlock()
+
 	if v.cfg.HooksDir == "" {
 		return
 	}
@@ -199,7 +267,7 @@ func (v *Verifier) verifyHooksDir(ctx context.Context, nodeID string, detector a
 		return
 	}
 
-	var reports []api.IntegrityViolationReport
+	var found []divergence
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -232,14 +300,18 @@ func (v *Verifier) verifyHooksDir(ctx context.Context, nodeID string, detector a
 			"actual_checksum", actual,
 		)
 
-		if report, ok := v.checksumViolation(
+		report, ok := v.checksumViolation(
 			api.IntegrityKindHookChecksum, detector, hookPath, expected, actual,
-		); ok {
-			reports = append(reports, report)
+		)
+		if !ok {
+			// No later pass could report it either.
+			v.adopt(hookPath, actual)
+			continue
 		}
+		found = append(found, divergence{report: report, key: hookPath, observed: actual})
 	}
 
-	v.report(ctx, nodeID, reports)
+	v.reportAndAdopt(ctx, nodeID, found)
 }
 
 // VerifyHostKey computes the SSH host key's fingerprint, compares it against
@@ -251,8 +323,12 @@ func (v *Verifier) verifyHooksDir(ctx context.Context, nodeID string, detector a
 // something replaced it. The fingerprint identifies the key, not the file — the
 // same key re-serialised keeps its fingerprint, which is why this is not a
 // checksum comparison. An unset HostKeyPath or an absent file is a no-op: a node
-// that never started the tunnel has no key to watch.
+// that never started the tunnel has no key to watch. Once the control plane has
+// accepted a report, the observed fingerprint becomes the baseline.
 func (v *Verifier) VerifyHostKey(ctx context.Context, nodeID string) error {
+	v.checkMu.Lock()
+	defer v.checkMu.Unlock()
+
 	if v.cfg.HostKeyPath == "" {
 		return nil
 	}
@@ -284,12 +360,16 @@ func (v *Verifier) VerifyHostKey(ctx context.Context, nodeID string) error {
 		"observed_fingerprint", actual,
 	)
 
-	v.report(ctx, nodeID, []api.IntegrityViolationReport{{
-		Kind:                api.IntegrityKindSSHHostKey,
-		DetectedBy:          api.IntegrityDetectorStartupScan,
-		ArtifactID:          v.cfg.HostKeyPath,
-		ObservedFingerprint: actual,
-		ExpectedFingerprint: expected,
+	v.reportAndAdopt(ctx, nodeID, []divergence{{
+		report: api.IntegrityViolationReport{
+			Kind:                api.IntegrityKindSSHHostKey,
+			DetectedBy:          api.IntegrityDetectorStartupScan,
+			ArtifactID:          v.cfg.HostKeyPath,
+			ObservedFingerprint: actual,
+			ExpectedFingerprint: expected,
+		},
+		key:      v.cfg.HostKeyPath,
+		observed: actual,
 	}})
 	return nil
 }
