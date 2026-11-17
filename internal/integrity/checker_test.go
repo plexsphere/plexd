@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"io"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -69,6 +70,31 @@ func TestHashFile_FileNotFound(t *testing.T) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("HashFile error = %v, want wrapping os.ErrNotExist", err)
+	}
+}
+
+// A pass hashes the running plexd binary while service.upgrade may be moving it
+// aside, so a file open for hashing must still be renamable. Unix allows that
+// anyway; on Windows it takes the share-delete open of openForHash, which
+// os.Open does not do. The open handle keeps reading the bytes it opened.
+func TestOpenForHash_LetsTheFileBeRenamed(t *testing.T) {
+	path := writeTemp(t, "plexd-binary")
+
+	f, err := openForHash(path)
+	if err != nil {
+		t.Fatalf("openForHash: %v", err)
+	}
+	defer f.Close()
+
+	if err := os.Rename(path, path+".old"); err != nil {
+		t.Fatalf("rename while the file is open for hashing: %v", err)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read after the rename: %v", err)
+	}
+	if string(data) != "plexd-binary" {
+		t.Errorf("read %q after the rename, want %q", data, "plexd-binary")
 	}
 }
 
