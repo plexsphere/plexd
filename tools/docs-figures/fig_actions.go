@@ -90,44 +90,69 @@ func actSide(s *seq, a int, lines ...Line) {
 
 // actionsIntegrityVerification draws the data flow of the integrity
 // verifier for docs/reference/actions/integrity-verification.md (Data
-// Flow): the startup check of the binary against its baseline, the
-// report of a mismatch, and the periodic re-run of every check.
+// Flow): the start of Verifier.Run and every tick of its ticker run one
+// pass of the three baseline checks, each compares what it observes
+// with the stored baseline, a mismatch is reported to the control
+// plane, and an accepted report makes the observed value the baseline.
 func actionsIntegrityVerification() *Figure {
-	f := &Figure{Name: "actions-integrity-verification", Title: "Verifying the binary at startup and on a ticker"}
-	const lx, lw = 0.0, 340.0
+	f := &Figure{Name: "actions-integrity-verification", Title: "One integrity pass at start and on every tick"}
+	const trigH, gap = 66.0, 70.0
 
-	start := f.state(stateNormal, spec{x: lx, y: 0, w: lw, lines: []Line{name("startup")}})
-	run := f.box(roleAgent, spec{x: lx, y: start.y + start.h + 60, w: lw, lines: []Line{codeName("Verifier.Run"), code("VerifyBinary")}})
-	f.arrow(flow, start.bottom(), run.top())
-	hash := f.box(roleAgent, spec{x: lx, y: run.y + run.h + 60, w: lw, lines: []Line{codeName("HashFile(binary)"), code("crypto/sha256")}})
-	f.arrow(flow, run.bottom(), hash.top())
-	base := f.store(roleStore, spec{x: 440, w: 300, lines: []Line{codeName("Store.Get"), body("the baseline")}})
-	base.y = hash.cy() - base.h/2
-	f.arrow(flow, hash.right(), base.leftAt(hash.cy()))
+	pass := f.actRules(roleAgent, 0, trigH+gap, 0,
+		[]Line{name("one pass")},
+		[]actRow{
+			{"1", code("VerifyBinary"), body("SHA-256 of BinaryPath")},
+			{"2", code("VerifyHooksDir"), body("each hook in HooksDir")},
+			{"3", code("VerifyHostKey"), body("fingerprint of HostKeyPath")},
+		})
 
-	cmp := f.state(stateNormal, spec{x: lx, y: base.y + base.h + 60, w: base.x + base.w - lx, lines: []Line{name("compare the checksums")}})
-	f.arrow(flow, hash.bottom(), cmp.topAt(hash.cx()))
+	// The two triggers, side by side over the pass they both start.
+	const trigW, trigGap = 210.0, 40.0
+	tx := pass.cx() - trigW - trigGap/2
+	start := f.state(stateNormal, spec{x: tx, y: 0, w: trigW, h: trigH, lines: []Line{name("start"), code("Verifier.Run")}})
+	tick := f.state(stateNormal, spec{x: tx + trigW + trigGap, y: 0, w: trigW, h: trigH, lines: []Line{name("tick"), body("every VerifyInterval")}})
+	f.arrow(flow, start.bottom(), pass.topAt(start.cx()))
+	f.arrow(flow, tick.bottom(), pass.topAt(tick.cx()))
+
+	base := f.store(roleStore, spec{x: pass.x + pass.w + 100, w: 260, lines: []Line{codeName("Store.Get"), body("the baseline of the path")}})
+	base.y = pass.cy() - base.h/2
+	f.arrow(flow, pass.right(), base.leftAt(pass.cy()))
+
+	cmpY := max(pass.y+pass.h, base.y+base.h) + 60
+	cmp := f.state(stateNormal, spec{x: pass.x, y: cmpY, w: base.x + base.w - pass.x, lines: []Line{name("compare the observed value with the baseline")}})
+	f.arrow(flow, pass.bottom(), cmp.topAt(pass.cx()))
 	f.arrow(flow, base.bottom(), cmp.topAt(base.cx()))
 
-	ok := f.state(stateNormal, spec{x: lx, y: cmp.y + cmp.h + 80, w: lw, lines: []Line{name("log OK")}})
-	rep := f.box(roleAgent, spec{x: base.x, y: ok.y, w: base.w, lines: []Line{codeName("ViolationReporter"), code(".ReportViolations")}})
+	// The three outcomes of the comparison, labelled level with each
+	// other in the gap below it.
+	rowY := cmp.y + cmp.h + 90
+	labelY := (cmp.y + cmp.h + rowY) / 2
+	ok := f.state(stateNormal, spec{x: pass.x, y: rowY, w: 230, lines: []Line{name("log the match"), code("binary verified"), code("host key verified")}})
 	f.arrow(flow, cmp.bottomAt(ok.cx()), ok.top())
-	f.labelLeft(pt{ok.cx(), (cmp.y + cmp.h + ok.y) / 2}, body("match"))
-	f.arrow(flow, cmp.bottomAt(rep.cx()), rep.top())
-	f.labelRight(pt{rep.cx(), (cmp.y + cmp.h + rep.y) / 2}, body("mismatch"))
+	f.labelLeft(pt{ok.cx(), labelY}, body("match"))
 
-	cp := f.box(roleCore, spec{y: rep.y + rep.h + 80, lines: []Line{name("control plane"), code("POST /v1/nodes/{id}/integrity-violations")}})
-	cp.x = rep.cx() - cp.w/2
+	cp := f.box(roleCore, spec{lines: []Line{name("control plane"), code("POST /v1/nodes/{id}/integrity-violations")}})
+	rep := f.box(roleAgent, spec{y: rowY, w: 330, lines: []Line{codeName("ViolationReporter"), code(".ReportViolations")}})
+	rep.x = cmp.x + cmp.w - cp.w/2 - 20 - rep.w/2
+	f.arrow(flow, cmp.bottomAt(rep.cx()), rep.top())
+	f.labelRight(pt{rep.cx(), labelY}, body("mismatch"))
+	cp.x, cp.y = rep.cx()-cp.w/2, rep.y+rep.h+70
 	f.arrow(publish, rep.bottom(), cp.topAt(rep.cx()))
 
-	// The periodic re-verification, which the page lists apart from
-	// the startup sequence.
-	const px, pw = 810.0, 260.0
-	tick := f.state(stateNormal, spec{x: px, y: 0, w: pw, lines: []Line{name("periodic ticker"), body("at VerifyInterval")}})
-	rerun := f.state(stateNormal, spec{x: px, y: tick.y + tick.h + 60, w: pw, lines: []Line{
-		name("re-run"), code("VerifyBinary"), code("VerifyHooksDir"), code("VerifyHostKey"),
-	}})
-	f.arrow(flow, tick.bottom(), rerun.top())
+	// The baseline moves when there was none and when the control
+	// plane accepted the report; a failed report leaves it alone.
+	outY := cp.y + cp.h + 90
+	set := f.store(roleStore, spec{x: ok.x + ok.w + 30, y: outY, w: 260, lines: []Line{codeName("Store.Set"), body("the observed value"), body("becomes the baseline")}})
+	fail := f.state(stateFailed, spec{x: set.x + set.w + 40, y: outY, lines: []Line{name("keep the baseline"), body("the next pass reports again")}})
+
+	none := set.x + 40
+	f.arrow(flow, cmp.bottomAt(none), set.capTop(none))
+	f.labelRight(pt{none, labelY}, body("no baseline"))
+	accepted := (cp.x + set.x + set.w) / 2
+	f.arrow(reply, cp.bottomAt(accepted), set.capTop(accepted))
+	f.labelRight(pt{accepted, (cp.y + cp.h + set.y) / 2}, body("accepted"))
+	f.arrow(refuse, cp.bottomAt(fail.cx()), fail.top())
+	f.labelRight(pt{fail.cx(), (cp.y + cp.h + fail.y) / 2}, body("error"))
 	return f
 }
 

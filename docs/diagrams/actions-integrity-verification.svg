@@ -1,54 +1,76 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1150" height="763" viewBox="0 0 1150 763" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Verifying the binary at startup and on a ticker">
-<title>Verifying the binary at startup and on a ticker</title>
-<rect width="1150" height="763" fill="#F6F5F1"/>
-<rect x="40" y="40" width="340" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="210" y="69" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">startup</text>
-<rect x="40" y="144" width="340" height="60" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="210" y="170.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">Verifier.Run</text>
-<text x="210" y="189.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">VerifyBinary</text>
-<polyline points="210,84 210,135" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="210,144 204,131 216,131" fill="#3A4452"/>
-<rect x="40" y="264" width="340" height="60" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="210" y="290.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">HashFile(binary)</text>
-<text x="210" y="309.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">crypto/sha256</text>
-<polyline points="210,204 210,255" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="210,264 204,251 216,251" fill="#3A4452"/>
-<path d="M480 263.5C480 250.17 780 250.17 780 263.5V324.5C780 337.83 480 337.83 480 324.5Z" fill="#E3F1F2" stroke="#0E7D89" stroke-width="2"/>
-<path d="M480 263.5C480 273.5 780 273.5 780 263.5" fill="none" stroke="#0E7D89" stroke-width="2"/>
-<text x="630" y="297.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#0B5F69" text-anchor="middle">Store.Get</text>
-<text x="630" y="317.65" font-size="17" fill="#55606E" text-anchor="middle">the baseline</text>
-<polyline points="380,294 471,294" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="480,294 467,300 467,288" fill="#3A4452"/>
-<rect x="40" y="394.5" width="740" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="410" y="423.5" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">compare the checksums</text>
-<polyline points="210,324 210,385.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="210,394.5 204,381.5 216,381.5" fill="#3A4452"/>
-<polyline points="630,334.5 630,385.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="630,394.5 624,381.5 636,381.5" fill="#3A4452"/>
-<rect x="40" y="518.5" width="340" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="210" y="547.5" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">log OK</text>
-<rect x="480" y="518.5" width="300" height="60" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="630" y="544.85" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ViolationReporter</text>
-<text x="630" y="564.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">.ReportViolations</text>
-<polyline points="210,438.5 210,509.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="210,518.5 204,505.5 216,505.5" fill="#3A4452"/>
-<text x="200" y="484.45" font-size="17" fill="#55606E" text-anchor="end">match</text>
-<polyline points="630,438.5 630,509.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="630,518.5 624,505.5 636,505.5" fill="#3A4452"/>
-<text x="640" y="484.45" font-size="17" fill="#55606E">mismatch</text>
-<rect x="419" y="658.5" width="422" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
-<text x="630" y="687.9" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
-<text x="630" y="708.1" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/integrity-violations</text>
-<polyline points="630,578.5 630,649.5" fill="none" stroke="#B38A00" stroke-width="2.5"/>
-<polygon points="630,658.5 624,645.5 636,645.5" fill="#B38A00"/>
-<rect x="850" y="40" width="260" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="980" y="69.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">periodic ticker</text>
-<text x="980" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">at VerifyInterval</text>
-<rect x="850" y="165" width="260" height="102" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="980" y="194.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">re-run</text>
-<text x="980" y="214.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">VerifyBinary</text>
-<text x="980" y="233.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">VerifyHooksDir</text>
-<text x="980" y="252.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">VerifyHostKey</text>
-<polyline points="980,105 980,156" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="980,165 974,152 986,152" fill="#3A4452"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="911" height="926" viewBox="0 0 911 926" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="One integrity pass at start and on every tick">
+<title>One integrity pass at start and on every tick</title>
+<rect width="911" height="926" fill="#F6F5F1"/>
+<rect x="40" y="176" width="465" height="132" rx="6" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<polyline points="40,220 505,220" fill="none" stroke="#2F8A57" stroke-width="1.5"/>
+<text x="54" y="205" font-size="20" font-weight="700" fill="#1E6B40">one pass</text>
+<text x="54" y="243.95" font-size="17" font-weight="700" fill="#1E6B40">1</text>
+<text x="79.83" y="243.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">VerifyBinary</text>
+<text x="225.7" y="243.95" font-size="17" fill="#7D8794">→</text>
+<text x="256.98" y="243.95" font-size="17" fill="#2B3440">SHA-256 of BinaryPath</text>
+<text x="54" y="269.95" font-size="17" font-weight="700" fill="#1E6B40">2</text>
+<text x="79.83" y="269.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">VerifyHooksDir</text>
+<text x="225.7" y="269.95" font-size="17" fill="#7D8794">→</text>
+<text x="256.98" y="269.95" font-size="17" fill="#2B3440">each hook in HooksDir</text>
+<text x="54" y="295.95" font-size="17" font-weight="700" fill="#1E6B40">3</text>
+<text x="79.83" y="295.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">VerifyHostKey</text>
+<text x="225.7" y="295.95" font-size="17" fill="#7D8794">→</text>
+<text x="256.98" y="295.95" font-size="17" fill="#2B3440">fingerprint of HostKeyPath</text>
+<rect x="42.5" y="40" width="210" height="66" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="147.5" y="70.4" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">start</text>
+<text x="147.5" y="90.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Verifier.Run</text>
+<rect x="292.5" y="40" width="210" height="66" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="397.5" y="69.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">tick</text>
+<text x="397.5" y="90.95" font-size="17" fill="#55606E" text-anchor="middle">every VerifyInterval</text>
+<polyline points="147.5,106 147.5,167" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="147.5,176 141.5,163 153.5,163" fill="#3A4452"/>
+<polyline points="397.5,106 397.5,167" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="397.5,176 391.5,163 403.5,163" fill="#3A4452"/>
+<path d="M605 211.5C605 199.94 865 199.94 865 211.5V272.5C865 284.06 605 284.06 605 272.5Z" fill="#E3F1F2" stroke="#0E7D89" stroke-width="2"/>
+<path d="M605 211.5C605 220.17 865 220.17 865 211.5" fill="none" stroke="#0E7D89" stroke-width="2"/>
+<text x="735" y="244.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#0B5F69" text-anchor="middle">Store.Get</text>
+<text x="735" y="264.65" font-size="17" fill="#55606E" text-anchor="middle">the baseline of the path</text>
+<polyline points="505,242 596,242" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="605,242 592,248 592,236" fill="#3A4452"/>
+<rect x="40" y="368" width="825" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="452.5" y="397" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">compare the observed value with the baseline</text>
+<polyline points="272.5,308 272.5,359" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="272.5,368 266.5,355 278.5,355" fill="#3A4452"/>
+<polyline points="735,281.17 735,359" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="735,368 729,355 741,355" fill="#3A4452"/>
+<rect x="40" y="502" width="230" height="83" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="155" y="531.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">log the match</text>
+<text x="155" y="551.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">binary verified</text>
+<text x="155" y="570.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">host key verified</text>
+<polyline points="155,412 155,493" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="155,502 149,489 161,489" fill="#3A4452"/>
+<text x="145" y="462.95" font-size="17" fill="#55606E" text-anchor="end">match</text>
+<rect x="423" y="632" width="422" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="634" y="661.4" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
+<text x="634" y="681.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/integrity-violations</text>
+<rect x="469" y="502" width="330" height="60" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="634" y="528.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ViolationReporter</text>
+<text x="634" y="547.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">.ReportViolations</text>
+<polyline points="634,412 634,493" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="634,502 628,489 640,489" fill="#3A4452"/>
+<text x="644" y="462.95" font-size="17" fill="#55606E">mismatch</text>
+<polyline points="634,562 634,623" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="634,632 628,619 640,619" fill="#B38A00"/>
+<path d="M300 794.67C300 783.11 560 783.11 560 794.67V876.67C560 888.22 300 888.22 300 876.67Z" fill="#E3F1F2" stroke="#0E7D89" stroke-width="2"/>
+<path d="M300 794.67C300 803.33 560 803.33 560 794.67" fill="none" stroke="#0E7D89" stroke-width="2"/>
+<text x="430" y="827.72" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#0B5F69" text-anchor="middle">Store.Set</text>
+<text x="430" y="848.12" font-size="17" fill="#55606E" text-anchor="middle">the observed value</text>
+<text x="430" y="868.52" font-size="17" fill="#55606E" text-anchor="middle">becomes the baseline</text>
+<rect x="600" y="786" width="271" height="65" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="735.5" y="815.3" font-size="20" font-weight="700" fill="#A3262E" text-anchor="middle">keep the baseline</text>
+<text x="735.5" y="836.45" font-size="17" fill="#A3262E" text-anchor="middle">the next pass reports again</text>
+<polyline points="340,412 340,779.41" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="340,788.41 334,775.41 346,775.41" fill="#3A4452"/>
+<text x="350" y="462.95" font-size="17" fill="#55606E">no baseline</text>
+<polyline points="491.5,696 491.5,787.03" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="485.5,774.03 491.5,787.03 497.5,774.03" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="501.5" y="746.95" font-size="17" fill="#55606E">accepted</text>
+<polyline points="735.5,696 735.5,777" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="735.5,786 729.5,773 741.5,773" fill="#C6343C"/>
+<text x="745.5" y="746.95" font-size="17" fill="#55606E">error</text>
 </svg>

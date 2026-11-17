@@ -46,7 +46,7 @@ The `runUp` function in `cmd/plexd/cmd/up.go` performs initialization before ent
 6. **Create SSE manager** — `api.NewSSEManager()` with handlers for signing key rotation, WireGuard peer events, tunnel events, policy events, and bridge events (bridge mode)
 7. **Create reconciler** — `reconcile.NewReconciler()` with handlers for WireGuard, policy, and bridge reconciliation
 8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment and key-rotation callback; its credential-refused callback is set in step 12, once the node API server exists
-9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()` for hook checksums
+9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()`, for the hook checksums the executor verifies before a run and for the baseline checks of the binary, the hooks directory and the SSH host key that goroutine 10 runs. With integrity enabled and `integrity.binary_path` empty, `integrity.SelfPath()` first sets it to the running executable with symlinks resolved; an error fails `plexd up`
 10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, build the rollout installer with `actions.NewRolloutInstaller()` (a constructor error logs `rolled-out hooks disabled`, and the agent runs on without rolled-out hooks), register the installer's `Handle`, when it was built, and then `actions.NewDispatcher()` on the reconciler as dispatch handlers, list the `PlexdHook` resources in a pod's namespace, and build `agent.NewCapabilityReporter()`, which sends nothing until it starts. In a pod, `newPlexdHookRunner()` also builds the PlexdHook runner, which runs a dispatched `PlexdHook` as a Kubernetes Job, and `executor.SetPlexdHookRunner()` hands it over before the reconciler starts. An empty ServiceAccount namespace, an unset `MY_NODE_NAME`, or a Job client that cannot be built logs a `plexd hook runs disabled` warning instead, and the node runs no PlexdHook (see [Kubernetes Deployment](reference/deployment/kubernetes-deployment.md#wiring-in-plexd-up))
 11. **Create hook watchers** — `actions.NewHookWatcher()` for `hooks_dir`, with an `onChange` that calls `executor.SetHooks()` and then the reporter's `Notify()`, and, when the installer was built and `actions.rollouts_enabled` is not `false`, `actions.NewRolloutHookWatcher()` for the rollout directory `<data_dir>/hooks`, whose `onChange` calls `executor.SetRolloutHooks()` and `Notify()`. plexd then runs the installer's `Load()`, which restores the rolled-out hooks from `hook_rollouts.json`, pins each to the checksum it was delivered with, and removes every other file of the rollout directory. It then runs one first scan over both directories with `hookDirsReloader.Reload()` and waits for it, for at most 10 seconds, so the executor's hook list is filled before anything reads it and the boot manifest carries the hooks on disk
 12. **Create node API server** — `nodeapi.NewServer()`, wire action provider, hook reloader (the same `hookDirsReloader`, so `POST /v1/hooks/reload` rescans both directories), and reconcile handler
@@ -67,11 +67,12 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 7. **Rollout Installer** — `rolloutInstaller.Run()` — one pass per `hooks` block the reconciler hands over: fetch, verify, install, and remove rolled-out hooks; started only when the installer was built
 8. **Capability Reporter** — `capabilityReporter.Run()` — sends the boot manifest, reports each hook or `PlexdHook` change and each change to the rollout errors, and retries a failed send
 9. **PlexdHook Inventory** — `plexdHooks.run()` — watches the `PlexdHook` resources in a pod's namespace; returns at once outside a cluster
-10. **Metrics Manager** — `metricsMgr.Run()` — collect and report metrics
-11. **Log Forwarder** — `logForwarder.Run()` — collect and forward logs
-12. **Audit Forwarder** — `auditForwarder.Run()` — collect and forward audit events
-13. **Peer Exchange** — `exchanger.Run()` — STUN discovery and endpoint exchange loop
-14. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
+10. **Integrity Verifier** — `integrityVerifier.Run()` — checks the binary, `integrity.hooks_dir` and the SSH host key against their baselines once at start and then every `integrity.verify_interval`, reports each change once and then adopts it as the baseline; returns at once when `integrity.enabled` is `false` (see [Integrity Verification](reference/actions/integrity-verification.md#startup-sequence))
+11. **Metrics Manager** — `metricsMgr.Run()` — collect and report metrics
+12. **Log Forwarder** — `logForwarder.Run()` — collect and forward logs
+13. **Audit Forwarder** — `auditForwarder.Run()` — collect and forward audit events
+14. **Peer Exchange** — `exchanger.Run()` — STUN discovery and endpoint exchange loop
+15. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
 
 The bridge's NAT relay is not a startup goroutine. In bridge mode with `bridge.relay_enabled` set, the reconciler's `RelayReconcileHandler` starts it on the first cycle whose state pull enables it, and stops it when a pull disables it or the bridge tears down (see [NAT Relay](reference/bridge/nat-relay.md#relayreconcilehandler)).
 

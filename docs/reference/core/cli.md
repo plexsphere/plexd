@@ -62,7 +62,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 14. Create log sources + forwarder
 15. Create audit sources + forwarder
 
-**Goroutines (the same in node and bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Capability Reporter, PlexdHook Inventory, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server. The capability reporter sends the boot manifest when it starts and retries it until one is accepted, then reports each hook or `PlexdHook` change. The PlexdHook inventory returns at once outside a cluster. A bridge's NAT relay starts and stops from the reconciler when the state pull enables or disables it, not as a startup goroutine.
+**Goroutines (the same in node and bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Capability Reporter, PlexdHook Inventory, Integrity Verifier, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server. The capability reporter sends the boot manifest when it starts and retries it until one is accepted, then reports each hook or `PlexdHook` change. The PlexdHook inventory returns at once outside a cluster. A bridge's NAT relay starts and stops from the reconciler when the state pull enables or disables it, not as a startup goroutine.
 
 **Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, mesh server shutdown, bridge teardowns (bridge mode), policy enforcer teardown, WireGuard teardown, wait for goroutines with 30s drain timeout.
 

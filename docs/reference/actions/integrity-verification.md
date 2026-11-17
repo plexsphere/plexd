@@ -10,28 +10,46 @@ The `internal/integrity` package verifies the integrity of the plexd binary, hoo
 
 ## Data Flow
 
-![At startup, Verifier.Run runs VerifyBinary: HashFile computes the SHA-256 checksum of the binary with crypto/sha256, Store.Get loads the stored baseline, and the two checksums are compared. A match is logged as OK. A mismatch goes to ViolationReporter.ReportViolations, which posts it to the control plane at POST /v1/nodes/{id}/integrity-violations. Apart from startup, a periodic ticker at VerifyInterval re-runs VerifyBinary, VerifyHooksDir and VerifyHostKey.](../../diagrams/actions-integrity-verification.svg)
+![Two triggers start the same pass: the start of Verifier.Run and every tick of its ticker at VerifyInterval. One pass runs VerifyBinary on the SHA-256 of BinaryPath, VerifyHooksDir on each hook in HooksDir and VerifyHostKey on the fingerprint of HostKeyPath, and Store.Get supplies the baseline of each path. The observed value is compared with the baseline. A match is logged as binary verified or host key verified. With no baseline, Store.Set stores the observed value as the baseline. A mismatch goes to ViolationReporter.ReportViolations, which posts it to the control plane at POST /v1/nodes/{id}/integrity-violations. When the control plane accepts the report, Store.Set makes the observed value the baseline; on an error the baseline stays and the next pass reports again.](../../diagrams/actions-integrity-verification.svg)
 
 ### Startup Sequence
 
+`plexd up` starts `Verifier.Run` in its own goroutine, step 20c of `runAgent`, after registration has returned the node ID and the tunnel has loaded or generated the SSH host key, and ends it by cancelling its context. `Run` makes its first pass at once, before its ticker starts. The pass begins with the binary:
+
 1. `Verifier.VerifyBinary` computes SHA-256 of the binary via `HashFile`
 2. Loads baseline from `Store.Get(binaryPath)`
-3. No baseline (first run): stores computed checksum via `Store.Set`, returns success
-4. Match: logs info, returns success
-5. Mismatch: logs error, reports violation via `ViolationReporter`, returns success (non-fatal)
+3. No baseline: stores the computed checksum via `Store.Set` and reports nothing
+4. Match: logs `binary verified`
+5. Mismatch: logs `binary integrity violation` at Error and reports a `binary_checksum` violation via `ViolationReporter`. Once the control plane accepts the report, the computed checksum becomes the baseline, so the change is reported once. A failed report keeps the old baseline, and the next pass reports the change again.
+
+`VerifyHooksDir` and `VerifyHostKey` follow in the same pass. A mismatch never stops `plexd up`, and neither does a binary that cannot be read: `Run` logs `binary verification failed` and goes on with the next check.
+
+Every change of the binary files one `binary_checksum` violation and then becomes the baseline. That includes an upgrade by `service.upgrade`, which plexd performs itself, as well as one done outside plexd. With `binary_path` unset, the baseline is keyed by the resolved path of the running executable, so an install that moves the binary to a new resolved path, a new Nix store path for instance, starts a new baseline and reports nothing.
+
+Earlier releases never ran these checks, so a node upgraded from one has no baselines yet: its first pass stores them and reports nothing.
 
 ### Periodic Re-verification
 
-1. `Verifier.Run` starts a `time.Ticker` at `Config.VerifyInterval`
-2. Each tick calls `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` to detect runtime tampering
+1. After the first pass, `Verifier.Run` starts a `time.Ticker` at `Config.VerifyInterval`
+2. Each tick runs the same pass: `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey`, in that order
 3. Loop exits cleanly on context cancellation
+
+A divergence found on a tick is handled as one found at start: reported once, adopted as the baseline once the control plane accepts the report, and reported again on the next pass while the report fails. A change therefore costs one report, not one per tick.
+
+### Hooks Directory Sweep
+
+The sweep and its watcher are opt-in. They run only where `integrity.hooks_dir` or `PLEXD_HOOKS_DIR` names a directory; nothing copies `actions.hooks_dir` into `HooksDir`, so a node that sets neither sweeps no hooks and starts no watcher. Where one is set, `VerifyHooksDir` hashes every file in the directory on every pass and compares each with its baseline, and unless `WatchEnabled` is false the watcher re-runs the sweep 200 ms after the last change in the directory.
+
+An in-place edit of a hook there files one `hook_checksum` violation and then becomes the baseline. Adopting it moves no executor pin: where the directory is also `actions.hooks_dir`, as `PLEXD_HOOKS_DIR` makes it, the executor still refuses the edited hook until the agent restarts (see [Hook Verification](#hook-verification)).
 
 ### Host Key Verification
 
 1. `Verifier.VerifyHostKey` parses the key at `Config.HostKeyPath` and renders its `SHA256:<base64>` fingerprint
-2. No baseline (first run): stores the fingerprint via `Store.Set`
-3. Match: logs info
-4. Mismatch: logs error and reports an `ssh_host_key` violation
+2. No baseline: stores the fingerprint via `Store.Set`
+3. Match: logs `host key verified`
+4. Mismatch: logs `host key integrity violation` at Error and reports an `ssh_host_key` violation. Once the control plane accepts it, the new fingerprint becomes the baseline; a failed report keeps the old one, and the next pass reports again.
+
+The check runs last in every pass, the first one at start included, so a key replaced while the agent was stopped is reported at start.
 
 The check compares fingerprints rather than file digests, because the fingerprint identifies the key: the same key re-serialised produces different bytes and the same identity, and the identity is what a peer pins. An unset `HostKeyPath` or an absent file is a no-op, so a node that never started the tunnel reports nothing.
 
@@ -44,7 +62,7 @@ The SSH server keeps serving the key it loaded at startup, so a key that changes
 3. Match: returns `true` (safe to execute)
 4. Mismatch: reports violation, returns `false` (must not execute)
 
-For a hook in `HooksDir`, the expected checksum is the digest the executor
+For a hook in `actions.hooks_dir`, the expected checksum is the digest the executor
 **pinned** the first time this process discovered the hook, not the one
 `HookWatcher` last recomputed. It does **not** come from the dispatch, because an
 action dispatch carries no checksum on the wire. This check therefore answers
@@ -84,10 +102,10 @@ the agent restarts and re-attests it. `plexd hooks reload` re-hashes the hooks
 through the same watcher and moves no pin, so changing a hook in place requires
 an agent restart, not a reload, before it can run again.
 
-The pin of a hook in `HooksDir` is process-local, so re-attestation on restart
+The pin of a hook in `actions.hooks_dir` is process-local, so re-attestation on restart
 is both the recovery path for a legitimate hook change and the limit of the
 control: a restart re-anchors the pin to whatever bytes are on disk at that
-moment. Write access to `HooksDir`
+moment. Write access to `actions.hooks_dir`
 must therefore be treated as equivalent to code execution with the agent's
 privileges — the pin narrows the window between discovery and execution, it does
 not make an untrusted hooks directory safe.
@@ -98,32 +116,32 @@ not make an untrusted hooks directory safe.
 
 | Field            | Type            | Default | Description                              |
 |------------------|-----------------|---------|------------------------------------------|
-| `Enabled`        | `bool`          | `true`  | Whether integrity verification is active |
-| `BinaryPath`     | `string`        | —       | Path to the plexd binary to verify       |
-| `HooksDir`       | `string`        | —       | Directory containing hook scripts        |
+| `Enabled`        | `*bool`         | `true`  | Whether `Run` makes its baseline checks. `nil` means `true`. `VerifyHook` ignores it |
+| `BinaryPath`     | `string`        | —       | Path to the plexd binary to verify. With integrity enabled, `plexd up` fills an empty value with `SelfPath()`, the running executable with symlinks resolved ([With internal/registration](#with-internal-registration)) |
+| `HooksDir`       | `string`        | —       | Directory of hook scripts to sweep and watch. Opt-in: empty sweeps and watches nothing ([Hooks Directory Sweep](#hooks-directory-sweep)) |
 | `HostKeyPath`    | `string`        | —       | SSH host key to verify. Not a YAML key: `AgentConfig.ApplyDefaults` derives it from the data dir via `tunnel.HostKeyPath` |
-| `VerifyInterval` | `time.Duration` | `5m`    | Interval between periodic re-checks      |
-| `WatchEnabled`   | `bool`          | `true`  | Enable inotify file watching on HooksDir |
+| `VerifyInterval` | `time.Duration` | `5m`    | Interval between the passes after the first one at start |
+| `WatchEnabled`   | `*bool`         | `true`  | Enable inotify file watching on HooksDir. `nil` means `true` |
 
 ```go
 cfg := integrity.Config{
     BinaryPath: "/usr/local/bin/plexd",
 }
-cfg.ApplyDefaults() // Enabled=true, WatchEnabled=true, VerifyInterval=5m
+cfg.ApplyDefaults() // VerifyInterval=5m; IsEnabled() and IsWatchEnabled() report true
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }
 ```
 
-`ApplyDefaults` uses zero-value detection: on a fully zero-valued `Config`, `VerifyInterval == 0` triggers all defaults including `Enabled = true`. If `VerifyInterval` is already set (indicating explicit construction), `Enabled` is left as-is.
+`Enabled` and `WatchEnabled` are tri-state: `IsEnabled()` and `IsWatchEnabled()` read `nil` as `true`, and `ApplyDefaults` leaves both alone, so an explicit `false` survives defaulting. `MarshalYAML` renders the effective value of each, so `config.dump` shows `enabled: true` and `watch_enabled: true` for an omitted key rather than `null`. `ApplyDefaults` only fills a zero `VerifyInterval` with `DefaultVerifyInterval`.
 
 ### Validation Rules
 
 | Field            | Rule                        | Error Message                                                         |
 |------------------|-----------------------------|-----------------------------------------------------------------------|
-| `VerifyInterval` | >= 30s when `Enabled=true`  | `integrity: config: VerifyInterval must be at least 30s when enabled` |
+| `VerifyInterval` | >= 30s when `IsEnabled()`   | `integrity: config: VerifyInterval must be at least 30s when enabled` |
 
-Validation is skipped entirely when `Enabled` is `false`.
+Validation is skipped entirely when `IsEnabled()` is `false`.
 
 ## CheckResult
 
@@ -147,6 +165,8 @@ func HashFile(path string) (string, error)
 ```
 
 Returns the hex-encoded SHA-256 digest. Errors wrap `os.ErrNotExist` for missing files.
+
+The file stays renamable while it is read. On Windows `os.Open` does not share delete access, which would make a rename of the file fail, so `HashFile` opens it with `CreateFile` and read, write and delete sharing instead. That keeps a pass over the running binary from failing a `service.upgrade`, which moves the running image aside with a rename.
 
 ## VerifyFile
 
@@ -230,7 +250,7 @@ Logger is tagged with `component=integrity`.
 | `VerifyHooksDir` | `(ctx context.Context, nodeID string)`                                 | Sweep the hooks directory against stored baselines     |
 | `VerifyHostKey`  | `(ctx context.Context, nodeID string) error`                           | Verify the SSH host key's fingerprint                  |
 | `BinaryChecksum` | `() string`                                                            | Thread-safe getter for last computed binary checksum   |
-| `Run`            | `(ctx context.Context, nodeID string) error`                           | Periodic re-verification loop (blocks until cancelled) |
+| `Run`            | `(ctx context.Context, nodeID string) error`                           | One pass at start, then one per tick (blocks until cancelled) |
 
 ### VerifyBinary
 
@@ -238,10 +258,24 @@ Logger is tagged with `component=integrity`.
 2. Updates `BinaryChecksum()` value under mutex
 3. Loads baseline from `Store.Get`
 4. No baseline: stores as new baseline via `Store.Set`
-5. Match: logs info
-6. Mismatch: logs error, reports violation via `ViolationReporter`
+5. Match: logs `binary verified`
+6. Mismatch: logs `binary integrity violation` at Error and hands the violation to `reportAndAdopt`, which reports it via `ViolationReporter` and moves the baseline once the report is accepted
 
-Violations are non-fatal: the agent continues running after reporting.
+Violations are non-fatal: the agent continues running after reporting. A binary that cannot be hashed returns the error after logging `binary hash failed`.
+
+### Report Once, Then Adopt
+
+`VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` hand every mismatch to `reportAndAdopt`, together with the artifact's path, which is its store key, and the observed value: the hex digest, or the `SHA256:<base64>` fingerprint of the host key. `reportAndAdopt` reports them in the chunks [ViolationReporter](#violationreporter) describes and settles each chunk on its own:
+
+- **Chunk accepted** (`ReportViolations` returns nil): calls `Store.Set(path, observed)` for every entry of the chunk and logs `integrity baseline updated`. The next pass finds a match and reports nothing.
+- **Chunk failed**: logs `failed to report integrity violations` at Warn and moves none of its baselines. The next pass finds the same divergence and reports it again, until a report goes through.
+- **`Store.Set` failed** after an accepted report: logs `failed to store integrity baseline` at Warn. `Set` updates its map before it writes the file, so this process stays quiet, and the next start, which reads the old file, reports the divergence once more.
+
+A mismatch whose digest will not convert to the wire form cannot be reported on any pass, so the check adopts the observed value directly and logs `integrity baseline updated`.
+
+The three checks hold one mutex, `checkMu`, for their whole body, so the watcher's sweep and a tick that find the same change report it once. `BinaryChecksum()` takes a separate mutex and never waits on a report.
+
+`VerifyHook` does not adopt: its expected value is the executor's pin, not a store entry, so it reports a mismatch and writes nothing to the store.
 
 ### VerifyHook
 
@@ -252,19 +286,13 @@ Violations are non-fatal: the agent continues running after reporting.
 
 ### BinaryChecksum
 
-Thread-safe getter protected by `sync.Mutex`. Returns empty string before any verification has run. Used for `HeartbeatRequest.BinaryChecksum`.
-
-```go
-heartbeat := api.HeartbeatRequest{
-    BinaryChecksum: verifier.BinaryChecksum(),
-}
-```
+Thread-safe getter protected by `sync.Mutex`. Returns the hex checksum the last `VerifyBinary` computed, and an empty string before the first pass has hashed the binary. `plexd up` does not read it: the heartbeat and the capability manifest carry the checksum computed once at start (see [HeartbeatRequest.BinaryChecksum](#heartbeatrequest-binarychecksum)).
 
 ### Run
 
-When `Config.Enabled` is `false`, returns immediately. Otherwise starts a `time.Ticker` at `Config.VerifyInterval` and calls `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` on each tick. Blocks until the context is cancelled.
+When `IsEnabled()` is `false`, logs `integrity verification disabled` and returns immediately. Otherwise makes one pass at once, calling `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` in that order, then starts a `time.Ticker` at `Config.VerifyInterval` and makes the same pass on each tick. An error from `VerifyBinary` or `VerifyHostKey` is logged at Error as `binary verification failed` or `host key verification failed` and stops neither the pass nor the loop. Blocks until the context is cancelled.
 
-When `WatchEnabled` is true and `HooksDir` is set, `Run` also watches `HooksDir`, set up through `fsutil.WatchDir`. A hook that vanishes while the watch is set up makes it set the watch up again, up to 10 attempts; a set-up failure is logged at Warn and the periodic sweep keeps running.
+When `IsWatchEnabled()` is true and `HooksDir` is set, `Run` also watches `HooksDir`, set up through `fsutil.WatchDir`. A hook that vanishes while the watch is set up makes it set the watch up again, up to 10 attempts; a set-up failure is logged at Warn and the periodic sweep keeps running. `Run` returns only after the watcher has returned, so a caller that waits for `Run` waits for the watcher too.
 
 ### Detectors
 
@@ -292,13 +320,13 @@ if err != nil {
 
 verifier := integrity.NewVerifier(cfg, store, reporter, logger)
 
-// Initial verification
-if err := verifier.VerifyBinary(ctx, nodeID); err != nil {
-    log.Fatal(err)
-}
-
-// Periodic re-verification (blocks)
-err := verifier.Run(ctx, nodeID)
+// One pass at once, then one per VerifyInterval, until ctx is cancelled.
+// wg.Wait() after the cancel also waits for the hooks-directory watcher.
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    _ = verifier.Run(ctx, nodeID)
+}()
 
 // Hook verification before execution
 ok, err := verifier.VerifyHook(ctx, nodeID, hookPath, expectedChecksum)
@@ -339,7 +367,9 @@ A digest that will not convert drops its own entry rather than the batch it trav
 
 ### HeartbeatRequest.BinaryChecksum
 
-The `BinaryChecksum` field in `api.HeartbeatRequest` (line 47 of `types.go`) is populated from `Verifier.BinaryChecksum()`. This allows the control plane to track which binary version each node is running.
+The `BinaryChecksum` field in `api.HeartbeatRequest` carries the SHA-256 of the running binary, so the control plane can track which binary each node runs. `plexd up` computes it once at start with `integrity.SelfChecksum()`, which hashes `os.Executable()`, converts it with `integrity.WireChecksum` into standard-padded base64, and sends that value in every heartbeat and as `binary_checksum` in the capability manifest. A binary that cannot be hashed fails the start with `plexd up: binary checksum: ...`.
+
+The value does not follow `Verifier.BinaryChecksum()`. A binary replaced under a running agent keeps the old checksum in the heartbeat and the manifest until the agent restarts; the next pass reports the change as a `binary_checksum` violation instead.
 
 ## Integration Points
 
@@ -363,19 +393,27 @@ func (r *controlPlaneReporter) ReportViolations(ctx context.Context, nodeID stri
 
 ### With internal/registration
 
-`Config.BinaryPath` is typically resolved from `os.Executable()` followed by `filepath.EvalSymlinks` during agent bootstrap, matching the pattern in `internal/registration`.
+A report needs the node ID that `registrar.Register` returns and the bearer token it sets on the control plane client, so `plexd up` starts `Run` only after registration. Before that, at step 9, it fills an empty `Config.BinaryPath` when integrity is enabled:
+
+```go
+func SelfPath() (string, error)
+```
+
+`SelfPath` returns `os.Executable()` followed by `filepath.EvalSymlinks`, each error wrapped as `integrity: self path: ...`. `plexd up` stores the result in `BinaryPath` before `integrity.NewVerifier` and fails with `plexd up: integrity binary path: ...` when it cannot resolve the path. A configured `binary_path` is used as written. The resolved path is the store key and the report's `artifact_id`.
 
 ## Error Handling
 
 | Scenario                       | Behavior                                        |
 |--------------------------------|-------------------------------------------------|
-| Binary file unreadable         | `VerifyBinary` returns error, logged at error   |
+| Binary file unreadable         | `VerifyBinary` returns error, logged at error; `Run` logs `binary verification failed` and goes on with the pass |
+| Host key unparsable            | `VerifyHostKey` returns error, logged at error; `Run` logs `host key verification failed`, and the next tick still runs |
 | Hook file unreadable           | `VerifyHook` returns error                      |
-| Violation report fails         | Logged at warn level, agent continues           |
-| Store persistence fails        | Error returned from `Set`/`Remove`              |
+| Violation report fails         | Logged at warn level, agent continues; the baseline stays and the next pass reports again |
+| Store persistence fails        | Error returned from `Set`/`Remove`; after an accepted report, logged as `failed to store integrity baseline` |
 | Empty expected checksum (hook) | Error returned (hooks require checksum)         |
-| Context cancelled              | `Run` loop exits cleanly, no goroutine leaks    |
-| Disabled config                | `Run` returns immediately, no checksums computed|
+| Digest will not convert        | No report; the observed value becomes the baseline |
+| Context cancelled              | `Run` loop exits cleanly after the watcher has returned, no goroutine leaks |
+| Disabled config                | `Run` returns immediately, no baseline check runs; `VerifyHook` still checks every hook before it runs |
 
 ## Logging
 
@@ -383,14 +421,23 @@ All log entries use `component=integrity`.
 
 | Level   | Event                         | Keys                                     |
 |---------|-------------------------------|------------------------------------------|
-| `Info`  | Binary baseline established   | `path`, `checksum`                       |
-| `Info`  | Binary verified               | `path`, `checksum`                       |
-| `Info`  | Hook verified                 | `path`, `checksum`                       |
-| `Info`  | Verification disabled         | —                                        |
-| `Error` | Binary integrity violation    | `path`, `expected_checksum`, `actual_checksum` |
-| `Error` | Hook integrity violation      | `path`, `expected_checksum`, `actual_checksum` |
-| `Error` | Binary hash failed            | `path`, `error`                          |
-| `Error` | Periodic verification failed  | `error`                                  |
-| `Warn`  | Failed to report violation    | `error`                                  |
+| `Info`  | binary baseline established   | `path`, `checksum`                       |
+| `Info`  | binary verified               | `path`, `checksum`                       |
+| `Info`  | hook baseline established     | `path`, `checksum`                       |
+| `Info`  | hook verified                 | `path`, `checksum`                       |
+| `Info`  | host key baseline established | `path`, `fingerprint`                    |
+| `Info`  | host key verified             | `path`, `fingerprint`                    |
+| `Info`  | integrity baseline updated    | `path`                                   |
+| `Info`  | integrity verification disabled | —                                      |
+| `Error` | binary integrity violation    | `path`, `expected_checksum`, `actual_checksum` |
+| `Error` | hook integrity violation      | `path`, `expected_checksum`, `actual_checksum` |
+| `Error` | host key integrity violation  | `path`, `expected_fingerprint`, `observed_fingerprint` |
+| `Error` | binary hash failed            | `path`, `error`                          |
+| `Error` | host key fingerprint failed   | `path`, `error`                          |
+| `Error` | binary verification failed    | `error`                                  |
+| `Error` | host key verification failed  | `error`                                  |
+| `Warn`  | failed to report integrity violations | `count`, `error`                 |
+| `Warn`  | failed to store integrity baseline | `path`, `error`                     |
+| `Warn`  | failed to store hook baseline | `path`, `error`                          |
 | `Warn`  | integrity: a hook vanished while the watch was set up; retrying | `path`, `error` |
 | `Warn`  | integrity: failed to watch hooks dir | `path`, `error`                   |
