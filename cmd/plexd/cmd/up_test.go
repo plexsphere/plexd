@@ -31,12 +31,14 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/health"
+	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/kubernetes"
 	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
@@ -3585,13 +3587,29 @@ func assertWireDigest(t *testing.T, field, value string) {
 // counts heartbeats too, which is how they see the daemon still running.
 //
 // A state pull answers what setState stored, and {} until then. A hook version
-// fetch is counted and answered {}, which no installer accepts.
+// fetch is counted and answered {}, which no installer accepts. An integrity
+// violation report is kept with its path and answered 200 {}, which the client
+// accepts without decoding.
 type capabilityCapture struct {
 	mu          sync.Mutex
 	bodies      [][]byte
 	heartbeats  int
 	state       []byte
 	hookFetches int
+	integrity   []integrityRequest
+}
+
+// integrityRequest is one POST of integrity violations the capture received.
+type integrityRequest struct {
+	path string
+	body []byte
+}
+
+// integrityRequests returns every integrity violation report received so far.
+func (cp *capabilityCapture) integrityRequests() []integrityRequest {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return append([]integrityRequest(nil), cp.integrity...)
 }
 
 // setState makes every later state pull answer body.
@@ -3653,6 +3671,11 @@ func (cp *capabilityCapture) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/hooks/"):
 		cp.mu.Lock()
 		cp.hookFetches++
+		cp.mu.Unlock()
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/integrity-violations"):
+		raw, _ := io.ReadAll(r.Body)
+		cp.mu.Lock()
+		cp.integrity = append(cp.integrity, integrityRequest{path: r.URL.Path, body: raw})
 		cp.mu.Unlock()
 	}
 	_, _ = w.Write([]byte("{}"))
@@ -3717,6 +3740,212 @@ func useRecordingDaemonLog(t *testing.T) *recordingHandler {
 	t.Cleanup(func() { newLogHandler = old })
 	newLogHandler = func(slog.Level) slog.Handler { return rec }
 	return rec
+}
+
+// seedIntegrityBaselines writes checksums.json into dataDir with two baselines
+// the daemon will not match: a digest the test binary does not have under
+// integrity.SelfPath(), and under the host key path the fingerprint of a
+// throwaway key, since runUp generates a fresh one. It returns the self path
+// and the two seeded values.
+func seedIntegrityBaselines(t *testing.T, dataDir string) (selfPath, seededDigest, seededFingerprint string) {
+	t.Helper()
+	selfPath, err := integrity.SelfPath()
+	if err != nil {
+		t.Fatalf("integrity.SelfPath(): %v", err)
+	}
+	throwaway, err := tunnel.GenerateHostKey()
+	if err != nil {
+		t.Fatalf("generate throwaway host key: %v", err)
+	}
+	seededDigest = strings.Repeat("ab", sha256.Size)
+	seededFingerprint = ssh.FingerprintSHA256(throwaway.PublicKey())
+
+	store, err := integrity.NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("open integrity store: %v", err)
+	}
+	if err := store.Set(selfPath, seededDigest); err != nil {
+		t.Fatalf("seed binary baseline: %v", err)
+	}
+	if err := store.Set(tunnel.HostKeyPath(dataDir), seededFingerprint); err != nil {
+		t.Fatalf("seed host key baseline: %v", err)
+	}
+	return selfPath, seededDigest, seededFingerprint
+}
+
+// plexd up runs the integrity verifier after registration: its startup pass
+// compares the running binary and the host key the daemon generated against
+// the seeded baselines, reports both divergences on the wire, and adopts the
+// observed values once the control plane accepted them.
+func TestRunUp_ReportsBaselineMismatchesAtStartup(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("PLEXD_HOOKS_DIR", t.TempDir())
+
+	cp, apiBase := newCapabilityCapture(t)
+	dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t))
+	selfPath, seededDigest, seededFingerprint := seedIntegrityBaselines(t, dataDir)
+	hostKeyPath := tunnel.HostKeyPath(dataDir)
+
+	observedDigest, err := integrity.HashFile(selfPath)
+	if err != nil {
+		t.Fatalf("hash the test binary: %v", err)
+	}
+
+	rec := useRecordingDaemonLog(t)
+	shutdown := startRunUp(t)
+	var once sync.Once
+	stop := func() { once.Do(shutdown) }
+	defer stop()
+
+	received := func() []api.IntegrityViolationReport {
+		var out []api.IntegrityViolationReport
+		for _, req := range cp.integrityRequests() {
+			var body api.IntegrityViolationsRequest
+			if err := json.Unmarshal(req.body, &body); err != nil {
+				t.Fatalf("decode integrity violations: %v (body: %s)", err, req.body)
+			}
+			out = append(out, body.Violations...)
+		}
+		return out
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for len(received()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("integrity violations received = %+v, want the binary and the host key", received())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The key runUp generated is on disk by now: the host key violation
+	// carries its fingerprint.
+	keyPEM, err := os.ReadFile(hostKeyPath)
+	if err != nil {
+		t.Fatalf("read the generated host key: %v", err)
+	}
+	signer, err := ssh.ParsePrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse the generated host key: %v", err)
+	}
+	observedFingerprint := ssh.FingerprintSHA256(signer.PublicKey())
+
+	// Adoption follows the accepted response, so wait for it on disk before
+	// cancelling: a cancel while the response is in flight would fail the
+	// report and keep the old baseline.
+	for {
+		store, err := integrity.NewStore(dataDir)
+		if err == nil && store.Get(selfPath) == observedDigest && store.Get(hostKeyPath) == observedFingerprint {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("checksums.json never adopted the observed values (last error %v)", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+
+	// runUp returns nil after a drain timeout too, so only the warning shows
+	// that the verifier's goroutine kept the drain waiting.
+	if n := rec.count(slog.LevelWarn, "drain timeout exceeded, forcing exit"); n != 0 {
+		t.Errorf("the drain timed out: the integrity verifier did not return when its context ended")
+	}
+
+	wire := func(hexDigest string) string {
+		t.Helper()
+		w, err := integrity.WireChecksum(hexDigest)
+		if err != nil {
+			t.Fatalf("WireChecksum(%q): %v", hexDigest, err)
+		}
+		return w
+	}
+	want := []api.IntegrityViolationReport{
+		{
+			Kind:             api.IntegrityKindBinaryChecksum,
+			DetectedBy:       api.IntegrityDetectorStartupScan,
+			ArtifactID:       selfPath,
+			ObservedChecksum: wire(observedDigest),
+			ExpectedChecksum: wire(seededDigest),
+		},
+		{
+			Kind:                api.IntegrityKindSSHHostKey,
+			DetectedBy:          api.IntegrityDetectorStartupScan,
+			ArtifactID:          hostKeyPath,
+			ObservedFingerprint: observedFingerprint,
+			ExpectedFingerprint: seededFingerprint,
+		},
+	}
+	if got := received(); !reflect.DeepEqual(got, want) {
+		t.Errorf("integrity violations =\n  %+v\nwant\n  %+v", got, want)
+	}
+	wantPath := "/v1/nodes/" + upTestNodeID + "/integrity-violations"
+	for _, req := range cp.integrityRequests() {
+		if req.path != wantPath {
+			t.Errorf("integrity violations posted to %q, want %q", req.path, wantPath)
+		}
+	}
+
+	store, err := integrity.NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("reopen integrity store: %v", err)
+	}
+	if got := store.Get(selfPath); got != observedDigest {
+		t.Errorf("binary baseline after shutdown = %q, want the observed %q", got, observedDigest)
+	}
+	if got := store.Get(hostKeyPath); got != observedFingerprint {
+		t.Errorf("host key baseline after shutdown = %q, want the observed %q", got, observedFingerprint)
+	}
+}
+
+// integrity.enabled: false holds through defaulting, so plexd up runs no
+// baseline check: nothing is reported and checksums.json is left as it was.
+// The disabled message shows Run was started and returned, so the wait does
+// not depend on how long a check would have taken.
+func TestRunUp_IntegrityDisabledRunsNoChecks(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("PLEXD_HOOKS_DIR", t.TempDir())
+
+	cp, apiBase := newCapabilityCapture(t)
+	dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t)+"heartbeat:\n  interval: 100ms\nintegrity:\n  enabled: false\n")
+	seedIntegrityBaselines(t, dataDir)
+	storePath := filepath.Join(dataDir, "checksums.json")
+	before, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("read seeded checksums.json: %v", err)
+	}
+
+	rec := useRecordingDaemonLog(t)
+	shutdown := startRunUp(t)
+	var once sync.Once
+	stop := func() { once.Do(shutdown) }
+	defer stop()
+
+	cp.firstBody(t)
+	cp.waitForNextHeartbeat(t)
+	deadline := time.Now().Add(30 * time.Second)
+	for rec.count(slog.LevelInfo, "integrity verification disabled") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the integrity verifier never reported itself disabled")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+
+	if n := rec.count(slog.LevelWarn, "drain timeout exceeded, forcing exit"); n != 0 {
+		t.Errorf("the drain timed out: a goroutine did not return when its context ended")
+	}
+	if reqs := cp.integrityRequests(); len(reqs) != 0 {
+		t.Errorf("integrity violation reports = %d, want none (first: %s)", len(reqs), reqs[0].body)
+	}
+	after, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("read checksums.json after shutdown: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Errorf("checksums.json changed:\n  before %s\n  after  %s", before, after)
+	}
 }
 
 // The boot manifest is the first thing the control plane learns about a node's

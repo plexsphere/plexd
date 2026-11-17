@@ -778,7 +778,18 @@ func runAgent(ctx context.Context) error {
 		return buildHeartbeatRequest(wireChecksum, buildVersion, exchanger.LastResult())
 	})
 
-	// 9. Create integrity verifier for hook execution.
+	// 9. Create the integrity verifier. The executor uses it for hook
+	// execution, and step 20c runs its baseline checks of the binary, the
+	// hooks directory and the SSH host key. An empty binary_path means the
+	// running executable, resolved through symlinks; a configured one is used
+	// as written.
+	if cfg.Integrity.IsEnabled() && cfg.Integrity.BinaryPath == "" {
+		selfPath, err := integrity.SelfPath()
+		if err != nil {
+			return fmt.Errorf("plexd up: integrity binary path: %w", err)
+		}
+		cfg.Integrity.BinaryPath = selfPath
+	}
 	integrityStore, err := integrity.NewStore(cfg.DataDir)
 	if err != nil {
 		return fmt.Errorf("plexd up: integrity store: %w", err)
@@ -1452,6 +1463,17 @@ func runAgent(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		plexdHooks.run(ctx, capabilityReporter.Notify)
+	}()
+
+	// 20c. Start the integrity verifier. It checks the binary, the hooks
+	// directory and the SSH host key once now and then every verify_interval,
+	// reports a divergence once and adopts it as the new baseline. Its first
+	// report needs the registered node ID and the host key generated above.
+	// It returns at once when integrity.enabled is false.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = integrityVerifier.Run(ctx, identity.NodeID)
 	}()
 
 	// 21. Start metrics manager.
