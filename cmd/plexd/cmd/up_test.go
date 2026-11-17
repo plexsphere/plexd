@@ -2497,6 +2497,11 @@ func TestNoProductionCodeOutsideRegistrationSetsTheBearer(t *testing.T) {
 			if d.Name() == ".git" || d.Name() == "vendor" {
 				return filepath.SkipDir
 			}
+			// tools/ is build and docs tooling, not code plexd ships:
+			// the docs figure generator names SetAuthToken in labels.
+			if path == filepath.Join(root, "tools") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(d.Name(), ".go") || strings.HasSuffix(d.Name(), "_test.go") {
