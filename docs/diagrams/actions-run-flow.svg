@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="933" height="877" viewBox="0 0 933 877" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="From the run goroutine to the terminal callback">
+<title>From the run goroutine to the terminal callback</title>
+<rect width="933" height="877" fill="#F6F5F1"/>
+<rect x="283.25" y="40" width="340" height="103" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="453.25" y="69.1" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">goroutine</text>
+<text x="453.25" y="89.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">runAction</text>
+<text x="453.25" y="109.45" font-size="17" fill="#55606E" text-anchor="middle">reads the hook sidecar</text>
+<text x="453.25" y="128.9" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">runBound</text>
+<rect x="40" y="283" width="320" height="61" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="200" y="309.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">runBuiltin</text>
+<text x="200" y="329.65" font-size="17" fill="#55606E" text-anchor="middle">calls its function</text>
+<rect x="520" y="283" width="373" height="259" rx="6" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<polyline points="520,324 893,324" fill="none" stroke="#2F8A57" stroke-width="1.5"/>
+<text x="534" y="309.45" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40">runHook</text>
+<text x="534" y="347.95" font-size="17" font-weight="700" fill="#1E6B40">1</text>
+<text x="559.83" y="347.95" font-size="17" fill="#2B3440">path traversal check</text>
+<text x="534" y="373.95" font-size="17" font-weight="700" fill="#1E6B40">2</text>
+<text x="559.83" y="373.95" font-size="17" fill="#2B3440">discovery-snapshot lookup</text>
+<text x="534" y="399.95" font-size="17" font-weight="700" fill="#1E6B40">3</text>
+<text x="559.83" y="399.95" font-size="17" fill="#2B3440">file checks: links, type, owner, mode</text>
+<text x="534" y="425.95" font-size="17" font-weight="700" fill="#1E6B40">4</text>
+<text x="559.83" y="425.95" font-size="17" fill="#2B3440">verify against the pinned digest</text>
+<text x="534" y="451.95" font-size="17" font-weight="700" fill="#1E6B40">5</text>
+<text x="559.83" y="451.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">exec.CommandContext</text>
+<text x="559.83" y="477.95" font-size="17" fill="#2B3440">in its own process group</text>
+<text x="534" y="503.95" font-size="17" font-weight="700" fill="#1E6B40">6</text>
+<text x="559.83" y="503.95" font-size="17" fill="#2B3440">capture stdout and stderr</text>
+<text x="534" y="529.95" font-size="17" font-weight="700" fill="#1E6B40">7</text>
+<text x="559.83" y="529.95" font-size="17" fill="#2B3440">truncate to MaxOutputBytes</text>
+<polyline points="393.25,143 393.25,193 200,193 200,274" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="200,283 194,270 206,270" fill="#3A4452"/>
+<text x="190" y="243.95" font-size="17" fill="#55606E" text-anchor="end">builtin</text>
+<polyline points="513.25,143 513.25,193 706.5,193 706.5,274" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="706.5,283 700.5,270 712.5,270" fill="#3A4452"/>
+<text x="716.5" y="243.95" font-size="17" fill="#55606E">hook</text>
+<rect x="120" y="622" width="666.5" height="61" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="453.25" y="648.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ExecutionCallback</text>
+<text x="453.25" y="668.65" font-size="17" fill="#55606E" text-anchor="middle">terminal</text>
+<polyline points="200,344 200,613" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="200,622 194,609 206,609" fill="#3A4452"/>
+<polyline points="706.5,542 706.5,613" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="706.5,622 700.5,609 712.5,609" fill="#3A4452"/>
+<rect x="283.25" y="793" width="340" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="453.25" y="822" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
+<polyline points="453.25,683 453.25,784" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="453.25,793 447.25,780 459.25,780" fill="#B38A00"/>
+<text x="463.25" y="733.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">POST /v1/nodes/{id}/executions/{eid}</text>
+<text x="463.25" y="753.55" font-size="17" fill="#55606E">ack → started → succeeded | failed | cancelled</text>
+</svg>

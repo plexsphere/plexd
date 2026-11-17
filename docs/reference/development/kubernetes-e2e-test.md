@@ -10,23 +10,7 @@ Validates that plexd deployed as a Kubernetes DaemonSet successfully registers, 
 
 ## Cluster Topology
 
-```
-┌─────────────────────────────────────────────────┐
-│              kind cluster (plexd-e2e)            │
-│                                                  │
-│  ┌──────────────┐       ┌──────────────────┐    │
-│  │   mock-api   │◄──────│  plexd DaemonSet │    │
-│  │  Deployment  │       │  (host network)  │    │
-│  │  :8080 (HTTP)│       │  1 pod per node  │    │
-│  │  :8443 (TLS) │       │                  │    │
-│  └──────────────┘       └──────────────────┘    │
-│  ClusterIP Service                               │
-│  mock-api.plexd-e2e:8080, :8443                  │
-└─────────────────────────────────────────────────┘
-        │ port-forward :18080
-        ▼
-   localhost:18080/test/assertions
-```
+![Inside the kind cluster plexd-e2e, the plexd DaemonSet, one pod per node on the host network, calls the mock-api Deployment, which listens on port 8080 for HTTP and on port 8443 for TLS behind the ClusterIP Service mock-api.plexd-e2e on ports 8080 and 8443. A port-forward on port 18080 lets the test script read localhost:18080/test/assertions.](../../diagrams/development-kubernetes-topology.svg)
 
 | Component | Image | Source | Purpose |
 |-----------|-------|--------|---------|

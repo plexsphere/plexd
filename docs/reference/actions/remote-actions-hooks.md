@@ -16,85 +16,9 @@ The `action_request` SSE event is a push-latency optimisation only. Its payload 
 
 ## Data Flow
 
-```text
-Control Plane
-       │  executions block of GET /v1/nodes/{id}/state
-       ▼
-┌──────────────────────┐
-│ Reconciler dispatch  │  reconcile.DispatchHandler, invoked after every
-│  stage               │  successful FetchState and BEFORE the diff
-└──────────┬───────────┘
-           │ *api.NodeStateSnapshot
-           ▼
-┌──────────────────────┐
-│ Dispatcher.Handle    │  per entry, in block order
-│  (dispatch.go)       │
-└──────────┬───────────┘
-           │
-     ┌─────┴──────────────────────────────────────┐
-     │ 0. cancel requested, run active → Cancel   │
-     │ 1. no execution_id?    → drop, no callback │
-     │ 2. already handled?    → skip              │
-     │ 3. run still active?   → skip              │
-     │ 4. budget short of one? → stop, next pull  │
-     │ 5. expires_at absent/lapsed? → skip        │
-     │ 6. status pending/ack  → Executor.Execute  │
-     │    (cancel requested   → not started)      │
-     │    (actions disabled   → reject)           │
-     │ 7. status started      → Resume a          │
-     │    plexd_hook entry, else FailOrphan       │
-     └──────────┬─────────────────────────────────┘
-                │ status pending | ack
-                ▼
-┌──────────────────────┐
-│ Executor.Execute     │
-│  (executor.go)       │
-└──────────┬───────────┘
-           │
-     ┌─────┴──────────────────────────────────────────┐
-     │ 1. shuttingDown / active id / MaxConcurrent    │
-     │    → ErrDispatchDeferred (no callback, retry)  │
-     │ 2. Look up action in the registry the entry's  │
-     │    type names → unknown_action rejects; a      │
-     │    plexd_hook entry is looked up by its run.   │
-     │    Another type, or plexd_hook with no runner  │
-     │    → unsupported_action_type                   │
-     │ 3. Claim: post ack (only when status is        │
-     │    pending), then started — both before the run│
-     └──────────┬─────────────────────────────────────┘
-                │ if accepted; a plexd_hook entry runs
-                │ runPlexdHook instead (Kubernetes CRD Hooks)
-                ▼
-        ┌───────────────┐
-        │  goroutine    │
-        │  runAction    │
-        │  hook sidecar │
-        │  runBound     │
-        └───┬───────┬───┘
-            │       │
-   builtin  │       │ hook
-            ▼       ▼
-     ┌──────────┐ ┌───────────────────────────────┐
-     │runBuiltin│ │runHook                        │
-     │ call fn  │ │ 1. Path traversal check       │
-     └────┬─────┘ │ 2. Discovery-snapshot lookup  │
-          │       │ 3. File checks: links, type,  │
-          │       │    owner, mode                │
-          │       │ 4. Verify vs pinned digest    │
-          │       │ 5. exec.CommandContext in its │
-          │       │    own process group          │
-          │       │ 6. Capture stdout/stderr      │
-          │       │ 7. Truncate to MaxOutputBytes │
-          │       └─────────┬─────────────────────┘
-          │                 │
-          └────────┬────────┘
-                   │
-                   ▼
-          ┌──────────────────────┐
-          │ ExecutionCallback    │  POST /v1/nodes/{id}/executions/{eid}
-          │ (terminal)           │  (ack → started → succeeded|failed|cancelled)
-          └──────────────────────┘
-```
+![The control plane serves the executions block of GET /v1/nodes/{id}/state to the Reconciler dispatch stage, reconcile.DispatchHandler, which is invoked after every successful FetchState and before the diff and hands the NodeStateSnapshot to Dispatcher.Handle in dispatch.go. Dispatcher.Handle takes each entry in block order: 0, a cancel request for a run that is active goes to Executor.Cancel; 1, an entry with no execution_id is dropped with no callback; 2, an entry already handled is skipped; 3, a run still active is skipped; 4, a pass budget short of one settlement stops the pass until the next pull; 5, an entry whose expires_at is absent is refused, marked settled and logged at warn, and one whose expires_at is not after now is skipped; 6, status pending or ack goes to Executor.Execute, except that a cancel request means not started and disabled actions mean a rejection; 7, status started resumes a plexd_hook entry and otherwise calls FailOrphan. Executor.Execute in executor.go then checks: 1, shuttingDown, an active id or MaxConcurrent returns ErrDispatchDeferred, with no callback and a retry; 2, it looks the action up in the registry the entry's type names, rejects an action it does not find with unknown_action, looks a plexd_hook entry up by its run, and rejects another type or a plexd_hook entry with no runner with unsupported_action_type; 3, it claims the execution by posting ack, only when the status is pending, then started, both before the run. If accepted, a goroutine runs runAction, which reads the hook sidecar and calls runBound; a plexd_hook entry runs runPlexdHook instead.](../../diagrams/actions-dispatch-flow.svg)
+
+![The run goroutine, runAction, reads the hook sidecar and calls runBound, then branches. A builtin goes to runBuiltin, which calls its function. A hook goes to runHook, which 1 checks the name for path traversal, 2 looks the hook up in the discovery snapshot, 3 checks the file for links, type, owner and mode, 4 verifies it against the pinned digest, 5 starts it with exec.CommandContext in its own process group, 6 captures stdout and stderr, and 7 truncates the output to MaxOutputBytes. Both branches end in the terminal ExecutionCallback, which posts to the control plane at POST /v1/nodes/{id}/executions/{eid}; the execution moves from ack to started to succeeded, failed or cancelled.](../../diagrams/actions-run-flow.svg)
 
 ## Config
 

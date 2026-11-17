@@ -10,43 +10,7 @@ The `internal/integrity` package verifies the integrity of the plexd binary, hoo
 
 ## Data Flow
 
-```
-Startup
-   │
-   ▼
-┌─────────────────┐
-│ Verifier.Run    │
-│  VerifyBinary   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌─────────────┐
-│ HashFile(binary)│────▶│ Store.Get   │
-│ (crypto/sha256) │     │  (baseline) │
-└────────┬────────┘     └──────┬──────┘
-         │                     │
-         ▼                     ▼
-   ┌───────────────────────────────┐
-   │        Compare checksums      │
-   └──────────┬──────────┬─────────┘
-              │          │
-      match   │          │ mismatch
-              ▼          ▼
-        ┌─────────┐  ┌───────────────────┐
-        │ Log OK  │  │ ViolationReporter │
-        └─────────┘  │  .ReportViolations│
-                     └───────────────────┘
-                              │
-                              ▼
-                     POST /v1/nodes/{id}/
-                      integrity-violations
-
-   ─── periodic ticker at VerifyInterval ───
-              │
-              ▼
-   Re-run VerifyBinary, VerifyHooksDir,
-             VerifyHostKey
-```
+![At startup, Verifier.Run runs VerifyBinary: HashFile computes the SHA-256 checksum of the binary with crypto/sha256, Store.Get loads the stored baseline, and the two checksums are compared. A match is logged as OK. A mismatch goes to ViolationReporter.ReportViolations, which posts it to the control plane at POST /v1/nodes/{id}/integrity-violations. Apart from startup, a periodic ticker at VerifyInterval re-runs VerifyBinary, VerifyHooksDir and VerifyHostKey.](../../diagrams/actions-integrity-verification.svg)
 
 ### Startup Sequence
 

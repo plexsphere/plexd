@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="282" viewBox="0 0 1140 282" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Services of the Docker end-to-end test">
+<title>Services of the Docker end-to-end test</title>
+<rect width="1140" height="282" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1060" height="202" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">e2e-net</text>
+<text x="170" y="71.45" font-size="17" fill="#55606E">Docker bridge network</text>
+<rect x="70" y="110" width="260" height="102" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="200" y="139.2" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">mock-api</text>
+<text x="200" y="159.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8080 (HTTP)</text>
+<text x="200" y="178.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8443 (TLS)</text>
+<text x="200" y="197.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">/v1/health</text>
+<rect x="440" y="110" width="260" height="102" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="570" y="148.2" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd</text>
+<text x="570" y="169.35" font-size="17" fill="#55606E" text-anchor="middle">the agent</text>
+<text x="570" y="188.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">depends_on: mock-api</text>
+<rect x="810" y="110" width="260" height="102" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="940" y="148.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">meshpeer</text>
+<text x="940" y="169" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg0</text>
+<text x="940" y="188.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.99.0.3</text>
+<polyline points="440,161 339,161" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="330,161 343,155 343,167" fill="#2457C5"/>
+<polyline points="709,161 801,161" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="810,161 797,167 797,155" fill="#2F8A57"/>
+<polygon points="700,161 713,155 713,167" fill="#2F8A57"/>
+<text x="755" y="150.45" font-size="17" fill="#55606E" text-anchor="middle">WireGuard</text>
+<text x="755" y="182.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:51820</text>
+</svg>

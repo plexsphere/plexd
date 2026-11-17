@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="631" viewBox="0 0 1060 631" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Lifecycle of a hook execution">
+<title>Lifecycle of a hook execution</title>
+<rect width="1060" height="631" fill="#F6F5F1"/>
+<rect x="40" y="40" width="186" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="133" y="79" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
+<rect x="595.5" y="40" width="95" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="643" y="69.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Node</text>
+<text x="643" y="89.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd</text>
+<polyline points="133,104 133,589.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="643,104 643,589.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="388" y="143.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{id}/state</text>
+<polyline points="643,154 142,154" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="133,154 146,148 146,160" fill="#2457C5"/>
+<text x="689" y="159.95" font-size="17" fill="#55606E">reconciliation pull</text>
+<text x="388" y="189.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">executions: [ entry ]</text>
+<polyline points="133,200 643,200" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="630,206 643,200 630,194" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="689" y="205.95" font-size="17" fill="#55606E">dispatch stage</text>
+<text x="388" y="236.45" font-size="17" fill="#55606E" text-anchor="middle">callback: ack</text>
+<polyline points="643,247 142,247" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="133,247 146,241 146,253" fill="#B38A00"/>
+<text x="689" y="252.95" font-size="17" fill="#55606E">claim</text>
+<text x="388" y="283.45" font-size="17" fill="#55606E" text-anchor="middle">callback: started</text>
+<polyline points="643,294 142,294" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="133,294 146,288 146,300" fill="#B38A00"/>
+<polyline points="643,318 679,318 679,358.8 652,358.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="643,358.8 656,352.8 656,364.8" fill="#3A4452"/>
+<text x="689" y="334.15" font-size="17" fill="#55606E">check the sidecar and the files</text>
+<text x="689" y="354.55" font-size="17" fill="#55606E">(a refusal reports failed)</text>
+<polyline points="643,384.8 679,384.8 679,412.8 652,412.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="643,412.8 656,406.8 656,418.8" fill="#3A4452"/>
+<text x="689" y="404.75" font-size="17" fill="#55606E">verify against the discovery digest</text>
+<polyline points="643,438.8 679,438.8 679,466.8 652,466.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="643,466.8 656,460.8 656,472.8" fill="#3A4452"/>
+<text x="689" y="458.75" font-size="17" fill="#55606E">execute the script</text>
+<polyline points="643,492.8 679,492.8 679,520.8 652,520.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="643,520.8 656,514.8 656,526.8" fill="#3A4452"/>
+<text x="689" y="512.75" font-size="17" fill="#55606E">capture stdout and stderr</text>
+<text x="388" y="559.25" font-size="17" fill="#55606E" text-anchor="middle">callback: succeeded</text>
+<polyline points="643,569.8 142,569.8" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="133,569.8 146,563.8 146,575.8" fill="#B38A00"/>
+<text x="689" y="565.55" font-size="17" fill="#55606E">report the terminal status and output;</text>
+<text x="689" y="585.95" font-size="17" fill="#55606E">the entry drains from the block</text>
+</svg>

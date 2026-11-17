@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="571" viewBox="0 0 1120 571" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The kind cluster of the Kubernetes end-to-end test">
+<title>The kind cluster of the Kubernetes end-to-end test</title>
+<rect width="1120" height="571" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1040" height="317" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">kind cluster</text>
+<text x="221" y="71.45" font-size="17" fill="#55606E">plexd-e2e</text>
+<rect x="80" y="110" width="340" height="103" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="250" y="139.1" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">mock-api</text>
+<text x="250" y="160.25" font-size="17" fill="#55606E" text-anchor="middle">Deployment</text>
+<text x="250" y="179.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8080 (HTTP)</text>
+<text x="250" y="198.9" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8443 (TLS)</text>
+<rect x="700" y="110" width="340" height="103" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="870" y="148.1" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd DaemonSet</text>
+<text x="870" y="169.25" font-size="17" fill="#55606E" text-anchor="middle">host network</text>
+<text x="870" y="189.65" font-size="17" fill="#55606E" text-anchor="middle">1 pod per node</text>
+<polyline points="700,161.5 429,161.5" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="420,161.5 433,155.5 433,167.5" fill="#2457C5"/>
+<rect x="80" y="263" width="340" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="250" y="292.4" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">ClusterIP Service</text>
+<text x="250" y="312.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">mock-api.plexd-e2e:8080, :8443</text>
+<polyline points="250,213 250,263" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="80" y="467" width="340" height="64" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="250" y="496.4" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">test script</text>
+<text x="250" y="516.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">localhost:18080/test/assertions</text>
+<polyline points="250,327 250,458" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="250,467 244,454 256,454" fill="#3A4452"/>
+<text x="260" y="417.95" font-size="17" fill="#55606E">port-forward :18080</text>
+</svg>

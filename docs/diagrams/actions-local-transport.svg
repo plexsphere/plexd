@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1090" height="549" viewBox="0 0 1090 549" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="plexd actions run through the Unix socket">
+<title>plexd actions run through the Unix socket</title>
+<rect width="1090" height="549" fill="#F6F5F1"/>
+<rect x="40" y="210" width="1010" height="165" rx="12" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="56" y="243.2" font-size="22" font-weight="700" fill="#2B3440">plexd daemon</text>
+<rect x="70" y="280" width="200" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="170" y="309.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">validate</text>
+<text x="170" y="330.45" font-size="17" fill="#55606E" text-anchor="middle">the session JWT</text>
+<rect x="320" y="280" width="200" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="420" y="309.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">check</text>
+<text x="420" y="330.45" font-size="17" fill="#55606E" text-anchor="middle">the action scope</text>
+<polyline points="270,312.5 311,312.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="320,312.5 307,318.5 307,306.5" fill="#3A4452"/>
+<rect x="570" y="280" width="200" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="670" y="309.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">verify</text>
+<text x="670" y="330.45" font-size="17" fill="#55606E" text-anchor="middle">the hook integrity</text>
+<polyline points="520,312.5 561,312.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="570,312.5 557,318.5 557,306.5" fill="#3A4452"/>
+<rect x="820" y="280" width="200" height="65" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="920" y="309.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">execute</text>
+<text x="920" y="330.45" font-size="17" fill="#55606E" text-anchor="middle">the action</text>
+<polyline points="770,312.5 811,312.5" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="820,312.5 807,318.5 807,306.5" fill="#3A4452"/>
+<rect x="295.5" y="40" width="499" height="60" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="545" y="66.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">plexd actions run</text>
+<text x="545" y="85.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">diagnostics.collect --param include_network=true</text>
+<polyline points="545,100 545,201" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="545,210 539,197 551,197" fill="#2457C5"/>
+<text x="555" y="151.35" font-size="17" fill="#55606E">Unix socket</text>
+<text x="555" y="170.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">/var/run/plexd.sock</text>
+<rect x="750" y="465" width="300" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="900" y="494" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
+<polyline points="920,345 920,456" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="920,465 914,452 926,452" fill="#B38A00"/>
+<text x="910" y="425.95" font-size="17" fill="#55606E" text-anchor="end">report</text>
+</svg>

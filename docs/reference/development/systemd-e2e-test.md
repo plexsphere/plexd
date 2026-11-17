@@ -10,24 +10,7 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 
 ## Container Topology
 
-```
-┌──────────────┐       ┌─────────────────────────┐       ┌──────────────────────┐
-│   mock-api   │◄──────│   systemd container     │──────►│ ingress target       │
-│  :8080 (HTTP)│       │  (Ubuntu 24.04)         │       │  :9441-9443 (TLS)    │
-│  :8443 (TLS) │       │  systemd PID 1          │◄──────│  :9022 (banner)      │
-│  /v1/health  │       │  plexd.service managed  │ probes│  openssl, nc         │
-└──────────────┘       └─────────────────────────┘       └──────────────────────┘
-        │                   │ ACME          ▲                       │
-        │                   ▼               │ TLS-ALPN-01 on :443   │
-        │              ┌─────────────────────────┐                  │
-        │              │   pebble                │                  │
-        │              │  :14000 (ACME, HTTPS)   │                  │
-        │              │  Let's Encrypt test CA  │                  │
-        │              └─────────────────────────┘                  │
-        │                          │                                │
-        └──────────────────── plexd-systemd-e2e ────────────────────┘
-                              (Docker network)
-```
+![Four containers share the Docker network plexd-systemd-e2e. In the systemd container, Ubuntu 24.04 with systemd as PID 1, systemd manages plexd.service. plexd calls mock-api, which listens on port 8080 for HTTP and on port 8443 for TLS and serves /v1/health. plexd connects to the rule targets on the ingress target, which serves TLS on ports 9441 to 9443 and a banner on port 9022 and carries openssl and nc, and the ingress target probes plexd. plexd talks ACME to pebble, Let's Encrypt's test CA, on port 14000 over HTTPS, and pebble validates plexd with TLS-ALPN-01 on port 443.](../../diagrams/development-systemd-topology.svg)
 
 | Container | Image | Source | Purpose |
 |-----------|-------|--------|---------|

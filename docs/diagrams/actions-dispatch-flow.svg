@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1010" height="1379" viewBox="0 0 1010 1379" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="From the state pull to the run goroutine">
+<title>From the state pull to the run goroutine</title>
+<rect width="1010" height="1379" fill="#F6F5F1"/>
+<rect x="250" y="40" width="340" height="44" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="420" y="69" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
+<rect x="250" y="174" width="340" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="420" y="203" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Reconciler dispatch stage</text>
+<polyline points="420,84 420,174" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="414,161 420,174 426,161" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="430" y="125.35" font-size="17" fill="#55606E">executions block of</text>
+<text x="430" y="144.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">GET /v1/nodes/{id}/state</text>
+<rect x="640" y="160" width="330" height="80" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="654" y="185.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">reconcile.DispatchHandler</text>
+<text x="654" y="205.35" font-size="17" fill="#55606E">invoked after every successful</text>
+<text x="654" y="225.75" font-size="17" fill="#55606E">FetchState and before the diff</text>
+<polyline points="590,196 640,196" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="40" y="298" width="760" height="402" rx="6" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<polyline points="40,378 800,378" fill="none" stroke="#2F8A57" stroke-width="1.5"/>
+<text x="54" y="324.15" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40">Dispatcher.Handle</text>
+<text x="54" y="343.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">dispatch.go</text>
+<text x="54" y="363.75" font-size="17" fill="#55606E">per entry, in block order</text>
+<text x="54" y="401.95" font-size="17" font-weight="700" fill="#1E6B40">0</text>
+<text x="79.83" y="401.95" font-size="17" fill="#2B3440">cancel requested, run active</text>
+<text x="401.04" y="401.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="401.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">Executor.Cancel</text>
+<text x="54" y="427.95" font-size="17" font-weight="700" fill="#1E6B40">1</text>
+<text x="79.83" y="427.95" font-size="17" fill="#2B3440">no execution_id</text>
+<text x="401.04" y="427.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="427.95" font-size="17" fill="#2B3440">drop, no callback</text>
+<text x="54" y="453.95" font-size="17" font-weight="700" fill="#1E6B40">2</text>
+<text x="79.83" y="453.95" font-size="17" fill="#2B3440">already handled</text>
+<text x="401.04" y="453.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="453.95" font-size="17" fill="#2B3440">skip</text>
+<text x="54" y="479.95" font-size="17" font-weight="700" fill="#1E6B40">3</text>
+<text x="79.83" y="479.95" font-size="17" fill="#2B3440">run still active</text>
+<text x="401.04" y="479.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="479.95" font-size="17" fill="#2B3440">skip</text>
+<text x="54" y="505.95" font-size="17" font-weight="700" fill="#1E6B40">4</text>
+<text x="79.83" y="505.95" font-size="17" fill="#2B3440">pass budget short of one settlement</text>
+<text x="401.04" y="505.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="505.95" font-size="17" fill="#2B3440">stop, next pull</text>
+<text x="54" y="531.95" font-size="17" font-weight="700" fill="#1E6B40">5</text>
+<text x="79.83" y="531.95" font-size="17" fill="#2B3440">expires_at absent</text>
+<text x="401.04" y="531.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="531.95" font-size="17" fill="#2B3440">refuse, mark settled, warn</text>
+<text x="79.83" y="557.95" font-size="17" fill="#2B3440">expires_at not after now</text>
+<text x="401.04" y="557.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="557.95" font-size="17" fill="#2B3440">skip</text>
+<text x="54" y="583.95" font-size="17" font-weight="700" fill="#1E6B40">6</text>
+<text x="79.83" y="583.95" font-size="17" fill="#2B3440">status pending or ack</text>
+<text x="401.04" y="583.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="583.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">Executor.Execute</text>
+<text x="79.83" y="609.95" font-size="17" fill="#2B3440" xml:space="preserve">   and cancel requested</text>
+<text x="401.04" y="609.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="609.95" font-size="17" fill="#2B3440">not started</text>
+<text x="79.83" y="635.95" font-size="17" fill="#2B3440" xml:space="preserve">   and actions disabled</text>
+<text x="401.04" y="635.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="635.95" font-size="17" fill="#2B3440">reject</text>
+<text x="54" y="661.95" font-size="17" font-weight="700" fill="#1E6B40">7</text>
+<text x="79.83" y="661.95" font-size="17" fill="#2B3440">status started</text>
+<text x="401.04" y="661.95" font-size="17" fill="#7D8794">→</text>
+<text x="432.32" y="661.95" font-size="17" fill="#2B3440">Resume a plexd_hook entry,</text>
+<text x="432.32" y="687.95" font-size="17" fill="#2B3440">else FailOrphan</text>
+<polyline points="420,218 420,289" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="420,298 414,285 426,285" fill="#3A4452"/>
+<text x="430" y="263.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">*api.NodeStateSnapshot</text>
+<rect x="40" y="780" width="760" height="356" rx="6" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<polyline points="40,840 800,840" fill="none" stroke="#2F8A57" stroke-width="1.5"/>
+<text x="54" y="806.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40">Executor.Execute</text>
+<text x="54" y="825.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">executor.go</text>
+<text x="54" y="863.95" font-size="17" font-weight="700" fill="#1E6B40">1</text>
+<text x="79.83" y="863.95" font-size="17" fill="#2B3440">shuttingDown, active id or MaxConcurrent</text>
+<text x="450.81" y="863.95" font-size="17" fill="#7D8794">→</text>
+<text x="482.09" y="863.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">ErrDispatchDeferred</text>
+<text x="482.09" y="889.95" font-size="17" fill="#2B3440">no callback, retry</text>
+<text x="54" y="915.95" font-size="17" font-weight="700" fill="#1E6B40">2</text>
+<text x="79.83" y="915.95" font-size="17" fill="#2B3440">look up the action in the registry</text>
+<text x="79.83" y="941.95" font-size="17" fill="#2B3440">the entry's type names</text>
+<text x="79.83" y="967.95" font-size="17" fill="#2B3440" xml:space="preserve">   not found</text>
+<text x="450.81" y="967.95" font-size="17" fill="#7D8794">→</text>
+<text x="482.09" y="967.95" font-size="17" fill="#2B3440">reject: unknown_action</text>
+<text x="79.83" y="993.95" font-size="17" fill="#2B3440" xml:space="preserve">   a plexd_hook entry</text>
+<text x="450.81" y="993.95" font-size="17" fill="#7D8794">→</text>
+<text x="482.09" y="993.95" font-size="17" fill="#2B3440">looked up by its run</text>
+<text x="79.83" y="1019.95" font-size="17" fill="#2B3440" xml:space="preserve">   another type</text>
+<text x="450.81" y="1019.95" font-size="17" fill="#7D8794">→</text>
+<text x="482.09" y="1019.95" font-size="17" fill="#2B3440">reject: unsupported_action_type</text>
+<text x="79.83" y="1045.95" font-size="17" fill="#2B3440" xml:space="preserve">   plexd_hook with no runner</text>
+<text x="450.81" y="1045.95" font-size="17" fill="#7D8794">→</text>
+<text x="482.09" y="1045.95" font-size="17" fill="#2B3440">reject: unsupported_action_type</text>
+<text x="54" y="1071.95" font-size="17" font-weight="700" fill="#1E6B40">3</text>
+<text x="79.83" y="1071.95" font-size="17" fill="#2B3440">claim</text>
+<text x="450.81" y="1071.95" font-size="17" fill="#7D8794">→</text>
+<text x="482.09" y="1071.95" font-size="17" fill="#2B3440">post ack (only when status is</text>
+<text x="482.09" y="1097.95" font-size="17" fill="#2B3440">pending), then started, both</text>
+<text x="482.09" y="1123.95" font-size="17" fill="#2B3440">before the run</text>
+<polyline points="420,700 420,771" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="420,780 414,767 426,767" fill="#3A4452"/>
+<text x="430" y="745.95" font-size="17" fill="#55606E">status pending or ack</text>
+<rect x="250" y="1236" width="340" height="103" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="420" y="1265.1" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">goroutine</text>
+<text x="420" y="1285.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">runAction</text>
+<text x="420" y="1305.45" font-size="17" fill="#55606E" text-anchor="middle">reads the hook sidecar</text>
+<text x="420" y="1324.9" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">runBound</text>
+<polyline points="420,1136 420,1227" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="420,1236 414,1223 426,1223" fill="#3A4452"/>
+<text x="430" y="1181.75" font-size="17" fill="#55606E">if accepted; a plexd_hook entry runs</text>
+<text x="430" y="1202.15" font-size="17" fill="#55606E">runPlexdHook instead (Kubernetes CRD Hooks)</text>
+</svg>

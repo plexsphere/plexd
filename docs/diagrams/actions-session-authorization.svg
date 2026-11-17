@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1074" height="958" viewBox="0 0 1074 958" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Authorizing an action run in an SSH session">
+<title>Authorizing an action run in an SSH session</title>
+<rect width="1074" height="958" fill="#F6F5F1"/>
+<rect x="40" y="40" width="88" height="65" rx="8" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="84" y="79.5" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">User</text>
+<rect x="320" y="40" width="148" height="65" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="394" y="69.3" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Platform</text>
+<text x="394" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">control plane</text>
+<rect x="705" y="40" width="138" height="65" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="774" y="69.3" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">plexd</text>
+<text x="774" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">target Node</text>
+<polyline points="84,105 84,918" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="394,105 394,918" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="774,105 774,918" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="239" y="145.45" font-size="17" fill="#55606E" text-anchor="middle">request an SSH session</text>
+<polyline points="84,156 385,156" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="394,156 381,162 381,150" fill="#2457C5"/>
+<polyline points="394,180 430,180 430,220.8 403,220.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="394,220.8 407,214.8 407,226.8" fill="#3A4452"/>
+<text x="440" y="196.15" font-size="17" fill="#55606E">check RBAC:</text>
+<text x="440" y="216.55" font-size="17" fill="#55606E">user × node × actions</text>
+<polyline points="394,246.8 430,246.8 430,286.4 403,286.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="394,286.4 407,280.4 407,292.4" fill="#3A4452"/>
+<text x="440" y="262.95" font-size="17" fill="#55606E">issue the session JWT</text>
+<text x="440" y="282.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">{ sub, node_id, actions, exp }</text>
+<text x="584" y="324.65" font-size="17" fill="#55606E" text-anchor="middle">the session, in the state</text>
+<text x="584" y="345.05" font-size="17" fill="#55606E" text-anchor="middle">pull's sessions block</text>
+<polyline points="394,355.4 774,355.4" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="761,361.4 774,355.4 761,349.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="774,379.4 810,379.4 810,407.4 783,407.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="774,407.4 787,401.4 787,413.4" fill="#3A4452"/>
+<text x="820" y="399.35" font-size="17" fill="#55606E">start the SSH session</text>
+<text x="429" y="445.85" font-size="17" fill="#55606E" text-anchor="middle">SSH session, relayed over plexd's socket</text>
+<polyline points="93,456.4 765,456.4" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="774,456.4 761,462.4 761,450.4" fill="#2F8A57"/>
+<polygon points="84,456.4 97,450.4 97,462.4" fill="#2F8A57"/>
+<polyline points="774,480.4 810,480.4 810,520 783,520" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="774,520 787,514 787,526" fill="#3A4452"/>
+<text x="820" y="496.55" font-size="17" fill="#55606E">inject</text>
+<text x="820" y="516" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">PLEXD_SESSION_TOKEN</text>
+<text x="429" y="557.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd actions run diagnostics.collect</text>
+<polyline points="84,568 765,568" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="774,568 761,574 761,562" fill="#2457C5"/>
+<polyline points="774,592 810,592 810,620 783,620" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="774,620 787,614 787,626" fill="#3A4452"/>
+<text x="820" y="611.95" font-size="17" fill="#55606E">read the token from env</text>
+<polyline points="774,646 810,646 810,674 783,674" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="774,674 787,668 787,680" fill="#3A4452"/>
+<text x="820" y="665.95" font-size="17" fill="#55606E">validate the JWT locally</text>
+<polyline points="774,700 810,700 810,728 783,728" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="774,728 787,722 787,734" fill="#3A4452"/>
+<text x="820" y="719.95" font-size="17" fill="#55606E">check the action scope</text>
+<polyline points="774,754 810,754 810,782 783,782" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="774,782 787,776 787,788" fill="#3A4452"/>
+<text x="820" y="773.95" font-size="17" fill="#55606E">execute</text>
+<text x="429" y="820.45" font-size="17" fill="#55606E" text-anchor="middle">result</text>
+<polyline points="774,831 84,831" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="97,825 84,831 97,837" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="584" y="867.25" font-size="17" fill="#55606E" text-anchor="middle">callback: the result and</text>
+<text x="584" y="887.65" font-size="17" fill="#55606E" text-anchor="middle">the session context</text>
+<polyline points="774,898 403,898" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="394,898 407,892 407,904" fill="#B38A00"/>
+</svg>

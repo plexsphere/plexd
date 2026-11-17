@@ -337,20 +337,7 @@ upload leg for larger output, see the
 
 ## Execution Lifecycle
 
-```text
-Control Plane                          Node (plexd)
-     │                                      │
-     │◀── GET /v1/nodes/{id}/state ─────────│── reconciliation pull
-     │─── executions: [ entry ] ───────────▶│── dispatch stage
-     │◀── callback: ack ────────────────────│── claim
-     │◀── callback: started ────────────────│── check sidecar and files
-     │                                      │   (a refusal reports failed)
-     │                                      │── verify vs discovery digest
-     │                                      │── execute script
-     │                                      │── capture stdout/stderr
-     │◀── callback: succeeded ──────────────│── report terminal status + output
-     │                                      │  (entry drains from the block)
-```
+![A sequence between the control plane and plexd on the Node. In the reconciliation pull plexd calls GET /v1/nodes/{id}/state, and the control plane answers with the executions block that holds the entry, which the dispatch stage takes. plexd claims the execution with an ack callback and a started callback. It then checks the sidecar and the files, where a refusal reports failed, verifies the script against the digest pinned at discovery, executes the script, and captures stdout and stderr. It reports the terminal status and the output with a succeeded callback, and the entry drains from the block.](../diagrams/actions-hook-execution-lifecycle.svg)
 
 ## Troubleshooting
 

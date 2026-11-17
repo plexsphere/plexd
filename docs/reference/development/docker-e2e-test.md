@@ -27,16 +27,7 @@ Before the first phase, the script arms the mock's token rate limit and checks t
 
 ## Service Topology
 
-```
-┌──────────────┐       ┌──────────────┐       ┌──────────────┐
-│   mock-api   │◄──────│    plexd     │◄─────▶│   meshpeer   │
-│  :8080 (HTTP)│       │  (agent)     │  wg   │  wg0         │
-│  :8443 (TLS) │       │  depends_on  │ :51820│  10.99.0.3   │
-│  /v1/health  │       │  mock-api    │       │              │
-└──────────────┘       └──────────────┘       └──────────────┘
-        │                      │                      │
-        └──────────────────────┴───── e2e-net ────────┘
-```
+![The three services share the Docker bridge network e2e-net. plexd, the agent, depends on mock-api and calls it; mock-api listens on port 8080 for HTTP and on port 8443 for TLS and serves /v1/health. plexd and meshpeer exchange WireGuard traffic on port 51820, and meshpeer has the interface wg0 with the address 10.99.0.3.](../../diagrams/development-docker-topology.svg)
 
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|

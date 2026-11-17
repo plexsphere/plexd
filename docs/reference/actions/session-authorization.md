@@ -8,30 +8,7 @@ Actions dispatched by the control plane are implicitly authorized: they arrive i
 
 ## Authorization Flow
 
-```
-User                Platform / CP              plexd (Target Node)
- |                       |                            |
- |-- Request SSH ------->|                            |
- |   session             |-- Check RBAC               |
- |                       |   (user x node x actions)  |
- |                       |                            |
- |                       |-- Issue session JWT        |
- |                       |   { sub, node_id,          |
- |                       |     actions, exp }         |
- |                       |                            |
- |                       |-- Session in the state --->|
- |                       |   pull's sessions block    |-- Start SSH session
- |<===== SSH session (relayed over plexd's socket) ==>|-- Inject PLEXD_SESSION_TOKEN
- |                       |                            |
- |-- plexd actions run -------------------------------->|
- |   diagnostics.collect |                            |-- Read token from env
- |                       |                            |-- Validate JWT (local)
- |                       |                            |-- Check action scope
- |                       |                            |-- Execute
- |<-- Result ----------------------------------------------|
- |                       |<-- Callback (result + -----|
- |                       |    session context)        |
-```
+![A sequence between the user, the platform's control plane and plexd on the target Node. The user requests an SSH session. The control plane checks RBAC for the user, the node and the actions, and issues a session JWT that carries sub, node_id, actions and exp. The session reaches plexd in the sessions block of the state pull. plexd starts the SSH session, which is relayed over plexd's socket between the user and plexd, and injects PLEXD_SESSION_TOKEN. The user runs plexd actions run diagnostics.collect, and plexd reads the token from the environment, validates the JWT locally, checks the action scope and executes the action. plexd returns the result to the user and sends the control plane a callback with the result and the session context.](../../diagrams/actions-session-authorization.svg)
 
 ## Session JWT Structure
 
@@ -89,13 +66,4 @@ The session JWT itself is not revoked on the node. Token validation consults no 
 
 The `plexd actions run` CLI does not execute actions directly. It connects to the plexd daemon via a Unix socket (`/var/run/plexd.sock`), ensuring locally triggered actions go through the same path as control-plane-dispatched ones: token validation, integrity checks, and audit.
 
-```
-plexd actions run diagnostics.collect --param include_network=true
-       |
-       |-- Unix socket (/var/run/plexd.sock) --> plexd daemon
-                                                    |-- Validate session JWT
-                                                    |-- Check action scope
-                                                    |-- Verify hook integrity
-                                                    |-- Execute
-                                                    +-- Report to control plane
-```
+![plexd actions run diagnostics.collect --param include_network=true connects to the plexd daemon over the Unix socket /var/run/plexd.sock. The daemon validates the session JWT, checks the action scope, verifies the hook integrity, executes the action and reports to the control plane.](../../diagrams/actions-local-transport.svg)
