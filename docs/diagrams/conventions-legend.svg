@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1260" height="1280" viewBox="0 0 1260 1280" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Notation of the documentation figures">
+<title>Notation of the documentation figures</title>
+<rect width="1260" height="1280" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1180" height="210" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">Roles</text>
+<text x="142" y="71.45" font-size="17" fill="#55606E">the colour says what a thing is</text>
+<rect x="64" y="100" width="260" height="58" rx="8" fill="#E7EDF9" stroke="#2457C5" stroke-width="2"/>
+<text x="194" y="125.8" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">control plane</text>
+<text x="194" y="146.95" font-size="17" fill="#55606E" text-anchor="middle">plexsphere, its API</text>
+<rect x="352" y="100" width="260" height="58" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="482" y="125.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">data plane</text>
+<text x="482" y="146.95" font-size="17" fill="#55606E" text-anchor="middle">plexd, Nodes</text>
+<rect x="640" y="100" width="260" height="58" rx="8" fill="#E3F1F2" stroke="#0E7D89" stroke-width="2"/>
+<text x="770" y="125.8" font-size="20" font-weight="700" fill="#0B5F69" text-anchor="middle">store</text>
+<text x="770" y="146.95" font-size="17" fill="#55606E" text-anchor="middle">data dir, cache, files</text>
+<rect x="928" y="100" width="260" height="58" rx="8" fill="#F7E8F0" stroke="#B0387F" stroke-width="2"/>
+<text x="1058" y="125.8" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">secret material</text>
+<text x="1058" y="146.95" font-size="17" fill="#55606E" text-anchor="middle">tokens, NSK, keys</text>
+<rect x="64" y="172" width="260" height="58" rx="8" fill="#FAF3DA" stroke="#B38A00" stroke-width="2"/>
+<text x="194" y="197.8" font-size="20" font-weight="700" fill="#6F5600" text-anchor="middle">event, record</text>
+<text x="194" y="218.95" font-size="17" fill="#55606E" text-anchor="middle">SSE, reports, logs</text>
+<rect x="352" y="172" width="260" height="58" rx="8" fill="#EEEAF7" stroke="#5E43A8" stroke-width="2"/>
+<text x="482" y="197.8" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">external system</text>
+<text x="482" y="218.95" font-size="17" fill="#55606E" text-anchor="middle">STUN, ACME, providers</text>
+<rect x="640" y="172" width="260" height="58" rx="8" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<text x="770" y="197.8" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">substrate</text>
+<text x="770" y="218.95" font-size="17" fill="#55606E" text-anchor="middle">hosts, kernel, clusters</text>
+<rect x="928" y="172" width="260" height="58" rx="8" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="1058" y="197.8" font-size="20" font-weight="700" fill="#A3262E" text-anchor="middle">refusal, failure</text>
+<text x="1058" y="218.95" font-size="17" fill="#55606E" text-anchor="middle">errors, failed states</text>
+<rect x="40" y="280" width="1180" height="300" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="313.2" font-size="22" font-weight="700" fill="#2B3440">Shapes</text>
+<rect x="64" y="340" width="200" height="56" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="164" y="375" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Service</text>
+<text x="164" y="422.45" font-size="17" fill="#55606E" text-anchor="middle">component</text>
+<rect x="290" y="340" width="200" height="56" rx="8" fill="#E7EDF9" stroke="#2457C5" stroke-width="2"/>
+<text x="390" y="375" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Service</text>
+<text x="390" y="422.45" font-size="17" fill="#55606E" text-anchor="middle">component, set apart</text>
+<path d="M516 344C516 333.33 716 333.33 716 344V392C716 402.67 516 402.67 516 392Z" fill="#E3F1F2" stroke="#0E7D89" stroke-width="2"/>
+<path d="M516 344C516 352 716 352 716 344" fill="none" stroke="#0E7D89" stroke-width="2"/>
+<text x="616" y="381" font-size="20" font-weight="700" fill="#0B5F69" text-anchor="middle">state cache</text>
+<text x="616" y="426.45" font-size="17" fill="#55606E" text-anchor="middle">store</text>
+<path d="M742 340H928L942 354V396H742Z" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<path d="M928 340V354H942" fill="none" stroke="#B0387F" stroke-width="2"/>
+<text x="842" y="375" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">response</text>
+<text x="842" y="422.45" font-size="17" fill="#55606E" text-anchor="middle">message or document</text>
+<rect x="968" y="340" width="220" height="56" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1078" y="375" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Operator</text>
+<text x="1078" y="422.45" font-size="17" fill="#55606E" text-anchor="middle">outside actor</text>
+<rect x="64" y="440" width="200" height="56" rx="8" fill="#FDFCF9" stroke="#7D8794" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="164" y="475" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">dispatcher</text>
+<rect x="159" y="428" width="93" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="205.5" y="445.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">not built</text>
+<text x="164" y="522.45" font-size="17" fill="#55606E" text-anchor="middle">planned, not built</text>
+<rect x="310" y="454" width="76" height="26" rx="13" fill="#3A4452"/>
+<text x="348" y="472.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">binary</text>
+<text x="400" y="474.2" font-size="22" font-weight="700" fill="#2B3440">cmd/plexd</text>
+<text x="310" y="522.45" font-size="17" fill="#55606E">frame: a binary, a cluster, a scope</text>
+<rect x="742" y="442" width="162" height="76" rx="6" fill="#FDFCF9" stroke="#0E7D89" stroke-width="2"/>
+<polyline points="742,482 904,482" fill="none" stroke="#0E7D89" stroke-width="1.5"/>
+<text x="756" y="467.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#0B5F69">table</text>
+<text x="756" y="505.25" font-size="15" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#0B5F69">PK</text>
+<text x="792.06" y="505.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440">id</text>
+<text x="829.33" y="505.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">uuid</text>
+<text x="924" y="488.25" font-size="17" fill="#55606E">database table,</text>
+<text x="924" y="508.65" font-size="17" fill="#55606E">record on the wire</text>
+<rect x="40" y="610" width="1180" height="300" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="643.2" font-size="22" font-weight="700" fill="#2B3440">Arrows</text>
+<polyline points="64,674 165,674" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="174,674 161,680 161,668" fill="#3A4452"/>
+<text x="190" y="679.95" font-size="17" fill="#55606E">order, data flow, transition</text>
+<polyline points="448,674 549,674" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="558,674 545,680 545,668" fill="#2457C5"/>
+<text x="574" y="679.95" font-size="17" fill="#55606E">call across a boundary</text>
+<polyline points="832,674 942,674" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="929,680 942,674 929,668" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="958" y="679.95" font-size="17" fill="#55606E">reply</text>
+<polyline points="64,732 165,732" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="174,732 161,738 161,726" fill="#B38A00"/>
+<text x="190" y="737.95" font-size="17" fill="#55606E">event or audit row</text>
+<polyline points="448,732 549,732" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="558,732 545,738 545,726" fill="#B0387F"/>
+<text x="574" y="737.95" font-size="17" fill="#55606E">secret material</text>
+<polyline points="832,732 933,732" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="942,732 929,738 929,726" fill="#2F8A57"/>
+<text x="958" y="737.95" font-size="17" fill="#55606E">creates, provisions</text>
+<polyline points="64,790 165,790" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="10 7.5"/>
+<polygon points="174,790 161,796 161,784" fill="#3A4452"/>
+<text x="190" y="795.95" font-size="17" fill="#55606E">out of band, by a person</text>
+<polyline points="448,790 549,790" fill="none" stroke="#7D8794" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polygon points="558,790 545,796 545,784" fill="#7D8794"/>
+<text x="574" y="795.95" font-size="17" fill="#55606E">planned, not built</text>
+<polyline points="832,790 933,790" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="942,790 929,796 929,784" fill="#C6343C"/>
+<text x="958" y="795.95" font-size="17" fill="#55606E">refusal, error exit</text>
+<polyline points="64,848 165,848" fill="none" stroke="#7D8794" stroke-width="2.5" stroke-dasharray="2.5 7.5"/>
+<polygon points="174,848 161,854 161,842" fill="#7D8794"/>
+<text x="190" y="853.95" font-size="17" fill="#55606E">derived at run time</text>
+<polyline points="448,848 558,848" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<text x="574" y="853.95" font-size="17" fill="#55606E">relation, no direction</text>
+<polyline points="841,848 933,848" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="942,848 929,854 929,842" fill="#2F8A57"/>
+<polygon points="832,848 845,842 845,854" fill="#2F8A57"/>
+<text x="958" y="853.95" font-size="17" fill="#55606E">traffic both ways</text>
+<rect x="40" y="940" width="750" height="300" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="56" y="973.2" font-size="22" font-weight="700" fill="#2B3440">State machines</text>
+<ellipse cx="90" cy="1040" rx="9" ry="9" fill="#17202B"/>
+<polyline points="99,1040 141,1040" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="150,1040 137,1046 137,1034" fill="#3A4452"/>
+<text x="90" y="1086.45" font-size="17" fill="#55606E" text-anchor="middle">initial</text>
+<rect x="150" y="1012" width="150" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="225" y="1047" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">active</text>
+<text x="225" y="1094.45" font-size="17" fill="#55606E" text-anchor="middle">state</text>
+<rect x="430" y="1012" width="150" height="56" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="505" y="1047" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">expired</text>
+<rect x="476" y="1000" width="92" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="522" y="1017.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">terminal</text>
+<polyline points="300,1040 421,1040" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="430,1040 417,1046 417,1034" fill="#3A4452"/>
+<text x="365" y="1009.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">Expire</text>
+<text x="365" y="1029.65" font-size="17" fill="#55606E" text-anchor="middle">trigger</text>
+<text x="505" y="1094.45" font-size="17" fill="#55606E" text-anchor="middle">terminal state</text>
+<polyline points="580,1040 631,1040" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="640,1040 627,1046 627,1034" fill="#3A4452"/>
+<ellipse cx="652" cy="1040" rx="12" ry="12" fill="#F6F5F1" stroke="#17202B" stroke-width="2"/>
+<ellipse cx="652" cy="1040" rx="7" ry="7" fill="#17202B"/>
+<text x="652" y="1080.45" font-size="17" fill="#55606E" text-anchor="middle">final</text>
+<rect x="150" y="1140" width="150" height="56" rx="6" fill="#E9ECEF" stroke="#7D8794" stroke-width="2"/>
+<text x="225" y="1175" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Deleted</text>
+<rect x="218" y="1128" width="70" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="253" y="1145.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">sticky</text>
+<polyline points="300,1154 334,1154 334,1182 309,1182" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="300,1182 313,1176 313,1188" fill="#3A4452"/>
+<text x="344" y="1173.95" font-size="17" fill="#55606E">self-transition</text>
+<rect x="510" y="1140" width="150" height="56" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="585" y="1175" font-size="20" font-weight="700" fill="#A3262E" text-anchor="middle">Failed</text>
+<text x="585" y="1222.45" font-size="17" fill="#55606E" text-anchor="middle">failed state</text>
+<rect x="820" y="940" width="400" height="300" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="836" y="973.2" font-size="22" font-weight="700" fill="#2B3440">Sequences and notes</text>
+<ellipse cx="860" cy="1020" rx="14" ry="14" fill="#17202B"/>
+<text x="860" y="1025.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">1</text>
+<text x="886" y="1024.25" font-size="17" fill="#55606E">step badge: the step</text>
+<text x="886" y="1044.65" font-size="17" fill="#55606E">the page lists</text>
+<polyline points="860,1070 860,1120" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="886" y="1106.45" font-size="17" fill="#55606E">a lifeline</text>
+<rect x="1010" y="1140" width="190" height="65" rx="4" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="1024" y="1169" font-size="20" font-weight="700" fill="#2B3440">note</text>
+<text x="1024" y="1190.15" font-size="17" fill="#55606E">attached to a box</text>
+<polyline points="950,1168 1010,1168" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+</svg>

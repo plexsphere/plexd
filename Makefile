@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e test-e2e-docker test-e2e-k8s test-e2e-systemd lint vet docker-build upgrade-fixture
+.PHONY: build test test-e2e test-e2e-docker test-e2e-k8s test-e2e-systemd lint vet docker-build upgrade-fixture docs-figures
 
 build:
 	go build ./...
@@ -23,6 +23,13 @@ lint: vet
 
 vet:
 	go vet ./...
+
+# docs-figures redraws every figure pair (.drawio + .svg) under docs/diagrams
+# from its function in tools/docs-figures. TestCommittedFiguresMatchTheGenerator
+# fails when a committed pair differs from what its function draws, so a
+# figure change is an edit to the function followed by this target.
+docs-figures:
+	go run ./tools/docs-figures
 
 docker-build:
 	docker build -f deploy/docker/Dockerfile \

@@ -145,6 +145,7 @@ export default withMermaid(defineConfig({
               { text: 'Container Workflow', link: '/reference/development/container-workflow' },
               { text: 'Release Workflow', link: '/reference/development/release-workflow' },
               { text: 'Docs Workflow', link: '/reference/development/docs-workflow' },
+              { text: 'Diagrams', link: '/reference/development/diagrams' },
               { text: 'E2E Workflow', link: '/reference/development/e2e-workflow' },
               { text: 'Docker E2E Test', link: '/reference/development/docker-e2e-test' },
               { text: 'Kubernetes E2E Test', link: '/reference/development/kubernetes-e2e-test' },
