@@ -243,11 +243,20 @@ Binary and hook integrity verification.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable integrity verification. Defaults to `true` when `verify_interval` is zero. |
-| `binary_path` | string | — | Path to the plexd binary to verify |
-| `hooks_dir` | string | — | Directory containing hook scripts to verify. When empty, mirrors `actions.hooks_dir`. |
+| `enabled` | bool | `true` | Enable integrity verification: one pass over the binary, `hooks_dir` and the SSH host key at start and one every `verify_interval`, each change reported once to the control plane and then adopted as the baseline. An omitted key leaves it `true`; an explicit `false` turns these baseline checks off and survives defaulting. It does not turn off the executor's check of a hook against its pin before every run, which still refuses a changed hook and reports it as `pre_dispatch`. See [Integrity Verification](../actions/integrity-verification.md#startup-sequence). |
+| `binary_path` | string | the running executable | Path to the plexd binary to verify. Empty means the executable `plexd up` runs from, with symlinks resolved; a configured path is used as written. The path keys the baseline, so with the default a binary that moves to a new resolved path, a new Nix store path for instance, starts a new baseline instead of filing a violation. |
+| `hooks_dir` | string | — | Directory of hook scripts to sweep against their baselines on every pass. Opt-in: empty sweeps and watches nothing, and nothing copies `actions.hooks_dir` into it; `PLEXD_HOOKS_DIR` sets both. An in-place edit of a hook here files one `hook_checksum` violation and is then adopted; where the directory is also `actions.hooks_dir`, the executor still refuses the edited hook until the agent restarts. |
 | `verify_interval` | duration | `5m` | Interval between integrity verification runs. Minimum: `30s`. |
-| `watch_enabled` | bool | `true` | Enable inotify file watching. When enabled, file changes in `hooks_dir` trigger immediate checksum recomputation. |
+| `watch_enabled` | bool | `true` | Enable inotify file watching. When enabled, file changes in `hooks_dir` trigger immediate checksum recomputation. Has no effect without `hooks_dir`. An omitted key leaves it `true`; an explicit `false` survives defaulting. |
+
+::: warning Upgrading from a release that used the zero-value heuristic
+Earlier releases derived `enabled` and `watch_enabled` from `verify_interval`: `ApplyDefaults()` set both to `true` only when `verify_interval` was zero, and left them as written otherwise. Each of the two switches therefore changes meaning after the upgrade, with no config change, in two shapes of config file:
+
+- Without `verify_interval`, an explicit `false` was turned back **on** and is now **off**: `enabled: false` now turns the checks off, and `watch_enabled: false` now turns the watch off.
+- With `verify_interval`, an omitted key was **off** and is now **on**: a file without an `enabled` key now runs the checks, and a file without a `watch_enabled` key now watches `hooks_dir` whenever the checks run, also where it sets `enabled: true`.
+
+If nodes of the second shape are meant to stay as they were, add an explicit `integrity.enabled: false`, or `integrity.watch_enabled: false` for the watch alone, before rolling the binary forward. `config.dump` reports the effective values under `integrity.enabled` and `integrity.watch_enabled`. Earlier releases never ran the checks at all, so the first pass after the upgrade stores the baselines and reports nothing.
+:::
 
 Source: `internal/integrity/config.go`
 
@@ -639,11 +648,11 @@ upgrade:
   # trusted_root_path: ""    # empty = embedded Sigstore public-good root
 
 integrity:
-  enabled: true
-  # binary_path: ""          # path to plexd binary
-  # hooks_dir: ""            # empty = mirrors actions.hooks_dir
+  enabled: true              # an explicit false survives defaulting
+  # binary_path: ""          # empty = the running executable, symlinks resolved
+  # hooks_dir: ""            # opt-in; empty = no hooks sweep and no watcher
   verify_interval: 5m        # min: 30s
-  watch_enabled: true
+  watch_enabled: true        # an explicit false survives defaulting
 
 metrics:
   enabled: true
