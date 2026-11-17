@@ -10,32 +10,7 @@ The user access integration extends bridge mode (`internal/bridge`) to allow ext
 
 ## Data Flow
 
-```
-External VPN Clients
-(Tailscale / Netbird / WireGuard)
-        │
-        │  WireGuard tunnel
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Bridge Node                              │
-│                                                                 │
-│  ┌───────────────────┐         ┌───────────────────┐           │
-│  │  Access WireGuard │  IP fwd │  Mesh WireGuard   │           │
-│  │  Interface        │────────▶│  Interface        │           │
-│  │  (wg-access)      │         │  (plexd0)         │           │
-│  │  port 51822       │         │                   │           │
-│  └───────────────────┘         └─────────┬─────────┘           │
-│         ▲                                │                     │
-│         │                                ▼                     │
-│  ┌──────┴──────────┐            ┌──────────────────┐           │
-│  │ AccessController│            │  Mesh Peers      │           │
-│  │ (WG operations) │            │  10.42.0.0/16    │           │
-│  └─────────────────┘            └──────────────────┘           │
-│                                                                 │
-│  Control Plane ──SSE──▶ bridge_config_updated ─▶ reconcile      │
-│                ──Rec──▶ UserAccessReconcileHandler               │
-└─────────────────────────────────────────────────────────────────┘
-```
+![External VPN clients of Tailscale, Netbird or WireGuard connect over a WireGuard tunnel to the access WireGuard interface wg-access on port 51822 of the bridge node. IP forwarding carries the traffic between wg-access and the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The AccessController creates wg-access and performs its WireGuard operations. The control plane sends the bridge_config_updated event over SSE, which triggers a reconcile; the reconcile hands the desired bridge state to the UserAccessReconcileHandler.](../../diagrams/bridge-user-access-data-flow.svg)
 
 Traffic from external VPN clients arrives on the access WireGuard interface (`wg-access`), is forwarded via IP forwarding to the mesh WireGuard interface (`plexd0`), and reaches mesh peers. The `RouteController` manages forwarding rules; the `AccessController` manages the WireGuard interface and peer configuration.
 

@@ -10,42 +10,7 @@ The tunnel providers feature extends site-to-site VPN connectivity (`internal/br
 
 ## Data Flow
 
-```
-External Network
-(remote site)
-      |
-      |  IPsec / OpenVPN tunnel
-      v
-+---------------------------------------------------------------+
-|                        Bridge Node                              |
-|                                                                 |
-|  +-------------------+         +-------------------+           |
-|  |  IPsec / OpenVPN  |  route  |  Mesh WireGuard   |           |
-|  |  Tunnels          |-------->|  Interface        |           |
-|  |  (ipsec-{id},     |         |  (plexd0)         |           |
-|  |   tun-{id})       |         |                   |           |
-|  +-------------------+         +---------+---------+           |
-|         ^                                |                     |
-|         |                                v                     |
-|  +------+------------+            +------------------+           |
-|  | TunnelProvider    |            |  Mesh Peers      |           |
-|  | (IPsec/OpenVPN)   |            |  10.42.0.0/16    |           |
-|  +---------+---------+            +------------------+           |
-|            |                                                     |
-|  +------+-------------+                                          |
-|  | CommandExecutor    |                                          |
-|  | (CLI invocation)   |                                          |
-|  +------+-------------+                                          |
-|            |                                                     |
-|  +------+-------------+                                          |
-|  | RouteController    |                                          |
-|  | (OS routing ops)   |                                          |
-|  +--------------------+                                          |
-|                                                                 |
-|  SiteToSiteManager delegates to TunnelProvider                  |
-|    when tunnel.ProviderType != "" && != "wireguard"             |
-+-----------------------------------------------------------------+
-```
+![An external network at a remote site connects over an IPsec or OpenVPN tunnel to the tunnels of the bridge node, ipsec-{id} and tun-{id}. A route carries the traffic between those tunnels and the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The TunnelProvider for IPsec or OpenVPN creates the tunnels. Lines join the TunnelProvider to the CommandExecutor, which runs the CLI invocations, and to the RouteController, which performs the OS routing operations. The SiteToSiteManager delegates to the TunnelProvider when a tunnel's ProviderType is neither empty nor wireguard.](../../diagrams/bridge-tunnel-providers-data-flow.svg)
 
 Traffic between the external site and mesh peers flows through provider-managed tunnel interfaces (`ipsec-{id}` for IPsec, `tun-{id}` for OpenVPN). The `TunnelProvider` wraps the tunnel daemon CLI, managing config generation, process lifecycle, and route installation via `RouteController`. The `SiteToSiteManager` tracks provider-managed tunnels alongside WireGuard tunnels in a unified `activeTunnels` map.
 

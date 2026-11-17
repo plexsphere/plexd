@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="750" viewBox="0 0 1170 750" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Data flow of a site-to-site tunnel through a tunnel provider">
+<title>Data flow of a site-to-site tunnel through a tunnel provider</title>
+<rect width="1170" height="750" fill="#F6F5F1"/>
+<rect x="40" y="190" width="790" height="520" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<text x="56" y="223.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
+<rect x="90" y="40" width="320" height="65" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="250" y="69.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">External network</text>
+<text x="250" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">remote site</text>
+<rect x="70" y="260" width="280" height="88" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="210" y="289.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">IPsec / OpenVPN</text>
+<text x="210" y="313.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">tunnels</text>
+<text x="210" y="333.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ipsec-{id}, tun-{id}</text>
+<rect x="500" y="260" width="300" height="88" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="650" y="289.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Mesh WireGuard</text>
+<text x="650" y="313.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">interface</text>
+<text x="650" y="333.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd0</text>
+<rect x="930" y="272" width="200" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1030" y="301.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Mesh peers</text>
+<text x="1030" y="321.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.42.0.0/16</text>
+<polyline points="250,114 250,251" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="250,260 244,247 256,247" fill="#2F8A57"/>
+<polygon points="250,105 256,118 244,118" fill="#2F8A57"/>
+<text x="260" y="153.45" font-size="17" fill="#55606E">IPsec or OpenVPN tunnel</text>
+<polyline points="359,304 491,304" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="500,304 487,310 487,298" fill="#2F8A57"/>
+<polygon points="350,304 363,298 363,310" fill="#2F8A57"/>
+<text x="425" y="293.45" font-size="17" fill="#55606E" text-anchor="middle">route</text>
+<polyline points="809,304 921,304" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="930,304 917,310 917,298" fill="#2F8A57"/>
+<polygon points="800,304 813,298 813,310" fill="#2F8A57"/>
+<rect x="70" y="408" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="435.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">TunnelProvider</text>
+<text x="210" y="456.15" font-size="17" fill="#55606E" text-anchor="middle">IPsec, OpenVPN</text>
+<polyline points="210,408 210,357" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="210,348 216,361 204,361" fill="#2F8A57"/>
+<rect x="70" y="512" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="539.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">CommandExecutor</text>
+<text x="210" y="560.15" font-size="17" fill="#55606E" text-anchor="middle">CLI invocations</text>
+<polyline points="210,472 210,512" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="70" y="616" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="643.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">RouteController</text>
+<text x="210" y="664.15" font-size="17" fill="#55606E" text-anchor="middle">OS routing operations</text>
+<polyline points="70,440 55,440 55,648 70,648" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="500" y="408" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="650" y="434.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteManager</text>
+<text x="650" y="454.95" font-size="17" fill="#55606E" text-anchor="middle">delegates when</text>
+<text x="650" y="474.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">tunnel.ProviderType != &quot;&quot;</text>
+<text x="650" y="493.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&amp;&amp; != &quot;wireguard&quot;</text>
+<polyline points="500,440 359,440" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="350,440 363,434 363,446" fill="#3A4452"/>
+</svg>

@@ -10,37 +10,7 @@ The site-to-site VPN feature extends bridge mode (`internal/bridge`) to establis
 
 ## Data Flow
 
-```
-External Network
-(remote site)
-      |
-      |  WireGuard tunnel (UDP)
-      v
-+---------------------------------------------------------------+
-|                        Bridge Node                              |
-|                                                                 |
-|  +-------------------+         +-------------------+           |
-|  |  S2S WireGuard    |  route  |  Mesh WireGuard   |           |
-|  |  Interfaces       |-------->|  Interface        |           |
-|  |  (wg-s2s-{id})    |         |  (plexd0)         |           |
-|  |  :51823, ...      |         |                   |           |
-|  +-------------------+         +---------+---------+           |
-|         ^                                |                     |
-|         |                                v                     |
-|  +------+------------+            +------------------+           |
-|  | VPNController     |            |  Mesh Peers      |           |
-|  | (WireGuard ops)   |            |  10.42.0.0/16    |           |
-|  +---------+---------+            +------------------+           |
-|            |                                                     |
-|  +------+-------------+                                          |
-|  | RouteController    |                                          |
-|  | (OS routing ops)   |                                          |
-|  +--------------------+                                          |
-|                                                                 |
-|  Control Plane --SSE--> bridge_config_updated --> reconcile      |
-|                --Rec--> SiteToSiteReconcileHandler                |
-+-----------------------------------------------------------------+
-```
+![An external network at a remote site connects over a WireGuard tunnel on UDP to the site-to-site WireGuard interfaces wg-s2s-{id} of the bridge node, which listen on port 51823 and further ports. A route carries the traffic between those interfaces and the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The VPNController creates the site-to-site interfaces and performs their WireGuard operations; a line joins it to the RouteController, which performs the OS routing operations. The control plane sends the bridge_config_updated event over SSE, which triggers a reconcile; the reconcile hands the desired bridge state to the SiteToSiteReconcileHandler.](../../diagrams/bridge-site-to-site-data-flow.svg)
 
 Traffic between the external site and mesh peers flows through per-tunnel WireGuard interfaces (`wg-s2s-{id}`). The `VPNController` manages WireGuard interface and peer operations. The `RouteController` manages OS-level routes for remote subnets. The control plane pushes tunnel definitions via the snapshot `bridge.site_to_site` subtree (`api.BridgeSnapshot.SiteToSite`).
 

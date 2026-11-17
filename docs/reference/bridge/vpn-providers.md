@@ -10,36 +10,7 @@ The VPN providers feature extends user access integration (`internal/bridge`) wi
 
 ## Data Flow
 
-```
-External VPN Users
-(Tailscale / Netbird)
-        |
-        |  Provider overlay network
-        v
-+---------------------------------------------------------------+
-|                        Bridge Node                              |
-|                                                                 |
-|  +-------------------+         +-------------------+           |
-|  |  Provider         |  IP fwd |  Mesh WireGuard   |           |
-|  |  Interface        |-------->|  Interface        |           |
-|  |  (tailscale0 /    |         |  (plexd0)         |           |
-|  |   wt0 / etc.)     |         |                   |           |
-|  +-------------------+         +---------+---------+           |
-|         ^                                |                     |
-|         |                                v                     |
-|  +------+------------+            +------------------+         |
-|  | UserAccessProvider |            |  Mesh Peers      |         |
-|  | (Tailscale/Netbird)|            |  10.42.0.0/16    |         |
-|  +---------+----------+            +------------------+         |
-|            |                                                    |
-|  +---------+---------+                                          |
-|  | CommandExecutor   |                                          |
-|  | (CLI invocations) |                                          |
-|  +-------------------+                                          |
-|                                                                 |
-|  UserAccessManager -----> provider.Start() / provider.Stop()    |
-+-----------------------------------------------------------------+
-```
+![External VPN users of Tailscale or Netbird reach the bridge node over the provider's overlay network and arrive on the provider interface, such as tailscale0 or wt0. IP forwarding carries the traffic between the provider interface and the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The UserAccessProvider for Tailscale or Netbird creates the provider interface; a line joins it to the CommandExecutor, which runs the CLI invocations. The UserAccessManager calls Start and Stop on the UserAccessProvider.](../../diagrams/bridge-vpn-providers-data-flow.svg)
 
 Traffic from external VPN users arrives on the provider's network interface, is forwarded via IP forwarding to the mesh WireGuard interface (`plexd0`), and reaches mesh peers. The `UserAccessProvider` manages the provider daemon lifecycle. The `CommandExecutor` abstracts CLI invocations for testability.
 
