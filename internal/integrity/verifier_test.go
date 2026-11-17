@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,9 +32,16 @@ type mockReporter struct {
 	mu         sync.Mutex
 	violations []api.IntegrityViolationReport
 	batches    [][]api.IntegrityViolationReport
+
+	// hold, when set, runs at the start of every call, outside mu, so a test
+	// can keep a call open inside ReportViolations.
+	hold func()
 }
 
 func (m *mockReporter) ReportViolations(_ context.Context, _ string, reports []api.IntegrityViolationReport) error {
+	if m.hold != nil {
+		m.hold()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(reports) == 0 {
@@ -330,13 +339,16 @@ func TestVerifier_BinaryChecksum_BeforeVerification(t *testing.T) {
 
 func TestVerifier_Disabled(t *testing.T) {
 	dir := t.TempDir()
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
 	store, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
 	reporter := &mockReporter{}
 	v := NewVerifier(Config{
-		Enabled: boolPtr(false),
+		Enabled:        boolPtr(false),
+		BinaryPath:     binaryPath,
+		VerifyInterval: DefaultVerifyInterval,
 	}, store, reporter, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -347,15 +359,97 @@ func TestVerifier_Disabled(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// No violations, no checksum computed.
+	// No violations, no checksum computed, no baseline stored.
 	if viol := reporter.get(); len(viol) != 0 {
 		t.Errorf("unexpected violations: %v", viol)
 	}
 	if got := v.BinaryChecksum(); got != "" {
 		t.Errorf("BinaryChecksum() = %q, want empty when disabled", got)
 	}
+	if got := store.Get(binaryPath); got != "" {
+		t.Errorf("binary baseline = %q, want none when disabled", got)
+	}
 }
 
+// startRun runs v.Run in a goroutine and returns a stop func that cancels it
+// and waits for Run to return. The stop func is also a cleanup, so a test that
+// fails before calling it leaves no goroutine behind for goleak.
+func startRun(t *testing.T, v *Verifier) (stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- v.Run(ctx, "node-1")
+	}()
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("Run: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Errorf("Run did not return after cancel")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+// waitFor polls cond until it holds, failing the test when timeout passes
+// first.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for %s", timeout, what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// replaceAtomically swaps the content of path in one rename, so a pass that
+// runs at the same moment reads the old file or the new one, never a torn one.
+func replaceAtomically(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := fsutil.WriteFileAtomic(filepath.Dir(path), filepath.Base(path), data, 0o600); err != nil {
+		t.Fatalf("replace %s: %v", path, err)
+	}
+}
+
+// logRecords decodes the lines a slog.JSONHandler wrote into logs and returns
+// those whose message is msg. Decoding, rather than searching the text, keeps
+// a Windows path inside a quoted error value comparable.
+func logRecords(t *testing.T, logs *syncBuffer, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if rec["msg"] == msg {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// jsonLogger returns a logger that writes JSON lines into logs.
+func jsonLogger(logs *syncBuffer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(logs, nil))
+}
+
+// TestVerifier_PeriodicRun_DetectsTampering changes the binary only after the
+// startup pass has stored its baseline, so the violation can come from a tick
+// alone.
 func TestVerifier_PeriodicRun_DetectsTampering(t *testing.T) {
 	dir := t.TempDir()
 	binaryContent := "binary-original"
@@ -372,43 +466,384 @@ func TestVerifier_PeriodicRun_DetectsTampering(t *testing.T) {
 		VerifyInterval: 50 * time.Millisecond, // short for test
 	}, store, reporter, slog.Default())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	stop := startRun(t, v)
 
-	// Run startup verification first to establish baseline.
-	if err := v.VerifyBinary(ctx, "node-1"); err != nil {
-		t.Fatalf("verify binary: %v", err)
-	}
+	// The startup pass establishes the baseline from an empty store.
+	waitFor(t, 2*time.Second, "the binary baseline", func() bool {
+		return store.Get(binaryPath) == sha256Hex(binaryContent)
+	})
 
 	// Tamper with the binary.
-	if err := os.WriteFile(binaryPath, []byte("binary-tampered"), 0o644); err != nil {
-		t.Fatalf("tamper binary: %v", err)
+	replaceAtomically(t, binaryPath, []byte("binary-tampered"))
+
+	// Wait for a periodic check to detect the tampering.
+	waitFor(t, 2*time.Second, "the binary violation", func() bool {
+		return len(reporter.get()) > 0
+	})
+	stop()
+
+	viol := reporter.get()
+	want := api.IntegrityViolationReport{
+		Kind:             api.IntegrityKindBinaryChecksum,
+		DetectedBy:       api.IntegrityDetectorStartupScan,
+		ArtifactID:       binaryPath,
+		ObservedChecksum: wireDigest(t, sha256Hex("binary-tampered")),
+		ExpectedChecksum: wireDigest(t, sha256Hex(binaryContent)),
+	}
+	if viol[0] != want {
+		t.Errorf("violation = %+v, want %+v", viol[0], want)
+	}
+}
+
+// TestVerifier_PeriodicRun_DetectsHostKeyChange replaces the host key after the
+// startup pass stored its fingerprint, and expects a tick to report the old and
+// the new fingerprint.
+func TestVerifier_PeriodicRun_DetectsHostKeyChange(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, oldFingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+		HostKeyPath:    keyPath,
+		VerifyInterval: 50 * time.Millisecond,
+	}, store, reporter, slog.Default())
+
+	stop := startRun(t, v)
+
+	waitFor(t, 2*time.Second, "the host key baseline", func() bool {
+		return store.Get(keyPath) == oldFingerprint
+	})
+
+	// Generate the replacement elsewhere and swap it in with one rename.
+	newPath, newFingerprint := writeHostKey(t, t.TempDir(), "ssh_host_ed25519_key")
+	if newFingerprint == oldFingerprint {
+		t.Fatal("regenerated host key kept its fingerprint")
+	}
+	newKey, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("read new host key: %v", err)
+	}
+	replaceAtomically(t, keyPath, newKey)
+
+	waitFor(t, 2*time.Second, "the host key violation", func() bool {
+		return len(reporter.get()) > 0
+	})
+	stop()
+
+	want := api.IntegrityViolationReport{
+		Kind:                api.IntegrityKindSSHHostKey,
+		DetectedBy:          api.IntegrityDetectorStartupScan,
+		ArtifactID:          keyPath,
+		ObservedFingerprint: newFingerprint,
+		ExpectedFingerprint: oldFingerprint,
+	}
+	if got := reporter.get()[0]; got != want {
+		t.Errorf("violation = %+v, want %+v", got, want)
+	}
+}
+
+// TestVerifier_Run_VerifiesAtStartup gives Run an interval no test waits for,
+// so both violations can only come from the pass Run makes at start.
+func TestVerifier_Run_VerifiesAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-v2")
+	keyPath, fingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+	_, oldFingerprint := writeHostKey(t, t.TempDir(), "ssh_host_ed25519_key")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Set(binaryPath, sha256Hex("binary-v1")); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+	if err := store.Set(keyPath, oldFingerprint); err != nil {
+		t.Fatalf("store set: %v", err)
 	}
 
-	// Start periodic loop in a goroutine.
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		BinaryPath:     binaryPath,
+		HostKeyPath:    keyPath,
+		VerifyInterval: time.Hour,
+	}, store, reporter, slog.Default())
+
+	stop := startRun(t, v)
+	waitFor(t, 3*time.Second, "both startup violations", func() bool {
+		return len(reporter.get()) >= 2
+	})
+	stop()
+
+	want := []api.IntegrityViolationReport{
+		{
+			Kind:             api.IntegrityKindBinaryChecksum,
+			DetectedBy:       api.IntegrityDetectorStartupScan,
+			ArtifactID:       binaryPath,
+			ObservedChecksum: wireDigest(t, sha256Hex("binary-v2")),
+			ExpectedChecksum: wireDigest(t, sha256Hex("binary-v1")),
+		},
+		{
+			Kind:                api.IntegrityKindSSHHostKey,
+			DetectedBy:          api.IntegrityDetectorStartupScan,
+			ArtifactID:          keyPath,
+			ObservedFingerprint: fingerprint,
+			ExpectedFingerprint: oldFingerprint,
+		},
+	}
+	if got := reporter.get(); !slices.Equal(got, want) {
+		t.Errorf("violations = %+v, want %+v", got, want)
+	}
+}
+
+// TestVerifier_Run_EstablishesBaselinesSilently starts Run on an empty store:
+// the startup pass stores what it finds and has nothing to report.
+func TestVerifier_Run_EstablishesBaselinesSilently(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
+	keyPath, fingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		BinaryPath:     binaryPath,
+		HostKeyPath:    keyPath,
+		VerifyInterval: time.Hour,
+	}, store, reporter, slog.Default())
+
+	stop := startRun(t, v)
+	waitFor(t, 3*time.Second, "both baselines", func() bool {
+		return store.Get(binaryPath) != "" && store.Get(keyPath) != ""
+	})
+	stop()
+
+	if got, want := store.Get(binaryPath), sha256Hex("binary-content"); got != want {
+		t.Errorf("binary baseline = %q, want %q", got, want)
+	}
+	if got := store.Get(keyPath); got != fingerprint {
+		t.Errorf("host key baseline = %q, want %q", got, fingerprint)
+	}
+	if got, want := v.BinaryChecksum(), sha256Hex("binary-content"); got != want {
+		t.Errorf("BinaryChecksum() = %q, want %q", got, want)
+	}
+	if batches := reporter.getBatches(); len(batches) != 0 {
+		t.Errorf("reporter received %d batches, want none: %v", len(batches), batches)
+	}
+}
+
+// TestVerifier_Run_StartsNoWatcherWithoutHooksDirOrWatch pins the opt-in: the
+// watcher needs both a hooks directory and the watch switch. The last case is
+// the control that shows the counting seam is reached when both are given.
+func TestVerifier_Run_StartsNoWatcherWithoutHooksDirOrWatch(t *testing.T) {
+	tests := []struct {
+		name      string
+		hooksDir  bool
+		watch     *bool
+		wantCalls int32
+	}{
+		{"no hooks dir", false, nil, 0},
+		{"watch disabled", true, boolPtr(false), 0},
+		{"hooks dir and watch", true, nil, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
+			cfg := Config{
+				BinaryPath:     binaryPath,
+				VerifyInterval: time.Hour,
+				WatchEnabled:   tt.watch,
+			}
+			if tt.hooksDir {
+				cfg.HooksDir = filepath.Join(dir, "hooks")
+			}
+			store, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("new store: %v", err)
+			}
+			v := NewVerifier(cfg, store, &mockReporter{}, slog.New(slog.NewTextHandler(&syncBuffer{}, nil)))
+			var calls atomic.Int32
+			v.watchDir = func(context.Context, string, func(error)) (*fsnotify.Watcher, error) {
+				calls.Add(1)
+				return nil, errors.New("counting seam: no watch")
+			}
+
+			stop := startRun(t, v)
+			waitFor(t, 3*time.Second, "the startup pass", func() bool {
+				return store.Get(binaryPath) != ""
+			})
+			// Run returns only after its watcher, so the count is final.
+			stop()
+
+			if got := calls.Load(); got != tt.wantCalls {
+				t.Errorf("watchDir calls = %d, want %d", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// TestVerifier_Run_ContinuesPastAnUnreadableBinary starts Run against a binary
+// path that names no file: the failure is logged, and the host key in the same
+// pass is still checked and reported.
+func TestVerifier_Run_ContinuesPastAnUnreadableBinary(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "plexd")
+	keyPath, fingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+	_, oldFingerprint := writeHostKey(t, t.TempDir(), "ssh_host_ed25519_key")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Set(keyPath, oldFingerprint); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	reporter := &mockReporter{}
+	logs := &syncBuffer{}
+	v := NewVerifier(Config{
+		BinaryPath:     missing,
+		HostKeyPath:    keyPath,
+		VerifyInterval: time.Hour,
+	}, store, reporter, jsonLogger(logs))
+
+	stop := startRun(t, v)
+	waitFor(t, 3*time.Second, "the host key violation", func() bool {
+		return len(reporter.get()) > 0
+	})
+	stop()
+
+	want := api.IntegrityViolationReport{
+		Kind:                api.IntegrityKindSSHHostKey,
+		DetectedBy:          api.IntegrityDetectorStartupScan,
+		ArtifactID:          keyPath,
+		ObservedFingerprint: fingerprint,
+		ExpectedFingerprint: oldFingerprint,
+	}
+	if got := reporter.get(); len(got) != 1 || got[0] != want {
+		t.Errorf("violations = %+v, want [%+v]", got, want)
+	}
+
+	// The platform's own text for a missing file, so the test reads the same
+	// on every OS.
+	_, openErr := os.Open(missing)
+	var pathErr *fs.PathError
+	if !errors.As(openErr, &pathErr) {
+		t.Fatalf("os.Open(%q) = %v, want a *fs.PathError", missing, openErr)
+	}
+	recs := logRecords(t, logs, "binary verification failed")
+	if len(recs) != 1 {
+		t.Fatalf("binary verification failed logged %d times, want 1 (log %s)", len(recs), logs.String())
+	}
+	if level := recs[0]["level"]; level != "ERROR" {
+		t.Errorf("level = %v, want ERROR", level)
+	}
+	errText, _ := recs[0]["error"].(string)
+	if !strings.Contains(errText, "integrity: open "+missing) || !strings.Contains(errText, pathErr.Err.Error()) {
+		t.Errorf("error = %q, want it to contain %q and %q", errText, "integrity: open "+missing, pathErr.Err.Error())
+	}
+}
+
+// TestVerifier_Run_ContinuesPastAnUnparsableHostKey gives Run a host key file
+// that holds no private key: each pass logs the failure, and the loop keeps
+// ticking.
+func TestVerifier_Run_ContinuesPastAnUnparsableHostKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeTempFile(t, dir, "ssh_host_ed25519_key", "not a private key")
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	logs := &syncBuffer{}
+	v := NewVerifier(Config{
+		BinaryPath:     binaryPath,
+		HostKeyPath:    keyPath,
+		VerifyInterval: 50 * time.Millisecond,
+	}, store, &mockReporter{}, jsonLogger(logs))
+
+	stop := startRun(t, v)
+	// The startup pass logs the first failure; a second one can only come
+	// from a tick.
+	waitFor(t, 3*time.Second, "two failed host key checks", func() bool {
+		return len(logRecords(t, logs, "host key verification failed")) >= 2
+	})
+	stop()
+
+	rec := logRecords(t, logs, "host key verification failed")[0]
+	if level := rec["level"]; level != "ERROR" {
+		t.Errorf("level = %v, want ERROR", level)
+	}
+	errText, _ := rec["error"].(string)
+	if want := "integrity: parse host key " + keyPath; !strings.Contains(errText, want) {
+		t.Errorf("error = %q, want it to contain %q", errText, want)
+	}
+	if got := store.Get(keyPath); got != "" {
+		t.Errorf("host key baseline = %q, want none for an unparsable key", got)
+	}
+	if got := store.Get(binaryPath); got == "" {
+		t.Error("binary baseline missing: the pass must not stop at the host key")
+	}
+}
+
+// TestVerifier_Run_WaitsForTheWatcher holds the watcher's setup open past the
+// cancellation: Run must not return before it has.
+func TestVerifier_Run_WaitsForTheWatcher(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	v := NewVerifier(Config{
+		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+		HooksDir:       filepath.Join(dir, "hooks"),
+		VerifyInterval: time.Hour,
+	}, store, &mockReporter{}, slog.New(slog.NewTextHandler(&syncBuffer{}, nil)))
+
+	entered := make(chan struct{})
+	var returned atomic.Bool
+	v.watchDir = func(ctx context.Context, _ string, _ func(error)) (*fsnotify.Watcher, error) {
+		close(entered)
+		<-ctx.Done()
+		time.Sleep(200 * time.Millisecond)
+		returned.Store(true)
+		return nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		done <- v.Run(ctx, "node-1")
 	}()
 
-	// Wait for at least one periodic check to detect the tampering.
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("timed out waiting for violation to be detected")
-		default:
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("Run did not start the watcher")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
 		}
-		if viol := reporter.get(); len(viol) > 0 {
-			if viol[0].Kind != api.IntegrityKindBinaryChecksum {
-				t.Errorf("violation kind = %q, want %q", viol[0].Kind, api.IntegrityKindBinaryChecksum)
-			}
-			cancel()
-			<-done
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if !returned.Load() {
+		t.Error("Run returned before the watcher did")
 	}
 }
 
@@ -980,6 +1415,79 @@ func TestVerifier_WatchHooksDir_RetriesWhenAHookVanishes(t *testing.T) {
 	want := `level=WARN msg="integrity: a hook vanished while the watch was set up; retrying" component=integrity path=` + hooksDir
 	if got := logs.String(); !strings.Contains(got, want) {
 		t.Errorf("log = %q, want it to contain %q", got, want)
+	}
+}
+
+// TestVerifier_WatchHooksDir_WaitsForADebouncedSweep holds a sweep the watcher
+// started inside ReportViolations and cancels the watch: watchHooksDir must
+// not return before that sweep has.
+func TestVerifier_WatchHooksDir_WaitsForADebouncedSweep(t *testing.T) {
+	hooksDir := t.TempDir()
+	hookPath := writeTempFile(t, hooksDir, "test-hook.sh", "#!/bin/sh\necho original")
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSweep := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSweep()
+
+	reporter := &mockReporter{hold: func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}}
+	v := newWatchTestVerifier(t, hooksDir, reporter, &syncBuffer{})
+
+	ready := make(chan struct{})
+	v.watchDir = func(ctx context.Context, dir string, onRetry func(error)) (*fsnotify.Watcher, error) {
+		fsw, err := fsutil.WatchDir(ctx, dir, onRetry)
+		close(ready)
+		return fsw, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.watchHooksDir(ctx, "node-1")
+	}()
+	// However the test ends, release the sweep first and then wait for the
+	// watcher, so goleak finds neither.
+	defer func() {
+		releaseSweep()
+		cancel()
+		<-done
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchHooksDir did not set up its watch through v.watchDir")
+	}
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho tampered"), 0o644); err != nil {
+		t.Fatalf("write tampered hook: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the debounced sweep did not reach the reporter")
+	}
+
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("watchHooksDir returned while its sweep was still inside ReportViolations")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseSweep()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchHooksDir did not return after its sweep finished")
 	}
 }
 
