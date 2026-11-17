@@ -64,7 +64,6 @@ const (
 	sizeBody    = 17.0 // second lines, edge labels, notes
 	sizeCode    = 16.0 // monospaced identifiers
 	sizeChip    = 15.0 // chips and badges
-	sizeCaption = 16.0 // captions under a figure
 )
 
 // Stroke widths.

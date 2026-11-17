@@ -24,9 +24,6 @@ func codeName(s string) Line { return Line{Text: s, Size: sizeCode + 1, Mono: tr
 // heading is the bold title of a frame.
 func heading(s string) Line { return Line{Text: s, Size: sizeHeading, Bold: true} }
 
-// small is a caption or a footnote line.
-func small(s string) Line { return Line{Text: s, Size: sizeCaption} }
-
 // colored fills in the colour of every line that has none: strong for
 // bold lines, weak for the rest.
 func colored(lines []Line, strong, weak string) []Line {
@@ -96,13 +93,6 @@ func (f *Figure) filled(r role, s spec) *node {
 	n := f.box(r, s)
 	n.fill = r.fill
 	return n
-}
-
-// tile is a small named box in a row of many: its narrow padding fits
-// short labels into narrow boxes.
-func (f *Figure) tile(r role, x, y, w float64, label string) {
-	n := f.box(r, spec{x: x, y: y, w: w, h: 50, lines: []Line{{Text: label, Size: sizeBody, Bold: true}}})
-	n.padX = 4
 }
 
 // panel is a box with a left-aligned label that starts at the top:
@@ -320,16 +310,6 @@ func (f *Figure) loop(n *node, lines ...Line) *node {
 	x := n.x + n.w
 	f.arrow(flow, pt{x, n.cy() - d}, pt{x + 34, n.cy() - d}, pt{x + 34, n.cy() + d}, pt{x, n.cy() + d})
 	return f.labelRight(pt{x + 34, n.cy()}, lines...)
-}
-
-// caption writes a footnote at y, flush with the left edge of what
-// the figure has drawn so far.
-func (f *Figure) caption(y float64, lines ...string) {
-	ls := make([]Line, 0, len(lines))
-	for _, l := range lines {
-		ls = append(ls, small(l))
-	}
-	f.text(f.extent().x0, y, "left", ls...)
 }
 
 // --- edges ---------------------------------------------------------

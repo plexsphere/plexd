@@ -17,12 +17,6 @@ const (
 	tableGap    = 18.0
 )
 
-// table draws a database table: its name in a header band and one row
-// per column. It returns the outline so edges can attach to it.
-func (f *Figure) table(x, y float64, title string, cols []col) *node {
-	return f.record(roleStore, x, y, title, cols)
-}
-
 // record draws a table-shaped record in the colours of r: a database
 // table, or the fields of a message on the wire.
 func (f *Figure) record(r role, x, y float64, title string, cols []col) *node {
@@ -84,10 +78,4 @@ func (f *Figure) record(r role, x, y float64, title string, cols []col) *node {
 		ry += tableRow
 	}
 	return outline
-}
-
-// firstRowY returns the y of the middle of the first row of a table
-// drawn at tableY, where a relation to the table's key attaches.
-func firstRowY(tableY float64) float64 {
-	return tableY + tableHeader + 5 + tableRow/2
 }

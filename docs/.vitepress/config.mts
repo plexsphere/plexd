@@ -1,7 +1,6 @@
 import { defineConfig } from 'vitepress'
-import { withMermaid } from 'vitepress-plugin-mermaid'
 
-export default withMermaid(defineConfig({
+export default defineConfig({
   title: 'plexd',
   description: 'Plexsphere Node Agent Documentation',
   base: '/plexd/',
@@ -172,4 +171,4 @@ export default withMermaid(defineConfig({
       level: [2, 3],
     },
   },
-}))
+})

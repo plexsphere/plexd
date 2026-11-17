@@ -74,7 +74,7 @@ Key properties of the mesh:
 
 ## See Also
 
-- [Architecture](/guide/architecture) — detailed ASCII diagrams, platform support, mesh topology
+- [Architecture](/guide/architecture) — detailed diagrams, platform support, mesh topology
 - [Agent Lifecycle](/guide/agent-lifecycle) — full startup sequence, operational behavior, deregistration
 - [Security & Trust Model](/guide/security) — key exchange, trust chain, threat model, network requirements
 - [Agent Internals](/concepts) — subsystem overview, goroutine map, shutdown sequence
