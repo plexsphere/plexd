@@ -1384,6 +1384,89 @@ type IngressStatusResponse struct {
 }
 
 // ---------------------------------------------------------------------------
+// User Access Status  PUT /v1/nodes/{node_id}/user-access-status
+// ---------------------------------------------------------------------------
+
+// User access states of a UserAccessStatusRequest.
+const (
+	// UserAccessStateEnabled marks a bridge whose local configuration serves
+	// the user access providers the state pull enables.
+	UserAccessStateEnabled = "enabled"
+	// UserAccessStateOptedOut marks a bridge whose local configuration,
+	// bridge.user_access_enabled: false, rules user access out: it serves no
+	// provider whatever the pull says.
+	UserAccessStateOptedOut = "opted_out"
+)
+
+// The health values of a UserAccessStatusProvider.
+const (
+	// UserAccessHealthUp marks a provider the bridge serves.
+	UserAccessHealthUp = "up"
+	// UserAccessHealthDown marks a provider the bridge does not serve; Reason
+	// says why.
+	UserAccessHealthDown = "down"
+)
+
+// MaxUserAccessStatusProviders is the contract's ceiling on the entries of
+// one user access status report. A bridge with more providers reports the
+// first ones in the order of the pull.
+const MaxUserAccessStatusProviders = 256
+
+// UserAccessStatusRequest is the body of
+// PUT /v1/nodes/{node_id}/user-access-status: whether the bridge's local
+// configuration serves user access, and whether each user access provider of
+// its pull is up. The control plane keeps the latest state per node and never
+// ages it, and refuses provider creates and updates and device admissions on
+// the bridge while it reads opted_out. The provider entries age after three
+// heartbeat intervals. Each report replaces the provider entries of the one
+// before it.
+//
+// A missing, null or unknown state, an unknown member, data after the report,
+// more than MaxUserAccessStatusProviders entries, and an entry with a
+// malformed id or a value outside its member's rule answer
+// 400 malformed_user_access_status, and so does an entry that breaks the
+// presence rules of UserAccessStatusProvider. An opted-out report with
+// entries and an id that repeats an earlier entry answer
+// 400 invalid_user_access_status. A body over 64 KiB answers
+// 413 user_access_status_body_too_large.
+type UserAccessStatusRequest struct {
+	// State is one of the UserAccessState* constants.
+	State string `json:"state"`
+	// Providers holds one entry per reported provider, in the order of the
+	// pull; nil omits the member, which the contract reads as no entries.
+	Providers []UserAccessStatusProvider `json:"providers,omitempty"`
+}
+
+// UserAccessStatusProvider is one entry of providers, the control plane's
+// UserAccessStatusReportProvider. Reason is sent exactly when Health is down;
+// PublicKey and ConnectedDevices only when it is up, and the bridge sends
+// both for a wireguard provider that is up and neither for a vendor one.
+// omitempty drops an empty member, so a caller leaves every member it must
+// not send empty.
+type UserAccessStatusProvider struct {
+	// ID is the provider's id from the pull, a UUID other than the zero UUID.
+	ID string `json:"id"`
+	// Health is one of the UserAccessHealth* constants.
+	Health string `json:"health"`
+	// Reason is a token of the grammar ^[a-z][a-z0-9_]{0,62}$.
+	Reason string `json:"reason,omitempty"`
+	// PublicKey is the public half of the key of a wireguard provider's
+	// interface: 44 characters of standard base64 that decode to 32 bytes.
+	PublicKey string `json:"public_key,omitempty"`
+	// ConnectedDevices is the number of the provider's devices whose latest
+	// WireGuard handshake is at most 180 seconds old, in 0..1024. It is a
+	// pointer because 0 is a valid count, for a provider no device reaches.
+	ConnectedDevices *int `json:"connected_devices,omitempty"`
+}
+
+// UserAccessStatusResponse is the 200 body of
+// PUT /v1/nodes/{node_id}/user-access-status.
+type UserAccessStatusResponse struct {
+	// AcceptedAt is the server receive time of the report.
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// ---------------------------------------------------------------------------
 // Policy Status  PUT /v1/nodes/{node_id}/policy-status
 // ---------------------------------------------------------------------------
 

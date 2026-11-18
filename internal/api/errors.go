@@ -268,6 +268,31 @@ func IsIngressStatusNotServed(err error) bool {
 	}
 }
 
+// IsUserAccessStatusNotServed reports whether err says the control plane does
+// not serve PUT /v1/nodes/{node_id}/user-access-status: a 404 with any code
+// but user_access_status_node_gone, or a 501 carrying the
+// user_access_status_not_provisioned problem code.
+//
+// A control plane older than the operation has no route for it, and its router
+// answers 404 with whatever its not-found handler writes, so no code can be
+// required of it. The operation's own 404 is user_access_status_node_gone: the
+// node was removed while the request ran, a verdict on the node rather than a
+// missing surface.
+func IsUserAccessStatusNotServed(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusNotFound:
+		return apiErr.Code != "user_access_status_node_gone"
+	case http.StatusNotImplemented:
+		return apiErr.Code == "user_access_status_not_provisioned"
+	default:
+		return false
+	}
+}
+
 // IsPolicyStatusNotServed reports whether err says the control plane has no
 // route for PUT /v1/nodes/{node_id}/policy-status: a 404 with any code but
 // policy_status_node_gone.

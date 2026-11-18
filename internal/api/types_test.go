@@ -3396,6 +3396,63 @@ func TestIngressStatusRequest_JSON(t *testing.T) {
 	}
 }
 
+func TestUserAccessStatusRequest_JSON(t *testing.T) {
+	connected := func(n int) *int { return &n }
+	const key = "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M="
+	tests := []struct {
+		name string
+		req  UserAccessStatusRequest
+		want string
+	}{
+		{
+			name: "opted out",
+			req:  UserAccessStatusRequest{State: UserAccessStateOptedOut},
+			want: `{"state":"opted_out"}`,
+		},
+		{
+			name: "no providers",
+			req:  UserAccessStatusRequest{State: UserAccessStateEnabled},
+			want: `{"state":"enabled"}`,
+		},
+		{
+			// The report of the contract's section "User access status".
+			name: "the contract's example",
+			req: UserAccessStatusRequest{State: UserAccessStateEnabled, Providers: []UserAccessStatusProvider{
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Health: UserAccessHealthUp, PublicKey: key, ConnectedDevices: connected(1)},
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Health: UserAccessHealthDown, Reason: "auth_secret_not_listed"},
+			}},
+			want: `{"state":"enabled","providers":[` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"up","public_key":"` + key + `","connected_devices":1},` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","health":"down","reason":"auth_secret_not_listed"}]}`,
+		},
+		{
+			name: "no device connected",
+			req: UserAccessStatusRequest{State: UserAccessStateEnabled, Providers: []UserAccessStatusProvider{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Health: UserAccessHealthUp, PublicKey: key, ConnectedDevices: connected(0),
+			}}},
+			want: `{"state":"enabled","providers":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"up","public_key":"` + key + `","connected_devices":0}]}`,
+		},
+		{
+			name: "a vendor provider that is up",
+			req: UserAccessStatusRequest{State: UserAccessStateEnabled, Providers: []UserAccessStatusProvider{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Health: UserAccessHealthUp,
+			}}},
+			want: `{"state":"enabled","providers":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","health":"up"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.req)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("JSON =\n  %s\nwant\n  %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidIngressRuleID(t *testing.T) {
 	const id = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1"
 	for _, s := range []string{id, strings.ToUpper(id)} {

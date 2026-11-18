@@ -260,6 +260,24 @@ func (c *ControlPlane) ReportIngressStatus(ctx context.Context, nodeID string, r
 	return &resp, nil
 }
 
+// ReportUserAccessStatus reports whether the bridge's local configuration
+// serves user access, and whether each user access provider of its pull is
+// up, and returns the control plane's receipt.
+//
+// It validates nothing and sends the request as passed: the user access
+// status reporter builds only the shapes the contract admits, and the control
+// plane refuses any other with 400 malformed_user_access_status or
+// invalid_user_access_status.
+// PUT /v1/nodes/{node_id}/user-access-status
+func (c *ControlPlane) ReportUserAccessStatus(ctx context.Context, nodeID string, req UserAccessStatusRequest) (*UserAccessStatusResponse, error) {
+	var resp UserAccessStatusResponse
+	path := fmt.Sprintf("/v1/nodes/%s/user-access-status", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPut, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ReportPolicyStatus reports what the node did with the policy block of its
 // pulls and returns the control plane's receipt.
 //

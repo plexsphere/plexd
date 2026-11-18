@@ -1523,6 +1523,203 @@ func TestReportIngressStatus_PathParametersEscaped(t *testing.T) {
 	}
 }
 
+// testUserAccessStatusAccepted is a 200 body of
+// PUT /v1/nodes/{node_id}/user-access-status.
+const testUserAccessStatusAccepted = `{"accepted_at":"2026-11-18T10:15:30.123Z"}`
+
+func TestReportUserAccessStatus_Success(t *testing.T) {
+	connected := func(n int) *int { return &n }
+	tests := []struct {
+		name     string
+		req      UserAccessStatusRequest
+		wantBody string
+	}{
+		{name: UserAccessStateOptedOut, req: UserAccessStatusRequest{State: UserAccessStateOptedOut}, wantBody: `{"state":"opted_out"}`},
+		{name: UserAccessStateEnabled, req: UserAccessStatusRequest{State: UserAccessStateEnabled}, wantBody: `{"state":"enabled"}`},
+		{
+			name: "enabled with providers",
+			req: UserAccessStatusRequest{State: UserAccessStateEnabled, Providers: []UserAccessStatusProvider{
+				{
+					ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Health: UserAccessHealthUp,
+					PublicKey: "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=", ConnectedDevices: connected(0),
+				},
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Health: UserAccessHealthDown, Reason: "auth_secret_not_listed"},
+			}},
+			wantBody: `{"state":"enabled","providers":[` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"up","public_key":"hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=","connected_devices":0},` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","health":"down","reason":"auth_secret_not_listed"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotMethod, gotPath, gotContentType, gotAuth string
+			var gotBody []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotContentType = r.Header.Get("Content-Type")
+				gotAuth = r.Header.Get("Authorization")
+				var err error
+				if gotBody, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, testUserAccessStatusAccepted)
+			})
+
+			resp, err := client.ReportUserAccessStatus(context.Background(), "node-1", tt.req)
+			if err != nil {
+				t.Fatalf("ReportUserAccessStatus: %v", err)
+			}
+
+			if gotMethod != http.MethodPut {
+				t.Errorf("method = %s, want PUT", gotMethod)
+			}
+			if gotPath != "/v1/nodes/node-1/user-access-status" {
+				t.Errorf("path = %s, want /v1/nodes/node-1/user-access-status", gotPath)
+			}
+			if gotContentType != "application/json" {
+				t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+			}
+			if gotAuth != "Bearer test-token" {
+				t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+			}
+
+			if got := strings.TrimSpace(string(gotBody)); got != tt.wantBody {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, tt.wantBody)
+			}
+
+			wantAcceptedAt := time.Date(2026, 11, 18, 10, 15, 30, 123_000_000, time.UTC)
+			if !resp.AcceptedAt.Equal(wantAcceptedAt) {
+				t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, wantAcceptedAt)
+			}
+		})
+	}
+}
+
+// A refusal must survive the client's error mapping in the shape the reporter
+// reads: the problem code of a 400 or a 404, and the bare 404 an older router
+// writes with no body, which IsUserAccessStatusNotServed takes for a missing
+// surface.
+func TestReportUserAccessStatus_ErrorAnswers(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		contentType   string
+		body          string
+		wantCode      string
+		wantNotServed bool
+	}{
+		{
+			"400 malformed_user_access_status", http.StatusBadRequest,
+			"application/problem+json", `{"title":"Bad Request","status":400,"detail":"providers[0].reason is required while health is down","code":"malformed_user_access_status"}`,
+			"malformed_user_access_status", false,
+		},
+		{
+			"404 user_access_status_node_gone", http.StatusNotFound,
+			"application/problem+json", `{"title":"Not Found","status":404,"detail":"the node was removed","code":"user_access_status_node_gone"}`,
+			"user_access_status_node_gone", false,
+		},
+		{
+			"404 with an empty body", http.StatusNotFound,
+			"", "",
+			"", true,
+		},
+		{
+			"501 user_access_status_not_provisioned", http.StatusNotImplemented,
+			"application/problem+json", `{"title":"Not Implemented","status":501,"detail":"user access status is not provisioned","code":"user_access_status_not_provisioned"}`,
+			"user_access_status_not_provisioned", true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			resp, err := client.ReportUserAccessStatus(context.Background(), "node-1", UserAccessStatusRequest{State: UserAccessStateEnabled})
+			if resp != nil {
+				t.Errorf("response = %+v, want nil", resp)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("errors.As failed to extract *APIError: %v", err)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", apiErr.Code, tt.wantCode)
+			}
+			if got := IsUserAccessStatusNotServed(err); got != tt.wantNotServed {
+				t.Errorf("IsUserAccessStatusNotServed(%v) = %v, want %v", err, got, tt.wantNotServed)
+			}
+		})
+	}
+}
+
+// The reporter's context ends at shutdown, possibly while a report waits on
+// a slow control plane. The call must end with it and say why.
+func TestReportUserAccessStatus_ContextCanceled(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	client, _ := newEndpointTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		// The server watches the connection for the client hanging up only
+		// once the request body is read, so the handler reads it before it
+		// waits, as in TestReportRelayStatus_ContextCanceled.
+		_, _ = io.Copy(io.Discard, r.Body)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(backstopContext(t))
+	defer cancel()
+	go func() {
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	resp, err := client.ReportUserAccessStatus(ctx, "node-1", UserAccessStatusRequest{State: UserAccessStateOptedOut})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want %v", err, context.Canceled)
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+}
+
+func TestReportUserAccessStatus_PathParametersEscaped(t *testing.T) {
+	// Verify the nodeID is escaped, so it cannot climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testUserAccessStatusAccepted)
+	})
+
+	_, err := client.ReportUserAccessStatus(context.Background(), "../../../etc/passwd", UserAccessStatusRequest{State: UserAccessStateEnabled})
+	if err != nil {
+		t.Fatalf("ReportUserAccessStatus: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/user-access-status"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 // testPolicyStatusAccepted is a 200 body of PUT /v1/nodes/{node_id}/policy-status.
 const testPolicyStatusAccepted = `{"accepted_at":"2026-11-13T10:15:30.123Z","status":"applied"}`
 
