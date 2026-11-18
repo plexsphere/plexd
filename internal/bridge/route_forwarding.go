@@ -11,10 +11,11 @@ type forwardingPair [2]string
 // Linux needs none of this: its knob is a per-interface sysctl and every
 // manager writes its own. The other two platforms share theirs. macOS has a
 // single global forwarding sysctl, and on Windows the mesh adapter's
-// forwarding flag is claimed by the bridge manager and the site-to-site
-// manager alike, so tearing one down would otherwise switch forwarding off
-// under the other. The user access manager claims no knob there: it serves
-// no provider on either platform.
+// forwarding flag is claimed by every pair that names the mesh adapter, so
+// releasing one pair would otherwise switch forwarding off under another.
+// The bridge manager is the only claimant there: the user access and
+// site-to-site managers claim no knob, since neither serves a provider or a
+// tunnel on either platform.
 //
 // V is the saved state; each platform picks its own. The ledger carries no
 // lock: every caller already holds its controller's mutex.

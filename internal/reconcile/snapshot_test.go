@@ -38,7 +38,7 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 			SiteToSite: &api.SiteToSiteConfig{
 				Enabled: true,
 				Tunnels: []api.SiteToSiteTunnel{
-					{TunnelID: "t1", LocalSubnets: []string{"10.0.0.0/24"}, RemoteSubnets: []string{"172.16.0.0/16"}},
+					{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "branch", Kind: api.SiteToSiteKindWireGuard, RemoteHost: "203.0.113.1", RemotePort: 51820, AllowedSubnets: []string{"172.16.0.0/16", "172.17.0.0/16"}},
 				},
 			},
 		},
@@ -130,7 +130,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	desired.Policy.Rules[0].Ports.From = 8443
 	desired.Policy.Revisions[0].RevisionID = "mutated"
 	desired.Bridge.UserAccess.Providers[0].Devices[0].Address = "mutated"
-	desired.Bridge.SiteToSite.Tunnels[0].LocalSubnets[0] = "mutated"
+	desired.Bridge.SiteToSite.Tunnels[0].AllowedSubnets[0] = "mutated"
 	desired.State.Metadata[0].Value = "mutated"
 	desired.Reports.Metadata[0].Value = "mutated"
 
@@ -160,8 +160,8 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	if got.Bridge.UserAccess.Providers[0].Devices[0].Address == "mutated" {
 		t.Error("Bridge user access devices were not copied on Update")
 	}
-	if got.Bridge.SiteToSite.Tunnels[0].LocalSubnets[0] == "mutated" {
-		t.Error("Bridge site-to-site subnets were not copied on Update")
+	if got.Bridge.SiteToSite.Tunnels[0].AllowedSubnets[0] == "mutated" {
+		t.Error("Bridge site-to-site allowed subnets were not copied on Update")
 	}
 	if got.State.Metadata[0].Value == "mutated" {
 		t.Error("State block was not copied on Update")
@@ -185,7 +185,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	got.Policy.Rules[0].SourceCIDR = "mutated"
 	got.Policy.Rules[0].Ports.To = 8443
 	got.Bridge.UserAccess.Providers[0].Devices[0].Address = "mutated"
-	got.Bridge.SiteToSite.Tunnels[0].RemoteSubnets[0] = "mutated"
+	got.Bridge.SiteToSite.Tunnels[0].AllowedSubnets[1] = "mutated"
 	got.State.Metadata[0].Value = "mutated"
 
 	got2 := snap.Get()
@@ -211,8 +211,8 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	if got2.Bridge.UserAccess.Providers[0].Devices[0].Address == "mutated" {
 		t.Error("Get did not return a copy of Bridge user access devices")
 	}
-	if got2.Bridge.SiteToSite.Tunnels[0].RemoteSubnets[0] == "mutated" {
-		t.Error("Get did not return a copy of Bridge site-to-site subnets")
+	if got2.Bridge.SiteToSite.Tunnels[0].AllowedSubnets[1] == "mutated" {
+		t.Error("Get did not return a copy of Bridge site-to-site allowed subnets")
 	}
 	if got2.State.Metadata[0].Value == "mutated" {
 		t.Error("Get did not return a copy of the State block")

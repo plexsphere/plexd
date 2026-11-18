@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -476,197 +477,193 @@ func TestConfig_Validate_IngressDisabled(t *testing.T) {
 	}
 }
 
+// The control plane delivers every site-to-site tunnel, so ApplyDefaults
+// leaves the local switch unset and gives the ignored keys no value.
 func TestConfig_ApplyDefaults_SiteToSiteFields(t *testing.T) {
 	var cfg Config
 	cfg.ApplyDefaults()
 
-	if cfg.SiteToSiteEnabled {
-		t.Error("SiteToSiteEnabled should default to false")
+	if cfg.SiteToSiteEnabled != nil {
+		t.Errorf("SiteToSiteEnabled = %v, want it to stay nil after ApplyDefaults", *cfg.SiteToSiteEnabled)
 	}
-	if cfg.SiteToSiteInterfacePrefix != DefaultSiteToSiteInterfacePrefix {
-		t.Errorf("SiteToSiteInterfacePrefix = %q, want %q", cfg.SiteToSiteInterfacePrefix, DefaultSiteToSiteInterfacePrefix)
+	if keys := cfg.ReplacedSiteToSiteKeys(); keys != nil {
+		t.Errorf("ReplacedSiteToSiteKeys() = %q after ApplyDefaults, want nil: the ignored keys have no default", keys)
 	}
-	if cfg.SiteToSiteListenPort != DefaultSiteToSiteListenPort {
-		t.Errorf("SiteToSiteListenPort = %d, want %d", cfg.SiteToSiteListenPort, DefaultSiteToSiteListenPort)
-	}
-	if cfg.MaxSiteToSiteTunnels != DefaultMaxSiteToSiteTunnels {
-		t.Errorf("MaxSiteToSiteTunnels = %d, want %d", cfg.MaxSiteToSiteTunnels, DefaultMaxSiteToSiteTunnels)
+	if cfg.SwanctlConfDir != "" {
+		t.Errorf("SwanctlConfDir = %q after ApplyDefaults, want empty: plexd up resolves the run directory", cfg.SwanctlConfDir)
 	}
 }
 
+func TestConfig_SiteToSiteOptedOut(t *testing.T) {
+	tests := []struct {
+		name              string
+		siteToSiteEnabled *bool
+		want              bool
+	}{
+		{"nil serves", nil, false},
+		{"explicit true", BoolPtr(true), false},
+		{"explicit false opts out", BoolPtr(false), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{SiteToSiteEnabled: tt.siteToSiteEnabled}
+			if got := cfg.SiteToSiteOptedOut(); got != tt.want {
+				t.Errorf("SiteToSiteOptedOut() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// An unset switch is the default every node carries, so only an explicit true
+// is refused outside bridge mode.
 func TestConfig_Validate_SiteToSiteWithoutBridge(t *testing.T) {
-	cfg := Config{
-		Enabled:           false,
-		SiteToSiteEnabled: true,
+	tests := []struct {
+		name              string
+		siteToSiteEnabled *bool
+		wantErr           string
+	}{
+		{"explicit true", BoolPtr(true), "bridge: config: site-to-site requires bridge mode to be enabled"},
+		{"nil", nil, ""},
+		{"explicit false", BoolPtr(false), ""},
 	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate should return error when site-to-site enabled without bridge")
-	}
-	want := "bridge: config: site-to-site requires bridge mode to be enabled"
-	if err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
-	}
-}
-
-func TestConfig_Validate_SiteToSiteValidConfig(t *testing.T) {
-	cfg := Config{
-		Enabled:                   true,
-		AccessInterface:           "eth1",
-		AccessSubnets:             []string{"10.0.0.0/24"},
-		SiteToSiteEnabled:         true,
-		SiteToSiteInterfacePrefix: "wg-s2s-",
-		SiteToSiteListenPort:      51823,
-		MaxSiteToSiteTunnels:      10,
-		IngressEnabled:            BoolPtr(false),
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should return nil for valid site-to-site config, got: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:           false,
+				SiteToSiteEnabled: tt.siteToSiteEnabled,
+			}
+			err := cfg.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("Validate() = nil, want %q", tt.wantErr)
+			case tt.wantErr != "" && err.Error() != tt.wantErr:
+				t.Errorf("got %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 }
 
-func TestConfig_Validate_SiteToSiteInvalidPort(t *testing.T) {
+func TestConfig_Validate_SiteToSiteInBridgeMode(t *testing.T) {
+	for name, enabled := range map[string]*bool{"nil": nil, "explicit true": BoolPtr(true), "explicit false": BoolPtr(false)} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:           true,
+				AccessInterface:   "eth1",
+				AccessSubnets:     []string{"10.0.0.0/24"},
+				SiteToSiteEnabled: enabled,
+				IngressEnabled:    BoolPtr(false),
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestConfig_ReplacedSiteToSiteKeys(t *testing.T) {
 	tests := []struct {
 		name string
-		port int
+		cfg  Config
+		want []string
 	}{
-		{"port zero", 0},
-		{"port too high", 70000},
+		{"none set", Config{Enabled: true, SiteToSiteEnabled: BoolPtr(true), SwanctlConfDir: "/etc/swanctl/conf.d"}, nil},
+		{"interface prefix", Config{SiteToSiteInterfacePrefix: "wg-s2s-"}, []string{"site_to_site_interface_prefix"}},
+		{"listen port", Config{SiteToSiteListenPort: 51823}, []string{"site_to_site_listen_port"}},
+		{"max tunnels", Config{MaxSiteToSiteTunnels: 10}, []string{"max_site_to_site_tunnels"}},
+		{"tunnel providers", Config{TunnelProviders: []string{"ipsec"}}, []string{"tunnel_providers"}},
+		{"empty tunnel providers", Config{TunnelProviders: []string{}}, nil},
+		{"two of them", Config{TunnelProviders: []string{"openvpn"}, SiteToSiteListenPort: 51823}, []string{"site_to_site_listen_port", "tunnel_providers"}},
+		{"all four", Config{
+			SiteToSiteInterfacePrefix: "wg-s2s-",
+			SiteToSiteListenPort:      51823,
+			MaxSiteToSiteTunnels:      10,
+			TunnelProviders:           []string{"ipsec", "openvpn"},
+		}, []string{"site_to_site_interface_prefix", "site_to_site_listen_port", "max_site_to_site_tunnels", "tunnel_providers"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{
-				Enabled:                   true,
-				AccessInterface:           "eth1",
-				AccessSubnets:             []string{"10.0.0.0/24"},
-				SiteToSiteEnabled:         true,
-				SiteToSiteInterfacePrefix: "wg-s2s-",
-				SiteToSiteListenPort:      tt.port,
-				MaxSiteToSiteTunnels:      10,
-				IngressEnabled:            BoolPtr(false),
+			got := tt.cfg.ReplacedSiteToSiteKeys()
+			if tt.want == nil {
+				if got != nil {
+					t.Errorf("ReplacedSiteToSiteKeys() = %q, want nil", got)
+				}
+				return
 			}
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatal("Validate should return error for invalid port")
-			}
-			want := "bridge: config: SiteToSiteListenPort must be between 1 and 65535"
-			if err.Error() != want {
-				t.Errorf("got %q, want %q", err.Error(), want)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ReplacedSiteToSiteKeys() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestConfig_Validate_SiteToSiteBoundaryPorts(t *testing.T) {
+// The ignored keys are not validated: values the local model refused, such
+// as an out-of-range port, a non-positive tunnel cap, an empty interface
+// prefix with site-to-site on and an unknown tunnel provider, are accepted
+// and ignored.
+func TestConfig_Validate_ReplacedSiteToSiteKeysAccepted(t *testing.T) {
 	tests := []struct {
-		name    string
-		port    int
-		wantErr bool
+		name string
+		set  func(*Config)
 	}{
-		{"port 1 (min valid)", 1, false},
-		{"port 65535 (max valid)", 65535, false},
-		{"port 65536 (just over max)", 65536, true},
+		{"listen port zero", func(c *Config) { c.SiteToSiteListenPort = 0 }},
+		{"listen port too high", func(c *Config) { c.SiteToSiteListenPort = 70000 }},
+		{"negative tunnel cap", func(c *Config) { c.MaxSiteToSiteTunnels = -1 }},
+		{"no interface prefix", func(c *Config) { c.SiteToSiteInterfacePrefix = "" }},
+		{"unknown tunnel provider", func(c *Config) { c.TunnelProviders = []string{"foo"} }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Config{
-				Enabled:                   true,
-				AccessInterface:           "eth1",
-				AccessSubnets:             []string{"10.0.0.0/24"},
-				SiteToSiteEnabled:         true,
-				SiteToSiteInterfacePrefix: "wg-s2s-",
-				SiteToSiteListenPort:      tt.port,
-				MaxSiteToSiteTunnels:      10,
-				IngressEnabled:            BoolPtr(false),
+				Enabled:           true,
+				AccessInterface:   "eth1",
+				AccessSubnets:     []string{"10.0.0.0/24"},
+				SiteToSiteEnabled: BoolPtr(true),
+				IngressEnabled:    BoolPtr(false),
 			}
-			err := cfg.Validate()
-			if tt.wantErr && err == nil {
-				t.Fatal("Validate should return error for out-of-range port")
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("Validate should return nil for valid port %d, got: %v", tt.port, err)
+			tt.set(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil: the key is ignored", err)
 			}
 		})
 	}
 }
 
-func TestConfig_Validate_SiteToSiteInvalidMaxTunnels(t *testing.T) {
-	tests := []struct {
-		name       string
-		maxTunnels int
-	}{
-		{"zero tunnels", 0},
-		{"negative tunnels", -1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{
-				Enabled:                   true,
-				AccessInterface:           "eth1",
-				AccessSubnets:             []string{"10.0.0.0/24"},
-				SiteToSiteEnabled:         true,
-				SiteToSiteInterfacePrefix: "wg-s2s-",
-				SiteToSiteListenPort:      51823,
-				MaxSiteToSiteTunnels:      tt.maxTunnels,
-				IngressEnabled:            BoolPtr(false),
-			}
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatal("Validate should return error for invalid MaxSiteToSiteTunnels")
-			}
-			want := "bridge: config: MaxSiteToSiteTunnels must be positive when site-to-site is enabled"
-			if err.Error() != want {
-				t.Errorf("got %q, want %q", err.Error(), want)
-			}
-		})
-	}
-}
-
-func TestConfig_Validate_SiteToSiteDisabled(t *testing.T) {
-	cfg := Config{
-		Enabled:           true,
-		AccessInterface:   "eth1",
-		AccessSubnets:     []string{"10.0.0.0/24"},
-		SiteToSiteEnabled: false,
-		IngressEnabled:    BoolPtr(false),
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should return nil when site-to-site is disabled, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TunnelProviders validation tests
-// ---------------------------------------------------------------------------
-
-func TestConfig_Validate_TunnelProviders_Valid(t *testing.T) {
-	cfg := Config{
+// swanctl_conf_dir must be an absolute path whatever the other settings say;
+// an empty one leaves plexd up to resolve the run directory.
+func TestConfig_Validate_SwanctlConfDir(t *testing.T) {
+	bridge := Config{
 		Enabled:         true,
 		AccessInterface: "eth1",
 		AccessSubnets:   []string{"10.0.0.0/24"},
-		TunnelProviders: []string{"ipsec", "openvpn"},
 		IngressEnabled:  BoolPtr(false),
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should accept valid tunnel providers, got: %v", err)
-	}
-}
+	for name, base := range map[string]Config{
+		"bridge mode":                   bridge,
+		"bridge mode, opted out":        func() Config { c := bridge; c.SiteToSiteEnabled = BoolPtr(false); return c }(),
+		"bridge disabled":               {},
+		"bridge disabled, opted out":    {SiteToSiteEnabled: BoolPtr(false)},
+		"bridge mode, site-to-site set": func() Config { c := bridge; c.SiteToSiteEnabled = BoolPtr(true); return c }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			cfg.SwanctlConfDir = "relative/dir"
+			const want = `bridge: config: swanctl_conf_dir: "relative/dir" is not an absolute path`
+			if err := cfg.Validate(); err == nil || err.Error() != want {
+				t.Errorf("Validate() = %v, want %q", err, want)
+			}
 
-func TestConfig_Validate_TunnelProviders_Invalid(t *testing.T) {
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		TunnelProviders: []string{"ipsec", "gre"},
-		IngressEnabled:  BoolPtr(false),
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate should return error for unsupported tunnel provider")
-	}
-	want := `bridge: config: unsupported TunnelProvider "gre"`
-	if err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
+			cfg.SwanctlConfDir = ""
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() with an empty swanctl_conf_dir = %v, want nil", err)
+			}
+
+			cfg.SwanctlConfDir = filepath.Join(t.TempDir(), "swanctl")
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() with the absolute swanctl_conf_dir %q = %v, want nil", cfg.SwanctlConfDir, err)
+			}
+		})
 	}
 }
 

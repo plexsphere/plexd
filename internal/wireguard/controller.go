@@ -33,8 +33,7 @@ type WGController interface {
 // Only code that hands the name back to the operating system needs this: the
 // readiness check, which resolves the interface with net.InterfaceByName; the
 // pf enforcer, whose rules match on the kernel name; and the route calls of
-// the site-to-site manager and of the manager's peer routes, because route(8)
-// takes the kernel name.
+// the manager's peer routes, because route(8) takes the kernel name.
 // Everything addressing the device through plexd keeps the configured name.
 type OSInterfaceNamer interface {
 	// OSInterfaceName returns the kernel's name for the interface created

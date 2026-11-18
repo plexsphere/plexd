@@ -1,596 +1,190 @@
 package bridge
 
-// Integration tests — Site-to-Site with TunnelProviders
-
 import (
-	"context"
-	"fmt"
+	"encoding/hex"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
-	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
 // ---------------------------------------------------------------------------
-// TestTunnelProviderIntegration_FullLifecycle
+// Integration tests — the tunnel providers under the site-to-site manager
 // ---------------------------------------------------------------------------
 
-// TestTunnelProviderIntegration_FullLifecycle wires a SiteToSiteManager with a
-// mock TunnelProvider ("ipsec") and verifies the full lifecycle: Setup, add
-// WireGuard tunnel, add provider tunnel, status, remove both, teardown.
-func TestTunnelProviderIntegration_FullLifecycle(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	ipsecProvider := newMockTunnelProvider()
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
+// providerFixture is a SiteToSiteManager over the real IPsecProvider and
+// OpenVPNProvider, which run their commands through one mock executor and
+// keep their files in temporary directories.
+type providerFixture struct {
+	*s2sFixture
+	runner  *mockCommandExecutor
+	handle  *mockCommandHandle
+	swanctl string
+	tunnels string
+}
 
-	providers := map[string]TunnelProvider{
-		"ipsec": ipsecProvider,
+// newProviderFixture builds the manager over the real providers and sets it
+// up. swanctl --list-conns lists dc-east's connection.
+func newProviderFixture(t *testing.T) *providerFixture {
+	t.Helper()
+	pf := &providerFixture{
+		runner:  newMockCommandExecutor(),
+		handle:  &mockCommandHandle{},
+		swanctl: filepath.Join(t.TempDir(), "swanctl"),
+		tunnels: filepath.Join(t.TempDir(), "tunnels"),
 	}
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), providers)
-
-	// --- Setup ---
-	if err := mgr.Setup("wg0"); err != nil {
+	pf.runner.startHandle = pf.handle
+	pf.runner.runOutputs["swanctl --list-conns"] = swanctlListConns(s2sID2)
+	pf.s2sFixture = buildS2SFixture(t, func(d *SiteToSiteDeps) {
+		d.Providers = map[string]TunnelProvider{
+			api.SiteToSiteKindIPsec:   NewIPsecProvider(pf.runner, pf.swanctl, discardLogger()),
+			api.SiteToSiteKindOpenVPN: NewOpenVPNProvider(pf.runner, pf.tunnels, discardLogger()),
+		}
+	})
+	if err := pf.mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-	if mgr.SiteToSiteStatus() == nil {
-		t.Fatal("should be active after Setup")
+	return pf
+}
+
+// commands returns the command lines the executor ran.
+func (pf *providerFixture) commands() [][]string {
+	return callLines(pf.runner.allCalls())
+}
+
+// TestTunnelProviderIntegration_Lifecycle drives an ipsec and an openvpn
+// tunnel through pulls of a real Reconciler: the providers write their files
+// and run their commands under the links the manager created, and a tunnel
+// the pull drops loses its files and its daemon's side.
+func TestTunnelProviderIntegration_Lifecycle(t *testing.T) {
+	pf := newProviderFixture(t)
+	fetcher := &integrationStateFetcher{state: siteToSiteState(s2sInventory(), dcEast, office)}
+	rec := runSiteToSiteReconciler(t, fetcher, pf.mgr)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return tunnelHealth(pf.mgr, s2sID2) == api.SiteToSiteHealthUp && tunnelHealth(pf.mgr, s2sID3) == api.SiteToSiteHealthUp
+	})
+
+	conn, err := os.ReadFile(filepath.Join(pf.swanctl, "plexd-"+s2sID2+".conf"))
+	if err != nil {
+		t.Fatalf("read dc-east's connection file: %v", err)
+	}
+	for _, want := range []string{
+		"remote_addrs = 203.0.113.10\n",
+		"if_id_in = 2694881506\n",
+		"local_ts = " + s2sMeshCIDR + "\n",
+		"remote_ts = 10.30.0.0/16,10.31.0.0/16\n",
+		"secret = 0x" + hex.EncodeToString([]byte(s2sIKEKey)) + "\n",
+	} {
+		if !strings.Contains(string(conn), want) {
+			t.Errorf("connection file lacks %q:\n%s", want, conn)
+		}
+	}
+	confPath := filepath.Join(pf.tunnels, "plexd-openvpn-"+s2sID3+".conf")
+	conf, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatalf("read office's configuration: %v", err)
+	}
+	for _, want := range []string{"dev " + s2sTunIface + "\n", "remote vpn.office.example.com 1194\n"} {
+		if !strings.Contains(string(conf), want) {
+			t.Errorf("configuration lacks %q:\n%s", want, conf)
+		}
+	}
+	key, err := os.ReadFile(filepath.Join(pf.tunnels, "plexd-openvpn-"+s2sID3+".key"))
+	if err != nil || string(key) != openvpnTestKey+"\n" {
+		t.Errorf("office's key file = %q, %v, want the static key", key, err)
+	}
+	wantCommands := [][]string{
+		swanctlLoad,
+		{"Run", "swanctl", "--list-conns"},
+		{"Start", "openvpn", "--config", confPath},
+	}
+	if got := pf.commands(); !slices.EqualFunc(got, wantCommands, slices.Equal) {
+		t.Errorf("commands =\n  %q\nwant\n  %q", got, wantCommands)
+	}
+	if got := pf.vpn.vpnMethods(); !slices.Equal(got, []string{"RemoveTunnelInterfaces", "CreateXfrmInterface", "CreateTunInterface"}) {
+		t.Errorf("controller calls = %q, want the cleanup and the two links", got)
 	}
 
-	// --- Add a WireGuard tunnel (ProviderType="" goes through VPNController) ---
-	wgTunnel := testTunnel("tun-wg-1")
-	if err := mgr.AddTunnel(wgTunnel); err != nil {
-		t.Fatalf("AddTunnel WireGuard: %v", err)
+	// dc-east leaves the pull: its file is gone, strongSwan loads it away
+	// and its connection is terminated; office stays.
+	pf.runner.mu.Lock()
+	pf.runner.callList = nil
+	pf.runner.mu.Unlock()
+	fetcher.setState(siteToSiteState(s2sInventory(), office))
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(tunnelIDs(pf.mgr)) == 1
+	})
+	requireNoFile(t, filepath.Join(pf.swanctl, "plexd-"+s2sID2+".conf"))
+	if got, want := pf.commands(), [][]string{swanctlLoad, swanctlTerminate(s2sID2)}; !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("commands = %q, want %q", got, want)
+	}
+	if pf.handle.stopCalls() != 0 {
+		t.Errorf("openvpn stops = %d, want office left running", pf.handle.stopCalls())
 	}
 
-	// Verify VPNController was called for WireGuard tunnel.
-	if len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) != 1 {
-		t.Errorf("expected 1 CreateTunnelInterface call for WG tunnel, got %d", len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")))
+	// office leaves the pull: its process stops and its files are gone.
+	fetcher.setState(siteToSiteState(s2sInventory()))
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return pf.handle.stopCalls() == 1
+	})
+	if got := dirNames(t, pf.tunnels); len(got) != 0 {
+		t.Errorf("tunnel directory holds %q, want nothing", got)
+	}
+}
+
+// TestTunnelProviderIntegration_ClientMissing serves an ipsec and an openvpn
+// tunnel on a host without swanctl and openvpn: both read client_missing,
+// leave no file and no link, and come up on a later pull once the clients
+// are installed.
+func TestTunnelProviderIntegration_ClientMissing(t *testing.T) {
+	pf := newProviderFixture(t)
+	pf.runner.runErrors["swanctl --load-all --clear --noprompt"] = &exec.Error{Name: "swanctl", Err: exec.ErrNotFound}
+	pf.runner.startErr = &exec.Error{Name: "openvpn", Err: exec.ErrNotFound}
+	fetcher := &integrationStateFetcher{state: siteToSiteState(s2sInventory(), dcEast, office)}
+	rec := runSiteToSiteReconciler(t, fetcher, pf.mgr)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(tunnelIDs(pf.mgr)) == 2
+	})
+	requireTunnelDown(t, pf.mgr, s2sID2, SiteToSiteReasonClientMissing)
+	requireTunnelDown(t, pf.mgr, s2sID3, SiteToSiteReasonClientMissing)
+	requireNoFile(t, filepath.Join(pf.swanctl, "plexd-"+s2sID2+".conf"))
+	if got := dirNames(t, pf.tunnels); len(got) != 0 {
+		t.Errorf("tunnel directory holds %q, want nothing", got)
+	}
+	var links []string
+	for _, c := range pf.vpn.vpnCallsFor("RemoveTunnelInterface") {
+		links = append(links, c.Args[0].(string))
+	}
+	if !slices.Equal(links, []string{s2sXfrmIface, s2sTunIface}) {
+		t.Errorf("links removed = %q, want both links of the failed attempts", links)
 	}
 
-	// --- Add a provider tunnel (ProviderType="ipsec" goes through provider) ---
-	ipsecTunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-1",
-		RemoteEndpoint: "203.0.113.1:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		PSK:            "shared-secret",
-		ProviderType:   "ipsec",
+	// The clients are installed; the bridge block is the same.
+	pf.runner.mu.Lock()
+	delete(pf.runner.runErrors, "swanctl --load-all --clear --noprompt")
+	pf.runner.startErr = nil
+	pf.runner.mu.Unlock()
+	pf.clock.Add(5 * time.Second)
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return tunnelHealth(pf.mgr, s2sID2) == api.SiteToSiteHealthUp && tunnelHealth(pf.mgr, s2sID3) == api.SiteToSiteHealthUp
+	})
+	if _, err := os.Stat(filepath.Join(pf.swanctl, "plexd-"+s2sID2+".conf")); err != nil {
+		t.Errorf("dc-east's connection file: %v", err)
 	}
-	if err := mgr.AddTunnel(ipsecTunnel); err != nil {
-		t.Fatalf("AddTunnel IPsec: %v", err)
-	}
-
-	// Verify provider.CreateTunnel was called.
-	createCalls := ipsecProvider.callsFor("CreateTunnel")
-	if len(createCalls) != 1 {
-		t.Fatalf("expected 1 provider CreateTunnel call, got %d", len(createCalls))
-	}
-
-	// Verify VPNController was NOT called again (still 1 from WG tunnel).
-	if len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) != 1 {
-		t.Errorf("CreateTunnelInterface should not be called for provider tunnel")
-	}
-
-	// --- Status shows TunnelProviderNames and TunnelCount ---
-	status := mgr.SiteToSiteStatus()
-	if status == nil {
-		t.Fatal("SiteToSiteStatus should not be nil when active")
-	}
-	if len(status.TunnelProviderNames) != 1 || status.TunnelProviderNames[0] != "ipsec" {
-		t.Errorf("TunnelProviderNames = %v, want [ipsec]", status.TunnelProviderNames)
-	}
-	if status.TunnelCount != 2 {
-		t.Errorf("TunnelCount = %d, want 2", status.TunnelCount)
-	}
-
-	// --- Remove the WireGuard tunnel (goes through VPNController) ---
-	vpnCtrl.resetVPN()
-	routeCtrl.reset()
-	mgr.RemoveTunnel("tun-wg-1")
-
-	if len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) != 1 {
-		t.Errorf("expected 1 RemoveTunnelInterface call for WG removal, got %d", len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")))
-	}
-
-	// --- Remove the provider tunnel (goes through provider.RemoveTunnel) ---
-	mgr.RemoveTunnel("t-ipsec-1")
-
-	removeCalls := ipsecProvider.callsFor("RemoveTunnel")
-	if len(removeCalls) != 1 {
-		t.Fatalf("expected 1 provider RemoveTunnel call, got %d", len(removeCalls))
-	}
-	if removeCalls[0].Args[0] != "t-ipsec-1" {
-		t.Errorf("RemoveTunnel tunnelID = %v, want t-ipsec-1", removeCalls[0].Args[0])
-	}
-
-	// No additional VPNController calls for provider tunnel removal.
-	if len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) != 1 {
-		t.Errorf("RemoveTunnelInterface should not be called for provider tunnel removal")
-	}
-
-	// --- Teardown calls provider.Stop() ---
-	if err := mgr.Teardown(); err != nil {
+	if err := pf.mgr.Teardown(); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
-
-	stopCalls := ipsecProvider.callsFor("Stop")
-	if len(stopCalls) != 1 {
-		t.Fatalf("expected 1 provider Stop call, got %d", len(stopCalls))
+	if pf.handle.stopCalls() != 1 {
+		t.Errorf("openvpn stops after Teardown = %d, want 1", pf.handle.stopCalls())
 	}
-
-	// Manager is inactive after teardown.
-	if mgr.SiteToSiteStatus() != nil {
-		t.Error("should be inactive after Teardown")
-	}
-
-	// Second teardown is no-op.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("second Teardown: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestTunnelProviderIntegration_MixedTunnels
-// ---------------------------------------------------------------------------
-
-// TestTunnelProviderIntegration_MixedTunnels wires with both "ipsec" and "openvpn"
-// providers and verifies mixed WireGuard + provider tunnels work correctly.
-func TestTunnelProviderIntegration_MixedTunnels(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	ipsecProvider := newMockTunnelProvider()
-	openvpnProvider := newMockTunnelProvider()
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	providers := map[string]TunnelProvider{
-		"ipsec":   ipsecProvider,
-		"openvpn": openvpnProvider,
-	}
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), providers)
-
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Add a WireGuard tunnel.
-	wgTunnel := testTunnel("tun-wg-mix")
-	if err := mgr.AddTunnel(wgTunnel); err != nil {
-		t.Fatalf("AddTunnel WG: %v", err)
-	}
-
-	// Add an IPsec tunnel.
-	ipsecTunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-mix",
-		RemoteEndpoint: "203.0.113.1:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		PSK:            "ipsec-secret",
-		ProviderType:   "ipsec",
-	}
-	if err := mgr.AddTunnel(ipsecTunnel); err != nil {
-		t.Fatalf("AddTunnel IPsec: %v", err)
-	}
-
-	// Add an OpenVPN tunnel.
-	openvpnTunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ovpn-mix",
-		RemoteEndpoint: "203.0.113.2:1194",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.2.0.0/24"},
-		PSK:            "ovpn-secret",
-		ProviderType:   "openvpn",
-	}
-	if err := mgr.AddTunnel(openvpnTunnel); err != nil {
-		t.Fatalf("AddTunnel OpenVPN: %v", err)
-	}
-
-	// Status shows sorted TunnelProviderNames and TunnelCount=3.
-	status := mgr.SiteToSiteStatus()
-	if status == nil {
-		t.Fatal("SiteToSiteStatus should not be nil")
-	}
-	if len(status.TunnelProviderNames) != 2 {
-		t.Fatalf("TunnelProviderNames count = %d, want 2", len(status.TunnelProviderNames))
-	}
-	if status.TunnelProviderNames[0] != "ipsec" {
-		t.Errorf("TunnelProviderNames[0] = %q, want %q", status.TunnelProviderNames[0], "ipsec")
-	}
-	if status.TunnelProviderNames[1] != "openvpn" {
-		t.Errorf("TunnelProviderNames[1] = %q, want %q", status.TunnelProviderNames[1], "openvpn")
-	}
-	if status.TunnelCount != 3 {
-		t.Errorf("TunnelCount = %d, want 3", status.TunnelCount)
-	}
-
-	// Teardown removes all tunnels and calls Stop() on both providers.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-
-	// Verify provider tunnels were removed via their respective providers.
-	ipsecRemoves := ipsecProvider.callsFor("RemoveTunnel")
-	if len(ipsecRemoves) != 1 {
-		t.Errorf("expected 1 ipsec RemoveTunnel call, got %d", len(ipsecRemoves))
-	}
-	openvpnRemoves := openvpnProvider.callsFor("RemoveTunnel")
-	if len(openvpnRemoves) != 1 {
-		t.Errorf("expected 1 openvpn RemoveTunnel call, got %d", len(openvpnRemoves))
-	}
-
-	// Verify Stop was called on both providers.
-	if len(ipsecProvider.callsFor("Stop")) != 1 {
-		t.Errorf("expected 1 ipsec Stop call, got %d", len(ipsecProvider.callsFor("Stop")))
-	}
-	if len(openvpnProvider.callsFor("Stop")) != 1 {
-		t.Errorf("expected 1 openvpn Stop call, got %d", len(openvpnProvider.callsFor("Stop")))
-	}
-
-	// Manager is inactive.
-	if mgr.SiteToSiteStatus() != nil {
-		t.Error("should be inactive after Teardown")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestTunnelProviderIntegration_ProviderCreateError
-// ---------------------------------------------------------------------------
-
-// TestTunnelProviderIntegration_ProviderCreateError verifies that a provider
-// create error prevents the tunnel from being tracked and makes no VPN or
-// route controller calls.
-func TestTunnelProviderIntegration_ProviderCreateError(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	ipsecProvider := newMockTunnelProvider()
-	ipsecProvider.createErr = fmt.Errorf("ipsec daemon unreachable")
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	providers := map[string]TunnelProvider{
-		"ipsec": ipsecProvider,
-	}
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), providers)
-
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	vpnCtrl.resetVPN()
-	routeCtrl.reset()
-
-	tunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-fail",
-		RemoteEndpoint: "203.0.113.1:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		PSK:            "shared-secret",
-		ProviderType:   "ipsec",
-	}
-
-	err := mgr.AddTunnel(tunnel)
-	if err == nil {
-		t.Fatal("AddTunnel should return error when provider.CreateTunnel fails")
-	}
-
-	// No tunnel is tracked.
-	if len(mgr.TunnelIDs()) != 0 {
-		t.Errorf("no tunnel should be tracked after provider create error, got %v", mgr.TunnelIDs())
-	}
-
-	// No VPNController calls were made.
-	if len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) != 0 {
-		t.Error("CreateTunnelInterface should not be called when provider fails")
-	}
-	if len(vpnCtrl.vpnCallsFor("ConfigureTunnelPeer")) != 0 {
-		t.Error("ConfigureTunnelPeer should not be called when provider fails")
-	}
-
-	// No RouteController calls were made.
-	if len(routeCtrl.callsFor("EnableForwarding")) != 0 {
-		t.Error("EnableForwarding should not be called when provider fails")
-	}
-	if len(routeCtrl.callsFor("AddRoute")) != 0 {
-		t.Error("AddRoute should not be called when provider fails")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestTunnelProviderIntegration_TeardownWithProviderError
-// ---------------------------------------------------------------------------
-
-// TestTunnelProviderIntegration_TeardownWithProviderError verifies that a
-// provider Stop error is aggregated in the teardown error but the manager
-// still becomes inactive.
-func TestTunnelProviderIntegration_TeardownWithProviderError(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	ipsecProvider := newMockTunnelProvider()
-	ipsecProvider.stopErr = fmt.Errorf("ipsec stop failed")
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	providers := map[string]TunnelProvider{
-		"ipsec": ipsecProvider,
-	}
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), providers)
-
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Add a provider tunnel.
-	tunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-err",
-		RemoteEndpoint: "203.0.113.1:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		PSK:            "shared-secret",
-		ProviderType:   "ipsec",
-	}
-	if err := mgr.AddTunnel(tunnel); err != nil {
-		t.Fatalf("AddTunnel: %v", err)
-	}
-
-	// Teardown returns aggregated error due to provider.Stop failure.
-	err := mgr.Teardown()
-	if err == nil {
-		t.Fatal("Teardown should return aggregated error when provider.Stop fails")
-	}
-
-	// Despite error, manager is inactive.
-	if mgr.SiteToSiteStatus() != nil {
-		t.Error("SiteToSiteStatus should be nil after teardown even with errors")
-	}
-
-	// provider.RemoveTunnel was called for the active tunnel.
-	removeCalls := ipsecProvider.callsFor("RemoveTunnel")
-	if len(removeCalls) != 1 {
-		t.Fatalf("expected 1 provider RemoveTunnel call, got %d", len(removeCalls))
-	}
-	if removeCalls[0].Args[0] != "t-ipsec-err" {
-		t.Errorf("RemoveTunnel tunnelID = %v, want t-ipsec-err", removeCalls[0].Args[0])
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestTunnelProviderIntegration_ReconcileWithProviders
-// ---------------------------------------------------------------------------
-
-// TestTunnelProviderIntegration_ReconcileWithProviders wires a real Reconciler
-// with a provider and verifies that reconciliation correctly delegates to
-// VPNController for WireGuard tunnels and to the provider for provider tunnels.
-func TestTunnelProviderIntegration_ReconcileWithProviders(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	ipsecProvider := newMockTunnelProvider()
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	providers := map[string]TunnelProvider{
-		"ipsec": ipsecProvider,
-	}
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), providers)
-
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	vpnCtrl.resetVPN()
-	routeCtrl.reset()
-
-	// Initial state: 1 WireGuard tunnel + 1 IPsec tunnel.
-	wgTunnel := testTunnel("tun-wg-rec")
-	ipsecTunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-rec",
-		RemoteEndpoint: "203.0.113.1:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		PSK:            "shared-secret",
-		ProviderType:   "ipsec",
-	}
-
-	state1 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{wgTunnel, ipsecTunnel},
-			},
-		},
-	}
-	fetcher := &integrationStateFetcher{state: state1}
-
-	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, discardLogger())
-	rec.RegisterHandler(SiteToSiteReconcileHandler(mgr, discardLogger()))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- rec.Run(ctx, "node-tp") }()
-
-	// Wait for initial cycle: WG tunnel via VPNController, IPsec tunnel via provider.
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) >= 1 &&
-			len(ipsecProvider.callsFor("CreateTunnel")) >= 1
-	})
-
-	// Verify both tunnels are tracked.
-	ids := mgr.TunnelIDs()
-	if len(ids) != 2 {
-		t.Errorf("TunnelIDs count = %d, want 2", len(ids))
-	}
-
-	// Update state: remove WG tunnel, add a new IPsec tunnel.
-	ipsecTunnel2 := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-rec-2",
-		RemoteEndpoint: "203.0.113.2:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.2.0.0/24"},
-		PSK:            "shared-secret-2",
-		ProviderType:   "ipsec",
-	}
-	state2 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{ipsecTunnel, ipsecTunnel2},
-			},
-		},
-	}
-	fetcher.setState(state2)
-	rec.TriggerReconcile()
-
-	// Wait for: WG tunnel removed via VPNController, new IPsec tunnel added via provider.
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) >= 1 &&
-			len(ipsecProvider.callsFor("CreateTunnel")) >= 2
-	})
-
-	// Verify provider-managed tunnels stayed through reconciliation.
-	_, ok := mgr.GetTunnel("t-ipsec-rec")
-	if !ok {
-		t.Error("t-ipsec-rec should still be present after reconcile")
-	}
-	_, ok = mgr.GetTunnel("t-ipsec-rec-2")
-	if !ok {
-		t.Error("t-ipsec-rec-2 should be present after reconcile")
-	}
-	_, ok = mgr.GetTunnel("tun-wg-rec")
-	if ok {
-		t.Error("tun-wg-rec should have been removed after reconcile")
-	}
-
-	cancel()
-	<-done
-
-	_ = mgr.Teardown()
-}
-
-// ---------------------------------------------------------------------------
-// TestTunnelProviderIntegration_ReconcileChangedProviderTunnel
-// ---------------------------------------------------------------------------
-
-// TestTunnelProviderIntegration_ReconcileChangedProviderTunnel verifies that
-// reconciliation detects changed tunnel config for provider-managed tunnels
-// and removes the old + adds the new via provider calls.
-func TestTunnelProviderIntegration_ReconcileChangedProviderTunnel(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	ipsecProvider := newMockTunnelProvider()
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	providers := map[string]TunnelProvider{
-		"ipsec": ipsecProvider,
-	}
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), providers)
-
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Initial state: 1 IPsec tunnel with specific RemoteEndpoint.
-	ipsecTunnel := api.SiteToSiteTunnel{
-		TunnelID:       "t-ipsec-change",
-		RemoteEndpoint: "203.0.113.1:500",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		PSK:            "shared-secret",
-		ProviderType:   "ipsec",
-	}
-
-	state1 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{ipsecTunnel},
-			},
-		},
-	}
-	fetcher := &integrationStateFetcher{state: state1}
-
-	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, discardLogger())
-	rec.RegisterHandler(SiteToSiteReconcileHandler(mgr, discardLogger()))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- rec.Run(ctx, "node-tp-change") }()
-
-	// Wait for initial reconcile to add the tunnel.
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ipsecProvider.callsFor("CreateTunnel")) >= 1
-	})
-
-	// Verify tunnel is present.
-	got, ok := mgr.GetTunnel("t-ipsec-change")
-	if !ok {
-		t.Fatal("t-ipsec-change should be present after initial reconcile")
-	}
-	if got.RemoteEndpoint != "203.0.113.1:500" {
-		t.Errorf("RemoteEndpoint = %q, want %q", got.RemoteEndpoint, "203.0.113.1:500")
-	}
-
-	// Update state: same TunnelID but different RemoteEndpoint.
-	changedTunnel := ipsecTunnel
-	changedTunnel.RemoteEndpoint = "203.0.113.99:500"
-	state2 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{changedTunnel},
-			},
-		},
-	}
-	fetcher.setState(state2)
-	rec.TriggerReconcile()
-
-	// Wait for reconcile: remove old + add new via provider calls.
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ipsecProvider.callsFor("RemoveTunnel")) >= 1 &&
-			len(ipsecProvider.callsFor("CreateTunnel")) >= 2
-	})
-
-	// Verify the active tunnel has the new config.
-	got, ok = mgr.GetTunnel("t-ipsec-change")
-	if !ok {
-		t.Fatal("t-ipsec-change should still be present after change reconcile")
-	}
-	if got.RemoteEndpoint != "203.0.113.99:500" {
-		t.Errorf("RemoteEndpoint = %q, want %q", got.RemoteEndpoint, "203.0.113.99:500")
-	}
-
-	// Verify NO VPNController calls were made for provider-managed tunnel changes.
-	if len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) != 0 {
-		t.Error("CreateTunnelInterface should not be called for provider tunnel changes")
-	}
-	if len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) != 0 {
-		t.Error("RemoveTunnelInterface should not be called for provider tunnel changes")
-	}
-
-	cancel()
-	<-done
-
-	_ = mgr.Teardown()
 }

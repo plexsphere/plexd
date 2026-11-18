@@ -13,11 +13,14 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// endpointResolveTimeout bounds the name lookup for the endpoint the control
-// plane supplies. net.ResolveUDPAddr, which is what would otherwise resolve
-// it, takes no deadline, and SiteToSiteManager holds its mutex across
-// ConfigureTunnelPeer: a nameserver that blackholes queries would park every
-// status report, every RemoveTunnel and the teardown behind one tunnel.
+// endpointResolveTimeout bounds a name lookup for a remote site the control
+// plane supplies. SiteToSiteManager resolves a tunnel's remote_host with
+// SiteToSiteDeps.Resolve under it, outside its mutex, and hands
+// ConfigureTunnelPeer an IP endpoint, so a nameserver that blackholes queries
+// holds up one attempt for at most 5 s and never a status read, a removal or
+// the teardown. resolveEndpoint bounds the lookup of an endpoint that names a
+// host with it too, since net.ResolveUDPAddr, which would otherwise resolve
+// it, takes no deadline.
 const endpointResolveTimeout = 5 * time.Second
 
 // wgOps holds the WireGuard work the access and the VPN controller share.
@@ -211,14 +214,14 @@ func resolveEndpoint(endpoint string) (string, error) {
 }
 
 // preferIPv4 returns the first IPv4 address among addrs, and the first address
-// of any family when there is none. net.ResolveUDPAddr, which
-// NetlinkVPNController still resolves the same endpoint with, prefers IPv4 for
-// network "udp" unless the host is an IPv6 literal, and keeping that
-// preference is what lets one control-plane endpoint reach the same peer on
-// every platform. Without it a dual-stack name is pinned to whichever family
-// the system resolver happened to return first, so a gateway with no IPv6
-// egress would be programmed with an address it cannot reach and the handshake
-// would never complete.
+// of any family when there is none. SiteToSiteManager picks a tunnel's remote
+// address with it, and resolveEndpoint an endpoint's. net.ResolveUDPAddr
+// prefers IPv4 for network "udp" unless the host is an IPv6 literal, and
+// keeping that preference is what lets one control-plane endpoint reach the
+// same peer on every platform. Without it a dual-stack name is pinned to
+// whichever family the system resolver happened to return first, so a gateway
+// with no IPv6 egress would be programmed with an address it cannot reach and
+// the handshake would never complete.
 func preferIPv4(addrs []netip.Addr) netip.Addr {
 	for _, addr := range addrs {
 		if addr.Unmap().Is4() {

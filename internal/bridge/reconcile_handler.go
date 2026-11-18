@@ -2,9 +2,7 @@ package bridge
 
 import (
 	"context"
-	"errors"
 	"log/slog"
-	"reflect"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -236,68 +234,76 @@ func UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) rec
 	}
 }
 
-// SiteToSiteReconcileHandler returns a reconcile.ReconcileHandler that updates
-// site-to-site tunnels when the desired bridge site-to-site subtree changes. It
-// diffs the desired tunnels against the currently active tunnels: adding missing
-// tunnels, removing stale tunnels, and restarting changed tunnels (same ID,
-// different config). The handler is presence-aware: a nil Bridge or nil
-// SiteToSite child means "not populated", so it reconciles against an empty
-// desired set and tears down stale tunnels.
+// SiteToSitePullHandler returns a reconcile.DispatchHandler that runs on every
+// successful pull. It hands the pull's secret inventory to the site-to-site
+// manager, which rebuilds each tunnel whose Secret the inventory lists at a
+// new version and brings up again each tunnel that is down for a reason a
+// retry can cure and whose next attempt is due. A pull whose only change is
+// the secrets block reports no drift, so no reconcile handler would see a
+// rotated Secret, and a tunnel whose port was taken or whose remote host did
+// not resolve needs a retry whatever drifted. A nil Secrets block, a control
+// plane that did not say this time, keeps the inventory the manager holds and
+// only retries. Dispatch handlers run before the reconcile handlers, so a
+// cycle that brings a new tunnel and its Secret hands the inventory over
+// first. A nil snapshot changes nothing.
+func SiteToSitePullHandler(mgr *SiteToSiteManager) reconcile.DispatchHandler {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot) {
+		if desired == nil {
+			return
+		}
+		if desired.Secrets == nil {
+			mgr.Retry(ctx)
+			return
+		}
+		mgr.SyncSecretInventory(ctx, *desired.Secrets)
+	}
+}
+
+// SiteToSiteReconcileHandler returns a reconcile.ReconcileHandler that serves
+// the desired bridge.site_to_site block whole. mgr is nil when the node opts
+// out of site-to-site tunnels, bridge.site_to_site_enabled: false. A nil
+// snapshot changes nothing, and the handler returns nil in every case: a
+// tunnel that is down is retried by SiteToSitePullHandler, so one broken
+// tunnel never makes the reconciler apply the whole snapshot again.
+//
+// With a manager, the pulled block is applied as it is, and a nil Bridge or
+// nil SiteToSite child applies the zero block, which tears every tunnel down
+// and deletes every key file. The manager serves tunnels only when the
+// block's Enabled is true.
+//
+// Without a manager the handler touches nothing. A block with Enabled true
+// and at least one tunnel is logged as a Warn naming how many tunnels the
+// local opt-out leaves unserved, only when diff.BridgeChanged is set: the
+// reconciler invokes every handler on any drift, and an ungated Warn would
+// repeat on each peer or policy change. It is logged once per change of the
+// pulled bridge block, which includes the first pull after every start.
 func SiteToSiteReconcileHandler(mgr *SiteToSiteManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
 		if desired == nil {
 			return nil
 		}
 
-		var tunnels []api.SiteToSiteTunnel
-		if desired.Bridge != nil && desired.Bridge.SiteToSite != nil {
-			tunnels = desired.Bridge.SiteToSite.Tunnels
+		var pulled *api.SiteToSiteConfig
+		if desired.Bridge != nil {
+			pulled = desired.Bridge.SiteToSite
 		}
 
-		// Build desired set for diffing.
-		desiredSet := make(map[string]api.SiteToSiteTunnel, len(tunnels))
-		for _, t := range tunnels {
-			desiredSet[t.TunnelID] = t
-		}
-
-		currentIDs := mgr.TunnelIDs()
-		currentSet := make(map[string]struct{}, len(currentIDs))
-		for _, id := range currentIDs {
-			currentSet[id] = struct{}{}
-		}
-
-		// Remove stale tunnels (present locally but not in desired state)
-		// and detect changed tunnels (same ID, different config).
-		for _, id := range currentIDs {
-			desiredTunnel, inDesired := desiredSet[id]
-			if !inDesired {
-				// Stale tunnel — remove.
-				mgr.RemoveTunnel(id)
-				continue
-			}
-			// Check if the tunnel config changed (requires restart).
-			currentTunnel, ok := mgr.GetTunnel(id)
-			if ok && !reflect.DeepEqual(currentTunnel, desiredTunnel) {
-				mgr.RemoveTunnel(id)
-				delete(currentSet, id) // mark for re-add below
-			}
-		}
-
-		// Add missing and changed tunnels.
-		var errs []error
-		for _, tunnel := range tunnels {
-			if _, ok := currentSet[tunnel.TunnelID]; ok {
-				continue
-			}
-			if err := mgr.AddTunnel(tunnel); err != nil {
-				logger.Error("site-to-site reconcile: add tunnel failed",
-					"tunnel_id", tunnel.TunnelID,
-					"error", err,
+		if mgr == nil {
+			if pulled != nil && pulled.Enabled && len(pulled.Tunnels) > 0 && diff.BridgeChanged {
+				logger.Warn("site-to-site: the control plane enables site-to-site tunnels, but bridge.site_to_site_enabled is false",
+					"component", "bridge",
+					"tunnels", len(pulled.Tunnels),
 				)
-				errs = append(errs, err)
 			}
+			return nil
 		}
 
-		return errors.Join(errs...)
+		// The zero block tears every tunnel down.
+		var block api.SiteToSiteConfig
+		if pulled != nil {
+			block = *pulled
+		}
+		mgr.Apply(ctx, block)
+		return nil
 	}
 }

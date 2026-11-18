@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -9,229 +10,134 @@ import (
 	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
-// testTunnel builds a site-to-site tunnel fixture with the given ID.
-func testTunnel(id string) api.SiteToSiteTunnel {
-	return api.SiteToSiteTunnel{
-		TunnelID:        id,
-		RemoteEndpoint:  "203.0.113.1:51820",
-		RemotePublicKey: "remote-pub-key-" + id,
-		LocalSubnets:    []string{"10.0.0.0/24"},
-		RemoteSubnets:   []string{"192.168.1.0/24"},
-		InterfaceName:   "wg-s2s-" + id,
-		ListenPort:      51823,
-	}
-}
-
 // ---------------------------------------------------------------------------
-// Integration tests — Site-to-Site
+// Integration tests — SiteToSite
 // ---------------------------------------------------------------------------
 
-// TestSiteToSiteIntegration_FullLifecycle wires a SiteToSiteManager with mock
-// controllers, verifies Setup → add tunnels via the manager → reconcile drift →
-// remove a tunnel via the manager → Teardown.
-func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
-
-	// Setup.
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	if mgr.SiteToSiteStatus() == nil {
-		t.Fatal("should be active after Setup")
-	}
-
-	// --- Step 1: Add a tunnel via the manager and verify tracking ---
-	tunnel1 := testTunnel("tun-lifecycle-1")
-	if err := mgr.AddTunnel(tunnel1); err != nil {
-		t.Fatalf("add tunnel: %v", err)
-	}
-
-	ids := mgr.TunnelIDs()
-	if len(ids) != 1 || ids[0] != "tun-lifecycle-1" {
-		t.Errorf("TunnelIDs = %v, want [tun-lifecycle-1]", ids)
-	}
-	status := mgr.SiteToSiteStatus()
-	if status.TunnelCount != 1 {
-		t.Errorf("TunnelCount = %d, want 1", status.TunnelCount)
-	}
-
-	// Verify tunnel config is retrievable.
-	got, ok := mgr.GetTunnel("tun-lifecycle-1")
-	if !ok {
-		t.Fatal("GetTunnel should return true for existing tunnel")
-	}
-	if got.RemoteEndpoint != tunnel1.RemoteEndpoint {
-		t.Errorf("RemoteEndpoint = %q, want %q", got.RemoteEndpoint, tunnel1.RemoteEndpoint)
-	}
-
-	// Verify VPNController calls.
-	createCalls := vpnCtrl.vpnCallsFor("CreateTunnelInterface")
-	if len(createCalls) != 1 {
-		t.Fatalf("expected 1 CreateTunnelInterface call, got %d", len(createCalls))
-	}
-	configureCalls := vpnCtrl.vpnCallsFor("ConfigureTunnelPeer")
-	if len(configureCalls) != 1 {
-		t.Fatalf("expected 1 ConfigureTunnelPeer call, got %d", len(configureCalls))
-	}
-	addRouteCalls := routeCtrl.callsFor("AddRoute")
-	if len(addRouteCalls) != 1 {
-		t.Fatalf("expected 1 AddRoute call, got %d", len(addRouteCalls))
-	}
-
-	// --- Step 2: Add a second tunnel via the manager ---
-	tunnel2 := testTunnel("tun-lifecycle-2")
-	if err := mgr.AddTunnel(tunnel2); err != nil {
-		t.Fatalf("add second tunnel: %v", err)
-	}
-	if len(mgr.TunnelIDs()) != 2 {
-		t.Errorf("TunnelIDs count = %d, want 2", len(mgr.TunnelIDs()))
-	}
-
-	// --- Step 3: Reconcile with desired state matching current — no changes ---
-	vpnCtrl.resetVPN()
-	routeCtrl.reset()
-
-	reconcileHandler := SiteToSiteReconcileHandler(mgr, discardLogger())
-	desired := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{tunnel1, tunnel2},
-			},
-		},
-	}
-	if err := reconcileHandler(context.Background(), desired, reconcile.StateDiff{}); err != nil {
-		t.Fatalf("reconcile handler: %v", err)
-	}
-	// No changes expected — tunnels already match desired state.
-	if len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) != 0 {
-		t.Error("CreateTunnelInterface should not be called for unchanged tunnels")
-	}
-	if len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) != 0 {
-		t.Error("RemoveTunnelInterface should not be called for unchanged tunnels")
-	}
-
-	// --- Step 4: Remove the first tunnel via the manager ---
-	mgr.RemoveTunnel("tun-lifecycle-1")
-
-	ids = mgr.TunnelIDs()
-	if len(ids) != 1 {
-		t.Errorf("TunnelIDs after remove = %v, want 1 item", ids)
-	}
-	status = mgr.SiteToSiteStatus()
-	if status.TunnelCount != 1 {
-		t.Errorf("TunnelCount after remove = %d, want 1", status.TunnelCount)
-	}
-
-	// --- Step 5: Teardown ---
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-	if mgr.SiteToSiteStatus() != nil {
-		t.Error("should be inactive after Teardown")
-	}
-
-	// Second teardown is no-op.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("second Teardown: %v", err)
-	}
-}
-
-// TestSiteToSiteIntegration_ReconcileDrift wires a SiteToSiteManager with a real
-// Reconciler and verifies that reconciliation correctly adds missing tunnels and
-// removes stale tunnels.
-func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	cfg := Config{
-		Enabled:           true,
-		SiteToSiteEnabled: true,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	vpnCtrl.resetVPN()
-	routeCtrl.reset()
-
-	// Initial state: one tunnel.
-	state1 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					testTunnel("tun-1"),
-				},
-			},
-		},
-	}
-	fetcher := &integrationStateFetcher{state: state1}
-
+// runSiteToSiteReconciler runs a real Reconciler that pulls state from
+// fetcher, with the site-to-site pull and reconcile handlers of mgr, until
+// the test ends.
+func runSiteToSiteReconciler(t *testing.T, fetcher *integrationStateFetcher, mgr *SiteToSiteManager) *reconcile.Reconciler {
+	t.Helper()
 	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, discardLogger())
+	rec.RegisterDispatchHandler(SiteToSitePullHandler(mgr))
 	rec.RegisterHandler(SiteToSiteReconcileHandler(mgr, discardLogger()))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	done := make(chan error, 1)
-	go func() { done <- rec.Run(ctx, "node-s2s") }()
-
-	// Wait for initial cycle: tun-1 should be added (1 CreateTunnelInterface call).
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) >= 1
+	go func() { done <- rec.Run(ctx, "node-bridge") }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
 	})
+	return rec
+}
 
-	// Update: replace tun-1 with tun-2 and tun-3.
-	state2 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					testTunnel("tun-2"),
-					testTunnel("tun-3"),
-				},
-			},
-		},
+// siteToSiteState returns a pull whose bridge block lists tunnels, with
+// inventory as its secret inventory.
+func siteToSiteState(inventory []api.NodeStateSecret, tunnels ...api.SiteToSiteTunnel) *api.NodeStateSnapshot {
+	return &api.NodeStateSnapshot{
+		Bridge:  &api.BridgeSnapshot{SiteToSite: &api.SiteToSiteConfig{Enabled: true, Tunnels: tunnels}},
+		Secrets: &inventory,
 	}
-	fetcher.setState(state2)
+}
+
+// tunnelHealth returns the health of the tunnel with id, "" while the
+// manager reports none.
+func tunnelHealth(mgr *SiteToSiteManager, id string) string {
+	info := mgr.SiteToSiteStatus()
+	if info == nil {
+		return ""
+	}
+	for _, ti := range info.Tunnels {
+		if ti.ID == id {
+			return ti.Health
+		}
+	}
+	return ""
+}
+
+// TestSiteToSiteIntegration_ReconcileDrift wires a SiteToSiteManager with a
+// real Reconciler and verifies that successive pulls bring a wireguard
+// tunnel up, rebuild it with its key when its subnets change, and tear it
+// down with its key once the pull no longer lists it.
+//
+// We observe state through the mock controllers rather than the manager to
+// keep assertions independent of reconcile timing.
+func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
+	fx := buildS2SFixture(t, nil)
+	if err := fx.mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	fetcher := &integrationStateFetcher{state: siteToSiteState(s2sInventory(), branchBerlin)}
+	rec := runSiteToSiteReconciler(t, fetcher, fx.mgr)
+
+	// The first pull brings the tunnel up.
+	waitForCondition(t, 2*time.Second, func() bool {
+		return tunnelHealth(fx.mgr, s2sID1) == api.SiteToSiteHealthUp
+	})
+	key := fx.storedKey(t, s2sID1)
+
+	// Reordered subnets rebuild the tunnel with the same key.
+	reordered := branchBerlin
+	reordered.AllowedSubnets = []string{"10.21.0.0/16", "10.20.0.0/16"}
+	fetcher.setState(siteToSiteState(s2sInventory(), reordered))
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(fx.vpn.vpnCallsFor("CreateTunnelInterface")) >= 2 && tunnelHealth(fx.mgr, s2sID1) == api.SiteToSiteHealthUp
+	})
+	for _, c := range fx.vpn.vpnCallsFor("CreateTunnelInterface") {
+		if !slices.Equal(c.Args[1].([]byte), key) {
+			t.Error("the rebuilt interface has another key")
+		}
+	}
+
+	// A pull without the tunnel removes its link, its routes and its key.
+	fetcher.setState(&api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{}})
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(fx.vpn.vpnCallsFor("RemoveTunnelInterface")) >= 2 && len(fx.keyFiles(t)) == 0
+	})
+	if got := routeCalls(fx.routes, "RemoveRoute"); len(got) != 4 {
+		t.Errorf("RemoveRoute calls = %q, want two per teardown", got)
+	}
+	if got := tunnelIDs(fx.mgr); len(got) != 0 {
+		t.Errorf("tunnels = %q, want none", got)
+	}
+}
+
+// TestSiteToSiteIntegration_RetriesOnEveryPull wires the manager with a real
+// Reconciler and verifies that a tunnel down for a taken port and one whose
+// Secret the inventory did not list come up on a later pull whose bridge
+// block did not change, once their next attempt is due.
+func TestSiteToSiteIntegration_RetriesOnEveryPull(t *testing.T) {
+	fx := buildS2SFixture(t, nil)
+	if err := fx.mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	fx.vpn.set(func(m *mockVPNController) {
+		m.createErrFor = map[string]error{s2sWGIface: ErrListenPortInUse}
+	})
+	fetcher := &integrationStateFetcher{state: siteToSiteState(inventoryOf("branch-berlin-psk", 1), branchBerlin, dcEast)}
+	rec := runSiteToSiteReconciler(t, fetcher, fx.mgr)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(tunnelIDs(fx.mgr)) == 2
+	})
+	requireTunnelDown(t, fx.mgr, s2sID1, SiteToSiteReasonBindFailed)
+	requireTunnelDown(t, fx.mgr, s2sID2, SiteToSiteReasonAuthSecretNotListed)
+
+	// The port is free and the inventory lists the Secret; the bridge block
+	// is the same.
+	fx.vpn.set(func(m *mockVPNController) { m.createErrFor = nil })
+	fetcher.setState(siteToSiteState(s2sInventory(), branchBerlin, dcEast))
+	fx.clock.Add(5 * time.Second)
 	rec.TriggerReconcile()
 
-	// Wait for: 1 RemoveTunnelInterface (tun-1 removed) + 2 more CreateTunnelInterface (tun-2, tun-3 added) = total 3.
 	waitForCondition(t, 2*time.Second, func() bool {
-		return len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) >= 3 &&
-			len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) >= 1
+		return tunnelHealth(fx.mgr, s2sID1) == api.SiteToSiteHealthUp && tunnelHealth(fx.mgr, s2sID2) == api.SiteToSiteHealthUp
 	})
-
-	// Update: empty tunnels — all removed.
-	state3 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			SiteToSite: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{},
-			},
-		},
+	if got := fx.ipsec.createCalls(); len(got) != 1 {
+		t.Errorf("ipsec CreateTunnel calls = %d, want 1", len(got))
 	}
-	fetcher.setState(state3)
-	rec.TriggerReconcile()
-
-	// Wait for 2 more RemoveTunnelInterface calls (tun-2, tun-3 removed) = total 3.
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(vpnCtrl.vpnCallsFor("RemoveTunnelInterface")) >= 3
-	})
-
-	cancel()
-	<-done
-
-	// Clean up.
-	_ = mgr.Teardown()
 }

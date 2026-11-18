@@ -2507,153 +2507,211 @@ func TestSiteToSiteConfig_JSONRoundTrip(t *testing.T) {
 		Enabled: true,
 		Tunnels: []SiteToSiteTunnel{
 			{
-				TunnelID:        "tun-001",
-				RemoteEndpoint:  "203.0.113.1:51820",
-				RemotePublicKey: "rpk-001",
-				LocalSubnets:    []string{"192.168.1.0/24"},
-				RemoteSubnets:   []string{"10.0.0.0/8"},
-				PSK:             "s2s-psk-001",
-				InterfaceName:   "wg-s2s0",
+				ID:              "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+				Slug:            "branch-berlin",
+				Kind:            SiteToSiteKindWireGuard,
+				RemoteHost:      "vpn.branch.example.com",
+				RemotePort:      51820,
+				AllowedSubnets:  []string{"10.20.0.0/16"},
 				ListenPort:      51830,
+				RemotePublicKey: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
 			},
 			{
-				TunnelID:        "tun-002",
-				RemoteEndpoint:  "203.0.113.2:51821",
-				RemotePublicKey: "rpk-002",
-				LocalSubnets:    []string{"172.16.0.0/12"},
-				RemoteSubnets:   []string{"10.10.0.0/16", "10.20.0.0/16"},
-				InterfaceName:   "wg-s2s1",
-				ListenPort:      51831,
+				ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e3",
+				Slug:           "office",
+				Kind:           SiteToSiteKindOpenVPN,
+				RemoteHost:     "203.0.113.30",
+				RemotePort:     1194,
+				AllowedSubnets: []string{"10.40.0.0/16"},
+				AuthSecretName: "office-ovpn",
 			},
 		},
 	}
 	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
+	if !reflect.DeepEqual(orig, got) {
+		t.Errorf("round trip = %+v, want %+v", got, orig)
 	}
-	for _, key := range []string{"enabled", "tunnels"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
+
+	// Each tunnel carries the members of its kind and no others: a
+	// wireguard tunnel without a preshared key carries no auth_secret_name.
+	const want = `{"enabled":true,"tunnels":[` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"branch-berlin","kind":"wireguard","remote_host":"vpn.branch.example.com","remote_port":51820,"allowed_subnets":["10.20.0.0/16"],"listen_port":51830,"remote_public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e3","slug":"office","kind":"openvpn","remote_host":"203.0.113.30","remote_port":1194,"allowed_subnets":["10.40.0.0/16"],"auth_secret_name":"office-ovpn"}]}`
+	if string(data) != want {
+		t.Errorf("JSON =\n  %s\nwant\n  %s", data, want)
 	}
 }
 
-func TestSiteToSiteTunnel_JSONRoundTrip(t *testing.T) {
-	// With PSK set.
-	orig := SiteToSiteTunnel{
-		TunnelID:        "tun-001",
-		RemoteEndpoint:  "203.0.113.1:51820",
-		RemotePublicKey: "rpk-001",
-		LocalSubnets:    []string{"192.168.1.0/24"},
-		RemoteSubnets:   []string{"10.0.0.0/8"},
-		PSK:             "s2s-psk-001",
-		InterfaceName:   "wg-s2s0",
-		ListenPort:      51830,
+// TestSiteToSiteConfig_DecodesContractBlock decodes the example block of the
+// agent contract's Site-to-site tunnels section
+// (plexsphere/plexsphere@4935e06, docs/reference/api/plexd-agent-contract.md).
+func TestSiteToSiteConfig_DecodesContractBlock(t *testing.T) {
+	const block = `{
+  "site_to_site": {
+    "enabled": true,
+    "tunnels": [
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+        "slug": "branch-berlin",
+        "kind": "wireguard",
+        "remote_host": "vpn.branch.example.com",
+        "remote_port": 51820,
+        "allowed_subnets": ["10.20.0.0/16"],
+        "listen_port": 51830,
+        "remote_public_key": "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+        "auth_secret_name": "branch-berlin-psk"
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+        "slug": "dc-east",
+        "kind": "ipsec",
+        "remote_host": "203.0.113.10",
+        "remote_port": 500,
+        "allowed_subnets": ["10.30.0.0/16", "10.31.0.0/16"],
+        "auth_secret_name": "dc-east-ike"
+      }
+    ]
+  }
+}`
+	var bridge BridgeSnapshot
+	if err := json.Unmarshal([]byte(block), &bridge); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
+	if bridge.SiteToSite == nil {
+		t.Fatal("SiteToSite is nil")
 	}
-	for _, key := range []string{"tunnel_id", "remote_endpoint", "remote_public_key", "local_subnets", "remote_subnets", "psk", "interface_name", "listen_port"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
+	if !bridge.SiteToSite.Enabled {
+		t.Error("SiteToSite.Enabled = false, want true")
 	}
-
-	// PSK should be omitted when empty.
-	orig.PSK = ""
-	data2, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data2); strings.Contains(s, `"psk"`) {
-		t.Errorf("psk should be omitted when empty, got: %s", s)
+	got := bridge.SiteToSite.Tunnels
+	if len(got) != 2 {
+		t.Fatalf("%d tunnels, want 2: %+v", len(got), got)
+	}
+	first := got[0]
+	if first.ListenPort != 51830 || first.RemotePublicKey != "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=" || first.AuthSecretName != "branch-berlin-psk" {
+		t.Errorf("first tunnel = %+v, want listen_port 51830, the remote public key and branch-berlin-psk", first)
+	}
+	if want := []string{"10.30.0.0/16", "10.31.0.0/16"}; !slices.Equal(got[1].AllowedSubnets, want) {
+		t.Errorf("second tunnel's AllowedSubnets = %q, want %q", got[1].AllowedSubnets, want)
+	}
+	want := []SiteToSiteTunnel{
+		{
+			ID:              "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+			Slug:            "branch-berlin",
+			Kind:            SiteToSiteKindWireGuard,
+			RemoteHost:      "vpn.branch.example.com",
+			RemotePort:      51820,
+			AllowedSubnets:  []string{"10.20.0.0/16"},
+			ListenPort:      51830,
+			RemotePublicKey: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+			AuthSecretName:  "branch-berlin-psk",
+		},
+		{
+			ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+			Slug:           "dc-east",
+			Kind:           SiteToSiteKindIPsec,
+			RemoteHost:     "203.0.113.10",
+			RemotePort:     500,
+			AllowedSubnets: []string{"10.30.0.0/16", "10.31.0.0/16"},
+			AuthSecretName: "dc-east-ike",
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Tunnels =\n  %+v\nwant\n  %+v", got, want)
 	}
 }
 
-func TestSiteToSiteTunnel_ProviderType_JSONRoundTrip(t *testing.T) {
-	// With ProviderType set.
-	orig := SiteToSiteTunnel{
-		TunnelID:        "tun-ipsec-001",
-		RemoteEndpoint:  "203.0.113.5:500",
-		RemotePublicKey: "",
-		LocalSubnets:    []string{"192.168.1.0/24"},
-		RemoteSubnets:   []string{"10.0.0.0/8"},
-		PSK:             "ipsec-psk",
-		InterfaceName:   "",
-		ListenPort:      0,
-		ProviderType:    "ipsec",
-	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify provider_type key present.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["provider_type"]; !ok {
-		t.Errorf("expected JSON key %q", "provider_type")
+// TestSiteToSiteConfig_DecodesEmptyLists decodes a block without tunnels and
+// a tunnel with "allowed_subnets": [] to empty lists without an error, and a
+// block in the shape before plexsphere/plexsphere#1107 to tunnels without an
+// id, which a bridge neither serves nor reports.
+func TestSiteToSiteConfig_DecodesEmptyLists(t *testing.T) {
+	for _, body := range []string{`{"enabled":true}`, `{"enabled":true,"tunnels":[]}`, `{"enabled":true,"tunnels":null}`} {
+		var got SiteToSiteConfig
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode %s: %v", body, err)
+		}
+		if len(got.Tunnels) != 0 {
+			t.Errorf("decode %s: Tunnels = %+v, want none", body, got.Tunnels)
+		}
 	}
 
-	// ProviderType should be omitted when empty.
-	orig.ProviderType = ""
-	data2, _ := roundTrip(t, orig)
-	if s := string(data2); strings.Contains(s, `"provider_type"`) {
-		t.Errorf("provider_type should be omitted when empty, got: %s", s)
+	var got SiteToSiteConfig
+	const noSubnets = `{"enabled":true,"tunnels":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"dc-east","kind":"ipsec","remote_host":"203.0.113.10","remote_port":500,"allowed_subnets":[],"auth_secret_name":"dc-east-ike"}]}`
+	if err := json.Unmarshal([]byte(noSubnets), &got); err != nil {
+		t.Fatalf("decode a tunnel without subnets: %v", err)
+	}
+	if len(got.Tunnels) != 1 {
+		t.Fatalf("%d tunnels, want 1", len(got.Tunnels))
+	}
+	if subnets := got.Tunnels[0].AllowedSubnets; subnets == nil || len(subnets) != 0 {
+		t.Errorf("AllowedSubnets = %#v, want an empty list", subnets)
+	}
+
+	var old SiteToSiteConfig
+	const oldShape = `{"enabled":true,"tunnels":[{"tunnel_id":"s2s-001","remote_endpoint":"198.51.100.1:51820","remote_public_key":"rpk-001","local_subnets":["10.99.0.0/24"],"remote_subnets":["172.16.0.0/16"],"psk":"s2s-psk","interface_name":"wg-s2s0","listen_port":51822,"provider_type":"ipsec"}]}`
+	if err := json.Unmarshal([]byte(oldShape), &old); err != nil {
+		t.Fatalf("decode the old shape: %v", err)
+	}
+	if !old.Enabled || len(old.Tunnels) != 1 {
+		t.Fatalf("old shape = %+v, want enabled and one tunnel", old)
+	}
+	if tunnel := old.Tunnels[0]; tunnel.ID != "" || tunnel.Kind != "" || len(tunnel.AllowedSubnets) != 0 {
+		t.Errorf("old-shape tunnel = %+v, want no id, no kind and no subnets", tunnel)
+	}
+}
+
+func TestValidSiteToSiteTunnelID(t *testing.T) {
+	const id = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"
+	for _, s := range []string{id, strings.ToUpper(id)} {
+		if !ValidSiteToSiteTunnelID(s) {
+			t.Errorf("ValidSiteToSiteTunnelID(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{
+		"",
+		"s2s-001",
+		"not-a-uuid",
+		"00000000-0000-0000-0000-000000000000",
+		strings.ReplaceAll(id, "-", ""),
+		"{" + id + "}",
+		id[:35] + "g",
+		id[:8] + "x" + id[9:],
+	} {
+		if ValidSiteToSiteTunnelID(s) {
+			t.Errorf("ValidSiteToSiteTunnelID(%q) = true, want false", s)
+		}
 	}
 }
 
 func TestSiteToSiteInfo_JSONRoundTrip(t *testing.T) {
 	orig := SiteToSiteInfo{
-		Enabled:     true,
-		TunnelCount: 3,
+		Enabled: true,
+		Tunnels: []SiteToSiteTunnelInfo{
+			{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "branch-berlin", Kind: SiteToSiteKindWireGuard, Interface: "wg-s2s-a0a0a0e1",
+				Health: SiteToSiteHealthUp, Established: true, ListenPort: 51830,
+				RemoteHost: "vpn.branch.example.com", RemotePort: 51820, AllowedSubnets: []string{"10.20.0.0/16"},
+			},
+			{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Slug: "dc-east", Kind: SiteToSiteKindIPsec,
+				Health: SiteToSiteHealthDown, Reason: "kind_not_served",
+				RemoteHost: "203.0.113.10", RemotePort: 500, AllowedSubnets: []string{"10.30.0.0/16", "10.31.0.0/16"},
+			},
+		},
 	}
 	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"enabled", "tunnel_count"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
-	}
-}
-
-func TestSiteToSiteInfo_TunnelProviderNames_JSONRoundTrip(t *testing.T) {
-	// With TunnelProviderNames set.
-	orig := SiteToSiteInfo{
-		Enabled:             true,
-		TunnelCount:         5,
-		TunnelProviderNames: []string{"ipsec", "openvpn"},
-	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify tunnel_provider_names key present.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["tunnel_provider_names"]; !ok {
-		t.Errorf("expected JSON key %q", "tunnel_provider_names")
+	if !reflect.DeepEqual(orig, got) {
+		t.Errorf("round trip = %+v, want %+v", got, orig)
 	}
 
-	// TunnelProviderNames should be omitted when nil.
-	orig.TunnelProviderNames = nil
-	data2, _ := roundTrip(t, orig)
-	if s := string(data2); strings.Contains(s, `"tunnel_provider_names"`) {
-		t.Errorf("tunnel_provider_names should be omitted when nil, got: %s", s)
+	// A tunnel that is down carries no interface and no port, and
+	// established is always present.
+	const want = `{"enabled":true,"tunnels":[` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"branch-berlin","kind":"wireguard","interface":"wg-s2s-a0a0a0e1","health":"up","established":true,"listen_port":51830,"remote_host":"vpn.branch.example.com","remote_port":51820,"allowed_subnets":["10.20.0.0/16"]},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"dc-east","kind":"ipsec","health":"down","reason":"kind_not_served","established":false,"remote_host":"203.0.113.10","remote_port":500,"allowed_subnets":["10.30.0.0/16","10.31.0.0/16"]}]}`
+	if string(data) != want {
+		t.Errorf("JSON =\n  %s\nwant\n  %s", data, want)
 	}
 }
 
@@ -2683,16 +2741,24 @@ func TestIngressInfo_ACMEEnabled_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestTypesSiteToSiteInfo round-trips SiteToSiteInfo directly. The
-// site-to-site manager still produces this type; it no longer travels in the
-// heartbeat.
+// TestTypesSiteToSiteInfo pins the payload of a bridge without tunnels,
+// which is also the one a node outside bridge mode publishes.
 func TestTypesSiteToSiteInfo(t *testing.T) {
-	orig := SiteToSiteInfo{
-		Enabled:     true,
-		TunnelCount: 2,
+	for _, tc := range []struct {
+		info SiteToSiteInfo
+		want string
+	}{
+		{SiteToSiteInfo{}, `{"enabled":false}`},
+		{SiteToSiteInfo{Enabled: true}, `{"enabled":true}`},
+	} {
+		data, got := roundTrip(t, tc.info)
+		if string(data) != tc.want {
+			t.Errorf("JSON = %s, want %s", data, tc.want)
+		}
+		if !reflect.DeepEqual(tc.info, got) {
+			t.Errorf("round trip = %+v, want %+v", got, tc.info)
+		}
 	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
 }
 
 // TestSigningKeyRotation_JSONDecode proves the signing_key_rotated payload

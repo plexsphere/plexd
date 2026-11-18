@@ -171,12 +171,11 @@ func (winipcfgConfigurator) SetMTU(luid uint64, mtu int) error {
 // wireguard-go device on it with the given private key and listen port.
 //
 // Creating an adapter requires Administrator. It returns once the IP stack
-// resolves the adapter by name, because what Manager.Setup and
-// SiteToSiteManager.AddTunnel call next resolves it in one attempt and never
-// retries: the route controller's LookupLUID and the WFP enforcer's
-// lookupWinIface. A device whose adapter never becomes visible goes away
-// again, because it would fail those calls with an error that does not name
-// the cause.
+// resolves the adapter by name, because what follows Manager.Setup resolves
+// it in one attempt and never retries: the route controller's LookupLUID and
+// the WFP enforcer's lookupWinIface. A device whose adapter never becomes
+// visible goes away again, because it would fail those calls with an error
+// that does not name the cause.
 func (c *WindowsController) CreateInterface(name string, privateKey []byte, listenPort int) error {
 	if err := c.createAdapter(name, privateKey, listenPort); err != nil {
 		return err
