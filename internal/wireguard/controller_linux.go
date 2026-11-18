@@ -3,9 +3,11 @@
 package wireguard
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -25,13 +27,28 @@ func NewNetlinkController(logger *slog.Logger) *NetlinkController {
 
 // CreateInterface creates a WireGuard interface with the given name,
 // configures it with the provided private key and listen port.
+//
+// A WireGuard link that already holds the name is one a process left behind
+// that ended without its teardown, as a plexd that was killed or crashed
+// does: the kernel keeps the link when its process ends. CreateInterface
+// deletes that link with its addresses, routes and peers and creates the
+// interface afresh, so the next start does not run without its mesh
+// interface until someone deletes the link by hand. A link of another type
+// keeps the name and fails the create.
 func (c *NetlinkController) CreateInterface(name string, privateKey []byte, listenPort int) error {
 	la := netlink.NewLinkAttrs()
 	la.Name = name
 	link := &netlink.GenericLink{LinkAttrs: la, LinkType: "wireguard"}
 
-	if err := netlink.LinkAdd(link); err != nil {
+	replaced, err := addLink(netlinkLinkOps, link)
+	if err != nil {
 		return fmt.Errorf("wireguard: create interface: %w", err)
+	}
+	if replaced {
+		c.logger.Warn("wireguard: replaced an interface an earlier process left behind",
+			"component", "wireguard",
+			"interface", name,
+		)
 	}
 
 	c.logger.Debug("netlink interface created",
@@ -65,6 +82,42 @@ func (c *NetlinkController) CreateInterface(name string, privateKey []byte, list
 	)
 
 	return nil
+}
+
+// linkOps is the part of netlink that addLink uses; tests substitute it.
+type linkOps struct {
+	add    func(netlink.Link) error
+	byName func(string) (netlink.Link, error)
+	del    func(netlink.Link) error
+}
+
+// netlinkLinkOps is linkOps over the kernel.
+var netlinkLinkOps = linkOps{add: netlink.LinkAdd, byName: netlink.LinkByName, del: netlink.LinkDel}
+
+// addLink adds link. When the kernel refuses it because a link of its name
+// exists, and that link is a WireGuard link, addLink deletes it, adds link
+// again and reports true. Any other refusal, and a name held by a link of
+// another type, is returned as an error.
+func addLink(ops linkOps, link netlink.Link) (bool, error) {
+	err := ops.add(link)
+	if err == nil || !errors.Is(err, syscall.EEXIST) {
+		return false, err
+	}
+	name := link.Attrs().Name
+	old, lookupErr := ops.byName(name)
+	if lookupErr != nil {
+		return false, err
+	}
+	if old.Type() != link.Type() {
+		return false, fmt.Errorf("%w: a %s link holds the name %s", err, old.Type(), name)
+	}
+	if err := ops.del(old); err != nil {
+		return false, fmt.Errorf("delete the %s link an earlier process left behind: %w", name, err)
+	}
+	if err := ops.add(link); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetPrivateKey replaces the named device's private key without touching its
