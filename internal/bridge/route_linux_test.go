@@ -3,10 +3,17 @@
 package bridge
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
+	"github.com/google/nftables/userdata"
 )
 
 func discardLoggerRoute() *slog.Logger {
@@ -273,5 +280,113 @@ func TestAddAndRemoveNATMasqueradeRoundTrip(t *testing.T) {
 	// Removing again should be idempotent.
 	if err := ctrl.RemoveNATMasquerade("lo"); err != nil {
 		t.Fatalf("second RemoveNATMasquerade failed: %v", err)
+	}
+}
+
+// formatExprs renders expressions with their types and field values, so a
+// mismatch shows what differs rather than two addresses.
+func formatExprs(exprs []expr.Any) string {
+	var b strings.Builder
+	for i, e := range exprs {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%T%+v", e, reflect.Indirect(reflect.ValueOf(e)).Interface())
+	}
+	return "[" + b.String() + "]"
+}
+
+func assertExprs(t *testing.T, got, want []expr.Any) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expressions differ\n got: %s\nwant: %s", formatExprs(got), formatExprs(want))
+	}
+}
+
+// TestMeshSourceRewriteExprs pins the rule that rewrites the source of a
+// packet from a user access interface into the mesh: the incoming interface
+// name, then the outgoing one, each compared with its terminating NUL, a
+// counter, and masquerade at the end.
+func TestMeshSourceRewriteExprs(t *testing.T) {
+	want := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("wg-ua-a0a0a0e1\x00")},
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("plexd0\x00")},
+		&expr.Counter{},
+		&expr.Masq{},
+	}
+	assertExprs(t, meshSourceRewriteExprs("wg-ua-a0a0a0e1", "plexd0"), want)
+}
+
+// TestMeshSourceRewriteTag pins the tag as the comment TLV libnftnl writes
+// (type 0, the length, the name and its NUL), which nft list ruleset shows as
+// the rule's comment.
+func TestMeshSourceRewriteTag(t *testing.T) {
+	got := meshSourceRewriteTag("wg-ua-a0a0a0e1")
+
+	want := append([]byte{byte(userdata.TypeComment), 15}, "wg-ua-a0a0a0e1\x00"...)
+	if !bytes.Equal(got, want) {
+		t.Errorf("meshSourceRewriteTag = %v, want %v", got, want)
+	}
+	if comment, ok := userdata.GetString(got, userdata.TypeComment); !ok || comment != "wg-ua-a0a0a0e1" {
+		t.Errorf("comment = %q, %v; want %q, true", comment, ok, "wg-ua-a0a0a0e1")
+	}
+}
+
+func TestFindMeshSourceRewrite(t *testing.T) {
+	untagged := &nftables.Rule{Handle: 1}
+	prefix := &nftables.Rule{Handle: 2, UserData: meshSourceRewriteTag("wg-ua-a0a0a0e")}
+	provider := &nftables.Rule{Handle: 3, UserData: meshSourceRewriteTag("wg-ua-a0a0a0e1")}
+	vendor := &nftables.Rule{Handle: 4, UserData: meshSourceRewriteTag("tailscale0")}
+	rules := []*nftables.Rule{untagged, prefix, provider, vendor}
+
+	tests := []struct {
+		name      string
+		rules     []*nftables.Rule
+		fromIface string
+		want      *nftables.Rule
+	}{
+		{"provider interface", rules, "wg-ua-a0a0a0e1", provider},
+		{"vendor interface", rules, "tailscale0", vendor},
+		{"tag is a prefix of another", rules, "wg-ua-a0a0a0e", prefix},
+		{"no rule carries the tag", rules, "wt0", nil},
+		{"no rules", nil, "wg-ua-a0a0a0e1", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := findMeshSourceRewrite(tt.rules, tt.fromIface); got != tt.want {
+				t.Errorf("findMeshSourceRewrite(%q) = %+v, want %+v", tt.fromIface, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAddMeshSourceRewriteRefusesInvalidInterfaceName covers the names
+// ifaceNameBytes cannot encode. They are refused before any nftables call.
+func TestAddMeshSourceRewriteRefusesInvalidInterfaceName(t *testing.T) {
+	ctrl := NewNetlinkRouteController(discardLoggerRoute())
+
+	tests := []struct {
+		name      string
+		fromIface string
+		meshIface string
+	}{
+		{"empty incoming", "", "plexd0"},
+		{"empty outgoing", "wg-ua-a0a0a0e1", ""},
+		{"incoming beyond IFNAMSIZ", "wg-ua-0123456789", "plexd0"},
+		{"outgoing beyond IFNAMSIZ", "wg-ua-a0a0a0e1", "plexd0123456789a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ctrl.AddMeshSourceRewrite(tt.fromIface, tt.meshIface)
+			if err == nil {
+				t.Fatal("expected error for invalid interface name")
+			}
+			expected := "bridge: add mesh source rewrite: invalid interface name"
+			if !strings.HasPrefix(err.Error(), expected) {
+				t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+			}
+		})
 	}
 }
