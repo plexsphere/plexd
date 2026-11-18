@@ -2055,33 +2055,102 @@ type IngressInfo struct {
 // Site-to-Site VPN
 // ---------------------------------------------------------------------------
 
-// SiteToSiteConfig is the site-to-site VPN configuration pushed from the control plane.
+// SiteToSiteConfig is the bridge.site_to_site block of the state pull, the
+// control plane's NodeStateBridgeSiteToSite: every site-to-site tunnel of the
+// bridge Resource, ordered by slug. A bridge serves Tunnels only when Enabled
+// is true and its local configuration does not opt out; a block with Enabled
+// false, and an absent or null block, serve no tunnel. The block is whole: a
+// tunnel a later pull no longer lists is torn down. A block in the shape
+// before plexsphere/plexsphere#1107 (tunnel_id, remote_endpoint,
+// local_subnets, remote_subnets, psk, interface_name, provider_type) decodes
+// to tunnels without an id, which a bridge neither serves nor reports.
 type SiteToSiteConfig struct {
 	Enabled bool               `json:"enabled"`
 	Tunnels []SiteToSiteTunnel `json:"tunnels"`
 }
 
-// SiteToSiteTunnel represents a single site-to-site VPN tunnel definition.
+// SiteToSiteTunnel is one tunnel of the block, the control plane's
+// NodeStateBridgeSiteToSiteTunnel. Every tunnel carries ID, Slug, Kind,
+// RemoteHost, RemotePort and AllowedSubnets; the other members follow from
+// its Kind: ListenPort, RemotePublicKey and an optional AuthSecretName for
+// wireguard, AuthSecretName alone for ipsec and openvpn. No member is a
+// private key or the value of a Secret.
 type SiteToSiteTunnel struct {
-	TunnelID        string   `json:"tunnel_id"`
-	RemoteEndpoint  string   `json:"remote_endpoint"`
-	RemotePublicKey string   `json:"remote_public_key"`
-	LocalSubnets    []string `json:"local_subnets"`
-	RemoteSubnets   []string `json:"remote_subnets"`
-	PSK             string   `json:"psk,omitempty"`
-	InterfaceName   string   `json:"interface_name"`
-	ListenPort      int      `json:"listen_port"`
-	// ProviderType specifies which tunnel provider to use for this tunnel.
-	// Empty or "wireguard" means the default WireGuard-based approach.
-	// Other values (e.g. "ipsec", "openvpn") delegate to the corresponding TunnelProvider.
-	ProviderType string `json:"provider_type,omitempty"`
+	// ID is a UUID; ValidSiteToSiteTunnelID checks it.
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	// Kind is one of the SiteToSiteKind* constants.
+	Kind string `json:"kind"`
+	// RemoteHost is the remote site's host name of at most 253 characters
+	// or its IP address.
+	RemoteHost string `json:"remote_host"`
+	// RemotePort is the remote site's port, 1 to 65535.
+	RemotePort int `json:"remote_port"`
+	// AllowedSubnets are the 1 to 64 networks behind the remote site, in
+	// CIDR notation and in the order the operator wrote them.
+	AllowedSubnets []string `json:"allowed_subnets"`
+	// ListenPort is the UDP port of a wireguard tunnel's interface.
+	ListenPort int `json:"listen_port,omitempty"`
+	// RemotePublicKey is the remote site's WireGuard public key of a
+	// wireguard tunnel: 44 characters of standard base64 that decode to 32
+	// bytes.
+	RemotePublicKey string `json:"remote_public_key,omitempty"`
+	// AuthSecretName names the Secret that holds the tunnel's key as plain
+	// text: the preshared key of a wireguard tunnel, absent when it uses
+	// none, the IKE pre-shared key of an ipsec tunnel, or the static key of
+	// an openvpn tunnel.
+	AuthSecretName string `json:"auth_secret_name,omitempty"`
 }
 
-// SiteToSiteInfo is the site-to-site VPN status reported by the node in heartbeats.
+// The kinds of a site-to-site tunnel.
+const (
+	// SiteToSiteKindWireGuard is a WireGuard interface on the bridge with
+	// one peer, the remote site.
+	SiteToSiteKindWireGuard = "wireguard"
+	// SiteToSiteKindIPsec is an IKE connection to the remote site,
+	// authenticated with a pre-shared key.
+	SiteToSiteKindIPsec = "ipsec"
+	// SiteToSiteKindOpenVPN is a point-to-point OpenVPN connection to the
+	// remote site with a static key.
+	SiteToSiteKindOpenVPN = "openvpn"
+)
+
+// ValidSiteToSiteTunnelID reports whether s is a UUID in canonical form, in
+// either case, other than the zero UUID: the check of
+// ValidUserAccessProviderID, and the id the control plane accepts in a
+// site-to-site status report.
+func ValidSiteToSiteTunnelID(s string) bool {
+	return ValidUserAccessProviderID(s)
+}
+
+// SiteToSiteInfo is the site-to-site status a node publishes under the node
+// API report key status.site-to-site: whether the last applied block enabled
+// site-to-site tunnels, and one entry per tunnel the bridge holds, in block
+// order.
 type SiteToSiteInfo struct {
-	Enabled             bool     `json:"enabled"`
-	TunnelCount         int      `json:"tunnel_count"`
-	TunnelProviderNames []string `json:"tunnel_provider_names,omitempty"`
+	Enabled bool                   `json:"enabled"`
+	Tunnels []SiteToSiteTunnelInfo `json:"tunnels,omitempty"`
+}
+
+// SiteToSiteTunnelInfo is one tunnel of a SiteToSiteInfo.
+type SiteToSiteTunnelInfo struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Kind string `json:"kind"`
+	// Interface is the tunnel's link; empty while it has none.
+	Interface string `json:"interface,omitempty"`
+	// Health is one of the SiteToSiteHealth* constants.
+	Health string `json:"health"`
+	// Reason says why a tunnel is down; empty while it is up.
+	Reason string `json:"reason,omitempty"`
+	// Established says whether the remote site of a tunnel that is up
+	// answers; it is false for a tunnel that is down.
+	Established bool `json:"established"`
+	// ListenPort is a wireguard tunnel's UDP port.
+	ListenPort     int      `json:"listen_port,omitempty"`
+	RemoteHost     string   `json:"remote_host"`
+	RemotePort     int      `json:"remote_port"`
+	AllowedSubnets []string `json:"allowed_subnets"`
 }
 
 // ---------------------------------------------------------------------------

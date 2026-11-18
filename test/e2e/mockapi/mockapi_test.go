@@ -9962,6 +9962,9 @@ func TestState_ReturnsIngressChild(t *testing.T) {
 	}
 }
 
+// TestState_ReturnsSiteToSiteChild pins the fixture's site_to_site block:
+// the two tunnels of the contract's example, in the shape the control plane
+// delivers, each with the members of its kind and no others.
 func TestState_ReturnsSiteToSiteChild(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
@@ -9973,30 +9976,75 @@ func TestState_ReturnsSiteToSiteChild(t *testing.T) {
 	if !s2s.Enabled {
 		t.Error("SiteToSite.Enabled = false, want true")
 	}
-	if len(s2s.Tunnels) != 1 {
-		t.Fatalf("len(SiteToSite.Tunnels) = %d, want 1", len(s2s.Tunnels))
+	want := []api.SiteToSiteTunnel{
+		{
+			ID:              "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+			Slug:            "branch-berlin",
+			Kind:            api.SiteToSiteKindWireGuard,
+			RemoteHost:      "vpn.branch.example.com",
+			RemotePort:      51820,
+			AllowedSubnets:  []string{"10.20.0.0/16"},
+			ListenPort:      51830,
+			RemotePublicKey: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+			AuthSecretName:  "branch-berlin-psk",
+		},
+		{
+			ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+			Slug:           "dc-east",
+			Kind:           api.SiteToSiteKindIPsec,
+			RemoteHost:     "203.0.113.10",
+			RemotePort:     500,
+			AllowedSubnets: []string{"10.30.0.0/16", "10.31.0.0/16"},
+			AuthSecretName: "dc-east-ike",
+		},
 	}
-	tunnel := s2s.Tunnels[0]
-	if tunnel.TunnelID == "" {
-		t.Error("SiteToSite.Tunnels[0].TunnelID is empty")
+	if !reflect.DeepEqual(s2s.Tunnels, want) {
+		t.Errorf("SiteToSite.Tunnels =\n  %+v\nwant\n  %+v", s2s.Tunnels, want)
 	}
-	if tunnel.RemoteEndpoint == "" {
-		t.Error("SiteToSite.Tunnels[0].RemoteEndpoint is empty")
+	for _, tunnel := range s2s.Tunnels {
+		if !api.ValidSiteToSiteTunnelID(tunnel.ID) {
+			t.Errorf("tunnel %s has an id the control plane would refuse", tunnel.Slug)
+		}
+		if tunnel.RemotePublicKey == "" {
+			continue
+		}
+		if key, err := base64.StdEncoding.DecodeString(tunnel.RemotePublicKey); err != nil || len(tunnel.RemotePublicKey) != 44 || len(key) != 32 {
+			t.Errorf("tunnel %s has no remote public key of 44 characters and 32 bytes", tunnel.Slug)
+		}
 	}
-	if tunnel.RemotePublicKey == "" {
-		t.Error("SiteToSite.Tunnels[0].RemotePublicKey is empty")
+
+	// The wire carries the members of each tunnel's kind and no others.
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
 	}
-	if len(tunnel.LocalSubnets) == 0 {
-		t.Error("SiteToSite.Tunnels[0].LocalSubnets is empty")
+	defer resp.Body.Close()
+	var raw struct {
+		Bridge struct {
+			SiteToSite struct {
+				Tunnels []map[string]json.RawMessage `json:"tunnels"`
+			} `json:"site_to_site"`
+		} `json:"bridge"`
 	}
-	if len(tunnel.RemoteSubnets) == 0 {
-		t.Error("SiteToSite.Tunnels[0].RemoteSubnets is empty")
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode state: %v", err)
 	}
-	if tunnel.InterfaceName == "" {
-		t.Error("SiteToSite.Tunnels[0].InterfaceName is empty")
+	wantKeys := [][]string{
+		{"allowed_subnets", "auth_secret_name", "id", "kind", "listen_port", "remote_host", "remote_port", "remote_public_key", "slug"},
+		{"allowed_subnets", "auth_secret_name", "id", "kind", "remote_host", "remote_port", "slug"},
 	}
-	if tunnel.ListenPort == 0 {
-		t.Error("SiteToSite.Tunnels[0].ListenPort = 0")
+	if len(raw.Bridge.SiteToSite.Tunnels) != len(wantKeys) {
+		t.Fatalf("%d tunnels on the wire, want %d", len(raw.Bridge.SiteToSite.Tunnels), len(wantKeys))
+	}
+	for i, tunnel := range raw.Bridge.SiteToSite.Tunnels {
+		var got []string
+		for k := range tunnel {
+			got = append(got, k)
+		}
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, wantKeys[i]) {
+			t.Errorf("tunnel %d members = %q, want %q", i, got, wantKeys[i])
+		}
 	}
 }
 

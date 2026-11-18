@@ -2,135 +2,139 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"net/netip"
 	"os"
 	"regexp"
-	"strings"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
-// TunnelConfig holds the configuration for creating a tunnel via a TunnelProvider.
+// TunnelConfig is what a TunnelProvider needs to run the daemon's side of one
+// site-to-site tunnel of the ipsec or openvpn kind. The SiteToSiteManager
+// builds it from the tunnel's entry and owns everything else: the link, the
+// routes, forwarding and the mesh source rewrite. Every member a provider
+// writes into a file passes ValidateTunnelConfig first.
 type TunnelConfig struct {
-	// TunnelID is the unique identifier for this tunnel.
-	TunnelID string `json:"tunnel_id"`
-
-	// LocalSubnets are the local CIDR subnets to expose through the tunnel.
-	LocalSubnets []string `json:"local_subnets"`
-
-	// RemoteSubnets are the remote CIDR subnets reachable through the tunnel.
-	RemoteSubnets []string `json:"remote_subnets"`
-
-	// RemoteEndpoint is the remote tunnel peer address (host:port or IP).
-	RemoteEndpoint string `json:"remote_endpoint"`
-
-	// PSK is the pre-shared key for tunnel authentication.
-	PSK string `json:"psk"`
-
-	// Extra holds provider-specific configuration parameters.
-	Extra map[string]string `json:"extra,omitempty"`
+	// TunnelID is the tunnel's id, lower case. It names the provider's files
+	// and its strongSwan connection.
+	TunnelID string
+	// InterfaceName is the link the manager created for the tunnel: the
+	// xfrm interface of an ipsec tunnel, the tun device of an openvpn one.
+	InterfaceName string
+	// InterfaceID is the id of an ipsec tunnel's xfrm interface, which
+	// strongSwan binds the connection to; 0 for openvpn.
+	InterfaceID uint32
+	// RemoteHost is the remote site's host name or IP address, as the pull
+	// carries it; the daemon resolves a name itself.
+	RemoteHost string
+	// RemotePort is the remote site's port.
+	RemotePort int
+	// LocalSubnets are the networks on the bridge's side of the tunnel: the
+	// Domain mesh CIDR.
+	LocalSubnets []string
+	// RemoteSubnets are the networks behind the remote site, the tunnel's
+	// allowed_subnets.
+	RemoteSubnets []string
+	// Key is the value of the tunnel's Secret, trimmed of surrounding white
+	// space: an IKE pre-shared key or an OpenVPN static key. It is never
+	// logged.
+	Key string
 }
 
-// TunnelStatus represents the current status of a tunnel managed by a TunnelProvider.
-type TunnelStatus struct {
-	// TunnelID is the unique identifier for this tunnel.
-	TunnelID string `json:"tunnel_id"`
+// tunnelRemoteHostPattern is the grammar of a remote host a provider writes
+// into a file: a host name or an IP address, without white space, quotes or
+// any other character a daemon's configuration syntax reads.
+var tunnelRemoteHostPattern = regexp.MustCompile(`^[A-Za-z0-9.:-]{1,253}$`)
 
-	// Running indicates whether the tunnel is active.
-	Running bool `json:"running"`
+// tunnelInterfaceNamePattern is the grammar of a link name: the kernel's 15
+// characters in the alphabet of the site-to-site prefixes.
+var tunnelInterfaceNamePattern = regexp.MustCompile(`^[a-z0-9-]{1,15}$`)
 
-	// InterfaceName is the network interface used by the tunnel.
-	InterfaceName string `json:"interface_name,omitempty"`
-
-	// Error holds the last error message, if any.
-	Error string `json:"error,omitempty"`
-}
-
-// tunnelIDPattern restricts tunnel IDs to safe alphanumeric strings with dashes.
-// This prevents path traversal when tunnel IDs are used in file paths.
-var tunnelIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9\-]{0,62}$`)
-
-// ValidateTunnelID checks that a tunnel ID is safe for use in file paths
-// and shell arguments. Returns an error if the ID is invalid.
-func ValidateTunnelID(id string) error {
-	if !tunnelIDPattern.MatchString(id) {
-		return fmt.Errorf("bridge: invalid tunnel ID %q: must match %s", id, tunnelIDPattern.String())
-	}
-	return nil
-}
-
-// ValidateTunnelConfig validates all fields of a TunnelConfig before they are
-// interpolated into config files. This prevents newline injection and config
-// injection in strongSwan/OpenVPN configurations.
+// ValidateTunnelConfig checks what a provider writes into a file before it
+// writes it: TunnelID passes api.ValidSiteToSiteTunnelID, RemoteHost matches
+// ^[A-Za-z0-9.:-]{1,253}$, RemotePort is 1 to 65535, every subnet parses as a
+// prefix, and InterfaceName matches ^[a-z0-9-]{1,15}$. Key is not checked
+// here: each provider checks it for its own form. An error never quotes Key.
 func ValidateTunnelConfig(cfg TunnelConfig) error {
-	if err := ValidateTunnelID(cfg.TunnelID); err != nil {
-		return err
+	if !api.ValidSiteToSiteTunnelID(cfg.TunnelID) {
+		return fmt.Errorf("bridge: tunnel: invalid tunnel id %q", cfg.TunnelID)
 	}
-	if strings.ContainsAny(cfg.RemoteEndpoint, "\n\r") {
-		return fmt.Errorf("bridge: invalid remote endpoint %q: contains newline", cfg.RemoteEndpoint)
+	if !tunnelRemoteHostPattern.MatchString(cfg.RemoteHost) {
+		return fmt.Errorf("bridge: tunnel %s: invalid remote host %q", cfg.TunnelID, cfg.RemoteHost)
 	}
-	if strings.ContainsAny(cfg.PSK, "\n\r") {
-		return fmt.Errorf("bridge: invalid PSK: contains newline")
+	if cfg.RemotePort < 1 || cfg.RemotePort > 65535 {
+		return fmt.Errorf("bridge: tunnel %s: remote port %d is outside 1 to 65535", cfg.TunnelID, cfg.RemotePort)
 	}
-	if err := validateSubnets("local subnet", cfg.LocalSubnets); err != nil {
-		return err
-	}
-	if err := validateSubnets("remote subnet", cfg.RemoteSubnets); err != nil {
-		return err
-	}
-	return nil
-}
-
-// validateSubnets checks that no subnet string contains newline characters.
-func validateSubnets(label string, subnets []string) error {
-	for _, s := range subnets {
-		if strings.ContainsAny(s, "\n\r") {
-			return fmt.Errorf("bridge: invalid %s %q: contains newline", label, s)
+	for _, s := range cfg.LocalSubnets {
+		if _, err := netip.ParsePrefix(s); err != nil {
+			return fmt.Errorf("bridge: tunnel %s: invalid local subnet %q", cfg.TunnelID, s)
 		}
 	}
+	for _, s := range cfg.RemoteSubnets {
+		if _, err := netip.ParsePrefix(s); err != nil {
+			return fmt.Errorf("bridge: tunnel %s: invalid remote subnet %q", cfg.TunnelID, s)
+		}
+	}
+	if !tunnelInterfaceNamePattern.MatchString(cfg.InterfaceName) {
+		return fmt.Errorf("bridge: tunnel %s: invalid interface name %q", cfg.TunnelID, cfg.InterfaceName)
+	}
 	return nil
 }
 
-// DefaultTunnelConfigDir is the default directory used for tunnel config files.
-// It is isolated from /tmp to prevent other users from reading PSK material.
+// DefaultTunnelConfigDir is the directory the OpenVPNProvider keeps the files
+// of its tunnels in. It lies under the run directory, so it is gone after a
+// reboot, and it is created with mode 0700, so no other user reads a key.
 const DefaultTunnelConfigDir = "/run/plexd/tunnels"
 
-// ensureTunnelConfigDir creates the given directory with restrictive
-// permissions (0700) if it does not already exist.
+// ensureTunnelConfigDir creates the given directory, and its parents, with
+// mode 0700 when it does not exist. A directory that exists keeps its mode.
 func ensureTunnelConfigDir(dir string) error {
 	return os.MkdirAll(dir, 0700)
 }
 
-// TunnelProvider abstracts lifecycle management of non-WireGuard tunnel
-// technologies (IPsec, OpenVPN, etc.) used for site-to-site connectivity
-// via a bridge node.
+// removeIfExists removes path and reports whether it existed. A path that
+// does not exist is no error.
+func removeIfExists(path string) (bool, error) {
+	err := os.Remove(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// TunnelProvider runs the daemon's side of the site-to-site tunnels of one
+// kind, ipsec or openvpn, each on a link the SiteToSiteManager created
+// before. The manager owns the link, the routes, forwarding and the mesh
+// source rewrite for every kind; a provider writes the daemon's files and runs
+// its commands.
 //
-// Implementations invoke the tunnel daemon/CLI to establish encrypted tunnels
-// to external networks. The bridge manager uses TunnelProvider alongside the
-// existing VPNController (WireGuard) to support heterogeneous site-to-site
-// connectivity.
-//
-// All methods must be safe for concurrent use.
+// Every command a provider runs gets the caller's context, and an error from
+// the executor stays wrapped, so a missing binary stays visible to
+// errors.Is(err, exec.ErrNotFound). All methods are safe for concurrent use.
 type TunnelProvider interface {
-	// Name returns the provider identifier (e.g. "ipsec", "openvpn").
+	// Name returns the kind the provider serves: "ipsec" or "openvpn".
 	Name() string
 
-	// CreateTunnel establishes a tunnel with the given configuration.
-	// The context controls the tunnel lifetime.
-	// Returns an error if the tunnel cannot be created or already exists.
+	// CreateTunnel brings up the daemon's side of the tunnel cfg describes.
+	// A failure leaves no file of the tunnel behind. A daemon the provider
+	// starts runs under ctx and ends with it.
 	CreateTunnel(ctx context.Context, cfg TunnelConfig) error
 
-	// RemoveTunnel tears down the tunnel with the given ID.
-	// Idempotent: removing a non-existent tunnel returns nil.
-	RemoveTunnel(tunnelID string) error
+	// RemoveTunnel tears down the tunnel with the given id and removes its
+	// files. Idempotent: a tunnel the provider holds no file of returns nil.
+	RemoveTunnel(ctx context.Context, tunnelID string) error
 
-	// TunnelStatus returns the status of the tunnel with the given ID.
-	// Returns a zero-value TunnelStatus with Running=false if the tunnel
-	// does not exist.
-	TunnelStatus(tunnelID string) TunnelStatus
+	// Established reports whether the remote site of the tunnel answers: for
+	// ipsec the IKE and child security associations stand, for openvpn the
+	// peer is connected. A failed read returns the error.
+	Established(ctx context.Context, tunnelID string) (bool, error)
 
-	// ActiveTunnels returns the IDs of all active tunnels.
-	ActiveTunnels() []string
-
-	// Stop gracefully shuts down all tunnels managed by this provider.
-	// Idempotent: calling Stop when no tunnels are active returns nil.
-	Stop() error
+	// Reset removes the files of every tunnel of the provider, also those a
+	// process that was killed left behind; the ipsec provider also unloads
+	// their connections from strongSwan. A provider without any file
+	// returns nil.
+	Reset(ctx context.Context) error
 }

@@ -1,99 +1,77 @@
 package bridge
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-func TestValidateTunnelID(t *testing.T) {
-	tests := []struct {
-		name    string
-		id      string
-		wantErr bool
-	}{
-		{name: "valid simple", id: "tun-001", wantErr: false},
-		{name: "valid alphanumeric", id: "abc123", wantErr: false},
-		{name: "valid with dashes", id: "my-tunnel-id", wantErr: false},
-		{name: "valid single char", id: "a", wantErr: false},
-		{name: "valid max length", id: "a234567890123456789012345678901234567890123456789012345678901ab", wantErr: false},
-		{name: "empty", id: "", wantErr: true},
-		{name: "starts with dash", id: "-bad", wantErr: true},
-		{name: "path traversal", id: "../etc/passwd", wantErr: true},
-		{name: "contains slash", id: "tun/bad", wantErr: true},
-		{name: "contains dot", id: "tun.bad", wantErr: true},
-		{name: "contains space", id: "tun bad", wantErr: true},
-		{name: "contains newline", id: "tun\nbad", wantErr: true},
-		{name: "too long", id: "a2345678901234567890123456789012345678901234567890123456789012abc", wantErr: true},
-		{name: "null byte", id: "tun\x00bad", wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateTunnelID(tt.id)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidateTunnelID(%q) error = %v, wantErr %v", tt.id, err, tt.wantErr)
-			}
-		})
+// validTunnelConfig returns a TunnelConfig every check of
+// ValidateTunnelConfig accepts: the ipsec tunnel of the contract's example.
+func validTunnelConfig() TunnelConfig {
+	return TunnelConfig{
+		TunnelID:      "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+		InterfaceName: "xf-s2s-a0a0a0e2",
+		InterfaceID:   2694881506,
+		RemoteHost:    "203.0.113.10",
+		RemotePort:    500,
+		LocalSubnets:  []string{"10.99.0.0/24"},
+		RemoteSubnets: []string{"10.30.0.0/16", "10.31.0.0/16"},
+		Key:           "s3",
 	}
 }
 
 func TestValidateTunnelConfig(t *testing.T) {
-	validCfg := TunnelConfig{
-		TunnelID:       "tun-001",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		RemoteEndpoint: "203.0.113.1:500",
-		PSK:            "shared-secret-key",
+	for name, adjust := range map[string]func(*TunnelConfig){
+		"the contract's example": func(*TunnelConfig) {},
+		"a host name":            func(c *TunnelConfig) { c.RemoteHost = "vpn.dc-east.example.com" },
+		"an IPv6 address":        func(c *TunnelConfig) { c.RemoteHost = "2001:db8::10" },
+		"a host of 253":          func(c *TunnelConfig) { c.RemoteHost = strings.Repeat("a", 253) },
+		"port 1":                 func(c *TunnelConfig) { c.RemotePort = 1 },
+		"port 65535":             func(c *TunnelConfig) { c.RemotePort = 65535 },
+		"no local subnet":        func(c *TunnelConfig) { c.LocalSubnets = nil },
+		"a tun device":           func(c *TunnelConfig) { c.InterfaceName, c.InterfaceID = "ov-s2s-a0a0a0e3", 0 },
+		"a key with a newline":   func(c *TunnelConfig) { c.Key = "line one\nline two" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validTunnelConfig()
+			adjust(&cfg)
+			if err := ValidateTunnelConfig(cfg); err != nil {
+				t.Errorf("ValidateTunnelConfig() = %v, want nil", err)
+			}
+		})
 	}
 
-	t.Run("valid config", func(t *testing.T) {
-		if err := ValidateTunnelConfig(validCfg); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("invalid tunnel ID", func(t *testing.T) {
-		cfg := validCfg
-		cfg.TunnelID = "../bad"
-		if err := ValidateTunnelConfig(cfg); err == nil {
-			t.Error("expected error for invalid tunnel ID")
-		}
-	})
-
-	t.Run("newline in remote endpoint", func(t *testing.T) {
-		cfg := validCfg
-		cfg.RemoteEndpoint = "203.0.113.1\nmalicious"
-		if err := ValidateTunnelConfig(cfg); err == nil {
-			t.Error("expected error for newline in remote endpoint")
-		}
-	})
-
-	t.Run("newline in PSK", func(t *testing.T) {
-		cfg := validCfg
-		cfg.PSK = "secret\nevil-config-line"
-		if err := ValidateTunnelConfig(cfg); err == nil {
-			t.Error("expected error for newline in PSK")
-		}
-	})
-
-	t.Run("carriage return in PSK", func(t *testing.T) {
-		cfg := validCfg
-		cfg.PSK = "secret\revil"
-		if err := ValidateTunnelConfig(cfg); err == nil {
-			t.Error("expected error for carriage return in PSK")
-		}
-	})
-
-	t.Run("newline in local subnet", func(t *testing.T) {
-		cfg := validCfg
-		cfg.LocalSubnets = []string{"10.0.0.0/24\nevil"}
-		if err := ValidateTunnelConfig(cfg); err == nil {
-			t.Error("expected error for newline in local subnet")
-		}
-	})
-
-	t.Run("newline in remote subnet", func(t *testing.T) {
-		cfg := validCfg
-		cfg.RemoteSubnets = []string{"10.1.0.0/24\nevil"}
-		if err := ValidateTunnelConfig(cfg); err == nil {
-			t.Error("expected error for newline in remote subnet")
-		}
-	})
+	for name, adjust := range map[string]func(*TunnelConfig){
+		"no tunnel id":                func(c *TunnelConfig) { c.TunnelID = "" },
+		"a tunnel id that is a path":  func(c *TunnelConfig) { c.TunnelID = "../../etc/swanctl" },
+		"the zero UUID":               func(c *TunnelConfig) { c.TunnelID = "00000000-0000-0000-0000-000000000000" },
+		"no remote host":              func(c *TunnelConfig) { c.RemoteHost = "" },
+		"a remote host with a CR":     func(c *TunnelConfig) { c.RemoteHost = "203.0.113.10\r" },
+		"a remote host with an LF":    func(c *TunnelConfig) { c.RemoteHost = "203.0.113.10\nsecret = 0x00" },
+		"a remote host with a space":  func(c *TunnelConfig) { c.RemoteHost = "203.0.113.10 203.0.113.11" },
+		"a remote host with a brace":  func(c *TunnelConfig) { c.RemoteHost = "vpn}" },
+		"a remote host of 254":        func(c *TunnelConfig) { c.RemoteHost = strings.Repeat("a", 254) },
+		"port 0":                      func(c *TunnelConfig) { c.RemotePort = 0 },
+		"port 65536":                  func(c *TunnelConfig) { c.RemotePort = 65536 },
+		"a local subnet with an LF":   func(c *TunnelConfig) { c.LocalSubnets = []string{"10.99.0.0/24\n"} },
+		"a remote subnet not a CIDR":  func(c *TunnelConfig) { c.RemoteSubnets = []string{"10.30.0.0/16", "not-a-prefix"} },
+		"no interface name":           func(c *TunnelConfig) { c.InterfaceName = "" },
+		"an interface name of 16":     func(c *TunnelConfig) { c.InterfaceName = "xf-s2s-a0a0a0e2x" },
+		"an interface name in upper":  func(c *TunnelConfig) { c.InterfaceName = "XF-S2S-A0A0A0E2" },
+		"an interface name with a /":  func(c *TunnelConfig) { c.InterfaceName = "xf/s2s" },
+		"an interface name with a LF": func(c *TunnelConfig) { c.InterfaceName = "xf-s2s\n" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validTunnelConfig()
+			cfg.Key = "never-in-an-error"
+			adjust(&cfg)
+			err := ValidateTunnelConfig(cfg)
+			if err == nil {
+				t.Fatal("ValidateTunnelConfig() = nil, want an error")
+			}
+			if strings.Contains(err.Error(), cfg.Key) {
+				t.Errorf("the error %q carries the key", err)
+			}
+		})
+	}
 }

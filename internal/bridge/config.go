@@ -3,16 +3,13 @@ package bridge
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"time"
 )
 
 const (
 	DefaultMaxIngressRules    = 20
 	DefaultIngressDialTimeout = 10 * time.Second
-
-	DefaultSiteToSiteInterfacePrefix = "wg-s2s-"
-	DefaultSiteToSiteListenPort      = 51823
-	DefaultMaxSiteToSiteTunnels      = 10
 )
 
 // Config holds the configuration for bridge mode.
@@ -84,27 +81,38 @@ type Config struct {
 	// Default: 10s. Minimum: 1s.
 	IngressDialTimeout time.Duration `yaml:"ingress_dial_timeout"`
 
-	// SiteToSiteEnabled controls whether site-to-site VPN connectivity is active.
-	// Default: false. Requires Enabled=true.
-	SiteToSiteEnabled bool `yaml:"site_to_site_enabled"`
+	// SiteToSiteEnabled is the local switch for site-to-site tunnels. nil and
+	// true serve the tunnels the state pull's bridge.site_to_site block
+	// enables; false opts the node out: plexd builds no site-to-site manager,
+	// creates no tunnel link and routes no network behind a tunnel into the
+	// mesh whatever the pull says.
+	// Default: nil, which serves. An explicit true requires Enabled=true.
+	SiteToSiteEnabled *bool `yaml:"site_to_site_enabled"`
 
-	// SiteToSiteInterfacePrefix is the prefix for WireGuard interfaces used by site-to-site tunnels.
-	// Each tunnel gets an interface named {prefix}{index}.
-	// Default: "wg-s2s-"
+	// The four keys below are ignored: the control plane delivers each
+	// site-to-site tunnel with its kind, port and subnets. They stay
+	// parseable so that a configuration written for an older plexd still
+	// loads, have no default and no validation, and plexd up names those that
+	// are set in one Warn (see ReplacedSiteToSiteKeys).
+
+	// SiteToSiteInterfacePrefix is ignored.
 	SiteToSiteInterfacePrefix string `yaml:"site_to_site_interface_prefix"`
 
-	// SiteToSiteListenPort is the base UDP port for site-to-site WireGuard interfaces.
-	// Each tunnel uses this port + tunnel index offset.
-	// Default: 51823
+	// SiteToSiteListenPort is ignored.
 	SiteToSiteListenPort int `yaml:"site_to_site_listen_port"`
 
-	// MaxSiteToSiteTunnels is the maximum number of concurrent site-to-site tunnels.
-	// Default: 10
+	// MaxSiteToSiteTunnels is ignored.
 	MaxSiteToSiteTunnels int `yaml:"max_site_to_site_tunnels"`
 
-	// TunnelProviders lists the tunnel provider types to enable for site-to-site connectivity.
-	// Supported values: "ipsec", "openvpn". Empty means WireGuard-only.
+	// TunnelProviders is ignored.
 	TunnelProviders []string `yaml:"tunnel_providers"`
+
+	// SwanctlConfDir is the directory plexd writes the strongSwan connection
+	// file of each ipsec tunnel into, which the host's
+	// /etc/swanctl/swanctl.conf includes as <dir>/*.conf. Empty means
+	// <run dir>/swanctl, which plexd up resolves. A value must be an
+	// absolute path.
+	SwanctlConfDir string `yaml:"swanctl_conf_dir"`
 
 	// ACMECacheDir is the directory that holds the ACME account key and the
 	// certificates of the acme rules. Empty means <data_dir>/acme.
@@ -164,6 +172,35 @@ func (c *Config) ReplacedUserAccessKeys() []string {
 	return keys
 }
 
+// SiteToSiteOptedOut reports whether the node opts out of site-to-site
+// tunnels: true exactly when SiteToSiteEnabled is set to false. An unset
+// SiteToSiteEnabled serves.
+func (c *Config) SiteToSiteOptedOut() bool {
+	return c.SiteToSiteEnabled != nil && !*c.SiteToSiteEnabled
+}
+
+// ReplacedSiteToSiteKeys returns the YAML names of the ignored site-to-site
+// keys that are set to a value other than the zero value, in the order
+// site_to_site_interface_prefix, site_to_site_listen_port,
+// max_site_to_site_tunnels, tunnel_providers, and nil when none is set.
+func (c *Config) ReplacedSiteToSiteKeys() []string {
+	var keys []string
+	for _, k := range []struct {
+		name string
+		set  bool
+	}{
+		{"site_to_site_interface_prefix", c.SiteToSiteInterfacePrefix != ""},
+		{"site_to_site_listen_port", c.SiteToSiteListenPort != 0},
+		{"max_site_to_site_tunnels", c.MaxSiteToSiteTunnels != 0},
+		{"tunnel_providers", len(c.TunnelProviders) != 0},
+	} {
+		if k.set {
+			keys = append(keys, k.name)
+		}
+	}
+	return keys
+}
+
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
 	// EnableNAT is handled via natEnabled(); nil means default true.
@@ -173,39 +210,34 @@ func (c *Config) ApplyDefaults() {
 	if c.IngressDialTimeout == 0 {
 		c.IngressDialTimeout = DefaultIngressDialTimeout
 	}
-	if c.SiteToSiteInterfacePrefix == "" {
-		c.SiteToSiteInterfacePrefix = DefaultSiteToSiteInterfacePrefix
-	}
-	if c.SiteToSiteListenPort == 0 {
-		c.SiteToSiteListenPort = DefaultSiteToSiteListenPort
-	}
-	if c.MaxSiteToSiteTunnels == 0 {
-		c.MaxSiteToSiteTunnels = DefaultMaxSiteToSiteTunnels
-	}
 }
 
 // Validate checks that configuration values are acceptable. When bridge mode
-// is disabled, validation is skipped, except for acme_directory_urls, which is
-// checked whatever the other settings say.
+// is disabled, validation is skipped, except for acme_directory_urls and
+// swanctl_conf_dir, which are checked whatever the other settings say.
 func (c *Config) Validate() error {
 	for _, u := range c.ACMEDirectoryURLs {
 		if !ValidACMEDirectoryURL(u) {
 			return fmt.Errorf("bridge: config: acme_directory_urls: %q is not an absolute https URL", u)
 		}
 	}
+	if c.SwanctlConfDir != "" && !filepath.IsAbs(c.SwanctlConfDir) {
+		return fmt.Errorf("bridge: config: swanctl_conf_dir: %q is not an absolute path", c.SwanctlConfDir)
+	}
 	if c.RelayEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: relay requires bridge mode to be enabled")
 	}
 	// Only an explicit true is refused outside bridge mode: an unset switch is
 	// the default every node carries, and an explicit false opts out of
-	// user access or ingress that does not run there either.
+	// user access, ingress or site-to-site tunnels that do not run there
+	// either.
 	if c.UserAccessEnabled != nil && *c.UserAccessEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: user access requires bridge mode to be enabled")
 	}
 	if c.IngressEnabled != nil && *c.IngressEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: ingress requires bridge mode to be enabled")
 	}
-	if c.SiteToSiteEnabled && !c.Enabled {
+	if c.SiteToSiteEnabled != nil && *c.SiteToSiteEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: site-to-site requires bridge mode to be enabled")
 	}
 	if !c.Enabled {
@@ -228,25 +260,6 @@ func (c *Config) Validate() error {
 		}
 		if c.IngressDialTimeout < 1*time.Second {
 			return fmt.Errorf("bridge: config: IngressDialTimeout must be at least 1s")
-		}
-	}
-	for _, tp := range c.TunnelProviders {
-		switch tp {
-		case "ipsec", "openvpn":
-			// valid
-		default:
-			return fmt.Errorf("bridge: config: unsupported TunnelProvider %q", tp)
-		}
-	}
-	if c.SiteToSiteEnabled {
-		if c.SiteToSiteListenPort < 1 || c.SiteToSiteListenPort > 65535 {
-			return fmt.Errorf("bridge: config: SiteToSiteListenPort must be between 1 and 65535")
-		}
-		if c.SiteToSiteInterfacePrefix == "" {
-			return fmt.Errorf("bridge: config: SiteToSiteInterfacePrefix is required when site-to-site is enabled")
-		}
-		if c.MaxSiteToSiteTunnels <= 0 {
-			return fmt.Errorf("bridge: config: MaxSiteToSiteTunnels must be positive when site-to-site is enabled")
 		}
 	}
 	return nil

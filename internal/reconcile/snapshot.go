@@ -130,8 +130,7 @@ func copySiteToSite(src *api.SiteToSiteConfig) *api.SiteToSiteConfig {
 	cp := *src
 	cp.Tunnels = slices.Clone(src.Tunnels)
 	for i := range cp.Tunnels {
-		cp.Tunnels[i].LocalSubnets = slices.Clone(src.Tunnels[i].LocalSubnets)
-		cp.Tunnels[i].RemoteSubnets = slices.Clone(src.Tunnels[i].RemoteSubnets)
+		cp.Tunnels[i].AllowedSubnets = slices.Clone(src.Tunnels[i].AllowedSubnets)
 	}
 	return &cp
 }

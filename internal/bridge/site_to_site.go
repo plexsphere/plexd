@@ -2,385 +2,539 @@ package bridge
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
+	"maps"
+	"net"
+	"net/netip"
+	"os/exec"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
-	"github.com/plexsphere/plexd/internal/wireguard"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// activeTunnel holds the state of a running site-to-site tunnel.
-type activeTunnel struct {
-	tunnel api.SiteToSiteTunnel
-	iface  string
-	// osIface is the name the operating system knows the interface by, utunN
-	// on macOS. It equals iface where the platform keeps the configured name.
-	osIface      string
-	providerName string // non-empty if managed by a TunnelProvider rather than WireGuard
+// The reasons a site-to-site tunnel is down for. Each is the reason of the
+// tunnel's entry in the node API's status.site-to-site report and of its
+// "site-to-site tunnel down" line. invalid_tunnel, setup_failed and
+// key_unavailable are plexd's own; the control plane stores any token of the
+// reason grammar.
+const (
+	// SiteToSiteReasonInvalidTunnel: a member of the entry is missing or
+	// malformed, or the entry clashes with an earlier one of the block. It is
+	// not retried until the entry changes.
+	SiteToSiteReasonInvalidTunnel = "invalid_tunnel"
+	// SiteToSiteReasonKindNotServed: this plexd serves no tunnel of the kind,
+	// because the platform has no mesh source rewrite, the kind is unknown,
+	// or no provider of the kind is built in. It is not retried until the
+	// entry changes.
+	SiteToSiteReasonKindNotServed = "kind_not_served"
+	// SiteToSiteReasonKeyUnavailable: the key of a wireguard tunnel's
+	// interface could not be read or created.
+	SiteToSiteReasonKeyUnavailable = "key_unavailable"
+	// SiteToSiteReasonBindFailed: the interface of a wireguard tunnel cannot
+	// listen on its port, which another socket holds.
+	SiteToSiteReasonBindFailed = "bind_failed"
+	// SiteToSiteReasonSetupFailed: the tunnel's link, its peer, its
+	// forwarding, its source rewrite, its routes or the daemon's side of it
+	// could not be set up, the Secret of a wireguard tunnel holds no
+	// preshared key, or an ipsec tunnel has no mesh CIDR as its local
+	// traffic selector.
+	SiteToSiteReasonSetupFailed = "setup_failed"
+	// SiteToSiteReasonAuthSecretNotListed: the secret inventory does not list
+	// the Secret the tunnel names.
+	SiteToSiteReasonAuthSecretNotListed = "auth_secret_not_listed"
+	// SiteToSiteReasonAuthSecretUnreadable: the inventory lists the Secret,
+	// but it could not be fetched.
+	SiteToSiteReasonAuthSecretUnreadable = "auth_secret_unreadable"
+	// SiteToSiteReasonClientMissing: the host has no client of the kind,
+	// swanctl for ipsec or openvpn for openvpn.
+	SiteToSiteReasonClientMissing = "client_missing"
+	// SiteToSiteReasonRemoteHostUnresolved: remote_host is a host name that
+	// does not resolve.
+	SiteToSiteReasonRemoteHostUnresolved = "remote_host_unresolved"
+)
+
+// siteToSiteProviderTimeout bounds what a provider runs for one call that
+// ends on its own: the commands of an ipsec tunnel's CreateTunnel, every
+// RemoveTunnel, and the resets of CleanupSiteToSite.
+const siteToSiteProviderTimeout = 30 * time.Second
+
+// maxSiteToSiteSubnets is the contract's ceiling on a tunnel's
+// allowed_subnets.
+const maxSiteToSiteSubnets = 64
+
+// SiteToSiteDeps are what a SiteToSiteManager serves tunnels with.
+type SiteToSiteDeps struct {
+	// VPN creates and removes the link of each tunnel: the WireGuard
+	// interface of a wireguard tunnel, the xfrm interface of an ipsec tunnel
+	// and the tun device of an openvpn tunnel.
+	VPN VPNController
+	// Routes switches forwarding on between a tunnel's link and the mesh
+	// interface and routes the tunnel's allowed_subnets into the link. The
+	// manager never switches forwarding off: a tunnel's link is deleted with
+	// the tunnel, and the mesh interface's forwarding belongs to the bridge
+	// manager.
+	Routes RouteController
+	// Rewriter rewrites the source of what a tunnel forwards into the mesh to
+	// the bridge's mesh address. nil: this platform serves no tunnel; one
+	// that passes its checks reads kind_not_served, one that fails them
+	// invalid_tunnel.
+	Rewriter MeshSourceRewriter
+	// Keys keeps the private key of each wireguard tunnel's interface. It
+	// must not be nil.
+	Keys *InterfaceKeyStore
+	// Secrets fetches the key a tunnel's Secret holds. It must not be nil
+	// while a tunnel names a Secret the inventory lists.
+	Secrets SecretValueFetcher
+	// Providers holds the provider of each kind other than wireguard this
+	// plexd serves, by kind: ipsec and openvpn. A kind without a provider
+	// reads kind_not_served.
+	Providers map[string]TunnelProvider
+	// Resolve resolves a remote_host that is no IP address. nil resolves
+	// with net.DefaultResolver.LookupNetIP(ctx, "ip", host).
+	Resolve func(ctx context.Context, host string) ([]netip.Addr, error)
+	// MeshInterface is the name of the mesh interface.
+	MeshInterface string
+	// MeshCIDR is the Domain mesh prefix: the local traffic selector of an
+	// ipsec tunnel, and the prefix no allowed subnet may overlap. Empty when
+	// the node has none, which leaves an ipsec tunnel down with
+	// setup_failed.
+	MeshCIDR string
+	Logger   *slog.Logger
 }
 
-// SiteToSiteManager manages site-to-site VPN tunnels — WireGuard interfaces
-// that establish VPN connections to external networks via a bridge node.
-// SiteToSiteManager is concurrent-safe via mu.
+// SiteToSiteManager serves the site-to-site tunnels of the state pull's
+// bridge.site_to_site block: for each a link of its kind, a WireGuard
+// interface with a kept key and the remote site as its peer, an xfrm
+// interface that strongSwan binds an IKE connection to, or a tun device an
+// openvpn process runs on. Each link forwards into the mesh with its source
+// rewritten to the bridge's mesh address, and the tunnel's allowed_subnets are
+// routed into it. Each tunnel is served on its own, so one that is down leaves
+// the others up. SiteToSiteManager is concurrent-safe via mu.
+//
+// Apply, SyncSecretInventory and Retry are called from the reconciler's
+// goroutine alone. They resolve a tunnel's remote host and fetch its Secret
+// outside mu, so Teardown and the status readers do not wait for either.
 type SiteToSiteManager struct {
-	ctrl            VPNController
-	routes          RouteController
-	cfg             Config
-	logger          *slog.Logger
-	tunnelProviders map[string]TunnelProvider // keyed by provider name (e.g. "ipsec", "openvpn")
+	vpn       VPNController
+	routes    RouteController
+	rewriter  MeshSourceRewriter
+	keys      *InterfaceKeyStore
+	secrets   SecretValueFetcher
+	providers map[string]TunnelProvider
+	resolve   func(ctx context.Context, host string) ([]netip.Addr, error)
+	meshIface string
+	meshCIDR  string
+	logger    *slog.Logger
+	now       func() time.Time
 
-	// mu protects active, activeTunnels from concurrent access.
+	// mu protects the fields below from concurrent access by the reconcile
+	// loop, Teardown and the status readers.
 	mu sync.Mutex
 
-	// tracked state
-	active        bool
-	meshIface     string
-	activeTunnels map[string]*activeTunnel // keyed by tunnel ID
+	active bool
+	// ctx is the context the openvpn processes run under; Teardown cancels
+	// it.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// enabled is the Enabled of the last applied block.
+	enabled bool
+	// tunnels holds every tunnel of the last applied block with a valid,
+	// unrepeated id, in block order; none while the block is not enabled.
+	tunnels []*siteToSiteTunnel
+	// inventory is the last secret inventory, version by Secret name; nil
+	// until the first SyncSecretInventory.
+	inventory map[string]int
+	// invalidIDs holds the "site-to-site tunnel down" lines of the last Apply
+	// for entries without state, so each is logged once.
+	invalidIDs map[string]struct{}
+
+	// changed carries ReportChanged's signal; capacity 1.
+	changed chan struct{}
 }
 
-// NewSiteToSiteManager creates a new SiteToSiteManager.
-// tunnelProviders can be nil (meaning WireGuard-only mode).
-func NewSiteToSiteManager(ctrl VPNController, routes RouteController, cfg Config, logger *slog.Logger, tunnelProviders map[string]TunnelProvider) *SiteToSiteManager {
-	if tunnelProviders == nil {
-		tunnelProviders = make(map[string]TunnelProvider)
+// siteToSiteTunnel is what the manager holds for one tunnel of the block. Its
+// fields are read and written under the manager's mu while the manager holds
+// it; Teardown stops the tunnels it detached outside mu.
+type siteToSiteTunnel struct {
+	// entry is the tunnel as the last Apply listed it; its ID is as pulled.
+	entry api.SiteToSiteTunnel
+	// key is the id lower-cased, which names the key file, the link and the
+	// provider's files.
+	key string
+	// check is why the entry is invalid_tunnel, nil when it passed its own
+	// checks.
+	check error
+
+	// settled is false until an attempt to bring the tunnel up has an
+	// outcome; an unsettled tunnel is not reported. An attempt resolves and
+	// fetches outside mu, which leaves a new or rebuilt tunnel unsettled for
+	// a while.
+	settled bool
+	up      bool
+	// reason says why the tunnel is down; empty while it is up.
+	reason string
+	// attempts counts the consecutive failed attempts; nextAttempt is when
+	// Retry may try again.
+	attempts    int
+	nextAttempt time.Time
+
+	// While the tunnel is up: its link, the public key of a wireguard
+	// tunnel's interface, and the version of the Secret it was built with,
+	// 0 for a tunnel without one.
+	iface     string
+	publicKey string
+	version   int
+}
+
+// siteToSiteAttempt is one attempt to bring a tunnel up past the checks that
+// need no lookup: its remote host is resolved and its Secret fetched outside
+// mu, then its link, routes and daemon are set up under mu.
+type siteToSiteAttempt struct {
+	t     *siteToSiteTunnel
+	entry api.SiteToSiteTunnel
+	key   string
+	// version is the version of the tunnel's Secret the inventory lists, 0
+	// for a tunnel without one.
+	version int
+	// ctx is the manager's context, which an openvpn process runs under.
+	ctx context.Context
+}
+
+// NewSiteToSiteManager creates a SiteToSiteManager. It serves nothing until
+// Setup.
+func NewSiteToSiteManager(deps SiteToSiteDeps) *SiteToSiteManager {
+	resolve := deps.Resolve
+	if resolve == nil {
+		resolve = func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		}
 	}
 	return &SiteToSiteManager{
-		ctrl:            ctrl,
-		routes:          routes,
-		cfg:             cfg,
-		logger:          logger.With("component", "bridge"),
-		tunnelProviders: tunnelProviders,
-		activeTunnels:   make(map[string]*activeTunnel),
+		vpn:       deps.VPN,
+		routes:    deps.Routes,
+		rewriter:  deps.Rewriter,
+		keys:      deps.Keys,
+		secrets:   deps.Secrets,
+		providers: deps.Providers,
+		resolve:   resolve,
+		meshIface: deps.MeshInterface,
+		meshCIDR:  deps.MeshCIDR,
+		logger:    deps.Logger,
+		now:       time.Now,
+		changed:   make(chan struct{}, 1),
 	}
 }
 
-// Setup initializes the site-to-site manager with the given mesh interface.
-// When site-to-site is disabled this is a no-op.
-func (m *SiteToSiteManager) Setup(meshIface string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.cfg.SiteToSiteEnabled {
-		return nil
-	}
-
-	m.active = true
-	m.meshIface = meshIface
-
-	m.logger.Info("site-to-site manager started",
-		"max_tunnels", m.cfg.MaxSiteToSiteTunnels,
-		"interface_prefix", m.cfg.SiteToSiteInterfacePrefix,
-		"mesh_iface", meshIface,
-	)
-
-	return nil
-}
-
-// Teardown removes all active tunnels, their routes, forwarding, and interfaces.
-// Errors are aggregated — cleanup continues even when individual operations fail.
-// Idempotent: calling Teardown when inactive returns nil.
-func (m *SiteToSiteManager) Teardown() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.active {
-		return nil
-	}
+// CleanupSiteToSite removes what a process that was killed left behind: every
+// link whose name starts with one of SiteToSiteInterfacePrefixes, through
+// vpn.RemoveTunnelInterfaces, and the files of every provider, through its
+// Reset, all under a timeout of 30 s. A nil vpn is skipped. Every step runs;
+// the errors are joined.
+//
+// The source rewrites of a killed process are gone before it runs: plexd up
+// runs CleanupUserAccess first, which resets the table both managers share.
+// Without it a tunnel's next create fails on the name the killed process
+// left, and a link of a bridge that opted out since keeps its port open.
+func CleanupSiteToSite(vpn VPNController, providers map[string]TunnelProvider) error {
+	ctx, cancel := context.WithTimeout(context.Background(), siteToSiteProviderTimeout)
+	defer cancel()
 
 	var errs []error
-
-	for id, at := range m.activeTunnels {
-		if at.providerName != "" {
-			// Provider-managed tunnel: delegate removal to the provider.
-			if provider, ok := m.tunnelProviders[at.providerName]; ok {
-				if err := provider.RemoveTunnel(id); err != nil {
-					errs = append(errs, fmt.Errorf("bridge: site-to-site: provider %s remove tunnel %s: %w", at.providerName, id, err))
-				}
-			}
+	if vpn != nil {
+		if err := vpn.RemoveTunnelInterfaces(SiteToSiteInterfacePrefixes); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, kind := range slices.Sorted(maps.Keys(providers)) {
+		provider := providers[kind]
+		if provider == nil {
 			continue
 		}
-		// WireGuard-managed tunnel: remove routes, forwarding, and interface.
-		for _, subnet := range at.tunnel.RemoteSubnets {
-			if err := m.routes.RemoveRoute(subnet, at.osIface); err != nil {
-				errs = append(errs, fmt.Errorf("bridge: site-to-site: remove route %s for tunnel %s: %w", subnet, id, err))
-			}
-		}
-		// Disable forwarding between tunnel and mesh interfaces.
-		if err := m.routes.DisableForwarding(at.osIface, m.meshIface); err != nil {
-			errs = append(errs, fmt.Errorf("bridge: site-to-site: disable forwarding for tunnel %s: %w", id, err))
-		}
-		// Remove the tunnel interface.
-		if err := m.ctrl.RemoveTunnelInterface(at.iface); err != nil {
-			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove interface for tunnel %s: %w", id, err))
+		if err := provider.Reset(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("reset the %s provider: %w", kind, err))
 		}
 	}
-
-	// Stop all tunnel providers.
-	for name, provider := range m.tunnelProviders {
-		if err := provider.Stop(); err != nil {
-			errs = append(errs, fmt.Errorf("bridge: site-to-site: stop provider %s: %w", name, err))
-		}
-	}
-
-	m.active = false
-	m.activeTunnels = make(map[string]*activeTunnel)
-
-	if len(errs) == 0 {
-		m.logger.Info("site-to-site manager stopped")
-	}
-
 	return errors.Join(errs...)
 }
 
-// AddTunnel establishes a site-to-site tunnel: creates a WireGuard interface,
-// configures the remote peer, enables forwarding, and adds routes for remote subnets.
-// Returns an error if the manager is inactive, the tunnel ID already exists,
-// or the maximum tunnel count is reached.
-func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
+// Setup removes what a process that was killed left behind, with
+// CleanupSiteToSite, so that a tunnel's link can be created again under its
+// name, creates the context the openvpn processes run under, and marks the
+// manager active. A failed cleanup fails Setup and leaves the manager
+// inactive.
+func (m *SiteToSiteManager) Setup() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.active {
-		return fmt.Errorf("bridge: site-to-site: manager is not active")
-	}
-
-	if _, ok := m.activeTunnels[tunnel.TunnelID]; ok {
-		return fmt.Errorf("bridge: site-to-site: tunnel already exists: %s", tunnel.TunnelID)
-	}
-	if len(m.activeTunnels) >= m.cfg.MaxSiteToSiteTunnels {
-		return fmt.Errorf("bridge: site-to-site: max tunnels reached (%d)", m.cfg.MaxSiteToSiteTunnels)
-	}
-
-	// Provider delegation: if ProviderType is non-empty and not "wireguard",
-	// delegate to the matching TunnelProvider.
-	if tunnel.ProviderType != "" && tunnel.ProviderType != "wireguard" {
-		provider, ok := m.tunnelProviders[tunnel.ProviderType]
-		if !ok {
-			return fmt.Errorf("bridge: site-to-site: unsupported provider type: %s", tunnel.ProviderType)
-		}
-
-		cfg := TunnelConfig{
-			TunnelID:       tunnel.TunnelID,
-			LocalSubnets:   tunnel.LocalSubnets,
-			RemoteSubnets:  tunnel.RemoteSubnets,
-			RemoteEndpoint: tunnel.RemoteEndpoint,
-			PSK:            tunnel.PSK,
-		}
-		if err := provider.CreateTunnel(context.Background(), cfg); err != nil {
-			return fmt.Errorf("bridge: site-to-site: provider %s create tunnel %s: %w", tunnel.ProviderType, tunnel.TunnelID, err)
-		}
-
-		m.activeTunnels[tunnel.TunnelID] = &activeTunnel{
-			tunnel:       tunnel,
-			providerName: tunnel.ProviderType,
-		}
-
-		m.logger.Info("site-to-site tunnel added via provider",
-			"tunnel_id", tunnel.TunnelID,
-			"provider", tunnel.ProviderType,
-			"remote_endpoint", tunnel.RemoteEndpoint,
-			"remote_subnets", tunnel.RemoteSubnets,
-		)
-
+	if m.active {
 		return nil
 	}
-
-	iface := tunnel.InterfaceName
-
-	// The controller takes the key from its caller. This manager keeps none,
-	// so every interface gets a fresh one, as it did when the controller
-	// generated it.
-	key, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		return fmt.Errorf("bridge: site-to-site: generate key for tunnel %s: %w", tunnel.TunnelID, err)
+	if err := CleanupSiteToSite(m.vpn, m.providers); err != nil {
+		return fmt.Errorf("bridge: site-to-site: clean up: %w", err)
 	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.active = true
 
-	// Create the WireGuard interface.
-	if err := m.ctrl.CreateTunnelInterface(iface, key[:], tunnel.ListenPort); err != nil {
-		return fmt.Errorf("bridge: site-to-site: create interface for tunnel %s: %w", tunnel.TunnelID, err)
-	}
-
-	// macOS names the interface utunN, and the route controller hands the name
-	// to route(8) verbatim, so every route call below uses the kernel name.
-	// The WireGuard controller keeps addressing the device by the configured
-	// name.
-	osIface := m.osInterfaceName(iface)
-	if osIface != iface {
-		m.logger.Debug("tunnel interface resolved",
-			"tunnel_id", tunnel.TunnelID,
-			"interface", iface,
-			"os_interface", osIface,
-		)
-	}
-
-	// Configure the remote peer.
-	if err := m.ctrl.ConfigureTunnelPeer(iface, tunnel.RemotePublicKey, tunnel.RemoteSubnets, tunnel.RemoteEndpoint, tunnel.PSK); err != nil {
-		// Rollback: remove the interface.
-		_ = m.ctrl.RemoveTunnelInterface(iface)
-		return fmt.Errorf("bridge: site-to-site: configure peer for tunnel %s: %w", tunnel.TunnelID, err)
-	}
-
-	// Enable forwarding between tunnel and mesh interfaces.
-	if err := m.routes.EnableForwarding(osIface, m.meshIface); err != nil {
-		// Rollback: remove peer and interface.
-		_ = m.ctrl.RemoveTunnelPeer(iface, tunnel.RemotePublicKey)
-		_ = m.ctrl.RemoveTunnelInterface(iface)
-		return fmt.Errorf("bridge: site-to-site: enable forwarding for tunnel %s: %w", tunnel.TunnelID, err)
-	}
-
-	// Add routes for remote subnets.
-	var addedRoutes []string
-	for _, subnet := range tunnel.RemoteSubnets {
-		if err := m.routes.AddRoute(subnet, osIface); err != nil {
-			// Rollback added routes.
-			for _, added := range addedRoutes {
-				_ = m.routes.RemoveRoute(added, osIface)
-			}
-			// Rollback forwarding, peer, and interface.
-			_ = m.routes.DisableForwarding(osIface, m.meshIface)
-			_ = m.ctrl.RemoveTunnelPeer(iface, tunnel.RemotePublicKey)
-			_ = m.ctrl.RemoveTunnelInterface(iface)
-			return fmt.Errorf("bridge: site-to-site: add route %s for tunnel %s: %w", subnet, tunnel.TunnelID, err)
-		}
-		addedRoutes = append(addedRoutes, subnet)
-	}
-
-	m.activeTunnels[tunnel.TunnelID] = &activeTunnel{
-		tunnel:  tunnel,
-		iface:   iface,
-		osIface: osIface,
-	}
-
-	m.logger.Info("site-to-site tunnel added",
-		"tunnel_id", tunnel.TunnelID,
-		"interface", iface,
-		"remote_endpoint", tunnel.RemoteEndpoint,
-		"remote_subnets", tunnel.RemoteSubnets,
-	)
-
+	m.logger.Info("site-to-site manager started", "component", "bridge")
 	return nil
 }
 
-// osInterfaceName returns the name the operating system knows iface by.
-// A controller that is no wireguard.OSInterfaceNamer, or one that finds no
-// such interface, leaves the configured name in place, which is what Linux
-// and Windows need.
-func (m *SiteToSiteManager) osInterfaceName(iface string) string {
-	if namer, ok := m.ctrl.(wireguard.OSInterfaceNamer); ok {
-		if osName, found := namer.OSInterfaceName(iface); found {
-			return osName
+// Teardown removes every tunnel: the provider's side of it, its routes, its
+// source rewrite and its link. It cancels the context the openvpn processes
+// run under and marks the manager inactive. It keeps the key files, so a
+// wireguard tunnel comes back with its key after a restart. Errors are
+// joined; the cleanup continues past a failure. Idempotent: calling Teardown
+// when inactive returns nil. It signals ReportChanged when it returns.
+func (m *SiteToSiteManager) Teardown() error {
+	defer m.signalReport()
+	m.mu.Lock()
+	if !m.active {
+		m.mu.Unlock()
+		return nil
+	}
+	held := m.tunnels
+	cancel := m.cancel
+	m.active = false
+	m.enabled = false
+	m.tunnels = nil
+	m.inventory = nil
+	m.invalidIDs = nil
+	m.mu.Unlock()
+
+	// Nothing reads the held tunnels once the manager is inactive, and an
+	// attempt that finishes now sets nothing up.
+	var errs []error
+	for _, t := range held {
+		if err := m.stopTunnel(t); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return iface
+	cancel()
+
+	if len(errs) == 0 {
+		m.logger.Info("site-to-site manager stopped", "component", "bridge")
+	}
+	return errors.Join(errs...)
 }
 
-// RemoveTunnel removes a site-to-site tunnel: removes routes, disables forwarding,
-// removes the peer, and removes the interface.
-// Removing a non-existent tunnel or calling on an inactive manager is a no-op.
-func (m *SiteToSiteManager) RemoveTunnel(tunnelID string) {
+// Apply serves the block whole. It does nothing while the manager is not
+// active.
+//
+//   - The key files of every tunnel the block lists are kept, whatever
+//     Enabled says, and every other key file is deleted; the zero block
+//     deletes them all.
+//   - A block with Enabled false serves no tunnel.
+//   - A held tunnel the block does not serve is torn down.
+//   - A held tunnel whose entry is unchanged is kept: the same kind,
+//     remote_host, remote_port, allowed_subnets in order, listen_port,
+//     remote_public_key and auth_secret_name, and the same verdict of its
+//     checks. A changed slug is taken over in place. Any other change tears
+//     the tunnel down and brings it up again, a wireguard tunnel with its
+//     kept key.
+//   - A new tunnel is brought up, in block order.
+//
+// A tunnel that cannot be brought up is down with its reason, and Retry
+// tries again when the reason allows it. Apply signals ReportChanged when it
+// returns, after every attempt it started.
+func (m *SiteToSiteManager) Apply(ctx context.Context, block api.SiteToSiteConfig) {
+	defer m.signalReport()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if !m.active {
+		m.mu.Unlock()
 		return
 	}
-	at, ok := m.activeTunnels[tunnelID]
-	if !ok {
-		return
-	}
+	m.enabled = block.Enabled
 
-	// Provider-managed tunnel: delegate removal to the provider.
-	if at.providerName != "" {
-		if provider, ok := m.tunnelProviders[at.providerName]; ok {
-			if err := provider.RemoveTunnel(tunnelID); err != nil {
-				m.logger.Error("bridge: site-to-site: provider remove tunnel failed",
-					"tunnel_id", tunnelID,
-					"provider", at.providerName,
-					"error", err,
-				)
-			}
+	keep := make(map[string]struct{})
+	for _, e := range block.Tunnels {
+		if api.ValidSiteToSiteTunnelID(e.ID) {
+			keep[strings.ToLower(e.ID)] = struct{}{}
 		}
-		delete(m.activeTunnels, tunnelID)
-		m.logger.Info("site-to-site tunnel removed via provider",
-			"tunnel_id", tunnelID,
-			"provider", at.providerName,
-		)
-		return
+	}
+	var entries []api.SiteToSiteTunnel
+	if block.Enabled {
+		entries = block.Tunnels
+	}
+	planned := m.planLocked(entries)
+
+	held := make(map[string]*siteToSiteTunnel, len(m.tunnels))
+	for _, t := range m.tunnels {
+		held[t.key] = t
+	}
+	listed := make(map[string]struct{}, len(planned))
+	kept := make(map[*siteToSiteTunnel]struct{})
+	var next, fresh []*siteToSiteTunnel
+	for _, nt := range planned {
+		listed[nt.key] = struct{}{}
+		if t := held[nt.key]; t != nil && t.unchanged(nt) {
+			t.entry = nt.entry
+			kept[t] = struct{}{}
+			next = append(next, t)
+			continue
+		}
+		next = append(next, nt)
+		fresh = append(fresh, nt)
 	}
 
-	// WireGuard-managed tunnel removal.
-	// Remove routes for remote subnets.
-	for _, subnet := range at.tunnel.RemoteSubnets {
-		if err := m.routes.RemoveRoute(subnet, at.osIface); err != nil {
-			m.logger.Error("bridge: site-to-site: remove route failed",
-				"tunnel_id", tunnelID,
-				"subnet", subnet,
+	for _, t := range m.tunnels {
+		if _, ok := kept[t]; ok {
+			continue
+		}
+		_, relisted := listed[t.key]
+		iface := t.iface
+		if err := m.stopTunnel(t); err != nil {
+			m.logger.Error("bridge: site-to-site: tear down tunnel failed",
+				"component", "bridge",
+				"tunnel_id", t.entry.ID,
+				"interface", iface,
 				"error", err,
+			)
+		} else if !relisted {
+			m.logger.Info("site-to-site tunnel removed",
+				"component", "bridge",
+				"tunnel_id", t.entry.ID,
+				"interface", iface,
 			)
 		}
 	}
+	m.tunnels = next
 
-	// Disable forwarding between tunnel and mesh interfaces.
-	if err := m.routes.DisableForwarding(at.osIface, m.meshIface); err != nil {
-		m.logger.Error("bridge: site-to-site: disable forwarding failed",
-			"tunnel_id", tunnelID,
+	if err := m.keys.Prune(keep); err != nil {
+		m.logger.Error("bridge: site-to-site: prune keys failed",
+			"component", "bridge",
 			"error", err,
 		)
 	}
 
-	// Remove the tunnel peer and interface.
-	if err := m.ctrl.RemoveTunnelPeer(at.iface, at.tunnel.RemotePublicKey); err != nil {
-		m.logger.Error("bridge: site-to-site: remove peer failed",
-			"tunnel_id", tunnelID,
-			"error", err,
-		)
+	var attempts []*siteToSiteAttempt
+	for _, t := range fresh {
+		if a := m.attemptLocked(t); a != nil {
+			attempts = append(attempts, a)
+		}
 	}
-	if err := m.ctrl.RemoveTunnelInterface(at.iface); err != nil {
-		m.logger.Error("bridge: site-to-site: remove interface failed",
-			"tunnel_id", tunnelID,
-			"error", err,
-		)
-	}
+	m.mu.Unlock()
 
-	delete(m.activeTunnels, tunnelID)
-
-	m.logger.Info("site-to-site tunnel removed",
-		"tunnel_id", tunnelID,
-	)
+	m.runAttempts(ctx, attempts)
 }
 
-// GetTunnel returns the SiteToSiteTunnel for the given ID and true if it exists,
-// or a zero value and false otherwise.
-func (m *SiteToSiteManager) GetTunnel(tunnelID string) (api.SiteToSiteTunnel, bool) {
+// SyncSecretInventory replaces the secret inventory the tunnels take their
+// Secret's version from, rebuilds every tunnel that is up and whose Secret
+// the inventory lists at another version than the one it was built with, and
+// then calls Retry. A tunnel whose Secret the inventory no longer lists keeps
+// running with the key it has. It does nothing while the manager is not
+// active.
+func (m *SiteToSiteManager) SyncSecretInventory(ctx context.Context, inventory []api.NodeStateSecret) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	at, ok := m.activeTunnels[tunnelID]
-	if !ok {
-		return api.SiteToSiteTunnel{}, false
+	if !m.active {
+		m.mu.Unlock()
+		return
 	}
-	return at.tunnel, true
+	m.inventory = secretInventory(inventory)
+
+	var attempts []*siteToSiteAttempt
+	for _, t := range m.tunnels {
+		if !t.up || t.entry.AuthSecretName == "" {
+			continue
+		}
+		version, listed := m.inventory[t.entry.AuthSecretName]
+		if !listed || version == t.version {
+			continue
+		}
+		iface := t.iface
+		if err := m.stopTunnel(t); err != nil {
+			m.logger.Error("bridge: site-to-site: tear down tunnel failed",
+				"component", "bridge",
+				"tunnel_id", t.entry.ID,
+				"interface", iface,
+				"error", err,
+			)
+		}
+		// Unsettled, the tunnel is left out of the reports until the
+		// rebuild has an outcome, rather than read down without a reason.
+		t.settled = false
+		if a := m.attemptLocked(t); a != nil {
+			attempts = append(attempts, a)
+		}
+	}
+	m.mu.Unlock()
+
+	m.runAttempts(ctx, attempts)
+	m.Retry(ctx)
 }
 
-// TunnelIDs returns the IDs of all active tunnels.
-func (m *SiteToSiteManager) TunnelIDs() []string {
+// Retry brings up again every tunnel that is down for bind_failed,
+// setup_failed, key_unavailable, auth_secret_not_listed,
+// auth_secret_unreadable, client_missing or remote_host_unresolved and whose
+// next attempt is due on the manager's clock. The delay after a failed
+// attempt is 5 s, doubling per consecutive failure to 60 s, or the
+// Retry-After of an API error when that is longer. invalid_tunnel and
+// kind_not_served are not retried until the entry changes. It does nothing
+// while the manager is not active. It signals ReportChanged when it returns.
+func (m *SiteToSiteManager) Retry(ctx context.Context) {
+	defer m.signalReport()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ids := make([]string, 0, len(m.activeTunnels))
-	for id := range m.activeTunnels {
-		ids = append(ids, id)
+	if !m.active {
+		m.mu.Unlock()
+		return
 	}
-	return ids
+	now := m.now()
+	var attempts []*siteToSiteAttempt
+	for _, t := range m.tunnels {
+		if t.up || !t.settled || !siteToSiteRetryable(t.reason) || now.Before(t.nextAttempt) {
+			continue
+		}
+		if a := m.attemptLocked(t); a != nil {
+			attempts = append(attempts, a)
+		}
+	}
+	m.mu.Unlock()
+
+	m.runAttempts(ctx, attempts)
 }
 
-// SiteToSiteStatus returns site-to-site status for heartbeat reporting.
-// Returns nil when site-to-site is not active.
+// siteToSiteRetryable reports whether Retry brings a tunnel down for reason
+// up again.
+func siteToSiteRetryable(reason string) bool {
+	switch reason {
+	case SiteToSiteReasonBindFailed, SiteToSiteReasonSetupFailed, SiteToSiteReasonKeyUnavailable,
+		SiteToSiteReasonAuthSecretNotListed, SiteToSiteReasonAuthSecretUnreadable,
+		SiteToSiteReasonClientMissing, SiteToSiteReasonRemoteHostUnresolved:
+		return true
+	}
+	return false
+}
+
+// ReportChanged returns the channel the manager signals, without blocking,
+// when what it reports may have changed: at the end of every Apply, every
+// Retry, and so every SyncSecretInventory, and Teardown. Several signals
+// before the reader wakes collapse into one. The signals are liberal; the
+// reader compares before it acts. A change of whether a remote site answers
+// signals nothing.
+func (m *SiteToSiteManager) ReportChanged() <-chan struct{} {
+	return m.changed
+}
+
+// signalReport signals ReportChanged without blocking: a full channel already
+// carries the signal.
+func (m *SiteToSiteManager) signalReport() {
+	select {
+	case m.changed <- struct{}{}:
+	default:
+	}
+}
+
+// SiteToSiteStatus returns the site-to-site status for the node API's
+// status.site-to-site report: the Enabled of the last applied block and one
+// entry per tunnel the manager holds with a settled first attempt, in block
+// order, with its health, the reason of a tunnel that is down and the link
+// of one that is up. It returns nil while the manager is not active.
 func (m *SiteToSiteManager) SiteToSiteStatus() *api.SiteToSiteInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -388,28 +542,530 @@ func (m *SiteToSiteManager) SiteToSiteStatus() *api.SiteToSiteInfo {
 	if !m.active {
 		return nil
 	}
-
-	var providerNames []string
-	for name := range m.tunnelProviders {
-		providerNames = append(providerNames, name)
+	info := &api.SiteToSiteInfo{Enabled: m.enabled}
+	for _, t := range m.tunnels {
+		if !t.settled {
+			continue
+		}
+		ti := api.SiteToSiteTunnelInfo{
+			ID:             t.entry.ID,
+			Slug:           t.entry.Slug,
+			Kind:           t.entry.Kind,
+			Interface:      t.iface,
+			Health:         api.SiteToSiteHealthDown,
+			Reason:         t.reason,
+			RemoteHost:     t.entry.RemoteHost,
+			RemotePort:     t.entry.RemotePort,
+			AllowedSubnets: append([]string{}, t.entry.AllowedSubnets...),
+		}
+		if t.up {
+			ti.Health = api.SiteToSiteHealthUp
+		}
+		if t.entry.Kind == api.SiteToSiteKindWireGuard {
+			ti.ListenPort = t.entry.ListenPort
+		}
+		info.Tunnels = append(info.Tunnels, ti)
 	}
-	sort.Strings(providerNames)
+	return info
+}
 
-	return &api.SiteToSiteInfo{
-		Enabled:             true,
-		TunnelCount:         len(m.activeTunnels),
-		TunnelProviderNames: providerNames,
+// planLocked returns the state of each entry with a valid id no earlier entry
+// carried, compared without case, in block order, with the verdict of the
+// entry's own checks. An entry with an invalid or repeated id gets no state,
+// since the control plane refuses a whole report for one; it is logged once
+// while the block lists it. The caller holds mu.
+//
+// An entry claims its valid subnets and its kind's link name, whatever the
+// rest of its checks say, so a later entry's verdict depends only on the ids,
+// kinds and subnets before it.
+func (m *SiteToSiteManager) planLocked(entries []api.SiteToSiteTunnel) []*siteToSiteTunnel {
+	var out []*siteToSiteTunnel
+	mesh, _ := netip.ParsePrefix(m.meshCIDR)
+	seen := make(map[string]struct{})
+	logged := make(map[string]struct{})
+	var claimed []netip.Prefix
+	names := make(map[string]struct{})
+	for _, e := range entries {
+		var invalid error
+		key := strings.ToLower(e.ID)
+		if !api.ValidSiteToSiteTunnelID(e.ID) {
+			invalid = errors.New("the id is no UUID other than the zero UUID")
+		} else if _, dup := seen[key]; dup {
+			invalid = errors.New("an earlier tunnel of the block has the same id")
+		}
+		if invalid != nil {
+			line := e.ID + "\x00" + invalid.Error()
+			logged[line] = struct{}{}
+			if _, ok := m.invalidIDs[line]; !ok {
+				m.logDown(e, SiteToSiteReasonInvalidTunnel, invalid)
+			}
+			continue
+		}
+		seen[key] = struct{}{}
+
+		check := checkSiteToSiteEntry(e, key, mesh, claimed, names)
+		for _, s := range e.AllowedSubnets {
+			if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Is4() && p == p.Masked() {
+				claimed = append(claimed, p)
+			}
+		}
+		names[siteToSiteNameClaim(e.Kind, key)] = struct{}{}
+		out = append(out, &siteToSiteTunnel{entry: e, key: key, check: check})
+	}
+	m.invalidIDs = logged
+	return out
+}
+
+// siteToSiteNameClaim identifies the link name a tunnel of kind with the
+// lower-cased id key takes: its kind and the last 8 hex digits of its id.
+func siteToSiteNameClaim(kind, key string) string {
+	return kind + " " + key[len(key)-8:]
+}
+
+// checkSiteToSiteEntry runs the checks of an entry with a valid id, lower
+// cased as key, and returns why it is invalid_tunnel, or nil. mesh is the
+// Domain mesh prefix, invalid when the node has none; claimed holds the
+// subnets and names the link names of the earlier tunnels of the block.
+func checkSiteToSiteEntry(e api.SiteToSiteTunnel, key string, mesh netip.Prefix, claimed []netip.Prefix, names map[string]struct{}) error {
+	if !tunnelRemoteHostPattern.MatchString(e.RemoteHost) {
+		return fmt.Errorf("remote_host %q is no host name or IP address", e.RemoteHost)
+	}
+	if e.RemotePort < 1 || e.RemotePort > 65535 {
+		return fmt.Errorf("remote_port %d is outside 1 to 65535", e.RemotePort)
+	}
+	if n := len(e.AllowedSubnets); n == 0 || n > maxSiteToSiteSubnets {
+		return fmt.Errorf("allowed_subnets holds %d subnets, want 1 to %d", n, maxSiteToSiteSubnets)
+	}
+	own := make(map[netip.Prefix]struct{}, len(e.AllowedSubnets))
+	for _, s := range e.AllowedSubnets {
+		p, err := netip.ParsePrefix(s)
+		switch {
+		case err != nil || !p.Addr().Is4():
+			return fmt.Errorf("allowed subnet %q is no IPv4 prefix", s)
+		case p != p.Masked():
+			return fmt.Errorf("allowed subnet %s has host bits set", s)
+		}
+		if _, dup := own[p]; dup {
+			return fmt.Errorf("allowed subnet %s repeats", s)
+		}
+		own[p] = struct{}{}
+		if mesh.IsValid() && mesh.Overlaps(p) {
+			return fmt.Errorf("allowed subnet %s overlaps the mesh CIDR %s", s, mesh)
+		}
+		for _, c := range claimed {
+			if c.Overlaps(p) {
+				return fmt.Errorf("allowed subnet %s overlaps the subnet %s of an earlier tunnel of the block", s, c)
+			}
+		}
+	}
+	if strings.HasSuffix(key, "00000000") {
+		return errors.New("the last 8 hex digits of the id are zero")
+	}
+	if _, taken := names[siteToSiteNameClaim(e.Kind, key)]; taken {
+		return fmt.Errorf("an earlier %s tunnel of the block ends its id in the same 8 hex digits", e.Kind)
+	}
+	switch e.Kind {
+	case api.SiteToSiteKindWireGuard:
+		if e.ListenPort < 1 || e.ListenPort > 65535 {
+			return fmt.Errorf("listen_port %d is outside 1 to 65535", e.ListenPort)
+		}
+		if !validWireGuardKey(e.RemotePublicKey) {
+			return errors.New("remote_public_key is no WireGuard key of 44 characters of standard base64")
+		}
+		if e.AuthSecretName != "" && !api.ValidSecretName(e.AuthSecretName) {
+			return fmt.Errorf("auth_secret_name %q is no Secret name", e.AuthSecretName)
+		}
+	case api.SiteToSiteKindIPsec, api.SiteToSiteKindOpenVPN:
+		if !api.ValidSecretName(e.AuthSecretName) {
+			return fmt.Errorf("auth_secret_name %q is no Secret name", e.AuthSecretName)
+		}
+	}
+	return nil
+}
+
+// validWireGuardKey reports whether s is a WireGuard key as the contract
+// writes one: 44 characters of standard base64 that decode to 32 bytes.
+func validWireGuardKey(s string) bool {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	return len(s) == 44 && err == nil && len(raw) == 32
+}
+
+// unchanged reports whether the held tunnel t serves nt's entry as it is: the
+// same kind, remote_host, remote_port, allowed_subnets in order, listen_port,
+// remote_public_key and auth_secret_name, and the same verdict of the checks.
+// The slug changes in place.
+func (t *siteToSiteTunnel) unchanged(nt *siteToSiteTunnel) bool {
+	old, e := t.entry, nt.entry
+	return old.Kind == e.Kind &&
+		old.RemoteHost == e.RemoteHost &&
+		old.RemotePort == e.RemotePort &&
+		slices.Equal(old.AllowedSubnets, e.AllowedSubnets) &&
+		old.ListenPort == e.ListenPort &&
+		old.RemotePublicKey == e.RemotePublicKey &&
+		old.AuthSecretName == e.AuthSecretName &&
+		errText(t.check) == errText(nt.check)
+}
+
+// siteToSiteInterfaceName returns the name of a tunnel's link: the prefix of
+// its kind and the last 8 hex digits of its id, lower case, wg-s2s-a0a0a0e1
+// for a wireguard tunnel 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1, xf-s2s- for
+// the xfrm interface of an ipsec tunnel and ov-s2s- for the tun device of an
+// openvpn tunnel. The first digits of a UUIDv7 are its timestamp and repeat
+// for tunnels created within a minute. The 15 characters are the kernel's
+// limit. It returns "" for any other kind. id is a valid tunnel id.
+func siteToSiteInterfaceName(kind, id string) string {
+	id = strings.ToLower(id)
+	var prefix string
+	switch kind {
+	case api.SiteToSiteKindWireGuard:
+		prefix = SiteToSiteWireGuardPrefix
+	case api.SiteToSiteKindIPsec:
+		prefix = SiteToSiteXfrmPrefix
+	case api.SiteToSiteKindOpenVPN:
+		prefix = SiteToSiteTunPrefix
+	default:
+		return ""
+	}
+	return prefix + id[len(id)-8:]
+}
+
+// siteToSiteInterfaceID returns the id of an ipsec tunnel's xfrm interface:
+// the last 8 hex digits of the tunnel's id as a number, 2694881506 for
+// 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2. id is a valid tunnel id.
+func siteToSiteInterfaceID(id string) uint32 {
+	n, _ := strconv.ParseUint(id[len(id)-8:], 16, 32)
+	return uint32(n)
+}
+
+// attemptLocked runs the checks of a tunnel that need no lookup and returns
+// its attempt, or nil when a check put the tunnel down. The caller holds mu.
+func (m *SiteToSiteManager) attemptLocked(t *siteToSiteTunnel) *siteToSiteAttempt {
+	e := t.entry
+	if t.check != nil {
+		m.downLocked(t, SiteToSiteReasonInvalidTunnel, t.check)
+		return nil
+	}
+	switch {
+	case m.rewriter == nil:
+		m.downLocked(t, SiteToSiteReasonKindNotServed, errors.New("this platform has no mesh source rewrite"))
+		return nil
+	case e.Kind == api.SiteToSiteKindWireGuard:
+	case e.Kind == api.SiteToSiteKindIPsec || e.Kind == api.SiteToSiteKindOpenVPN:
+		if m.providers[e.Kind] == nil {
+			m.downLocked(t, SiteToSiteReasonKindNotServed, fmt.Errorf("no %s provider is built in", e.Kind))
+			return nil
+		}
+	default:
+		m.downLocked(t, SiteToSiteReasonKindNotServed, fmt.Errorf("kind %q is not known", e.Kind))
+		return nil
+	}
+
+	var version int
+	if e.AuthSecretName != "" {
+		v, listed := m.inventory[e.AuthSecretName]
+		if !listed {
+			m.downLocked(t, SiteToSiteReasonAuthSecretNotListed, fmt.Errorf("the secret inventory does not list %q", e.AuthSecretName))
+			return nil
+		}
+		version = v
+	}
+	if e.Kind == api.SiteToSiteKindIPsec && m.meshCIDR == "" {
+		m.downLocked(t, SiteToSiteReasonSetupFailed, errors.New("the node has no mesh CIDR as the local traffic selector"))
+		return nil
+	}
+	return &siteToSiteAttempt{t: t, entry: e, key: t.key, version: version, ctx: m.ctx}
+}
+
+// runAttempts runs each attempt in turn.
+func (m *SiteToSiteManager) runAttempts(ctx context.Context, attempts []*siteToSiteAttempt) {
+	for _, a := range attempts {
+		m.attempt(ctx, a)
 	}
 }
 
-// SiteToSiteCapabilities returns capability metadata for registration.
-// Returns nil when site-to-site is not enabled.
-func (m *SiteToSiteManager) SiteToSiteCapabilities() map[string]string {
-	if !m.cfg.SiteToSiteEnabled {
+// attempt resolves the tunnel's remote host and fetches its Secret outside
+// mu, then, under mu, sets up its link, its routes and its daemon. An attempt
+// that finds the manager inactive, or the tunnel no longer held, after the
+// lookups sets nothing up.
+func (m *SiteToSiteManager) attempt(ctx context.Context, a *siteToSiteAttempt) {
+	e := a.entry
+	addr, err := m.remoteAddr(ctx, e.RemoteHost)
+	if err != nil {
+		m.attemptFailed(a, SiteToSiteReasonRemoteHostUnresolved, err)
+		return
+	}
+
+	var secret string
+	if e.AuthSecretName != "" {
+		// A Teardown during the lookup leaves nothing to fetch for.
+		if !m.holds(a.t) {
+			return
+		}
+		value, err := m.secrets.FetchSecretValue(ctx, e.AuthSecretName, a.version)
+		if err != nil {
+			m.attemptFailed(a, SiteToSiteReasonAuthSecretUnreadable, err)
+			return
+		}
+		// The value is never logged.
+		secret = strings.TrimSpace(string(value))
+		clear(value)
+		if e.Kind == api.SiteToSiteKindWireGuard && !validWireGuardKey(secret) {
+			m.attemptFailed(a, SiteToSiteReasonSetupFailed,
+				fmt.Errorf("the Secret %q holds no preshared key of 44 characters of standard base64", e.AuthSecretName))
+			return
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active || !slices.Contains(m.tunnels, a.t) {
+		return
+	}
+	m.bringUpLocked(ctx, a, addr, secret)
+}
+
+// remoteAddr returns the address of host: host itself when it is an IP
+// address, else the address preferIPv4 picks among those Resolve returns
+// under a timeout of endpointResolveTimeout.
+func (m *SiteToSiteManager) remoteAddr(ctx context.Context, host string) (netip.Addr, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, endpointResolveTimeout)
+	defer cancel()
+	addrs, err := m.resolve(ctx, host)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("resolve %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return netip.Addr{}, fmt.Errorf("resolve %q: no address", host)
+	}
+	return preferIPv4(addrs), nil
+}
+
+// holds reports whether the manager is active and holds t.
+func (m *SiteToSiteManager) holds(t *siteToSiteTunnel) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.active && slices.Contains(m.tunnels, t)
+}
+
+// attemptFailed records an attempt that failed outside mu, unless the
+// manager went inactive or no longer holds the tunnel.
+func (m *SiteToSiteManager) attemptFailed(a *siteToSiteAttempt, reason string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active && slices.Contains(m.tunnels, a.t) {
+		m.downLocked(a.t, reason, err)
+	}
+}
+
+// bringUpLocked sets up the tunnel of a, whose remote host is addr and whose
+// Secret holds secret, empty without one: the link of its kind, a wireguard
+// tunnel's peer, forwarding into the mesh, the source rewrite, a route for
+// each allowed subnet, and the provider's side of an ipsec or openvpn
+// tunnel. A failure undoes what the attempt added, in reverse. The caller
+// holds mu.
+func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAttempt, addr netip.Addr, secret string) {
+	t, e := a.t, a.entry
+	name := siteToSiteInterfaceName(e.Kind, a.key)
+
+	var publicKey string
+	switch e.Kind {
+	case api.SiteToSiteKindWireGuard:
+		private, err := m.keys.LoadOrCreate(a.key)
+		if err != nil {
+			m.downLocked(t, SiteToSiteReasonKeyUnavailable, err)
+			return
+		}
+		if err := m.vpn.CreateTunnelInterface(name, private[:], e.ListenPort); err != nil {
+			// The controller removes an interface it created before it
+			// fails; this also removes one of the same name it could not
+			// create over.
+			_ = m.vpn.RemoveTunnelInterface(name)
+			reason := SiteToSiteReasonSetupFailed
+			if errors.Is(err, ErrListenPortInUse) {
+				reason = SiteToSiteReasonBindFailed
+			}
+			m.downLocked(t, reason, fmt.Errorf("create interface %s: %w", name, err))
+			return
+		}
+		endpoint := net.JoinHostPort(addr.String(), strconv.Itoa(e.RemotePort))
+		if err := m.vpn.ConfigureTunnelPeer(name, e.RemotePublicKey, e.AllowedSubnets, endpoint, secret); err != nil {
+			_ = m.vpn.RemoveTunnelInterface(name)
+			m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("configure the remote peer on %s: %w", name, err))
+			return
+		}
+		publicKey = private.PublicKey().String()
+	case api.SiteToSiteKindIPsec:
+		if err := m.vpn.CreateXfrmInterface(name, siteToSiteInterfaceID(a.key)); err != nil {
+			_ = m.vpn.RemoveTunnelInterface(name)
+			m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("create xfrm interface %s: %w", name, err))
+			return
+		}
+	case api.SiteToSiteKindOpenVPN:
+		if err := m.vpn.CreateTunInterface(name); err != nil {
+			_ = m.vpn.RemoveTunnelInterface(name)
+			m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("create tun device %s: %w", name, err))
+			return
+		}
+	}
+
+	var routed []string
+	rewritten := false
+	undo := func() {
+		for _, s := range slices.Backward(routed) {
+			_ = m.routes.RemoveRoute(s, name)
+		}
+		if rewritten {
+			_ = m.rewriter.RemoveMeshSourceRewrite(name, m.meshIface)
+		}
+		_ = m.vpn.RemoveTunnelInterface(name)
+	}
+	if err := m.routes.EnableForwarding(m.meshIface, name); err != nil {
+		undo()
+		m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("enable forwarding: %w", err))
+		return
+	}
+	if err := m.rewriter.AddMeshSourceRewrite(name, m.meshIface); err != nil {
+		undo()
+		m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("add mesh source rewrite: %w", err))
+		return
+	}
+	rewritten = true
+	for _, s := range e.AllowedSubnets {
+		if err := m.routes.AddRoute(s, name); err != nil {
+			undo()
+			m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("add route %s: %w", s, err))
+			return
+		}
+		routed = append(routed, s)
+	}
+
+	if e.Kind != api.SiteToSiteKindWireGuard {
+		if err := m.createProviderTunnel(ctx, a, name, secret); err != nil {
+			undo()
+			reason := SiteToSiteReasonSetupFailed
+			if errors.Is(err, exec.ErrNotFound) {
+				reason = SiteToSiteReasonClientMissing
+			}
+			m.downLocked(t, reason, err)
+			return
+		}
+	}
+
+	t.iface = name
+	t.publicKey = publicKey
+	t.version = a.version
+	m.upLocked(t)
+}
+
+// createProviderTunnel hands an ipsec or openvpn tunnel on the link name to
+// its provider, with the key its Secret holds and the Domain mesh CIDR as its
+// local subnet. The commands of an ipsec tunnel
+// run under a timeout of 30 s derived from ctx. An openvpn process runs under
+// the manager's context instead, since a process ends with the context it
+// started under, and the call itself starts the process and returns.
+func (m *SiteToSiteManager) createProviderTunnel(ctx context.Context, a *siteToSiteAttempt, name, secret string) error {
+	e := a.entry
+	cfg := TunnelConfig{
+		TunnelID:      a.key,
+		InterfaceName: name,
+		RemoteHost:    e.RemoteHost,
+		RemotePort:    e.RemotePort,
+		RemoteSubnets: slices.Clone(e.AllowedSubnets),
+		Key:           secret,
+	}
+	if m.meshCIDR != "" {
+		cfg.LocalSubnets = []string{m.meshCIDR}
+	}
+	if e.Kind == api.SiteToSiteKindIPsec {
+		cfg.InterfaceID = siteToSiteInterfaceID(a.key)
+	}
+
+	runCtx := a.ctx
+	if e.Kind != api.SiteToSiteKindOpenVPN {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, siteToSiteProviderTimeout)
+		defer cancel()
+	}
+	return m.providers[e.Kind].CreateTunnel(runCtx, cfg)
+}
+
+// stopTunnel tears down what t serves on: the provider's side of an ipsec or
+// openvpn tunnel, a route for each allowed subnet, the source rewrite and the
+// link. A tunnel that is down holds nothing. t reads down afterwards.
+func (m *SiteToSiteManager) stopTunnel(t *siteToSiteTunnel) error {
+	if !t.up {
 		return nil
 	}
-	return map[string]string{
-		"site_to_site":             "true",
-		"max_site_to_site_tunnels": strconv.Itoa(m.cfg.MaxSiteToSiteTunnels),
+	e := t.entry
+	var errs []error
+	if e.Kind != api.SiteToSiteKindWireGuard {
+		ctx, cancel := context.WithTimeout(context.Background(), siteToSiteProviderTimeout)
+		err := m.providers[e.Kind].RemoveTunnel(ctx, t.key)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove the %s side of %s: %w", e.Kind, t.key, err))
+		}
 	}
+	for _, s := range e.AllowedSubnets {
+		if err := m.routes.RemoveRoute(s, t.iface); err != nil {
+			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove route %s via %s: %w", s, t.iface, err))
+		}
+	}
+	if err := m.rewriter.RemoveMeshSourceRewrite(t.iface, m.meshIface); err != nil {
+		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove mesh source rewrite %s: %w", t.iface, err))
+	}
+	if err := m.vpn.RemoveTunnelInterface(t.iface); err != nil {
+		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove interface %s: %w", t.iface, err))
+	}
+	t.up = false
+	t.iface, t.publicKey, t.version = "", "", 0
+	return errors.Join(errs...)
+}
+
+// upLocked records that t is up and logs it. The caller holds mu.
+func (m *SiteToSiteManager) upLocked(t *siteToSiteTunnel) {
+	t.settled, t.up = true, true
+	t.reason = ""
+	t.attempts, t.nextAttempt = 0, time.Time{}
+
+	attrs := []any{
+		"component", "bridge",
+		"tunnel_id", t.entry.ID,
+		"slug", t.entry.Slug,
+		"kind", t.entry.Kind,
+		"interface", t.iface,
+	}
+	if t.entry.Kind == api.SiteToSiteKindWireGuard {
+		attrs = append(attrs, "listen_port", t.entry.ListenPort)
+	}
+	m.logger.Info("site-to-site tunnel up", attrs...)
+}
+
+// downLocked records a failed attempt to bring t up: t is down for reason,
+// and its next attempt is due after the retry delay. The tunnel's down line
+// is logged when the reason changed. The caller holds mu.
+func (m *SiteToSiteManager) downLocked(t *siteToSiteTunnel, reason string, err error) {
+	changed := !t.settled || t.up || t.reason != reason
+	t.settled, t.up = true, false
+	t.reason = reason
+	t.attempts++
+	t.nextAttempt = m.now().Add(certRetryDelay(t.attempts, err))
+	if changed {
+		m.logDown(t.entry, reason, err)
+	}
+}
+
+// logDown logs that a tunnel is down for reason.
+func (m *SiteToSiteManager) logDown(e api.SiteToSiteTunnel, reason string, err error) {
+	m.logger.Warn("site-to-site tunnel down",
+		"component", "bridge",
+		"tunnel_id", e.ID,
+		"slug", e.Slug,
+		"kind", e.Kind,
+		"reason", reason,
+		"error", err,
+	)
 }

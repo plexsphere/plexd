@@ -164,16 +164,19 @@ func TestStatusReportPublisher_NilBridgeManagersDisabled(t *testing.T) {
 	}
 }
 
-// fakeBridgeKernel stands in for the kernel a user access manager programs:
-// it is the access controller, the route controller and the mesh source
-// rewriter at once, and every call succeeds. PeerHandshakes answers
-// handshakes for every interface.
+// fakeBridgeKernel stands in for the kernel a user access or site-to-site
+// manager programs: it is the access controller, the VPN controller, the
+// route controller and the mesh source rewriter at once, and every call
+// succeeds. PeerHandshakes answers handshakes for every interface;
+// TunnelPeerHandshake answers the zero time, a remote site that never
+// answered.
 type fakeBridgeKernel struct {
 	handshakes map[string]time.Time
 }
 
 var (
 	_ bridge.AccessController   = fakeBridgeKernel{}
+	_ bridge.VPNController      = fakeBridgeKernel{}
 	_ bridge.RouteController    = fakeBridgeKernel{}
 	_ bridge.MeshSourceRewriter = fakeBridgeKernel{}
 )
@@ -185,6 +188,18 @@ func (fakeBridgeKernel) ConfigurePeer(string, string, []string, string) error { 
 func (fakeBridgeKernel) RemovePeer(string, string) error                      { return nil }
 func (k fakeBridgeKernel) PeerHandshakes(string) (map[string]time.Time, error) {
 	return maps.Clone(k.handshakes), nil
+}
+func (fakeBridgeKernel) CreateTunnelInterface(string, []byte, int) error { return nil }
+func (fakeBridgeKernel) CreateXfrmInterface(string, uint32) error        { return nil }
+func (fakeBridgeKernel) CreateTunInterface(string) error                 { return nil }
+func (fakeBridgeKernel) RemoveTunnelInterface(string) error              { return nil }
+func (fakeBridgeKernel) RemoveTunnelInterfaces([]string) error           { return nil }
+func (fakeBridgeKernel) ConfigureTunnelPeer(string, string, []string, string, string) error {
+	return nil
+}
+func (fakeBridgeKernel) RemoveTunnelPeer(string, string) error { return nil }
+func (fakeBridgeKernel) TunnelPeerHandshake(string, string) (time.Time, error) {
+	return time.Time{}, nil
 }
 func (fakeBridgeKernel) EnableForwarding(string, string) error        { return nil }
 func (fakeBridgeKernel) DisableForwarding(string, string) error       { return nil }
@@ -251,6 +266,65 @@ func TestStatusReportPublisher_UserAccess(t *testing.T) {
 	p.publishOnce()
 	if got := string(findPayload(t, fake, statusUserAccessKey)); got != `{"enabled":false}` {
 		t.Errorf("status.user-access after Teardown = %s, want {\"enabled\":false}", got)
+	}
+}
+
+// TestStatusReportPublisher_SiteToSite publishes status.site-to-site with one
+// entry per tunnel a real site-to-site manager holds, with its health and
+// established, and {"enabled":false} without a manager and once the manager
+// is torn down.
+func TestStatusReportPublisher_SiteToSite(t *testing.T) {
+	fake := &fakeReportPublisher{}
+	p := newTestPublisher(fake, func() int { return 0 })
+	p.publishOnce()
+	if got := string(findPayload(t, fake, statusSiteToSiteKey)); got != `{"enabled":false}` {
+		t.Errorf("status.site-to-site without a manager = %s, want {\"enabled\":false}", got)
+	}
+
+	mgr := bridge.NewSiteToSiteManager(bridge.SiteToSiteDeps{
+		VPN:           fakeBridgeKernel{},
+		Routes:        fakeBridgeKernel{},
+		Rewriter:      fakeBridgeKernel{},
+		Keys:          bridge.NewInterfaceKeyStore(t.TempDir()),
+		MeshInterface: "plexd0",
+		MeshCIDR:      "10.99.0.0/24",
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Teardown() })
+	mgr.Apply(t.Context(), api.SiteToSiteConfig{Enabled: true, Tunnels: []api.SiteToSiteTunnel{
+		{
+			ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "branch-berlin", Kind: api.SiteToSiteKindWireGuard,
+			RemoteHost: "198.51.100.1", RemotePort: 51820, AllowedSubnets: []string{"10.20.0.0/16"},
+			ListenPort: 51830, RemotePublicKey: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+		},
+		// No ipsec provider is built in, so the tunnel is not served.
+		{
+			ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Slug: "dc-east", Kind: api.SiteToSiteKindIPsec,
+			RemoteHost: "203.0.113.10", RemotePort: 500, AllowedSubnets: []string{"10.30.0.0/16", "10.31.0.0/16"},
+			AuthSecretName: "dc-east-ike",
+		},
+	}})
+
+	p.s2sMgr = mgr
+	fake.calls = nil
+	p.publishOnce()
+	const want = `{"enabled":true,"tunnels":[` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"branch-berlin","kind":"wireguard","interface":"wg-s2s-a0a0a0e1","health":"up","established":false,"listen_port":51830,"remote_host":"198.51.100.1","remote_port":51820,"allowed_subnets":["10.20.0.0/16"]},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"dc-east","kind":"ipsec","health":"down","reason":"kind_not_served","established":false,"remote_host":"203.0.113.10","remote_port":500,"allowed_subnets":["10.30.0.0/16","10.31.0.0/16"]}]}`
+	if got := string(findPayload(t, fake, statusSiteToSiteKey)); got != want {
+		t.Errorf("status.site-to-site =\n  %s\nwant\n  %s", got, want)
+	}
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	fake.calls = nil
+	p.publishOnce()
+	if got := string(findPayload(t, fake, statusSiteToSiteKey)); got != `{"enabled":false}` {
+		t.Errorf("status.site-to-site after Teardown = %s, want {\"enabled\":false}", got)
 	}
 }
 

@@ -2,6 +2,8 @@ package bridge
 
 import (
 	"context"
+	"errors"
+	"os"
 	"os/exec"
 )
 
@@ -20,24 +22,35 @@ func (e *StdCommandExecutor) Run(ctx context.Context, name string, args ...strin
 }
 
 // Start launches the named command asynchronously and returns a handle
-// that can be used to stop it.
+// that can be used to stop it. The process is waited for as soon as it
+// exits, whether it ends by itself, through Stop or with ctx, so it leaves no
+// zombie behind and the goroutine os/exec watches ctx with ends with it.
 func (e *StdCommandExecutor) Start(ctx context.Context, name string, args ...string) (CommandHandle, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &execHandle{cmd: cmd}, nil
+	h := &execHandle{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		close(h.done)
+	}()
+	return h, nil
 }
 
 // execHandle wraps an os/exec.Cmd for the CommandHandle interface.
 type execHandle struct {
 	cmd *exec.Cmd
+	// done is closed once the process was waited for.
+	done chan struct{}
 }
 
-// Stop kills the running process.
+// Stop kills the running process and returns once it was waited for. A
+// process that already exited is no error, so Stop may be called again.
 func (h *execHandle) Stop() error {
-	if h.cmd.Process == nil {
-		return nil
+	if err := h.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
 	}
-	return h.cmd.Process.Kill()
+	<-h.done
+	return nil
 }

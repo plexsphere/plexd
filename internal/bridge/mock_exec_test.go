@@ -164,6 +164,33 @@ func callLines(calls []execCall) [][]string {
 	return lines
 }
 
+// swanctlListConns returns what swanctl --list-conns prints for a daemon that
+// holds the strongSwan connections plexd-<id> of the given tunnel ids, each
+// with its child, indented below it as swanctl prints them.
+func swanctlListConns(ids ...string) []byte {
+	var b strings.Builder
+	for _, id := range ids {
+		name := "plexd-" + id
+		b.WriteString(name + ": IKEv2, no reauthentication, rekeying every 14400s\n")
+		b.WriteString("  local:  %any\n")
+		b.WriteString("  remote: 203.0.113.10\n")
+		b.WriteString("  local pre-shared key authentication:\n")
+		b.WriteString("  remote pre-shared key authentication:\n")
+		b.WriteString("  " + name + ": TUNNEL, rekeying every 3600s\n")
+		b.WriteString("    local:  10.99.0.0/24\n")
+		b.WriteString("    remote: 10.30.0.0/16 10.31.0.0/16\n")
+	}
+	return []byte(b.String())
+}
+
+// swanctlListSAs returns what swanctl --list-sas --ike plexd-<id> --raw
+// prints for an IKE security association in ikeState whose child is in
+// childState.
+func swanctlListSAs(id, ikeState, childState string) []byte {
+	name := "plexd-" + id
+	return []byte("list-sa event {" + name + " {state=" + ikeState + " child-sas {" + name + "-1 {state=" + childState + "}}}}\n")
+}
+
 // assertCallDeadline fails t unless call ran under a context whose deadline
 // was more than lo and at most hi away. A zero hi wants no deadline at all.
 func assertCallDeadline(t *testing.T, call execCall, lo, hi time.Duration) {

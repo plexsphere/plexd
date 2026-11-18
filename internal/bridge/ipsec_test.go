@@ -3,330 +3,360 @@ package bridge
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
-var _ TunnelProvider = (*IPsecProvider)(nil)
+const ipsecTestID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2"
 
-// newTestIPsecProvider creates an IPsecProvider with configDir set to a temp directory.
-func newTestIPsecProvider(t *testing.T, exec CommandExecutor, routes RouteController) *IPsecProvider {
+// newTestIPsecProvider returns a provider over a mock executor whose
+// swanctl --list-conns lists the test tunnel's connection, with a confDir
+// that does not exist yet.
+func newTestIPsecProvider(t *testing.T) (*IPsecProvider, *mockCommandExecutor, string) {
 	t.Helper()
-	p := NewIPsecProvider(exec, routes, discardLogger())
-	p.configDir = t.TempDir()
-	return p
+	runner := newMockCommandExecutor()
+	runner.runOutputs["swanctl --list-conns"] = swanctlListConns(ipsecTestID)
+	confDir := filepath.Join(t.TempDir(), "run", "swanctl")
+	return NewIPsecProvider(runner, confDir, discardLogger()), runner, confDir
 }
 
-func TestIPsecProvider_ImplementsInterface(t *testing.T) {
-	// Compile-time check is above; this test exists for clarity.
-	var p TunnelProvider = NewIPsecProvider(newMockCommandExecutor(), &mockRouteController{}, discardLogger())
-	if p.Name() != "ipsec" {
-		t.Fatalf("expected name %q, got %q", "ipsec", p.Name())
+// swanctlLoad is the command line of a load.
+var swanctlLoad = []string{"Run", "swanctl", "--load-all", "--clear", "--noprompt"}
+
+// swanctlTerminate returns the command line of a terminate of the tunnel's
+// connection.
+func swanctlTerminate(id string) []string {
+	return []string{"Run", "swanctl", "--terminate", "--ike", "plexd-" + id}
+}
+
+// requireCommands fails unless runner ran exactly want, in order.
+func requireCommands(t *testing.T, runner *mockCommandExecutor, want ...[]string) {
+	t.Helper()
+	got := callLines(runner.allCalls())
+	if !slices.EqualFunc(got, want, slices.Equal) {
+		t.Fatalf("commands =\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+// requireNoFile fails unless path does not exist.
+func requireNoFile(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat %s = %v, want it gone", path, err)
 	}
 }
 
 func TestIPsecProvider_Name(t *testing.T) {
-	p := NewIPsecProvider(newMockCommandExecutor(), &mockRouteController{}, discardLogger())
+	p, _, _ := newTestIPsecProvider(t)
+	var _ TunnelProvider = p
 	if got := p.Name(); got != "ipsec" {
-		t.Fatalf("Name() = %q, want %q", got, "ipsec")
+		t.Errorf("Name() = %q, want ipsec", got)
 	}
 }
 
-func TestIPsecProvider_CreateTunnel_Success(t *testing.T) {
-	exec := newMockCommandExecutor()
-	routes := &mockRouteController{}
-	p := newTestIPsecProvider(t, exec, routes)
-
-	cfg := TunnelConfig{
-		TunnelID:       "tun1",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24", "10.2.0.0/24"},
-		RemoteEndpoint: "203.0.113.1",
-		PSK:            "secret123",
+// TestIPsecProvider_CreateTunnel checks the connection file, its mode and
+// its directory's mode, and the commands that load it, under the caller's
+// context.
+func TestIPsecProvider_CreateTunnel(t *testing.T) {
+	p, runner, confDir := newTestIPsecProvider(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := p.CreateTunnel(ctx, validTunnelConfig()); err != nil {
+		t.Fatalf("CreateTunnel: %v", err)
 	}
 
-	if err := p.CreateTunnel(context.Background(), cfg); err != nil {
-		t.Fatalf("CreateTunnel() error: %v", err)
+	const want = `connections {
+    plexd-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2 {
+        version = 2
+        remote_addrs = 203.0.113.10
+        remote_port = 500
+        dpd_delay = 30s
+        if_id_in = 2694881506
+        if_id_out = 2694881506
+        local {
+            auth = psk
+        }
+        remote {
+            auth = psk
+        }
+        children {
+            plexd-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2 {
+                local_ts = 10.99.0.0/24
+                remote_ts = 10.30.0.0/16,10.31.0.0/16
+                start_action = start
+                close_action = start
+                dpd_action = restart
+            }
+        }
+    }
+}
+secrets {
+    ike-plexd-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2 {
+        secret = 0x7333
+    }
+}
+`
+	path := filepath.Join(confDir, "plexd-"+ipsecTestID+".conf")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the connection file: %v", err)
+	}
+	if string(data) != want {
+		t.Errorf("connection file =\n%s\nwant\n%s", data, want)
+	}
+	assertPerm(t, path, 0600)
+	assertPerm(t, confDir, 0700)
+	if got := dirNames(t, confDir); !slices.Equal(got, []string{"plexd-" + ipsecTestID + ".conf"}) {
+		t.Errorf("confDir holds %q, want the connection file alone", got)
 	}
 
-	// Verify exec calls.
-	calls := exec.allCalls()
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 exec calls, got %d", len(calls))
-	}
-	if calls[0].Name != "swanctl" || calls[0].Args[0] != "--load-conns" {
-		t.Errorf("call[0] = %v %v, want swanctl --load-conns ...", calls[0].Name, calls[0].Args)
-	}
-	if calls[1].Name != "swanctl" || calls[1].Args[0] != "--initiate" {
-		t.Errorf("call[1] = %v %v, want swanctl --initiate ...", calls[1].Name, calls[1].Args)
-	}
-
-	// Verify routes were added.
-	addCalls := routes.callsFor("AddRoute")
-	if len(addCalls) != 2 {
-		t.Fatalf("expected 2 AddRoute calls, got %d", len(addCalls))
-	}
-	if addCalls[0].Args[0] != "10.1.0.0/24" || addCalls[0].Args[1] != "ipsec-tun1" {
-		t.Errorf("AddRoute[0] = %v, want (10.1.0.0/24, ipsec-tun1)", addCalls[0].Args)
-	}
-	if addCalls[1].Args[0] != "10.2.0.0/24" || addCalls[1].Args[1] != "ipsec-tun1" {
-		t.Errorf("AddRoute[1] = %v, want (10.2.0.0/24, ipsec-tun1)", addCalls[1].Args)
-	}
-
-	// Verify tunnel status.
-	status := p.TunnelStatus("tun1")
-	if !status.Running {
-		t.Error("expected tunnel to be running")
-	}
-	if status.InterfaceName != "ipsec-tun1" {
-		t.Errorf("InterfaceName = %q, want %q", status.InterfaceName, "ipsec-tun1")
+	requireCommands(t, runner, swanctlLoad, []string{"Run", "swanctl", "--list-conns"})
+	for _, c := range runner.allCalls() {
+		assertCallDeadline(t, c, 29*time.Second, 30*time.Second)
 	}
 }
 
-func TestIPsecProvider_CreateTunnel_Duplicate(t *testing.T) {
-	exec := newMockCommandExecutor()
-	p := newTestIPsecProvider(t, exec, &mockRouteController{})
-
-	cfg := TunnelConfig{
-		TunnelID:       "tun1",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		RemoteEndpoint: "203.0.113.1",
-		PSK:            "secret",
-	}
-
-	if err := p.CreateTunnel(context.Background(), cfg); err != nil {
-		t.Fatalf("first CreateTunnel() error: %v", err)
-	}
-
-	err := p.CreateTunnel(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected error for duplicate tunnel, got nil")
-	}
-	if got := err.Error(); !strings.Contains(got, "already exists") {
-		t.Errorf("error = %q, want substring %q", got, "already exists")
-	}
-}
-
-func TestIPsecProvider_CreateTunnel_LoadConnsError(t *testing.T) {
-	loadErr := errors.New("swanctl load failed")
-	exec := newMockCommandExecutor()
-	p := newTestIPsecProvider(t, exec, &mockRouteController{})
-	// Inject error for swanctl --load-conns using the provider's config dir.
-	exec.runErrors[commandKey("swanctl", "--load-conns", "--file", p.configDir+"/plexd-ipsec-tun1.conf")] = loadErr
-
-	cfg := TunnelConfig{
-		TunnelID:       "tun1",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		RemoteEndpoint: "203.0.113.1",
-		PSK:            "secret",
-	}
-
-	err := p.CreateTunnel(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !errors.Is(err, loadErr) {
-		t.Errorf("error = %v, want wrapped %v", err, loadErr)
-	}
-
-	// Tunnel should not be tracked.
-	if len(p.ActiveTunnels()) != 0 {
-		t.Error("expected no active tunnels after load error")
+// TestIPsecProvider_CreateTunnel_NotIncluded lists no connection after the
+// load: the file is removed, the load runs again and the error names the
+// include line. A child of the same name, indented, does not count.
+func TestIPsecProvider_CreateTunnel_NotIncluded(t *testing.T) {
+	for name, listing := range map[string][]byte{
+		"nothing listed":    nil,
+		"another tunnel":    swanctlListConns("0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e9"),
+		"a child alone":     []byte("host-conn: IKEv2\n  plexd-" + ipsecTestID + ": TUNNEL\n"),
+		"a longer name too": []byte("plexd-" + ipsecTestID + "x: IKEv2\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, runner, confDir := newTestIPsecProvider(t)
+			runner.runOutputs["swanctl --list-conns"] = listing
+			err := p.CreateTunnel(t.Context(), validTunnelConfig())
+			want := `bridge: ipsec: strongSwan did not load the connection, add "include ` + filepath.Join(confDir, "*.conf") + `" to /etc/swanctl/swanctl.conf`
+			if err == nil || err.Error() != want {
+				t.Fatalf("CreateTunnel = %v, want %q", err, want)
+			}
+			requireNoFile(t, filepath.Join(confDir, "plexd-"+ipsecTestID+".conf"))
+			requireCommands(t, runner, swanctlLoad, []string{"Run", "swanctl", "--list-conns"}, swanctlLoad)
+		})
 	}
 }
 
-func TestIPsecProvider_CreateTunnel_InitiateError(t *testing.T) {
-	initErr := errors.New("swanctl initiate failed")
-	exec := newMockCommandExecutor()
-	exec.runErrors[commandKey("swanctl", "--initiate", "--child", "tun1")] = initErr
-
-	p := newTestIPsecProvider(t, exec, &mockRouteController{})
-
-	cfg := TunnelConfig{
-		TunnelID:       "tun1",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		RemoteEndpoint: "203.0.113.1",
-		PSK:            "secret",
+// TestIPsecProvider_CreateTunnel_Refused checks that an empty key and a
+// remote host with a line break write nothing and run nothing.
+func TestIPsecProvider_CreateTunnel_Refused(t *testing.T) {
+	for name, adjust := range map[string]func(*TunnelConfig){
+		"empty key":                 func(c *TunnelConfig) { c.Key = "" },
+		"remote host with an LF":    func(c *TunnelConfig) { c.RemoteHost = "203.0.113.10\n" },
+		"remote host with a CRLF":   func(c *TunnelConfig) { c.RemoteHost = "203.0.113.10\r\n" },
+		"remote subnet not a CIDR":  func(c *TunnelConfig) { c.RemoteSubnets = []string{"10.30.0.0"} },
+		"interface name of 16":      func(c *TunnelConfig) { c.InterfaceName = "xf-s2s-a0a0a0e2x" },
+		"tunnel id outside the set": func(c *TunnelConfig) { c.TunnelID = "../x" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, runner, confDir := newTestIPsecProvider(t)
+			cfg := validTunnelConfig()
+			adjust(&cfg)
+			if strings.Contains(name, "remote host") {
+				if err := ValidateTunnelConfig(cfg); err == nil {
+					t.Fatal("ValidateTunnelConfig accepts a remote host with a line break")
+				}
+			}
+			if err := p.CreateTunnel(t.Context(), cfg); err == nil {
+				t.Fatal("CreateTunnel = nil, want an error")
+			}
+			if len(runner.allCalls()) != 0 {
+				t.Errorf("commands = %q, want none", callLines(runner.allCalls()))
+			}
+			requireNoFile(t, confDir)
+		})
 	}
+}
 
-	err := p.CreateTunnel(context.Background(), cfg)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !errors.Is(err, initErr) {
-		t.Errorf("error = %v, want wrapped %v", err, initErr)
-	}
-
-	// Verify rollback: terminate was called.
-	calls := exec.allCalls()
-	foundTerminate := false
-	for _, c := range calls {
-		if c.Name == "swanctl" && len(c.Args) > 0 && c.Args[0] == "--terminate" {
-			foundTerminate = true
-			break
+// TestIPsecProvider_CreateTunnel_LoadFails checks that a failed load removes
+// the file and returns the error wrapped, a missing swanctl included, that a
+// load that failed with swanctl present runs again without the file, since
+// it may have loaded the connection, and that a failed listing removes the
+// file and loads again.
+func TestIPsecProvider_CreateTunnel_LoadFails(t *testing.T) {
+	t.Run("swanctl missing", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		runner.runErrors["swanctl --load-all --clear --noprompt"] = &exec.Error{Name: "swanctl", Err: exec.ErrNotFound}
+		err := p.CreateTunnel(t.Context(), validTunnelConfig())
+		if !errors.Is(err, exec.ErrNotFound) {
+			t.Fatalf("CreateTunnel = %v, want it to wrap exec.ErrNotFound", err)
 		}
-	}
-	if !foundTerminate {
-		t.Error("expected swanctl --terminate rollback call")
-	}
+		requireNoFile(t, filepath.Join(confDir, "plexd-"+ipsecTestID+".conf"))
+		requireCommands(t, runner, swanctlLoad)
+	})
 
-	// Tunnel should not be tracked.
-	if len(p.ActiveTunnels()) != 0 {
-		t.Error("expected no active tunnels after initiate error")
-	}
-}
-
-func TestIPsecProvider_RemoveTunnel_Success(t *testing.T) {
-	exec := newMockCommandExecutor()
-	routes := &mockRouteController{}
-	p := newTestIPsecProvider(t, exec, routes)
-
-	cfg := TunnelConfig{
-		TunnelID:       "tun1",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		RemoteEndpoint: "203.0.113.1",
-		PSK:            "secret",
-	}
-
-	if err := p.CreateTunnel(context.Background(), cfg); err != nil {
-		t.Fatalf("CreateTunnel() error: %v", err)
-	}
-
-	if err := p.RemoveTunnel("tun1"); err != nil {
-		t.Fatalf("RemoveTunnel() error: %v", err)
-	}
-
-	// Verify terminate was called.
-	calls := exec.allCalls()
-	lastCall := calls[len(calls)-1]
-	if lastCall.Name != "swanctl" || lastCall.Args[0] != "--terminate" {
-		t.Errorf("last call = %v %v, want swanctl --terminate ...", lastCall.Name, lastCall.Args)
-	}
-
-	// Verify route removal.
-	removeCalls := routes.callsFor("RemoveRoute")
-	if len(removeCalls) != 1 {
-		t.Fatalf("expected 1 RemoveRoute call, got %d", len(removeCalls))
-	}
-
-	// Verify tunnel is gone.
-	status := p.TunnelStatus("tun1")
-	if status.Running {
-		t.Error("expected tunnel to not be running after removal")
-	}
-}
-
-func TestIPsecProvider_RemoveTunnel_Idempotent(t *testing.T) {
-	p := NewIPsecProvider(newMockCommandExecutor(), &mockRouteController{}, discardLogger())
-
-	// Removing a non-existent tunnel should not error.
-	if err := p.RemoveTunnel("nonexistent"); err != nil {
-		t.Fatalf("RemoveTunnel(nonexistent) error: %v", err)
-	}
-}
-
-func TestIPsecProvider_TunnelStatus_Active(t *testing.T) {
-	exec := newMockCommandExecutor()
-	p := newTestIPsecProvider(t, exec, &mockRouteController{})
-
-	cfg := TunnelConfig{
-		TunnelID:       "active1",
-		LocalSubnets:   []string{"10.0.0.0/24"},
-		RemoteSubnets:  []string{"10.1.0.0/24"},
-		RemoteEndpoint: "203.0.113.1",
-		PSK:            "secret",
-	}
-
-	if err := p.CreateTunnel(context.Background(), cfg); err != nil {
-		t.Fatalf("CreateTunnel() error: %v", err)
-	}
-
-	status := p.TunnelStatus("active1")
-	if !status.Running {
-		t.Error("expected Running=true")
-	}
-	if status.TunnelID != "active1" {
-		t.Errorf("TunnelID = %q, want %q", status.TunnelID, "active1")
-	}
-	if status.InterfaceName != "ipsec-active1" {
-		t.Errorf("InterfaceName = %q, want %q", status.InterfaceName, "ipsec-active1")
-	}
-}
-
-func TestIPsecProvider_TunnelStatus_NotFound(t *testing.T) {
-	p := NewIPsecProvider(newMockCommandExecutor(), &mockRouteController{}, discardLogger())
-
-	status := p.TunnelStatus("missing")
-	if status.Running {
-		t.Error("expected Running=false for missing tunnel")
-	}
-	if status.TunnelID != "missing" {
-		t.Errorf("TunnelID = %q, want %q", status.TunnelID, "missing")
-	}
-	if status.InterfaceName != "" {
-		t.Errorf("InterfaceName = %q, want empty", status.InterfaceName)
-	}
-}
-
-func TestIPsecProvider_ActiveTunnels(t *testing.T) {
-	exec := newMockCommandExecutor()
-	p := newTestIPsecProvider(t, exec, &mockRouteController{})
-
-	for _, id := range []string{"tun-b", "tun-a"} {
-		cfg := TunnelConfig{
-			TunnelID:       id,
-			LocalSubnets:   []string{"10.0.0.0/24"},
-			RemoteSubnets:  []string{"10.1.0.0/24"},
-			RemoteEndpoint: "203.0.113.1",
-			PSK:            "secret",
+	t.Run("daemon not running", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		errRefused := errors.New("exit status 111")
+		runner.runErrors["swanctl --load-all --clear --noprompt"] = errRefused
+		if err := p.CreateTunnel(t.Context(), validTunnelConfig()); !errors.Is(err, errRefused) {
+			t.Fatalf("CreateTunnel = %v, want it to wrap the load's error", err)
 		}
-		if err := p.CreateTunnel(context.Background(), cfg); err != nil {
-			t.Fatalf("CreateTunnel(%s) error: %v", id, err)
+		requireNoFile(t, filepath.Join(confDir, "plexd-"+ipsecTestID+".conf"))
+		requireCommands(t, runner, swanctlLoad, swanctlLoad)
+	})
+
+	t.Run("listing fails", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		errList := errors.New("exit status 1")
+		runner.runErrors["swanctl --list-conns"] = errList
+		if err := p.CreateTunnel(t.Context(), validTunnelConfig()); !errors.Is(err, errList) {
+			t.Fatalf("CreateTunnel = %v, want it to wrap the listing's error", err)
 		}
+		requireNoFile(t, filepath.Join(confDir, "plexd-"+ipsecTestID+".conf"))
+		requireCommands(t, runner, swanctlLoad, []string{"Run", "swanctl", "--list-conns"}, swanctlLoad)
+	})
+}
+
+func TestIPsecProvider_Established(t *testing.T) {
+	saKey := "swanctl --list-sas --ike plexd-" + ipsecTestID + " --raw"
+	for _, tc := range []struct {
+		name   string
+		output []byte
+		want   bool
+	}{
+		{"established and installed", []byte("list-sa event {plexd-" + ipsecTestID + " {state=ESTABLISHED child-sas {plexd-" + ipsecTestID + "-1 {state=INSTALLED}}}}"), true},
+		{"the stand-in's answer", swanctlListSAs(ipsecTestID, "ESTABLISHED", "INSTALLED"), true},
+		{"connecting", swanctlListSAs(ipsecTestID, "CONNECTING", "INSTALLING"), false},
+		{"established without a child", []byte("list-sa event {plexd-" + ipsecTestID + " {state=ESTABLISHED child-sas {}}}"), false},
+		{"empty output", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, runner, _ := newTestIPsecProvider(t)
+			runner.runOutputs[saKey] = tc.output
+			got, err := p.Established(t.Context(), ipsecTestID)
+			if err != nil {
+				t.Fatalf("Established: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("Established() = %v, want %v", got, tc.want)
+			}
+			requireCommands(t, runner, []string{"Run", "swanctl", "--list-sas", "--ike", "plexd-" + ipsecTestID, "--raw"})
+		})
 	}
 
-	active := p.ActiveTunnels()
-	if len(active) != 2 {
-		t.Fatalf("ActiveTunnels() len = %d, want 2", len(active))
+	t.Run("failed command", func(t *testing.T) {
+		p, runner, _ := newTestIPsecProvider(t)
+		errList := errors.New("exit status 111")
+		runner.runErrors[saKey] = errList
+		runner.runOutputs[saKey] = swanctlListSAs(ipsecTestID, "ESTABLISHED", "INSTALLED")
+		got, err := p.Established(t.Context(), ipsecTestID)
+		if !errors.Is(err, errList) || got {
+			t.Errorf("Established() = %v, %v, want false and the command's error", got, err)
+		}
+	})
+}
+
+// TestIPsecProvider_RemoveTunnel checks that a removal loads the connection
+// away and terminates it, ignoring a failed terminate, and that it runs
+// nothing without a file.
+func TestIPsecProvider_RemoveTunnel(t *testing.T) {
+	p, runner, confDir := newTestIPsecProvider(t)
+	if err := p.CreateTunnel(t.Context(), validTunnelConfig()); err != nil {
+		t.Fatalf("CreateTunnel: %v", err)
 	}
-	// Sorted order.
-	if active[0] != "tun-a" || active[1] != "tun-b" {
-		t.Errorf("ActiveTunnels() = %v, want [tun-a tun-b]", active)
+	runner.callList = nil
+	runner.runErrors["swanctl --terminate --ike plexd-"+ipsecTestID] = errors.New("exit status 1")
+
+	if err := p.RemoveTunnel(t.Context(), ipsecTestID); err != nil {
+		t.Fatalf("RemoveTunnel = %v, want the failed terminate ignored", err)
+	}
+	requireNoFile(t, filepath.Join(confDir, "plexd-"+ipsecTestID+".conf"))
+	requireCommands(t, runner, swanctlLoad, swanctlTerminate(ipsecTestID))
+
+	runner.callList = nil
+	if err := p.RemoveTunnel(t.Context(), ipsecTestID); err != nil {
+		t.Fatalf("second RemoveTunnel: %v", err)
+	}
+	if len(runner.allCalls()) != 0 {
+		t.Errorf("commands without a file = %q, want none", callLines(runner.allCalls()))
+	}
+
+	if err := p.RemoveTunnel(t.Context(), "../x"); err == nil {
+		t.Error("RemoveTunnel accepts an id that is a path")
 	}
 }
 
-func TestIPsecProvider_Stop(t *testing.T) {
-	exec := newMockCommandExecutor()
-	routes := &mockRouteController{}
-	p := newTestIPsecProvider(t, exec, routes)
-
-	for _, id := range []string{"tun1", "tun2"} {
-		cfg := TunnelConfig{
-			TunnelID:       id,
-			LocalSubnets:   []string{"10.0.0.0/24"},
-			RemoteSubnets:  []string{"10.1.0.0/24"},
-			RemoteEndpoint: "203.0.113.1",
-			PSK:            "secret",
+// TestIPsecProvider_Reset checks that a missing directory is no error and
+// runs nothing, and that two leftover files are removed with one load and a
+// terminate each, while the host's own files stay.
+func TestIPsecProvider_Reset(t *testing.T) {
+	t.Run("missing directory", func(t *testing.T) {
+		p, runner, _ := newTestIPsecProvider(t)
+		if err := p.Reset(t.Context()); err != nil {
+			t.Fatalf("Reset = %v, want nil", err)
 		}
-		if err := p.CreateTunnel(context.Background(), cfg); err != nil {
-			t.Fatalf("CreateTunnel(%s) error: %v", id, err)
+		if len(runner.allCalls()) != 0 {
+			t.Errorf("commands = %q, want none", callLines(runner.allCalls()))
+		}
+	})
+
+	t.Run("empty directory", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		if err := os.MkdirAll(confDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.Reset(t.Context()); err != nil {
+			t.Fatalf("Reset = %v, want nil", err)
+		}
+		if len(runner.allCalls()) != 0 {
+			t.Errorf("commands = %q, want none", callLines(runner.allCalls()))
+		}
+	})
+
+	const otherID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e8"
+	leftovers := func(t *testing.T, confDir string) {
+		t.Helper()
+		if err := os.MkdirAll(confDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"plexd-" + ipsecTestID + ".conf", "plexd-" + otherID + ".conf", "host.conf", "plexd-notes.txt"} {
+			if err := os.WriteFile(filepath.Join(confDir, name), []byte("x"), 0600); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
-	if err := p.Stop(); err != nil {
-		t.Fatalf("Stop() error: %v", err)
-	}
+	t.Run("two files", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		leftovers(t, confDir)
+		runner.runErrors["swanctl --terminate --ike plexd-"+otherID] = errors.New("exit status 1")
+		if err := p.Reset(t.Context()); err != nil {
+			t.Fatalf("Reset = %v, want nil", err)
+		}
+		if got := dirNames(t, confDir); !slices.Equal(got, []string{"host.conf", "plexd-notes.txt"}) {
+			t.Errorf("confDir holds %q, want the host's files alone", got)
+		}
+		requireCommands(t, runner, swanctlLoad, swanctlTerminate(ipsecTestID), swanctlTerminate(otherID))
+	})
 
-	if len(p.ActiveTunnels()) != 0 {
-		t.Error("expected no active tunnels after Stop")
-	}
+	t.Run("swanctl missing", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		leftovers(t, confDir)
+		runner.runErrors["swanctl --load-all --clear --noprompt"] = &exec.Error{Name: "swanctl", Err: exec.ErrNotFound}
+		if err := p.Reset(t.Context()); err != nil {
+			t.Fatalf("Reset = %v, want a missing swanctl ignored", err)
+		}
+		if got := dirNames(t, confDir); !slices.Equal(got, []string{"host.conf", "plexd-notes.txt"}) {
+			t.Errorf("confDir holds %q, want the host's files alone", got)
+		}
+	})
 
-	// Stop is idempotent.
-	if err := p.Stop(); err != nil {
-		t.Fatalf("second Stop() error: %v", err)
-	}
+	t.Run("failed load", func(t *testing.T) {
+		p, runner, confDir := newTestIPsecProvider(t)
+		leftovers(t, confDir)
+		errLoad := errors.New("exit status 111")
+		runner.runErrors["swanctl --load-all --clear --noprompt"] = errLoad
+		if err := p.Reset(t.Context()); !errors.Is(err, errLoad) {
+			t.Fatalf("Reset = %v, want the load's error", err)
+		}
+	})
 }

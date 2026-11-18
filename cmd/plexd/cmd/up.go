@@ -39,6 +39,7 @@ import (
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/packaging"
+	"github.com/plexsphere/plexd/internal/paths"
 	"github.com/plexsphere/plexd/internal/peerexchange"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -605,13 +606,21 @@ func runAgent(ctx context.Context) error {
 				"keys", keys,
 			)
 		}
+		// The same holds for the keys of the local site-to-site model.
+		if keys := cfg.Bridge.ReplacedSiteToSiteKeys(); len(keys) > 0 {
+			logger.Warn("bridge: config: site-to-site keys are ignored, the control plane delivers tunnels",
+				"component", "bridge",
+				"keys", keys,
+			)
+		}
 
 		// The fetch of the Secrets a bridge reads: the certificates of
-		// terminate rules and the join keys of vendor user access providers.
-		// It is built once, ahead of both managers, and only when one of them
-		// is: a bridge that opts out of both reads no node secret key.
+		// terminate rules, the join keys of vendor user access providers and
+		// the keys of site-to-site tunnels. It is built once, ahead of the
+		// three managers, and only when one of them is: a bridge that opts
+		// out of all three reads no node secret key.
 		var secrets nodeSecretFetcher
-		if !cfg.Bridge.IngressOptedOut() || !cfg.Bridge.UserAccessOptedOut() {
+		if !cfg.Bridge.IngressOptedOut() || !cfg.Bridge.UserAccessOptedOut() || !cfg.Bridge.SiteToSiteOptedOut() {
 			bridgeNSK, err := identity.SecretKey()
 			if err != nil {
 				return fmt.Errorf("plexd up: %w", err)
@@ -695,20 +704,62 @@ func runAgent(ctx context.Context) error {
 			)
 		}
 
-		// Site-to-site VPN manager.
-		if cfg.Bridge.SiteToSiteEnabled {
-			vpnCtrl := newVPNController(logger, identity.MeshIP)
-			s2sMgr = bridge.NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg.Bridge, logger, nil)
-			if err := s2sMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
+		// Site-to-site manager, unless the node opts out with
+		// bridge.site_to_site_enabled: false. It serves the tunnels the
+		// state pull enables: a WireGuard interface with a kept key under
+		// <data_dir>/site-to-site for each wireguard tunnel, an xfrm
+		// interface and a strongSwan connection file in swanctl_conf_dir,
+		// <run dir>/swanctl by default, for each ipsec tunnel, and a tun
+		// device with an openvpn process for each openvpn tunnel, each
+		// joined with the key its Secret holds. Without a mesh source
+		// rewrite, on macOS and Windows, it serves no tunnel: one that
+		// passes its checks reads kind_not_served, one that fails them
+		// invalid_tunnel. Setup first removes the links and files a killed
+		// process left behind; the rewrites went with the user access
+		// cleanup above, which resets the table both managers share. An
+		// opted-out bridge builds no manager and removes them all the same,
+		// so no link of an earlier process keeps a port open.
+		swanctlDir := cfg.Bridge.SwanctlConfDir
+		if swanctlDir == "" {
+			swanctlDir = filepath.Join(paths.RunDir(), "swanctl")
+		}
+		vpnCtrl := newVPNController(logger, identity.MeshIP)
+		tunnelProviders := map[string]bridge.TunnelProvider{
+			api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
+			api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
+		}
+		if !cfg.Bridge.SiteToSiteOptedOut() {
+			s2sMgr = bridge.NewSiteToSiteManager(bridge.SiteToSiteDeps{
+				VPN:           vpnCtrl,
+				Routes:        routeCtrl,
+				Rewriter:      newMeshSourceRewriter(routeCtrl),
+				Keys:          bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "site-to-site")),
+				Secrets:       secrets,
+				Providers:     tunnelProviders,
+				MeshInterface: cfg.WireGuard.InterfaceName,
+				MeshCIDR:      userAccessMeshCIDR(wgMgr.MeshPrefix()),
+				Logger:        logger,
+			})
+			if err := s2sMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: site-to-site setup: %w", err)
 			}
+		} else {
+			if err := bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders); err != nil {
+				logger.Error("bridge: site-to-site: clean up failed",
+					"component", "bridge",
+					"error", err,
+				)
+			}
+			logger.Info("site-to-site: opted out by bridge.site_to_site_enabled, no tunnel is served",
+				"component", "bridge",
+			)
 		}
 
 		logger.Info("bridge subsystem initialized",
 			"relay", cfg.Bridge.RelayEnabled,
 			"ingress", !cfg.Bridge.IngressOptedOut(),
 			"user_access", !cfg.Bridge.UserAccessOptedOut(),
-			"site_to_site", cfg.Bridge.SiteToSiteEnabled,
+			"site_to_site", !cfg.Bridge.SiteToSiteOptedOut(),
 		)
 	}
 
@@ -1218,7 +1269,7 @@ func runAgent(ctx context.Context) error {
 	// handler runs whenever bridge mode does as well: it serves the block the
 	// pull enables, and on a bridge that opts out of public ingress (a nil
 	// ingress manager) it only says that the control plane enables rules. The
-	// user access handler does the same for the user access block.
+	// user access and site-to-site handlers do the same for their blocks.
 	if bridgeMgr != nil {
 		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
@@ -1236,8 +1287,11 @@ func runAgent(ctx context.Context) error {
 		}
 		reconciler.RegisterHandler(bridge.UserAccessReconcileHandler(userAccessMgr, logger))
 		if s2sMgr != nil {
-			reconciler.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
+			// The same holds for the Secret of a tunnel, and a tunnel that
+			// is down is retried on every successful pull.
+			reconciler.RegisterDispatchHandler(bridge.SiteToSitePullHandler(s2sMgr))
 		}
+		reconciler.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 	}
 
 	// 13. Create metrics collectors and manager. The tunnel collector reads the

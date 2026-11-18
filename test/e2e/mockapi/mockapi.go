@@ -502,17 +502,34 @@ func newStateFixture() api.NodeStateSnapshot {
 					},
 				},
 			},
+			// The block in the shape the control plane delivers, the two
+			// tunnels of the contract's example: a wireguard tunnel to a
+			// branch office with a preshared key and an ipsec tunnel to a
+			// data center. No suite serves them: the Docker and Kubernetes
+			// suites run no bridge, and the systemd suite sets site_to_site
+			// to null before its node becomes one.
 			SiteToSite: &api.SiteToSiteConfig{
 				Enabled: true,
 				Tunnels: []api.SiteToSiteTunnel{
 					{
-						TunnelID:        "s2s-001",
-						RemoteEndpoint:  "198.51.100.1:51820",
-						RemotePublicKey: "s2s-remote-pub-key-001",
-						LocalSubnets:    []string{"10.99.0.0/24"},
-						RemoteSubnets:   []string{"172.16.0.0/16"},
-						InterfaceName:   "wg-s2s0",
-						ListenPort:      51822,
+						ID:              "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+						Slug:            "branch-berlin",
+						Kind:            api.SiteToSiteKindWireGuard,
+						RemoteHost:      "vpn.branch.example.com",
+						RemotePort:      51820,
+						AllowedSubnets:  []string{"10.20.0.0/16"},
+						ListenPort:      51830,
+						RemotePublicKey: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+						AuthSecretName:  "branch-berlin-psk",
+					},
+					{
+						ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+						Slug:           "dc-east",
+						Kind:           api.SiteToSiteKindIPsec,
+						RemoteHost:     "203.0.113.10",
+						RemotePort:     500,
+						AllowedSubnets: []string{"10.30.0.0/16", "10.31.0.0/16"},
+						AuthSecretName: "dc-east-ike",
 					},
 				},
 			},
@@ -4372,8 +4389,8 @@ func decodeSiteToSiteStatus(data []byte) (siteToSiteStatusBody, bool) {
 // details are the control plane's sentences
 // (plexsphere/plexsphere@4935e06 docs/reference/api/node-events.md), and a
 // detail never quotes an id, a reason or a key of the body. The mock accepts
-// canonical ids only (api.ValidIngressRuleID, the check
-// api.ValidUserAccessProviderID applies), which is narrower than the control
+// canonical ids only (api.ValidSiteToSiteTunnelID, the check the agent's
+// manager applies to a tunnel's id), which is narrower than the control
 // plane's parser and wide enough for what plexd sends. A reason is judged by
 // api.ValidIngressReason, whose grammar, ^[a-z][a-z0-9_]{0,62}$, is the one
 // the contract gives a site-to-site reason.
@@ -4467,7 +4484,7 @@ func checkSiteToSiteStatusEntry(e siteToSiteStatusEntry) string {
 	switch {
 	case e.ID == nil:
 		return ".id is missing"
-	case !api.ValidIngressRuleID(*e.ID):
+	case !api.ValidSiteToSiteTunnelID(*e.ID):
 		return members["id"]
 	case e.Health == nil:
 		return ".health is missing"

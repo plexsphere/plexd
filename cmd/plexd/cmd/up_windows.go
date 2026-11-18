@@ -118,7 +118,8 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 }
 
 // newMeshSourceRewriter returns nil: Windows has no mesh source rewrite yet,
-// so every user access provider reads kind_not_served (plexd#214).
+// so every user access provider (plexd#214) and every site-to-site tunnel
+// reads kind_not_served.
 func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
 	return nil
 }

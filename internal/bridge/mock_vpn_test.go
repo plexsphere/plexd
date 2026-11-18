@@ -120,6 +120,25 @@ func (m *mockVPNController) vpnCallsFor(method string) []mockVPNCall {
 	return result
 }
 
+// vpnMethods returns the methods of the recorded calls, in order.
+func (m *mockVPNController) vpnMethods() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	methods := make([]string, len(m.calls))
+	for i, c := range m.calls {
+		methods[i] = c.Method
+	}
+	return methods
+}
+
+// set runs f on the mock under its mutex, for a test that changes a field
+// while the code under test may call the mock.
+func (m *mockVPNController) set(f func(m *mockVPNController)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f(m)
+}
+
 func (m *mockVPNController) resetVPN() {
 	m.mu.Lock()
 	m.calls = nil
