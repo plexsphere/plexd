@@ -580,6 +580,9 @@ func TestEnforcer_AdmitsTCPDialWithoutEnforcement(t *testing.T) {
 		if admitted, enforced := enf.AdmitsTCPDial(src, dst); !admitted || enforced {
 			t.Errorf("%s: AdmitsTCPDial = (%v, %v), want (true, false)", name, admitted, enforced)
 		}
+		if admitted, enforced := enf.AdmitsUDPDial(src, dst); !admitted || enforced {
+			t.Errorf("%s: AdmitsUDPDial = (%v, %v), want (true, false)", name, admitted, enforced)
+		}
 	}
 }
 
@@ -630,5 +633,64 @@ func TestEnforcer_AdmitsTCPDialMatchesTheInstalledRules(t *testing.T) {
 	}
 	if admitted, enforced := enf.AdmitsTCPDial(src, netip.MustParseAddrPort("10.99.0.2:9022")); !admitted || !enforced {
 		t.Errorf("AdmitsTCPDial after a refused apply = (%v, %v), want (true, true) from the ruleset still installed", admitted, enforced)
+	}
+}
+
+// A UDP dial matches the allow rules for udp and for every protocol, never a
+// tcp rule's; the protocol "any" of a policy rule compiles to a FirewallRule
+// without a protocol.
+func TestEnforcer_AdmitsUDPDialMatchesTheInstalledRules(t *testing.T) {
+	src := netip.MustParseAddr("10.99.0.1")
+	dst := netip.MustParseAddrPort("10.99.0.2:9053")
+	ports := &api.PortRange{From: 9000, To: 9100}
+	snapshot := func(rule api.PolicyRule) *api.PolicySnapshot {
+		return &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-1", Rules: []api.PolicyRule{rule}}
+	}
+	for _, tc := range []struct {
+		name             string
+		policy           *api.PolicySnapshot // nil installs the default deny alone
+		proto            string              // the Protocol of the compiled allow rule
+		wantUDP, wantTCP bool
+	}{
+		{"a udp allow rule", snapshot(api.PolicyRule{Protocol: "udp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24", Ports: ports}), "udp", true, false},
+		{"a tcp allow rule", snapshot(api.PolicyRule{Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24", Ports: ports}), "tcp", false, true},
+		{"a rule without a protocol", snapshot(api.PolicyRule{Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"}), "", true, true},
+		{"the default deny alone", nil, "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			enf := NewEnforcer(NewPolicyEngine(testLogger()), &mockFirewallController{}, Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}, testLogger())
+			if _, err := enf.ApplyFirewallRules(tc.policy, "wg0"); err != nil {
+				t.Fatalf("ApplyFirewallRules: %v", err)
+			}
+			if tc.policy != nil {
+				if got := enf.installedRules[0]; got.Action != "allow" || got.Protocol != tc.proto {
+					t.Fatalf("installed rule = %+v, want an allow rule with Protocol %q", got, tc.proto)
+				}
+			}
+			if admitted, enforced := enf.AdmitsUDPDial(src, dst); admitted != tc.wantUDP || !enforced {
+				t.Errorf("AdmitsUDPDial(%s, %s) = (%v, %v), want (%v, true)", src, dst, admitted, enforced, tc.wantUDP)
+			}
+			if admitted, enforced := enf.AdmitsTCPDial(src, dst); admitted != tc.wantTCP || !enforced {
+				t.Errorf("AdmitsTCPDial(%s, %s) = (%v, %v), want (%v, true)", src, dst, admitted, enforced, tc.wantTCP)
+			}
+		})
+	}
+
+	// A udp rule admits a UDP dial only to its ports and its addresses.
+	enf := NewEnforcer(NewPolicyEngine(testLogger()), &mockFirewallController{}, Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}, testLogger())
+	if _, err := enf.ApplyFirewallRules(snapshot(api.PolicyRule{Protocol: "udp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24", Ports: ports}), "wg0"); err != nil {
+		t.Fatalf("ApplyFirewallRules: %v", err)
+	}
+	for _, tt := range []struct {
+		dst          string
+		wantAdmitted bool
+	}{
+		{"10.99.0.2:9053", true},
+		{"10.99.0.2:53", false},
+		{"[fd00:99::2]:9053", false},
+	} {
+		if admitted, enforced := enf.AdmitsUDPDial(src, netip.MustParseAddrPort(tt.dst)); admitted != tt.wantAdmitted || !enforced {
+			t.Errorf("AdmitsUDPDial(%s, %s) = (%v, %v), want (%v, true)", src, tt.dst, admitted, enforced, tt.wantAdmitted)
+		}
 	}
 }

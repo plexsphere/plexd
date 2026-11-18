@@ -200,12 +200,31 @@ func (e *Enforcer) applyLocked(policy *api.PolicySnapshot, iface string) (bool, 
 // alone, which the startup baseline and a pull with policy: null install,
 // admits nothing.
 func (e *Enforcer) AdmitsTCPDial(src netip.Addr, dst netip.AddrPort) (admitted, enforced bool) {
+	return e.admitsDial(ipProtoTCP, src, dst)
+}
+
+// AdmitsUDPDial reports whether the ruleset the backend holds lets a socket of
+// the node send UDP datagrams from src, the node's mesh address, to dst. It
+// answers as AdmitsTCPDial does: enforced is false, and admitted true, while
+// enforcement is disabled, no backend exists, no ruleset is installed, or the
+// Enforcer is closed. Otherwise the dial is admitted when an allow rule for
+// udp, or for every protocol, matches its addresses and destination port; a
+// tcp rule admits no UDP dial, and the default deny alone admits nothing.
+func (e *Enforcer) AdmitsUDPDial(src netip.Addr, dst netip.AddrPort) (admitted, enforced bool) {
+	return e.admitsDial(ipProtoUDP, src, dst)
+}
+
+// admitsDial answers AdmitsTCPDial and AdmitsUDPDial for a dial of the IP
+// protocol proto, ipProtoTCP or ipProtoUDP, from src to dst: it matches the
+// dial as a connection event against the allow rules of the installed
+// ruleset.
+func (e *Enforcer) admitsDial(proto uint8, src netip.Addr, dst netip.AddrPort) (admitted, enforced bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.cfg.IsEnabled() || e.firewall == nil || !e.hasInstalled || e.closed {
 		return true, false
 	}
-	ev := ConnEvent{Src: src, Dst: dst.Addr(), Protocol: ipProtoTCP, DstPort: dst.Port()}
+	ev := ConnEvent{Src: src, Dst: dst.Addr(), Protocol: proto, DstPort: dst.Port()}
 	for i := range e.installedRules {
 		r := &e.installedRules[i]
 		if r.Action == "allow" && r.admits(ev) {
