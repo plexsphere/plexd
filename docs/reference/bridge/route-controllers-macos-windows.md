@@ -11,7 +11,9 @@ The Linux implementation is [`NetlinkRouteController`](./netlink-route-controlle
 
 ## Architecture
 
-![The Bridge Manager, UserAccessManager and SiteToSiteManager each call DarwinRouteController or WindowsRouteController. DarwinRouteController runs route(8) and sysctl(8) and delegates to PFController. WindowsRouteController uses winipcfg and delegates to WFPController.](../../diagrams/bridge-route-controllers-macos-windows.svg)
+![The Bridge Manager and the SiteToSiteManager each call DarwinRouteController or WindowsRouteController. DarwinRouteController runs route(8) and sysctl(8) and delegates to PFController. WindowsRouteController uses winipcfg and delegates to WFPController.](../../diagrams/bridge-route-controllers-macos-windows.svg)
+
+The user access manager holds the route controller too, but serves no provider on macOS or Windows: neither platform has the mesh source rewrite, so no provider reaches the controller there: one that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_provider` (see [User Access Integration](user-access-integration.md)).
 
 ## Constructors
 
@@ -57,7 +59,7 @@ Only IPv4 is toggled, matching Linux. The mesh is IPv4, and on macOS the IPv6 kn
 
 ### The ledger
 
-Linux writes a per-interface sysctl and every manager writes its own, so `NetlinkRouteController` keeps no state. The other two platforms share a knob: macOS has exactly one, and on Windows the access adapter's flag is claimed by the bridge manager and the user-access manager alike. Without bookkeeping, tearing down a site-to-site tunnel would switch forwarding off under a live bridge.
+Linux writes a per-interface sysctl and every manager writes its own, so `NetlinkRouteController` keeps no state. The other two platforms share a knob: macOS has exactly one, and on Windows the mesh adapter's flag is claimed by the bridge manager and the site-to-site manager alike. The user access manager claims no knob on either platform, because it serves no provider there. Without bookkeeping, tearing down a site-to-site tunnel would switch forwarding off under a live bridge.
 
 Both controllers track holders in a `forwardingLedger`, keyed by the knob:
 
@@ -105,7 +107,7 @@ Neither controller maps names. Each passes what it is given straight to the plat
 
 On Windows, `net.InterfaceByName` resolves the friendly name and `ConvertInterfaceIndexToLuid` turns it into the LUID the IP Helper API addresses. A Wintun adapter is created under the configured interface name, so `plexd0` resolves without a mapping; see [Windows controller](../networking/wireguard.md#windows-controller).
 
-macOS is the platform where this matters most. The kernel names a tunnel device `utunN`, not `plexd0`, so a caller routing over a WireGuard interface has to resolve the kernel name first and hand that in. The bridge manager routes over `access_interface`, which is already a kernel name. `SiteToSiteManager` resolves the name of a tunnel interface through `wireguard.OSInterfaceNamer`, which `WGVPNController` implements over `DarwinController`, and hands the resulting `utunN` to `AddRoute`, `RemoveRoute` and the two forwarding calls; see [Site-to-Site VPN](./site-to-site-vpn.md#sitetositemanager). User access installs no route, so its forwarding calls carry the configured name, which macOS only logs, and `WGAccessController` exposes no mapping of its own.
+macOS is the platform where this matters most. The kernel names a tunnel device `utunN`, not `plexd0`, so a caller routing over a WireGuard interface has to resolve the kernel name first and hand that in. The bridge manager routes over `access_interface`, which is already a kernel name. `SiteToSiteManager` resolves the name of a tunnel interface through `wireguard.OSInterfaceNamer`, which `WGVPNController` implements over `DarwinController`, and hands the resulting `utunN` to `AddRoute`, `RemoveRoute` and the two forwarding calls; see [Site-to-Site VPN](./site-to-site-vpn.md#sitetositemanager). User access serves no provider on macOS, so it makes no routing or forwarding call there, and `WGAccessController` exposes no mapping of its own.
 
 The mesh interface name reaches only `EnableForwarding`. macOS logs it and programs the global sysctl; Windows resolves it and programs its flag.
 

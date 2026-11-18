@@ -251,10 +251,10 @@ When the leaf of a loaded certificate does not cover a rule's host (`x509.Certif
 
 Certificates and their keys live in memory only. Nothing writes a Secret's value to disk, a restart fetches every certificate again, and `Teardown` forgets the inventory and every certificate. No log line and no error carries a Secret's value.
 
-`cmd/plexd/cmd/ingress_certs.go` implements `CertificateSecretFetcher` with `ingressCertFetcher`, over `ControlPlane.FetchSecret` and `nodeapi.DecryptSecret`:
+`cmd/plexd/cmd/node_secrets.go` implements `CertificateSecretFetcher` with `nodeSecretFetcher`, over `ControlPlane.FetchSecret` and `nodeapi.DecryptSecret`. The same fetcher reads the join key of a `tailscale` or `netbird` user access provider through `FetchSecretValue`, which delegates to `FetchCertificateSecret` (see [VPN Providers](vpn-providers.md#the-join-key)):
 
 ```go
-type ingressCertFetcher struct {
+type nodeSecretFetcher struct {
     client nodeapi.SecretFetcher
     nodeID string
     nsk    []byte
@@ -361,7 +361,7 @@ type IngressController interface {
 func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager, certs CertificateSecretFetcher) *IngressManager
 ```
 
-Neither `acme` nor `certs` may be nil. In bridge mode, unless `bridge.ingress_enabled` is `false`, `plexd up` builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`), reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`), builds `ingressCertFetcher` with it, and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress.
+Neither `acme` nor `certs` may be nil. In bridge mode, `plexd up` reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`) and builds `nodeSecretFetcher` with it once, when the bridge serves public ingress or user access. Unless `bridge.ingress_enabled` is `false`, it builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`) and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress; it reads the key for user access unless `bridge.user_access_enabled` is `false` too.
 
 Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
 
@@ -654,9 +654,9 @@ Published as the `status.ingress` report entry, each field under its snake_case 
 | `IngressManager.Apply` (inactive)       | `bridge: ingress: manager is not active`       |
 | `IngressManager.Apply` (listen)         | `bridge: ingress: listen on :<port>: `         |
 | `IngressManager.Teardown` (close)       | `bridge: ingress: close listener <port>: `     |
-| `ingressCertFetcher` (fetch)            | `fetch secret "<name>" version <v>: `          |
-| `ingressCertFetcher` (version)          | `fetch secret "<name>": asked for version <v>, got <w>` |
-| `ingressCertFetcher` (decrypt)          | `decrypt secret "<name>" version <v>: `        |
+| `nodeSecretFetcher` (fetch)             | `fetch secret "<name>" version <v>: `          |
+| `nodeSecretFetcher` (version)           | `fetch secret "<name>": asked for version <v>, got <w>` |
+| `nodeSecretFetcher` (decrypt)           | `decrypt secret "<name>" version <v>: `        |
 | `Config.Validate` (ACME directories)    | `bridge: config: acme_directory_urls: "<entry>" is not an absolute https URL` |
 
 ## Logging

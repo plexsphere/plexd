@@ -496,6 +496,66 @@ Returns a list of report entry summaries (key, version).
 > local caller overwrote or deleted is re-asserted on the next tick instead of
 > standing until the sampled value happens to change.
 
+#### `status.user-access`
+
+The user access status of a bridge, `api.UserAccessInfo`, as
+`UserAccessManager.UserAccessStatus` returns it (see
+[User Access Integration](../bridge/user-access-integration.md#local-status)).
+It is sampled at the heartbeat's interval like the other `status.*` reports,
+and published when it differs from the stored value.
+
+```json
+{
+  "enabled": true,
+  "providers": [
+    {
+      "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+      "slug": "field-team",
+      "kind": "wireguard",
+      "interface": "wg-ua-a0a0a0e1",
+      "health": "up",
+      "listen_port": 51821,
+      "devices": 2,
+      "connected_devices": 1
+    },
+    {
+      "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+      "slug": "tailnet",
+      "kind": "tailscale",
+      "health": "down",
+      "reason": "auth_secret_not_listed",
+      "devices": 0,
+      "connected_devices": 0
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `enabled` | bool | The `enabled` of the last `bridge.user_access` block the manager applied; `false` before the first one |
+| `providers` | array, optional | One entry per provider the manager holds, in block order; omitted when it holds none |
+
+Each provider entry carries:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | The provider's id as pulled |
+| `slug` | string | The provider's slug |
+| `kind` | string | The provider's kind as pulled |
+| `interface` | string, optional | The interface the provider serves on while it is up: its WireGuard interface, or the one its vendor client reports; omitted while it is down |
+| `health` | string | `up` or `down` |
+| `reason` | string, optional | Why the provider is down, one of the reason tokens of the [user access status report](../bridge/user-access-integration.md#reasons); omitted while it is up |
+| `listen_port` | int, optional | A `wireguard` provider's `listen_port`, also while it is down |
+| `devices` | int | The devices configured on a `wireguard` provider's interface; 0 for a provider that is down and for a vendor provider |
+| `connected_devices` | int | Those of them whose latest WireGuard handshake is at most 180 s old; 0 for a provider that is down and for a vendor provider |
+
+A provider whose id is no UUID or repeats an earlier one has no entry, and a
+vendor provider whose first join still runs has none until the join ends. A
+node outside bridge mode, a bridge that opts out with
+`bridge.user_access_enabled: false`, and a bridge whose manager is not active
+publish `{"enabled": false}`.
+
 ### GET /v1/state/report/{key}
 
 Returns a full report entry.

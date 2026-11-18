@@ -115,13 +115,14 @@ func bridgeNetlinkRouteController() *Figure {
 // bridgeRouteControllersMacOSWindows draws the macOS and Windows route
 // controllers, the managers that call them, and what each delegates
 // to, for docs/reference/bridge/route-controllers-macos-windows.md.
+// The user access manager is not among them: it serves no provider on
+// either platform, so it never calls the route controller there.
 func bridgeRouteControllersMacOSWindows() *Figure {
 	f := &Figure{Name: "bridge-route-controllers-macos-windows", Title: "The macOS and Windows route controllers and what they program"}
 	const leafY, leafW, leafGap = 330.0, 180.0, 30.0
 	mgrs := []*node{
-		f.box(roleAgent, spec{x: 0, y: 0, w: 300, h: 64, lines: []Line{name("Bridge Manager")}}),
-		f.box(roleAgent, spec{x: 375, y: 0, w: 300, h: 64, lines: []Line{codeName("UserAccessManager")}}),
-		f.box(roleAgent, spec{x: 750, y: 0, w: 300, h: 64, lines: []Line{codeName("SiteToSiteManager")}}),
+		f.box(roleAgent, spec{x: 150, y: 0, w: 300, h: 64, lines: []Line{name("Bridge Manager")}}),
+		f.box(roleAgent, spec{x: 735, y: 0, w: 300, h: 64, lines: []Line{codeName("SiteToSiteManager")}}),
 	}
 	leaf := func(i int, r role, label string) *node {
 		x := float64(i) * (leafW + leafGap)

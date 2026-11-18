@@ -6,11 +6,11 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, checks the bridge's ingress status report, closes every public listener for a block that does not enable ingress and on a bridge that opts out with `bridge.ingress_enabled: false`, then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, checks the bridge's ingress status report, closes every public listener for a block that does not enable ingress and on a bridge that opts out with `bridge.ingress_enabled: false`, serves a `wireguard` user access provider through which a device reaches a mesh node with the bridge's mesh address, reports each provider's state, keeps the provider's key across a restart and a killed process, and opts out with `bridge.user_access_enabled: false`, then verifies clean shutdown.
 
 ## Container Topology
 
-![Four containers share the Docker network plexd-systemd-e2e. In the systemd container, Ubuntu 24.04 with systemd as PID 1, systemd manages plexd.service. plexd calls mock-api, which listens on port 8080 for HTTP and on port 8443 for TLS and serves /v1/health. plexd connects to the rule targets on the ingress target, which serves TLS on ports 9441 to 9443 and a banner on port 9022 and carries openssl and nc, and the ingress target probes plexd. plexd talks ACME to pebble, Let's Encrypt's test CA, on port 14000 over HTTPS, and pebble validates plexd with TLS-ALPN-01 on port 443.](../../diagrams/development-systemd-topology.svg)
+![Six containers share the Docker network plexd-systemd-e2e. In the systemd container, Ubuntu 24.04 with systemd as PID 1, systemd manages plexd.service. plexd calls mock-api, which listens on port 8080 for HTTP and on port 8443 for TLS and serves /v1/health. plexd connects to the rule targets on the ingress target, which serves TLS on ports 9441 to 9443 and a banner on port 9022 and carries openssl and nc, and the ingress target probes plexd. plexd talks ACME to pebble, Let's Encrypt's test CA, on port 14000 over HTTPS, and pebble validates plexd with TLS-ALPN-01 on port 443. The device, with wg0 at 10.77.0.2 and an nc probe, reaches plexd over WireGuard on port 51900, a wg-ua- interface of the bridge. The mesh node, with wg0 at 10.99.0.3 and nc listening on port 7101, peers with plexd over WireGuard on plexd0 port 51820.](../../diagrams/development-systemd-topology.svg)
 
 | Container | Image | Source | Purpose |
 |-----------|-------|--------|---------|
@@ -18,6 +18,10 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 | `plexd-e2e-systemd` | `plexd-systemd:e2e` | `test/e2e/systemd/Dockerfile` | Ubuntu 24.04 with systemd as PID 1, runs plexd as a real service |
 | `plexd-e2e-ingress-target` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | Alpine with `openssl` and `netcat-openbsd`; started by phase 16, serves the ingress rules' targets and runs the probes |
 | `plexd-e2e-pebble` | `ghcr.io/letsencrypt/pebble:2.10.3`, pinned by digest | Pebble's release image, with `test/e2e/systemd/pebble-config.json` mounted | Pebble, Let's Encrypt's test CA; started by phase 16 with the network alias `pebble`, issues the certificate of the `acme` rule after it validated the bridge over TLS-ALPN-01 on port 443 |
+| `plexd-e2e-meshnode` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | Alpine with `wireguard-tools`, `iproute2` and `netcat-openbsd`; started by phase 17 with `NET_ADMIN`, the fixture's mesh peer `...a0b2` on a `wg0` of its own at `10.99.0.3`, and listens on port 7101 |
+| `plexd-e2e-device` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | The same image; started by phase 17 with `NET_ADMIN`, a device of a `wireguard` user access provider on a `wg0` of its own at `10.77.0.2`, and runs the probe to the mesh node |
+
+Phase 17 also runs short-lived containers of the same image with `--network container:plexd-e2e-systemd` and `NET_ADMIN`, which share the systemd container's network namespace: the systemd image carries neither `ip` nor `wg`, so they read the kernel state of `plexd0` and of the provider's interface. They are removed as they exit.
 
 The systemd image installs `dbus` and `systemd-resolved` next to `systemd`, `systemd-sysv`, `curl`, `ca-certificates`, `jq`, `openssh-client`, and `sshpass`. Both install enabled, so the container boots with a system bus and its own systemd-resolved, which plexd registers its mesh DNS resolver with. Docker mounts its own `/etc/resolv.conf` (`nameserver 127.0.0.11`) over the one the package would link, so systemd-resolved runs in foreign mode with Docker's DNS as its global server, `nsswitch.conf` keeps `hosts: files dns`, and the mesh DNS phases ask systemd-resolved directly with `resolvectl`. Every `resolvectl` call runs inside the container through `docker exec` and reaches the container's systemd-resolved, never the host's.
 
@@ -37,7 +41,7 @@ Builds the mock-api image, the systemd container image, and cross-compiles the p
 
 ### 4. Network and container startup
 
-Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
+Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, and phase 17 the mesh node and the device. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
 
 ### 5. Service installation
 
@@ -164,15 +168,36 @@ bridge:
   acme_directory_urls: ["https://pebble:14000/dir"]
 ```
 
-Step 19 appends `  ingress_enabled: false` to it.
+Step 20 appends `  ingress_enabled: false` to it, and step 10 of phase 17 appends `  user_access_enabled: false` and `  user_access_listen_port: 51822`.
 
-### 17. Shutdown verification
+### 17. User access through a bridge
 
-Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. It runs with the opt-out of phase 15 and the bridge mode, environment file and ingress opt-out of phase 16 in place, so it stops a bridge that opts out of public ingress.
+The phase serves user access providers on the bridge of phase 16, which still opts out of public ingress and sets no `bridge.user_access_enabled`, so user access runs on its default (see [User Access Integration](../bridge/user-access-integration.md)). It ends with the bridge opted out of user access.
 
-### 18. Cleanup
+**Setup.** It starts `plexd-e2e-meshnode` and `plexd-e2e-device` from the image phase 16 built, with `--cap-add NET_ADMIN` and `--init`, on `plexd-systemd-e2e`. It reads plexd's public key with `wg show plexd0 public-key` through a container that shares the systemd container's network namespace. The mesh node then becomes the fixture's peer `...a0b2`, with the recipe of the Docker suite's policy phase: its `wg0` gets a key of its own, listen port 51820, the address `10.99.0.3/24`, and plexd as its one peer with the edge PSK the mock derives for that peer, the bridge's address and port 51820 as endpoint, `10.99.0.1/32` as allowed IPs and a keepalive of 5 s. `nc -l -k -v 7101` listens on it and logs each peer. The phase splices the mesh node's key and endpoint into peer `...a0b2` of the live snapshot, posts it to `POST /test/configure-state`, requires the live policy to carry the fixture's rule that allows `10.99.0.0/24` to itself, serves it with `configure_policy`, and waits up to 60 seconds for the mesh node's handshake with `plexd0`.
 
-The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the four containers and the Docker network.
+`configure_user_access <tag> <providers-json or null> [secrets-json]` reads the live snapshot, sets `.bridge.user_access` to `{enabled: true, providers: <providers>}`, or to `null` for `null`, leaves the rest of the bridge block as it is, replaces `.secrets` with `secrets-json` when it is given, posts the result to `POST /test/configure-state` and injects a `node_state_updated` event. `wait_user_access_report <tag> <what> <jq-filter>` polls `GET /test/last-request/user-access-status` with `jq -e` every 2 seconds, for 60 seconds unless `UA_REPORT_WAIT` sets another bound. The probe is `nc -z -w 3 10.99.0.3 7101` in the device container. Every `wireguard` provider of the phase has the pool `10.77.0.0/24` and at most 64 devices.
+
+1. **No provider.** Before any provider is served, the last report reads exactly `{"state":"enabled"}`.
+2. **A provider.** It serves `field-team` (`...a0e1`, `wireguard`, port 51900) without a device. The report must carry one entry, `up`, with a `public_key` of 44 characters, `connected_devices` 0 and no `reason`. `ip -4 -o address show dev wg-ua-a0a0a0e1` must show `10.77.0.1/24`, and `stat -c %a /var/lib/plexd/user-access/<id>.key` must print `600`.
+3. **No device.** The device brings up its `wg0` at `10.77.0.2/24` with a key of its own, the reported key as its peer, the bridge's address and port 51900 as endpoint, `10.99.0.0/24` as allowed IPs and a keepalive of 5 s, and routes `10.99.0.0/24` over it. The probe must fail while the block lists no device.
+4. **A device.** It adds the device (`...a0d1`, `e2e-device`) at `10.77.0.2` with its public key. Within 60 seconds the probe must succeed, the mesh node's listener log must name `10.99.0.1`, the bridge's mesh address, and no address of `10.77.0.0/24`, and a report must show `connected_devices` 1.
+5. **A restart.** `systemctl restart plexd`. Within 60 seconds the new process (`plexd[<MainPID>]:`) must log `user access provider up` for `field-team`, the report's `public_key` must equal the one of step 2, and the probe must succeed without a change on the device.
+6. **A killed process.** `systemctl kill --kill-whom=main -s KILL plexd`. The signal goes to the main process alone: in this container systemd cannot signal the unit's other processes and would fail the command. Right after the kill `/sys/class/net/wg-ua-a0a0a0e1` must still exist. Within 60 seconds the unit must have started a process with another MainPID that logs `user access provider up` for `field-team`. The journal must then hold exactly one line `plexd.service: Sent signal SIGKILL to main process <pid> (plexd) on client request.`, with the MainPID of step 5. The killed process left `plexd0` in the kernel as well, so the new process must log `wireguard: replaced an interface an earlier process left behind` and `wireguard interface configured`, each with `interface=plexd0`, and no `wireguard setup failed`. It must log no `user access provider down` for `field-team`; the report must show the same `public_key`, and the probe must succeed.
+7. **A taken port.** It serves `clash` (`...a0e3`, port 51820, which `plexd0` holds) before `field-team`. The report must show `clash` `down` with `bind_failed` and `field-team` `up`, and the probe must still succeed.
+8. **A vendor provider.** It adds `tailnet` (`...a0e2`, `tailscale`, `auth_secret_name` `ts-join`) with the inventory `[]`. The report must show it `down` with `auth_secret_not_listed`. It then posts the Secret `ts-join` in version 1 to `POST /test/configure-secrets` and serves the inventory `[{"name": "ts-join", "version": 1}]`. Within 90 seconds the report must show `tailnet` `down` with `client_missing`: the image carries no Tailscale client, so the change proves the fetch of the Secret.
+9. **A removed provider.** It serves `clash` and `tailnet` without `field-team`. The report must carry no entry with its id, `wg-ua-a0a0a0e1` must be gone within 30 seconds, the key file must be gone, and the probe must fail.
+10. **Opted out.** It serves `kept` (`...a0e4`, port 51901) beside `clash` and `tailnet` and waits up to 90 seconds for it to read `up`. It requires the last block of `/etc/plexd/config.yaml` to be the bridge block and neither key to be set, appends `  user_access_enabled: false` and `  user_access_listen_port: 51822`, and runs `systemctl restart plexd`. Within 60 seconds `GET /test/last-request/user-access-status` must return exactly `{"state":"opted_out"}`, and the journal of the new process must hold the Warn `user access: the control plane enables user access, but bridge.user_access_enabled is false` with `providers=3`. That journal must also hold `user access: opted out by bridge.user_access_enabled, no provider is served`, exactly one Warn `bridge: config: user access keys are ignored, the control plane delivers providers` with `keys=[user_access_listen_port]`, and `bridge subsystem initialized` with `user_access=false`. No interface whose name starts with `wg-ua-` may exist, and the key file of `kept` must still exist.
+
+The phase ends by requiring that the journal holds no `user access status: send failed` line, so the mock refused no report.
+
+### 18. Shutdown verification
+
+Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. The crash check leaves out the line `plexd.service: Sent signal SIGKILL to main process <pid> (plexd) on client request.` with which systemd records the deliberate kill of step 6 of phase 17, and checks every other line. It runs with the opt-out of phase 15, the bridge mode, environment file and ingress opt-out of phase 16 and the user access opt-out of phase 17 in place, so it stops a bridge that opts out of public ingress and of user access.
+
+### 19. Cleanup
+
+The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the six containers and the Docker network.
 
 ## Assertion Logic
 
@@ -288,7 +313,7 @@ TIMEOUT=120 make test-e2e-systemd
 
 - Docker
 - `curl` and `jq` on the host
-- Kernel WireGuard on the host: the mesh DNS phase needs `plexd0`, which plexd creates in the container's network namespace
+- Kernel WireGuard on the host: the mesh DNS phase needs `plexd0`, which plexd creates in the container's network namespace, and the user access phase needs the provider's interface and the `wg0` of the mesh node and of the device
 
 ## Debugging Failures
 
@@ -381,12 +406,26 @@ Common causes:
 - `mesh` reads `dial_reason` `policy_denied` under the fixture's policy in step 17: the fixture's policy is not the one the node holds. `policy ruleset applied` names the revision it applied.
 - `mesh` never reads `policy_denied` after the policy change: no `policy ruleset applied` for the new revision means the pull did not reach the node or the policy did not apply. With the line present, the dial did not leave from the mesh address: `docker exec plexd-e2e-systemd ip route get 10.99.0.2` must name `plexd0` and `src 10.99.0.1`.
 
+**A user access step fails:**
+
+```bash
+curl -sS http://localhost:18080/test/last-request/user-access-status | jq .
+docker exec plexd-e2e-systemd journalctl -u plexd --no-pager | grep -E 'user access|access interface|mesh source rewrite'
+docker run --rm --network container:plexd-e2e-systemd --cap-add NET_ADMIN plexd-ingress-target:e2e wg show
+docker exec plexd-e2e-device wg show wg0
+docker exec plexd-e2e-meshnode cat /tmp/listen.log
+```
+
+Common causes:
+- The report shows the provider `down`: its `reason` names the step that failed (see [Reasons](../bridge/user-access-integration.md#reasons)), and the `user access provider down` line carries the error.
+- The probe fails although the provider is `up`: the peer key `wg show wg0` lists on the device must equal the report's `public_key`, which a restart or a kill must not change, and the mesh node's `wg show wg0` must list a recent handshake with `plexd0`.
+
 **Leftover containers from previous run:**
 
 The script performs pre-cleanup, but if issues persist:
 
 ```bash
-docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target plexd-e2e-pebble
+docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target plexd-e2e-pebble plexd-e2e-meshnode plexd-e2e-device
 docker network rm plexd-systemd-e2e
 ```
 
@@ -418,7 +457,7 @@ On any failure, the `print_diagnostics` function outputs:
 | `test/e2e/systemd/.dockerignore` | Prevents unnecessary files in Docker context |
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
 | `test/e2e/mockapi/mockapi.go` | Mock API server with `/test/assertions` endpoint |
-| `test/e2e/meshpeer/Dockerfile` | Alpine image with `openssl` and `netcat-openbsd`; phase 16 runs it as the ingress target |
+| `test/e2e/meshpeer/Dockerfile` | Alpine image with `wireguard-tools`, `iproute2`, `netcat-openbsd` and `openssl`; phase 16 runs it as the ingress target, and phase 17 as the mesh node, as the device and as the short-lived containers that read the systemd container's network state |
 | `deploy/systemd/plexd.service` | Production unit file (copied verbatim into container) |
 | `deploy/systemd/plexd-session-helper.socket`, `deploy/systemd/plexd-session-helper@.service` | Session helper units (copied verbatim into container) |
 | `Makefile` | `test-e2e-systemd` target |

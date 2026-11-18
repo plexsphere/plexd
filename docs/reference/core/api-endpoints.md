@@ -845,6 +845,129 @@ operation's own answer, a verdict on the node rather than a missing route, so
 it is false. A `501` with any other code is an ordinary failure and logged at
 Warn. No answer stops the reporter, and none touches the listeners.
 
+## User Access Status
+
+### PUT /v1/nodes/{node_id}/user-access-status
+
+Reports whether a bridge's local configuration serves user access, so the
+control plane refuses a provider or a device that no bridge would serve, and
+whether each user access provider of the bridge's pull is up. The report is
+also how the public key of a `wireguard` provider's interface reaches the
+control plane, which a device's configuration names as its peer's key. While a
+bridge's report reads `opted_out`, the control plane answers a create or an
+update of a provider, and a device admission, on its bridge Resource with
+`409 bridge_user_access_opted_out`. It keeps the providers and devices stored
+before the opt-out, keeps delivering them in the
+[`bridge.user_access`](#get-v1-nodes-node-id-state) block with
+`enabled: true`, and allows a delete. A bridge that never reported reads
+`not_reported` and accepts providers and devices. The control plane's side is
+[plexsphere/plexsphere#1108](https://github.com/plexsphere/plexsphere/pull/1108).
+See [User Access Status Report](../bridge/user-access-integration.md#user-access-status-report)
+for how plexd derives the state and each entry.
+
+**Request body** (`UserAccessStatusRequest`, at most 64 KiB):
+
+```json
+{
+  "state": "enabled",
+  "providers": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", "health": "up",
+      "public_key": "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=", "connected_devices": 1 },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", "health": "down", "reason": "auth_secret_not_listed" }
+  ]
+}
+```
+
+- `state`: required, one of `enabled` and `opted_out`. `enabled` means the
+  local configuration serves the providers the pull enables:
+  [`bridge.user_access_enabled`](configuration.md#bridge) is absent or `true`.
+  `opted_out` means `bridge.user_access_enabled: false`: the bridge serves no
+  provider whatever the pull says.
+- `providers`: optional, at most 256 entries (`UserAccessStatusProvider`), one
+  per provider of the bridge's last applied block, in the order of the pull.
+  An absent `providers`, a `null` and an empty array all mean no entries. An
+  `opted_out` report carries none, and plexd omits the member when it has no
+  entry. Each entry carries `id`, the provider's UUID, and `health`, `up` or
+  `down`; then `reason` exactly when `health` is `down`, and, only when it is
+  `up`, `public_key`, the public key of a `wireguard` provider's interface in
+  44 characters of standard base64, and `connected_devices`, the provider's
+  devices whose latest WireGuard handshake is at most 180 seconds old, from 0
+  to 1024. plexd sends both for a `wireguard` provider that is up and neither
+  for a `tailscale` or `netbird` one. A reason is a token matching
+  `^[a-z][a-z0-9_]{0,62}$`; the tokens plexd sends are listed in
+  [Reasons](../bridge/user-access-integration.md#reasons).
+
+The control plane decodes the body with unknown members refused, of the report
+and of each entry. A body that is not one JSON object, an unknown member, data
+after the report, a missing or `null` `state`, a value outside the two states,
+more than 256 entries, and an entry with a missing, malformed or zero `id`,
+without `health`, with a `health` outside its values, a reason outside the
+grammar, a malformed `public_key`, a `connected_devices` outside its range, or
+a member the presence rules above forbid or require each answer
+`400 malformed_user_access_status`. An `opted_out` report with entries and an
+`id` that repeats an earlier entry each answer
+`400 invalid_user_access_status`. The `detail` names the entry by index, as
+`providers[3].reason is required while health is down`, and never repeats a
+value of the body. A member of an entry sent as `null` reads as omitted.
+`ReportUserAccessStatus` validates nothing, because the reporter builds only
+the shapes the contract admits: it reports no provider whose `id` is no UUID in
+canonical form or repeats an earlier one.
+
+**Response** (`200 OK`, `UserAccessStatusResponse`):
+
+```json
+{
+  "accepted_at": "2026-11-18T10:15:30.123Z"
+}
+```
+
+`accepted_at` is the server receive time. Every answer carries
+`Cache-Control: no-store`.
+
+**Cadence.** plexd reports from a loop of its own, started in bridge mode,
+whether or not the bridge opts out. It sends the report once right after each
+start, without waiting for the first state pull and so without entries; on
+every change of an entry's `id`, `health`, `reason` or `public_key`, at most
+once per 5 s; and once per `heartbeat.interval` (default 30s). A moving
+`connected_devices` alone sends nothing; the next tick carries it. The state
+comes from the local configuration, which plexd reads once per start, so a
+changed `bridge.user_access_enabled` takes effect, and is reported, with the
+restart. A failed report is not retried within its tick. plexd sends nothing
+at shutdown, and a node outside bridge mode sends nothing at all.
+
+**Sticky state, aging entries.** The control plane keeps the latest state per
+node and never ages it, so a bridge that reported `opted_out` and went offline
+stays opted out until it reports `enabled`. Each report replaces the provider
+entries of the one before, and a bridge that has not reported for three
+heartbeat intervals of its Domain, 90 seconds under the default policy, has its
+providers read `stale`. Every report renews that window, a repeat that changes
+nothing included, so the report once per interval is load-bearing. An entry
+whose `id` is no provider of the bridge Resource is ignored. The report never
+gates serving: a bridge serves as the pull says while a report fails or the
+control plane does not serve the operation.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Report accepted; body is a `UserAccessStatusResponse` | Logged at Debug as `accepted` on every send; also at Info as `reported` for the first accepted send, and once at Info after a not-served phase |
+| `400 Bad Request` | `malformed_user_access_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), names a `state` outside the two (`detail` `state is not one of enabled and opted_out`), carries more than 256 entries (`detail` `providers carries more than 256 entries`), or an entry that breaks a member rule or the presence rules (`detail` such as `providers[0].health is not one of up and down`) | Logged at Warn as `send failed` on every send; the next tick sends the report again |
+| `400 Bad Request` | `invalid_user_access_status` | An `opted_out` report with entries (`detail` `an opted-out bridge reports no providers`) or an `id` that repeats an earlier entry (`detail` such as `providers[1].id repeats providers[0].id`) | Logged at Warn as `send failed`; the next tick sends the report again |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends the report again. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends the report again |
+| `404 Not Found` | `user_access_status_node_gone` | The node was removed while the request ran | Logged at Warn as `rejected, this node was removed` on every send; plexd keeps reporting every interval |
+| `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
+| `413 Payload Too Large` | `user_access_status_body_too_large` | Body exceeds 64 KiB | Logged at Warn as `send failed`; the next tick sends the report again |
+| `500 Internal Server Error` | `internal` | Server error, for example a failed write of the report | Logged at Warn as `send failed`; the next tick sends the report again |
+| `501 Not Implemented` | `user_access_status_not_provisioned` | The control plane has not provisioned the operation: its recording service is not wired | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
+
+`api.IsUserAccessStatusNotServed` classifies the two not-served answers: a
+`404` with any code but `user_access_status_node_gone`, and a `501` carrying
+`user_access_status_not_provisioned`. A `404 user_access_status_node_gone` is
+the operation's own answer, a verdict on the node rather than a missing route,
+so it is false. A `501` with any other code is an ordinary failure and logged at
+Warn. No answer stops the reporter, and none changes what the bridge serves.
+
 ## Policy Status
 
 ### PUT /v1/nodes/{node_id}/policy-status
@@ -1334,6 +1457,28 @@ it dials. A peer that holds this bridge only as a standby relay is not listed.
 plexd decodes and carries the list, and the relay does not read it. A change of `enabled`, `listen_port` or an assignment is bridge
 drift. A node outside bridge mode ignores the block. See
 [NAT Relay](../bridge/nat-relay.md).
+
+`bridge.user_access` lists the user access providers of the bridge Resource,
+by `slug` ascending, and carries `enabled`, the control plane's switch, which
+it sends as `true` on every block. A bridge serves the providers when `enabled`
+is true and its local configuration does not opt out with
+[`bridge.user_access_enabled: false`](configuration.md#bridge), and reports
+each provider's state with the
+[user access status report](#user-access-status). Each provider carries `id`,
+`slug` and `kind` (`wireguard`, `tailscale` or `netbird`). A `wireguard`
+provider also carries `listen_port`, `address_pool`, `max_devices` and
+`devices`, each device with `id`, `slug`, `public_key` and `address`; the
+bridge serves it on a WireGuard interface of its own with each device as a
+peer. A `tailscale` or `netbird` provider carries `auth_secret_name`, the
+Secret of the bridge's Project that holds its join key, which the bridge
+fetches in the version the `secrets` block lists. For every kind the bridge
+forwards into the mesh with the source rewritten to its mesh address. The
+block is whole, so a provider missing from a later pull is torn down, and a
+`null` block serves no provider. The control plane delivers the block in this
+shape since
+[plexsphere/plexsphere#1108](https://github.com/plexsphere/plexsphere/pull/1108).
+A node outside bridge mode ignores the block. See
+[User Access Integration](../bridge/user-access-integration.md).
 
 `bridge.ingress` lists the public ingress rules of the bridge Resource, by
 `slug` ascending, and carries `enabled`, the control plane's switch, which it

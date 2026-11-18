@@ -76,7 +76,7 @@ func developmentKubernetesTopology() *Figure {
 	return f
 }
 
-// developmentSystemdTopology draws the four containers of the systemd
+// developmentSystemdTopology draws the six containers of the systemd
 // end-to-end test on their network, for
 // docs/reference/development/systemd-e2e-test.md (Container Topology).
 func developmentSystemdTopology() *Figure {
@@ -88,18 +88,21 @@ func developmentSystemdTopology() *Figure {
 	}})
 	host := f.frame(roleSubstrate, 330, y, 330, 0, "", "systemd container", "")
 	f.text(host.x+16, host.y+48, "left", body("Ubuntu 24.04, systemd PID 1"))
-	plexd := f.box(roleAgent, spec{x: host.x + 30, y: host.y + 88, w: host.w - 60, lines: []Line{
+	// plexd.service is tall enough that the WireGuard tunnels of the
+	// user access phase leave it below the calls of the other phases.
+	plexd := f.box(roleAgent, spec{x: host.x + 30, y: host.y + 88, w: host.w - 60, h: 108, lines: []Line{
 		codeName("plexd.service"), body("managed by systemd"),
 	}})
 	host.h = plexd.y + plexd.h + 24 - host.y
 	target := f.box(roleSubstrate, spec{x: host.x + host.w + 150, y: mock.y, w: 250, lines: []Line{
 		name("ingress target"), code(":9441-9443 (TLS)"), code(":9022 (banner)"), body("openssl, nc"),
 	}})
-	mock.y = plexd.cy() - mock.h/2
-	target.y = plexd.cy() - target.h/2
+	top := plexd.cy() - 20
+	mock.y = top - mock.h/2
+	target.y = top - target.h/2
 
-	f.arrow(call, plexd.left(), mock.rightAt(plexd.cy()))
-	up, down := plexd.cy()-14, plexd.cy()+14
+	f.arrow(call, plexd.leftAt(top), mock.rightAt(top))
+	up, down := top-14, top+14
 	f.arrow(call, plexd.rightAt(up), target.leftAt(up))
 	f.label(pt{(host.x + host.w + target.x) / 2, up}, body("rule targets"))
 	f.arrow(call, target.leftAt(down), plexd.rightAt(down))
@@ -114,7 +117,24 @@ func developmentSystemdTopology() *Figure {
 	f.arrow(call, pebble.topAt(alpn), plexd.bottomAt(alpn))
 	f.labelRight(pt{alpn, (plexd.y + plexd.h + pebble.y) / 2}, body("TLS-ALPN-01 on :443"))
 
+	// The user access phase: the device reaches the mesh node through
+	// a wireguard provider of the bridge, and the mesh node is the
+	// fixture's peer ...a0b2 on plexd0. Both tunnels leave plexd.service
+	// on one row and turn down the gaps beside the systemd container.
+	device := f.actor(spec{x: mock.x, y: pebble.y, w: mock.w, lines: []Line{
+		name("device"), code("wg0 10.77.0.2"), body("nc probe"),
+	}})
+	meshNode := f.box(roleSubstrate, spec{x: target.x, y: pebble.y, w: target.w, lines: []Line{
+		name("mesh node"), code("wg0 10.99.0.3"), code(":7101 (nc -l)"),
+	}})
+	wg := plexd.y + plexd.h - 14
+	left, right := (mock.x+mock.w+host.x)/2, target.x-25
+	f.arrow(both, plexd.leftAt(wg), pt{left, wg}, pt{left, device.cy()}, device.right())
+	f.labelLeft(pt{left, (wg + device.cy()) / 2}, body("WireGuard"), code(":51900 (wg-ua-…)"))
+	f.arrow(both, plexd.rightAt(wg), pt{right, wg}, pt{right, meshNode.cy()}, meshNode.left())
+	f.labelRight(pt{right, (wg + meshNode.cy()) / 2}, body("WireGuard"), code("plexd0 :51820"))
+
 	net.w = target.x + target.w + 30
-	net.h = pebble.y + pebble.h + 30
+	net.h = max(pebble.y+pebble.h, device.y+device.h, meshNode.y+meshNode.h) + 30
 	return f
 }

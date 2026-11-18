@@ -6,39 +6,61 @@ feature: PXD-0028
 
 # VPN Providers
 
-The VPN providers feature extends user access integration (`internal/bridge`) with a `UserAccessProvider` interface for external VPN provider integration. Concrete implementations for Tailscale and Netbird enable external VPN users to access mesh resources through the bridge node via their provider's overlay network.
+A `tailscale` or `netbird` user access provider joins the bridge to that vendor's network with the vendor's client, so the users of that network reach the nodes of the bridge's Domain through the bridge. This page covers the two clients, the key they join with and how plexd runs them. The `bridge.user_access` block, the checks, the reasons, the retry and the status report are on [User Access Integration](user-access-integration.md).
+
+A Linux bridge serves both kinds. On macOS and Windows no client starts: a provider that passes its own [checks](user-access-integration.md#checks) reads `kind_not_served`, and one that fails them reads `invalid_provider`. Serving there is [#213](https://github.com/plexsphere/plexd/issues/213) and [#214](https://github.com/plexsphere/plexd/issues/214).
 
 ## Data Flow
 
-![External VPN users of Tailscale or Netbird reach the bridge node over the provider's overlay network and arrive on the provider interface, such as tailscale0 or wt0. IP forwarding carries the traffic between the provider interface and the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The UserAccessProvider for Tailscale or Netbird creates the provider interface; a line joins it to the CommandExecutor, which runs the CLI invocations. The UserAccessManager calls Start and Stop on the UserAccessProvider.](../../diagrams/bridge-vpn-providers-data-flow.svg)
+![Users of a tailnet or a NetBird network reach the bridge node over the vendor's overlay network and arrive on the client's interface, such as tailscale0 or wt0. Forwarding with a source rewrite carries their traffic to the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The UserAccessClient for Tailscale or NetBird creates the client's interface; a line joins it to the CommandExecutor, which runs the tailscale and netbird commands. The UserAccessManager calls Start and Stop on the UserAccessClient. The nodeSecretFetcher fetches the Secret's value from the control plane and hands the join key to the UserAccessManager.](../../diagrams/bridge-vpn-providers-data-flow.svg)
 
-Traffic from external VPN users arrives on the provider's network interface, is forwarded via IP forwarding to the mesh WireGuard interface (`plexd0`), and reaches mesh peers. The `UserAccessProvider` manages the provider daemon lifecycle. The `CommandExecutor` abstracts CLI invocations for testability.
+The vendor's users reach the bridge through the vendor's network and arrive on the client's interface: `tailscale0` for Tailscale, and for NetBird the interface `netbird status --json` names, such as `wt0`. The bridge forwards between that interface and `plexd0` and rewrites the source of what it forwards into the mesh to its own mesh address, as for every kind (see [Policy and Device Traffic](user-access-integration.md#policy-and-device-traffic)). `UserAccessManager` fetches the key from the Secret the provider names and starts the client with it. The client runs its commands through a `CommandExecutor`.
 
-## UserAccessProvider Interface
+## The Join Key
 
-Interface abstracting lifecycle management of external VPN providers (Tailscale, Netbird) used for user access into the mesh via a bridge node. Implementations invoke the provider's CLI or daemon to join an overlay network, then report status so the bridge can route traffic between the provider's interface and the mesh.
+A provider's `auth_secret_name` names a Secret of the bridge's Project that holds the key the client joins with as plain text: a Tailscale auth key or a NetBird setup key. The bridge reads it in the version its secret inventory lists, the pull's `secrets` block, which `UserAccessPullHandler` hands to the manager on every successful pull (see [Retry](user-access-integration.md#retry)):
+
+1. The inventory does not list the name: `auth_secret_not_listed`. A name the inventory does not list is a Secret the bridge may not read. The control plane checks the read grant when the provider is written, but a grant revoked or a Secret deleted later leaves the provider in the block.
+2. The fetch of that version fails: `auth_secret_unreadable`.
+3. Otherwise the manager trims white space from both ends of the value and starts the client with it.
+
+The fetch is `nodeSecretFetcher.FetchSecretValue(ctx, name, version)` in `cmd/plexd/cmd/node_secrets.go`. It fetches the sealed envelope of that version with `ControlPlane.FetchSecret`, which sends `GET /v1/nodes/{node_id}/secrets/{name}` with the node's own credential, refuses an envelope of another version, and opens it under the node secret key with `nodeapi.DecryptSecret` (see [GET /v1/nodes/{node_id}/secrets/{key}](../core/api-endpoints.md#get-v1-nodes-node-id-secrets)). The same fetcher reads the certificates of `terminate` ingress rules through `FetchCertificateSecret` (see [Certificates from the Secret Store](public-ingress.md#certificates-from-the-secret-store)). Step 5e of `plexd up` builds it once, in bridge mode, before the ingress and the user access managers, and only when one of them is built: it reads the node secret key with `identity.SecretKey()`, and an error fails `plexd up` as `plexd up: <error>`. A bridge that opts out of both reads no node secret key.
+
+| Case | Error |
+|---|---|
+| `FetchSecret` fails | `fetch secret "<name>" version <v>: <error>`, wrapping the error, such as an `*api.APIError` |
+| The envelope holds another version | `fetch secret "<name>": asked for version <v>, got <w>` |
+| The envelope does not open under the node secret key | `decrypt secret "<name>" version <v>: <error>` |
+
+A failed fetch is retried like every `auth_secret_unreadable`, after 5 s doubling to 60 s, or after the `Retry-After` of a `429` answer when that is longer. No log line and no error carries the key.
+
+A client that runs keeps its join when the inventory lists a new version of its Secret or stops listing it: the manager reads the inventory only at a join, and the next join, after a restart, a changed `auth_secret_name` or a retry, uses the version listed then.
+
+### The Key on the Command Line
+
+Both clients take the key as an argument: `tailscale up --authkey=<key>` and `netbird up --setup-key <key>`. While the join command runs, at most 60 s, the key is on that process's command line, which other processes of the host can read in the process list. plexd logs neither the key nor the command line, and keeps the key out of its errors.
+
+## UserAccessClient
+
+Interface for the vendor clients, named apart from the control plane's `api.UserAccessProvider`, the provider of the block:
 
 ```go
-type UserAccessProvider interface {
+type UserAccessClient interface {
     Name() string
-    Start(ctx context.Context) error
+    Start(ctx context.Context, key string, meshCIDR string) error
     Stop() error
     Status() ProviderStatus
 }
 ```
 
-| Method   | Description                                                                |
-|----------|----------------------------------------------------------------------------|
-| `Name`   | Returns the provider identifier (e.g. `"tailscale"`, `"netbird"`)         |
-| `Start`  | Launches the provider daemon/process; reads auth credentials from the environment |
-| `Stop`   | Gracefully shuts down the provider; idempotent when not running            |
-| `Status` | Returns the current provider status                                        |
+| Method | Description |
+|---|---|
+| `Name` | The client's identifier, `"tailscale"` or `"netbird"` |
+| `Start` | Joins the vendor's network with `key`. An empty key is refused before any command runs. `meshCIDR` is the route a client advertises where its vendor lets it; a client whose vendor defines routes elsewhere ignores it. A daemon the client starts runs under `ctx` and ends with it; the join commands run under a timeout of 60 s derived from `ctx`. An error of the executor stays wrapped, so `errors.Is(err, exec.ErrNotFound)` tells a missing executable |
+| `Stop` | Leaves the network and stops what the client started; idempotent when not running |
+| `Status` | The client's state: `Running`, `InterfaceName`, `IP` |
 
-All methods must be safe for concurrent use.
-
-## ProviderStatus
-
-Represents the current status of a user access VPN provider.
+All methods are safe for concurrent use. The manager calls `Start` with the context its `Setup` creates and its `Teardown` cancels, not with the context of a reconcile cycle, so a daemon outlives the cycle that started it.
 
 ```go
 type ProviderStatus struct {
@@ -49,52 +71,22 @@ type ProviderStatus struct {
 }
 ```
 
-| Field           | Description                                             |
-|-----------------|---------------------------------------------------------|
-| `Running`       | Whether the provider process is active                  |
-| `InterfaceName` | Network interface created by the provider               |
-| `IP`            | IP address assigned by the provider                     |
-| `Error`         | Last error message, if any                              |
+### How the Manager Runs a Client
 
-## CommandExecutor Interface
+`UserAccessDeps.Clients` holds one client per vendor kind; a kind without a client reads `kind_not_served`. A bridge holds at most one `tailscale` and one `netbird` provider, because one host runs one client of each: a second provider of the same kind reads `invalid_provider`. `plexd up` builds `NewTailscaleProvider` and `NewNetbirdProvider`, each over its own `NewStdCommandExecutor()`.
 
-Shared abstraction for CLI command execution, enabling full unit testing without invoking real binaries.
+1. The manager starts the client with the key and the Domain mesh CIDR. A start error that wraps `exec.ErrNotFound` reads `client_missing`, any other `join_failed`.
+2. It reads the client's interface from `Status().InterfaceName`. An empty name stops the client and reads `join_failed`.
+3. It switches forwarding on between `plexd0` and that interface and adds the source rewrite for it. An error stops the client and reads `setup_failed`.
 
-```go
-type CommandExecutor interface {
-    Run(ctx context.Context, name string, args ...string) ([]byte, error)
-    Start(ctx context.Context, name string, args ...string) (CommandHandle, error)
-}
-```
-
-| Method  | Description                                                                  |
-|---------|------------------------------------------------------------------------------|
-| `Run`   | Executes a command synchronously and returns its combined output             |
-| `Start` | Starts a command without waiting for completion; returns a handle to stop it |
-
-### CommandHandle
-
-```go
-type CommandHandle interface {
-    Stop() error
-}
-```
-
-| Method | Description                |
-|--------|----------------------------|
-| `Stop` | Terminates the process     |
+The provider is then up, and its report entry carries `id` and `health` alone: the vendor's network manages its own keys and devices. A provider that leaves the block, or whose `auth_secret_name` changes, has its client stopped and its source rewrite removed; a changed `auth_secret_name` then starts the client again with the key of the new Secret. `Teardown` stops every client and cancels the context the daemons run under.
 
 ## TailscaleProvider
 
-Concrete `UserAccessProvider` implementation wrapping the Tailscale CLI (`tailscale`/`tailscaled`). Joins a Tailscale network on a bridge node, enabling Tailscale users to access mesh resources.
-
 - **File**: `internal/bridge/tailscale.go`
 - **Name**: `"tailscale"`
-- **Interface name**: `"tailscale0"` (hardcoded)
-- **Auth key env var**: `PLEXD_TAILSCALE_AUTH_KEY`
+- **Interface name**: `"tailscale0"`, set by plexd, not read from the client
 - **Concurrency**: `sync.Mutex` protects `running`, `ip`, `ifaceName`, `daemonHandle`
-
-### Constructor
 
 ```go
 func NewTailscaleProvider(exec CommandExecutor, logger *slog.Logger) *TailscaleProvider
@@ -102,59 +94,44 @@ func NewTailscaleProvider(exec CommandExecutor, logger *slog.Logger) *TailscaleP
 
 ### Start Sequence
 
-1. Read auth key from `PLEXD_TAILSCALE_AUTH_KEY` environment variable
-2. Start `tailscaled --state=mem:` via `CommandExecutor.Start` (long-running daemon)
-3. Run `tailscale up --authkey=<key> --accept-routes` via `CommandExecutor.Run`
-4. Run `tailscale status --json` via `CommandExecutor.Run` to discover the assigned IP
-5. Parse `TailscaleIPs[0]` from the JSON response as the provider IP
-6. Set interface name to `"tailscale0"`, mark as running
+1. Refuse an empty key: `bridge: tailscale: auth key is empty`.
+2. Start `tailscaled --state=mem:` with `CommandExecutor.Start` under `ctx`, the manager's context. The daemon runs until `Stop` or until the context ends.
+3. Run `tailscale up --authkey=<key> --accept-routes --advertise-routes=<mesh CIDR>` with `CommandExecutor.Run`.
+4. Run `tailscale status --json`.
+5. Take the first entry of `TailscaleIPs` from the JSON as the client's IP, set the interface name to `tailscale0`, and mark the client running.
 
-Full rollback on failure at any step:
+Steps 3 and 4 share one timeout of 60 s derived from `ctx`. A failure rolls back what the earlier steps started:
 
-| Failure Point            | Rollback Actions                                              |
-|--------------------------|---------------------------------------------------------------|
-| `tailscale up` fails     | Stop daemon handle                                            |
-| `tailscale status` fails | Run `tailscale down`, stop daemon handle                      |
-| JSON parse fails         | Run `tailscale down`, stop daemon handle                      |
+| Failure | Rollback |
+|---|---|
+| `tailscale up` fails | Stop the daemon |
+| `tailscale status` fails | Run `tailscale down`, stop the daemon |
+| The JSON does not parse | Run `tailscale down`, stop the daemon |
+
+`tailscale down` in a rollback runs under the same timeout, so once the timeout has run out it fails at once, and stopping the daemon ends the session.
 
 ### Stop Sequence
 
-1. Run `tailscale down` (disconnect from network)
-2. Stop daemon handle via `CommandHandle.Stop`
-3. Clear `running`, `ip`, `ifaceName`
+1. Run `tailscale down`, without a timeout. A failure is logged and does not stop the next step.
+2. Stop the daemon: `CommandHandle.Stop` kills the process. A failure is logged.
+3. Clear `running`, `ip` and `ifaceName`.
 
-Idempotent: calling `Stop` when not running returns `nil`.
+`Stop` returns nil, also after a logged failure, and does nothing when the client does not run.
 
-### Usage
+### The Advertised Route
 
-```go
-exec := &prodCommandExecutor{} // production CommandExecutor
-provider := bridge.NewTailscaleProvider(exec, logger)
+`tailscale up` advertises the Domain mesh CIDR, `UserAccessDeps.MeshCIDR`, as a route, so the tailnet reaches the mesh through the bridge. `plexd up` sets it to the Domain mesh prefix, masked to its network. When the node has no Domain mesh CIDR, or only the `/32` of its own mesh address, the CIDR is empty and a `tailscale` provider reads `setup_failed` before the inventory is read and before any command runs: the client would join a tailnet that cannot reach the mesh. The CIDR is read once at start, so such a provider stays down until a restart finds one.
 
-// Start — joins Tailscale network
-if err := provider.Start(ctx); err != nil {
-    log.Fatal(err) // e.g. "bridge: tailscale: PLEXD_TAILSCALE_AUTH_KEY is not set"
-}
+### A Reusable Auth Key
 
-// Query status
-status := provider.Status()
-// ProviderStatus{Running: true, InterfaceName: "tailscale0", IP: "100.64.0.1"}
-
-// Graceful shutdown
-provider.Stop()
-```
+`tailscaled` keeps its state in memory (`--state=mem:`), so the client keeps no state across its starts: every join logs in with the auth key again, after a restart of plexd, after a changed `auth_secret_name`, and on a retry after a failed join. The auth key in the Secret must therefore be reusable. A key that Tailscale accepts once serves the first join only.
 
 ## NetbirdProvider
 
-Concrete `UserAccessProvider` implementation wrapping the Netbird CLI (`netbird`). Joins a Netbird network using a setup key, enabling Netbird users to access mesh resources through the bridge node.
-
 - **File**: `internal/bridge/netbird.go`
 - **Name**: `"netbird"`
-- **Interface name**: discovered from `netbird status --json` (e.g. `"wt0"`)
-- **Setup key env var**: `PLEXD_NETBIRD_SETUP_KEY`
+- **Interface name**: the member `interface.name` of `netbird status --json`, such as `"wt0"`
 - **Concurrency**: `sync.Mutex` protects `status`
-
-### Constructor
 
 ```go
 func NewNetbirdProvider(exec CommandExecutor, logger *slog.Logger) *NetbirdProvider
@@ -162,268 +139,88 @@ func NewNetbirdProvider(exec CommandExecutor, logger *slog.Logger) *NetbirdProvi
 
 ### Start Sequence
 
-1. Read setup key from `PLEXD_NETBIRD_SETUP_KEY` environment variable
-2. Run `netbird up --setup-key <key>` via `CommandExecutor.Run`
-3. Run `netbird status --json` via `CommandExecutor.Run` to discover IP and interface
-4. Parse IP and interface name from the JSON response
-5. Strip CIDR prefix from IP if present (e.g. `"100.119.0.1/16"` becomes `"100.119.0.1"`)
-6. Mark as running
+1. Refuse an empty key: `bridge: netbird: setup key is empty`.
+2. Log `starting netbird provider` with the key's length, `setup_key_len`.
+3. Run `netbird up --setup-key <key>` with `CommandExecutor.Run`.
+4. Run `netbird status --json`.
+5. Take `ip`, without a CIDR suffix (`"100.119.0.1/16"` becomes `"100.119.0.1"`), and `interface.name` from the JSON, and mark the client running.
+
+Steps 3 and 4 share one timeout of 60 s derived from `ctx`. plexd starts no NetBird daemon of its own. A failed `netbird status`, or JSON that does not parse, leaves the client as `netbird up` left it: no `netbird down` runs, and the client does not count as running, so the next `Stop` does nothing. The retry runs `netbird up` again.
 
 ### Stop Sequence
 
-1. Run `netbird down` via `CommandExecutor.Run`
-2. Clear status to zero value
+1. Run `netbird down`, without a timeout. A failure returns `bridge: netbird: down failed: <error>` and keeps the status.
+2. Clear the status.
 
-Idempotent: calling `Stop` when not running returns `nil`.
+`Stop` does nothing when the client does not run. A failed `netbird down` during `Teardown` is part of `Teardown`'s error, and the source rewrite is removed all the same.
 
-### Usage
+### The Route of a netbird Provider
 
-```go
-exec := &prodCommandExecutor{} // production CommandExecutor
-provider := bridge.NewNetbirdProvider(exec, logger)
+The route of a `netbird` provider is defined by the operator in NetBird's management service, with the bridge as routing peer: a NetBird client cannot advertise a route, so `NetbirdProvider.Start` ignores the mesh CIDR and plexd advertises nothing. The NetBird network reaches the Domain mesh through the bridge only once that route exists. This deviates from the control plane's agent contract, whose section "User access" says that a `tailscale` or `netbird` provider advertises the Domain mesh CIDR as a route. A `netbird` provider needs no Domain mesh CIDR on the bridge, so it never reads `setup_failed` for a missing one.
 
-// Start — joins Netbird network
-if err := provider.Start(ctx); err != nil {
-    log.Fatal(err) // e.g. "bridge: netbird: PLEXD_NETBIRD_SETUP_KEY environment variable is not set"
-}
+## CommandExecutor
 
-// Query status
-status := provider.Status()
-// ProviderStatus{Running: true, InterfaceName: "wt0", IP: "100.119.0.1"}
-
-// Graceful shutdown
-provider.Stop()
-```
-
-## Config Fields
-
-The following fields on the bridge `Config` struct control VPN provider selection.
-
-| Field                      | Type     | Default | Description                                              |
-|----------------------------|----------|---------|----------------------------------------------------------|
-| `UserAccessProviderType`   | `string` | `""`    | External VPN provider: `"tailscale"`, `"netbird"`, or `""` (disabled) |
-| `AuthKeyEnv`               | `string` | —       | Env var name for the auth key (e.g. `"PLEXD_TAILSCALE_AUTH_KEY"`) |
-| `SetupKeyEnv`              | `string` | —       | Env var name for the setup key (e.g. `"PLEXD_NETBIRD_SETUP_KEY"`) |
+Shared abstraction for running the vendor's commands, so a test runs a client without its executables:
 
 ```go
-cfg := bridge.Config{
-    Enabled:                true,
-    AccessInterface:        "eth1",
-    AccessSubnets:          []string{"10.0.0.0/24"},
-    UserAccessEnabled:      true,
-    UserAccessProviderType: "tailscale",
-    AuthKeyEnv:             "PLEXD_TAILSCALE_AUTH_KEY",
+type CommandExecutor interface {
+    Run(ctx context.Context, name string, args ...string) ([]byte, error)
+    Start(ctx context.Context, name string, args ...string) (CommandHandle, error)
 }
-cfg.ApplyDefaults()
-if err := cfg.Validate(); err != nil {
-    log.Fatal(err)
+
+type CommandHandle interface {
+    Stop() error
 }
 ```
 
-### Validation Rules
+| Method | Description |
+|---|---|
+| `Run` | Runs a command and returns its combined output |
+| `Start` | Starts a command without waiting for it; returns a handle to stop it |
+| `CommandHandle.Stop` | Kills the process |
 
-Provider validation runs when `UserAccessProviderType` is non-empty, regardless of other flags.
+`StdCommandExecutor` (`exec_std.go`) implements it with `exec.CommandContext`, which kills a process when its context ends. A command is named without a path, so its executable must be on the `PATH` of the plexd process. A missing executable fails with an error that wraps `exec.ErrNotFound`, which the manager reports as `client_missing`.
 
-| Field                      | Rule                                         | Error Message                                                      |
-|----------------------------|----------------------------------------------|--------------------------------------------------------------------|
-| `UserAccessProviderType`   | Must be `"tailscale"`, `"netbird"`, or `""`  | `bridge: config: unsupported UserAccessProviderType "<value>"`     |
+## Host Requirements
 
-## Integration with UserAccessManager
+The host must carry the vendor's client: `tailscaled` and `tailscale` for a `tailscale` provider, `netbird` for a `netbird` provider, each on the `PATH` of the plexd process. Whether a vendor client runs inside the sandbox of `deploy/systemd/plexd.service` is unproven, as no suite runs one.
 
-The `UserAccessProvider` integrates into the existing `UserAccessManager` as an optional dependency.
+## Testing
 
-### Constructor
-
-```go
-func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger, provider UserAccessProvider) *UserAccessManager
-```
-
-The `provider` parameter is optional -- pass `nil` when no external VPN provider is used.
-
-### Setup
-
-When a provider is configured, `Setup` calls `provider.Start()` after the WireGuard interface and forwarding are established:
-
-1. `AccessController.CreateInterface(interfaceName, listenPort)` -- create WG interface
-2. `RouteController.EnableForwarding(interfaceName, accessInterface)` -- enable IP forwarding
-3. `provider.Start(ctx)` -- launch the VPN provider (only when provider is non-nil)
-
-If `provider.Start()` fails, full rollback is performed: forwarding is disabled and the interface is removed.
-
-### Teardown
-
-When a provider is configured, `Teardown` calls `provider.Stop()` first, before removing peers and interfaces:
-
-1. `provider.Stop()` -- stop the VPN provider (only when provider is non-nil)
-2. Remove all tracked peers via `AccessController.RemovePeer`
-3. Disable forwarding via `RouteController.DisableForwarding`
-4. Remove interface via `AccessController.RemoveInterface`
-
-Errors are aggregated via `errors.Join` -- cleanup continues even when individual operations fail.
-
-### UserAccessStatus
-
-When a provider is configured, `UserAccessStatus()` includes provider information in the returned `api.UserAccessInfo`:
-
-| Field            | Source                    | Values                                   |
-|------------------|---------------------------|------------------------------------------|
-| `ProviderName`   | `provider.Name()`         | `"tailscale"`, `"netbird"`               |
-| `ProviderStatus` | Derived from `provider.Status()` | `"running"`, `"error"`, `"stopped"` |
-
-Status derivation logic:
-
-- `status.Running == true` => `"running"`
-- `status.Error != ""` => `"error"`
-- Otherwise => `"stopped"`
-
-### UserAccessInfo API Type
-
-```go
-type UserAccessInfo struct {
-    Enabled        bool   `json:"enabled"`
-    InterfaceName  string `json:"interface_name"`
-    PeerCount      int    `json:"peer_count"`
-    ListenPort     int    `json:"listen_port"`
-    ProviderName   string `json:"provider_name,omitempty"`
-    ProviderStatus string `json:"provider_status,omitempty"`
-}
-```
-
-| Field            | Description                                                          |
-|------------------|----------------------------------------------------------------------|
-| `ProviderName`   | Provider identifier; empty when no provider is configured            |
-| `ProviderStatus` | Provider state: `"running"`, `"error"`, or `"stopped"`; empty when no provider |
+No test suite runs a real Tailscale or NetBird client; the proof is the command stand-in. `tailscale_test.go` and `netbird_test.go` run each client over a mock `CommandExecutor` and check the exact commands and arguments, the 60 s deadline of the join commands, the refused empty key, the rollback, a missing executable, and that no log line carries the key. `provider_integration_test.go` runs the user access manager with both clients over the stand-in, up to the forwarding and the source rewrite of the client's interface, and covers `client_missing` and a client that reports no interface. The systemd suite's user access phase serves a `tailscale` provider on a host without a Tailscale client: it proves the Secret fetch, through the change from `auth_secret_not_listed` to `client_missing`, and nothing of a join (see [Systemd E2E Test](../development/systemd-e2e-test.md#_17-user-access-through-a-bridge)). A real client would need a coordination server in the suite.
 
 ## Error Prefixes
 
-| Source                                            | Prefix                                                         |
-|---------------------------------------------------|----------------------------------------------------------------|
-| `TailscaleProvider.Start` (no key)                | `bridge: tailscale: PLEXD_TAILSCALE_AUTH_KEY is not set`       |
-| `TailscaleProvider.Start` (daemon)                | `bridge: tailscale: start tailscaled: `                        |
-| `TailscaleProvider.Start` (up)                    | `bridge: tailscale: tailscale up: `                            |
-| `TailscaleProvider.Start` (status)                | `bridge: tailscale: tailscale status: `                        |
-| `TailscaleProvider.Start` (parse)                 | `bridge: tailscale: parse status: `                            |
-| `NetbirdProvider.Start` (no key)                  | `bridge: netbird: PLEXD_NETBIRD_SETUP_KEY environment variable is not set` |
-| `NetbirdProvider.Start` (up)                      | `bridge: netbird: up failed: `                                 |
-| `NetbirdProvider.Start` (status)                  | `bridge: netbird: status failed: `                             |
-| `NetbirdProvider.Start` (parse)                   | `bridge: netbird: failed to parse status JSON: `               |
-| `NetbirdProvider.Stop` (down)                     | `bridge: netbird: down failed: `                               |
-| `UserAccessManager.Setup` (provider)              | `bridge: user access: start provider: `                        |
-| `UserAccessManager.Teardown` (provider)           | `bridge: user access: stop provider: `                         |
+| Source | Prefix |
+|---|---|
+| `TailscaleProvider.Start` (no key) | `bridge: tailscale: auth key is empty` |
+| `TailscaleProvider.Start` (daemon) | `bridge: tailscale: start tailscaled: ` |
+| `TailscaleProvider.Start` (up) | `bridge: tailscale: tailscale up: ` |
+| `TailscaleProvider.Start` (status) | `bridge: tailscale: tailscale status: ` |
+| `TailscaleProvider.Start` (parse) | `bridge: tailscale: parse status: ` |
+| `NetbirdProvider.Start` (no key) | `bridge: netbird: setup key is empty` |
+| `NetbirdProvider.Start` (up) | `bridge: netbird: up failed: ` |
+| `NetbirdProvider.Start` (status) | `bridge: netbird: status failed: ` |
+| `NetbirdProvider.Start` (parse) | `bridge: netbird: failed to parse status JSON: ` |
+| `NetbirdProvider.Stop` (down) | `bridge: netbird: down failed: ` |
+| `UserAccessManager.Teardown` (client) | `bridge: user access: stop <kind> client: ` |
+
+The errors of the Secret fetch are listed under [The Join Key](#the-join-key).
 
 ## Logging
 
 All log entries use `component=bridge`.
 
-| Level   | Event                              | Keys                              |
-|---------|------------------------------------|-----------------------------------|
-| `Info`  | Tailscale provider started         | `ip`, `interface`                 |
-| `Info`  | Tailscale provider stopped         | (none)                            |
-| `Error` | Tailscale down failed              | `error`                           |
-| `Error` | Stop tailscaled failed             | `error`                           |
-| `Info`  | Starting netbird provider          | `setup_key_len`                   |
-| `Info`  | Netbird up completed               | `output`                          |
-| `Info`  | Netbird provider started           | `ip`, `interface`                 |
-| `Info`  | Stopping netbird provider          | (none)                            |
-| `Info`  | Netbird down completed             | `output`                          |
-| `Info`  | User access provider started       | `provider`                        |
+| Level | Message | Keys |
+|---|---|---|
+| `Info` | `tailscale provider started` | `ip`, `interface` |
+| `Info` | `tailscale provider stopped` | (none) |
+| `Error` | `bridge: tailscale: tailscale down failed` | `error` |
+| `Error` | `bridge: tailscale: stop tailscaled failed` | `error` |
+| `Info` | `starting netbird provider` | `setup_key_len` |
+| `Debug` | `netbird up completed` | `output` |
+| `Info` | `netbird provider started` | `ip`, `interface` |
+| `Info` | `stopping netbird provider` | (none) |
+| `Debug` | `netbird down completed` | `output` |
 
-## Lifecycle Without Provider
-
-```go
-cfg := bridge.Config{
-    Enabled:           true,
-    AccessInterface:   "eth1",
-    AccessSubnets:     []string{"10.0.0.0/24"},
-    UserAccessEnabled: true,
-}
-cfg.ApplyDefaults()
-
-// No provider — pass nil
-accessMgr := bridge.NewUserAccessManager(accessCtrl, routeCtrl, cfg, logger, nil)
-
-// Setup — creates WG interface, enables forwarding (no provider step)
-if err := accessMgr.Setup(); err != nil {
-    log.Fatal(err)
-}
-
-// Report status in heartbeat — no provider fields populated
-status := accessMgr.UserAccessStatus()
-// &api.UserAccessInfo{Enabled: true, InterfaceName: "wg-access", PeerCount: 0, ListenPort: 51822}
-
-// Graceful shutdown
-<-ctx.Done()
-if err := accessMgr.Teardown(); err != nil {
-    logger.Warn("user access teardown failed", "error", err)
-}
-```
-
-## Lifecycle With Provider
-
-```go
-cfg := bridge.Config{
-    Enabled:                true,
-    AccessInterface:        "eth1",
-    AccessSubnets:          []string{"10.0.0.0/24"},
-    UserAccessEnabled:      true,
-    UserAccessProviderType: "tailscale",
-}
-cfg.ApplyDefaults()
-
-// Create provider based on config
-var provider bridge.UserAccessProvider
-switch cfg.UserAccessProviderType {
-case "tailscale":
-    provider = bridge.NewTailscaleProvider(exec, logger)
-case "netbird":
-    provider = bridge.NewNetbirdProvider(exec, logger)
-}
-
-accessMgr := bridge.NewUserAccessManager(accessCtrl, routeCtrl, cfg, logger, provider)
-
-// Setup — creates WG interface, enables forwarding, starts provider
-if err := accessMgr.Setup(); err != nil {
-    log.Fatal(err)
-}
-
-// Report status in heartbeat — includes provider fields
-status := accessMgr.UserAccessStatus()
-// &api.UserAccessInfo{
-//     Enabled: true, InterfaceName: "wg-access", PeerCount: 0,
-//     ListenPort: 51822, ProviderName: "tailscale", ProviderStatus: "running",
-// }
-
-// Register the bridge SSE handler
-dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventBridgeConfigUpdated,
-    bridge.HandleBridgeConfigUpdated(reconciler))
-
-// Register reconcile handler
-r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
-
-// Run reconciler
-go r.Run(ctx, nodeID)
-
-// Graceful shutdown — stops provider first, then tears down WG interface
-<-ctx.Done()
-if err := accessMgr.Teardown(); err != nil {
-    logger.Warn("user access teardown failed", "error", err)
-}
-```
-
-## Heartbeat Reporting
-
-```go
-heartbeat := api.HeartbeatRequest{
-    UserAccess: accessMgr.UserAccessStatus(), // includes ProviderName, ProviderStatus
-}
-```
-
-## Registration Capabilities
-
-```go
-caps := accessMgr.UserAccessCapabilities()
-// {"user_access": "true", "access_listen_port": "51822"}
-// nil when user access is disabled
-```
+The manager's lines, `user access provider up` and `user access provider down` among them, are listed in [User Access Integration](user-access-integration.md#logging).

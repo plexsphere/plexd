@@ -1,16 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="790" viewBox="0 0 1170 790" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Data flow of user access through a bridge node">
+<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="894" viewBox="0 0 1170 894" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Data flow of user access through a bridge node">
 <title>Data flow of user access through a bridge node</title>
-<rect width="1170" height="790" fill="#F6F5F1"/>
-<rect x="40" y="190" width="790" height="560" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<rect width="1170" height="894" fill="#F6F5F1"/>
+<rect x="40" y="190" width="790" height="664" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
 <text x="56" y="223.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
 <rect x="90" y="40" width="320" height="65" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="250" y="69.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">External VPN clients</text>
-<text x="250" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">Tailscale, Netbird, WireGuard</text>
+<text x="250" y="69.3" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Devices</text>
+<text x="250" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">of a wireguard provider</text>
 <rect x="70" y="260" width="280" height="108" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="210" y="289.2" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Access WireGuard</text>
+<text x="210" y="289.2" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Provider WireGuard</text>
 <text x="210" y="313.2" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">interface</text>
-<text x="210" y="333.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg-access</text>
-<text x="210" y="353.55" font-size="17" fill="#55606E" text-anchor="middle">port 51822</text>
+<text x="210" y="333.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg-ua-a0a0a0e1</text>
+<text x="210" y="353.55" font-size="17" fill="#55606E" text-anchor="middle">10.99.0.1/24</text>
 <rect x="500" y="260" width="300" height="108" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
 <text x="650" y="299.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Mesh WireGuard</text>
 <text x="650" y="323.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">interface</text>
@@ -21,19 +21,28 @@
 <polyline points="250,114 250,251" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
 <polygon points="250,260 244,247 256,247" fill="#2F8A57"/>
 <polygon points="250,105 256,118 244,118" fill="#2F8A57"/>
-<text x="260" y="153.45" font-size="17" fill="#55606E">WireGuard tunnel</text>
+<text x="260" y="153.45" font-size="17" fill="#55606E">WireGuard, UDP listen_port</text>
 <polyline points="359,314 491,314" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
 <polygon points="500,314 487,320 487,308" fill="#2F8A57"/>
 <polygon points="350,314 363,308 363,320" fill="#2F8A57"/>
-<text x="425" y="303.45" font-size="17" fill="#55606E" text-anchor="middle">IP forwarding</text>
+<text x="425" y="283.25" font-size="17" fill="#55606E" text-anchor="middle">forwarding,</text>
+<text x="425" y="303.65" font-size="17" fill="#55606E" text-anchor="middle">source rewrite</text>
 <polyline points="809,314 921,314" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
 <polygon points="930,314 917,320 917,308" fill="#2F8A57"/>
 <polygon points="800,314 813,308 813,320" fill="#2F8A57"/>
 <rect x="70" y="428" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="210" y="455.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">AccessController</text>
-<text x="210" y="476.15" font-size="17" fill="#55606E" text-anchor="middle">WireGuard operations</text>
+<text x="210" y="476.15" font-size="17" fill="#55606E" text-anchor="middle">interface and devices</text>
 <polyline points="210,428 210,377" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
 <polygon points="210,368 216,381 204,381" fill="#2F8A57"/>
+<rect x="70" y="532" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="559.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">UserAccessManager</text>
+<text x="210" y="580.15" font-size="17" fill="#55606E" text-anchor="middle">one entry per provider</text>
+<polyline points="210,492 210,532" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="70" y="636" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="664.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">InterfaceKeyStore</text>
+<text x="210" y="683.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&lt;data_dir&gt;/user-access</text>
+<polyline points="210,596 210,636" fill="none" stroke="#7D8794" stroke-width="2.5"/>
 <rect x="500" y="428" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#B38A00" stroke-width="2"/>
 <text x="650" y="465.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#6F5600" text-anchor="middle">bridge_config_updated</text>
 <rect x="500" y="532" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
@@ -50,4 +59,14 @@
 <polyline points="930,460 809,460" fill="none" stroke="#B38A00" stroke-width="2.5"/>
 <polygon points="800,460 813,454 813,466" fill="#B38A00"/>
 <text x="880" y="449.45" font-size="17" fill="#55606E" text-anchor="middle">SSE</text>
+<polyline points="500,688 425,688 425,564 359,564" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="350,564 363,558 363,570" fill="#3A4452"/>
+<text x="387.5" y="553.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Apply()</text>
+<rect x="500" y="760" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="650" y="797.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">UserAccessStatusReporter</text>
+<polyline points="70,564 55,564 55,792 491,792" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="500,792 487,798 487,786" fill="#3A4452"/>
+<polyline points="800,792 1030,792 1030,501" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="1030,492 1036,505 1024,505" fill="#2457C5"/>
+<text x="915" y="781.45" font-size="17" fill="#55606E" text-anchor="middle">status report</text>
 </svg>
