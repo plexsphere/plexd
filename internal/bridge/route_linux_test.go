@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"github.com/google/nftables/userdata"
+	"github.com/vishvananda/netlink"
 )
 
 func discardLoggerRoute() *slog.Logger {
@@ -389,4 +392,102 @@ func TestAddMeshSourceRewriteRefusesInvalidInterfaceName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNetlinkRouteController_RealRoutes adds a route through a dummy link in
+// a network namespace of its own and wants RemoveRoute to delete it from the
+// kernel, not only to return nil. AddRoute installs the route with link
+// scope, and the kernel deletes an IPv4 route only when the request names its
+// scope or none, so a delete with the universe scope found nothing, answered
+// ESRCH, and RemoveRoute took that for a route that was already gone. A
+// peer's routed subnet is routed through the mesh interface, which outlives
+// the route, so the route stayed after the pull that dropped the subnet.
+//
+// It also wants RemoveRoute to keep a route plexd did not add: the kernel's
+// route to the link's own network, which AddRoute meets as EEXIST and takes
+// for its own. A delete that matched it would cut the host off that network,
+// an access LAN a bridge serves as one of its access_subnets, when the bridge
+// stops.
+//
+// It shares the gate of TestNetlinkVPNController_RealLinks, which CI runs in
+// the step "Run privileged Linux tests".
+func TestNetlinkRouteController_RealRoutes(t *testing.T) {
+	if os.Getenv("PLEXD_TEST_REAL_LINKS") != "1" {
+		t.Skip("set PLEXD_TEST_REAL_LINKS=1 to add real routes in a test network namespace")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("creating a network namespace and routes needs root; run with sudo")
+	}
+
+	const (
+		iface     = "plexd-rt0"
+		subnet    = "10.40.0.0/16"
+		connected = "10.41.0.0/16"
+	)
+	inOwnNetns(t, func() {
+		la := netlink.NewLinkAttrs()
+		la.Name = iface
+		if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: la}); err != nil {
+			t.Fatalf("add dummy link %s: %v", iface, err)
+		}
+		link := mustLink(t, iface)
+		if err := netlink.LinkSetUp(link); err != nil {
+			t.Fatalf("set %s up: %v", iface, err)
+		}
+		addr, err := netlink.ParseAddr("10.41.0.1/16")
+		if err != nil {
+			t.Fatalf("ParseAddr: %v", err)
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			t.Fatalf("address %s: %v", iface, err)
+		}
+		routes := func(cidr string) []netlink.Route {
+			t.Helper()
+			_, dst, err := net.ParseCIDR(cidr)
+			if err != nil {
+				t.Fatalf("ParseCIDR(%q): %v", cidr, err)
+			}
+			got, err := netlink.RouteListFiltered(netlink.FAMILY_V4,
+				&netlink.Route{Dst: dst, LinkIndex: link.Attrs().Index},
+				netlink.RT_FILTER_DST|netlink.RT_FILTER_OIF)
+			if err != nil {
+				t.Fatalf("list the routes to %s: %v", cidr, err)
+			}
+			return got
+		}
+		if got := routes(connected); len(got) != 1 {
+			t.Fatalf("the kernel holds %d routes to %s, the network of %s, want its own one: %+v", len(got), connected, iface, got)
+		}
+
+		c := NewNetlinkRouteController(discardLoggerRoute())
+		for range 2 {
+			if err := c.AddRoute(subnet, iface); err != nil {
+				t.Fatalf("AddRoute(%q, %q): %v", subnet, iface, err)
+			}
+		}
+		if got := routes(subnet); len(got) != 1 {
+			t.Fatalf("after AddRoute twice, the kernel holds %d routes to %s through %s, want 1: %+v", len(got), subnet, iface, got)
+		}
+
+		for range 2 {
+			if err := c.RemoveRoute(subnet, iface); err != nil {
+				t.Fatalf("RemoveRoute(%q, %q): %v", subnet, iface, err)
+			}
+		}
+		if got := routes(subnet); len(got) != 0 {
+			t.Fatalf("after RemoveRoute, the kernel still holds the route to %s through %s: %+v", subnet, iface, got)
+		}
+
+		// The kernel's route to the link's network: AddRoute meets it as
+		// EEXIST, and RemoveRoute must leave it.
+		if err := c.AddRoute(connected, iface); err != nil {
+			t.Fatalf("AddRoute(%q, %q) over the kernel's route: %v", connected, iface, err)
+		}
+		if err := c.RemoveRoute(connected, iface); err != nil {
+			t.Fatalf("RemoveRoute(%q, %q): %v", connected, iface, err)
+		}
+		if got := routes(connected); len(got) != 1 {
+			t.Fatalf("after RemoveRoute, the kernel holds %d routes to %s, the network of %s, want its own one kept: %+v", len(got), connected, iface, got)
+		}
+	})
 }

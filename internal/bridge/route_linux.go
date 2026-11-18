@@ -105,6 +105,12 @@ func setSysctl(iface, value string) error {
 	return nil
 }
 
+// routeProtocol marks the routes AddRoute installs, so that RemoveRoute
+// deletes only those. The kernel deletes an IPv4 route only when the request
+// names its protocol or none, and its own routes, such as the route to an
+// interface's network, carry the kernel protocol.
+const routeProtocol = netlink.RouteProtocol(syscall.RTPROT_STATIC)
+
 // AddRoute adds a route for the given CIDR subnet via the given interface.
 // Idempotent: adding an existing route returns nil.
 func (c *NetlinkRouteController) AddRoute(subnet, iface string) error {
@@ -122,6 +128,7 @@ func (c *NetlinkRouteController) AddRoute(subnet, iface string) error {
 		Dst:       dst,
 		LinkIndex: link.Attrs().Index,
 		Scope:     netlink.SCOPE_LINK,
+		Protocol:  routeProtocol,
 	}
 
 	if err := netlink.RouteAdd(route); err != nil {
@@ -158,9 +165,18 @@ func (c *NetlinkRouteController) RemoveRoute(subnet, iface string) error {
 		return fmt.Errorf("bridge: remove route: lookup interface %q: %w", iface, err)
 	}
 
+	// The scope and the protocol are the ones AddRoute installs. The kernel
+	// deletes an IPv4 route only when the request names its scope or none,
+	// and netlink sends a zero Scope as the universe scope, which no
+	// link-scope route matches: the delete then answered ESRCH, which reads
+	// as a route already gone. The protocol keeps the delete off a route
+	// plexd did not add, the kernel's route to the interface's own network
+	// above all, which AddRoute meets as EEXIST.
 	route := &netlink.Route{
 		Dst:       dst,
 		LinkIndex: link.Attrs().Index,
+		Scope:     netlink.SCOPE_LINK,
+		Protocol:  routeProtocol,
 	}
 
 	if err := netlink.RouteDel(route); err != nil {
