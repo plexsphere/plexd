@@ -880,6 +880,37 @@ func TestIsIngressStatusNotServed(t *testing.T) {
 	}
 }
 
+func TestIsUserAccessStatusNotServed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// An older control plane has no route, so its router's 404 carries
+		// whatever code its not-found handler writes, or none.
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"404 with a router code", &APIError{StatusCode: 404, Code: "not_found"}, true},
+		{"wrapped 404", fmt.Errorf("report user access status: %w", &APIError{StatusCode: 404}), true},
+		{"501 with the provisioning code", &APIError{StatusCode: 501, Code: "user_access_status_not_provisioned"}, true},
+		{"404 user_access_status_node_gone is a verdict on the node", &APIError{StatusCode: 404, Code: "user_access_status_node_gone"}, false},
+		{"501 with another surface's code", &APIError{StatusCode: 501, Code: "ingress_status_not_provisioned"}, false},
+		{"501 without a code", &APIError{StatusCode: 501}, false},
+		{"500 internal", &APIError{StatusCode: 500, Code: "internal"}, false},
+		{"400 malformed_user_access_status", &APIError{StatusCode: 400, Code: "malformed_user_access_status"}, false},
+		{"413 user_access_status_body_too_large", &APIError{StatusCode: 413, Code: "user_access_status_body_too_large"}, false},
+		{"non-API error", errors.New("boom"), false},
+		{"io.EOF", io.EOF, false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsUserAccessStatusNotServed(tt.err); got != tt.want {
+				t.Errorf("IsUserAccessStatusNotServed(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsPolicyStatusNotServed(t *testing.T) {
 	tests := []struct {
 		name string
