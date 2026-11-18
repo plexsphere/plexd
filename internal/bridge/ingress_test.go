@@ -129,7 +129,7 @@ func TestIngressManager_Setup_Disabled(t *testing.T) {
 }
 
 func TestIngressManager_Setup_Enabled(t *testing.T) {
-	mgr, _ := newActiveIngressManager(t, &mockIngressController{})
+	mgr, logs := newActiveIngressManager(t, &mockIngressController{})
 
 	status := mgr.IngressStatus()
 	if status == nil {
@@ -137,6 +137,9 @@ func TestIngressManager_Setup_Enabled(t *testing.T) {
 	}
 	if !status.Enabled || status.RuleCount != 0 || status.ConnectionCount != 0 {
 		t.Errorf("IngressStatus = %+v, want enabled with no rules and no connections", status)
+	}
+	if got := logLines(logs, `msg="ingress manager started"`, "max_udp_flows=1024"); got != 1 {
+		t.Errorf("%d 'ingress manager started' lines with max_udp_flows=1024, want 1:\n%s", got, logs.String())
 	}
 }
 
@@ -262,6 +265,19 @@ func TestIngressManager_Apply_NotActive(t *testing.T) {
 	}
 	if err := mgr.Apply(t.Context(), rulesBlock(fourRules()...)); err == nil || err.Error() != want {
 		t.Errorf("Apply after Teardown = %v, want %q", err, want)
+	}
+
+	// An opted-out manager opens no UDP socket either.
+	ctrl := newLoopbackIngressController(t)
+	optedOut := buildIngressFixture(t, ctrl, ingressTestConfig(false)).mgr
+	if err := optedOut.Setup(); err != nil {
+		t.Fatalf("Setup of the opted-out manager: %v", err)
+	}
+	if err := optedOut.Apply(t.Context(), rulesBlock(udpIngressRule("dns", 7053, 9053))); err == nil || err.Error() != want {
+		t.Errorf("Apply of a udp rule on an opted-out manager = %v, want %q", err, want)
+	}
+	if calls := ctrl.ingressCallsFor("ListenUDP"); len(calls) != 0 {
+		t.Errorf("ListenUDP calls = %+v, want none", calls)
 	}
 }
 
@@ -647,6 +663,18 @@ func TestIngressReconcileHandler(t *testing.T) {
 		}
 		if got := logLines(logs); got != 1 {
 			t.Errorf("%d log lines, want only the Warn:\n%s", got, logs.String())
+		}
+
+		udpLogger, udpLogs := newRelayLogger()
+		withUDPRule := &api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{Ingress: &api.IngressConfig{
+			Enabled: true,
+			Rules:   []api.IngressRule{udpIngressRule("dns", 7053, 9053)},
+		}}}
+		if err := IngressReconcileHandler(nil, udpLogger)(t.Context(), withUDPRule, bridgeChanged); err != nil {
+			t.Fatalf("handler with one udp rule = %v, want nil", err)
+		}
+		if got := logLines(udpLogs, "level=WARN", warn, "component=bridge", "rules=1"); got != 1 {
+			t.Errorf("%d opted-out Warn lines with rules=1 for one udp rule, want 1:\n%s", got, udpLogs.String())
 		}
 
 		for _, tc := range []struct {

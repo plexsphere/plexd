@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -62,10 +63,12 @@ type notServedKey struct {
 }
 
 // IngressManager serves public ingress: one TCP listener per listen port of the
-// bridge.ingress block, routing each connection to the target of its rule.
-// A passthrough rule's connection is forwarded unread; a terminate or acme
-// rule's connection ends TLS at the bridge, and the plaintext goes to the
-// target. IngressManager is concurrent-safe via mu.
+// tcp rules of the bridge.ingress block, routing each connection to the target
+// of its rule, and one UDP socket per listen port of its udp rules, forwarding
+// the datagrams of each client address and port on a flow of their own (see
+// serveUDP). A passthrough rule's connection is forwarded unread; a terminate
+// or acme rule's connection ends TLS at the bridge, and the plaintext goes to
+// the target. IngressManager is concurrent-safe via mu.
 type IngressManager struct {
 	ctrl             IngressController
 	cfg              Config
@@ -81,6 +84,15 @@ type IngressManager struct {
 	// dialPolicy names a failed dial policy_denied; set before Setup, nil
 	// without one.
 	dialPolicy IngressDialPolicy
+	// maxUDPFlows is the most flows one udp rule holds.
+	maxUDPFlows int
+	// udpUnansweredTimeout and udpAnsweredTimeout close a flow after that long
+	// without a datagram in either direction, before and after the target
+	// answered; tests shorten them.
+	udpUnansweredTimeout time.Duration
+	udpAnsweredTimeout   time.Duration
+	// openUDP, nil in production, replaces openUDPFlowConn in tests.
+	openUDP func(target netip.AddrPort) (udpFlowConn, error)
 
 	// mu protects the fields below from concurrent access by the reconcile
 	// loop, the connections and status readers.
@@ -92,6 +104,7 @@ type IngressManager struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	listeners map[int]*ingressListener
+	udp       map[int]*udpIngressListener // the UDP socket of each udp listen port
 	states    []IngressRuleState
 	held      map[string]api.IngressRule // the held rules of the last Apply, by id
 	heldOrder []string                   // their ids, in block order
@@ -103,7 +116,9 @@ type IngressManager struct {
 	coverage  map[coverageKey]struct{} // the hosts checked against a loaded certificate
 	dials     map[string]dialRecord    // the last dial of each held rule, by rule id
 
-	connCount atomic.Int64 // connections from accept to close, across all ports
+	// connCount counts the connections from accept to close and the udp flows
+	// from open to close, across all ports.
+	connCount atomic.Int64
 
 	// changed carries ReportChanged's signal; capacity 1.
 	changed chan struct{}
@@ -124,10 +139,15 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 		acme:             acme,
 		fetcher:          certs,
 		now:              time.Now,
+		maxUDPFlows:      cfg.MaxIngressUDPFlows,
 		listeners:        make(map[int]*ingressListener),
+		udp:              make(map[int]*udpIngressListener),
 		certs:            make(map[string]*certEntry),
 		dials:            make(map[string]dialRecord),
 		changed:          make(chan struct{}, 1),
+
+		udpUnansweredTimeout: ingressUDPUnansweredTimeout,
+		udpAnsweredTimeout:   ingressUDPAnsweredTimeout,
 	}
 	acme.OnIssuedChange(m.signalReport)
 	return m
@@ -149,16 +169,18 @@ func (m *IngressManager) Setup() error {
 	m.logger.Info("ingress manager started",
 		"component", "bridge",
 		"max_rules", m.cfg.MaxIngressRules,
+		"max_udp_flows", m.maxUDPFlows,
 		"dial_timeout", m.dialTimeout.String(),
 	)
 
 	return nil
 }
 
-// Teardown cancels every route, which closes every connection, closes every
-// listener, and forgets the secret inventory and every certificate. Errors are
-// aggregated; cleanup continues past a failed close. Idempotent: calling
-// Teardown when inactive returns nil.
+// Teardown cancels every route, which closes every connection and every udp
+// flow, closes every listener and UDP socket, and forgets the secret inventory
+// and every certificate. It returns once every accept loop, read loop and
+// reply loop has ended. Errors are aggregated; cleanup continues past a failed
+// close. Idempotent: calling Teardown when inactive returns nil.
 func (m *IngressManager) Teardown() error {
 	m.mu.Lock()
 
@@ -175,9 +197,14 @@ func (m *IngressManager) Teardown() error {
 			errs = append(errs, fmt.Errorf("bridge: ingress: close listener %d: %w", l.port, err))
 		}
 	}
+	closedUDP := m.sortedUDPListeners()
+	for _, l := range closedUDP {
+		closeUDPListener(l)
+	}
 
 	m.active = false
 	m.listeners = make(map[int]*ingressListener)
+	m.udp = make(map[int]*udpIngressListener)
 	m.states = nil
 	m.held = nil
 	m.heldOrder = nil
@@ -189,10 +216,15 @@ func (m *IngressManager) Teardown() error {
 	m.signalReport()
 	m.mu.Unlock()
 
-	// Wait for the accept loops outside the lock.
+	// Wait for the accept loops and the read loops outside the lock: a read
+	// loop takes mu to record a dial.
 	for _, l := range closed {
 		<-l.done
-		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port)
+		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port, "protocol", api.IngressProtocolTCP)
+	}
+	for _, l := range closedUDP {
+		<-l.done
+		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port, "protocol", api.IngressProtocolUDP)
 	}
 
 	if len(errs) == 0 {
@@ -208,17 +240,20 @@ func (m *IngressManager) Teardown() error {
 //
 // It checks the block's acme member against bridge.acme_directory_urls,
 // plans the block, and forgets the certificates of Secrets no held rule names
-// any more. It then opens a listener for each port in the plan that has none,
-// swaps the routing table of every other port in place, and closes the
-// listeners of ports the plan no longer names. A route whose rule is unchanged
-// keeps its context and its connections; every other route of the last Apply
-// is cancelled, which closes its connections. A failed bind marks the port's
-// rules listen_failed and is retried by the next Apply; the other ports are
-// served. After the binds it configures the ACME account with the hosts of
-// the acme rules that have no reason, which retires it when there are none,
-// so an acme rule whose port failed to bind asks the CA for nothing. Last, it
-// loads the certificates of the held terminate rules. The result joins the
-// bind errors and is nil when there are none.
+// any more. It then opens a listener for each TCP port in the plan that has
+// none, swaps the routing table of every other port in place, and closes the
+// listeners of ports the plan no longer names. It does the same for the UDP
+// socket of each udp port, in ascending order, swapping the port's route in
+// place. A route whose rule is unchanged keeps its context and its connections
+// or flows; every other route of the last Apply is cancelled, which closes its
+// connections and flows. A failed bind marks the rules of that port and
+// protocol listen_failed and is retried by the next Apply; the other ports,
+// and the other protocol on the same port number, are served. After the binds
+// it configures the ACME account with the hosts of the acme rules that have
+// no reason, which retires it when there are none, so an acme rule whose port
+// failed to bind asks the CA for nothing. Last, it loads the certificates of
+// the held terminate rules. The result joins the bind errors and is nil when
+// there are none.
 func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) error {
 	m.mu.Lock()
 
@@ -258,16 +293,26 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 			current[r.rule.ID] = r
 		}
 	}
+	for _, l := range m.udp {
+		r := l.route.Load()
+		current[r.rule.ID] = r
+	}
 	carried := make(map[*ingressRoute]struct{})
+	carry := func(r *ingressRoute) {
+		if old, ok := current[r.rule.ID]; ok && old.rule == r.rule {
+			r.ctx, r.cancel = old.ctx, old.cancel
+			carried[old] = struct{}{}
+			return
+		}
+		r.ctx, r.cancel = context.WithCancel(m.ctx)
+	}
 	for _, t := range plan.tables {
 		for _, r := range t.routes() {
-			if old, ok := current[r.rule.ID]; ok && old.rule == r.rule {
-				r.ctx, r.cancel = old.ctx, old.cancel
-				carried[old] = struct{}{}
-				continue
-			}
-			r.ctx, r.cancel = context.WithCancel(m.ctx)
+			carry(r)
 		}
+	}
+	for _, r := range plan.udp {
+		carry(r)
 	}
 	for _, old := range current {
 		if _, ok := carried[old]; !ok {
@@ -290,11 +335,7 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 			for _, r := range t.routes() {
 				r.cancel()
 			}
-			attrs := []any{"component", "bridge", "listen_port", port, "error", err}
-			if port < 1024 && errors.Is(err, fs.ErrPermission) {
-				attrs = append(attrs, "hint", lowPortHint)
-			}
-			m.logger.Error("bridge: ingress: listen failed", attrs...)
+			m.logListenFailed(port, api.IngressProtocolTCP, err)
 			errs = append(errs, fmt.Errorf("bridge: ingress: listen on %s: %w", addr, err))
 			continue
 		}
@@ -302,7 +343,32 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 		l.table.Store(t)
 		m.listeners[port] = l
 		go m.acceptLoop(m.ctx, l)
-		m.logger.Info("ingress listener opened", "component", "bridge", "listen_port", port)
+		m.logger.Info("ingress listener opened", "component", "bridge", "listen_port", port, "protocol", api.IngressProtocolTCP)
+	}
+
+	// The failed binds are kept per protocol: a tcp and a udp rule on one
+	// port number bind sockets of their own.
+	failedUDP := make(map[int]struct{})
+	for _, port := range slices.Sorted(maps.Keys(plan.udp)) {
+		route := plan.udp[port]
+		if l, ok := m.udp[port]; ok {
+			l.route.Store(route)
+			continue
+		}
+		addr := ":" + strconv.Itoa(port)
+		conn, err := m.ctrl.ListenUDP(addr)
+		if err != nil {
+			failedUDP[port] = struct{}{}
+			route.cancel()
+			m.logListenFailed(port, api.IngressProtocolUDP, err)
+			errs = append(errs, fmt.Errorf("bridge: ingress: listen on udp %s: %w", addr, err))
+			continue
+		}
+		l := newUDPIngressListener(port, conn)
+		l.route.Store(route)
+		m.udp[port] = l
+		go m.serveUDP(l)
+		m.logger.Info("ingress listener opened", "component", "bridge", "listen_port", port, "protocol", api.IngressProtocolUDP)
 	}
 
 	var closed []*ingressListener
@@ -320,10 +386,23 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 		}
 		closed = append(closed, l)
 	}
+	var closedUDP []*udpIngressListener
+	for _, l := range m.sortedUDPListeners() {
+		if _, ok := plan.udp[l.port]; ok {
+			continue
+		}
+		delete(m.udp, l.port)
+		closeUDPListener(l)
+		closedUDP = append(closedUDP, l)
+	}
 
 	for i := range plan.states {
 		st := &plan.states[i]
-		if _, ok := failed[st.Rule.ListenPort]; ok && st.Served {
+		failedPorts := failed
+		if st.Rule.Protocol == api.IngressProtocolUDP {
+			failedPorts = failedUDP
+		}
+		if _, ok := failedPorts[st.Rule.ListenPort]; ok && st.Served {
 			st.Served = false
 			st.Reason = IngressReasonListenFailed
 		}
@@ -351,10 +430,16 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 	m.signalReport()
 	m.mu.Unlock()
 
-	// Wait for the accept loops of closed listeners outside the lock.
+	// Wait for the accept loops of closed listeners and the read loops of
+	// closed UDP sockets outside the lock: a read loop takes mu to record a
+	// dial.
 	for _, l := range closed {
 		<-l.done
-		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port)
+		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port, "protocol", api.IngressProtocolTCP)
+	}
+	for _, l := range closedUDP {
+		<-l.done
+		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port, "protocol", api.IngressProtocolUDP)
 	}
 
 	m.loadCertificates(ctx)
@@ -394,6 +479,7 @@ func (m *IngressManager) logRuleChanges(states []IngressRuleState) {
 			"component", "bridge",
 			"rule_id", r.ID,
 			"slug", r.Slug,
+			"protocol", r.Protocol,
 			"listen_port", r.ListenPort,
 			"reason", st.Reason,
 			"detail", st.Detail,
@@ -415,6 +501,7 @@ func (m *IngressManager) logRule(msg string, r api.IngressRule) {
 		"component", "bridge",
 		"rule_id", r.ID,
 		"slug", r.Slug,
+		"protocol", r.Protocol,
 		"listen_port", r.ListenPort,
 		"mode", r.Mode,
 		"sni_host", r.SNIHost,
@@ -422,11 +509,31 @@ func (m *IngressManager) logRule(msg string, r api.IngressRule) {
 	)
 }
 
+// logListenFailed logs a failed bind of port for protocol, tcp or udp, with
+// the hint that a missing CAP_NET_BIND_SERVICE explains a permission error
+// below 1024, which covers both protocols.
+func (m *IngressManager) logListenFailed(port int, protocol string, err error) {
+	attrs := []any{"component", "bridge", "listen_port", port, "protocol", protocol, "error", err}
+	if port < 1024 && errors.Is(err, fs.ErrPermission) {
+		attrs = append(attrs, "hint", lowPortHint)
+	}
+	m.logger.Error("bridge: ingress: listen failed", attrs...)
+}
+
 // sortedListeners returns the listeners by port. The caller holds mu.
 func (m *IngressManager) sortedListeners() []*ingressListener {
 	out := make([]*ingressListener, 0, len(m.listeners))
 	for _, port := range slices.Sorted(maps.Keys(m.listeners)) {
 		out = append(out, m.listeners[port])
+	}
+	return out
+}
+
+// sortedUDPListeners returns the UDP sockets by port. The caller holds mu.
+func (m *IngressManager) sortedUDPListeners() []*udpIngressListener {
+	out := make([]*udpIngressListener, 0, len(m.udp))
+	for _, port := range slices.Sorted(maps.Keys(m.udp)) {
+		out = append(out, m.udp[port])
 	}
 	return out
 }

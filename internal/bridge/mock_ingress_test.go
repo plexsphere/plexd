@@ -33,6 +33,8 @@ type mockIngressController struct {
 
 	// listenFn allows custom listener creation for tests that need real TCP.
 	listenFn func(addr string, tlsCfg *tls.Config) (net.Listener, error)
+	// listenUDPFn allows custom socket creation for tests that need real UDP.
+	listenUDPFn func(addr string) (*net.UDPConn, error)
 }
 
 func (m *mockIngressController) Listen(addr string, tlsCfg *tls.Config) (net.Listener, error) {
@@ -72,6 +74,22 @@ func (m *mockIngressController) Close(listener net.Listener) error {
 	return nil
 }
 
+func (m *mockIngressController) ListenUDP(addr string) (*net.UDPConn, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockIngressCall{Method: "ListenUDP", Args: []interface{}{addr}})
+	listenUDPFn := m.listenUDPFn
+	m.mu.Unlock()
+	if listenUDPFn != nil {
+		return listenUDPFn(addr)
+	}
+	// Default: create a real UDP socket for basic tests
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp", udpAddr)
+}
+
 func (m *mockIngressController) ingressCallsFor(method string) []mockIngressCall {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -89,13 +107,18 @@ var _ IngressController = (*mockIngressController)(nil)
 
 // loopbackIngressController records calls like mockIngressController and binds
 // 127.0.0.1:0 for each port it is asked to listen on, so a test names port 443
-// and dials the ephemeral port addr returns.
+// and dials the ephemeral port addr returns. It binds a UDP socket on a port
+// of its own for each port ListenUDP is asked for, which udpAddr returns, and
+// never a port number the kernel picked for TCP: windows-latest refuses UDP on
+// one of those (plexd#221).
 type loopbackIngressController struct {
 	*mockIngressController
 
-	lmu      sync.Mutex
-	addrs    map[int]string
-	failures map[int]error
+	lmu         sync.Mutex
+	addrs       map[int]string
+	failures    map[int]error
+	udpAddrs    map[int]string
+	udpFailures map[int]error
 }
 
 func newLoopbackIngressController(t *testing.T) *loopbackIngressController {
@@ -104,6 +127,8 @@ func newLoopbackIngressController(t *testing.T) *loopbackIngressController {
 		mockIngressController: &mockIngressController{},
 		addrs:                 make(map[int]string),
 		failures:              make(map[int]error),
+		udpAddrs:              make(map[int]string),
+		udpFailures:           make(map[int]error),
 	}
 	c.listenFn = func(addr string, _ *tls.Config) (net.Listener, error) {
 		_, portStr, err := net.SplitHostPort(addr)
@@ -126,6 +151,27 @@ func newLoopbackIngressController(t *testing.T) *loopbackIngressController {
 		c.addrs[port] = ln.Addr().String()
 		return ln, nil
 	}
+	c.listenUDPFn = func(addr string) (*net.UDPConn, error) {
+		_, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, err
+		}
+		c.lmu.Lock()
+		defer c.lmu.Unlock()
+		if err := c.udpFailures[port]; err != nil {
+			return nil, err
+		}
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			return nil, err
+		}
+		c.udpAddrs[port] = conn.LocalAddr().String()
+		return conn, nil
+	}
 	return c
 }
 
@@ -134,6 +180,35 @@ func (c *loopbackIngressController) addr(port int) string {
 	c.lmu.Lock()
 	defer c.lmu.Unlock()
 	return c.addrs[port]
+}
+
+// udpAddr returns the address the UDP socket for port was last bound to.
+func (c *loopbackIngressController) udpAddr(port int) string {
+	c.lmu.Lock()
+	defer c.lmu.Unlock()
+	return c.udpAddrs[port]
+}
+
+// failListenUDP makes every ListenUDP for port fail with err; a nil err lets
+// it bind again.
+func (c *loopbackIngressController) failListenUDP(port int, err error) {
+	c.lmu.Lock()
+	defer c.lmu.Unlock()
+	if err == nil {
+		delete(c.udpFailures, port)
+		return
+	}
+	c.udpFailures[port] = err
+}
+
+// listenUDPAddrs returns the address argument of every ListenUDP call, in
+// order.
+func (c *loopbackIngressController) listenUDPAddrs() []string {
+	var out []string
+	for _, call := range c.ingressCallsFor("ListenUDP") {
+		out = append(out, call.Args[0].(string))
+	}
+	return out
 }
 
 // failListen makes every Listen for port fail with err; a nil err lets it
@@ -342,4 +417,141 @@ func (p *fakeDialPolicy) askedWith() []dialQuestion {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]dialQuestion(nil), p.questions...)
+}
+
+// scriptedRead is what one read of a scriptedFlowConn returns.
+type scriptedRead struct {
+	payload []byte
+	from    netip.AddrPort
+	err     error
+}
+
+// scriptedSend is one datagram a scriptedFlowConn was asked to send.
+type scriptedSend struct {
+	payload []byte
+	to      netip.AddrPort
+}
+
+// scriptedFlowConn is a udpFlowConn for the scripted tests. Each send is
+// recorded and returns the next error of sendErrs, nil once they run out. A
+// read returns what the test hands to read, blocking until then, and
+// net.ErrClosed once the conn is closed; a send after the close fails with
+// net.ErrClosed as well. It ignores read deadlines, so a flow on it is never
+// idle.
+type scriptedFlowConn struct {
+	reads  chan scriptedRead
+	closed chan struct{}
+	once   sync.Once
+
+	mu       sync.Mutex
+	sendErrs []error
+	sends    []scriptedSend
+}
+
+var _ udpFlowConn = (*scriptedFlowConn)(nil)
+
+func newScriptedFlowConn(sendErrs ...error) *scriptedFlowConn {
+	return &scriptedFlowConn{
+		reads:    make(chan scriptedRead),
+		closed:   make(chan struct{}),
+		sendErrs: sendErrs,
+	}
+}
+
+func (c *scriptedFlowConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
+	select {
+	case r := <-c.reads:
+		return copy(b, r.payload), r.from, r.err
+	case <-c.closed:
+		return 0, netip.AddrPort{}, &net.OpError{Op: "read", Net: "udp", Err: net.ErrClosed}
+	}
+}
+
+func (c *scriptedFlowConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+	if c.isClosed() {
+		return 0, &net.OpError{Op: "write", Net: "udp", Err: net.ErrClosed}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sends = append(c.sends, scriptedSend{payload: bytes.Clone(b), to: addr})
+	if len(c.sendErrs) == 0 {
+		return len(b), nil
+	}
+	err := c.sendErrs[0]
+	c.sendErrs = c.sendErrs[1:]
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *scriptedFlowConn) SetReadDeadline(time.Time) error { return nil }
+
+func (c *scriptedFlowConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+// isClosed reports whether the conn was closed.
+func (c *scriptedFlowConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// sent returns every datagram the conn was asked to send, in order.
+func (c *scriptedFlowConn) sent() []scriptedSend {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]scriptedSend(nil), c.sends...)
+}
+
+// read hands r to the next read of the conn, waiting up to 2 s for one.
+func (c *scriptedFlowConn) read(t *testing.T, r scriptedRead) {
+	t.Helper()
+	select {
+	case c.reads <- r:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no read of the scripted flow socket within 2s")
+	}
+}
+
+// openStep is how a scriptedFlowOpener answers one open: with err, or with
+// conn.
+type openStep struct {
+	conn *scriptedFlowConn
+	err  error
+}
+
+// scriptedFlowOpener replaces IngressManager.openUDP. Each open records its
+// target and answers with the next of steps; once they run out it fails.
+type scriptedFlowOpener struct {
+	mu      sync.Mutex
+	steps   []openStep
+	targets []netip.AddrPort
+}
+
+func (o *scriptedFlowOpener) open(target netip.AddrPort) (udpFlowConn, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.targets = append(o.targets, target)
+	if len(o.steps) == 0 {
+		return nil, errors.New("scripted: no flow socket left")
+	}
+	step := o.steps[0]
+	o.steps = o.steps[1:]
+	if step.err != nil {
+		return nil, step.err
+	}
+	return step.conn, nil
+}
+
+// opened returns the target of every open so far, in order.
+func (o *scriptedFlowOpener) opened() []netip.AddrPort {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]netip.AddrPort(nil), o.targets...)
 }
