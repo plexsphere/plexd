@@ -145,7 +145,14 @@ type UserAccessManager struct {
 	// invalidIDs holds the "user access provider down" lines of the last
 	// Apply for entries without state, so each is logged once.
 	invalidIDs map[string]struct{}
+
+	// changed carries ReportChanged's signal; capacity 1.
+	changed chan struct{}
 }
+
+// userAccessConnectedAge is the oldest handshake that counts a device of a
+// wireguard provider as connected.
+const userAccessConnectedAge = 180 * time.Second
 
 // userAccessProvider is what the manager holds for one provider of the block.
 // Its fields are read and written under the manager's mu while the manager
@@ -226,6 +233,7 @@ func NewUserAccessManager(deps UserAccessDeps) *UserAccessManager {
 		meshCIDR:  deps.MeshCIDR,
 		logger:    deps.Logger,
 		now:       time.Now,
+		changed:   make(chan struct{}, 1),
 	}
 }
 
@@ -255,8 +263,10 @@ func (m *UserAccessManager) Setup() error {
 // interface, cancels the context the clients run under and marks the manager
 // inactive. It keeps the key files, so a provider comes back with its key
 // after a restart. Errors are joined; the cleanup continues past a failure.
-// Idempotent: calling Teardown when inactive returns nil.
+// Idempotent: calling Teardown when inactive returns nil. It signals
+// ReportChanged when it returns.
 func (m *UserAccessManager) Teardown() error {
+	defer m.signalReport()
 	m.mu.Lock()
 	if !m.active {
 		m.mu.Unlock()
@@ -304,8 +314,10 @@ func (m *UserAccessManager) Teardown() error {
 //   - A new provider is brought up, in block order.
 //
 // A provider that cannot be brought up is down with its reason, and Retry
-// tries again when the reason allows it.
+// tries again when the reason allows it. Apply signals ReportChanged when it
+// returns, after every join it started.
 func (m *UserAccessManager) Apply(ctx context.Context, block api.UserAccessConfig) {
+	defer m.signalReport()
 	m.mu.Lock()
 	if !m.active {
 		m.mu.Unlock()
@@ -414,8 +426,9 @@ func (m *UserAccessManager) SyncSecretInventory(ctx context.Context, inventory [
 // 5 s, doubling per consecutive failure to 60 s, or the Retry-After of an API
 // error when that is longer. invalid_provider and kind_not_served are not
 // retried until the entry changes. It does nothing while the manager is not
-// active.
+// active. It signals ReportChanged when it returns.
 func (m *UserAccessManager) Retry(ctx context.Context) {
+	defer m.signalReport()
 	m.mu.Lock()
 	if !m.active {
 		m.mu.Unlock()
@@ -447,10 +460,98 @@ func retryable(reason string) bool {
 	return false
 }
 
+// ProviderReports returns one report per provider of the last applied block
+// with a valid id no earlier entry carried, in block order, and nil while the
+// manager is not active. A provider whose first attempt has no outcome yet, a
+// vendor provider joining for the first time, is left out until it has one.
+//
+// A provider that is down reports its reason. A wireguard provider that is up
+// reports the public key of its interface and how many of the devices
+// configured on it completed a handshake at most 180 s ago on the manager's
+// clock, read with one PeerHandshakes call per such provider; a failed read
+// counts none.
+func (m *UserAccessManager) ProviderReports() []UserAccessProviderReport {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active {
+		return nil
+	}
+	out := make([]UserAccessProviderReport, 0, len(m.providers))
+	for _, p := range m.providers {
+		if !p.settled {
+			continue
+		}
+		r := UserAccessProviderReport{
+			ProviderID: p.entry.ID,
+			Kind:       p.entry.Kind,
+			Health:     api.UserAccessHealthDown,
+			Reason:     p.reason,
+		}
+		if p.up {
+			r.Health = api.UserAccessHealthUp
+			r.PublicKey = p.publicKey
+			r.ConnectedDevices = m.connectedDevicesLocked(p)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// ReportChanged returns the channel the manager signals, without blocking,
+// when what ProviderReports returns may have changed: at the end of every
+// Apply, every Retry, and so every SyncSecretInventory, and Teardown. Several
+// signals before the reader wakes collapse into one. The signals are liberal;
+// the reader compares before it acts. A change of connected devices alone
+// signals nothing.
+func (m *UserAccessManager) ReportChanged() <-chan struct{} {
+	return m.changed
+}
+
+// signalReport signals ReportChanged without blocking: a full channel already
+// carries the signal.
+func (m *UserAccessManager) signalReport() {
+	select {
+	case m.changed <- struct{}{}:
+	default:
+	}
+}
+
+// connectedDevicesLocked returns how many devices configured on the interface
+// of p, a wireguard provider that is up, completed a handshake at most
+// userAccessConnectedAge ago on the manager's clock. It reads the interface
+// once; a failed read counts none and is logged at Debug. Any other provider
+// counts none. The caller holds mu.
+func (m *UserAccessManager) connectedDevicesLocked(p *userAccessProvider) int {
+	if !p.up || p.entry.Kind != api.UserAccessKindWireGuard {
+		return 0
+	}
+	handshakes, err := m.access.PeerHandshakes(p.iface)
+	if err != nil {
+		m.logger.Debug("bridge: user access: read handshakes failed",
+			"component", "bridge",
+			"provider_id", p.entry.ID,
+			"interface", p.iface,
+			"error", err,
+		)
+		return 0
+	}
+	now := m.now()
+	n := 0
+	for pk := range p.devices {
+		// wgctrl gives a zero time for a peer that never completed a
+		// handshake.
+		if at, ok := handshakes[pk]; ok && !at.IsZero() && now.Sub(at) <= userAccessConnectedAge {
+			n++
+		}
+	}
+	return n
+}
+
 // UserAccessStatus returns the user access status for the node API's
 // status.user-access report: the Enabled of the last applied block and one
-// entry per provider the manager holds, in block order. It returns nil while
-// the manager is not active.
+// entry per provider the manager holds, in block order, with the count of
+// connected devices ProviderReports reports. It returns nil while the manager
+// is not active.
 func (m *UserAccessManager) UserAccessStatus() *api.UserAccessInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -474,6 +575,7 @@ func (m *UserAccessManager) UserAccessStatus() *api.UserAccessInfo {
 		}
 		if p.up {
 			pi.Health = api.UserAccessHealthUp
+			pi.ConnectedDevices = m.connectedDevicesLocked(p)
 		}
 		if p.entry.Kind == api.UserAccessKindWireGuard {
 			pi.ListenPort = p.entry.ListenPort
