@@ -302,20 +302,26 @@ func requireNoSignal(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
+// dialQuestion is one question a fakeDialPolicy was asked.
+type dialQuestion struct {
+	protocol string
+	target   netip.AddrPort
+}
+
 // fakeDialPolicy is an IngressDialPolicy that answers denied and records
-// every target it was asked about.
+// every protocol and target it was asked about.
 type fakeDialPolicy struct {
-	mu      sync.Mutex
-	denied  bool
-	targets []netip.AddrPort
+	mu        sync.Mutex
+	denied    bool
+	questions []dialQuestion
 }
 
 var _ IngressDialPolicy = (*fakeDialPolicy)(nil)
 
-func (p *fakeDialPolicy) DialDenied(target netip.AddrPort) bool {
+func (p *fakeDialPolicy) DialDenied(protocol string, target netip.AddrPort) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.targets = append(p.targets, target)
+	p.questions = append(p.questions, dialQuestion{protocol: protocol, target: target})
 	return p.denied
 }
 
@@ -323,5 +329,17 @@ func (p *fakeDialPolicy) DialDenied(target netip.AddrPort) bool {
 func (p *fakeDialPolicy) asked() []netip.AddrPort {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]netip.AddrPort(nil), p.targets...)
+	targets := make([]netip.AddrPort, 0, len(p.questions))
+	for _, q := range p.questions {
+		targets = append(targets, q.target)
+	}
+	return targets
+}
+
+// askedWith returns every protocol and target the policy was asked about, in
+// order.
+func (p *fakeDialPolicy) askedWith() []dialQuestion {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]dialQuestion(nil), p.questions...)
 }

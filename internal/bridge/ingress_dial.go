@@ -11,10 +11,12 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// IngressDialPolicy tells whether the node's compiled policy blocks a TCP dial
-// to target.
+// IngressDialPolicy tells whether the node's compiled policy blocks a dial to
+// target.
 type IngressDialPolicy interface {
-	DialDenied(target netip.AddrPort) bool
+	// DialDenied reports whether the compiled policy blocks a dial of
+	// protocol, tcp or udp, to target.
+	DialDenied(protocol string, target netip.AddrPort) bool
 }
 
 // The reasons of a failed dial in an ingress status report, in the order they
@@ -74,20 +76,21 @@ func (m *IngressManager) dialTarget(route *ingressRoute) (net.Conn, error) {
 }
 
 // recordDial records the outcome of a dial to route's target, err being the
-// dial's error, and returns the reason of a failed dial. It records nothing
-// and returns "" once the route's context is done: the rule changed or was
-// removed, or the manager was torn down, and err is context.Canceled or
-// belongs to a target the rule no longer names. A record whose outcome or
-// reason differs from the one before signals ReportChanged.
-func (m *IngressManager) recordDial(route *ingressRoute, err error) string {
+// dial's error, and returns the reason of a failed dial and whether the record
+// changed: it is new, or its target, outcome or reason differs from the one
+// before. A changed record signals ReportChanged. It records nothing and
+// returns "" and false once the route's context is done: the rule changed or
+// was removed, or the manager was torn down, and err is context.Canceled or
+// belongs to a target the rule no longer names.
+func (m *IngressManager) recordDial(route *ingressRoute, err error) (reason string, changed bool) {
 	if route.ctx.Err() != nil {
-		return ""
+		return "", false
 	}
 	rec := dialRecord{target: route.target}
 	if err != nil {
 		// Named outside mu: the policy asks the kernel for a route and the
 		// Enforcer for its rules.
-		rec.failed, rec.reason = true, m.dialReason(route.target, err)
+		rec.failed, rec.reason = true, m.dialReason(route.rule.Protocol, route.target, err)
 	}
 
 	m.mu.Lock()
@@ -95,22 +98,24 @@ func (m *IngressManager) recordDial(route *ingressRoute, err error) string {
 	// Apply, renewRoutesLocked and Teardown cancel a route under mu, so a
 	// route that is live here is still the rule's.
 	if route.ctx.Err() != nil || !m.active {
-		return ""
+		return "", false
 	}
 	rec.at = m.now()
 	old, ok := m.dials[route.rule.ID]
 	m.dials[route.rule.ID] = rec
-	if !ok || old.target != rec.target || old.failed != rec.failed || old.reason != rec.reason {
+	changed = !ok || old.target != rec.target || old.failed != rec.failed || old.reason != rec.reason
+	if changed {
 		m.signalReport()
 	}
-	return rec.reason
+	return rec.reason, changed
 }
 
-// dialReason names a failed dial to target: policy_denied when the dial
-// policy blocks it, and otherwise what classifyDialError makes of err.
-func (m *IngressManager) dialReason(target string, err error) string {
+// dialReason names a failed dial of protocol, tcp or udp, to target:
+// policy_denied when the dial policy blocks it, and otherwise what
+// classifyDialError makes of err.
+func (m *IngressManager) dialReason(protocol, target string, err error) string {
 	if m.dialPolicy != nil {
-		if addr, perr := netip.ParseAddrPort(target); perr == nil && m.dialPolicy.DialDenied(addr) {
+		if addr, perr := netip.ParseAddrPort(target); perr == nil && m.dialPolicy.DialDenied(protocol, addr) {
 			return IngressDialReasonPolicyDenied
 		}
 	}
