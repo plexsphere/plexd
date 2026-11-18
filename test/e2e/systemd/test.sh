@@ -51,6 +51,18 @@
 #     provider whose interface and key file go, and the opt-out with
 #     bridge.user_access_enabled: false, which serves no provider, keeps the
 #     keys, reports opted_out and names an ignored local key
+#   - Site-to-site through a bridge: a wireguard tunnel on an interface of
+#     its own with a route for the site's network and a key file that
+#     survives a restart and a killed process, a site that reaches a mesh
+#     node once it takes the reported key and arrives there with the
+#     bridge's mesh address, a mesh node that reaches the site only once the
+#     policy allows it and arrives there with its own address, a preshared
+#     key from a Secret once the inventory lists it, tunnels reported
+#     bind_failed on the port plexd0 holds, remote_host_unresolved for a
+#     name that does not resolve and client_missing for an openvpn tunnel, a
+#     removed tunnel whose interface, route and key file go, and the opt-out
+#     with bridge.site_to_site_enabled: false, which serves no tunnel, keeps
+#     the keys, reports opted_out and names an ignored local key
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -71,6 +83,8 @@ PEBBLE_IMAGE="ghcr.io/letsencrypt/pebble:2.10.3@sha256:0c81f05db371f436c97fb894b
 # meshpeer image.
 UA_MESHNODE_CONTAINER="plexd-e2e-meshnode"
 UA_DEVICE_CONTAINER="plexd-e2e-device"
+# The site-to-site phase's remote site, of the same image.
+S2S_SITE_CONTAINER="plexd-e2e-site"
 TIMEOUT="${TIMEOUT:-60}"
 TEST_FAILED=1
 # Set while the mesh DNS phase holds the mock API container paused, so a
@@ -160,6 +174,8 @@ print_diagnostics() {
     echo "==> User access mesh node and device wg show:"
     docker exec "${UA_MESHNODE_CONTAINER}" wg show 2>&1 || true
     docker exec "${UA_DEVICE_CONTAINER}" wg show 2>&1 || true
+    echo "==> Site-to-site site wg show:"
+    docker exec "${S2S_SITE_CONTAINER}" wg show 2>&1 || true
     echo "--- End diagnostics ---"
 }
 
@@ -192,6 +208,7 @@ cleanup() {
     docker rm -f "${PEBBLE_CONTAINER}" 2>/dev/null || true
     docker rm -f "${UA_MESHNODE_CONTAINER}" 2>/dev/null || true
     docker rm -f "${UA_DEVICE_CONTAINER}" 2>/dev/null || true
+    docker rm -f "${S2S_SITE_CONTAINER}" 2>/dev/null || true
     docker network rm "${NETWORK_NAME}" 2>/dev/null || true
     rm -f "${REPO_ROOT}/plexd-linux-amd64"
 }
@@ -213,6 +230,7 @@ docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
 docker rm -f "${PEBBLE_CONTAINER}" 2>/dev/null || true
 docker rm -f "${UA_MESHNODE_CONTAINER}" 2>/dev/null || true
 docker rm -f "${UA_DEVICE_CONTAINER}" 2>/dev/null || true
+docker rm -f "${S2S_SITE_CONTAINER}" 2>/dev/null || true
 docker network rm "${NETWORK_NAME}" 2>/dev/null || true
 
 # --- Build images ---
@@ -3521,6 +3539,559 @@ fi
 echo "  PASS: plexd logged no 'user access status: send failed'"
 echo "=== User access through a bridge PASSED ==="
 
+# --- Site-to-site through a bridge ---
+# The bridge of the user access phase, opted out of user access and without
+# bridge.site_to_site_enabled, serves the site-to-site tunnels the mock's
+# bridge.site_to_site block lists. A third container of the meshpeer image
+# joins the suite's network as the remote site: it holds 10.40.0.1/16 on a
+# WireGuard interface with a key of its own, listens on UDP 51940 and on TCP
+# 7201, and routes 10.99.0.0/24 into that interface. The mesh node of the
+# user access phase, the fixture's peer ...a0b2 at 10.99.0.3, gets a route
+# for 10.40.0.0/16 to the bridge by hand, since it runs no plexd. The phase
+# ends with bridge.site_to_site_enabled: false, the opt-out.
+echo "=== Testing site-to-site through a bridge ==="
+docker run -d --name "${S2S_SITE_CONTAINER}" --network "${NETWORK_NAME}" --cap-add NET_ADMIN --init \
+    "${INGRESS_TARGET_IMAGE}" >/dev/null
+S2S_SITE_IP=$(container_ip "${S2S_SITE_CONTAINER}")
+if [ -z "${S2S_SITE_IP}" ]; then
+    fail "could not read the address of ${S2S_SITE_CONTAINER}"
+fi
+S2S_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+
+# s2s_journal leaves the plexd unit's journal in S2S_JOURNAL.
+s2s_journal() {
+    S2S_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) \
+        || fail "journalctl -u plexd failed: ${S2S_JOURNAL}"
+}
+
+# s2s_nudge <tag> nudges plexd into a pull, as configure_user_access does,
+# with an event id of its own on every call.
+S2S_NUDGES=0
+s2s_nudge() {
+    local tag=$1 status
+    S2S_NUDGES=$((S2S_NUDGES + 1))
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-site-to-site-nudge-${tag}-${S2S_NUDGES}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] site-to-site nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# configure_site_to_site <tag> <tunnels-json or null> [secrets-json] serves
+# the tunnels as an enabled bridge.site_to_site block, or no block for null,
+# and leaves the rest of the bridge block as it is. With a third argument it
+# also replaces the snapshot's secret inventory.
+configure_site_to_site() {
+    local tag=$1 tunnels=$2 secrets=${3:-} set_secrets=false snapshot spliced status
+    if [ "$#" -ge 3 ]; then
+        set_secrets=true
+    fi
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson t "${tunnels}" \
+        --arg secrets "${secrets}" --argjson set_secrets "${set_secrets}" \
+        '.bridge.site_to_site = (if $t == null then null else {enabled: true, tunnels: $t} end)
+         | if $set_secrets then .secrets = ($secrets | fromjson) else . end') \
+        || fail "[${tag}] could not splice the tunnels into the live snapshot"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    s2s_nudge "${tag}"
+}
+
+# wait_site_to_site_report <tag> <what> <jq-filter> [jq-args...] waits until
+# the last site-to-site status report matches the filter and leaves it in
+# S2S_REPORT. It waits S2S_REPORT_WAIT seconds, 60 unless set. Whether the
+# remote site answers raises no report of its own, and a tunnel that is down
+# is retried only from a pull: the report follows either with the next pull
+# or on the heartbeat interval. So every 10 s of waiting it nudges plexd into
+# a pull.
+wait_site_to_site_report() {
+    local tag=$1 what=$2 filter=$3 start=${SECONDS} nudged=${SECONDS} wait=${S2S_REPORT_WAIT:-60}
+    shift 3
+    while :; do
+        S2S_REPORT=$(curl -sf "http://localhost:18080/test/last-request/site-to-site-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+        if [ -n "${S2S_REPORT}" ] && printf '%s' "${S2S_REPORT}" | jq -e "$@" "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${tag}] the last site-to-site status report shows ${what}"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge "${wait}" ]; then
+            fail "[${tag}] ${wait}s on, the last site-to-site status report is '${S2S_REPORT}', want one that shows ${what}"
+        fi
+        if [ $((SECONDS - nudged)) -ge 10 ]; then
+            s2s_nudge "${tag}"
+            nudged=${SECONDS}
+        fi
+        sleep 2
+    done
+}
+
+# s2s_probe succeeds when the site opens a TCP connection to port 7101 of the
+# mesh node through the bridge.
+s2s_probe() {
+    docker exec "${S2S_SITE_CONTAINER}" nc -z -w 3 10.99.0.3 7101 2>/dev/null
+}
+
+# s2s_wait_probe <tag> waits up to 60s for the probe to succeed.
+s2s_wait_probe() {
+    local tag=$1 start=${SECONDS}
+    until s2s_probe; do
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            fail "[${tag}] the site reached no listener at 10.99.0.3:7101 through the bridge within 60s; site wg0: $(docker exec "${S2S_SITE_CONTAINER}" wg show wg0 2>&1)"
+        fi
+        sleep 2
+    done
+    echo "  PASS: [${tag}] the site reaches 10.99.0.3:7101 through the bridge"
+}
+
+# s2s_mesh_probe succeeds when the mesh node opens a TCP connection to port
+# 7201 of the site through the bridge.
+s2s_mesh_probe() {
+    docker exec "${UA_MESHNODE_CONTAINER}" nc -z -w 3 10.40.0.1 7201 2>/dev/null
+}
+
+# s2s_listener <container> <tag> waits up to 30s for the listener log of the
+# container, /tmp/listen.log, to record a connection and leaves the log in
+# S2S_LISTEN. The mesh node's listener looks up the name of each peer before
+# it logs it.
+s2s_listener() {
+    local container=$1 tag=$2 start=${SECONDS}
+    while :; do
+        S2S_LISTEN=$(docker exec "${container}" cat /tmp/listen.log 2>&1) \
+            || fail "[${tag}] reading the listener log of ${container} failed: ${S2S_LISTEN}"
+        case "${S2S_LISTEN}" in
+            *"Connection received on "*) return 0 ;;
+        esac
+        if [ $((SECONDS - start)) -ge 30 ]; then
+            fail "[${tag}] the listener of ${container} logged no connection within 30s: '${S2S_LISTEN}'"
+        fi
+        sleep 2
+    done
+}
+
+# s2s_tunnel <id> <slug> <listen-port> <allowed-subnet> [remote-host] [auth-secret-name]
+# prints a wireguard tunnel to port 51940 of the site under the site's key, at
+# the site's address unless a remote host is given.
+s2s_tunnel() {
+    jq -cn --arg id "$1" --arg slug "$2" --argjson port "$3" --arg subnet "$4" \
+        --arg host "${5:-${S2S_SITE_IP}}" --arg key "${S2S_SITE_PUBKEY}" --arg secret "${6:-}" \
+        '{id: $id, slug: $slug, kind: "wireguard", remote_host: $host, remote_port: 51940,
+          allowed_subnets: [$subnet], listen_port: $port, remote_public_key: $key}
+         + (if $secret == "" then {} else {auth_secret_name: $secret} end)'
+}
+
+S2S_BRANCH_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1e1"
+S2S_BRANCH_IFACE="wg-s2s-a0a0a1e1"
+S2S_CLASH_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1e2"
+S2S_UNRESOLVED_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1e3"
+S2S_OVPN_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1e4"
+S2S_KEPT_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1e5"
+S2S_KEY_DIR="/var/lib/plexd/site-to-site"
+
+# The site: 10.40.0.1/16 on wg0 with a key of its own and port 51940, and the
+# mesh routed into wg0. Its peer, the bridge, follows in step 3, once the
+# bridge reports the key of its tunnel interface. Its listener on 7201 logs
+# each peer's address without looking up a name.
+S2S_SITE_SETUP='
+umask 077
+wg genkey > /tmp/wg0.key
+ip link add wg0 type wireguard
+wg set wg0 listen-port 51940 private-key /tmp/wg0.key
+ip address add 10.40.0.1/16 dev wg0
+ip link set wg0 up
+ip route add 10.99.0.0/24 dev wg0
+wg pubkey < /tmp/wg0.key
+'
+S2S_SITE_OUT=$(docker exec "${S2S_SITE_CONTAINER}" sh -euc "${S2S_SITE_SETUP}" 2>&1) \
+    || fail "setting up wg0 in ${S2S_SITE_CONTAINER} failed: ${S2S_SITE_OUT}"
+S2S_SITE_PUBKEY=${S2S_SITE_OUT##*$'\n'}
+if [ "${#S2S_SITE_PUBKEY}" -ne 44 ]; then
+    fail "the site's wg0 setup printed '${S2S_SITE_OUT}', want its 44-character public key on the last line"
+fi
+docker exec -d "${S2S_SITE_CONTAINER}" sh -c 'nc -l -k -v -n 7201 >> /tmp/listen.log 2>&1'
+S2S_START=${SECONDS}
+until S2S_SITE_LISTEN=$(docker exec "${S2S_SITE_CONTAINER}" ss -ltn 2>&1) \
+    && case "${S2S_SITE_LISTEN}" in *"0.0.0.0:7201 "*) ;; *) false ;; esac; do
+    if [ $((SECONDS - S2S_START)) -ge 10 ]; then
+        fail "the site did not listen on 7201 within 10s: ${S2S_SITE_LISTEN}"
+    fi
+    sleep 1
+done
+echo "  PASS: the site at ${S2S_SITE_IP} listens on 7201"
+
+# The mesh node sends 10.40.0.0/16 to the bridge: the bridge's peer on its wg0
+# allows the network, and a route sends it into wg0.
+S2S_MESH_OUT=$(docker exec "${UA_MESHNODE_CONTAINER}" sh -euc '
+wg set wg0 peer "$1" allowed-ips 10.99.0.1/32,10.40.0.0/16
+ip route add 10.40.0.0/16 dev wg0
+' sh "${UA_PLEXD_PUBKEY}" 2>&1) || fail "routing 10.40.0.0/16 to the bridge in ${UA_MESHNODE_CONTAINER} failed: ${S2S_MESH_OUT}"
+
+# 1. Before any tunnel is served, the report carries no entries.
+wait_site_to_site_report none 'exactly {"state":"enabled"}' '. == {"state":"enabled"}'
+
+# 2. A wireguard tunnel comes up on an interface of its own, with a route for
+# the site's network and a key file of mode 600. The site does not know the
+# bridge's key yet, so the remote site does not answer.
+S2S_BRANCH=$(s2s_tunnel "${S2S_BRANCH_ID}" branch 51930 10.40.0.0/16)
+configure_site_to_site branch "[${S2S_BRANCH}]"
+wait_site_to_site_report branch "branch up with a public key and established false" \
+    '.state == "enabled" and (.tunnels | length) == 1
+     and (.tunnels[0] | .id == $id and .health == "up" and (.public_key | length) == 44
+          and .established == false and (has("reason") | not))' --arg id "${S2S_BRANCH_ID}"
+S2S_PUBKEY=$(printf '%s' "${S2S_REPORT}" | jq -r '.tunnels[0].public_key')
+if docker exec "${SYSTEMD_CONTAINER}" test -e "/sys/class/net/${S2S_BRANCH_IFACE}"; then
+    echo "  PASS: [branch] ${S2S_BRANCH_IFACE} exists"
+else
+    fail "[branch] ${S2S_BRANCH_IFACE} does not exist although the report shows branch up"
+fi
+S2S_ROUTE=$(bridge_netns ip -4 route show 10.40.0.0/16 2>&1) || fail "ip route show 10.40.0.0/16 failed: ${S2S_ROUTE}"
+case "${S2S_ROUTE}" in
+    *"10.40.0.0/16 dev ${S2S_BRANCH_IFACE} "*) echo "  PASS: [branch] the route for 10.40.0.0/16 names ${S2S_BRANCH_IFACE}" ;;
+    *) fail "[branch] ip route show 10.40.0.0/16 printed '${S2S_ROUTE}', want a route through ${S2S_BRANCH_IFACE}" ;;
+esac
+S2S_KEY_MODE=$(docker exec "${SYSTEMD_CONTAINER}" stat -c %a "${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key" 2>&1) \
+    || fail "stat ${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key failed: ${S2S_KEY_MODE}"
+if [ "${S2S_KEY_MODE}" != "600" ]; then
+    fail "${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key has mode ${S2S_KEY_MODE}, want 600"
+fi
+echo "  PASS: ${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key has mode 600"
+
+# 3. The site takes the reported key as its peer. The bridge reports that the
+# remote site answers, and the site reaches the mesh node, which sees the
+# bridge's mesh address: the bridge rewrites the source of what the tunnel
+# forwards into the mesh. The listener's log is emptied first, since the
+# user access phase left connections from 10.99.0.1 in it.
+S2S_PEER_OUT=$(docker exec "${S2S_SITE_CONTAINER}" sh -euc \
+    'wg set wg0 peer "$1" endpoint "$2" allowed-ips 10.99.0.0/24 persistent-keepalive 5' \
+    sh "${S2S_PUBKEY}" "${BRIDGE_IP}:51930" 2>&1) \
+    || fail "setting the bridge as the peer of the site's wg0 failed: ${S2S_PEER_OUT}"
+wait_site_to_site_report established "branch up and established" \
+    '.tunnels[]? | select(.id == $id) | .health == "up" and .established == true' --arg id "${S2S_BRANCH_ID}"
+docker exec "${UA_MESHNODE_CONTAINER}" sh -c ': > /tmp/listen.log' \
+    || fail "could not empty the listener log of ${UA_MESHNODE_CONTAINER}"
+s2s_wait_probe established
+s2s_listener "${UA_MESHNODE_CONTAINER}" established
+case "${S2S_LISTEN}" in
+    *"Connection received on 10.99.0.1 "*) echo "  PASS: [established] the mesh node's listener names the bridge's mesh address 10.99.0.1 as the peer" ;;
+    *) fail "[established] the mesh node's listener logged '${S2S_LISTEN}', want a connection from 10.99.0.1" ;;
+esac
+case "${S2S_LISTEN}" in
+    *10.40.0.*) fail "[established] the mesh node's listener logged '${S2S_LISTEN}', which names the site's own address" ;;
+esac
+
+# 4. The policy the user access phase left has no rule to 10.40.0.0/16, so
+# the bridge drops what the mesh node sends into the tunnel. A rule from the
+# mesh to the site's network lets it through, and the site sees the mesh
+# node's own address: the bridge's compiled policy filters mesh traffic into
+# the tunnel and leaves its source as it is.
+S2S_POLICY_BEFORE=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null | jq -c '.policy' 2>/dev/null || true)
+S2S_POLICY_ID=$(printf '%s' "${S2S_POLICY_BEFORE}" | jq -r '.revisions[0].policy_id // empty' 2>/dev/null || true)
+if [ -z "${S2S_POLICY_ID}" ]; then
+    fail "the live snapshot's policy block '${S2S_POLICY_BEFORE}' carries no revisions[0].policy_id"
+fi
+if printf '%s' "${S2S_POLICY_BEFORE}" | jq -e 'any(.rules[]; .destination_cidr == "10.40.0.0/16")' >/dev/null 2>&1; then
+    fail "the live policy '${S2S_POLICY_BEFORE}' already has a rule to 10.40.0.0/16"
+fi
+if s2s_mesh_probe; then
+    fail "[no-rule] the mesh node reached 10.40.0.1:7201 although no rule of the policy allows 10.40.0.0/16"
+fi
+echo "  PASS: [no-rule] the mesh node does not reach 10.40.0.1:7201 while no rule allows 10.40.0.0/16"
+S2S_POLICY_REV="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c8"
+S2S_RULES=$(printf '%s' "${S2S_POLICY_BEFORE}" \
+    | jq -c '.rules + [{protocol: "any", source_cidr: "10.99.0.0/24", destination_cidr: "10.40.0.0/16"}]') \
+    || fail "could not add the rule to 10.40.0.0/16 to the rules of '${S2S_POLICY_BEFORE}'"
+S2S_FP=$(docker exec "${S2S_SITE_CONTAINER}" sh -c 'set -o pipefail; printf "%s" "$1" | openssl dgst -sha256 -binary | base64' _ "${S2S_POLICY_REV}|${S2S_RULES}" 2>&1) \
+    || fail "could not compute a fingerprint in ${S2S_SITE_CONTAINER}: ${S2S_FP}"
+if [ "${#S2S_FP}" -ne 44 ]; then
+    fail "${S2S_SITE_CONTAINER} computed the fingerprint '${S2S_FP}', want 44 characters of base64"
+fi
+S2S_POLICY=$(jq -cn --arg r "${S2S_POLICY_REV}" --arg f "${S2S_FP}" --arg p "${S2S_POLICY_ID}" --argjson rules "${S2S_RULES}" \
+    '{revision_id: $r, fingerprint: $f, rules: $rules, revisions: [{policy_id: $p, revision_id: $r}]}')
+configure_policy site-to-site-allow "${S2S_POLICY}"
+S2S_START=${SECONDS}
+until s2s_journal && journal_has "${S2S_JOURNAL}" "plexd[${S2S_PID}]:" 'msg="policy ruleset applied"' "revision_id=${S2S_POLICY_REV}"; do
+    if [ $((SECONDS - S2S_START)) -ge 60 ]; then
+        fail "[allow] plexd[${S2S_PID}] logged no 'policy ruleset applied' for revision_id=${S2S_POLICY_REV} within 60s of the policy being served"
+    fi
+    sleep 2
+done
+echo "  PASS: [allow] plexd[${S2S_PID}] applied the policy with the rule from 10.99.0.0/24 to 10.40.0.0/16"
+S2S_START=${SECONDS}
+until s2s_mesh_probe; do
+    if [ $((SECONDS - S2S_START)) -ge 60 ]; then
+        fail "[allow] the mesh node reached no listener at 10.40.0.1:7201 through the bridge within 60s of the policy being applied"
+    fi
+    sleep 2
+done
+echo "  PASS: [allow] the mesh node reaches 10.40.0.1:7201 through the bridge"
+s2s_listener "${S2S_SITE_CONTAINER}" allow
+case "${S2S_LISTEN}" in
+    *"Connection received on 10.99.0.3 "*) echo "  PASS: [allow] the site's listener names the mesh node's address 10.99.0.3 as the peer" ;;
+    *) fail "[allow] the site's listener logged '${S2S_LISTEN}', want a connection from 10.99.0.3" ;;
+esac
+case "${S2S_LISTEN}" in
+    *"Connection received on 10.99.0.1 "*) fail "[allow] the site's listener logged '${S2S_LISTEN}', which names the bridge's mesh address" ;;
+esac
+
+# 5. The tunnel takes its preshared key from a Secret. While the inventory
+# does not list it, the tunnel is down; once it is listed, the bridge fetches
+# it and brings the tunnel up again with the kept key. The site, which still
+# holds the session of the interface the rebuild removed, sets the same
+# preshared key; the probe's packets make it start a new handshake once 15 s
+# pass without an answer.
+S2S_BRANCH=$(s2s_tunnel "${S2S_BRANCH_ID}" branch 51930 10.40.0.0/16 "" s2s-psk)
+configure_site_to_site psk-unlisted "[${S2S_BRANCH}]" '[]'
+wait_site_to_site_report psk-unlisted "branch down with auth_secret_not_listed" \
+    '.tunnels[]? | select(.id == $id) | .health == "down" and .reason == "auth_secret_not_listed"' \
+    --arg id "${S2S_BRANCH_ID}"
+S2S_PSK=$(docker exec "${S2S_SITE_CONTAINER}" wg genpsk 2>&1) || fail "wg genpsk in ${S2S_SITE_CONTAINER} failed: ${S2S_PSK}"
+if [ "${#S2S_PSK}" -ne 44 ]; then
+    fail "wg genpsk printed '${S2S_PSK}', want 44 characters of base64"
+fi
+S2S_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" \
+    -d "$(jq -cn --arg psk "${S2S_PSK}" '{secrets: [{name: "s2s-psk", version: 1, value: $psk}]}')" \
+    "http://localhost:18080/test/configure-secrets" 2>/dev/null || true)
+if [ "${S2S_STATUS}" != "204" ]; then
+    fail "[psk-listed] configure-secrets returned status ${S2S_STATUS}, want 204"
+fi
+configure_site_to_site psk-listed "[${S2S_BRANCH}]" '[{"name": "s2s-psk", "version": 1}]'
+wait_site_to_site_report psk-listed "branch up with the key of step 2" \
+    '.tunnels[]? | select(.id == $id) | .health == "up" and .public_key == $key' \
+    --arg id "${S2S_BRANCH_ID}" --arg key "${S2S_PUBKEY}"
+S2S_PSK_OUT=$(docker exec "${S2S_SITE_CONTAINER}" sh -euc \
+    'umask 077; printf "%s\n" "$2" > /tmp/wg0.psk; wg set wg0 peer "$1" preshared-key /tmp/wg0.psk' \
+    sh "${S2S_PUBKEY}" "${S2S_PSK}" 2>&1) \
+    || fail "setting the preshared key on the site's wg0 failed: ${S2S_PSK_OUT}"
+s2s_wait_probe psk
+wait_site_to_site_report psk "branch up and established with the preshared key" \
+    '.tunnels[]? | select(.id == $id) | .health == "up" and .established == true' --arg id "${S2S_BRANCH_ID}"
+
+# 6. A restart keeps the interface's key: the site answers again unchanged.
+# The report is read once the restarted process has sent one, so it is not
+# the last report of the process before. The site still holds the session of
+# the interface the restart removed, so the probe's packets make it start a
+# new handshake, after which the bridge reports the remote site answering.
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+S2S_RESTART_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+S2S_START=${SECONDS}
+while :; do
+    s2s_journal
+    if journal_has "${S2S_JOURNAL}" "plexd[${S2S_RESTART_PID}]:" 'msg="site-to-site tunnel up"' "tunnel_id=${S2S_BRANCH_ID}" \
+        && journal_has "${S2S_JOURNAL}" "plexd[${S2S_RESTART_PID}]:" 'msg="site-to-site status: reported"'; then
+        break
+    fi
+    if [ $((SECONDS - S2S_START)) -ge 60 ]; then
+        fail "[restart] within 60s of the restart plexd[${S2S_RESTART_PID}] logged no 'site-to-site tunnel up' for ${S2S_BRANCH_ID} or no 'site-to-site status: reported'"
+    fi
+    sleep 2
+done
+echo "  PASS: [restart] plexd[${S2S_RESTART_PID}] brought branch up again and reported"
+wait_site_to_site_report restart "branch up with the key of step 2" \
+    '.tunnels[]? | select(.id == $id) | .health == "up" and .public_key == $key' \
+    --arg id "${S2S_BRANCH_ID}" --arg key "${S2S_PUBKEY}"
+s2s_wait_probe restart
+wait_site_to_site_report restart "branch up and established again" \
+    '.tunnels[]? | select(.id == $id) | .health == "up" and .established == true' --arg id "${S2S_BRANCH_ID}"
+
+# 7. A killed process leaves its interface in the kernel. The process the unit
+# starts next removes it and brings the tunnel up again with the same key. The
+# signal goes to the main process alone, as in the user access phase; systemd
+# records the kill in one line, which the shutdown phase knows is no crash.
+docker exec "${SYSTEMD_CONTAINER}" systemctl kill --kill-whom=main -s KILL plexd
+S2S_KILLED_LINE="plexd.service: Sent signal SIGKILL to main process ${S2S_RESTART_PID} (plexd) on client request."
+if docker exec "${SYSTEMD_CONTAINER}" test -e "/sys/class/net/${S2S_BRANCH_IFACE}"; then
+    echo "  PASS: [kill] ${S2S_BRANCH_IFACE} is left in the kernel after the kill"
+else
+    fail "[kill] ${S2S_BRANCH_IFACE} is gone right after the kill, want it left behind by the killed process"
+fi
+S2S_START=${SECONDS}
+while :; do
+    S2S_KILL_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+    if [ -n "${S2S_KILL_PID}" ] && [ "${S2S_KILL_PID}" != "0" ] && [ "${S2S_KILL_PID}" != "${S2S_RESTART_PID}" ]; then
+        s2s_journal
+        if journal_has "${S2S_JOURNAL}" "plexd[${S2S_KILL_PID}]:" 'msg="site-to-site tunnel up"' "tunnel_id=${S2S_BRANCH_ID}" \
+            && journal_has "${S2S_JOURNAL}" "plexd[${S2S_KILL_PID}]:" 'msg="site-to-site status: reported"'; then
+            break
+        fi
+    fi
+    if [ $((SECONDS - S2S_START)) -ge 60 ]; then
+        fail "[kill] within 60s of the kill no restarted plexd logged 'site-to-site tunnel up' for ${S2S_BRANCH_ID} and 'site-to-site status: reported' (MainPID ${S2S_KILL_PID})"
+    fi
+    sleep 2
+done
+echo "  PASS: [kill] the unit restarted plexd as plexd[${S2S_KILL_PID}], which brought branch up and reported"
+if [ "$(journal_count "${S2S_JOURNAL}" "${S2S_KILLED_LINE}")" != "1" ]; then
+    fail "[kill] the journal holds $(journal_count "${S2S_JOURNAL}" "${S2S_KILLED_LINE}") lines '${S2S_KILLED_LINE}', want 1"
+fi
+echo "  PASS: [kill] systemd recorded the kill of plexd[${S2S_RESTART_PID}] once"
+if journal_has "${S2S_JOURNAL}" "plexd[${S2S_KILL_PID}]:" 'msg="site-to-site tunnel down"' "tunnel_id=${S2S_BRANCH_ID}"; then
+    fail "[kill] plexd[${S2S_KILL_PID}] logged 'site-to-site tunnel down' for ${S2S_BRANCH_ID}"
+fi
+echo "  PASS: [kill] plexd[${S2S_KILL_PID}] logged no 'site-to-site tunnel down' for branch"
+wait_site_to_site_report kill "branch up with the key of step 2" \
+    '.tunnels[]? | select(.id == $id) | .health == "up" and .public_key == $key' \
+    --arg id "${S2S_BRANCH_ID}" --arg key "${S2S_PUBKEY}"
+s2s_wait_probe kill
+
+# 8. Each further tunnel that cannot come up is down with its own reason, and
+# branch keeps serving: a wireguard tunnel on the port plexd0 holds, one
+# whose remote host does not resolve, and an openvpn tunnel, whose client the
+# image does not carry. The openvpn tunnel's link is a tun device, which
+# every runner has.
+S2S_CLASH=$(s2s_tunnel "${S2S_CLASH_ID}" clash 51820 10.41.0.0/16)
+configure_site_to_site clash "[${S2S_BRANCH}, ${S2S_CLASH}]"
+wait_site_to_site_report clash "clash down with bind_failed and branch up" \
+    '(.tunnels | map({key: .id, value: .}) | from_entries) as $t
+     | $t[$clash].health == "down" and $t[$clash].reason == "bind_failed"
+       and $t[$branch].health == "up"' \
+    --arg clash "${S2S_CLASH_ID}" --arg branch "${S2S_BRANCH_ID}"
+S2S_UNRESOLVED=$(s2s_tunnel "${S2S_UNRESOLVED_ID}" unresolved 51932 10.42.0.0/16 nosuch.invalid)
+configure_site_to_site unresolved "[${S2S_BRANCH}, ${S2S_CLASH}, ${S2S_UNRESOLVED}]"
+wait_site_to_site_report unresolved "unresolved down with remote_host_unresolved and branch up" \
+    '(.tunnels | map({key: .id, value: .}) | from_entries) as $t
+     | $t[$unresolved].health == "down" and $t[$unresolved].reason == "remote_host_unresolved"
+       and $t[$branch].health == "up"' \
+    --arg unresolved "${S2S_UNRESOLVED_ID}" --arg branch "${S2S_BRANCH_ID}"
+S2S_OVPN_KEY=$(docker exec "${S2S_SITE_CONTAINER}" sh -euc '
+set -o pipefail
+printf "%s\n" "-----BEGIN OpenVPN Static key V1-----"
+openssl rand -hex 256 | fold -w 32
+printf "%s\n" "-----END OpenVPN Static key V1-----"
+' 2>&1) || fail "generating an OpenVPN static key in ${S2S_SITE_CONTAINER} failed: ${S2S_OVPN_KEY}"
+case "${S2S_OVPN_KEY}" in
+    "-----BEGIN OpenVPN Static key V1-----"$'\n'*$'\n'"-----END OpenVPN Static key V1-----") ;;
+    *) fail "the site printed '${S2S_OVPN_KEY}', want an OpenVPN static key between its BEGIN and END lines" ;;
+esac
+S2S_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" \
+    -d "$(jq -cn --arg psk "${S2S_PSK}" --arg ovpn "${S2S_OVPN_KEY}" \
+        '{secrets: [{name: "s2s-psk", version: 1, value: $psk}, {name: "s2s-ovpn", version: 1, value: $ovpn}]}')" \
+    "http://localhost:18080/test/configure-secrets" 2>/dev/null || true)
+if [ "${S2S_STATUS}" != "204" ]; then
+    fail "[openvpn] configure-secrets returned status ${S2S_STATUS}, want 204"
+fi
+S2S_OVPN=$(jq -cn --arg id "${S2S_OVPN_ID}" --arg host "${S2S_SITE_IP}" \
+    '{id: $id, slug: "ovpn", kind: "openvpn", remote_host: $host, remote_port: 1194,
+      allowed_subnets: ["10.43.0.0/16"], auth_secret_name: "s2s-ovpn"}')
+configure_site_to_site openvpn "[${S2S_BRANCH}, ${S2S_CLASH}, ${S2S_UNRESOLVED}, ${S2S_OVPN}]" \
+    '[{"name": "s2s-psk", "version": 1}, {"name": "s2s-ovpn", "version": 1}]'
+wait_site_to_site_report openvpn "ovpn down with client_missing and branch up" \
+    '(.tunnels | map({key: .id, value: .}) | from_entries) as $t
+     | $t[$ovpn].health == "down" and $t[$ovpn].reason == "client_missing"
+       and $t[$branch].health == "up"' \
+    --arg ovpn "${S2S_OVPN_ID}" --arg branch "${S2S_BRANCH_ID}"
+
+# 9. Removed from the block, branch loses its interface, its route and its
+# key file, and the site no longer reaches the mesh node.
+configure_site_to_site remove "[${S2S_CLASH}, ${S2S_UNRESOLVED}, ${S2S_OVPN}]"
+wait_site_to_site_report remove "no entry for branch" \
+    '(.tunnels // []) | map(.id) | index($id) == null' --arg id "${S2S_BRANCH_ID}"
+S2S_START=${SECONDS}
+while docker exec "${SYSTEMD_CONTAINER}" test -e "/sys/class/net/${S2S_BRANCH_IFACE}"; do
+    if [ $((SECONDS - S2S_START)) -ge 30 ]; then
+        fail "[remove] ${S2S_BRANCH_IFACE} still exists 30s after branch left the block"
+    fi
+    sleep 2
+done
+echo "  PASS: [remove] ${S2S_BRANCH_IFACE} is gone"
+S2S_ROUTE=$(bridge_netns ip -4 route show 10.40.0.0/16 2>&1) || fail "ip route show 10.40.0.0/16 failed: ${S2S_ROUTE}"
+if [ -n "${S2S_ROUTE}" ]; then
+    fail "[remove] ip route show 10.40.0.0/16 printed '${S2S_ROUTE}' after branch left the block, want no route"
+fi
+echo "  PASS: [remove] no route for 10.40.0.0/16 is left"
+if docker exec "${SYSTEMD_CONTAINER}" test -e "${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key"; then
+    fail "[remove] ${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key still exists after branch left the block"
+fi
+echo "  PASS: [remove] ${S2S_KEY_DIR}/${S2S_BRANCH_ID}.key is gone"
+if s2s_probe; then
+    fail "[remove] the site still reaches 10.99.0.3:7101 after branch left the block"
+fi
+echo "  PASS: [remove] the site no longer reaches 10.99.0.3:7101"
+
+# 10. bridge.site_to_site_enabled: false opts the bridge out. The restarted
+# process serves no tunnel, removes the interfaces the last one left, keeps
+# their keys, reports opted_out and names the ignored local key.
+S2S_KEPT=$(s2s_tunnel "${S2S_KEPT_ID}" kept 51931 10.44.0.0/16)
+configure_site_to_site kept "[${S2S_CLASH}, ${S2S_UNRESOLVED}, ${S2S_OVPN}, ${S2S_KEPT}]"
+wait_site_to_site_report kept "kept up" \
+    '.tunnels[]? | select(.id == $id) | .health == "up"' --arg id "${S2S_KEPT_ID}"
+S2S_CONFIG=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/config.yaml 2>&1) || fail "could not read /etc/plexd/config.yaml: ${S2S_CONFIG}"
+S2S_LAST_TOP=""
+S2S_LAST_LINE=""
+while IFS= read -r line; do
+    case "${line}" in
+        "  site_to_site_enabled:"* | "  site_to_site_listen_port:"*) fail "/etc/plexd/config.yaml already has the line '${line}', so the opt-out cannot be appended" ;;
+        "" | " "* | "#"*) ;;
+        *) S2S_LAST_TOP=${line} ;;
+    esac
+    if [ -n "${line}" ]; then
+        S2S_LAST_LINE=${line}
+    fi
+done <<< "${S2S_CONFIG}"
+case "${S2S_LAST_LINE}" in
+    " "*) ;;
+    *) fail "the last line of /etc/plexd/config.yaml is '${S2S_LAST_LINE}', want an indented line of the bridge block" ;;
+esac
+if [ "${S2S_LAST_TOP}" != "bridge:" ]; then
+    fail "the last block of /etc/plexd/config.yaml is '${S2S_LAST_TOP}', want bridge:"
+fi
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf "  site_to_site_enabled: false\n  site_to_site_listen_port: 51823\n" >> /etc/plexd/config.yaml' \
+    || fail "could not append the opt-out to the bridge block of /etc/plexd/config.yaml"
+echo "  bridge.site_to_site_enabled: false and bridge.site_to_site_listen_port: 51823 appended to /etc/plexd/config.yaml"
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+S2S_OPTOUT_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+S2S_START=${SECONDS}
+while :; do
+    S2S_REPORT=$(curl -sf "http://localhost:18080/test/last-request/site-to-site-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+    s2s_journal
+    if [ "${S2S_REPORT}" = '{"state":"opted_out"}' ] \
+        && journal_has "${S2S_JOURNAL}" "plexd[${S2S_OPTOUT_PID}]:" "level=WARN" \
+            'msg="site-to-site: the control plane enables site-to-site tunnels, but bridge.site_to_site_enabled is false"' "tunnels=4"; then
+        break
+    fi
+    if [ $((SECONDS - S2S_START)) -ge 60 ]; then
+        fail "[opt-out] 60s after the restart the last report is '${S2S_REPORT}', want {\"state\":\"opted_out\"}, and plexd[${S2S_OPTOUT_PID}] must warn that the control plane enables site-to-site tunnels with tunnels=4"
+    fi
+    sleep 2
+done
+echo "  PASS: [opt-out] the last report reads {\"state\":\"opted_out\"} and plexd[${S2S_OPTOUT_PID}] warned that the control plane enables site-to-site tunnels (tunnels=4)"
+if journal_has "${S2S_JOURNAL}" "plexd[${S2S_OPTOUT_PID}]:" "level=INFO" 'msg="site-to-site: opted out by bridge.site_to_site_enabled, no tunnel is served"'; then
+    echo "  PASS: [opt-out] plexd[${S2S_OPTOUT_PID}] logged 'site-to-site: opted out by bridge.site_to_site_enabled, no tunnel is served' at Info"
+else
+    fail "[opt-out] plexd[${S2S_OPTOUT_PID}] logged no Info 'site-to-site: opted out by bridge.site_to_site_enabled, no tunnel is served'"
+fi
+S2S_IGNORED=$(journal_count "${S2S_JOURNAL}" "plexd[${S2S_OPTOUT_PID}]:" "level=WARN" \
+    'msg="bridge: config: site-to-site keys are ignored, the control plane delivers tunnels"' "keys=[site_to_site_listen_port]")
+if [ "${S2S_IGNORED}" != "1" ]; then
+    fail "[opt-out] plexd[${S2S_OPTOUT_PID}] logged ${S2S_IGNORED} Warn lines 'bridge: config: site-to-site keys are ignored, the control plane delivers tunnels' with keys=[site_to_site_listen_port], want 1"
+fi
+echo "  PASS: [opt-out] plexd[${S2S_OPTOUT_PID}] warned once that site_to_site_listen_port is ignored"
+S2S_LINKS=$(docker exec "${SYSTEMD_CONTAINER}" ls /sys/class/net 2>&1) || fail "ls /sys/class/net failed: ${S2S_LINKS}"
+case "${S2S_LINKS}" in
+    *wg-s2s-* | *xf-s2s-* | *ov-s2s-*) fail "[opt-out] interfaces starting with wg-s2s-, xf-s2s- or ov-s2s- remain on the opted-out bridge: ${S2S_LINKS}" ;;
+esac
+echo "  PASS: [opt-out] no interface starting with wg-s2s-, xf-s2s- or ov-s2s- exists"
+if docker exec "${SYSTEMD_CONTAINER}" test -e "${S2S_KEY_DIR}/${S2S_KEPT_ID}.key"; then
+    echo "  PASS: [opt-out] ${S2S_KEY_DIR}/${S2S_KEPT_ID}.key is kept"
+else
+    fail "[opt-out] ${S2S_KEY_DIR}/${S2S_KEPT_ID}.key is gone, want the opt-out to keep the keys"
+fi
+
+# No report the mock refused: every refusal makes plexd log a send failure.
+s2s_journal
+if journal_has "${S2S_JOURNAL}" 'msg="site-to-site status: send failed"'; then
+    fail "plexd logged 'site-to-site status: send failed', so the mock refused a report"
+fi
+echo "  PASS: plexd logged no 'site-to-site status: send failed'"
+echo "=== Site-to-site through a bridge PASSED ==="
+
 # --- Clean shutdown verification ---
 echo "=== Stopping plexd service ==="
 docker exec "${SYSTEMD_CONTAINER}" systemctl stop plexd
@@ -3544,12 +4115,14 @@ fi
 # Check journalctl for crash indicators.
 echo "=== Checking for crash indicators in journalctl ==="
 CRASH_OUTPUT=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>/dev/null || true)
-# The user access phase kills plexd on purpose, and systemd records that kill
-# in one line naming SIGKILL. That line is no crash; every other line is
-# checked.
-if [ -n "${UA_KILLED_LINE:-}" ]; then
-    CRASH_OUTPUT=$(printf '%s\n' "${CRASH_OUTPUT}" | grep -vF "${UA_KILLED_LINE}" || true)
-fi
+# The user access and the site-to-site phases each kill plexd on purpose, and
+# systemd records each kill in one line naming SIGKILL. Those lines are no
+# crash; every other line is checked.
+for killed_line in "${UA_KILLED_LINE:-}" "${S2S_KILLED_LINE:-}"; do
+    if [ -n "${killed_line}" ]; then
+        CRASH_OUTPUT=$(printf '%s\n' "${CRASH_OUTPUT}" | grep -vF "${killed_line}" || true)
+    fi
+done
 CRASH_FOUND=0
 for indicator in "core dumped" "segfault" "SIGABRT" "SIGKILL"; do
     if echo "${CRASH_OUTPUT}" | grep -qi "${indicator}"; then
