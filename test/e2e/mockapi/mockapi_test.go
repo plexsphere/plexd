@@ -1035,7 +1035,9 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 	// Peer ...a0b1 carries no direct endpoint, only an endpoint candidate and
 	// its relay fallback (TestState_ServesFixtureEndpointCandidates pins the
 	// candidate), and peer ...a0b2 only a direct endpoint, so the agent's dial
-	// order meets both shapes.
+	// order meets both shapes. Peer ...a0b1 routes one network, so every
+	// suite's node programs one peer route, and peer ...a0b2 routes none and
+	// carries no routed_subnets member.
 	var peers []map[string]json.RawMessage
 	if err := json.Unmarshal(envelope["peers"], &peers); err != nil {
 		t.Fatalf("unmarshal peers: %v", err)
@@ -1046,6 +1048,12 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 		}
 		if got := string(peers[1]["endpoint"]); got != `"198.51.100.20:51820"` {
 			t.Errorf("peer %s endpoint = %s, want \"198.51.100.20:51820\"", peers[1]["node_id"], got)
+		}
+		if got := string(peers[0]["routed_subnets"]); got != `["10.50.0.0/16"]` {
+			t.Errorf("peer %s routed_subnets = %s, want [\"10.50.0.0/16\"]", peers[0]["node_id"], got)
+		}
+		if _, ok := peers[1]["routed_subnets"]; ok {
+			t.Errorf("peer %s carries routed_subnets, want none: %s", peers[1]["node_id"], envelope["peers"])
 		}
 	}
 
