@@ -2,7 +2,10 @@ package bridge
 
 import (
 	"context"
+	"strings"
 	"sync"
+	"testing"
+	"time"
 )
 
 // execCall records a single method invocation on mockCommandExecutor.
@@ -10,6 +13,22 @@ type execCall struct {
 	Method string
 	Name   string
 	Args   []string
+
+	// HasDeadline records whether the call's context carried a deadline, and
+	// DeadlineIn how far away that deadline was when the call was made. Both
+	// are zero for a context without one.
+	HasDeadline bool
+	DeadlineIn  time.Duration
+}
+
+// newExecCall records a call to method under ctx.
+func newExecCall(ctx context.Context, method, name string, args []string) execCall {
+	c := execCall{Method: method, Name: name, Args: args}
+	if d, ok := ctx.Deadline(); ok {
+		c.HasDeadline = true
+		c.DeadlineIn = time.Until(d)
+	}
+	return c
 }
 
 // mockRunResult pairs output and error for sequential Run results.
@@ -18,13 +37,27 @@ type mockRunResult struct {
 	Err    error
 }
 
-// mockCommandHandle is a test double for CommandHandle.
+// mockCommandHandle is a test double for CommandHandle. It counts the calls
+// to Stop.
 type mockCommandHandle struct {
 	stopErr error
+
+	mu    sync.Mutex
+	stops int
 }
 
 func (h *mockCommandHandle) Stop() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stops++
 	return h.stopErr
+}
+
+// stopCalls returns how often Stop was called.
+func (h *mockCommandHandle) stopCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stops
 }
 
 // mockCommandExecutor is a test double for CommandExecutor.
@@ -69,11 +102,11 @@ func commandKey(name string, args ...string) string {
 	return key
 }
 
-func (m *mockCommandExecutor) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+func (m *mockCommandExecutor) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.callList = append(m.callList, execCall{Method: "Run", Name: name, Args: args})
+	m.callList = append(m.callList, newExecCall(ctx, "Run", name, args))
 
 	// Sequential mode takes precedence.
 	if len(m.runResults) > 0 && m.runIndex < len(m.runResults) {
@@ -88,11 +121,11 @@ func (m *mockCommandExecutor) Run(_ context.Context, name string, args ...string
 	return out, err
 }
 
-func (m *mockCommandExecutor) Start(_ context.Context, name string, args ...string) (CommandHandle, error) {
+func (m *mockCommandExecutor) Start(ctx context.Context, name string, args ...string) (CommandHandle, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.callList = append(m.callList, execCall{Method: "Start", Name: name, Args: args})
+	m.callList = append(m.callList, newExecCall(ctx, "Start", name, args))
 
 	return m.startHandle, m.startErr
 }
@@ -119,6 +152,37 @@ func (m *mockCommandExecutor) allCalls() []execCall {
 	result := make([]execCall, len(m.callList))
 	copy(result, m.callList)
 	return result
+}
+
+// callLines renders each recorded call as its method, its command name and
+// its arguments, for comparing whole command lines.
+func callLines(calls []execCall) [][]string {
+	lines := make([][]string, 0, len(calls))
+	for _, c := range calls {
+		lines = append(lines, append([]string{c.Method, c.Name}, c.Args...))
+	}
+	return lines
+}
+
+// assertCallDeadline fails t unless call ran under a context whose deadline
+// was more than lo and at most hi away. A zero hi wants no deadline at all.
+func assertCallDeadline(t *testing.T, call execCall, lo, hi time.Duration) {
+	t.Helper()
+
+	line := strings.Join(append([]string{call.Name}, call.Args...), " ")
+	if hi == 0 {
+		if call.HasDeadline {
+			t.Errorf("%s ran under a deadline %v away, want none", line, call.DeadlineIn)
+		}
+		return
+	}
+	if !call.HasDeadline {
+		t.Errorf("%s ran without a deadline, want one in (%v, %v]", line, lo, hi)
+		return
+	}
+	if call.DeadlineIn <= lo || call.DeadlineIn > hi {
+		t.Errorf("%s ran under a deadline %v away, want one in (%v, %v]", line, call.DeadlineIn, lo, hi)
+	}
 }
 
 // Verify mockCommandExecutor satisfies CommandExecutor at compile time.
