@@ -90,6 +90,7 @@ type AssertionCounters struct {
 	PolicyStatusCount             int64 `json:"policy_status_count"`
 	IngressStatusCount            int64 `json:"ingress_status_count"`
 	UserAccessStatusCount         int64 `json:"user_access_status_count"`
+	SiteToSiteStatusCount         int64 `json:"site_to_site_status_count"`
 	EdgePSKCount                  int64 `json:"edge_psk_count"`
 	HookFetchCount                int64 `json:"hook_fetch_count"`
 	InjectEventCount              int64 `json:"inject_event_count"`
@@ -159,6 +160,7 @@ type Server struct {
 	policyStatusCount              atomic.Int64
 	ingressStatusCount             atomic.Int64
 	userAccessStatusCount          atomic.Int64
+	siteToSiteStatusCount          atomic.Int64
 	edgePSKCount                   atomic.Int64
 	hookFetchCount                 atomic.Int64
 	injectEventCount               atomic.Int64
@@ -358,6 +360,7 @@ func (s *Server) Assertions() AssertionCounters {
 		PolicyStatusCount:              s.policyStatusCount.Load(),
 		IngressStatusCount:             s.ingressStatusCount.Load(),
 		UserAccessStatusCount:          s.userAccessStatusCount.Load(),
+		SiteToSiteStatusCount:          s.siteToSiteStatusCount.Load(),
 		EdgePSKCount:                   s.edgePSKCount.Load(),
 		HookFetchCount:                 s.hookFetchCount.Load(),
 		InjectEventCount:               s.injectEventCount.Load(),
@@ -690,6 +693,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/policy-status", s.handlePolicyStatus)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/ingress-status", s.handleIngressStatus)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/user-access-status", s.handleUserAccessStatus)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/site-to-site-status", s.handleSiteToSiteStatus)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/hooks/{name}/versions/{version}", s.handleHookVersion)
 
@@ -736,6 +740,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/policy-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/ingress-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/user-access-status", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/site-to-site-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/hooks/{name}/versions/{version}", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
@@ -4217,6 +4222,274 @@ func validUserAccessPublicKey(s string) bool {
 	}
 	key, err := base64.StdEncoding.Strict().DecodeString(s)
 	return err == nil && len(key) == 32
+}
+
+// The contract's numbers for a site-to-site status report, the mock's own
+// copies: the 64 KiB body cap and at most 256 tunnel entries.
+const (
+	maxSiteToSiteStatusBody    = 64 << 10
+	maxSiteToSiteStatusTunnels = 256
+)
+
+// The values of a site-to-site status report's state and of an entry's
+// health, the mock's own copies of the contract's strings.
+const (
+	siteToSiteStateEnabled  = "enabled"
+	siteToSiteStateOptedOut = "opted_out"
+	siteToSiteHealthUp      = "up"
+	siteToSiteHealthDown    = "down"
+)
+
+// siteToSiteStatusDecodeDetail is the one detail of a body the JSON decoder
+// refuses as a whole: one that is no JSON object, carries an unknown member
+// of the report or data after it, or a tunnels that is no array. It is the
+// control plane's sentence and names no part of the body, which the
+// decoder's own message can quote.
+const siteToSiteStatusDecodeDetail = "request body is not a valid site-to-site status report; it carries only state and tunnels"
+
+// handleSiteToSiteStatus handles PUT /v1/nodes/{id}/site-to-site-status, the
+// bridge's report of whether its local configuration serves site-to-site
+// tunnels and of the health of each tunnel of its pull. It enforces the
+// contract's gates in order: the 64 KiB body cap (413
+// site_to_site_status_body_too_large), the strict decode of
+// decodeSiteToSiteStatus, which answers 400 malformed_site_to_site_status,
+// and the rules of checkSiteToSiteStatus, which answer 400
+// malformed_site_to_site_status or invalid_site_to_site_status. The body is
+// captured under site-to-site-status as it is read, before the decode and
+// the rules judge it, so a refused report can be read back too; a body over
+// the cap is not captured. The 200 answer carries accepted_at.
+// Every answer of the handler carries Cache-Control: no-store, as the
+// contract asks. The counter increments only on the 200. As for
+// user-access-status, the bearer gate is the only check of the node: the
+// path id is not compared with it.
+//
+// The decode target is mock-local rather than the agent's request type, for
+// the reason handleIngressStatus gives: a pointer keeps a missing or null
+// member missing, so an agent that drops one is refused with the detail the
+// control plane writes for it.
+func (s *Server) handleSiteToSiteStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, maxSiteToSiteStatusBody)
+	// The cap lies below maxCapturedBody, so the read of captureBody reaches
+	// the byte that trips the MaxBytesReader, and no drain is needed to tell a
+	// body at the cap from a longer one.
+	data, err := s.captureBody("site-to-site-status", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "site_to_site_status_body_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte site-to-site status cap", maxSiteToSiteStatusBody))
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_site_to_site_status", "invalid request body")
+		return
+	}
+
+	req, ok := decodeSiteToSiteStatus(data)
+	if !ok {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_site_to_site_status", siteToSiteStatusDecodeDetail)
+		return
+	}
+	if code, detail := checkSiteToSiteStatus(req); code != "" {
+		writeProblem(w, r, http.StatusBadRequest, code, detail)
+		return
+	}
+
+	s.siteToSiteStatusCount.Add(1)
+	writeJSON(w, http.StatusOK, siteToSiteStatusResponse{AcceptedAt: time.Now().UTC()})
+}
+
+// siteToSiteStatusResponse is the 200 body of
+// PUT /v1/nodes/{id}/site-to-site-status, the mock's own copy of the
+// contract's SiteToSiteStatusReportResponse.
+type siteToSiteStatusResponse struct {
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// siteToSiteStatusBody is the mock's reading of a site-to-site status
+// report. State is a pointer, so a missing or null state decodes to nil and
+// reads as missing, as the contract has it. The tunnel entries stay
+// undecoded until checkSiteToSiteStatus decodes each one on its own, so a
+// detail names the entry by its index; a null tunnels decodes to nil and
+// reads as no entries.
+type siteToSiteStatusBody struct {
+	State   *string            `json:"state"`
+	Tunnels *[]json.RawMessage `json:"tunnels"`
+}
+
+// siteToSiteStatusEntry is the mock's reading of one tunnel entry. Every
+// member is a pointer, so the presence rules can tell an omitted member from
+// a sent one, an established of false included; a member sent as null reads
+// as omitted, as on the control plane.
+type siteToSiteStatusEntry struct {
+	ID          *string `json:"id"`
+	Health      *string `json:"health"`
+	Reason      *string `json:"reason"`
+	Established *bool   `json:"established"`
+	PublicKey   *string `json:"public_key"`
+}
+
+// siteToSiteStatusEntryMembers maps each member of a tunnel entry onto the
+// sentence that refuses its value, without the entry's index. A value
+// outside the member's rule and a value of the wrong JSON type earn the same
+// sentence. A name outside the map is a member the contract does not define.
+var siteToSiteStatusEntryMembers = map[string]string{
+	"id":          ".id is not a tunnel id",
+	"health":      ".health is not one of up and down",
+	"reason":      ".reason is not a reason token",
+	"established": ".established is not a boolean",
+	"public_key":  ".public_key is not a WireGuard public key of 44 characters of standard base64",
+}
+
+// decodeSiteToSiteStatus strict-decodes the body as exactly one site-to-site
+// status report: a JSON object without unknown members and with nothing
+// after it. It reports false for a body that is no such object. A null body
+// decodes to a report without members, which checkSiteToSiteStatus refuses
+// for its missing state, as the control plane does.
+func decodeSiteToSiteStatus(data []byte) (siteToSiteStatusBody, bool) {
+	var req siteToSiteStatusBody
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return siteToSiteStatusBody{}, false
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return siteToSiteStatusBody{}, false
+	}
+	return req, true
+}
+
+// checkSiteToSiteStatus runs the contract's rules over a decoded report and
+// returns the code and detail of the first breach, or two empty strings when
+// the report is valid. The shape rules, over the state and over every tunnel
+// entry, the presence rules of an entry's health included, answer
+// malformed_site_to_site_status; then the consistency rules, an opted-out
+// report with entries and an id that repeats an earlier entry, answer
+// invalid_site_to_site_status. Every entry passes the shape rules first, so
+// a report that breaks both kinds answers malformed_site_to_site_status. The
+// details are the control plane's sentences
+// (plexsphere/plexsphere@4935e06 docs/reference/api/node-events.md), and a
+// detail never quotes an id, a reason or a key of the body. The mock accepts
+// canonical ids only (api.ValidIngressRuleID, the check
+// api.ValidUserAccessProviderID applies), which is narrower than the control
+// plane's parser and wide enough for what plexd sends. A reason is judged by
+// api.ValidIngressReason, whose grammar, ^[a-z][a-z0-9_]{0,62}$, is the one
+// the contract gives a site-to-site reason.
+func checkSiteToSiteStatus(req siteToSiteStatusBody) (code, detail string) {
+	const malformed, invalid = "malformed_site_to_site_status", "invalid_site_to_site_status"
+	switch {
+	case req.State == nil:
+		return malformed, "state is missing"
+	case *req.State != siteToSiteStateEnabled && *req.State != siteToSiteStateOptedOut:
+		return malformed, "state is not one of enabled and opted_out"
+	case req.Tunnels == nil:
+		return "", ""
+	}
+	raw := *req.Tunnels
+	if len(raw) > maxSiteToSiteStatusTunnels {
+		return malformed, fmt.Sprintf("tunnels carries more than %d entries", maxSiteToSiteStatusTunnels)
+	}
+	entries := make([]siteToSiteStatusEntry, len(raw))
+	for i, entry := range raw {
+		var detail string
+		if entries[i], detail = decodeSiteToSiteStatusEntry(entry); detail == "" {
+			detail = checkSiteToSiteStatusEntry(entries[i])
+		}
+		if detail != "" {
+			return malformed, fmt.Sprintf("tunnels[%d]%s", i, detail)
+		}
+	}
+
+	if *req.State == siteToSiteStateOptedOut && len(entries) > 0 {
+		return invalid, "an opted-out bridge reports no tunnels"
+	}
+	first := make(map[string]int, len(entries))
+	for i, e := range entries {
+		// Two spellings of one UUID repeat each other.
+		id := strings.ToLower(*e.ID)
+		if j, seen := first[id]; seen {
+			return invalid, fmt.Sprintf("tunnels[%d].id repeats tunnels[%d].id", i, j)
+		}
+		first[id] = i
+	}
+	return "", ""
+}
+
+// decodeSiteToSiteStatusEntry decodes one tunnel entry and returns it, or
+// the detail naming what is wrong with it, without the entry's index: an
+// entry that is no JSON object, a member the contract does not define, or a
+// member of the wrong JSON type. Members match by their exact name. An
+// unknown member is named only when its name is a token of the reason
+// grammar, so nothing of the body beyond a short identifier reaches the
+// detail; of several, the first in sorted order is named, so one body always
+// earns one detail. A null entry decodes as an entry without members, which
+// checkSiteToSiteStatusEntry refuses for its missing id.
+func decodeSiteToSiteStatusEntry(raw json.RawMessage) (siteToSiteStatusEntry, string) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return siteToSiteStatusEntry{}, " is not an object"
+	}
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		if _, known := siteToSiteStatusEntryMembers[name]; known {
+			continue
+		}
+		if api.ValidIngressReason(name) {
+			return siteToSiteStatusEntry{}, " carries the unknown member " + name
+		}
+		return siteToSiteStatusEntry{}, " carries a member SiteToSiteStatusReportTunnel does not define"
+	}
+	var e siteToSiteStatusEntry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			if detail, known := siteToSiteStatusEntryMembers[typeErr.Field]; known {
+				return siteToSiteStatusEntry{}, detail
+			}
+		}
+		return siteToSiteStatusEntry{}, " is not a valid tunnel entry"
+	}
+	return e, ""
+}
+
+// checkSiteToSiteStatusEntry applies the member rules of one tunnel entry
+// in the order the contract lists the members, then the presence rules of
+// its health, and returns the detail of the first broken one, without the
+// entry's index, or "". An established of the wrong JSON type is refused by
+// decodeSiteToSiteStatusEntry, so any established that reaches here is a
+// boolean. A down entry carries a reason and neither an established nor a
+// public_key; an up entry carries an established and no reason, and
+// public_key is optional on it, since an ipsec or openvpn tunnel that is up
+// sends none.
+func checkSiteToSiteStatusEntry(e siteToSiteStatusEntry) string {
+	members := siteToSiteStatusEntryMembers
+	switch {
+	case e.ID == nil:
+		return ".id is missing"
+	case !api.ValidIngressRuleID(*e.ID):
+		return members["id"]
+	case e.Health == nil:
+		return ".health is missing"
+	case *e.Health != siteToSiteHealthUp && *e.Health != siteToSiteHealthDown:
+		return members["health"]
+	case e.Reason != nil && !api.ValidIngressReason(*e.Reason):
+		return members["reason"]
+	case e.PublicKey != nil && !validUserAccessPublicKey(*e.PublicKey):
+		return members["public_key"]
+	}
+	down := *e.Health == siteToSiteHealthDown
+	switch {
+	case down && e.Reason == nil:
+		return ".reason is required while health is down"
+	case down && e.PublicKey != nil:
+		return ".public_key is set while health is down"
+	case down && e.Established != nil:
+		return ".established is set while health is down"
+	case !down && e.Reason != nil:
+		return ".reason is set while health is up"
+	case !down && e.Established == nil:
+		return ".established is required while health is up"
+	}
+	return ""
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state
