@@ -307,12 +307,19 @@ func TestDNSStub_ListenFailsWhenEitherPortIsTaken(t *testing.T) {
 		t.Errorf("ListenDNS on a taken UDP port = %s, want an error", stub.Addr())
 	}
 
-	tcp, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
+	// The port comes from a stub, which bound it for UDP and TCP alike. A
+	// port the kernel picks for TCP alone need not be free for UDP: on
+	// Windows a UDP bind on one failed with WSAEACCES.
+	bound, stop := startStub(t)
+	taken := bound.Addr()
+	if err := stop(); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	tcp, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(taken))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tcp.Close()
-	taken := tcp.Addr().(*net.TCPAddr).AddrPort()
 	if stub, err := mockapi.ListenDNS(taken.String()); err == nil {
 		t.Errorf("ListenDNS on a taken TCP port = %s, want an error", stub.Addr())
 	}
