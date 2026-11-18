@@ -17,8 +17,10 @@ const (
 	IngressReasonInvalid = "invalid_rule"
 	// IngressReasonDuplicateID: an earlier rule of the block has the same id.
 	IngressReasonDuplicateID = "duplicate_id"
-	// IngressReasonListenerConflict: a held rule has the same listen port and
-	// host, or one of the two has no host; Detail is the holder's slug.
+	// IngressReasonListenerConflict: a held rule of the same protocol has the
+	// same listen port and host, or one of the two has no host; Detail is the
+	// holder's slug. A udp rule has no host, so it conflicts with every held
+	// udp rule on its port, and a tcp and a udp rule never conflict.
 	IngressReasonListenerConflict = "listener_conflict"
 	// IngressReasonMaxRules: bridge.max_ingress_rules rules are held already.
 	IngressReasonMaxRules = "max_rules"
@@ -104,9 +106,11 @@ func checkACMEDirectory(settings *api.IngressACME, allowed []string) acmeAvailab
 	return acmeAvailability{}
 }
 
-// ingressPlan is what planIngress makes of a block.
+// ingressPlan is what planIngress makes of a block: a routing table for each
+// TCP listen port and a route for each UDP listen port.
 type ingressPlan struct {
-	tables map[int]*ingressTable // by listen port; every port with a held rule, and the challenge port
+	tables map[int]*ingressTable // by listen port; every port with a held tcp rule, and the challenge port
+	udp    map[int]*ingressRoute // by listen port; the held udp rule of each port, served
 	states []IngressRuleState    // one per input rule, in input order
 }
 
@@ -168,18 +172,28 @@ func (t *ingressTable) routes() []*ingressRoute {
 	return out
 }
 
-// planIngress decides which rules of a block are held and builds the routing
-// table of each listen port. It walks the rules in the order the pull lists
-// them and gives each the first reason that applies; a rule that passes every
-// check up to the bound is held. Every port with a held rule gets a table.
+// planIngress decides which rules of a block are held, builds the routing
+// table of each TCP listen port and picks the route of each UDP listen port.
+// It sets an empty protocol to tcp on its copy of each rule before any check,
+// so every state and route carries tcp or udp. It walks the rules in the order
+// the pull lists them and gives each the first reason that applies; a rule
+// that passes every check up to the bound is held, and the rules of both
+// protocols count toward the bound. Listener conflicts are per protocol: a
+// tcp rule conflicts only with held tcp rules, and a udp rule with the held
+// udp rule of its port. Every port with a held tcp rule gets a table, and
+// every port with a held udp rule gets that rule's route in plan.udp, served.
 // A held passthrough or terminate rule is served once its port is bound (a
 // terminate rule also needs its certificate, which the manager overlays). A
 // held acme rule is served when acme carries no reason and no rule of another
-// mode on port 443 would take the CA's challenge connection for its host; when
-// one is served and port 443 holds no rule, the plan adds an empty table for
-// 443, so the port opens for challenges.
+// mode on TCP port 443 would take the CA's challenge connection for its host;
+// when one is served and TCP port 443 holds no rule, the plan adds an empty
+// table for 443, so the port opens for challenges. A udp rule on 443 neither
+// takes the challenge connection nor holds the port for it.
 func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) ingressPlan {
-	plan := ingressPlan{tables: make(map[int]*ingressTable)}
+	plan := ingressPlan{
+		tables: make(map[int]*ingressTable),
+		udp:    make(map[int]*ingressRoute),
+	}
 	if len(rules) > 0 {
 		plan.states = make([]IngressRuleState, 0, len(rules))
 	}
@@ -202,6 +216,14 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 	held := 0
 
 	for _, r := range rules {
+		// A rule without a protocol, as a control plane before
+		// plexsphere/plexsphere#1110 sends it, is a tcp rule. Apply keeps a
+		// route whose rule compares equal to the last one, so the rule must
+		// not change when the control plane starts to send the member.
+		if r.Protocol == "" {
+			r.Protocol = api.IngressProtocolTCP
+		}
+		udp := r.Protocol == api.IngressProtocolUDP
 		st := IngressRuleState{Rule: r}
 		host := strings.ToLower(r.SNIHost)
 		_, dup := ids[r.ID]
@@ -214,14 +236,19 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			st.Reason, st.Detail = IngressReasonInvalid, "id"
 		case dup:
 			st.Reason = IngressReasonDuplicateID
-		case r.Mode != api.IngressModePassthrough && r.Mode != api.IngressModeTerminate && r.Mode != api.IngressModeACME:
+		case r.Protocol != api.IngressProtocolTCP && !udp:
+			st.Reason, st.Detail = IngressReasonInvalid, "protocol"
+		case (r.Mode != api.IngressModePassthrough && r.Mode != api.IngressModeTerminate && r.Mode != api.IngressModeACME) ||
+			(udp && r.Mode != api.IngressModePassthrough):
+			// The bridge forwards a udp rule's datagrams unchanged, so a udp
+			// rule is a passthrough rule.
 			st.Reason, st.Detail = IngressReasonInvalid, "mode"
 		case r.ListenPort < 1 || r.ListenPort > 65535:
 			st.Reason, st.Detail = IngressReasonInvalid, "listen_port"
-		case !validSNIHost(host) || (host == "" && r.Mode != api.IngressModePassthrough) ||
+		case (udp && host != "") || !validSNIHost(host) || (host == "" && r.Mode != api.IngressModePassthrough) ||
 			(r.Mode == api.IngressModeACME && (strings.HasPrefix(host, "*.") || !strings.Contains(host, "."))):
-			// An acme rule never names a wildcard, and autocert refuses a
-			// name of one label.
+			// A udp rule has no server name to match. An acme rule never
+			// names a wildcard, and autocert refuses a name of one label.
 			st.Reason, st.Detail = IngressReasonInvalid, "sni_host"
 		case !validTargetAddress(r.TargetAddress):
 			st.Reason, st.Detail = IngressReasonInvalid, "target_address"
@@ -231,7 +258,11 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			st.Reason, st.Detail = IngressReasonInvalid, "certificate_secret_name"
 		}
 		if st.Reason == "" {
-			if h := ports[r.ListenPort]; h != nil {
+			if udp {
+				if holder := plan.udp[r.ListenPort]; holder != nil {
+					st.Reason, st.Detail = IngressReasonListenerConflict, holder.rule.Slug
+				}
+			} else if h := ports[r.ListenPort]; h != nil {
 				switch {
 				case h.plain != "":
 					st.Reason, st.Detail = IngressReasonListenerConflict, h.plain
@@ -252,6 +283,12 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 
 		// The rule is held.
 		held++
+		if udp {
+			plan.udp[r.ListenPort] = &ingressRoute{rule: r, target: ingressTarget(r), served: true}
+			st.held, st.Served = true, true
+			plan.states = append(plan.states, st)
+			continue
+		}
 		h := ports[r.ListenPort]
 		if h == nil {
 			h = &portHolders{

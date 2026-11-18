@@ -7,11 +7,13 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// planRule returns a valid passthrough rule; each test changes what it checks.
+// planRule returns a valid tcp passthrough rule; each test changes what it
+// checks.
 func planRule(slug string, port int, host string) api.IngressRule {
 	return api.IngressRule{
 		ID:            "id-" + slug,
 		Slug:          slug,
+		Protocol:      api.IngressProtocolTCP,
 		ListenPort:    port,
 		Mode:          api.IngressModePassthrough,
 		SNIHost:       host,
@@ -163,6 +165,167 @@ func TestPlanIngress_ListenerConflict(t *testing.T) {
 	}
 }
 
+// udpPlanRule returns a valid udp rule on port.
+func udpPlanRule(slug string, port int) api.IngressRule {
+	r := planRule(slug, port, "")
+	r.Protocol = api.IngressProtocolUDP
+	return r
+}
+
+// routesOf returns the slugs of every route in the plan's tables.
+func routesOf(plan ingressPlan) []string {
+	var slugs []string
+	for _, tbl := range plan.tables {
+		for _, r := range tbl.routes() {
+			slugs = append(slugs, r.rule.Slug)
+		}
+	}
+	return slugs
+}
+
+func TestPlanIngress_Protocol(t *testing.T) {
+	t.Run("an empty protocol is tcp", func(t *testing.T) {
+		r := planRule("web", 443, "web.example.com")
+		r.Protocol = ""
+		plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+		st := plan.states[0]
+		if !st.held || !st.Served || st.Reason != "" {
+			t.Errorf("rule without a protocol = %+v, want held and served", st)
+		}
+		if st.Rule.Protocol != api.IngressProtocolTCP {
+			t.Errorf("state Rule.Protocol = %q, want %q", st.Rule.Protocol, api.IngressProtocolTCP)
+		}
+		route := plan.tables[443].exact["web.example.com"]
+		if route == nil || route.rule.Protocol != api.IngressProtocolTCP {
+			t.Errorf("route = %+v, want one under web.example.com whose rule reads %q", route, api.IngressProtocolTCP)
+		}
+		if len(plan.udp) != 0 {
+			t.Errorf("plan.udp = %+v, want empty", plan.udp)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		rule   api.IngressRule // the rule before edit
+		edit   func(*api.IngressRule)
+		reason string
+		detail string
+	}{
+		{name: "protocol sctp", rule: planRule("web", 443, ""), edit: func(r *api.IngressRule) { r.Protocol = "sctp" }, reason: IngressReasonInvalid, detail: "protocol"},
+		{name: "protocol UDP", rule: planRule("web", 443, ""), edit: func(r *api.IngressRule) { r.Protocol = "UDP" }, reason: IngressReasonInvalid, detail: "protocol"},
+		{name: "unknown protocol and unknown mode", rule: planRule("web", 443, ""), edit: func(r *api.IngressRule) { r.Protocol = "sctp"; r.Mode = "tcp" }, reason: IngressReasonInvalid, detail: "protocol"},
+		{name: "udp terminate", rule: udpPlanRule("dns", 53), edit: func(r *api.IngressRule) {
+			r.Mode, r.SNIHost, r.CertificateSecretName = api.IngressModeTerminate, "dns.example.com", "tls"
+		}, reason: IngressReasonInvalid, detail: "mode"},
+		{name: "udp acme", rule: udpPlanRule("dns", 53), edit: func(r *api.IngressRule) { r.Mode, r.SNIHost = api.IngressModeACME, "dns.example.com" }, reason: IngressReasonInvalid, detail: "mode"},
+		{name: "udp passthrough with an sni host", rule: udpPlanRule("dns", 53), edit: func(r *api.IngressRule) { r.SNIHost = "dns.example.com" }, reason: IngressReasonInvalid, detail: "sni_host"},
+		{name: "udp passthrough with a secret name outside the grammar is held", rule: udpPlanRule("dns", 53), edit: func(r *api.IngressRule) { r.CertificateSecretName = "Tls" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.rule
+			tc.edit(&r)
+			plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+			st := plan.states[0]
+			if st.Rule != r {
+				t.Errorf("state rule = %+v, want %+v", st.Rule, r)
+			}
+			if st.Reason != tc.reason || st.Detail != tc.detail {
+				t.Errorf("reason, detail = %q, %q, want %q, %q", st.Reason, st.Detail, tc.reason, tc.detail)
+			}
+			if wantServed := tc.reason == ""; st.Served != wantServed || st.held != wantServed {
+				t.Errorf("Served, held = %v, %v, want %v, %v", st.Served, st.held, wantServed, wantServed)
+			}
+		})
+	}
+
+	t.Run("a udp passthrough rule is held in plan.udp", func(t *testing.T) {
+		r := udpPlanRule("dns", 53)
+		plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+		if st := plan.states[0]; !st.held || !st.Served || st.Reason != "" || st.Rule != r {
+			t.Errorf("udp rule = %+v, want held and served as pulled", st)
+		}
+		route := plan.udp[53]
+		if route == nil || route.rule != r || !route.served || route.target != "10.0.0.5:8443" {
+			t.Errorf("plan.udp[53] = %+v, want the served route of the rule to 10.0.0.5:8443", route)
+		}
+		if len(plan.udp) != 1 {
+			t.Errorf("plan.udp = %+v, want only port 53", plan.udp)
+		}
+		if slugs := routesOf(plan); len(slugs) != 0 || len(plan.tables) != 0 {
+			t.Errorf("tables = %+v with routes %v, want no table for a udp rule", plan.tables, slugs)
+		}
+	})
+}
+
+func TestPlanIngress_UDPListenerConflict(t *testing.T) {
+	t.Run("a plain tcp rule and a udp rule on 53", func(t *testing.T) {
+		for name, rules := range map[string][]api.IngressRule{
+			"tcp first": {planRule("tcp53", 53, ""), udpPlanRule("udp53", 53)},
+			"udp first": {udpPlanRule("udp53", 53), planRule("tcp53", 53, "")},
+		} {
+			plan := planIngress(rules, 20, acmeAvailability{})
+			for _, st := range plan.states {
+				if !st.held || !st.Served || st.Reason != "" {
+					t.Errorf("%s: rule %s = %+v, want held and served", name, st.Rule.Slug, st)
+				}
+			}
+			if tbl := plan.tables[53]; tbl == nil || tbl.plain == nil || tbl.plain.rule.Slug != "tcp53" {
+				t.Errorf("%s: table of 53 = %+v, want tcp53 as its plain rule", name, tbl)
+			}
+			if route := plan.udp[53]; route == nil || route.rule.Slug != "udp53" {
+				t.Errorf("%s: plan.udp[53] = %+v, want udp53", name, route)
+			}
+		}
+	})
+
+	t.Run("a second udp rule on 53", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{
+			planRule("tcp53", 53, ""),
+			udpPlanRule("udp53", 53),
+			udpPlanRule("udp53b", 53),
+		}, 20, acmeAvailability{})
+		if st := plan.states[2]; st.Served || st.held || st.Reason != IngressReasonListenerConflict || st.Detail != "udp53" {
+			t.Errorf("second udp rule = %+v, want %q held by udp53", st, IngressReasonListenerConflict)
+		}
+		if route := plan.udp[53]; route == nil || route.rule.Slug != "udp53" {
+			t.Errorf("plan.udp[53] = %+v, want the first udp rule", route)
+		}
+	})
+
+	t.Run("a udp rule on 443 beside an acme rule on 443", func(t *testing.T) {
+		for name, rules := range map[string][]api.IngressRule{
+			"acme first": {acmePlanRule("acme", 443, "acme.example.com"), udpPlanRule("quic", 443)},
+			"udp first":  {udpPlanRule("quic", 443), acmePlanRule("acme", 443, "acme.example.com")},
+		} {
+			plan := planIngress(rules, 20, acmeAvailability{})
+			for _, st := range plan.states {
+				if !st.held || !st.Served || st.Reason != "" {
+					t.Errorf("%s: rule %s = %+v, want held and served", name, st.Rule.Slug, st)
+				}
+			}
+			if tbl := plan.tables[acmeChallengePort]; tbl == nil || len(tbl.routes()) != 1 || tbl.exact["acme.example.com"] == nil {
+				t.Errorf("%s: table of 443 = %+v, want only the acme rule's", name, tbl)
+			}
+			if route := plan.udp[443]; route == nil || route.rule.Slug != "quic" {
+				t.Errorf("%s: plan.udp[443] = %+v, want quic", name, route)
+			}
+		}
+	})
+
+	t.Run("a udp rule on 443 holds no challenge port", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{
+			acmePlanRule("acme", 8443, "acme.example.com"),
+			udpPlanRule("quic", 443),
+		}, 20, acmeAvailability{})
+		if st := plan.states[0]; !st.Served || st.Reason != "" {
+			t.Errorf("acme rule = %+v, want served", st)
+		}
+		if tbl := plan.tables[acmeChallengePort]; tbl == nil || len(tbl.routes()) != 0 {
+			t.Errorf("table of 443 = %+v, want the empty challenge table", tbl)
+		}
+	})
+}
+
 func TestPlanIngress_MaxRules(t *testing.T) {
 	invalid := planRule("bad", 443, "bad.example.com")
 	invalid.Mode = "tcp"
@@ -187,6 +350,23 @@ func TestPlanIngress_MaxRules(t *testing.T) {
 	if tbl := plan.tables[443]; tbl == nil || len(tbl.exact) != 2 {
 		t.Errorf("table of 443 = %+v, want the two held hosts", tbl)
 	}
+
+	// The rules of both protocols count toward the bound.
+	for _, third := range []api.IngressRule{planRule("tcp3", 8443, ""), udpPlanRule("udp3", 8053)} {
+		plan := planIngress([]api.IngressRule{planRule("tcp1", 443, ""), udpPlanRule("udp1", 53), third}, 2, acmeAvailability{})
+		want := []string{"", "", IngressReasonMaxRules}
+		for i, st := range plan.states {
+			if st.Reason != want[i] {
+				t.Errorf("third rule %s: rule %s: reason = %q, want %q", third.Slug, st.Rule.Slug, st.Reason, want[i])
+			}
+		}
+		if len(plan.tables) != 1 || plan.tables[443] == nil {
+			t.Errorf("third rule %s: tables = %+v, want only 443's", third.Slug, plan.tables)
+		}
+		if len(plan.udp) != 1 || plan.udp[53] == nil {
+			t.Errorf("third rule %s: plan.udp = %+v, want only 53's", third.Slug, plan.udp)
+		}
+	}
 }
 
 func TestPlanIngress_EmptyAndTerminateBlocks(t *testing.T) {
@@ -194,6 +374,9 @@ func TestPlanIngress_EmptyAndTerminateBlocks(t *testing.T) {
 		plan := planIngress(rules, 20, acmeAvailability{})
 		if len(plan.tables) != 0 || len(plan.states) != 0 {
 			t.Errorf("%s: %d tables and %d states, want none", name, len(plan.tables), len(plan.states))
+		}
+		if len(plan.udp) != 0 {
+			t.Errorf("%s: plan.udp = %+v, want empty", name, plan.udp)
 		}
 	}
 
