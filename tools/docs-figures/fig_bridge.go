@@ -189,20 +189,26 @@ func bridgeRouteControllersMacOSWindows() *Figure {
 }
 
 // bridgePublicIngress draws how a bridge routes a public TCP
-// connection to a target node over the mesh, and which handlers feed
-// its listeners and certificates, for
-// docs/reference/bridge/public-ingress.md.
+// connection or the datagrams of a UDP client to a target node over
+// the mesh, and which handlers feed its listeners and certificates,
+// for docs/reference/bridge/public-ingress.md. The plain and the SNI
+// port are TCP listeners. The UDP port keeps one flow per client
+// address and sends each datagram through the same target dial. A TCP
+// and a UDP rule may share a port number, so the bridge runs one
+// listener per listen port and protocol.
 func bridgePublicIngress() *Figure {
 	f := &Figure{Name: "bridge-public-ingress", Title: "How a bridge routes a public connection to a target node"}
-	const lsnX, lsnW, yA, yB, gap = 60.0, 160.0, 210.0, 390.0, 64.0
+	const lsnX, lsnW, yA, yU, yB, gap = 60.0, 160.0, 210.0, 345.0, 515.0, 64.0
 	clients := f.actor(spec{x: -20, y: 0, w: 360, h: 64, lines: []Line{name("Public internet clients")}})
-	fr := f.frame(roleSubstrate, 30, 130, 1046, 0, "", "Bridge node", "one listener per listen port")
+	fr := f.frame(roleSubstrate, 30, 130, 1046, 0, "", "Bridge node", "one listener per listen port and protocol")
 
 	plain := f.box(roleAgent, spec{x: lsnX, y: yA, w: lsnW, h: 70, lines: []Line{codeName(":2222"), body("plain port")}})
+	udp := f.box(roleAgent, spec{x: lsnX, y: yU, w: lsnW, h: 70, lines: []Line{codeName(":53"), body("UDP port")}})
 	sni := f.box(roleAgent, spec{x: lsnX, y: yB - 35, w: lsnW, h: 70, lines: []Line{codeName(":443"), body("SNI port")}})
-	f.arrow(call, vh(clients.bottomAt(0), plain.left())...)
-	f.arrow(call, vh(clients.bottomAt(0), sni.left())...)
-	f.labelRight(pt{0, 97}, body("TCP to"), code("<bridge>:<listen_port>"))
+	for _, n := range []*node{plain, udp, sni} {
+		f.arrow(call, vh(clients.bottomAt(0), n.left())...)
+	}
+	f.labelRight(pt{0, 97}, body("TCP or UDP to"), code("<bridge>:<listen_port>"))
 
 	peek := f.state(stateNormal, spec{x: lsnX + lsnW + 40, y: yB - 40, w: 266, h: 80, lines: []Line{
 		brgSub("peek the ClientHello,"), brgSub("match the server name"),
@@ -222,8 +228,13 @@ func bridgePublicIngress() *Figure {
 	f.arrow(flow, hvh(peek.right(), term.left(), modeX-gap/2)...)
 	f.arrow(flow, hvh(pass.right(), dial.left(), dial.x-gap/2)...)
 	f.arrow(flow, hvh(term.right(), dial.left(), dial.x-gap/2)...)
-	f.arrow(flow, hv(plain.right(), dial.top())...)
-	f.label(pt{(plain.x + plain.w + dial.cx()) / 2, plain.cy()}, body("forward without reading"))
+	// The plain port's edge enters the dial right of the UDP port's, so
+	// its descent never crosses the UDP edge below it.
+	plainIn, udpIn := dial.topAt(dial.x+dial.w*2/3), dial.topAt(dial.x+dial.w/3)
+	f.arrow(flow, hv(plain.right(), plainIn)...)
+	f.label(pt{(plain.x + plain.w + plainIn.X) / 2, plain.cy()}, body("forward without reading"))
+	f.arrow(flow, hv(udp.right(), udpIn)...)
+	f.label(pt{(udp.x + udp.w + udpIn.X) / 2, udp.cy()}, body("one flow per client address"))
 
 	const colX, colW, tgtX, tgtW, rowH = lsnX, 330.0, lsnX + 390, 300.0, 70.0
 	rowY := term.y + term.h + 80
