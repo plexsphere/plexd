@@ -17,7 +17,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// linkListAttempts bounds how often RemoveInterfaces lists the links while the
+// linkListAttempts bounds how often removeLinks lists the links while the
 // kernel reports the dump as interrupted, which it does when a link changes
 // during the dump.
 const linkListAttempts = 3
@@ -85,7 +85,7 @@ func (c *NetlinkAccessController) CreateInterface(name string, privateKey []byte
 		PrivateKey: &key,
 		ListenPort: &listenPort,
 	}); err != nil {
-		return listenPortErr("configure device", err)
+		return listenPortErr("access", "configure device", err)
 	}
 
 	if addr != nil {
@@ -95,7 +95,7 @@ func (c *NetlinkAccessController) CreateInterface(name string, privateKey []byte
 	}
 
 	if err := netlink.LinkSetUp(link); err != nil {
-		return listenPortErr("set interface up", err)
+		return listenPortErr("access", "set interface up", err)
 	}
 
 	c.logger.Info("access interface created",
@@ -115,60 +115,78 @@ func (c *NetlinkAccessController) CreateInterface(name string, privateKey []byte
 	return nil
 }
 
-// listenPortErr wraps err from the CreateInterface step named step. The kernel
+// listenPortErr wraps err from the step named step of a WireGuard create, under
+// the error prefix of the calling controller, "access" or "vpn". The kernel
 // binds a WireGuard device's listen port when the device comes up, and again
 // when the port changes on a device that is already up, so a port another
 // socket holds surfaces as EADDRINUSE from LinkSetUp or from ConfigureDevice.
 // Such an error wraps ErrListenPortInUse besides its cause, which is what lets
 // the caller tell a taken port from a failed setup. The unit test proves the
 // mapping; that the kernel answers EADDRINUSE is proven only on a real kernel.
-func listenPortErr(step string, err error) error {
+func listenPortErr(prefix, step string, err error) error {
 	if errors.Is(err, syscall.EADDRINUSE) {
-		return fmt.Errorf("bridge: access: %s: %w: %w", step, ErrListenPortInUse, err)
+		return fmt.Errorf("bridge: %s: %s: %w: %w", prefix, step, ErrListenPortInUse, err)
 	}
-	return fmt.Errorf("bridge: access: %s: %w", step, err)
+	return fmt.Errorf("bridge: %s: %s: %w", prefix, step, err)
 }
 
 // RemoveInterfaces deletes every link of type wireguard whose name starts with
 // prefix. An empty prefix is refused, since it would match the mesh interface
-// and every tunnel. A link that is gone by the time it is deleted counts as
+// and every tunnel. removeLinks says how a link that is already gone and an
+// interrupted link dump count.
+func (c *NetlinkAccessController) RemoveInterfaces(prefix string) error {
+	if prefix == "" {
+		return errors.New("bridge: access: remove interfaces: empty prefix")
+	}
+
+	err := removeLinks(c.logger, "access interface removed", func(link netlink.Link) bool {
+		return link.Type() == "wireguard" && strings.HasPrefix(link.Attrs().Name, prefix)
+	})
+	if err != nil {
+		return fmt.Errorf("bridge: access: remove interfaces: %w", err)
+	}
+
+	return nil
+}
+
+// removeLinks deletes every link match accepts and logs each deletion at Info
+// on logger with the message removed, the line each controller logs when it
+// removes one of its links by name. It is the sweep NetlinkAccessController.RemoveInterfaces and
+// NetlinkVPNController.RemoveTunnelInterfaces share; each wraps the error in
+// its own prefix. A link that is gone by the time it is deleted counts as
 // removed; the errors of the other deletions are joined.
 //
 // The kernel marks a link dump interrupted when a link changes while the dump
 // runs. The list is then taken again, up to linkListAttempts times. When the
 // last attempt is still interrupted, the links that dump named are deleted
 // and the error wraps netlink.ErrDumpInterrupted: a link the dump missed would
-// make the next CreateInterface under its name fail, so the caller has to
-// know the sweep may be incomplete.
-func (c *NetlinkAccessController) RemoveInterfaces(prefix string) error {
-	if prefix == "" {
-		return errors.New("bridge: access: remove interfaces: empty prefix")
-	}
-
+// make the next create under its name fail, so the caller has to know the
+// sweep may be incomplete.
+func removeLinks(logger *slog.Logger, removed string, match func(netlink.Link) bool) error {
 	links, err := listLinks()
 	if err != nil && !errors.Is(err, netlink.ErrDumpInterrupted) {
-		return fmt.Errorf("bridge: access: remove interfaces: list links: %w", err)
+		return fmt.Errorf("list links: %w", err)
 	}
 
 	var errs []error
 	if err != nil {
-		errs = append(errs, fmt.Errorf("bridge: access: remove interfaces: list links: %w", err))
+		errs = append(errs, fmt.Errorf("list links: %w", err))
 	}
 
 	for _, link := range links {
-		name := link.Attrs().Name
-		if link.Type() != "wireguard" || !strings.HasPrefix(name, prefix) {
+		if !match(link) {
 			continue
 		}
 
+		name := link.Attrs().Name
 		if err := netlink.LinkDel(link); err != nil {
 			if !errors.Is(err, syscall.ENODEV) {
-				errs = append(errs, fmt.Errorf("bridge: access: remove interface %s: %w", name, err))
+				errs = append(errs, fmt.Errorf("remove interface %s: %w", name, err))
 			}
 			continue
 		}
 
-		c.logger.Info("access interface removed",
+		logger.Info(removed,
 			"component", "bridge",
 			"interface", name,
 		)

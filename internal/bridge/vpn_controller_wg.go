@@ -1,21 +1,25 @@
 package bridge
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // WGVPNController implements VPNController on top of the platform
 // WGController: DarwinController on a utun device, WindowsController on a
 // Wintun adapter, both running on UserspaceBackend. Every tunnel interface
-// gets a fresh private key.
+// carries the private key its caller passes. It creates WireGuard interfaces
+// only: the xfrm interface and the tun device the other tunnel kinds need
+// exist on Linux alone.
 //
 // A repeated CreateTunnelInterface for the same name fails with an error
 // wrapping os.ErrExist, which is what EEXIST is for the Linux netlink
-// controller. RemoveTunnelInterface and RemoveTunnelPeer are idempotent.
+// controller. RemoveTunnelInterface, RemoveTunnelInterfaces and
+// RemoveTunnelPeer are idempotent.
 type WGVPNController struct {
 	wgOps
 
@@ -47,21 +51,38 @@ func NewWGVPNController(wg wireguard.WGController, address string, logger *slog.
 }
 
 // CreateTunnelInterface creates a WireGuard interface for a site-to-site
-// tunnel under a freshly generated private key, carrying the address the
-// controller was built with.
-func (c *WGVPNController) CreateTunnelInterface(name string, listenPort int) error {
-	key, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		return fmt.Errorf("bridge: vpn: generate key: %w", err)
-	}
+// tunnel with the given private key and listen port, carrying the address the
+// controller was built with. The key is checked before anything is created.
+func (c *WGVPNController) CreateTunnelInterface(name string, privateKey []byte, listenPort int) error {
+	return c.create(name, privateKey, listenPort, c.address)
+}
 
-	return c.create(name, key[:], listenPort, c.address)
+// CreateXfrmInterface creates nothing and returns an error wrapping
+// errors.ErrUnsupported: xfrm interfaces are a Linux kernel feature, so an
+// ipsec tunnel has no link on macOS and Windows.
+func (c *WGVPNController) CreateXfrmInterface(name string, _ uint32) error {
+	return fmt.Errorf("bridge: vpn: create xfrm interface %s: %w", name, errors.ErrUnsupported)
+}
+
+// CreateTunInterface creates nothing and returns an error wrapping
+// errors.ErrUnsupported: the persistent tun device an openvpn tunnel runs on
+// is a Linux kernel feature, so such a tunnel has no link on macOS and
+// Windows.
+func (c *WGVPNController) CreateTunInterface(name string) error {
+	return fmt.Errorf("bridge: vpn: create tun interface %s: %w", name, errors.ErrUnsupported)
 }
 
 // RemoveTunnelInterface deletes the named WireGuard tunnel interface.
 // It is idempotent: removing a non-existent interface returns nil.
 func (c *WGVPNController) RemoveTunnelInterface(name string) error {
 	return c.remove(name)
+}
+
+// RemoveTunnelInterfaces returns nil without touching anything. A userspace
+// device lives in the process that created it and ends with it, so a killed
+// process leaves no interface behind for a start to clear.
+func (c *WGVPNController) RemoveTunnelInterfaces([]string) error {
+	return nil
 }
 
 // ConfigureTunnelPeer adds or updates the remote peer on the tunnel interface.
@@ -73,6 +94,37 @@ func (c *WGVPNController) ConfigureTunnelPeer(iface, publicKey string, allowedIP
 // It is idempotent: removing an unknown peer returns nil.
 func (c *WGVPNController) RemoveTunnelPeer(iface, publicKey string) error {
 	return c.removePeer(iface, publicKey)
+}
+
+// TunnelPeerHandshake reads the tunnel interface through the wrapped
+// controller's wireguard.PeerStatsReader and returns the latest handshake of
+// the peer with the given public key: the zero time for a peer that never
+// completed one and for a peer the device does not hold. The key is checked
+// before the device is read. A controller that cannot read peer stats fails
+// with an error wrapping wireguard.ErrPeerStatsUnsupported.
+func (c *WGVPNController) TunnelPeerHandshake(iface, publicKey string) (time.Time, error) {
+	pub, err := c.peerKey(publicKey)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	reader, ok := c.wg.(wireguard.PeerStatsReader)
+	if !ok {
+		return time.Time{}, fmt.Errorf("bridge: vpn: peer handshake: %w", wireguard.ErrPeerStatsUnsupported)
+	}
+
+	stats, err := reader.PeerStats(iface)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("bridge: vpn: peer handshake: %w", err)
+	}
+
+	for _, s := range stats {
+		if s.PublicKey == pub {
+			return s.LastHandshake, nil
+		}
+	}
+
+	return time.Time{}, nil
 }
 
 // OSInterfaceName returns the kernel's name for the tunnel interface created

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
@@ -19,11 +20,12 @@ const (
 )
 
 func TestWGVPNController_CreateTunnelInterface(t *testing.T) {
+	key := testPrivateKey(t)
 	fake := &fakeWGController{}
 	logger, buf := debugLogger()
 	c := NewWGVPNController(fake, "", logger)
 
-	if err := c.CreateTunnelInterface(testVPNIface, testVPNPort); err != nil {
+	if err := c.CreateTunnelInterface(testVPNIface, key, testVPNPort); err != nil {
 		t.Fatalf("CreateTunnelInterface() error = %v", err)
 	}
 
@@ -34,9 +36,8 @@ func TestWGVPNController_CreateTunnelInterface(t *testing.T) {
 	if got := created[0].Args[0]; got != testVPNIface {
 		t.Errorf("interface = %v, want %q", got, testVPNIface)
 	}
-	key, ok := created[0].Args[1].([]byte)
-	if !ok || len(key) != 32 {
-		t.Errorf("private key = %v, want 32 bytes", created[0].Args[1])
+	if got, ok := created[0].Args[1].([]byte); !ok || !bytes.Equal(got, key) {
+		t.Error("private key differs from the key passed to CreateTunnelInterface")
 	}
 	if got := created[0].Args[2]; got != testVPNPort {
 		t.Errorf("listen port = %v, want %d", got, testVPNPort)
@@ -61,6 +62,9 @@ func TestWGVPNController_CreateTunnelInterface(t *testing.T) {
 	if strings.Contains(logged, "interface addressed") {
 		t.Errorf("log = %q, want no address line for an unnumbered interface", logged)
 	}
+	if strings.Contains(logged, base64.StdEncoding.EncodeToString(key)) {
+		t.Errorf("log = %q, want no key material in it", logged)
+	}
 }
 
 // TestWGVPNController_CreateTunnelInterfaceAddressed covers the macOS case:
@@ -71,7 +75,7 @@ func TestWGVPNController_CreateTunnelInterfaceAddressed(t *testing.T) {
 	logger, buf := debugLogger()
 	c := NewWGVPNController(fake, testVPNAddress, logger)
 
-	if err := c.CreateTunnelInterface(testVPNIface, testVPNPort); err != nil {
+	if err := c.CreateTunnelInterface(testVPNIface, testPrivateKey(t), testVPNPort); err != nil {
 		t.Fatalf("CreateTunnelInterface() error = %v", err)
 	}
 
@@ -104,12 +108,16 @@ func TestWGVPNController_CreateTunnelInterfaceAddressed(t *testing.T) {
 	}
 }
 
-func TestWGVPNController_CreateTunnelInterfaceFreshKeys(t *testing.T) {
+// The caller owns the key, so a tunnel interface created again under the same
+// key keeps its public key, and the remote site configured against it keeps
+// working.
+func TestWGVPNController_CreateTunnelInterfaceKeptKey(t *testing.T) {
+	key := testPrivateKey(t)
 	fake := &fakeWGController{}
 	c := NewWGVPNController(fake, "", discardLogger())
 
 	for i := range 2 {
-		if err := c.CreateTunnelInterface(testVPNIface, testVPNPort); err != nil {
+		if err := c.CreateTunnelInterface(testVPNIface, key, testVPNPort); err != nil {
 			t.Fatalf("CreateTunnelInterface() #%d error = %v", i, err)
 		}
 	}
@@ -118,21 +126,34 @@ func TestWGVPNController_CreateTunnelInterfaceFreshKeys(t *testing.T) {
 	if len(created) != 2 {
 		t.Fatalf("CreateInterface calls = %d, want 2", len(created))
 	}
-	first := created[0].Args[1].([]byte)
-	second := created[1].Args[1].([]byte)
-	if bytes.Equal(first, second) {
-		t.Error("both tunnels got the same private key, want a fresh key per interface")
+	for i, call := range created {
+		if got, ok := call.Args[1].([]byte); !ok || !bytes.Equal(got, key) {
+			t.Errorf("create #%d: private key differs from the key passed in, want the same key on every create", i)
+		}
 	}
 }
 
 func TestWGVPNController_CreateTunnelInterfaceErrors(t *testing.T) {
 	fakeErr := errors.New("wg failed")
 
+	t.Run("private key malformed", func(t *testing.T) {
+		for _, key := range [][]byte{nil, make([]byte, 31), make([]byte, 33)} {
+			fake := &fakeWGController{}
+			c := NewWGVPNController(fake, testVPNAddress, discardLogger())
+
+			err := c.CreateTunnelInterface(testVPNIface, key, testVPNPort)
+			wantWGErrPrefix(t, err, "bridge: vpn: parse private key:")
+			if got := fake.wgMethods(); len(got) != 0 {
+				t.Errorf("%d-byte key: calls = %v, want none", len(key), got)
+			}
+		}
+	})
+
 	t.Run("create fails", func(t *testing.T) {
 		fake := &fakeWGController{createInterfaceErr: fakeErr}
 		c := NewWGVPNController(fake, testVPNAddress, discardLogger())
 
-		err := c.CreateTunnelInterface(testVPNIface, testVPNPort)
+		err := c.CreateTunnelInterface(testVPNIface, testPrivateKey(t), testVPNPort)
 		wantWGErrPrefix(t, err, "bridge: vpn: create interface wg-s2s-0:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
@@ -148,7 +169,7 @@ func TestWGVPNController_CreateTunnelInterfaceErrors(t *testing.T) {
 		fake := &fakeWGController{configureAddressErr: fakeErr}
 		c := NewWGVPNController(fake, testVPNAddress, discardLogger())
 
-		err := c.CreateTunnelInterface(testVPNIface, testVPNPort)
+		err := c.CreateTunnelInterface(testVPNIface, testPrivateKey(t), testVPNPort)
 		wantWGErrPrefix(t, err, "bridge: vpn: configure address 10.0.0.5/32:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
@@ -169,7 +190,7 @@ func TestWGVPNController_CreateTunnelInterfaceErrors(t *testing.T) {
 		fake := &fakeWGController{setInterfaceUpErr: fakeErr}
 		c := NewWGVPNController(fake, "", discardLogger())
 
-		err := c.CreateTunnelInterface(testVPNIface, testVPNPort)
+		err := c.CreateTunnelInterface(testVPNIface, testPrivateKey(t), testVPNPort)
 		wantWGErrPrefix(t, err, "bridge: vpn: set interface up:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
@@ -219,6 +240,152 @@ func TestWGVPNController_RemoveTunnelInterface(t *testing.T) {
 		wantWGErrPrefix(t, err, "bridge: vpn: remove interface:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
+		}
+	})
+}
+
+// xfrm interfaces and persistent tun devices exist on Linux alone, so the
+// userspace controller refuses both links with errors.ErrUnsupported and asks
+// the wrapped controller nothing.
+func TestWGVPNController_UnsupportedLinks(t *testing.T) {
+	tests := []struct {
+		name       string
+		create     func(c *WGVPNController) error
+		wantPrefix string
+	}{
+		{
+			name:       "xfrm interface",
+			create:     func(c *WGVPNController) error { return c.CreateXfrmInterface("xf-s2s-a0a0a0e2", 2694881506) },
+			wantPrefix: "bridge: vpn: create xfrm interface xf-s2s-a0a0a0e2:",
+		},
+		{
+			name:       "tun interface",
+			create:     func(c *WGVPNController) error { return c.CreateTunInterface("ov-s2s-a0a0a0e3") },
+			wantPrefix: "bridge: vpn: create tun interface ov-s2s-a0a0a0e3:",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeWGController{}
+			c := NewWGVPNController(fake, testVPNAddress, discardLogger())
+
+			err := tt.create(c)
+			wantWGErrPrefix(t, err, tt.wantPrefix)
+			if !errors.Is(err, errors.ErrUnsupported) {
+				t.Errorf("errors.Is(err, errors.ErrUnsupported) = false, want true (err = %q)", err)
+			}
+			if got := fake.wgMethods(); len(got) != 0 {
+				t.Errorf("calls = %v, want none", got)
+			}
+		})
+	}
+}
+
+// A userspace device ends with the process that created it, so there is
+// nothing a start would have to clear: RemoveTunnelInterfaces succeeds without
+// asking the controller anything.
+func TestWGVPNController_RemoveTunnelInterfaces(t *testing.T) {
+	fake := &fakeWGController{}
+	c := NewWGVPNController(fake, "", discardLogger())
+
+	if err := c.RemoveTunnelInterfaces(SiteToSiteInterfacePrefixes); err != nil {
+		t.Fatalf("RemoveTunnelInterfaces() error = %v", err)
+	}
+	if got := fake.wgMethods(); len(got) != 0 {
+		t.Errorf("calls = %v, want none", got)
+	}
+}
+
+func TestWGVPNController_TunnelPeerHandshake(t *testing.T) {
+	b64A, rawA := testPeerKey(t)
+	b64B, rawB := testPeerKey(t)
+	b64Unknown, _ := testPeerKey(t)
+	handshake := time.Unix(1700000000, 0)
+
+	stats := []wireguard.PeerStat{
+		{PublicKey: [32]byte(rawA), LastHandshake: handshake, RxBytes: 10},
+		{PublicKey: [32]byte(rawB)},
+	}
+
+	tests := []struct {
+		name      string
+		publicKey string
+		want      time.Time
+	}{
+		{name: "peer with a handshake", publicKey: b64A, want: handshake},
+		{name: "peer without a handshake", publicKey: b64B},
+		{name: "unknown peer", publicKey: b64Unknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &statsWGController{fakeWGController: &fakeWGController{}, stats: stats}
+			c := NewWGVPNController(fake, "", discardLogger())
+
+			got, err := c.TunnelPeerHandshake(testVPNIface, tt.publicKey)
+			if err != nil {
+				t.Fatalf("TunnelPeerHandshake() error = %v", err)
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("TunnelPeerHandshake() = %v, want %v", got, tt.want)
+			}
+
+			read := fake.wgCallsFor("PeerStats")
+			if len(read) != 1 || read[0].Args[0] != testVPNIface {
+				t.Errorf("PeerStats calls = %v, want one for %q", read, testVPNIface)
+			}
+		})
+	}
+
+	t.Run("read fails", func(t *testing.T) {
+		fakeErr := errors.New("wg failed")
+		fake := &statsWGController{fakeWGController: &fakeWGController{}, err: fakeErr}
+		c := NewWGVPNController(fake, "", discardLogger())
+
+		got, err := c.TunnelPeerHandshake(testVPNIface, b64A)
+		wantWGErrPrefix(t, err, "bridge: vpn: peer handshake:")
+		if !errors.Is(err, fakeErr) {
+			t.Errorf("errors.Is(err, fakeErr) = false, want true")
+		}
+		if !got.IsZero() {
+			t.Errorf("TunnelPeerHandshake() = %v, want the zero time on error", got)
+		}
+	})
+
+	t.Run("controller reads no stats", func(t *testing.T) {
+		fake := &fakeWGController{}
+		c := NewWGVPNController(fake, "", discardLogger())
+
+		_, err := c.TunnelPeerHandshake(testVPNIface, b64A)
+		wantWGErrPrefix(t, err, "bridge: vpn: peer handshake:")
+		if !errors.Is(err, wireguard.ErrPeerStatsUnsupported) {
+			t.Errorf("errors.Is(err, wireguard.ErrPeerStatsUnsupported) = false, want true")
+		}
+		if calls := fake.wgMethods(); len(calls) != 0 {
+			t.Errorf("calls = %v, want none", calls)
+		}
+	})
+
+	// The key is checked before the device is read, so a malformed one costs
+	// no read and names what was wrong with it.
+	t.Run("invalid public key", func(t *testing.T) {
+		for _, tt := range []struct {
+			name, publicKey, wantPrefix string
+		}{
+			{name: "not base64", publicKey: "!!!", wantPrefix: "bridge: vpn: decode public key:"},
+			{name: "empty", publicKey: "", wantPrefix: "bridge: vpn: parse public key:"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				fake := &statsWGController{fakeWGController: &fakeWGController{}, stats: stats}
+				c := NewWGVPNController(fake, "", discardLogger())
+
+				_, err := c.TunnelPeerHandshake(testVPNIface, tt.publicKey)
+				wantWGErrPrefix(t, err, tt.wantPrefix)
+				if calls := fake.wgMethods(); len(calls) != 0 {
+					t.Errorf("calls = %v, want none", calls)
+				}
+			})
 		}
 	})
 }

@@ -263,8 +263,11 @@ func TestSiteToSiteManager_AddTunnel_Success(t *testing.T) {
 	if createCalls[0].Args[0] != "wg-s2s-0" {
 		t.Errorf("CreateTunnelInterface name = %v, want wg-s2s-0", createCalls[0].Args[0])
 	}
-	if createCalls[0].Args[1] != 51823 {
-		t.Errorf("CreateTunnelInterface listenPort = %v, want 51823", createCalls[0].Args[1])
+	if key, ok := createCalls[0].Args[1].([]byte); !ok || len(key) != 32 {
+		t.Errorf("CreateTunnelInterface privateKey = %v, want 32 bytes", createCalls[0].Args[1])
+	}
+	if createCalls[0].Args[2] != 51823 {
+		t.Errorf("CreateTunnelInterface listenPort = %v, want 51823", createCalls[0].Args[2])
 	}
 
 	// Verify ConfigureTunnelPeer called.

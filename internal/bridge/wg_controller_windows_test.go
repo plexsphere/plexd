@@ -59,7 +59,7 @@ func TestWGControllers_RealWintun(t *testing.T) {
 		const name = "plexd-s2sci"
 
 		ctrl := NewWGVPNController(wireguard.NewWindowsController(discardLogger()), "", discardLogger())
-		if err := ctrl.CreateTunnelInterface(name, 0); err != nil {
+		if err := ctrl.CreateTunnelInterface(name, testPrivateKey(t), 0); err != nil {
 			t.Fatalf("CreateTunnelInterface: %v", err)
 		}
 		removed := false
