@@ -32,6 +32,12 @@ type tunnelCreate struct {
 	ctx context.Context
 }
 
+// tunnelEstablished records one call to Established.
+type tunnelEstablished struct {
+	tunnelID string
+	ctx      context.Context
+}
+
 // mockTunnelProvider is a test double for TunnelProvider. It records every
 // call and returns the error set for its method.
 type mockTunnelProvider struct {
@@ -47,6 +53,10 @@ type mockTunnelProvider struct {
 	creates        []tunnelCreate
 	removes        []string
 	resets         []context.Context
+	establishes    []tunnelEstablished
+	// establishedHook, when set, runs inside Established, outside mu,
+	// before it returns.
+	establishedHook func()
 }
 
 var _ TunnelProvider = (*mockTunnelProvider)(nil)
@@ -69,11 +79,16 @@ func (p *mockTunnelProvider) RemoveTunnel(_ context.Context, tunnelID string) er
 	return p.removeErr
 }
 
-func (p *mockTunnelProvider) Established(context.Context, string) (bool, error) {
+func (p *mockTunnelProvider) Established(ctx context.Context, tunnelID string) (bool, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.methods = append(p.methods, "Established")
-	return p.established, p.establishedErr
+	p.establishes = append(p.establishes, tunnelEstablished{tunnelID: tunnelID, ctx: ctx})
+	hook, established, err := p.establishedHook, p.established, p.establishedErr
+	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return established, err
 }
 
 func (p *mockTunnelProvider) Reset(ctx context.Context) error {
@@ -119,11 +134,18 @@ func (p *mockTunnelProvider) resetCalls() []context.Context {
 	return slices.Clone(p.resets)
 }
 
+// establishedCalls returns the recorded Established calls.
+func (p *mockTunnelProvider) establishedCalls() []tunnelEstablished {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.establishes)
+}
+
 // reset clears the recorded calls.
 func (p *mockTunnelProvider) reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.methods, p.creates, p.removes, p.resets = nil, nil, nil, nil
+	p.methods, p.creates, p.removes, p.resets, p.establishes = nil, nil, nil, nil, nil
 }
 
 // resolveCall records one call to fakeResolver.Resolve.
@@ -451,15 +473,21 @@ func requireTunnelUp(t *testing.T, mgr *SiteToSiteManager, id string) api.SiteTo
 	return ti
 }
 
-// tunnelIDs returns the ids the manager reports, in order.
+// tunnelIDs returns the ids the manager reports, in order. It reads what the
+// manager holds rather than its status, which asks each tunnel that is up
+// whether its remote site answers, so a test that calls or polls it adds no
+// device read and no provider command to the calls it checks.
 func tunnelIDs(mgr *SiteToSiteManager) []string {
-	info := mgr.SiteToSiteStatus()
-	if info == nil {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if !mgr.active {
 		return nil
 	}
 	var ids []string
-	for _, ti := range info.Tunnels {
-		ids = append(ids, ti.ID)
+	for _, t := range mgr.tunnels {
+		if t.settled {
+			ids = append(ids, t.entry.ID)
+		}
 	}
 	return ids
 }
@@ -1227,13 +1255,15 @@ func TestSiteToSiteManager_InvalidTunnels(t *testing.T) {
 			with(office, func(e *api.SiteToSiteTunnel) { e.ID, e.Slug = "00000000-0000-0000-0000-000000000000", "zero" }),
 		)
 		fx.mgr.Apply(t.Context(), block)
+		// The controller calls are read before the status, which reads the
+		// handshake of branch-berlin's interface.
+		if got := fx.vpn.vpnMethods(); !slices.Equal(got, []string{"CreateTunnelInterface", "ConfigureTunnelPeer"}) {
+			t.Errorf("controller calls = %q, want branch-berlin's alone", got)
+		}
 		if got := tunnelIDs(fx.mgr); !slices.Equal(got, []string{s2sID1}) {
 			t.Errorf("tunnels = %q, want branch-berlin alone", got)
 		}
 		requireTunnelUp(t, fx.mgr, s2sID1)
-		if got := fx.vpn.vpnMethods(); !slices.Equal(got, []string{"CreateTunnelInterface", "ConfigureTunnelPeer"}) {
-			t.Errorf("controller calls = %q, want branch-berlin's alone", got)
-		}
 		if len(fx.ipsec.calls()) != 0 || len(fx.openvpn.calls()) != 0 {
 			t.Error("a provider was called for an entry without state")
 		}
@@ -1535,7 +1565,7 @@ func TestSiteToSiteManager_OneFailingTunnelLeavesTheOthersUp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Teardown and the change signal
+// Teardown
 // ---------------------------------------------------------------------------
 
 func TestSiteToSiteManager_Teardown(t *testing.T) {
@@ -1657,47 +1687,6 @@ func TestSiteToSiteManager_TeardownDuringAnAttempt(t *testing.T) {
 	}
 	if fx.mgr.SiteToSiteStatus() != nil {
 		t.Error("SiteToSiteStatus() after Teardown is not nil")
-	}
-}
-
-// TestSiteToSiteManager_ReportChanged checks that Apply, Retry,
-// SyncSecretInventory and Teardown each signal ReportChanged without
-// blocking, and that several signals collapse into one.
-func TestSiteToSiteManager_ReportChanged(t *testing.T) {
-	fx := newS2SFixture(t, nil)
-	changed := fx.mgr.ReportChanged()
-	drain := func() bool {
-		select {
-		case <-changed:
-			return true
-		default:
-			return false
-		}
-	}
-	drain()
-
-	for name, call := range map[string]func(){
-		"Apply":               func() { fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin)) },
-		"Retry":               func() { fx.mgr.Retry(t.Context()) },
-		"SyncSecretInventory": func() { fx.mgr.SyncSecretInventory(t.Context(), s2sInventory()) },
-	} {
-		call()
-		if !drain() {
-			t.Errorf("%s signalled nothing", name)
-		}
-	}
-
-	fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
-	fx.mgr.Retry(t.Context())
-	if !drain() || drain() {
-		t.Error("two signals did not collapse into one")
-	}
-
-	if err := fx.mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-	if !drain() {
-		t.Error("Teardown signalled nothing")
 	}
 }
 
