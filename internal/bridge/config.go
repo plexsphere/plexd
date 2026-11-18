@@ -7,10 +7,6 @@ import (
 )
 
 const (
-	DefaultUserAccessInterfaceName = "wg-access"
-	DefaultUserAccessListenPort    = 51822
-	DefaultMaxAccessPeers          = 50
-
 	DefaultMaxIngressRules    = 20
 	DefaultIngressDialTimeout = 10 * time.Second
 
@@ -42,32 +38,35 @@ type Config struct {
 	// Default: false. Requires Enabled=true.
 	RelayEnabled bool `yaml:"relay_enabled"`
 
-	// UserAccessEnabled controls whether user access integration is active.
-	// Default: false. Requires Enabled=true.
-	UserAccessEnabled bool `yaml:"user_access_enabled"`
+	// UserAccessEnabled is the local switch for user access. nil and true
+	// serve the providers the state pull's bridge.user_access block enables;
+	// false opts the node out: plexd builds no user access manager, creates
+	// no interface and starts no vendor client whatever the pull says.
+	// Default: nil, which serves. An explicit true requires Enabled=true.
+	UserAccessEnabled *bool `yaml:"user_access_enabled"`
 
-	// UserAccessInterfaceName is the name of the WireGuard interface for user access.
-	// Default: "wg-access"
+	// The six keys below are ignored: the control plane delivers each user
+	// access provider with its interface, port, devices and join Secret. They
+	// stay parseable so that a configuration written for an older plexd still
+	// loads, have no default and no validation, and plexd up names those that
+	// are set in one Warn (see ReplacedUserAccessKeys).
+
+	// UserAccessInterfaceName is ignored.
 	UserAccessInterfaceName string `yaml:"user_access_interface_name"`
 
-	// UserAccessListenPort is the UDP port for the user access WireGuard interface.
-	// Default: 51822
+	// UserAccessListenPort is ignored.
 	UserAccessListenPort int `yaml:"user_access_listen_port"`
 
-	// MaxAccessPeers is the maximum number of concurrent user access peers.
-	// Default: 50
+	// MaxAccessPeers is ignored.
 	MaxAccessPeers int `yaml:"max_access_peers"`
 
-	// UserAccessProviderType selects the external VPN provider for user access.
-	// Supported values: "tailscale", "netbird", or "" (disabled).
+	// UserAccessProviderType is ignored.
 	UserAccessProviderType string `yaml:"user_access_provider_type"`
 
-	// AuthKeyEnv is the environment variable name containing the auth key
-	// for the user access provider (e.g. "PLEXD_TAILSCALE_AUTH_KEY").
+	// AuthKeyEnv is ignored.
 	AuthKeyEnv string `yaml:"auth_key_env"`
 
-	// SetupKeyEnv is the environment variable name containing the setup key
-	// for the user access provider (e.g. "PLEXD_NETBIRD_SETUP_KEY").
+	// SetupKeyEnv is ignored.
 	SetupKeyEnv string `yaml:"setup_key_env"`
 
 	// IngressEnabled is the local switch for public ingress. nil and true serve
@@ -133,18 +132,41 @@ func (c *Config) IngressOptedOut() bool {
 	return c.IngressEnabled != nil && !*c.IngressEnabled
 }
 
+// UserAccessOptedOut reports whether the node opts out of user access: true
+// exactly when UserAccessEnabled is set to false. An unset UserAccessEnabled
+// serves.
+func (c *Config) UserAccessOptedOut() bool {
+	return c.UserAccessEnabled != nil && !*c.UserAccessEnabled
+}
+
+// ReplacedUserAccessKeys returns the YAML names of the ignored user access
+// keys that are set to a value other than the zero value, in the order
+// user_access_interface_name, user_access_listen_port, max_access_peers,
+// user_access_provider_type, auth_key_env, setup_key_env, and nil when none
+// is set.
+func (c *Config) ReplacedUserAccessKeys() []string {
+	var keys []string
+	for _, k := range []struct {
+		name string
+		set  bool
+	}{
+		{"user_access_interface_name", c.UserAccessInterfaceName != ""},
+		{"user_access_listen_port", c.UserAccessListenPort != 0},
+		{"max_access_peers", c.MaxAccessPeers != 0},
+		{"user_access_provider_type", c.UserAccessProviderType != ""},
+		{"auth_key_env", c.AuthKeyEnv != ""},
+		{"setup_key_env", c.SetupKeyEnv != ""},
+	} {
+		if k.set {
+			keys = append(keys, k.name)
+		}
+	}
+	return keys
+}
+
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
 	// EnableNAT is handled via natEnabled(); nil means default true.
-	if c.UserAccessInterfaceName == "" {
-		c.UserAccessInterfaceName = DefaultUserAccessInterfaceName
-	}
-	if c.UserAccessListenPort == 0 {
-		c.UserAccessListenPort = DefaultUserAccessListenPort
-	}
-	if c.MaxAccessPeers == 0 {
-		c.MaxAccessPeers = DefaultMaxAccessPeers
-	}
 	if c.MaxIngressRules == 0 {
 		c.MaxIngressRules = DefaultMaxIngressRules
 	}
@@ -174,12 +196,12 @@ func (c *Config) Validate() error {
 	if c.RelayEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: relay requires bridge mode to be enabled")
 	}
-	if c.UserAccessEnabled && !c.Enabled {
-		return fmt.Errorf("bridge: config: user access requires bridge mode to be enabled")
-	}
 	// Only an explicit true is refused outside bridge mode: an unset switch is
 	// the default every node carries, and an explicit false opts out of
-	// ingress that does not run there either.
+	// user access or ingress that does not run there either.
+	if c.UserAccessEnabled != nil && *c.UserAccessEnabled && !c.Enabled {
+		return fmt.Errorf("bridge: config: user access requires bridge mode to be enabled")
+	}
 	if c.IngressEnabled != nil && *c.IngressEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: ingress requires bridge mode to be enabled")
 	}
@@ -198,25 +220,6 @@ func (c *Config) Validate() error {
 	for _, subnet := range c.AccessSubnets {
 		if _, _, err := net.ParseCIDR(subnet); err != nil {
 			return fmt.Errorf("bridge: config: invalid CIDR %q: %w", subnet, err)
-		}
-	}
-	if c.UserAccessEnabled {
-		if c.UserAccessListenPort < 1 || c.UserAccessListenPort > 65535 {
-			return fmt.Errorf("bridge: config: UserAccessListenPort must be between 1 and 65535")
-		}
-		if c.UserAccessInterfaceName == "" {
-			return fmt.Errorf("bridge: config: UserAccessInterfaceName is required when user access is enabled")
-		}
-		if c.MaxAccessPeers <= 0 {
-			return fmt.Errorf("bridge: config: MaxAccessPeers must be positive when user access is enabled")
-		}
-	}
-	if c.UserAccessProviderType != "" {
-		switch c.UserAccessProviderType {
-		case "tailscale", "netbird":
-			// valid
-		default:
-			return fmt.Errorf("bridge: config: unsupported UserAccessProviderType %q", c.UserAccessProviderType)
 		}
 	}
 	if !c.IngressOptedOut() {

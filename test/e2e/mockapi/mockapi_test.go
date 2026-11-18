@@ -9351,24 +9351,74 @@ func TestState_ReturnsUserAccessChild(t *testing.T) {
 	if !ua.Enabled {
 		t.Error("UserAccess.Enabled = false, want true")
 	}
-	if ua.InterfaceName == "" {
-		t.Error("UserAccess.InterfaceName is empty")
+	want := []api.UserAccessProvider{
+		{
+			ID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+			Slug:        "field-team",
+			Kind:        api.UserAccessKindWireGuard,
+			ListenPort:  51821,
+			AddressPool: "10.98.0.0/24",
+			MaxDevices:  64,
+			Devices: []api.UserAccessDevice{{
+				ID:        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1",
+				Slug:      "alice-laptop",
+				PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+				Address:   "10.98.0.2",
+			}},
+		},
+		{
+			ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+			Slug:           "tailnet",
+			Kind:           api.UserAccessKindTailscale,
+			AuthSecretName: "ts-join",
+		},
 	}
-	if ua.ListenPort == 0 {
-		t.Error("UserAccess.ListenPort = 0")
+	if !reflect.DeepEqual(ua.Providers, want) {
+		t.Errorf("UserAccess.Providers =\n  %+v\nwant\n  %+v", ua.Providers, want)
 	}
-	if len(ua.Peers) != 1 {
-		t.Fatalf("len(UserAccess.Peers) = %d, want 1", len(ua.Peers))
+	for _, p := range ua.Providers {
+		if !api.ValidUserAccessProviderID(p.ID) {
+			t.Errorf("provider %s has an id the control plane would refuse", p.Slug)
+		}
+		for _, d := range p.Devices {
+			if key, err := base64.StdEncoding.DecodeString(d.PublicKey); err != nil || len(d.PublicKey) != 44 || len(key) != 32 {
+				t.Errorf("device %s has no 44-character key of 32 bytes", d.Slug)
+			}
+		}
 	}
-	uaPeer := ua.Peers[0]
-	if uaPeer.PublicKey == "" {
-		t.Error("UserAccess.Peers[0].PublicKey is empty")
+
+	// The wire carries the members of each provider's kind and no others.
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
 	}
-	if len(uaPeer.AllowedIPs) == 0 {
-		t.Error("UserAccess.Peers[0].AllowedIPs is empty")
+	defer resp.Body.Close()
+	var raw struct {
+		Bridge struct {
+			UserAccess struct {
+				Providers []map[string]json.RawMessage `json:"providers"`
+			} `json:"user_access"`
+		} `json:"bridge"`
 	}
-	if uaPeer.Label == "" {
-		t.Error("UserAccess.Peers[0].Label is empty")
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	wantKeys := [][]string{
+		{"address_pool", "devices", "id", "kind", "listen_port", "max_devices", "slug"},
+		{"auth_secret_name", "id", "kind", "slug"},
+	}
+	if len(raw.Bridge.UserAccess.Providers) != len(wantKeys) {
+		t.Fatalf("%d providers on the wire, want %d", len(raw.Bridge.UserAccess.Providers), len(wantKeys))
+	}
+	for i, p := range raw.Bridge.UserAccess.Providers {
+		var got []string
+		for k := range p {
+			got = append(got, k)
+		}
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, wantKeys[i]) {
+			t.Errorf("provider %d members = %q, want %q", i, got, wantKeys[i])
+		}
 	}
 }
 

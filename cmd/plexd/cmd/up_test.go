@@ -6685,6 +6685,27 @@ func TestRunUp_MeshDNSListenAddress(t *testing.T) {
 	}
 }
 
+// A tailscale provider advertises the Domain mesh CIDR the WireGuard manager
+// set up, masked; an invalid prefix and the single-address fallback give none.
+func TestUserAccessMeshCIDR(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix netip.Prefix
+		want   string
+	}{
+		{"the Domain mesh prefix", netip.MustParsePrefix("10.99.0.0/24"), "10.99.0.0/24"},
+		{"a prefix around the mesh IP", netip.MustParsePrefix("10.99.0.5/16"), "10.99.0.0/16"},
+		{"the zero prefix before Setup", netip.Prefix{}, ""},
+		{"the /32 fallback without a domain_mesh_cidr", netip.MustParsePrefix("10.99.0.5/32"), ""},
+		{"an IPv6 /128", netip.MustParsePrefix("fd00::5/128"), ""},
+		{"an IPv6 prefix", netip.MustParsePrefix("fd00::5/64"), "fd00::/64"},
+	} {
+		if got := userAccessMeshCIDR(tc.prefix); got != tc.want {
+			t.Errorf("%s: userAccessMeshCIDR(%v) = %q, want %q", tc.name, tc.prefix, got, tc.want)
+		}
+	}
+}
+
 // macOS and Windows listen on loopback: a Mac cannot reach its own utun mesh
 // IP, and on Windows no plexd packet filter can match a query to 127.0.0.1.
 // Every other platform listens on the mesh IP.

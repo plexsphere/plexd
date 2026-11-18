@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/bridge"
 )
 
 // publishedReport records a single PublishReport call.
@@ -157,6 +160,89 @@ func TestStatusReportPublisher_NilBridgeManagersDisabled(t *testing.T) {
 		if !strings.Contains(string(payload), `"enabled":false`) {
 			t.Errorf("key %q payload = %s, want \"enabled\":false", key, payload)
 		}
+	}
+}
+
+// fakeBridgeKernel stands in for the kernel a user access manager programs:
+// it is the access controller, the route controller and the mesh source
+// rewriter at once, and every call succeeds.
+type fakeBridgeKernel struct{}
+
+var (
+	_ bridge.AccessController   = fakeBridgeKernel{}
+	_ bridge.RouteController    = fakeBridgeKernel{}
+	_ bridge.MeshSourceRewriter = fakeBridgeKernel{}
+)
+
+func (fakeBridgeKernel) CreateInterface(string, []byte, int, string) error    { return nil }
+func (fakeBridgeKernel) RemoveInterface(string) error                         { return nil }
+func (fakeBridgeKernel) RemoveInterfaces(string) error                        { return nil }
+func (fakeBridgeKernel) ConfigurePeer(string, string, []string, string) error { return nil }
+func (fakeBridgeKernel) RemovePeer(string, string) error                      { return nil }
+func (fakeBridgeKernel) PeerHandshakes(string) (map[string]time.Time, error) {
+	return map[string]time.Time{}, nil
+}
+func (fakeBridgeKernel) EnableForwarding(string, string) error        { return nil }
+func (fakeBridgeKernel) DisableForwarding(string, string) error       { return nil }
+func (fakeBridgeKernel) AddRoute(string, string) error                { return nil }
+func (fakeBridgeKernel) RemoveRoute(string, string) error             { return nil }
+func (fakeBridgeKernel) AddNATMasquerade(string) error                { return nil }
+func (fakeBridgeKernel) RemoveNATMasquerade(string) error             { return nil }
+func (fakeBridgeKernel) AddMeshSourceRewrite(string, string) error    { return nil }
+func (fakeBridgeKernel) RemoveMeshSourceRewrite(string, string) error { return nil }
+func (fakeBridgeKernel) ResetMeshSourceRewrite() error                { return nil }
+
+// TestStatusReportPublisher_UserAccess publishes status.user-access with one
+// entry per provider a real user access manager holds, and {"enabled":false}
+// without a manager and once the manager is torn down.
+func TestStatusReportPublisher_UserAccess(t *testing.T) {
+	fake := &fakeReportPublisher{}
+	p := newTestPublisher(fake, func() int { return 0 })
+	p.publishOnce()
+	if got := string(findPayload(t, fake, statusUserAccessKey)); got != `{"enabled":false}` {
+		t.Errorf("status.user-access without a manager = %s, want {\"enabled\":false}", got)
+	}
+
+	mgr := bridge.NewUserAccessManager(bridge.UserAccessDeps{
+		Access:        fakeBridgeKernel{},
+		Routes:        fakeBridgeKernel{},
+		Rewriter:      fakeBridgeKernel{},
+		Keys:          bridge.NewInterfaceKeyStore(t.TempDir()),
+		MeshInterface: "plexd0",
+		MeshCIDR:      "10.99.0.0/24",
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Teardown() })
+	mgr.Apply(t.Context(), api.UserAccessConfig{Enabled: true, Providers: []api.UserAccessProvider{
+		{
+			ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "field-team", Kind: api.UserAccessKindWireGuard,
+			ListenPort: 51821, AddressPool: "10.98.0.0/24", MaxDevices: 64,
+			Devices: []api.UserAccessDevice{{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", Slug: "alice-laptop", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", Address: "10.98.0.2"}},
+		},
+		// No tailscale client is built in, so the provider is not served.
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Slug: "tailnet", Kind: api.UserAccessKindTailscale, AuthSecretName: "ts-join"},
+	}})
+
+	p.userAccessMgr = mgr
+	fake.calls = nil
+	p.publishOnce()
+	const want = `{"enabled":true,"providers":[` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"field-team","kind":"wireguard","interface":"wg-ua-a0a0a0e1","health":"up","listen_port":51821,"devices":1,"connected_devices":0},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"tailnet","kind":"tailscale","health":"down","reason":"kind_not_served","devices":0,"connected_devices":0}]}`
+	if got := string(findPayload(t, fake, statusUserAccessKey)); got != want {
+		t.Errorf("status.user-access =\n  %s\nwant\n  %s", got, want)
+	}
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	fake.calls = nil
+	p.publishOnce()
+	if got := string(findPayload(t, fake, statusUserAccessKey)); got != `{"enabled":false}` {
+		t.Errorf("status.user-access after Teardown = %s, want {\"enabled\":false}", got)
 	}
 }
 

@@ -448,15 +448,34 @@ func newStateFixture() api.NodeStateSnapshot {
 					},
 				},
 			},
+			// The block in the shape the control plane delivers: one
+			// wireguard provider with one device and one tailscale provider.
+			// The pool differs from the contract's example, which takes
+			// 10.99.0.0/24, the fixture's mesh.
 			UserAccess: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access0",
-				ListenPort:    51821,
-				Peers: []api.UserAccessPeer{
+				Enabled: true,
+				Providers: []api.UserAccessProvider{
 					{
-						PublicKey:  "ua-pub-key-001",
-						AllowedIPs: []string{"10.100.0.1/32"},
-						Label:      "admin-laptop",
+						ID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+						Slug:        "field-team",
+						Kind:        api.UserAccessKindWireGuard,
+						ListenPort:  51821,
+						AddressPool: "10.98.0.0/24",
+						MaxDevices:  64,
+						Devices: []api.UserAccessDevice{
+							{
+								ID:        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1",
+								Slug:      "alice-laptop",
+								PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+								Address:   "10.98.0.2",
+							},
+						},
+					},
+					{
+						ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+						Slug:           "tailnet",
+						Kind:           api.UserAccessKindTailscale,
+						AuthSecretName: "ts-join",
 					},
 				},
 			},

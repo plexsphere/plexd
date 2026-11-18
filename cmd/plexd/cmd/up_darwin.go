@@ -115,6 +115,12 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 	return bridge.NewWGAccessController(wireguard.NewDarwinController(logger), logger)
 }
 
+// newMeshSourceRewriter returns nil: macOS has no mesh source rewrite yet, so
+// every user access provider reads kind_not_served (plexd#213).
+func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
+	return nil
+}
+
 // newVPNController creates the utun-backed controller for bridge
 // site-to-site tunnels on macOS. It needs root for the same reason, and it
 // holds its own DarwinController.

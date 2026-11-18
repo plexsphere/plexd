@@ -1920,102 +1920,226 @@ func TestBridgeInfo_RelayFields_JSONRoundTrip(t *testing.T) {
 
 func TestUserAccessConfig_JSONRoundTrip(t *testing.T) {
 	orig := UserAccessConfig{
-		Enabled:       true,
-		InterfaceName: "wg-access0",
-		ListenPort:    51830,
-		Peers: []UserAccessPeer{
+		Enabled: true,
+		Providers: []UserAccessProvider{
 			{
-				PublicKey:  "ua-pk-001",
-				AllowedIPs: []string{"10.99.0.1/32"},
-				PSK:        "ua-psk-001",
-				Label:      "alice-laptop",
+				ID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+				Slug:        "field-team",
+				Kind:        UserAccessKindWireGuard,
+				ListenPort:  51821,
+				AddressPool: "10.99.0.0/24",
+				MaxDevices:  64,
+				Devices: []UserAccessDevice{
+					{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", Slug: "alice-laptop", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", Address: "10.99.0.2"},
+				},
 			},
 			{
-				PublicKey:  "ua-pk-002",
-				AllowedIPs: []string{"10.99.0.2/32", "10.99.0.3/32"},
-				Label:      "bob-phone",
+				ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+				Slug:           "tailnet",
+				Kind:           UserAccessKindTailscale,
+				AuthSecretName: "tailscale-auth-key",
 			},
 		},
 	}
 	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
+	if !reflect.DeepEqual(orig, got) {
+		t.Errorf("round trip = %+v, want %+v", got, orig)
 	}
-	for _, key := range []string{"enabled", "interface_name", "listen_port", "peers"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
+
+	// Each provider carries the members of its kind and no others.
+	const want = `{"enabled":true,"providers":[` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"field-team","kind":"wireguard","listen_port":51821,"address_pool":"10.99.0.0/24","max_devices":64,` +
+		`"devices":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1","slug":"alice-laptop","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","address":"10.99.0.2"}]},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"tailnet","kind":"tailscale","auth_secret_name":"tailscale-auth-key"}]}`
+	if string(data) != want {
+		t.Errorf("JSON =\n  %s\nwant\n  %s", data, want)
 	}
 }
 
-func TestUserAccessPeer_JSONRoundTrip(t *testing.T) {
-	// With PSK set.
-	orig := UserAccessPeer{
-		PublicKey:  "ua-pk-001",
-		AllowedIPs: []string{"10.99.0.1/32"},
-		PSK:        "ua-psk-001",
-		Label:      "alice-laptop",
+// TestUserAccessConfig_DecodesContractBlock decodes the example block of the
+// agent contract's User access section (plexsphere/plexsphere@4935e06,
+// docs/reference/api/plexd-agent-contract.md).
+func TestUserAccessConfig_DecodesContractBlock(t *testing.T) {
+	const block = `{
+  "user_access": {
+    "enabled": true,
+    "providers": [
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+        "slug": "field-team",
+        "kind": "wireguard",
+        "listen_port": 51821,
+        "address_pool": "10.99.0.0/24",
+        "max_devices": 64,
+        "devices": [
+          {
+            "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1",
+            "slug": "alice-laptop",
+            "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            "address": "10.99.0.2"
+          },
+          {
+            "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2",
+            "slug": "bob-phone",
+            "public_key": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+            "address": "10.99.0.3"
+          }
+        ]
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+        "slug": "tailnet",
+        "kind": "tailscale",
+        "auth_secret_name": "tailscale-auth-key"
+      }
+    ]
+  }
+}`
+	var bridge BridgeSnapshot
+	if err := json.Unmarshal([]byte(block), &bridge); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
+	if bridge.UserAccess == nil {
+		t.Fatal("UserAccess is nil")
+	}
+	if !bridge.UserAccess.Enabled {
+		t.Error("UserAccess.Enabled = false, want true")
+	}
+	got := bridge.UserAccess.Providers
+	if len(got) != 2 {
+		t.Fatalf("%d providers, want 2: %+v", len(got), got)
+	}
+	if len(got[0].Devices) != 2 {
+		t.Errorf("%d devices on the first provider, want 2", len(got[0].Devices))
+	}
+	if got[1].AuthSecretName != "tailscale-auth-key" {
+		t.Errorf("second provider's AuthSecretName = %q, want tailscale-auth-key", got[1].AuthSecretName)
+	}
+	want := []UserAccessProvider{
+		{
+			ID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+			Slug:        "field-team",
+			Kind:        UserAccessKindWireGuard,
+			ListenPort:  51821,
+			AddressPool: "10.99.0.0/24",
+			MaxDevices:  64,
+			Devices: []UserAccessDevice{
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", Slug: "alice-laptop", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", Address: "10.99.0.2"},
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2", Slug: "bob-phone", PublicKey: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=", Address: "10.99.0.3"},
+			},
+		},
+		{
+			ID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+			Slug:           "tailnet",
+			Kind:           UserAccessKindTailscale,
+			AuthSecretName: "tailscale-auth-key",
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Providers =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
 
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"public_key", "allowed_ips", "psk", "label"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
+// TestUserAccessConfig_DecodesEmptyLists decodes a block without providers
+// and a provider with "devices": [] to empty lists without an error, and a
+// block in the shape before plexsphere/plexsphere#1108 to no providers, so a
+// control plane that still sends it has nothing served.
+func TestUserAccessConfig_DecodesEmptyLists(t *testing.T) {
+	for _, body := range []string{`{"enabled":true}`, `{"enabled":true,"providers":[]}`, `{"enabled":true,"providers":null}`} {
+		var got UserAccessConfig
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode %s: %v", body, err)
+		}
+		if len(got.Providers) != 0 {
+			t.Errorf("decode %s: Providers = %+v, want none", body, got.Providers)
 		}
 	}
 
-	// PSK should be omitted when empty.
-	orig.PSK = ""
-	data2, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data2); strings.Contains(s, `"psk"`) {
-		t.Errorf("psk should be omitted when empty, got: %s", s)
+	var got UserAccessConfig
+	const noDevices = `{"enabled":true,"providers":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"field-team","kind":"wireguard","listen_port":51821,"address_pool":"10.99.0.0/24","max_devices":64,"devices":[]}]}`
+	if err := json.Unmarshal([]byte(noDevices), &got); err != nil {
+		t.Fatalf("decode a provider without devices: %v", err)
+	}
+	if len(got.Providers) != 1 {
+		t.Fatalf("%d providers, want 1", len(got.Providers))
+	}
+	if devices := got.Providers[0].Devices; devices == nil || len(devices) != 0 {
+		t.Errorf("Devices = %#v, want an empty list", devices)
+	}
+
+	var old UserAccessConfig
+	const oldShape = `{"enabled":true,"interface_name":"wg-access0","listen_port":51821,"peers":[{"public_key":"ua-pub-key-001","allowed_ips":["10.100.0.1/32"],"label":"admin-laptop"}]}`
+	if err := json.Unmarshal([]byte(oldShape), &old); err != nil {
+		t.Fatalf("decode the old shape: %v", err)
+	}
+	if !old.Enabled || len(old.Providers) != 0 {
+		t.Errorf("old shape = %+v, want enabled and no providers", old)
+	}
+}
+
+func TestValidUserAccessProviderID(t *testing.T) {
+	const id = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"
+	for _, s := range []string{id, strings.ToUpper(id)} {
+		if !ValidUserAccessProviderID(s) {
+			t.Errorf("ValidUserAccessProviderID(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{
+		"",
+		"not-a-uuid",
+		"00000000-0000-0000-0000-000000000000",
+		strings.ReplaceAll(id, "-", ""),
+		"{" + id + "}",
+		id[:35] + "g",
+		id[:8] + "x" + id[9:],
+	} {
+		if ValidUserAccessProviderID(s) {
+			t.Errorf("ValidUserAccessProviderID(%q) = true, want false", s)
+		}
 	}
 }
 
 func TestUserAccessInfo_JSONRoundTrip(t *testing.T) {
 	orig := UserAccessInfo{
-		Enabled:       true,
-		InterfaceName: "wg-access0",
-		PeerCount:     5,
-		ListenPort:    51830,
+		Enabled: true,
+		Providers: []UserAccessProviderInfo{
+			{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "field-team", Kind: UserAccessKindWireGuard, Interface: "wg-ua-a0a0a0e1", Health: UserAccessHealthUp, ListenPort: 51821, Devices: 2, ConnectedDevices: 1},
+			{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Slug: "tailnet", Kind: UserAccessKindTailscale, Health: UserAccessHealthDown, Reason: "auth_secret_not_listed"},
+		},
 	}
 	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
+	if !reflect.DeepEqual(orig, got) {
+		t.Errorf("round trip = %+v, want %+v", got, orig)
 	}
-	for _, key := range []string{"enabled", "interface_name", "peer_count", "listen_port"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
+
+	// A provider that is down carries no interface or port, and both counts
+	// are always present.
+	const want = `{"enabled":true,"providers":[` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"field-team","kind":"wireguard","interface":"wg-ua-a0a0a0e1","health":"up","listen_port":51821,"devices":2,"connected_devices":1},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"tailnet","kind":"tailscale","health":"down","reason":"auth_secret_not_listed","devices":0,"connected_devices":0}]}`
+	if string(data) != want {
+		t.Errorf("JSON =\n  %s\nwant\n  %s", data, want)
 	}
 }
 
-// TestTypesUserAccessInfo round-trips UserAccessInfo directly. The user-access
-// manager still produces this type; it no longer travels in the heartbeat.
+// TestTypesUserAccessInfo pins the payload of a bridge without providers,
+// which is also the one a node outside bridge mode publishes.
 func TestTypesUserAccessInfo(t *testing.T) {
-	orig := UserAccessInfo{
-		Enabled:       true,
-		InterfaceName: "wg-access0",
-		PeerCount:     3,
-		ListenPort:    51830,
+	for _, tc := range []struct {
+		info UserAccessInfo
+		want string
+	}{
+		{UserAccessInfo{}, `{"enabled":false}`},
+		{UserAccessInfo{Enabled: true}, `{"enabled":true}`},
+	} {
+		data, got := roundTrip(t, tc.info)
+		if string(data) != tc.want {
+			t.Errorf("JSON = %s, want %s", data, tc.want)
+		}
+		if !reflect.DeepEqual(tc.info, got) {
+			t.Errorf("round trip = %+v, want %+v", got, tc.info)
+		}
 	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
 }
 
 func TestIngressConfig_JSONRoundTrip(t *testing.T) {

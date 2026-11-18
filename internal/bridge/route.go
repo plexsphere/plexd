@@ -78,3 +78,27 @@ type MeshSourceRewriter interface {
 	// Idempotent: resetting when no rewrite exists returns nil.
 	ResetMeshSourceRewrite() error
 }
+
+// CleanupUserAccess removes what a process that was killed left behind: every
+// interface whose name starts with UserAccessInterfacePrefix, through
+// access.RemoveInterfaces, and with a rewriter every mesh source rewrite,
+// through rewriter.ResetMeshSourceRewrite. A nil access or rewriter is
+// skipped. Both run; their errors are joined.
+//
+// Without it a provider's next CreateInterface fails on the name the killed
+// process left, and an interface of a bridge that opted out since keeps its
+// port open.
+func CleanupUserAccess(access AccessController, rewriter MeshSourceRewriter) error {
+	var errs []error
+	if access != nil {
+		if err := access.RemoveInterfaces(UserAccessInterfacePrefix); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if rewriter != nil {
+		if err := rewriter.ResetMeshSourceRewrite(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}

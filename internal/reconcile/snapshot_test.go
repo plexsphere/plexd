@@ -27,8 +27,12 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 		Bridge: &api.BridgeSnapshot{
 			UserAccess: &api.UserAccessConfig{
 				Enabled: true,
-				Peers: []api.UserAccessPeer{
-					{PublicKey: "ua-1", AllowedIPs: []string{"10.100.0.1/32"}},
+				Providers: []api.UserAccessProvider{
+					{
+						ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "field-team", Kind: api.UserAccessKindWireGuard,
+						ListenPort: 51821, AddressPool: "10.100.0.0/24", MaxDevices: 64,
+						Devices: []api.UserAccessDevice{{ID: "dev-1", Slug: "alice-laptop", PublicKey: "ua-1", Address: "10.100.0.2"}},
+					},
 				},
 			},
 			SiteToSite: &api.SiteToSiteConfig{
@@ -92,7 +96,7 @@ func TestStateSnapshot_Update(t *testing.T) {
 	if len(got.Policy.Rules) != 1 || got.Policy.Rules[0].Ports == nil || got.Policy.Rules[0].Ports.From != 443 {
 		t.Fatalf("Policy rules mismatch: %+v", got.Policy.Rules)
 	}
-	if got.Bridge == nil || got.Bridge.UserAccess == nil || len(got.Bridge.UserAccess.Peers) != 1 {
+	if got.Bridge == nil || got.Bridge.UserAccess == nil || len(got.Bridge.UserAccess.Providers) != 1 {
 		t.Fatalf("Bridge mismatch: %+v", got.Bridge)
 	}
 	if got.State == nil || len(got.State.Metadata) != 1 || got.State.Metadata[0].Value != "prod" {
@@ -124,7 +128,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	desired.Policy.Rules[0].SourceCIDR = "mutated"
 	desired.Policy.Rules[0].Ports.From = 8443
 	desired.Policy.Revisions[0].RevisionID = "mutated"
-	desired.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
+	desired.Bridge.UserAccess.Providers[0].Devices[0].Address = "mutated"
 	desired.Bridge.SiteToSite.Tunnels[0].LocalSubnets[0] = "mutated"
 	desired.State.Metadata[0].Value = "mutated"
 	desired.Reports.Metadata[0].Value = "mutated"
@@ -149,8 +153,8 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	if len(got.Policy.Revisions) != 1 || got.Policy.Revisions[0].RevisionID != "rev-1" {
 		t.Errorf("Policy revisions = %+v, want the stored [{pol-1 rev-1}] unaffected by the source", got.Policy.Revisions)
 	}
-	if got.Bridge.UserAccess.Peers[0].AllowedIPs[0] == "mutated" {
-		t.Error("Bridge user access AllowedIPs were not copied on Update")
+	if got.Bridge.UserAccess.Providers[0].Devices[0].Address == "mutated" {
+		t.Error("Bridge user access devices were not copied on Update")
 	}
 	if got.Bridge.SiteToSite.Tunnels[0].LocalSubnets[0] == "mutated" {
 		t.Error("Bridge site-to-site subnets were not copied on Update")
@@ -175,7 +179,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	got.Peers[0].EndpointCandidates[0] = "mutated"
 	got.Policy.Rules[0].SourceCIDR = "mutated"
 	got.Policy.Rules[0].Ports.To = 8443
-	got.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
+	got.Bridge.UserAccess.Providers[0].Devices[0].Address = "mutated"
 	got.Bridge.SiteToSite.Tunnels[0].RemoteSubnets[0] = "mutated"
 	got.State.Metadata[0].Value = "mutated"
 
@@ -196,8 +200,8 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	if got2.Policy.Rules[0].Ports.To == 8443 {
 		t.Error("Get did not deep-copy the port range pointer")
 	}
-	if got2.Bridge.UserAccess.Peers[0].AllowedIPs[0] == "mutated" {
-		t.Error("Get did not return a copy of Bridge user access AllowedIPs")
+	if got2.Bridge.UserAccess.Providers[0].Devices[0].Address == "mutated" {
+		t.Error("Get did not return a copy of Bridge user access devices")
 	}
 	if got2.Bridge.SiteToSite.Tunnels[0].RemoteSubnets[0] == "mutated" {
 		t.Error("Get did not return a copy of Bridge site-to-site subnets")
@@ -288,6 +292,72 @@ func TestStateSnapshot_CopiesRelayAssignments(t *testing.T) {
 	}
 	if diff := ComputeDiff(empty, &got); diff.BridgeChanged {
 		t.Error("an unchanged relay block with no assignments reads as bridge drift")
+	}
+}
+
+// TestStateSnapshot_CopiesUserAccessDevices proves copyUserAccess clones each
+// provider and its devices on both Update and Get, so mutating a copied
+// provider's device leaves the stored snapshot unchanged, and keeps an empty
+// device list empty: a nil copy of the [] a pull decodes would make
+// ComputeDiff report bridge drift on every pull.
+func TestStateSnapshot_CopiesUserAccessDevices(t *testing.T) {
+	snap := NewStateSnapshot()
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled: true,
+				Providers: []api.UserAccessProvider{
+					{
+						ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "field-team", Kind: api.UserAccessKindWireGuard,
+						ListenPort: 51821, AddressPool: "10.99.0.0/24", MaxDevices: 64,
+						Devices: []api.UserAccessDevice{
+							{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", Slug: "alice-laptop", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", Address: "10.99.0.2"},
+						},
+					},
+					{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Slug: "tailnet", Kind: api.UserAccessKindTailscale, AuthSecretName: "ts-join"},
+				},
+			},
+		},
+	}
+	snap.Update(desired)
+
+	got := snap.Get()
+	if diff := ComputeDiff(desired, &got); diff.BridgeChanged {
+		t.Fatalf("stored user access = %+v, want %+v", got.Bridge.UserAccess, desired.Bridge.UserAccess)
+	}
+
+	// Mutate the source after Update: the snapshot must be unaffected.
+	desired.Bridge.UserAccess.Providers[0].Devices[0].Address = "10.99.0.9"
+	desired.Bridge.UserAccess.Providers[1].AuthSecretName = "mutated"
+	if got2 := snap.Get(); got2.Bridge.UserAccess.Providers[0].Devices[0].Address != "10.99.0.2" {
+		t.Error("user access devices were not copied on Update")
+	} else if got2.Bridge.UserAccess.Providers[1].AuthSecretName != "ts-join" {
+		t.Error("user access providers were not copied on Update")
+	}
+
+	// Mutate a device of the returned copy: the snapshot must be unaffected.
+	got.Bridge.UserAccess.Providers[0].Devices[0].PublicKey = "mutated"
+	got.Bridge.UserAccess.Providers[0].Devices = append(got.Bridge.UserAccess.Providers[0].Devices, api.UserAccessDevice{ID: "extra"})
+	got3 := snap.Get()
+	if devices := got3.Bridge.UserAccess.Providers[0].Devices; len(devices) != 1 || devices[0].PublicKey != "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" {
+		t.Errorf("stored devices = %+v after mutating a copy, want the one device unchanged", devices)
+	}
+
+	empty := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:   true,
+				Providers: []api.UserAccessProvider{{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Kind: api.UserAccessKindWireGuard, Devices: []api.UserAccessDevice{}}},
+			},
+		},
+	}
+	snap.Update(empty)
+	got = snap.Get()
+	if got.Bridge.UserAccess.Providers[0].Devices == nil {
+		t.Error("an empty device list was copied to nil, want an empty non-nil slice")
+	}
+	if diff := ComputeDiff(empty, &got); diff.BridgeChanged {
+		t.Error("an unchanged user access block with no devices reads as bridge drift")
 	}
 }
 

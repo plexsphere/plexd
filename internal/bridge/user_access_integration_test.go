@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,191 +14,115 @@ import (
 // Integration tests — UserAccess
 // ---------------------------------------------------------------------------
 
-// TestUserAccessIntegration_FullLifecycle wires a UserAccessManager with mock
-// controllers, performs Setup → AddPeer → RemovePeer → Teardown, and verifies
-// the complete lifecycle. (Single-goroutine — no race concerns.)
-func TestUserAccessIntegration_FullLifecycle(t *testing.T) {
-	ctrl := &mockAccessController{}
-	routes := &mockRouteController{}
-	cfg := Config{
-		Enabled:                 true,
-		AccessInterface:         "eth1",
-		AccessSubnets:           []string{"10.0.0.0/24"},
-		UserAccessEnabled:       true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:    51822,
-	}
-	cfg.ApplyDefaults()
+// runUserAccessReconciler runs a real Reconciler that pulls state from
+// fetcher, with the user access pull and reconcile handlers of mgr, until the
+// test ends.
+func runUserAccessReconciler(t *testing.T, fetcher *integrationStateFetcher, mgr *UserAccessManager) *reconcile.Reconciler {
+	t.Helper()
+	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, discardLogger())
+	rec.RegisterDispatchHandler(UserAccessPullHandler(mgr))
+	rec.RegisterHandler(UserAccessReconcileHandler(mgr, discardLogger()))
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- rec.Run(ctx, "node-access") }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return rec
+}
 
-	// Setup.
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	if mgr.UserAccessStatus() == nil {
-		t.Fatal("should be active after Setup")
-	}
-
-	// Verify setup calls.
-	if n := len(ctrl.accessCallsFor("CreateInterface")); n != 1 {
-		t.Errorf("CreateInterface calls = %d, want 1", n)
-	}
-	if n := len(routes.callsFor("EnableForwarding")); n != 1 {
-		t.Errorf("EnableForwarding calls = %d, want 1", n)
-	}
-
-	// Add peers.
-	peer1 := api.UserAccessPeer{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, PSK: "psk-1", Label: "alice"}
-	peer2 := api.UserAccessPeer{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"}
-	if err := mgr.AddPeer(peer1); err != nil {
-		t.Fatalf("AddPeer 1: %v", err)
-	}
-	if err := mgr.AddPeer(peer2); err != nil {
-		t.Fatalf("AddPeer 2: %v", err)
-	}
-
-	status := mgr.UserAccessStatus()
-	if status.PeerCount != 2 {
-		t.Errorf("PeerCount = %d, want 2", status.PeerCount)
-	}
-
-	// Remove one peer.
-	mgr.RemovePeer("pk-1")
-	status = mgr.UserAccessStatus()
-	if status.PeerCount != 1 {
-		t.Errorf("PeerCount after remove = %d, want 1", status.PeerCount)
-	}
-
-	// Teardown.
-	ctrl.resetAccess()
-	routes.reset()
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-
-	// Verify teardown calls.
-	if n := len(ctrl.accessCallsFor("RemovePeer")); n != 1 {
-		t.Errorf("RemovePeer calls in teardown = %d, want 1 (remaining peer)", n)
-	}
-	if n := len(routes.callsFor("DisableForwarding")); n != 1 {
-		t.Errorf("DisableForwarding calls = %d, want 1", n)
-	}
-	if n := len(ctrl.accessCallsFor("RemoveInterface")); n != 1 {
-		t.Errorf("RemoveInterface calls = %d, want 1", n)
-	}
-
-	if mgr.UserAccessStatus() != nil {
-		t.Error("should be inactive after Teardown")
-	}
-
-	// Second teardown is no-op.
-	ctrl.resetAccess()
-	routes.reset()
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("second Teardown: %v", err)
-	}
-	if n := len(ctrl.accessCallsFor("RemoveInterface")); n != 0 {
-		t.Errorf("RemoveInterface calls on second teardown = %d, want 0", n)
+// userAccessState returns a pull whose bridge block lists providers, with
+// inventory as its secret inventory.
+func userAccessState(inventory []api.NodeStateSecret, providers ...api.UserAccessProvider) *api.NodeStateSnapshot {
+	return &api.NodeStateSnapshot{
+		Bridge:  &api.BridgeSnapshot{UserAccess: &api.UserAccessConfig{Enabled: true, Providers: providers}},
+		Secrets: &inventory,
 	}
 }
 
 // TestUserAccessIntegration_ReconcileDrift wires a UserAccessManager with a
-// real Reconciler and verifies that reconciliation correctly adds missing
-// peers and removes stale peers.
+// real Reconciler and verifies that successive pulls bring a wireguard
+// provider up, diff its devices, and tear it down with its key once the pull
+// no longer lists it.
 //
-// We observe state through the mock controller (accessCallsFor) rather than
-// the UserAccessManager to keep assertions independent of reconcile timing.
+// We observe state through the mock controller rather than the manager to
+// keep assertions independent of reconcile timing.
 func TestUserAccessIntegration_ReconcileDrift(t *testing.T) {
-	ctrl := &mockAccessController{}
-	routes := &mockRouteController{}
-	cfg := Config{
-		Enabled:                 true,
-		AccessInterface:         "eth1",
-		AccessSubnets:           []string{"10.0.0.0/24"},
-		UserAccessEnabled:       true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:    51822,
-	}
-	cfg.ApplyDefaults()
+	fx := newUAFixture(t, nil)
+	fetcher := &integrationStateFetcher{state: userAccessState(nil, wgProvider(uaID1, "field-team", 51821, "10.99.0.0/24", alice))}
+	rec := runUserAccessReconciler(t, fetcher, fx.mgr)
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	ctrl.resetAccess()
-
-	// Initial state: one peer.
-	state1 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			UserAccess: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access",
-				ListenPort:    51822,
-				Peers: []api.UserAccessPeer{
-					{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
-				},
-			},
-		},
-	}
-	fetcher := &integrationStateFetcher{state: state1}
-
-	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: time.Hour}, discardLogger())
-	rec.RegisterHandler(UserAccessReconcileHandler(mgr, discardLogger()))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- rec.Run(ctx, "node-access") }()
-
-	// Wait for initial cycle: pk-1 should be added (1 ConfigurePeer call).
+	// The first pull brings the provider up with alice.
 	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ctrl.accessCallsFor("ConfigurePeer")) >= 1
+		return len(fx.access.accessCallsFor("ConfigurePeer")) >= 1
 	})
-
-	// Update: replace pk-1 with pk-2 and pk-3.
-	state2 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			UserAccess: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access",
-				ListenPort:    51822,
-				Peers: []api.UserAccessPeer{
-					{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
-					{PublicKey: "pk-3", AllowedIPs: []string{"10.99.0.3/32"}, Label: "charlie"},
-				},
-			},
-		},
+	if got := len(fx.access.accessCallsFor("CreateInterface")); got != 1 {
+		t.Fatalf("CreateInterface calls = %d, want 1", got)
 	}
-	fetcher.setState(state2)
+
+	// alice is replaced by bob and carol: one RemovePeer and two more
+	// ConfigurePeer calls, on the same interface.
+	fetcher.setState(userAccessState(nil, wgProvider(uaID1, "field-team", 51821, "10.99.0.0/24", bob, carol)))
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(fx.access.accessCallsFor("ConfigurePeer")) >= 3 &&
+			len(fx.access.accessCallsFor("RemovePeer")) >= 1
+	})
+	if got := len(fx.access.accessCallsFor("CreateInterface")); got != 1 {
+		t.Errorf("CreateInterface calls = %d after a device change, want still 1", got)
+	}
+
+	// A pull without the provider removes its interface and its key.
+	fetcher.setState(&api.NodeStateSnapshot{Bridge: &api.BridgeSnapshot{}})
+	rec.TriggerReconcile()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(fx.access.accessCallsFor("RemoveInterface")) >= 1
+	})
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(fx.keyFiles(t)) == 0
+	})
+	if c := fx.rewriter.callsFor("RemoveMeshSourceRewrite"); len(c) != 1 || c[0].Args[0] != uaIface1 {
+		t.Errorf("RemoveMeshSourceRewrite calls = %+v, want %s", c, uaIface1)
+	}
+}
+
+// TestUserAccessIntegration_RetriesOnEveryPull wires the manager with a real
+// Reconciler and verifies that a provider down for a taken port and a vendor
+// provider whose Secret the inventory did not list come up on later pulls
+// whose bridge block did not change, once their next attempt is due.
+func TestUserAccessIntegration_RetriesOnEveryPull(t *testing.T) {
+	fx := newUAFixture(t, nil)
+	fx.access.createInterfaceErrFor = map[string]error{uaIface1: ErrListenPortInUse}
+	fx.secrets.set("ts-join", 1, "tskey")
+	providers := []api.UserAccessProvider{fieldTeam, vendorProvider(uaID2, "tailnet", api.UserAccessKindTailscale, "ts-join")}
+	fetcher := &integrationStateFetcher{state: userAccessState(nil, providers...)}
+	rec := runUserAccessReconciler(t, fetcher, fx.mgr)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(providerIDs(fx.mgr)) == 2
+	})
+	requireDown(t, fx.mgr, uaID1, UserAccessReasonBindFailed)
+	requireDown(t, fx.mgr, uaID2, UserAccessReasonAuthSecretNotListed)
+
+	// The port is free and the inventory lists the Secret; the bridge block
+	// is the same.
+	fx.access.mu.Lock()
+	fx.access.createInterfaceErrFor = nil
+	fx.access.mu.Unlock()
+	fetcher.setState(userAccessState(inventoryOf("ts-join", 1), providers...))
+	fx.clock.Add(5 * time.Second)
 	rec.TriggerReconcile()
 
-	// Wait for: 1 RemovePeer (pk-1) + 2 more ConfigurePeer (pk-2, pk-3) = total 3 ConfigurePeer.
 	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ctrl.accessCallsFor("ConfigurePeer")) >= 3 &&
-			len(ctrl.accessCallsFor("RemovePeer")) >= 1
+		info := fx.mgr.UserAccessStatus()
+		if info == nil || len(info.Providers) != 2 {
+			return false
+		}
+		return info.Providers[0].Health == api.UserAccessHealthUp && info.Providers[1].Health == api.UserAccessHealthUp
 	})
-
-	// Update: empty peers — all removed.
-	state3 := &api.NodeStateSnapshot{
-		Bridge: &api.BridgeSnapshot{
-			UserAccess: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access",
-				ListenPort:    51822,
-				Peers:         []api.UserAccessPeer{},
-			},
-		},
+	if got := fx.secrets.fetches(); !slices.Equal(got, []certVersion{{"ts-join", 1}}) {
+		t.Errorf("fetches = %v, want the listed version once", got)
 	}
-	fetcher.setState(state3)
-	rec.TriggerReconcile()
-
-	// Wait for 2 more RemovePeer calls (pk-2, pk-3) = total 3 RemovePeer.
-	waitForCondition(t, 2*time.Second, func() bool {
-		return len(ctrl.accessCallsFor("RemovePeer")) >= 3
-	})
-
-	cancel()
-	<-done
 }

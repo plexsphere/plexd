@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -164,178 +165,156 @@ func TestConfig_Validate_RelayValidConfig(t *testing.T) {
 	}
 }
 
+// The control plane delivers every user access provider, so ApplyDefaults
+// leaves the local switch unset and gives the ignored keys no value.
 func TestConfig_ApplyDefaults_UserAccessFields(t *testing.T) {
 	var cfg Config
 	cfg.ApplyDefaults()
 
-	if cfg.UserAccessEnabled {
-		t.Error("UserAccessEnabled should default to false")
+	if cfg.UserAccessEnabled != nil {
+		t.Errorf("UserAccessEnabled = %v, want it to stay nil after ApplyDefaults", *cfg.UserAccessEnabled)
 	}
-	if cfg.UserAccessInterfaceName != DefaultUserAccessInterfaceName {
-		t.Errorf("UserAccessInterfaceName = %q, want %q", cfg.UserAccessInterfaceName, DefaultUserAccessInterfaceName)
-	}
-	if cfg.UserAccessListenPort != DefaultUserAccessListenPort {
-		t.Errorf("UserAccessListenPort = %d, want %d", cfg.UserAccessListenPort, DefaultUserAccessListenPort)
-	}
-	if cfg.MaxAccessPeers != DefaultMaxAccessPeers {
-		t.Errorf("MaxAccessPeers = %d, want %d", cfg.MaxAccessPeers, DefaultMaxAccessPeers)
+	if keys := cfg.ReplacedUserAccessKeys(); keys != nil {
+		t.Errorf("ReplacedUserAccessKeys() = %q after ApplyDefaults, want nil: the ignored keys have no default", keys)
 	}
 }
 
+func TestConfig_UserAccessOptedOut(t *testing.T) {
+	tests := []struct {
+		name              string
+		userAccessEnabled *bool
+		want              bool
+	}{
+		{"nil serves", nil, false},
+		{"explicit true", BoolPtr(true), false},
+		{"explicit false opts out", BoolPtr(false), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{UserAccessEnabled: tt.userAccessEnabled}
+			if got := cfg.UserAccessOptedOut(); got != tt.want {
+				t.Errorf("UserAccessOptedOut() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// An unset switch is the default every node carries, so only an explicit true
+// is refused outside bridge mode.
 func TestConfig_Validate_UserAccessWithoutBridge(t *testing.T) {
-	cfg := Config{
-		Enabled:           false,
-		UserAccessEnabled: true,
+	tests := []struct {
+		name              string
+		userAccessEnabled *bool
+		wantErr           string
+	}{
+		{"explicit true", BoolPtr(true), "bridge: config: user access requires bridge mode to be enabled"},
+		{"nil", nil, ""},
+		{"explicit false", BoolPtr(false), ""},
 	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate should return error when user access enabled without bridge")
-	}
-	want := "bridge: config: user access requires bridge mode to be enabled"
-	if err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:           false,
+				UserAccessEnabled: tt.userAccessEnabled,
+			}
+			err := cfg.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("Validate() = nil, want %q", tt.wantErr)
+			case tt.wantErr != "" && err.Error() != tt.wantErr:
+				t.Errorf("got %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 }
 
-func TestConfig_Validate_UserAccessInvalidPort(t *testing.T) {
+func TestConfig_Validate_UserAccessInBridgeMode(t *testing.T) {
+	for name, enabled := range map[string]*bool{"nil": nil, "explicit true": BoolPtr(true), "explicit false": BoolPtr(false)} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:           true,
+				AccessInterface:   "eth1",
+				AccessSubnets:     []string{"10.0.0.0/24"},
+				UserAccessEnabled: enabled,
+				IngressEnabled:    BoolPtr(false),
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestConfig_ReplacedUserAccessKeys(t *testing.T) {
 	tests := []struct {
 		name string
-		port int
+		cfg  Config
+		want []string
 	}{
-		{"port zero", 0},
-		{"port too high", 70000},
+		{"none set", Config{Enabled: true, UserAccessEnabled: BoolPtr(true)}, nil},
+		{"interface name", Config{UserAccessInterfaceName: "wg-access"}, []string{"user_access_interface_name"}},
+		{"listen port", Config{UserAccessListenPort: 51822}, []string{"user_access_listen_port"}},
+		{"max peers", Config{MaxAccessPeers: 50}, []string{"max_access_peers"}},
+		{"provider type", Config{UserAccessProviderType: "tailscale"}, []string{"user_access_provider_type"}},
+		{"auth key env", Config{AuthKeyEnv: "PLEXD_TAILSCALE_AUTH_KEY"}, []string{"auth_key_env"}},
+		{"setup key env", Config{SetupKeyEnv: "PLEXD_NETBIRD_SETUP_KEY"}, []string{"setup_key_env"}},
+		{"two of them", Config{SetupKeyEnv: "PLEXD_NETBIRD_SETUP_KEY", UserAccessListenPort: 51822}, []string{"user_access_listen_port", "setup_key_env"}},
+		{"all six", Config{
+			UserAccessInterfaceName: "wg-access",
+			UserAccessListenPort:    51822,
+			MaxAccessPeers:          50,
+			UserAccessProviderType:  "netbird",
+			AuthKeyEnv:              "PLEXD_TAILSCALE_AUTH_KEY",
+			SetupKeyEnv:             "PLEXD_NETBIRD_SETUP_KEY",
+		}, []string{"user_access_interface_name", "user_access_listen_port", "max_access_peers", "user_access_provider_type", "auth_key_env", "setup_key_env"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{
-				Enabled:                true,
-				AccessInterface:        "eth1",
-				AccessSubnets:          []string{"10.0.0.0/24"},
-				UserAccessEnabled:      true,
-				UserAccessInterfaceName: "wg-access",
-				UserAccessListenPort:   tt.port,
+			got := tt.cfg.ReplacedUserAccessKeys()
+			if tt.want == nil {
+				if got != nil {
+					t.Errorf("ReplacedUserAccessKeys() = %q, want nil", got)
+				}
+				return
 			}
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatal("Validate should return error for invalid port")
-			}
-			want := "bridge: config: UserAccessListenPort must be between 1 and 65535"
-			if err.Error() != want {
-				t.Errorf("got %q, want %q", err.Error(), want)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ReplacedUserAccessKeys() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestConfig_Validate_UserAccessBoundaryPorts(t *testing.T) {
+// The ignored keys are not validated: values the local model refused, such
+// as an out-of-range port, a non-positive peer cap, an empty interface name
+// with user access on and an unknown provider type, are accepted and ignored.
+func TestConfig_Validate_ReplacedUserAccessKeysAccepted(t *testing.T) {
 	tests := []struct {
-		name    string
-		port    int
-		wantErr bool
+		name string
+		set  func(*Config)
 	}{
-		{"port 1 (min valid)", 1, false},
-		{"port 65535 (max valid)", 65535, false},
-		{"port 65536 (just over max)", 65536, true},
+		{"listen port zero", func(c *Config) { c.UserAccessListenPort = 0 }},
+		{"listen port too high", func(c *Config) { c.UserAccessListenPort = 70000 }},
+		{"negative peer cap", func(c *Config) { c.MaxAccessPeers = -1 }},
+		{"no interface name", func(c *Config) { c.UserAccessInterfaceName = "" }},
+		{"unknown provider type", func(c *Config) { c.UserAccessProviderType = "wireguard" }},
+		{"key variables", func(c *Config) { c.AuthKeyEnv, c.SetupKeyEnv = "X", "Y" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Config{
-				Enabled:                true,
-				AccessInterface:        "eth1",
-				AccessSubnets:          []string{"10.0.0.0/24"},
-				UserAccessEnabled:      true,
-				UserAccessInterfaceName: "wg-access",
-				UserAccessListenPort:   tt.port,
-				MaxAccessPeers:         50,
-				IngressEnabled:         BoolPtr(false),
+				Enabled:           true,
+				AccessInterface:   "eth1",
+				AccessSubnets:     []string{"10.0.0.0/24"},
+				UserAccessEnabled: BoolPtr(true),
+				IngressEnabled:    BoolPtr(false),
 			}
-			err := cfg.Validate()
-			if tt.wantErr && err == nil {
-				t.Fatal("Validate should return error for out-of-range port")
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("Validate should return nil for valid port %d, got: %v", tt.port, err)
+			tt.set(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil: the key is ignored", err)
 			}
 		})
-	}
-}
-
-func TestConfig_Validate_UserAccessValidConfig(t *testing.T) {
-	cfg := Config{
-		Enabled:                true,
-		AccessInterface:        "eth1",
-		AccessSubnets:          []string{"10.0.0.0/24"},
-		UserAccessEnabled:      true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:   51822,
-		MaxAccessPeers:         50,
-		IngressEnabled:         BoolPtr(false),
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should return nil for valid user access config, got: %v", err)
-	}
-}
-
-func TestConfig_Validate_UserAccessMissingAccessSubnets(t *testing.T) {
-	cfg := Config{
-		Enabled:                true,
-		AccessInterface:        "eth1",
-		UserAccessEnabled:      true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:   51822,
-		MaxAccessPeers:         50,
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate should return error when AccessSubnets is empty")
-	}
-	want := "bridge: config: at least one AccessSubnet is required when enabled"
-	if err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
-	}
-}
-
-func TestConfig_Validate_UserAccessInvalidMaxPeers(t *testing.T) {
-	tests := []struct {
-		name     string
-		maxPeers int
-	}{
-		{"zero peers", 0},
-		{"negative peers", -1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{
-				Enabled:                true,
-				AccessInterface:        "eth1",
-				AccessSubnets:          []string{"10.0.0.0/24"},
-				UserAccessEnabled:      true,
-				UserAccessInterfaceName: "wg-access",
-				UserAccessListenPort:   51822,
-				MaxAccessPeers:         tt.maxPeers,
-			}
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatal("Validate should return error for invalid MaxAccessPeers")
-			}
-			want := "bridge: config: MaxAccessPeers must be positive when user access is enabled"
-			if err.Error() != want {
-				t.Errorf("got %q, want %q", err.Error(), want)
-			}
-		})
-	}
-}
-
-func TestConfig_Validate_UserAccessDisabled(t *testing.T) {
-	cfg := Config{
-		Enabled:           true,
-		AccessInterface:   "eth1",
-		AccessSubnets:     []string{"10.0.0.0/24"},
-		UserAccessEnabled: false,
-		IngressEnabled:    BoolPtr(false),
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should return nil when user access is disabled, got: %v", err)
 	}
 }
 
@@ -653,56 +632,6 @@ func TestConfig_Validate_SiteToSiteDisabled(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil when site-to-site is disabled, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// UserAccessProviderType validation tests
-// ---------------------------------------------------------------------------
-
-func TestConfig_Validate_UserAccessProviderType_Valid(t *testing.T) {
-	for _, pt := range []string{"tailscale", "netbird"} {
-		t.Run(pt, func(t *testing.T) {
-			cfg := Config{
-				Enabled:                true,
-				AccessInterface:        "eth1",
-				AccessSubnets:          []string{"10.0.0.0/24"},
-				UserAccessProviderType: pt,
-				IngressEnabled:         BoolPtr(false),
-			}
-			if err := cfg.Validate(); err != nil {
-				t.Errorf("Validate should accept provider type %q, got: %v", pt, err)
-			}
-		})
-	}
-}
-
-func TestConfig_Validate_UserAccessProviderType_Empty(t *testing.T) {
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		IngressEnabled:  BoolPtr(false),
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate should accept empty provider type, got: %v", err)
-	}
-}
-
-func TestConfig_Validate_UserAccessProviderType_Invalid(t *testing.T) {
-	cfg := Config{
-		Enabled:                true,
-		AccessInterface:        "eth1",
-		AccessSubnets:          []string{"10.0.0.0/24"},
-		UserAccessProviderType: "wireguard",
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate should return error for unsupported provider type")
-	}
-	want := `bridge: config: unsupported UserAccessProviderType "wireguard"`
-	if err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
 	}
 }
 

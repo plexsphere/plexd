@@ -102,9 +102,9 @@ func copyUserAccess(src *api.UserAccessConfig) *api.UserAccessConfig {
 		return nil
 	}
 	cp := *src
-	cp.Peers = slices.Clone(src.Peers)
-	for i := range cp.Peers {
-		cp.Peers[i].AllowedIPs = slices.Clone(src.Peers[i].AllowedIPs)
+	cp.Providers = slices.Clone(src.Providers)
+	for i := range cp.Providers {
+		cp.Providers[i].Devices = slices.Clone(src.Providers[i].Devices)
 	}
 	return &cp
 }

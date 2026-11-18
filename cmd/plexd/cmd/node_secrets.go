@@ -8,22 +8,26 @@ import (
 	"github.com/plexsphere/plexd/internal/nodeapi"
 )
 
-// ingressCertFetcher reads the certificate Secret of a bridge's terminate
-// rule: it fetches the sealed envelope of one version with the node's own
+// nodeSecretFetcher reads a Secret of the bridge's Project: the certificate
+// of a terminate rule, or the key a vendor user access provider joins with.
+// For either, it fetches the sealed envelope of one version with the node's own
 // credential and opens it under the node secret key. Neither the value nor the
 // key reaches an error.
-type ingressCertFetcher struct {
+type nodeSecretFetcher struct {
 	client nodeapi.SecretFetcher
 	nodeID string
 	nsk    []byte
 }
 
-var _ bridge.CertificateSecretFetcher = ingressCertFetcher{}
+var (
+	_ bridge.CertificateSecretFetcher = nodeSecretFetcher{}
+	_ bridge.SecretValueFetcher       = nodeSecretFetcher{}
+)
 
 // FetchCertificateSecret returns the plaintext of version of the Secret name.
 // It refuses an envelope of another version, so a certificate is always the
 // version the secret inventory listed.
-func (f ingressCertFetcher) FetchCertificateSecret(ctx context.Context, name string, version int) ([]byte, error) {
+func (f nodeSecretFetcher) FetchCertificateSecret(ctx context.Context, name string, version int) ([]byte, error) {
 	env, err := f.client.FetchSecret(ctx, f.nodeID, name, version)
 	if err != nil {
 		return nil, fmt.Errorf("fetch secret %q version %d: %w", name, version, err)
@@ -36,4 +40,11 @@ func (f ingressCertFetcher) FetchCertificateSecret(ctx context.Context, name str
 		return nil, fmt.Errorf("decrypt secret %q version %d: %w", name, version, err)
 	}
 	return []byte(value), nil
+}
+
+// FetchSecretValue returns the plaintext of version of the Secret name, as
+// FetchCertificateSecret does, so a join key is always the version the secret
+// inventory listed.
+func (f nodeSecretFetcher) FetchSecretValue(ctx context.Context, name string, version int) ([]byte, error) {
+	return f.FetchCertificateSecret(ctx, name, version)
 }

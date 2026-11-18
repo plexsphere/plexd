@@ -1791,30 +1791,100 @@ type RelayAssignment struct {
 // User Access
 // ---------------------------------------------------------------------------
 
-// UserAccessConfig is the user access configuration pushed from the control plane.
+// UserAccessConfig is the bridge.user_access block of the state pull, the
+// control plane's NodeStateBridgeUserAccess: every user access provider of the
+// bridge Resource, ordered by slug. A bridge serves Providers only when Enabled
+// is true and its local configuration does not opt out; a block with Enabled
+// false, and an absent or null block, serve no provider. The block is whole: a
+// provider a later pull no longer lists is torn down. A block in the shape
+// before plexsphere/plexsphere#1108 (interface_name, listen_port, peers)
+// decodes to no providers.
 type UserAccessConfig struct {
-	Enabled       bool             `json:"enabled"`
-	InterfaceName string           `json:"interface_name"`
-	ListenPort    int              `json:"listen_port"`
-	Peers         []UserAccessPeer `json:"peers"`
+	Enabled   bool                 `json:"enabled"`
+	Providers []UserAccessProvider `json:"providers"`
 }
 
-// UserAccessPeer represents a user access peer (external VPN client).
-type UserAccessPeer struct {
-	PublicKey  string   `json:"public_key"`
-	AllowedIPs []string `json:"allowed_ips"`
-	PSK        string   `json:"psk,omitempty"`
-	Label      string   `json:"label"`
+// UserAccessProvider is one provider of the block, the control plane's
+// NodeStateBridgeUserAccessProvider. It carries the members of its Kind and no
+// others: ListenPort, AddressPool, MaxDevices and Devices for wireguard,
+// AuthSecretName for tailscale and netbird.
+type UserAccessProvider struct {
+	// ID is a UUID; ValidUserAccessProviderID checks it.
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	// Kind is one of the UserAccessKind* constants.
+	Kind string `json:"kind"`
+	// ListenPort is the UDP port of a wireguard provider's interface.
+	ListenPort int `json:"listen_port,omitempty"`
+	// AddressPool is the IPv4 network, in CIDR notation, a wireguard
+	// provider's interface and devices take their addresses from. The
+	// interface takes the first host address with the pool's prefix length.
+	AddressPool string `json:"address_pool,omitempty"`
+	// MaxDevices is the most devices a wireguard provider admits. The control
+	// plane holds the ceiling; the bridge does not enforce it.
+	MaxDevices int `json:"max_devices,omitempty"`
+	// Devices are the devices a wireguard provider admits.
+	Devices []UserAccessDevice `json:"devices,omitempty"`
+	// AuthSecretName names the Secret that holds the key a tailscale or
+	// netbird provider joins with, a Tailscale auth key or a NetBird setup
+	// key as plain text.
+	AuthSecretName string `json:"auth_secret_name,omitempty"`
 }
 
-// UserAccessInfo is the user access status reported by the node in heartbeats.
+// UserAccessDevice is one device of a wireguard provider, the control plane's
+// NodeStateBridgeUserAccessDevice: a WireGuard peer of the provider's
+// interface with PublicKey, and Address as its one allowed IP, a /32.
+type UserAccessDevice struct {
+	ID        string `json:"id"`
+	Slug      string `json:"slug"`
+	PublicKey string `json:"public_key"`
+	Address   string `json:"address"`
+}
+
+// The kinds of a user access provider.
+const (
+	// UserAccessKindWireGuard is a WireGuard interface on the bridge that
+	// admits the devices the operator registers by their public keys.
+	UserAccessKindWireGuard = "wireguard"
+	// UserAccessKindTailscale joins the bridge to a tailnet.
+	UserAccessKindTailscale = "tailscale"
+	// UserAccessKindNetbird joins the bridge to a NetBird network.
+	UserAccessKindNetbird = "netbird"
+)
+
+// ValidUserAccessProviderID reports whether s is a UUID in canonical form, in
+// either case, other than the zero UUID: the check of ValidIngressRuleID, and
+// the id the control plane accepts in a user access status report.
+func ValidUserAccessProviderID(s string) bool {
+	return ValidIngressRuleID(s)
+}
+
+// UserAccessInfo is the user access status a node publishes under the node API
+// report key status.user-access: whether the last applied block enabled user
+// access, and one entry per provider the bridge holds, in block order.
 type UserAccessInfo struct {
-	Enabled        bool   `json:"enabled"`
-	InterfaceName  string `json:"interface_name"`
-	PeerCount      int    `json:"peer_count"`
-	ListenPort     int    `json:"listen_port"`
-	ProviderName   string `json:"provider_name,omitempty"`
-	ProviderStatus string `json:"provider_status,omitempty"`
+	Enabled   bool                     `json:"enabled"`
+	Providers []UserAccessProviderInfo `json:"providers,omitempty"`
+}
+
+// UserAccessProviderInfo is one provider of a UserAccessInfo.
+type UserAccessProviderInfo struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Kind string `json:"kind"`
+	// Interface is the provider's network interface; empty while it has none.
+	Interface string `json:"interface,omitempty"`
+	// Health is one of the UserAccessHealth* constants.
+	Health string `json:"health"`
+	// Reason says why a provider is down; empty while it is up.
+	Reason string `json:"reason,omitempty"`
+	// ListenPort is a wireguard provider's UDP port.
+	ListenPort int `json:"listen_port,omitempty"`
+	// Devices counts the devices configured on a wireguard provider's
+	// interface.
+	Devices int `json:"devices"`
+	// ConnectedDevices counts those of them with a recent handshake.
+	ConnectedDevices int `json:"connected_devices"`
 }
 
 // ---------------------------------------------------------------------------

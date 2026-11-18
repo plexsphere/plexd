@@ -498,6 +498,102 @@ bridge:
 	}
 }
 
+// TestParseConfig_ReplacedUserAccessKeys pins that a file written for an
+// older plexd keeps loading: the control plane delivers each user access
+// provider, the six keys of the local model have no effect, and the bridge
+// config names those that are set, which plexd up logs once. Values the old
+// validation refused load as well.
+func TestParseConfig_ReplacedUserAccessKeys(t *testing.T) {
+	yaml := `
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth1
+  access_subnets: ["10.0.0.0/24"]
+  user_access_enabled: true
+  user_access_interface_name: wg-access
+  user_access_listen_port: 70000
+  max_access_peers: 0
+  user_access_provider_type: wireguard
+  auth_key_env: PLEXD_TAILSCALE_AUTH_KEY
+  setup_key_env: PLEXD_NETBIRD_SETUP_KEY
+`
+	path := writeTemp(t, yaml)
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	if cfg.Bridge.UserAccessEnabled == nil || !*cfg.Bridge.UserAccessEnabled {
+		t.Errorf("Bridge.UserAccessEnabled = %v, want a pointer to true", cfg.Bridge.UserAccessEnabled)
+	}
+	want := []string{"user_access_interface_name", "user_access_listen_port", "user_access_provider_type", "auth_key_env", "setup_key_env"}
+	if got := cfg.Bridge.ReplacedUserAccessKeys(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Bridge.ReplacedUserAccessKeys() = %q, want %q: max_access_peers is set to its zero value", got, want)
+	}
+	if err := cfg.Bridge.Validate(); err != nil {
+		t.Errorf("Bridge.Validate() = %v, want nil", err)
+	}
+}
+
+// TestParseConfig_BridgeUserAccessSwitch pins bridge.user_access_enabled
+// through the whole load. A bridge that sets no key serves the providers the
+// pull enables, and `user_access_enabled: false` is the host operator's only
+// way to keep user access off, so it must survive defaulting exactly as
+// written. A node outside bridge mode may carry false but not true.
+func TestParseConfig_BridgeUserAccessSwitch(t *testing.T) {
+	const bridgeBlock = `
+api:
+  base_url: https://example.com
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth1
+  access_subnets: ["10.0.0.0/24"]
+`
+	const nodeBlock = "api:\n  base_url: https://example.com\nmode: node\n"
+	tests := []struct {
+		name         string
+		yaml         string
+		wantNil      bool
+		wantOptedOut bool
+		wantErr      string
+	}{
+		{name: "no user_access_enabled key", yaml: bridgeBlock, wantNil: true},
+		{name: "user_access_enabled false", yaml: bridgeBlock + "  user_access_enabled: false\n", wantOptedOut: true},
+		{name: "user_access_enabled true", yaml: bridgeBlock + "  user_access_enabled: true\n"},
+		{name: "mode node without a bridge block", yaml: nodeBlock, wantNil: true},
+		{name: "mode node with user_access_enabled false", yaml: nodeBlock + "bridge:\n  user_access_enabled: false\n", wantOptedOut: true},
+		{name: "mode node with user_access_enabled true", yaml: nodeBlock + "bridge:\n  user_access_enabled: true\n", wantErr: "bridge: config: user access requires bridge mode to be enabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, found, err := ParseConfig(writeTemp(t, tt.yaml))
+			if err != nil {
+				t.Fatalf("ParseConfig: %v", err)
+			}
+			if !found {
+				t.Error("found = false, want true for an existing file")
+			}
+			if got := cfg.Bridge.UserAccessEnabled == nil; got != tt.wantNil {
+				t.Errorf("Bridge.UserAccessEnabled == nil is %v, want %v", got, tt.wantNil)
+			}
+			if got := cfg.Bridge.UserAccessOptedOut(); got != tt.wantOptedOut {
+				t.Errorf("Bridge.UserAccessOptedOut() = %v, want %v", got, tt.wantOptedOut)
+			}
+			err = cfg.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Errorf("Validate() = %v, want an error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestParseConfig_BridgeIngressSwitch pins bridge.ingress_enabled through the
 // whole load. A bridge that sets no key serves public ingress, and
 // `ingress_enabled: false` is the host operator's only way to keep the host
