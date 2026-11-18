@@ -102,6 +102,17 @@ func (m *mockRouteController) callsFor(method string) []mockCall {
 	return result
 }
 
+// methods returns the methods of the recorded calls, in order.
+func (m *mockRouteController) methods() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	methods := make([]string, len(m.calls))
+	for i, c := range m.calls {
+		methods[i] = c.Method
+	}
+	return methods
+}
+
 // reset clears all recorded calls.
 func (m *mockRouteController) reset() {
 	m.mu.Lock()
@@ -146,6 +157,37 @@ func (m *mockMeshSourceRewriter) ResetMeshSourceRewrite() error {
 	err := m.resetMeshSourceRewriteErr
 	m.mu.Unlock()
 	return err
+}
+
+// callsFor returns all recorded calls for the given method name.
+func (m *mockMeshSourceRewriter) callsFor(method string) []mockCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []mockCall
+	for _, c := range m.calls {
+		if c.Method == method {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+// methods returns the methods of the recorded calls, in order.
+func (m *mockMeshSourceRewriter) methods() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	methods := make([]string, len(m.calls))
+	for i, c := range m.calls {
+		methods[i] = c.Method
+	}
+	return methods
+}
+
+// reset clears all recorded calls.
+func (m *mockMeshSourceRewriter) reset() {
+	m.mu.Lock()
+	m.calls = nil
+	m.mu.Unlock()
 }
 
 type nopWriter struct{}

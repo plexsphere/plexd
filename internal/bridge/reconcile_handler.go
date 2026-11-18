@@ -163,58 +163,76 @@ func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile
 	}
 }
 
-// UserAccessReconcileHandler returns a reconcile.ReconcileHandler that updates
-// user access peers when the desired bridge user-access subtree changes. It
-// diffs the desired peers against the currently active peers, adding missing
-// and removing stale peers. The handler is presence-aware: a nil Bridge or nil
-// UserAccess child means "not populated", so it reconciles against an empty
-// desired set and tears down stale peers.
+// UserAccessPullHandler returns a reconcile.DispatchHandler that runs on every
+// successful pull. It hands the pull's secret inventory to the user access
+// manager, which brings up again each provider that is down for a reason a
+// retry can cure and whose next attempt is due. A pull whose only change is
+// the secrets block reports no drift, so no reconcile handler would see a
+// Secret the inventory newly lists, and a provider whose port was taken needs
+// a retry whatever drifted. A nil Secrets block, a control plane that did not
+// say this time, keeps the inventory the manager holds and only retries.
+// Dispatch handlers run before the reconcile handlers, so a cycle that brings
+// a new provider and its Secret hands the inventory over first. A nil
+// snapshot changes nothing.
+func UserAccessPullHandler(mgr *UserAccessManager) reconcile.DispatchHandler {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot) {
+		if desired == nil {
+			return
+		}
+		if desired.Secrets == nil {
+			mgr.Retry(ctx)
+			return
+		}
+		mgr.SyncSecretInventory(ctx, *desired.Secrets)
+	}
+}
+
+// UserAccessReconcileHandler returns a reconcile.ReconcileHandler that serves
+// the desired bridge.user_access block whole. mgr is nil when the node opts
+// out of user access, bridge.user_access_enabled: false. A nil snapshot
+// changes nothing, and the handler returns nil in every case: a provider that
+// is down is retried by UserAccessPullHandler, so one broken provider never
+// makes the reconciler apply the whole snapshot again.
+//
+// With a manager, the pulled block is applied as it is, and a nil Bridge or
+// nil UserAccess child applies the zero block, which tears every provider
+// down and deletes every key file. The manager serves providers only when the
+// block's Enabled is true.
+//
+// Without a manager the handler touches nothing. A block with Enabled true
+// and at least one provider is logged as a Warn naming how many providers the
+// local opt-out leaves unserved, only when diff.BridgeChanged is set: the
+// reconciler invokes every handler on any drift, and an ungated Warn would
+// repeat on each peer or policy change. It is logged once per change of the
+// pulled bridge block, which includes the first pull after every start.
 func UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
 		if desired == nil {
 			return nil
 		}
 
-		var peers []api.UserAccessPeer
-		if desired.Bridge != nil && desired.Bridge.UserAccess != nil {
-			peers = desired.Bridge.UserAccess.Peers
+		var pulled *api.UserAccessConfig
+		if desired.Bridge != nil {
+			pulled = desired.Bridge.UserAccess
 		}
 
-		// Build desired and current sets for diffing.
-		desiredSet := make(map[string]api.UserAccessPeer, len(peers))
-		for _, p := range peers {
-			desiredSet[p.PublicKey] = p
-		}
-
-		currentKeys := mgr.PeerPublicKeys()
-		currentSet := make(map[string]struct{}, len(currentKeys))
-		for _, pk := range currentKeys {
-			currentSet[pk] = struct{}{}
-		}
-
-		// Remove stale peers (present locally but not in desired state).
-		for _, pk := range currentKeys {
-			if _, ok := desiredSet[pk]; !ok {
-				mgr.RemovePeer(pk)
-			}
-		}
-
-		// Add missing peers (present in desired state but not locally).
-		var errs []error
-		for _, peer := range peers {
-			if _, ok := currentSet[peer.PublicKey]; ok {
-				continue
-			}
-			if err := mgr.AddPeer(peer); err != nil {
-				logger.Error("user access reconcile: add peer failed",
-					"public_key", peer.PublicKey,
-					"error", err,
+		if mgr == nil {
+			if pulled != nil && pulled.Enabled && len(pulled.Providers) > 0 && diff.BridgeChanged {
+				logger.Warn("user access: the control plane enables user access, but bridge.user_access_enabled is false",
+					"component", "bridge",
+					"providers", len(pulled.Providers),
 				)
-				errs = append(errs, err)
 			}
+			return nil
 		}
 
-		return errors.Join(errs...)
+		// The zero block tears every provider down.
+		var block api.UserAccessConfig
+		if pulled != nil {
+			block = *pulled
+		}
+		mgr.Apply(ctx, block)
+		return nil
 	}
 }
 

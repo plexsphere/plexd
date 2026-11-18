@@ -84,6 +84,17 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 	return bridge.NewNetlinkAccessController(logger)
 }
 
+// newMeshSourceRewriter returns the route controller itself on Linux: the
+// NetlinkRouteController rewrites the source of user access traffic into the
+// mesh in its nftables table plexd-mesh-nat. It returns nil for any other
+// route controller, which serves no user access provider.
+func newMeshSourceRewriter(routes bridge.RouteController) bridge.MeshSourceRewriter {
+	if r, ok := routes.(*bridge.NetlinkRouteController); ok && r != nil {
+		return r
+	}
+	return nil
+}
+
 // newVPNController creates a NetlinkVPNController for site-to-site tunnels on
 // Linux. The mesh IP is unused: the tunnel link stays unnumbered, because a
 // netlink route names the link itself.

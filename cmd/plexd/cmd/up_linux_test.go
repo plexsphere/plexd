@@ -92,6 +92,28 @@ func TestNewVPNController_Linux(t *testing.T) {
 	}
 }
 
+// TestNewMeshSourceRewriter_Linux pins that the netlink route controller is
+// the mesh source rewriter on Linux, and that any other route controller, a
+// nil one included, yields an untyped nil, which serves no user access
+// provider.
+func TestNewMeshSourceRewriter_Linux(t *testing.T) {
+	routes := newRouteController(discardLogger(), nil)
+	rewriter := newMeshSourceRewriter(routes)
+	if rewriter == nil {
+		t.Fatal("newMeshSourceRewriter() = nil, want the netlink route controller on Linux")
+	}
+	if got, ok := rewriter.(*bridge.NetlinkRouteController); !ok || got != routes {
+		t.Errorf("newMeshSourceRewriter() = %T %p, want the route controller %p itself", rewriter, rewriter, routes)
+	}
+	if got := newMeshSourceRewriter(nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(nil) = %#v, want nil", got)
+	}
+	var typedNil *bridge.NetlinkRouteController
+	if got := newMeshSourceRewriter(typedNil); got != nil {
+		t.Errorf("newMeshSourceRewriter(typed nil) = %#v, want an untyped nil", got)
+	}
+}
+
 const helperSocketWarning = "plexd-session-helper.socket is not listening; ssh sessions run inside plexd's own sandbox and cannot switch users"
 
 func TestNewSessionLauncher_WarnsWithoutSocketUnderSystemd(t *testing.T) {

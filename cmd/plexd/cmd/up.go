@@ -586,6 +586,29 @@ func runAgent(ctx context.Context) error {
 			return fmt.Errorf("plexd up: bridge setup: %w", err)
 		}
 
+		// The control plane delivers every user access provider; the keys
+		// of the local model still parse and are ignored, so a configuration
+		// written for an older plexd keeps starting after an upgrade.
+		if keys := cfg.Bridge.ReplacedUserAccessKeys(); len(keys) > 0 {
+			logger.Warn("bridge: config: user access keys are ignored, the control plane delivers providers",
+				"component", "bridge",
+				"keys", keys,
+			)
+		}
+
+		// The fetch of the Secrets a bridge reads: the certificates of
+		// terminate rules and the join keys of vendor user access providers.
+		// It is built once, ahead of both managers, and only when one of them
+		// is: a bridge that opts out of both reads no node secret key.
+		var secrets nodeSecretFetcher
+		if !cfg.Bridge.IngressOptedOut() || !cfg.Bridge.UserAccessOptedOut() {
+			bridgeNSK, err := identity.SecretKey()
+			if err != nil {
+				return fmt.Errorf("plexd up: %w", err)
+			}
+			secrets = nodeSecretFetcher{client: client, nodeID: identity.NodeID, nsk: bridgeNSK}
+		}
+
 		// Ingress manager, with the ACME account its acme rules share and the
 		// fetch of its terminate rules' certificates, unless the node opts out
 		// with bridge.ingress_enabled: false. An opted-out bridge builds
@@ -601,13 +624,8 @@ func runAgent(ctx context.Context) error {
 				acmeDir = filepath.Join(cfg.DataDir, "acme")
 			}
 			acmeMgr = bridge.NewACMEManager(bridge.ACMEConfig{CacheDir: acmeDir}, logger)
-			ingressNSK, err := identity.SecretKey()
-			if err != nil {
-				return fmt.Errorf("plexd up: %w", err)
-			}
-			certs := ingressCertFetcher{client: client, nodeID: identity.NodeID, nsk: ingressNSK}
 			ingressCtrl := bridge.NewStdIngressController(logger)
-			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr, certs)
+			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr, secrets)
 			if dialPolicy, err := newIngressDialPolicy(enforcer, identity.MeshIP); err != nil {
 				logger.Warn("ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error",
 					"component", "bridge",
@@ -626,13 +644,45 @@ func runAgent(ctx context.Context) error {
 			)
 		}
 
-		// User access manager.
-		if cfg.Bridge.UserAccessEnabled {
-			accessCtrl := newAccessController(logger)
-			userAccessMgr = bridge.NewUserAccessManager(accessCtrl, routeCtrl, cfg.Bridge, logger, nil)
+		// User access manager, unless the node opts out with
+		// bridge.user_access_enabled: false. It serves the providers the
+		// state pull enables: a WireGuard interface with a kept key under
+		// <data_dir>/user-access for each wireguard provider, and the vendor
+		// client of each tailscale or netbird provider, joined with the key
+		// its Secret holds. Without a mesh source rewrite, on macOS and
+		// Windows, it serves no provider: one that passes its checks reads
+		// kind_not_served, one that fails them invalid_provider. Setup first
+		// removes the interfaces and rewrites a killed process left behind.
+		// An opted-out bridge builds no manager and removes them all the
+		// same, so no interface of an earlier process keeps a port open.
+		if !cfg.Bridge.UserAccessOptedOut() {
+			userAccessMgr = bridge.NewUserAccessManager(bridge.UserAccessDeps{
+				Access:   newAccessController(logger),
+				Routes:   routeCtrl,
+				Rewriter: newMeshSourceRewriter(routeCtrl),
+				Keys:     bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "user-access")),
+				Secrets:  secrets,
+				Clients: map[string]bridge.UserAccessClient{
+					api.UserAccessKindTailscale: bridge.NewTailscaleProvider(bridge.NewStdCommandExecutor(), logger),
+					api.UserAccessKindNetbird:   bridge.NewNetbirdProvider(bridge.NewStdCommandExecutor(), logger),
+				},
+				MeshInterface: cfg.WireGuard.InterfaceName,
+				MeshCIDR:      userAccessMeshCIDR(wgMgr.MeshPrefix()),
+				Logger:        logger,
+			})
 			if err := userAccessMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: user access setup: %w", err)
 			}
+		} else {
+			if err := bridge.CleanupUserAccess(newAccessController(logger), newMeshSourceRewriter(routeCtrl)); err != nil {
+				logger.Error("bridge: user access: clean up failed",
+					"component", "bridge",
+					"error", err,
+				)
+			}
+			logger.Info("user access: opted out by bridge.user_access_enabled, no provider is served",
+				"component", "bridge",
+			)
 		}
 
 		// Site-to-site VPN manager.
@@ -647,7 +697,7 @@ func runAgent(ctx context.Context) error {
 		logger.Info("bridge subsystem initialized",
 			"relay", cfg.Bridge.RelayEnabled,
 			"ingress", !cfg.Bridge.IngressOptedOut(),
-			"user_access", cfg.Bridge.UserAccessEnabled,
+			"user_access", !cfg.Bridge.UserAccessOptedOut(),
 			"site_to_site", cfg.Bridge.SiteToSiteEnabled,
 		)
 	}
@@ -1157,7 +1207,8 @@ func runAgent(ctx context.Context) error {
 	// manager's tracker, which the reporter of step 17d sends. The ingress
 	// handler runs whenever bridge mode does as well: it serves the block the
 	// pull enables, and on a bridge that opts out of public ingress (a nil
-	// ingress manager) it only says that the control plane enables rules.
+	// ingress manager) it only says that the control plane enables rules. The
+	// user access handler does the same for the user access block.
 	if bridgeMgr != nil {
 		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
@@ -1168,8 +1219,12 @@ func runAgent(ctx context.Context) error {
 		}
 		reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		if userAccessMgr != nil {
-			reconciler.RegisterHandler(bridge.UserAccessReconcileHandler(userAccessMgr, logger))
+			// The same holds for the Secret of a vendor provider, and a
+			// provider that is down is retried on every successful pull, so
+			// no reconcile cycle fails for one.
+			reconciler.RegisterDispatchHandler(bridge.UserAccessPullHandler(userAccessMgr))
 		}
+		reconciler.RegisterHandler(bridge.UserAccessReconcileHandler(userAccessMgr, logger))
 		if s2sMgr != nil {
 			reconciler.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 		}
@@ -1690,6 +1745,20 @@ func meshMTUProbe(natCfg nat.Config) func(context.Context) (int, error) {
 	return func(ctx context.Context) (int, error) {
 		return nat.ProbePathMTU(ctx, servers, nat.MTUProbeTimeout)
 	}
+}
+
+// userAccessMeshCIDR returns the Domain mesh CIDR a tailscale user access
+// provider advertises as a route: prefix masked to its network. It returns ""
+// for a prefix that is not valid, as before the WireGuard manager's Setup
+// succeeded, and for one that covers a single address, which the manager
+// falls back to when the identity carries no usable domain_mesh_cidr: a route
+// to the bridge's own mesh address alone would reach no other node. An empty
+// CIDR leaves a tailscale provider down with setup_failed.
+func userAccessMeshCIDR(prefix netip.Prefix) string {
+	if !prefix.IsValid() || prefix.IsSingleIP() {
+		return ""
+	}
+	return prefix.Masked().String()
 }
 
 // meshDNSListenIP returns the address the mesh resolver listens on: the

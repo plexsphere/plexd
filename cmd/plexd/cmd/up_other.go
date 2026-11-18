@@ -68,6 +68,11 @@ func newAccessController(_ *slog.Logger) bridge.AccessController {
 	return nil
 }
 
+// newMeshSourceRewriter returns nil on platforms without an implementation.
+func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
+	return nil
+}
+
 // newVPNController returns nil on platforms without an implementation.
 func newVPNController(_ *slog.Logger, _ string) bridge.VPNController {
 	return nil

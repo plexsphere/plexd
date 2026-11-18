@@ -25,9 +25,10 @@ type mockAccessController struct {
 	peerHandshakesErr   error
 
 	// Per-key error injection.
-	configurePeerErrFor  map[string]error // keyed by publicKey
-	removePeerErrFor     map[string]error // keyed by publicKey
-	peerHandshakesErrFor map[string]error // keyed by interface name
+	createInterfaceErrFor map[string]error // keyed by interface name
+	configurePeerErrFor   map[string]error // keyed by publicKey
+	removePeerErrFor      map[string]error // keyed by publicKey
+	peerHandshakesErrFor  map[string]error // keyed by interface name
 
 	// peerHandshakes is what PeerHandshakes returns for an interface, keyed
 	// by interface name; an interface it does not list reads as no peers.
@@ -39,7 +40,7 @@ type mockAccessController struct {
 func (m *mockAccessController) CreateInterface(name string, privateKey []byte, listenPort int, address string) error {
 	m.mu.Lock()
 	m.calls = append(m.calls, mockAccessCall{Method: "CreateInterface", Args: []interface{}{name, privateKey, listenPort, address}})
-	err := m.createInterfaceErr
+	err := errForKey(m.createInterfaceErrFor, name, m.createInterfaceErr)
 	m.mu.Unlock()
 	return err
 }
@@ -102,6 +103,17 @@ func (m *mockAccessController) accessCallsFor(method string) []mockAccessCall {
 		}
 	}
 	return result
+}
+
+// accessMethods returns the methods of the recorded calls, in order.
+func (m *mockAccessController) accessMethods() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	methods := make([]string, len(m.calls))
+	for i, c := range m.calls {
+		methods[i] = c.Method
+	}
+	return methods
 }
 
 func (m *mockAccessController) resetAccess() {

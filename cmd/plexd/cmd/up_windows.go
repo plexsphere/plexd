@@ -117,6 +117,12 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 	return bridge.NewWGAccessController(wireguard.NewWindowsController(logger), logger)
 }
 
+// newMeshSourceRewriter returns nil: Windows has no mesh source rewrite yet,
+// so every user access provider reads kind_not_served (plexd#214).
+func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
+	return nil
+}
+
 // newVPNController creates the Wintun-backed controller for bridge
 // site-to-site tunnels on Windows. It needs Administrator for the same
 // reason, and it holds its own WindowsController.
