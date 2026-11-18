@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -13,7 +14,7 @@ import (
 // mockUserAccessProvider
 // ---------------------------------------------------------------------------
 
-// mockUserAccessProvider is a test double for UserAccessProvider.
+// mockUserAccessProvider is a test double for UserAccessClient.
 type mockUserAccessProvider struct {
 	mu       sync.Mutex
 	calls    []string
@@ -29,7 +30,7 @@ func newMockUserAccessProvider(name string) *mockUserAccessProvider {
 
 func (p *mockUserAccessProvider) Name() string { return p.name }
 
-func (p *mockUserAccessProvider) Start(_ context.Context) error {
+func (p *mockUserAccessProvider) Start(_ context.Context, _, _ string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls = append(p.calls, "Start")
@@ -68,8 +69,8 @@ func (p *mockUserAccessProvider) hasCalled(method string) bool {
 	return false
 }
 
-// Verify mockUserAccessProvider satisfies UserAccessProvider at compile time.
-var _ UserAccessProvider = (*mockUserAccessProvider)(nil)
+// Verify mockUserAccessProvider satisfies UserAccessClient at compile time.
+var _ UserAccessClient = (*mockUserAccessProvider)(nil)
 
 // ---------------------------------------------------------------------------
 // UserAccessManager tests
@@ -599,6 +600,9 @@ func TestUserAccessManager_UserAccessCapabilities_Disabled(t *testing.T) {
 // Provider integration tests
 // ---------------------------------------------------------------------------
 
+// TestUserAccessManager_Setup_WithProvider verifies that a manager with a
+// provider fails Setup without starting it: a client starts only with a join
+// key, and this manager has none.
 func TestUserAccessManager_Setup_WithProvider(t *testing.T) {
 	ctrl := &mockAccessController{}
 	routes := &mockRouteController{}
@@ -615,48 +619,17 @@ func TestUserAccessManager_Setup_WithProvider(t *testing.T) {
 
 	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
 
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	// Verify provider Start was called.
-	if !provider.hasCalled("Start") {
-		t.Error("provider.Start should have been called")
-	}
-
-	// Verify status includes provider info.
-	status := mgr.UserAccessStatus()
-	if status == nil {
-		t.Fatal("UserAccessStatus should not be nil when active")
-	}
-	if status.ProviderName != "tailscale" {
-		t.Errorf("ProviderName = %q, want %q", status.ProviderName, "tailscale")
-	}
-	if status.ProviderStatus != "running" {
-		t.Errorf("ProviderStatus = %q, want %q", status.ProviderStatus, "running")
-	}
-}
-
-func TestUserAccessManager_Setup_ProviderError(t *testing.T) {
-	ctrl := &mockAccessController{}
-	routes := &mockRouteController{}
-	provider := newMockUserAccessProvider("tailscale")
-	provider.startErr = fmt.Errorf("auth key expired")
-	cfg := Config{
-		Enabled:                 true,
-		AccessInterface:         "eth1",
-		AccessSubnets:           []string{"10.0.0.0/24"},
-		UserAccessEnabled:       true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:    51822,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
-
 	err := mgr.Setup()
-	if err == nil {
-		t.Fatal("Setup should return error when provider.Start fails")
+	if !errors.Is(err, errNoJoinKey) {
+		t.Fatalf("Setup error = %v, want one wrapping errNoJoinKey", err)
+	}
+	if want := "bridge: user access: start provider: tailscale: no join key to start the client with"; err.Error() != want {
+		t.Errorf("Setup error = %q, want %q", err.Error(), want)
+	}
+
+	// The client is never started.
+	if provider.hasCalled("Start") {
+		t.Error("provider.Start should not have been called")
 	}
 
 	// Verify rollback: interface removed and forwarding disabled.
@@ -672,123 +645,6 @@ func TestUserAccessManager_Setup_ProviderError(t *testing.T) {
 	// Manager should be inactive.
 	if mgr.UserAccessStatus() != nil {
 		t.Error("UserAccessStatus should be nil after failed setup")
-	}
-}
-
-func TestUserAccessManager_Teardown_WithProvider(t *testing.T) {
-	ctrl := &mockAccessController{}
-	routes := &mockRouteController{}
-	provider := newMockUserAccessProvider("netbird")
-	cfg := Config{
-		Enabled:                 true,
-		AccessInterface:         "eth1",
-		AccessSubnets:           []string{"10.0.0.0/24"},
-		UserAccessEnabled:       true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:    51822,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-
-	// Verify provider Stop was called.
-	if !provider.hasCalled("Stop") {
-		t.Error("provider.Stop should have been called")
-	}
-
-	// Status should be nil after teardown.
-	if mgr.UserAccessStatus() != nil {
-		t.Error("UserAccessStatus should be nil after teardown")
-	}
-}
-
-func TestUserAccessManager_Teardown_ProviderStopError(t *testing.T) {
-	ctrl := &mockAccessController{}
-	routes := &mockRouteController{}
-	provider := newMockUserAccessProvider("tailscale")
-	provider.stopErr = fmt.Errorf("daemon not responding")
-	cfg := Config{
-		Enabled:                 true,
-		AccessInterface:         "eth1",
-		AccessSubnets:           []string{"10.0.0.0/24"},
-		UserAccessEnabled:       true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:    51822,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	err := mgr.Teardown()
-	if err == nil {
-		t.Fatal("Teardown should return error when provider.Stop fails")
-	}
-
-	// Despite error, teardown should still complete (interface removed, forwarding disabled).
-	removeCalls := ctrl.accessCallsFor("RemoveInterface")
-	if len(removeCalls) != 1 {
-		t.Errorf("expected 1 RemoveInterface call, got %d", len(removeCalls))
-	}
-	fwdCalls := routes.callsFor("DisableForwarding")
-	if len(fwdCalls) != 1 {
-		t.Errorf("expected 1 DisableForwarding call, got %d", len(fwdCalls))
-	}
-
-	// Manager should be inactive.
-	if mgr.UserAccessStatus() != nil {
-		t.Error("UserAccessStatus should be nil after teardown even with errors")
-	}
-}
-
-func TestUserAccessManager_UserAccessStatus_WithProvider(t *testing.T) {
-	ctrl := &mockAccessController{}
-	routes := &mockRouteController{}
-	provider := newMockUserAccessProvider("tailscale")
-	cfg := Config{
-		Enabled:                 true,
-		AccessInterface:         "eth1",
-		AccessSubnets:           []string{"10.0.0.0/24"},
-		UserAccessEnabled:       true,
-		UserAccessInterfaceName: "wg-access",
-		UserAccessListenPort:    51822,
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
-
-	if err := mgr.Setup(); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	status := mgr.UserAccessStatus()
-	if status == nil {
-		t.Fatal("UserAccessStatus should not be nil when active")
-	}
-	if status.ProviderName != "tailscale" {
-		t.Errorf("ProviderName = %q, want %q", status.ProviderName, "tailscale")
-	}
-	if status.ProviderStatus != "running" {
-		t.Errorf("ProviderStatus = %q, want %q", status.ProviderStatus, "running")
-	}
-
-	// After teardown, status should be nil.
-	if err := mgr.Teardown(); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-	if mgr.UserAccessStatus() != nil {
-		t.Error("UserAccessStatus should be nil after teardown")
 	}
 }
 

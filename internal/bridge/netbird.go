@@ -3,9 +3,9 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 )
@@ -20,7 +20,7 @@ type netbirdStatusResponse struct {
 	} `json:"interface"`
 }
 
-// NetbirdProvider implements UserAccessProvider by wrapping the Netbird CLI.
+// NetbirdProvider implements UserAccessClient by wrapping the Netbird CLI.
 // It joins a Netbird network using a setup key, enabling Netbird users to
 // access mesh resources through the bridge node.
 type NetbirdProvider struct {
@@ -45,26 +45,31 @@ func (n *NetbirdProvider) Name() string {
 	return "netbird"
 }
 
-// Start launches the Netbird daemon by running `netbird up` with the setup key
-// from the PLEXD_NETBIRD_SETUP_KEY environment variable, then queries
-// `netbird status --json` to discover the assigned IP and interface name.
-func (n *NetbirdProvider) Start(ctx context.Context) error {
-	setupKey := os.Getenv("PLEXD_NETBIRD_SETUP_KEY")
-	if setupKey == "" {
-		return fmt.Errorf("bridge: netbird: PLEXD_NETBIRD_SETUP_KEY environment variable is not set")
+// Start joins the Netbird network by running `netbird up` with the setup key,
+// then queries `netbird status --json` to discover the assigned IP and
+// interface name. Both run under a timeout of vendorJoinTimeout derived from
+// ctx. meshCIDR is ignored: a NetBird client cannot advertise a route, which
+// NetBird's management service defines with the bridge as routing peer. The
+// key is passed on netbird's command line and never logged.
+func (n *NetbirdProvider) Start(ctx context.Context, key string, _ string) error {
+	if key == "" {
+		return errors.New("bridge: netbird: setup key is empty")
 	}
 
-	n.logger.Info("starting netbird provider", "component", "bridge", "setup_key_len", len(setupKey))
+	n.logger.Info("starting netbird provider", "component", "bridge", "setup_key_len", len(key))
+
+	joinCtx, cancel := context.WithTimeout(ctx, vendorJoinTimeout)
+	defer cancel()
 
 	// Run netbird up with the setup key.
-	out, err := n.exec.Run(ctx, "netbird", "up", "--setup-key", setupKey)
+	out, err := n.exec.Run(joinCtx, "netbird", "up", "--setup-key", key)
 	if err != nil {
 		return fmt.Errorf("bridge: netbird: up failed: %w", err)
 	}
 	n.logger.Debug("netbird up completed", "component", "bridge", "output", string(out))
 
 	// Query netbird status to discover IP and interface.
-	statusOut, err := n.exec.Run(ctx, "netbird", "status", "--json")
+	statusOut, err := n.exec.Run(joinCtx, "netbird", "status", "--json")
 	if err != nil {
 		return fmt.Errorf("bridge: netbird: status failed: %w", err)
 	}

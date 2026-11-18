@@ -3,9 +3,9 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 )
 
@@ -42,16 +42,18 @@ func (p *TailscaleProvider) Name() string {
 	return "tailscale"
 }
 
-// Start launches tailscaled and joins the Tailscale network using an auth key
-// read from the PLEXD_TAILSCALE_AUTH_KEY environment variable.
-func (p *TailscaleProvider) Start(ctx context.Context) error {
+// Start launches tailscaled and joins the Tailscale network with the auth
+// key, advertising meshCIDR as a route so the tailnet reaches the mesh through
+// the bridge. tailscaled runs under ctx, which ends it; tailscale up and
+// tailscale status run under a timeout of vendorJoinTimeout derived from ctx.
+// The key is passed on tailscale's command line and never logged.
+func (p *TailscaleProvider) Start(ctx context.Context, key string, meshCIDR string) error {
+	if key == "" {
+		return errors.New("bridge: tailscale: auth key is empty")
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	authKey := os.Getenv("PLEXD_TAILSCALE_AUTH_KEY")
-	if authKey == "" {
-		return fmt.Errorf("bridge: tailscale: PLEXD_TAILSCALE_AUTH_KEY is not set")
-	}
 
 	// Start tailscaled daemon with in-memory state.
 	handle, err := p.exec.Start(ctx, "tailscaled", "--state=mem:")
@@ -60,8 +62,14 @@ func (p *TailscaleProvider) Start(ctx context.Context) error {
 	}
 	p.daemonHandle = handle
 
+	// The join commands, and the tailscale down that cleans up after a
+	// failed one, share this bound. Once it has run out, tailscale down
+	// fails at once and stopping the daemon ends the session.
+	joinCtx, cancel := context.WithTimeout(ctx, vendorJoinTimeout)
+	defer cancel()
+
 	// Join the Tailscale network.
-	if _, err := p.exec.Run(ctx, "tailscale", "up", "--authkey="+authKey, "--accept-routes"); err != nil {
+	if _, err := p.exec.Run(joinCtx, "tailscale", "up", "--authkey="+key, "--accept-routes", "--advertise-routes="+meshCIDR); err != nil {
 		// Best-effort cleanup of daemon.
 		_ = handle.Stop()
 		p.daemonHandle = nil
@@ -69,10 +77,10 @@ func (p *TailscaleProvider) Start(ctx context.Context) error {
 	}
 
 	// Query status to discover assigned IP.
-	out, err := p.exec.Run(ctx, "tailscale", "status", "--json")
+	out, err := p.exec.Run(joinCtx, "tailscale", "status", "--json")
 	if err != nil {
 		// Best-effort cleanup.
-		_, _ = p.exec.Run(ctx, "tailscale", "down")
+		_, _ = p.exec.Run(joinCtx, "tailscale", "down")
 		_ = handle.Stop()
 		p.daemonHandle = nil
 		return fmt.Errorf("bridge: tailscale: tailscale status: %w", err)
@@ -81,7 +89,7 @@ func (p *TailscaleProvider) Start(ctx context.Context) error {
 	var status tailscaleStatus
 	if err := json.Unmarshal(out, &status); err != nil {
 		// Best-effort cleanup.
-		_, _ = p.exec.Run(ctx, "tailscale", "down")
+		_, _ = p.exec.Run(joinCtx, "tailscale", "down")
 		_ = handle.Stop()
 		p.daemonHandle = nil
 		return fmt.Errorf("bridge: tailscale: parse status: %w", err)

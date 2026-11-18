@@ -2,7 +2,6 @@
 package bridge
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +12,10 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+// errNoJoinKey fails Setup while a provider is set: a UserAccessClient starts
+// only with a join key, and this manager has none to hand over.
+var errNoJoinKey = errors.New("no join key to start the client with")
+
 // UserAccessManager manages user access integration — a WireGuard interface
 // that allows external VPN clients to reach the mesh via a bridge node.
 // UserAccessManager is concurrent-safe via mu.
@@ -21,7 +24,7 @@ type UserAccessManager struct {
 	routes   RouteController
 	cfg      Config
 	logger   *slog.Logger
-	provider UserAccessProvider // optional, may be nil
+	provider UserAccessClient // optional, may be nil
 
 	// mu protects active and activePeers from concurrent access by
 	// SSE event handlers and the reconcile loop.
@@ -33,8 +36,9 @@ type UserAccessManager struct {
 }
 
 // NewUserAccessManager creates a new UserAccessManager. The provider parameter
-// is optional — pass nil when no external VPN provider is used.
-func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger, provider UserAccessProvider) *UserAccessManager {
+// is optional — pass nil when no external VPN provider is used. This manager
+// has no join key to start a provider with, so Setup fails while one is set.
+func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger, provider UserAccessClient) *UserAccessManager {
 	return &UserAccessManager{
 		ctrl:        ctrl,
 		routes:      routes,
@@ -73,18 +77,13 @@ func (m *UserAccessManager) Setup() error {
 	m.active = true
 
 	if m.provider != nil {
-		if err := m.provider.Start(context.Background()); err != nil {
-			// Best-effort rollback: disable forwarding and remove interface.
-			_ = m.routes.DisableForwarding(m.cfg.UserAccessInterfaceName, m.cfg.AccessInterface)
-			_ = m.ctrl.RemoveInterface(m.cfg.UserAccessInterfaceName)
-			m.active = false
-			return fmt.Errorf("bridge: user access: start provider: %w", err)
-		}
-
-		m.logger.Info("user access provider started",
-			"component", "bridge",
-			"provider", m.provider.Name(),
-		)
+		// The client is not started: it needs a join key, and this
+		// manager has none (see errNoJoinKey). Best-effort rollback:
+		// disable forwarding and remove interface.
+		_ = m.routes.DisableForwarding(m.cfg.UserAccessInterfaceName, m.cfg.AccessInterface)
+		_ = m.ctrl.RemoveInterface(m.cfg.UserAccessInterfaceName)
+		m.active = false
+		return fmt.Errorf("bridge: user access: start provider: %s: %w", m.provider.Name(), errNoJoinKey)
 	}
 
 	m.logger.Info("user access interface created",
