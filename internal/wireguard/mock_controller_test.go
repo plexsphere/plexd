@@ -107,6 +107,30 @@ func (m *mockController) callsFor(method string) []mockCall {
 	return result
 }
 
+// mockRouter is a test double for PeerRouter. It records its calls into the
+// calls of ctrl, so a test reads route calls and device calls in the order
+// they were made, and returns addRouteErr and removeRouteErr as configured.
+type mockRouter struct {
+	ctrl *mockController
+
+	addRouteErr    error
+	removeRouteErr error
+}
+
+func (r *mockRouter) AddRoute(subnet, iface string) error {
+	r.ctrl.mu.Lock()
+	defer r.ctrl.mu.Unlock()
+	r.ctrl.calls = append(r.ctrl.calls, mockCall{Method: "AddRoute", Args: []interface{}{subnet, iface}})
+	return r.addRouteErr
+}
+
+func (r *mockRouter) RemoveRoute(subnet, iface string) error {
+	r.ctrl.mu.Lock()
+	defer r.ctrl.mu.Unlock()
+	r.ctrl.calls = append(r.ctrl.calls, mockCall{Method: "RemoveRoute", Args: []interface{}{subnet, iface}})
+	return r.removeRouteErr
+}
+
 type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }

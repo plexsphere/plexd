@@ -11,7 +11,7 @@ import (
 func sampleSnapshot() *api.NodeStateSnapshot {
 	return &api.NodeStateSnapshot{
 		Peers: []api.SnapshotPeer{
-			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820", FallbackEndpoints: []string{"1.2.3.4:51820", "5.6.7.8:51820"}, EndpointCandidates: []string{"10.0.0.5:51820"}},
+			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820", FallbackEndpoints: []string{"1.2.3.4:51820", "5.6.7.8:51820"}, EndpointCandidates: []string{"10.0.0.5:51820"}, RoutedSubnets: []string{"10.20.0.0/16"}},
 		},
 		// Populated so the never-stored assertions below bite instead of holding
 		// vacuously against a fixture that never carried the block.
@@ -125,6 +125,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	desired.Peers[0].NodeID = "mutated"
 	desired.Peers[0].FallbackEndpoints[0] = "mutated"
 	desired.Peers[0].EndpointCandidates[0] = "mutated"
+	desired.Peers[0].RoutedSubnets[0] = "mutated"
 	desired.Policy.Rules[0].SourceCIDR = "mutated"
 	desired.Policy.Rules[0].Ports.From = 8443
 	desired.Policy.Revisions[0].RevisionID = "mutated"
@@ -143,6 +144,9 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 	}
 	if got.Peers[0].EndpointCandidates[0] == "mutated" {
 		t.Error("Peer endpoint candidates were not copied on Update")
+	}
+	if got.Peers[0].RoutedSubnets[0] == "mutated" {
+		t.Error("Peer routed subnets were not copied on Update")
 	}
 	if got.Policy.Rules[0].SourceCIDR == "mutated" {
 		t.Error("Policy rules were not copied on Update")
@@ -177,6 +181,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	got.Peers[0].NodeID = "mutated"
 	got.Peers[0].FallbackEndpoints[0] = "mutated"
 	got.Peers[0].EndpointCandidates[0] = "mutated"
+	got.Peers[0].RoutedSubnets[0] = "mutated"
 	got.Policy.Rules[0].SourceCIDR = "mutated"
 	got.Policy.Rules[0].Ports.To = 8443
 	got.Bridge.UserAccess.Providers[0].Devices[0].Address = "mutated"
@@ -193,6 +198,9 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	}
 	if got2.Peers[0].EndpointCandidates[0] == "mutated" {
 		t.Error("Get did not return a copy of the peer endpoint candidates")
+	}
+	if got2.Peers[0].RoutedSubnets[0] == "mutated" {
+		t.Error("Get did not return a copy of the peer routed subnets")
 	}
 	if got2.Policy.Rules[0].SourceCIDR == "mutated" {
 		t.Error("Get did not return a copy of Policy rules")

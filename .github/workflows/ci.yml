@@ -82,9 +82,14 @@ jobs:
           grep -q -- '--- PASS: TestNftablesController_RealConnLog ' "$RUNNER_TEMP/real-nftables.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
-      # and the forwarding sysctl, so the six macOS tests against the real
+      # and the forwarding sysctl, so the seven macOS tests against the real
       # kernel skip in the unprivileged run above. The bridge controller test
       # creates its utuns through the bridge controllers and routes over them.
+      # The peer route test TestPeerRoutes_RealUTUN sets a WireGuard manager up
+      # on a utun of its own and reads back the allowed IPs and the route a
+      # peer's routed subnet gets; it is the only proof that macOS accepts the
+      # peer routes, so the step also fails unless its PASS line is in the
+      # output.
       # Loading a pf anchor and taking a pf enable reference need root as well;
       # the three pf tests also ask for PLEXD_TEST_REAL_PF, so sudo go test
       # ./... on a developer's Mac leaves the host's pf alone. The pf traffic
@@ -115,25 +120,37 @@ jobs:
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
             PLEXD_TEST_REAL_PF=1 PLEXD_TEST_REAL_RESOLVER=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestPFController_RealConnLog|TestWGControllers_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestPFController_RealConnLog|TestWGControllers_RealUTUN|TestPeerRoutes_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
             ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/ ./internal/meshdns/ \
             | tee "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealTraffic ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealConnLog ' "$RUNNER_TEMP/real-darwin.txt"
+          grep -q -- '--- PASS: TestPeerRoutes_RealUTUN ' "$RUNNER_TEMP/real-darwin.txt"
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
-      # than the privilege check: without one the two tests, the controller's
-      # own and the bridge controllers', would also run inside the ordinary step
-      # above and create real adapters there. The tests write the embedded
-      # wintun.dll beside their own binaries, so nothing has to be fetched.
+      # than the privilege check: without one the three tests, the controller's
+      # own, the bridge controllers' and the peer route test, would also run
+      # inside the ordinary step above and create real adapters there. The
+      # tests write the embedded wintun.dll beside their own binaries, so
+      # nothing has to be fetched. The peer route test TestPeerRoutes_RealWintun
+      # also alters the routing table, so it asks for PLEXD_TEST_REAL_ROUTES as
+      # well. It is the only proof that Windows accepts the peer routes, so the
+      # step fails unless its PASS line is in the output: a skip would pass
+      # otherwise.
       - name: Run real Wintun tests
         if: runner.os == 'Windows'
         env:
           PLEXD_TEST_REAL_WINTUN: '1'
-        run: >-
-          go test -race -count=1 -v
-          -run '^(TestWindowsController_RealWintun|TestWGControllers_RealWintun)$' ./internal/wireguard/ ./internal/bridge/
+          PLEXD_TEST_REAL_ROUTES: '1'
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'real-wintun.txt'
+          go test -race -count=1 -v -run '^(TestWindowsController_RealWintun|TestWGControllers_RealWintun|TestPeerRoutes_RealWintun)$' ./internal/wireguard/ ./internal/bridge/ | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestPeerRoutes_RealWintun ')) {
+            Write-Error 'TestPeerRoutes_RealWintun did not pass'
+            exit 1
+          }
 
       # Adding a route and toggling an adapter's forwarding flag need
       # Administrator. The runner has it, so the gate is this variable for the

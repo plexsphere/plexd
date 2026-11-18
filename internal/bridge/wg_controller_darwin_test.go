@@ -3,16 +3,21 @@
 package bridge
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/reconcile"
+	"github.com/plexsphere/plexd/internal/registration"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -216,6 +221,122 @@ func TestWGControllers_RealUTUN(t *testing.T) {
 			t.Errorf("second RemoveInterface = %v, want nil", err)
 		}
 	})
+}
+
+// The mesh and the peer of TestPeerRoutes_RealUTUN. No other test that runs
+// against the kernel uses these prefixes, so the routes cannot collide.
+const (
+	peerRoutesInterface  = "plexd-peerrt"
+	peerRoutesListenPort = 51994
+	peerRoutesMeshIP     = "10.99.0.1"
+	peerRoutesMeshCIDR   = "10.99.0.0/24"
+	peerRoutesPeerIP     = "10.99.0.2"
+	peerRoutesSubnet     = "10.20.0.0/16"
+	peerRoutesProbe      = "10.20.0.1"
+)
+
+// TestPeerRoutes_RealUTUN proves the peer routes on macOS without traffic: a
+// wireguard.Manager over a real DarwinController, with a
+// DarwinRouteController as its PeerRouter, programs the routed subnet of a
+// peer as one of its allowed IPs on the mesh device and routes the subnet
+// through the mesh utun, and takes both away once the peer drops the subnet.
+// The fake-based tests in package wireguard pin which calls the manager
+// makes; this is the only test that proves macOS accepts them.
+//
+// CI runs it in the privileged macOS step, which fails unless it passed.
+func TestPeerRoutes_RealUTUN(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("creating a utun and routing over it need root; run with sudo")
+	}
+	ctx := context.Background()
+
+	ctrl := wireguard.NewDarwinController(discardLogger())
+	mgr := wireguard.NewManager(ctrl, wireguard.Config{InterfaceName: peerRoutesInterface, ListenPort: peerRoutesListenPort}, discardLogger())
+	mgr.SetPeerRouter(NewDarwinRouteController(discardLogger(), nil))
+	identity := &registration.NodeIdentity{
+		NodeID:         "node-peer-routes",
+		MeshIP:         peerRoutesMeshIP,
+		DomainMeshCIDR: peerRoutesMeshCIDR,
+		PrivateKey:     testPrivateKey(t),
+	}
+	if err := mgr.Setup(ctx, identity); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	// Teardown removes the peer route the test leaves behind, then the utun.
+	t.Cleanup(func() { _ = mgr.Teardown() })
+
+	osName := mgr.OSInterfaceName()
+	if !utunNameRE.MatchString(osName) {
+		t.Fatalf("OSInterfaceName() = %q, want utunN", osName)
+	}
+
+	publicKey, raw := testPeerKey(t)
+	peer := api.SnapshotPeer{
+		NodeID:        "peer-routes",
+		MeshIP:        peerRoutesPeerIP,
+		PublicKey:     publicKey,
+		RoutedSubnets: []string{peerRoutesSubnet},
+	}
+	handler := wireguard.ReconcileHandler(mgr, nil)
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("handler with the routed subnet: %v", err)
+	}
+
+	if got, want := meshPeerAllowedIPs(t, ctrl, raw), []string{peerRoutesSubnet, peerRoutesPeerIP + "/32"}; !slices.Equal(got, want) {
+		t.Errorf("allowed IPs = %v, want %v", got, want)
+	}
+	if iface, ok := routeGetInterface(t, peerRoutesProbe); !ok || iface != osName {
+		t.Errorf("route -n get %s names interface %q (found %v), want %s", peerRoutesProbe, iface, ok, osName)
+	}
+
+	peer.RoutedSubnets = nil
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("handler without the routed subnet: %v", err)
+	}
+
+	if got, want := meshPeerAllowedIPs(t, ctrl, raw), []string{peerRoutesPeerIP + "/32"}; !slices.Equal(got, want) {
+		t.Errorf("allowed IPs after the member is gone = %v, want %v", got, want)
+	}
+	if iface, ok := routeGetInterface(t, peerRoutesProbe); ok && iface == osName {
+		t.Errorf("route -n get %s still names %s after the member is gone", peerRoutesProbe, osName)
+	}
+}
+
+// meshPeerAllowedIPs returns the allowed IPs the mesh device of
+// TestPeerRoutes_RealUTUN holds for the peer whose public key is raw, sorted,
+// and fails the test when the device does not hold the peer.
+func meshPeerAllowedIPs(t *testing.T, reader wireguard.PeerStatsReader, raw []byte) []string {
+	t.Helper()
+
+	stats, err := reader.PeerStats(peerRoutesInterface)
+	if err != nil {
+		t.Fatalf("PeerStats(%q): %v", peerRoutesInterface, err)
+	}
+	for _, s := range stats {
+		if s.PublicKey != [32]byte(raw) {
+			continue
+		}
+		allowed := make([]string, 0, len(s.AllowedIPs))
+		for _, p := range s.AllowedIPs {
+			allowed = append(allowed, p.String())
+		}
+		slices.Sort(allowed)
+		return allowed
+	}
+	t.Fatalf("the mesh device holds no peer with the test's key: %+v", stats)
+	return nil
+}
+
+// routeGetInterface returns the interface route(8) names for the route the
+// kernel picks to dst, and false when it names none, as when no route covers
+// dst.
+func routeGetInterface(t *testing.T, dst string) (string, bool) {
+	t.Helper()
+
+	// route(8) exits non-zero when no route covers dst, which is an answer
+	// here, so only the output decides.
+	out, _ := exec.Command(routePath, "-n", "get", dst).CombinedOutput()
+	return routeInterface(out)
 }
 
 // tunnelPrefixRE matches the destination netstat prints for the test's /30. It

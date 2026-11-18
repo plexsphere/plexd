@@ -1044,6 +1044,55 @@ func TestSnapshotPeer_FallbackEndpoints(t *testing.T) {
 	}
 }
 
+func TestSnapshotPeer_RoutedSubnets(t *testing.T) {
+	const withSubnets = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","routed_subnets":["10.20.0.0/16","10.30.0.0/16"]}`
+	var got SnapshotPeer
+	if err := json.Unmarshal([]byte(withSubnets), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if want := []string{"10.20.0.0/16", "10.30.0.0/16"}; !slices.Equal(got.RoutedSubnets, want) {
+		t.Errorf("RoutedSubnets = %v, want %v", got.RoutedSubnets, want)
+	}
+
+	// A peer that routes no network decodes to an empty list either way: the
+	// member is absent, or it carries [].
+	for name, doc := range map[string]string{
+		"without the key": `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`,
+		"with []":         `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","routed_subnets":[]}`,
+	} {
+		var empty SnapshotPeer
+		if err := json.Unmarshal([]byte(doc), &empty); err != nil {
+			t.Fatalf("%s: Unmarshal: %v", name, err)
+		}
+		if len(empty.RoutedSubnets) != 0 {
+			t.Errorf("%s: RoutedSubnets = %#v, want an empty list", name, empty.RoutedSubnets)
+		}
+	}
+
+	data, err := json.Marshal(SnapshotPeer{NodeID: "n-001"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if s := string(data); strings.Contains(s, `"routed_subnets"`) {
+		t.Errorf("routed_subnets should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestPeer_RoutedSubnetsTag(t *testing.T) {
+	orig := Peer{ID: "n-002", AllowedIPs: []string{"10.99.0.2/32", "10.20.0.0/16"}, RoutedSubnets: []string{"10.20.0.0/16"}}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+	if s := string(data); !strings.Contains(s, `"routed_subnets":["10.20.0.0/16"]`) {
+		t.Errorf("routed subnets should serialize under the routed_subnets key, got: %s", s)
+	}
+
+	orig.RoutedSubnets = nil
+	data, _ = roundTrip(t, orig)
+	if s := string(data); strings.Contains(s, `"routed_subnets"`) {
+		t.Errorf("routed_subnets should be omitted when nil, got: %s", s)
+	}
+}
+
 func TestPeer_FallbacksTag(t *testing.T) {
 	orig := Peer{ID: "n-002", Endpoints: []string{"203.0.113.1:51820", "203.0.113.2:51820"}, Fallbacks: []string{"203.0.113.1:51820", "203.0.113.2:51820"}}
 	data, got := roundTrip(t, orig)

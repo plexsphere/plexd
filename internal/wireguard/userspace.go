@@ -325,8 +325,9 @@ func peerUAPI(cfg PeerConfig) (string, error) {
 // parseUAPIPeerStats reads the peers out of a UAPI get dump, the text
 // device.IpcGet returns: device keys first, then for each peer a public_key
 // line followed by that peer's keys. A public_key line starts a new peer;
-// endpoint, last_handshake_time_sec and _nsec, rx_bytes and tx_bytes fill it.
-// Empty lines and every other key are skipped.
+// endpoint, last_handshake_time_sec and _nsec, rx_bytes and tx_bytes fill it,
+// and each allowed_ip line appends one prefix to its AllowedIPs. Empty lines
+// and every other key are skipped.
 //
 // A handshake time of sec 0 and nsec 0 is the zero time.Time, and any other
 // pair is time.Unix(sec, nsec). wgctrl's own UAPI parser requires both to be
@@ -375,7 +376,7 @@ func parseUAPIPeerStats(dump string) ([]PeerStat, error) {
 			cur = &PeerStat{PublicKey: pub}
 			sec, nsec = 0, 0
 			continue
-		case "endpoint", "last_handshake_time_sec", "last_handshake_time_nsec", "rx_bytes", "tx_bytes":
+		case "endpoint", "last_handshake_time_sec", "last_handshake_time_nsec", "rx_bytes", "tx_bytes", "allowed_ip":
 			// A peer key belongs to the peer its public_key line opened.
 			if cur == nil {
 				return nil, fmt.Errorf("wireguard: peer stats: %s before public_key", key)
@@ -396,6 +397,11 @@ func parseUAPIPeerStats(dump string) ([]PeerStat, error) {
 			cur.RxBytes, err = strconv.ParseUint(value, 10, 64)
 		case "tx_bytes":
 			cur.TxBytes, err = strconv.ParseUint(value, 10, 64)
+		case "allowed_ip":
+			var prefix netip.Prefix
+			if prefix, err = netip.ParsePrefix(value); err == nil {
+				cur.AllowedIPs = append(cur.AllowedIPs, prefix)
+			}
 		}
 		if err != nil {
 			return nil, fmt.Errorf("wireguard: peer stats: parse %s: %w", key, err)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -688,7 +689,10 @@ func TestDarwinController_PeerOperationsDelegate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PeerStats: %v", err)
 	}
-	assertPeerStats(t, stats, []PeerStat{{PublicKey: peerKey.PublicKey()}})
+	assertPeerStats(t, stats, []PeerStat{{
+		PublicKey:  peerKey.PublicKey(),
+		AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
+	}})
 
 	rotated := mustKey(t)
 	before := privateKeyHex(ipcGet(t, c.backend, "plexd0"))

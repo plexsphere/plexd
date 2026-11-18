@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -30,6 +31,7 @@ type Manager struct {
 	// dial is the endpoint selection state per node ID. Its peer is the last
 	// peer written, which SetPeerPSK needs as well: every device write replaces
 	// the peer's allowed IPs, so a PSK alone cannot be written without them.
+	// syncPeerRoutes routes the routed subnets of these peers.
 	dial map[string]*dialState
 
 	// meshPrefix is the prefix the interface address carries, masked: the
@@ -61,6 +63,29 @@ type Manager struct {
 	// serializes peer writes only.
 	mtu     int
 	raiseTo int
+
+	// routeMu guards router and routes, and serializes the route calls of
+	// syncPeerRoutes and Teardown. It is taken before mu, never while mu is
+	// held, so a route call never holds up a peer write.
+	routeMu sync.Mutex
+	// router programs the routes of the peers' routed subnets. It is nil
+	// until SetPeerRouter sets it, and no route is programmed then.
+	router PeerRouter
+	// routes is the set of subnets router holds a route for on the mesh
+	// interface.
+	routes map[string]struct{}
+}
+
+// PeerRouter adds and removes the routes that carry a peer's routed subnets
+// into the mesh interface. Every bridge.RouteController satisfies it. Both
+// calls are idempotent: adding a route that exists and removing one that does
+// not return nil.
+type PeerRouter interface {
+	// AddRoute adds a route for subnet, a CIDR, through the interface the
+	// operating system knows as iface.
+	AddRoute(subnet, iface string) error
+	// RemoveRoute removes the route for subnet through iface.
+	RemoveRoute(subnet, iface string) error
 }
 
 // NewManager creates a new Manager. Config defaults are applied automatically.
@@ -74,6 +99,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 		dial:          make(map[string]*dialState),
 		localPrefixes: func() ([]netip.Prefix, error) { return nil, nil },
 		now:           time.Now,
+		routes:        make(map[string]struct{}),
 	}
 }
 
@@ -189,12 +215,147 @@ func (m *Manager) SetLocalPrefixes(fn func() ([]netip.Prefix, error)) {
 	m.localPrefixes = fn
 }
 
-// Teardown deletes the WireGuard interface.
+// SetPeerRouter sets the router the reconcile handler programs the routes of
+// the peers' routed subnets with. Call it before the handler runs. Without
+// one, the manager programs the routed subnets as allowed IPs and adds no
+// route.
+func (m *Manager) SetPeerRouter(r PeerRouter) {
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	m.router = r
+}
+
+// Teardown removes the routes syncPeerRoutes programmed and then deletes the
+// WireGuard interface. A route it cannot remove is logged at Warn and stops
+// nothing: the delete takes the interface's routes with it.
 func (m *Manager) Teardown() error {
+	m.removePeerRoutes()
 	if err := m.ctrl.DeleteInterface(m.cfg.InterfaceName); err != nil {
 		return fmt.Errorf("wireguard: teardown: %w", err)
 	}
 	return nil
+}
+
+// syncPeerRoutes brings the routes on the mesh interface in line with the
+// routed subnets of the peers the manager last wrote, the peers of dial: it
+// removes the route of every programmed subnet no such peer lists any more,
+// then adds one for every listed subnet that has none, each through
+// OSInterfaceName, in subnet order. A subnet two peers list is routed once
+// and keeps its route until the last of them drops it.
+//
+// A call that fails is logged at Error and leaves that subnet's state as it
+// was, so the next run tries it again; the failures are returned joined, so
+// the reconciler applies the snapshot again. A run that changed a route logs
+// the change once at Info. Without a router it does nothing.
+//
+// The peers are read under mu and the router is called under routeMu alone,
+// so a slow route(8) or IP Helper call never holds up a peer write or
+// endpoint selection.
+func (m *Manager) syncPeerRoutes() error {
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	if m.router == nil {
+		return nil
+	}
+
+	wanted := m.wantedPeerRoutes()
+	iface := m.OSInterfaceName()
+
+	var (
+		errs           []error
+		added, removed []string
+	)
+	for _, subnet := range slices.Sorted(maps.Keys(m.routes)) {
+		if _, ok := wanted[subnet]; ok {
+			continue
+		}
+		if err := m.router.RemoveRoute(subnet, iface); err != nil {
+			m.logger.Error("wireguard: peer route failed",
+				"component", "wireguard",
+				"subnet", subnet,
+				"op", "remove",
+				"error", err,
+			)
+			errs = append(errs, fmt.Errorf("wireguard: remove peer route %s: %w", subnet, err))
+			continue
+		}
+		delete(m.routes, subnet)
+		removed = append(removed, subnet)
+	}
+	for _, subnet := range slices.Sorted(maps.Keys(wanted)) {
+		if _, ok := m.routes[subnet]; ok {
+			continue
+		}
+		if err := m.router.AddRoute(subnet, iface); err != nil {
+			m.logger.Error("wireguard: peer route failed",
+				"component", "wireguard",
+				"subnet", subnet,
+				"op", "add",
+				"error", err,
+			)
+			errs = append(errs, fmt.Errorf("wireguard: add peer route %s: %w", subnet, err))
+			continue
+		}
+		m.routes[subnet] = struct{}{}
+		added = append(added, subnet)
+	}
+
+	m.logPeerRoutesChanged(added, removed)
+	return errors.Join(errs...)
+}
+
+// wantedPeerRoutes returns the union of the routed subnets of the peers the
+// manager last wrote.
+func (m *Manager) wantedPeerRoutes() map[string]struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	wanted := make(map[string]struct{})
+	for _, st := range m.dial {
+		for _, subnet := range st.peer.RoutedSubnets {
+			wanted[subnet] = struct{}{}
+		}
+	}
+	return wanted
+}
+
+// removePeerRoutes removes every route syncPeerRoutes programmed, for
+// Teardown. A route it cannot remove is logged at Warn and stays in the set.
+func (m *Manager) removePeerRoutes() {
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	if m.router == nil || len(m.routes) == 0 {
+		return
+	}
+
+	iface := m.OSInterfaceName()
+	var removed []string
+	for _, subnet := range slices.Sorted(maps.Keys(m.routes)) {
+		if err := m.router.RemoveRoute(subnet, iface); err != nil {
+			m.logger.Warn("wireguard: peer route failed",
+				"component", "wireguard",
+				"subnet", subnet,
+				"op", "remove",
+				"error", err,
+			)
+			continue
+		}
+		delete(m.routes, subnet)
+		removed = append(removed, subnet)
+	}
+	m.logPeerRoutesChanged(nil, removed)
+}
+
+// logPeerRoutesChanged logs the routes a run added and removed, once, and
+// nothing when it changed none.
+func (m *Manager) logPeerRoutesChanged(added, removed []string) {
+	if len(added) == 0 && len(removed) == 0 {
+		return
+	}
+	m.logger.Info("wireguard: peer routes changed",
+		"component", "wireguard",
+		"added", added,
+		"removed", removed,
+	)
 }
 
 // OSInterfaceName returns the name the operating system knows the managed
@@ -233,8 +394,7 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 // empty, non-nil slice when no device peer maps.
 //
 // A device peer whose key the index does not map is dropped. That is the case
-// for a key left on the device after the peer's key rotated, and for a key two
-// node IDs share (see PeerIndex.NodeIDsByPublicKey). A peer with no handshake
+// for a key two node IDs share (see PeerIndex.NodeIDsByPublicKey). A peer with no handshake
 // is kept, because the tunnel metrics report it; the handshake reporter drops it
 // itself. Endpoint passes through as the device reports it, and the consumers
 // apply their own wire rules.
@@ -343,7 +503,10 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 // The first rule that applies decides the write:
 //   - A peer with no state, or whose public key changed, starts over from the
 //     first entry of its new order, like AddPeer. A rotated key is a new
-//     device peer to WireGuard, which has no endpoint yet.
+//     device peer to WireGuard, which has no endpoint yet. The device peer of
+//     the old key is removed first: WireGuard moves to the new key only the
+//     allowed IPs its write names, so the old key would keep a routed subnet
+//     the update no longer lists and could still send from it.
 //   - A peer whose programmed entry is one of its Fallbacks, and that is
 //     relayed or not connected, moves to the update's first relay at once, on
 //     a fresh device peer (see redialRelay), when the update takes its relay
@@ -377,6 +540,11 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 	st, ok := m.dial[peer.ID]
 	switch {
 	case !ok || st.peer.PublicKey != peer.PublicKey:
+		if ok {
+			if err := m.removeDevicePeer(st.peer.PublicKey); err != nil {
+				return fmt.Errorf("wireguard: update peer: remove the device peer of the rotated key: %w", err)
+			}
+		}
 		if err := m.programFirst(peer); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
@@ -521,6 +689,19 @@ func (m *Manager) SetPeerPSK(peerNodeID, publicKey string, psk []byte) error {
 		"peer_id", peerNodeID,
 	)
 	return nil
+}
+
+// removeDevicePeer removes the device peer of publicKey, a base64 key.
+// Removing a key the device does not hold is accepted by the userspace
+// backend (see UserspaceBackend.RemovePeer), and the Linux module is assumed
+// to accept it as well, so a write that failed after the removal can be
+// tried again. Callers hold m.mu.
+func (m *Manager) removeDevicePeer(publicKey string) error {
+	key, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil {
+		return fmt.Errorf("decode public key: %w", err)
+	}
+	return m.ctrl.RemovePeer(m.cfg.InterfaceName, key)
 }
 
 // programFirst writes peer with the first entry of its dial order and starts

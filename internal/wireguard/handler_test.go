@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -144,14 +146,15 @@ func TestReconcileHandler_RemoveUnknownPeer(t *testing.T) {
 	ctrl := &mockController{}
 	mgr := newTestManager(ctrl)
 
-	// peer-unknown is absent from the index, so RemovePeerByID errors and the
-	// controller is never touched.
+	// peer-unknown is absent from the index, so it is already gone: the
+	// removal succeeds and the controller is never touched. A failed run
+	// hands the same removal over again, after the peer left the index (see
+	// TestReconcileHandler_RemovalAppliedAgainAfterARouteFailure).
 	diff := reconcile.StateDiff{PeersToRemove: []string{"peer-unknown"}}
 
 	handler := ReconcileHandler(mgr, nil)
-	err := handler(context.Background(), nil, diff)
-	if err == nil {
-		t.Fatal("expected non-nil error for unknown peer removal")
+	if err := handler(context.Background(), nil, diff); err != nil {
+		t.Fatalf("removal of a peer the index does not hold = %v, want nil", err)
 	}
 	if n := len(ctrl.callsFor("RemovePeer")); n != 0 {
 		t.Errorf("expected 0 RemovePeer calls for unknown peer, got %d", n)
@@ -373,5 +376,530 @@ func TestReconcileHandler_ProgramsLookedUpPSK(t *testing.T) {
 				t.Errorf("PSK = %x, want %x", cfgs[0].PSK, tt.wantPSK)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Routed subnets
+// ---------------------------------------------------------------------------
+
+func TestUsableRoutedSubnets(t *testing.T) {
+	local := []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}
+
+	tests := []struct {
+		name         string
+		subnets      []string
+		mesh         netip.Prefix
+		wantAccepted []string
+		wantSkipped  []skippedSubnet
+	}{
+		{
+			name:         "a network behind the peer",
+			subnets:      []string{"10.20.0.0/16"},
+			mesh:         testMesh,
+			wantAccepted: []string{"10.20.0.0/16"},
+		},
+		{
+			name:        "host bits set",
+			subnets:     []string{"10.20.0.1/16"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"10.20.0.1/16", "invalid"}},
+		},
+		{
+			name:        "ipv6",
+			subnets:     []string{"fd00::/64"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"fd00::/64", "invalid"}},
+		},
+		{
+			name:        "ipv4-mapped ipv6",
+			subnets:     []string{"::ffff:10.20.0.0/112"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"::ffff:10.20.0.0/112", "invalid"}},
+		},
+		{
+			name:        "not a prefix",
+			subnets:     []string{"not-a-prefix"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"not-a-prefix", "invalid"}},
+		},
+		{
+			name:        "inside the mesh",
+			subnets:     []string{"10.99.0.0/25"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"10.99.0.0/25", "overlaps_mesh"}},
+		},
+		{
+			name:        "around the mesh",
+			subnets:     []string{"0.0.0.0/0"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"0.0.0.0/0", "overlaps_mesh"}},
+		},
+		{
+			name:         "a zero mesh skips the mesh check",
+			subnets:      []string{"10.99.0.0/25"},
+			wantAccepted: []string{"10.99.0.0/25"},
+		},
+		{
+			name:        "a local network",
+			subnets:     []string{"192.168.1.0/24"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"192.168.1.0/24", "inside_local_network"}},
+		},
+		{
+			name:        "inside a local network",
+			subnets:     []string{"192.168.1.128/25"},
+			mesh:        testMesh,
+			wantSkipped: []skippedSubnet{{"192.168.1.128/25", "inside_local_network"}},
+		},
+		{
+			name:         "around a local network",
+			subnets:      []string{"192.168.0.0/16"},
+			mesh:         testMesh,
+			wantAccepted: []string{"192.168.0.0/16"},
+		},
+		{
+			name:         "repeated",
+			subnets:      []string{"10.20.0.0/16", "10.30.0.0/16", "10.20.0.0/16"},
+			mesh:         testMesh,
+			wantAccepted: []string{"10.20.0.0/16", "10.30.0.0/16"},
+			wantSkipped:  []skippedSubnet{{"10.20.0.0/16", "duplicate"}},
+		},
+		{
+			name:         "the list's order is kept",
+			subnets:      []string{"10.30.0.0/16", "10.99.0.0/25", "10.20.0.0/16", "not-a-prefix", "10.21.0.0/16"},
+			mesh:         testMesh,
+			wantAccepted: []string{"10.30.0.0/16", "10.20.0.0/16", "10.21.0.0/16"},
+			wantSkipped:  []skippedSubnet{{"10.99.0.0/25", "overlaps_mesh"}, {"not-a-prefix", "invalid"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			accepted, skipped := usableRoutedSubnets(tt.subnets, tt.mesh, local)
+			if !slices.Equal(accepted, tt.wantAccepted) {
+				t.Errorf("accepted = %v, want %v", accepted, tt.wantAccepted)
+			}
+			if !slices.Equal(skipped, tt.wantSkipped) {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+		})
+	}
+
+	for name, subnets := range map[string][]string{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			accepted, skipped := usableRoutedSubnets(subnets, testMesh, local)
+			if len(accepted) != 0 || len(skipped) != 0 {
+				t.Errorf("usableRoutedSubnets(%#v) = (%v, %v), want two empty lists", subnets, accepted, skipped)
+			}
+		})
+	}
+}
+
+// routedPeer returns a snapshot peer without endpoints whose public key is
+// testKey(key) and whose routed_subnets are subnets.
+func routedPeer(nodeID, meshIP string, key byte, subnets ...string) api.SnapshotPeer {
+	p := snapshotPeer(nodeID, meshIP, "")
+	_, p.PublicKey = testKey(key)
+	p.RoutedSubnets = subnets
+	return p
+}
+
+// routeCalls returns the route calls ctrl recorded through a mockRouter, as
+// "AddRoute <subnet> <iface>" and "RemoveRoute <subnet> <iface>".
+func routeCalls(ctrl *mockController) []string {
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	var calls []string
+	for _, c := range ctrl.calls {
+		if c.Method == "AddRoute" || c.Method == "RemoveRoute" {
+			calls = append(calls, fmt.Sprintf("%s %s %s", c.Method, c.Args[0], c.Args[1]))
+		}
+	}
+	return calls
+}
+
+// callCount returns how many calls ctrl recorded, its device calls and the
+// route calls of a mockRouter over it together.
+func callCount(ctrl *mockController) int {
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	return len(ctrl.calls)
+}
+
+// lastAllowedIPs returns the allowed IPs of the last AddPeer call ctrl
+// recorded.
+func lastAllowedIPs(t *testing.T, ctrl *mockController) []string {
+	t.Helper()
+	cfgs := addPeerConfigs(t, ctrl)
+	if len(cfgs) == 0 {
+		t.Fatal("no AddPeer call recorded")
+	}
+	return cfgs[len(cfgs)-1].AllowedIPs
+}
+
+func TestReconcileHandler_RoutesRoutedSubnets(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, slogTextLogger(&logs))
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	handler := ReconcileHandler(mgr, nil)
+	ctx := context.Background()
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32", "10.20.0.0/16"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs = %v, want %v", got, want)
+	}
+	if got, want := routeCalls(ctrl), []string{"AddRoute 10.20.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+	if out := logs.String(); !strings.Contains(out, `level=INFO msg="wireguard: peer routes changed" component=wireguard added=[10.20.0.0/16] removed=[]`) {
+		t.Errorf("log does not name the added route:\n%s", out)
+	}
+
+	// The same snapshot again: the reconciler's diff is empty, and the
+	// handler touches neither the device nor a route.
+	before := callCount(ctrl)
+	logs.Reset()
+	if err := handler(ctx, nil, reconcile.StateDiff{}); err != nil {
+		t.Fatalf("unchanged: %v", err)
+	}
+	if after := callCount(ctrl); after != before {
+		t.Errorf("calls after an unchanged run = %d, want the %d before it", after, before)
+	}
+	if strings.Contains(logs.String(), "peer routes changed") {
+		t.Errorf("an unchanged run logged a route change:\n%s", logs.String())
+	}
+
+	// The member is gone: the route goes, and the peer is written with its
+	// mesh address alone.
+	peer.RoutedSubnets = nil
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs after the member is gone = %v, want %v", got, want)
+	}
+	if got, want := routeCalls(ctrl), []string{"AddRoute 10.20.0.0/16 plexd0", "RemoveRoute 10.20.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+	if out := logs.String(); !strings.Contains(out, "added=[] removed=[10.20.0.0/16]") {
+		t.Errorf("log does not name the removed route:\n%s", out)
+	}
+}
+
+func TestReconcileHandler_PeerRoutesOnOSInterfaceName(t *testing.T) {
+	ctrl := &namingController{osName: "utun7", found: true}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	mgr.SetPeerRouter(&mockRouter{ctrl: &ctrl.mockController})
+	handler := ReconcileHandler(mgr, nil)
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := handler(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got, want := routeCalls(&ctrl.mockController), []string{"AddRoute 10.20.0.0/16 utun7"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v: route(8) takes the kernel's name", got, want)
+	}
+}
+
+func TestReconcileHandler_SkipsUnusableRoutedSubnets(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, slogTextLogger(&logs))
+	mgr.SetLocalPrefixes(func() ([]netip.Prefix, error) {
+		return []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}, nil
+	})
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	handler := ReconcileHandler(mgr, nil)
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.99.0.0/25", "192.168.1.0/24", "10.20.0.0/16", "10.20.0.0/16")
+	if err := handler(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32", "10.20.0.0/16"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs = %v, want %v", got, want)
+	}
+	if got, want := routeCalls(ctrl), []string{"AddRoute 10.20.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		`level=WARN msg="wireguard: routed subnet not programmed" component=wireguard peer_id=peer-1 subnet=10.99.0.0/25 reason=overlaps_mesh`,
+		`level=WARN msg="wireguard: routed subnet not programmed" component=wireguard peer_id=peer-1 subnet=192.168.1.0/24 reason=inside_local_network`,
+		`level=WARN msg="wireguard: routed subnet not programmed" component=wireguard peer_id=peer-1 subnet=10.20.0.0/16 reason=duplicate`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log does not contain %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestReconcileHandler_SharedRoutedSubnet(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	handler := ReconcileHandler(mgr, nil)
+	ctx := context.Background()
+
+	a := routedPeer("peer-a", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	b := routedPeer("peer-b", "10.99.0.3", 0x0b, "10.20.0.0/16", "10.30.0.0/16")
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{a, b}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	want := []string{"AddRoute 10.20.0.0/16 plexd0", "AddRoute 10.30.0.0/16 plexd0"}
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Fatalf("route calls = %v, want %v: a subnet two peers list is routed once", got, want)
+	}
+
+	// peer-a drops the shared subnet: peer-b still lists it.
+	a.RoutedSubnets = nil
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{a}}); err != nil {
+		t.Fatalf("update peer-a: %v", err)
+	}
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Fatalf("route calls = %v, want %v: the route stays while peer-b lists the subnet", got, want)
+	}
+
+	// peer-b drops it too: the route goes.
+	b.RoutedSubnets = []string{"10.30.0.0/16"}
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{b}}); err != nil {
+		t.Fatalf("update peer-b: %v", err)
+	}
+	want = append(want, "RemoveRoute 10.20.0.0/16 plexd0")
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+}
+
+func TestReconcileHandler_SetPeerPSKKeepsRoutedSubnets(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	handler := ReconcileHandler(mgr, nil)
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := handler(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	// Every device write replaces the allowed IPs, so a PSK write that left
+	// the routed subnets out would cut the networks behind the peer off.
+	if err := mgr.SetPeerPSK("peer-1", peer.PublicKey, bytes.Repeat([]byte{0x42}, 32)); err != nil {
+		t.Fatalf("SetPeerPSK: %v", err)
+	}
+	if n := len(addPeerConfigs(t, ctrl)); n != 2 {
+		t.Fatalf("AddPeer calls = %d, want the add and the PSK write", n)
+	}
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32", "10.20.0.0/16"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs of the PSK write = %v, want %v", got, want)
+	}
+}
+
+func TestReconcileHandler_RemovedPeerRemovesRoutes(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	handler := ReconcileHandler(mgr, nil)
+	ctx := context.Background()
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16", "10.30.0.0/16")
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToRemove: []string{"peer-1"}}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	want := []string{
+		"AddRoute 10.20.0.0/16 plexd0",
+		"AddRoute 10.30.0.0/16 plexd0",
+		"RemoveRoute 10.20.0.0/16 plexd0",
+		"RemoveRoute 10.30.0.0/16 plexd0",
+	}
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+}
+
+// TestReconcileHandler_RemovalAppliedAgainAfterARouteFailure removes a peer
+// in a run whose route removal fails, so the handler fails and the
+// reconciler hands the same removal over again. The second run must remove
+// the route and succeed, not fail on the peer the first run removed: that
+// would fail every run after it.
+func TestReconcileHandler_RemovalAppliedAgainAfterARouteFailure(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	router := &mockRouter{ctrl: ctrl}
+	mgr.SetPeerRouter(router)
+	handler := ReconcileHandler(mgr, nil)
+	ctx := context.Background()
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	routeErr := errors.New("route: writing to routing socket: transient")
+	router.removeRouteErr = routeErr
+	removal := reconcile.StateDiff{PeersToRemove: []string{"peer-1"}}
+	if err := handler(ctx, nil, removal); !errors.Is(err, routeErr) {
+		t.Fatalf("first removal = %v, want it to wrap %v", err, routeErr)
+	}
+
+	router.removeRouteErr = nil
+	if err := handler(ctx, nil, removal); err != nil {
+		t.Fatalf("the removal applied again = %v, want nil", err)
+	}
+	want := []string{
+		"AddRoute 10.20.0.0/16 plexd0",
+		"RemoveRoute 10.20.0.0/16 plexd0",
+		"RemoveRoute 10.20.0.0/16 plexd0",
+	}
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+	if n := len(ctrl.callsFor("RemovePeer")); n != 1 {
+		t.Errorf("RemovePeer calls = %d, want 1: the second run finds the peer gone", n)
+	}
+}
+
+// TestReconcileHandler_KeyRotationRemovesTheOldDevicePeer rotates a peer's
+// key in the pull that also drops its routed subnet. WireGuard moves to the
+// new key only the allowed IPs its write names, so the device peer of the old
+// key would keep the subnet and could still send from it: the old device
+// peer is removed before the new one is written. A failed removal changes
+// nothing, and the next run tries the rotation again.
+func TestReconcileHandler_KeyRotationRemovesTheOldDevicePeer(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	handler := ReconcileHandler(mgr, nil)
+	ctx := context.Background()
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	oldKey, _ := testKey(0x0a)
+
+	rotated := routedPeer("peer-1", "10.99.0.2", 0x0b)
+	removeErr := errors.New("remove device peer: transient")
+	ctrl.mu.Lock()
+	ctrl.removePeerErr = removeErr
+	ctrl.calls = nil
+	ctrl.mu.Unlock()
+	update := reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{rotated}}
+	if err := handler(ctx, nil, update); !errors.Is(err, removeErr) {
+		t.Fatalf("rotation with a failing removal = %v, want it to wrap %v", err, removeErr)
+	}
+	if n := len(ctrl.callsFor("AddPeer")); n != 0 {
+		t.Fatalf("AddPeer calls after a failed removal = %d, want 0: the new key must not be written", n)
+	}
+
+	ctrl.mu.Lock()
+	ctrl.removePeerErr = nil
+	ctrl.calls = nil
+	ctrl.mu.Unlock()
+	if err := handler(ctx, nil, update); err != nil {
+		t.Fatalf("rotation applied again: %v", err)
+	}
+	var order []string
+	for _, c := range ctrl.callsFor("RemovePeer") {
+		if !bytes.Equal(c.Args[1].([]byte), oldKey[:]) {
+			t.Errorf("RemovePeer key = %x, want the old key %x", c.Args[1], oldKey[:])
+		}
+	}
+	ctrl.mu.Lock()
+	for _, c := range ctrl.calls {
+		if c.Method == "RemovePeer" || c.Method == "AddPeer" {
+			order = append(order, c.Method)
+		}
+	}
+	ctrl.mu.Unlock()
+	if want := []string{"RemovePeer", "AddPeer"}; !slices.Equal(order, want) {
+		t.Errorf("device writes = %v, want %v", order, want)
+	}
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs of the new key = %v, want %v", got, want)
+	}
+	if got, want := routeCalls(ctrl), []string{"RemoveRoute 10.20.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+}
+
+func TestReconcileHandler_PeerRouteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, slogTextLogger(&logs))
+	routeErr := errors.New("route: writing to routing socket: Network is unreachable")
+	router := &mockRouter{ctrl: ctrl, addRouteErr: routeErr}
+	mgr.SetPeerRouter(router)
+	handler := ReconcileHandler(mgr, nil)
+	ctx := context.Background()
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}})
+	if !errors.Is(err, routeErr) {
+		t.Fatalf("handler error = %v, want it to wrap %v", err, routeErr)
+	}
+	// The peer is on the device all the same: the route failed, not the write.
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32", "10.20.0.0/16"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs = %v, want %v", got, want)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		`level=ERROR msg="wireguard: peer route failed" component=wireguard subnet=10.20.0.0/16 op=add`,
+		"Network is unreachable",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "peer routes changed") {
+		t.Errorf("a run that changed no route logged a change:\n%s", out)
+	}
+
+	// The failed subnet stays unprogrammed, so the next run adds it again.
+	router.addRouteErr = nil
+	if err := handler(ctx, nil, reconcile.StateDiff{}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	want := []string{"AddRoute 10.20.0.0/16 plexd0", "AddRoute 10.20.0.0/16 plexd0"}
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+
+	// A failed remove keeps the route programmed, and the next run removes
+	// it again.
+	router.removeRouteErr = routeErr
+	peer.RoutedSubnets = nil
+	if err := handler(ctx, nil, reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{peer}}); !errors.Is(err, routeErr) {
+		t.Fatalf("handler error = %v, want it to wrap %v", err, routeErr)
+	}
+	router.removeRouteErr = nil
+	if err := handler(ctx, nil, reconcile.StateDiff{}); err != nil {
+		t.Fatalf("retry remove: %v", err)
+	}
+	want = append(want, "RemoveRoute 10.20.0.0/16 plexd0", "RemoveRoute 10.20.0.0/16 plexd0")
+	if got := routeCalls(ctrl); !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+}
+
+func TestReconcileHandler_NoPeerRouter(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	handler := ReconcileHandler(mgr, nil)
+
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := handler(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add without a router = %v, want nil", err)
+	}
+	if got, want := lastAllowedIPs(t, ctrl), []string{"10.99.0.2/32", "10.20.0.0/16"}; !slices.Equal(got, want) {
+		t.Errorf("AllowedIPs = %v, want %v", got, want)
+	}
+	if got := routeCalls(ctrl); len(got) != 0 {
+		t.Errorf("route calls = %v, want none", got)
 	}
 }

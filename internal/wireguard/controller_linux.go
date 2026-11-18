@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"syscall"
 	"time"
 
@@ -352,7 +353,8 @@ func (c *NetlinkController) RemovePeer(iface string, publicKey []byte) error {
 // os.ErrNotExist, which wgctrl maps from ENODEV.
 //
 // wgctrl already gives a zero LastHandshakeTime for a peer that never
-// completed a handshake, so it passes through unchanged.
+// completed a handshake, so it passes through unchanged. The allowed IPs are
+// converted with allowedIPPrefixes.
 func (c *NetlinkController) PeerStats(name string) ([]PeerStat, error) {
 	client, err := wgctrl.New()
 	if err != nil {
@@ -372,6 +374,7 @@ func (c *NetlinkController) PeerStats(name string) ([]PeerStat, error) {
 			LastHandshake: p.LastHandshakeTime,
 			RxBytes:       uint64(p.ReceiveBytes),
 			TxBytes:       uint64(p.TransmitBytes),
+			AllowedIPs:    allowedIPPrefixes(p.AllowedIPs),
 		}
 		// A peer the kernel knows no endpoint for has a nil Endpoint; its
 		// PeerStat keeps the invalid zero AddrPort.
@@ -382,4 +385,31 @@ func (c *NetlinkController) PeerStats(name string) ([]PeerStat, error) {
 	}
 
 	return stats, nil
+}
+
+// allowedIPPrefixes converts the allowed IPs wgctrl reads into prefixes, in
+// the device's order, and returns nil for none. wgctrl hands an IPv4 entry
+// over as a 4-byte address with a 32-bit mask; an IPv4-mapped 16-byte address
+// with a 32-bit mask is unmapped, and an entry whose mask is not canonical or
+// does not fit its address is left out.
+func allowedIPPrefixes(nets []net.IPNet) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, n := range nets {
+		addr, ok := netip.AddrFromSlice(n.IP)
+		if !ok {
+			continue
+		}
+		ones, bits := n.Mask.Size()
+		if bits == 0 {
+			continue
+		}
+		if bits == 32 {
+			addr = addr.Unmap()
+		}
+		if addr.BitLen() != bits {
+			continue
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, ones))
+	}
+	return prefixes
 }

@@ -307,6 +307,17 @@ func runAgent(ctx context.Context) error {
 		}
 	}
 
+	// The route controller is built once, here. Every node routes the
+	// networks a peer's routed_subnets lists through the mesh interface with
+	// it, and bridge mode (step 5e) drives the same instance. newRouteController
+	// returns an untyped nil only where no implementation exists, and a
+	// manager without a router programs the routed subnets as allowed IPs and
+	// adds no route.
+	routeCtrl := newRouteController(logger, fwCtrl)
+	if wgReady && routeCtrl != nil {
+		wgMgr.SetPeerRouter(routeCtrl)
+	}
+
 	// 5a-1. Edge PSKs. With the interface up, plexd fetches each edge's PSK and
 	// programs it on the peer, unless wireguard.edge_psk turns that off for a
 	// rolling upgrade: WireGuard needs the same PSK on both ends of a tunnel, so
@@ -580,7 +591,6 @@ func runAgent(ctx context.Context) error {
 		acmeMgr       *bridge.ACMEManager
 	)
 	if cfg.Mode == "bridge" && cfg.Bridge.Enabled {
-		routeCtrl := newRouteController(logger, fwCtrl)
 		bridgeMgr = bridge.NewManager(routeCtrl, cfg.Bridge, logger)
 		if err := bridgeMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
 			return fmt.Errorf("plexd up: bridge setup: %w", err)
