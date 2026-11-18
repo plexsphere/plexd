@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -81,6 +84,33 @@ func TestPeerStatsNonExistent(t *testing.T) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("err = %v, want it to wrap os.ErrNotExist", err)
+	}
+}
+
+func TestAllowedIPPrefixes(t *testing.T) {
+	nets := []net.IPNet{
+		// wgctrl's shape for an IPv4 and an IPv6 entry.
+		{IP: net.IP{10, 99, 0, 2}, Mask: net.CIDRMask(32, 32)},
+		{IP: net.IP{10, 20, 0, 0}, Mask: net.CIDRMask(16, 32)},
+		{IP: net.ParseIP("fd00::"), Mask: net.CIDRMask(64, 128)},
+		// A 16-byte IPv4 address with a 32-bit mask is unmapped.
+		{IP: net.ParseIP("10.30.0.0"), Mask: net.CIDRMask(16, 32)},
+		// A mask that is not canonical, and one that does not fit its
+		// address, are left out.
+		{IP: net.IP{10, 40, 0, 0}, Mask: net.IPMask{255, 0, 255, 0}},
+		{IP: net.IP{10, 50, 0, 0}, Mask: net.CIDRMask(64, 128)},
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("10.99.0.2/32"),
+		netip.MustParsePrefix("10.20.0.0/16"),
+		netip.MustParsePrefix("fd00::/64"),
+		netip.MustParsePrefix("10.30.0.0/16"),
+	}
+	if got := allowedIPPrefixes(nets); !slices.Equal(got, want) {
+		t.Errorf("allowedIPPrefixes() = %v, want %v", got, want)
+	}
+	if got := allowedIPPrefixes(nil); got != nil {
+		t.Errorf("allowedIPPrefixes(nil) = %#v, want nil", got)
 	}
 }
 

@@ -32,8 +32,9 @@ type WGController interface {
 //
 // Only code that hands the name back to the operating system needs this: the
 // readiness check, which resolves the interface with net.InterfaceByName; the
-// pf enforcer, whose rules match on the kernel name; and the site-to-site
-// manager's route calls, because route(8) takes the kernel name.
+// pf enforcer, whose rules match on the kernel name; and the route calls of
+// the site-to-site manager and of the manager's peer routes, because route(8)
+// takes the kernel name.
 // Everything addressing the device through plexd keeps the configured name.
 type OSInterfaceNamer interface {
 	// OSInterfaceName returns the kernel's name for the interface created
@@ -48,6 +49,9 @@ type PeerStat struct {
 	LastHandshake time.Time      // zero when no handshake has completed
 	RxBytes       uint64
 	TxBytes       uint64
+	// AllowedIPs are the peer's allowed IPs in the device's order, nil when
+	// it has none.
+	AllowedIPs []netip.Prefix
 }
 
 // PeerStatsReader is implemented by controllers that can read peer runtime state.

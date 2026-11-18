@@ -1197,8 +1197,10 @@ func TestUpdatePeer_RotatedKeyWithANewFallbackStartsOver(t *testing.T) {
 	if err := mgr.UpdatePeer(relayUpdate(rotated, newRelay)); err != nil {
 		t.Fatalf("UpdatePeer: %v", err)
 	}
-	if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"add " + relayOrder[0]}) {
-		t.Errorf("device writes = %v, want the new order's first entry", got)
+	// The device peer of the old key goes first, then the new key is written
+	// with the new order's first entry.
+	if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"remove", "add " + relayOrder[0]}) {
+		t.Errorf("device writes = %v, want the old key removed and the new order's first entry", got)
 	}
 	if mgr.dial["node-a"].relayed {
 		t.Error("relayed = true after a key rotation, want false")

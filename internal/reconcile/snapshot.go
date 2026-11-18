@@ -68,6 +68,7 @@ func copyPeers(src []api.SnapshotPeer) []api.SnapshotPeer {
 	for i := range dst {
 		dst[i].FallbackEndpoints = slices.Clone(src[i].FallbackEndpoints)
 		dst[i].EndpointCandidates = slices.Clone(src[i].EndpointCandidates)
+		dst[i].RoutedSubnets = slices.Clone(src[i].RoutedSubnets)
 	}
 	return dst
 }

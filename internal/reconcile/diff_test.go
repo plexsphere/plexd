@@ -208,6 +208,58 @@ func TestComputeDiff_PeersUpdated(t *testing.T) {
 		}
 	})
 
+	t.Run("routed_subnets-only change is an update", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			from, to []string
+		}{
+			{"first subnet", nil, []string{"10.20.0.0/16"}},
+			{"subnet replaced", []string{"10.20.0.0/16"}, []string{"10.21.0.0/16"}},
+			{"order changed", []string{"10.20.0.0/16", "10.21.0.0/16"}, []string{"10.21.0.0/16", "10.20.0.0/16"}},
+			{"subnets withdrawn", []string{"10.20.0.0/16"}, nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				desired := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{
+						{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", RoutedSubnets: tc.to},
+						{NodeID: "p2", PublicKey: "pk2", MeshIP: "10.0.0.2"},
+					},
+				}
+				current := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{
+						{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", RoutedSubnets: tc.from},
+						{NodeID: "p2", PublicKey: "pk2", MeshIP: "10.0.0.2"},
+					},
+				}
+
+				diff := ComputeDiff(desired, current)
+
+				if len(diff.PeersToUpdate) != 1 {
+					t.Fatalf("PeersToUpdate = %d, want 1", len(diff.PeersToUpdate))
+				}
+				if got := diff.PeersToUpdate[0]; got.NodeID != "p1" || !slices.Equal(got.RoutedSubnets, tc.to) {
+					t.Errorf("updated peer = %s with RoutedSubnets %v, want p1 with %v", got.NodeID, got.RoutedSubnets, tc.to)
+				}
+				if len(diff.PeersToAdd) != 0 || len(diff.PeersToRemove) != 0 {
+					t.Errorf("add/remove = %d/%d, want 0/0", len(diff.PeersToAdd), len(diff.PeersToRemove))
+				}
+			})
+		}
+	})
+
+	t.Run("nil and empty routed_subnets are not an update", func(t *testing.T) {
+		desired := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", RoutedSubnets: []string{}}},
+		}
+		current := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1"}},
+		}
+
+		if diff := ComputeDiff(desired, current); len(diff.PeersToUpdate) != 0 {
+			t.Errorf("nil vs empty routed_subnets should not update, got %d", len(diff.PeersToUpdate))
+		}
+	})
+
 	t.Run("identical peer is not an update", func(t *testing.T) {
 		peer := api.SnapshotPeer{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"}
 		desired := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{peer}}

@@ -57,9 +57,15 @@ type Peer struct {
 	// when the peer has no relay. Endpoint selection holds each relay as long
 	// as the entries before the first one took together, and only a peer that
 	// connected over a relay dials the standbys.
-	Fallbacks  []string `json:"fallbacks,omitempty"`
+	Fallbacks []string `json:"fallbacks,omitempty"`
+	// AllowedIPs is the peer's mesh address as a /32 followed by
+	// RoutedSubnets.
 	AllowedIPs []string `json:"allowed_ips"`
 	PSK        string   `json:"psk"`
+	// RoutedSubnets are the subnets of the peer's routed_subnets this node
+	// accepted, in the list's order, and nil when it accepted none. The
+	// WireGuard manager routes each of them through the mesh interface.
+	RoutedSubnets []string `json:"routed_subnets,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +257,8 @@ type NodeStateSecret struct {
 // SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a
 // separate type from RegisterPeer (one Go type per contract schema) and carries
 // the peer's direct endpoint but NO psk or allowed_ips: AllowedIPs are derived
-// locally as mesh_ip/32, and the pairwise edge PSK is fetched per edge from
+// locally as mesh_ip/32 followed by the entries of RoutedSubnets the node
+// accepts, and the pairwise edge PSK is fetched per edge from
 // GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk, never projected.
 type SnapshotPeer struct {
 	NodeID    string `json:"node_id"`
@@ -282,6 +289,13 @@ type SnapshotPeer struct {
 	// which, and plexd orders them alike. The field is absent when the peer
 	// has none, and on every control plane that does not deliver them.
 	EndpointCandidates []string `json:"endpoint_candidates,omitempty"`
+	// RoutedSubnets are the IPv4 networks the control plane routes through
+	// the peer as CIDRs: the networks behind the site-to-site tunnels of a
+	// peer that is a bridge. A node adds the ones it accepts to the peer's
+	// allowed IPs and routes them through the mesh interface. The field is
+	// absent for a peer that routes no network, and the registration
+	// response never carries it.
+	RoutedSubnets []string `json:"routed_subnets,omitempty"`
 }
 
 // ReachabilitySnapshot is the interior of the snapshot's reachability block: the

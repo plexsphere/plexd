@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -658,8 +659,31 @@ func TestUserspaceBackend_PeerStats_NoHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PeerStats: %v", err)
 	}
-	// No endpoint and no traffic: the peer is there with nothing but its key.
-	want := []PeerStat{{PublicKey: peer.PublicKey()}}
+	// No endpoint and no traffic: the peer is there with nothing but its key
+	// and its allowed IP.
+	want := []PeerStat{{PublicKey: peer.PublicKey(), AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")}}}
+	assertPeerStats(t, stats, want)
+}
+
+// TestUserspaceBackend_PeerStats_AllowedIPs reads back the allowed IPs of a
+// peer written with two, a mesh address and a routed subnet, in the order
+// they were written: the macOS and Windows proofs of the peer routes read them
+// this way.
+func TestUserspaceBackend_PeerStats_AllowedIPs(t *testing.T) {
+	b := createOnePeerDevice(t)
+	peer := mustKey(t)
+	if err := b.AddPeer("wg-a", PeerConfig{PublicKey: pubBytes(peer), AllowedIPs: []string{"10.99.0.2/32", "10.20.0.0/16"}}); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+
+	stats, err := b.PeerStats("wg-a")
+	if err != nil {
+		t.Fatalf("PeerStats: %v", err)
+	}
+	want := []PeerStat{{
+		PublicKey:  peer.PublicKey(),
+		AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32"), netip.MustParsePrefix("10.20.0.0/16")},
+	}}
 	assertPeerStats(t, stats, want)
 }
 
@@ -718,6 +742,7 @@ func TestParseUAPIPeerStats(t *testing.T) {
 				LastHandshake: time.Unix(1700000005, 250),
 				RxBytes:       2048,
 				TxBytes:       1024,
+				AllowedIPs:    []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32"), netip.MustParsePrefix("fd00::2/128")},
 			}},
 		},
 		{
@@ -744,14 +769,18 @@ func TestParseUAPIPeerStats(t *testing.T) {
 		},
 		{
 			// The second peer has no handshake lines and must not inherit the
-			// first peer's time.
+			// first peer's time, nor its allowed IPs.
 			name: "two peers in dump order",
 			dump: device +
 				"public_key=" + pubBHex + "\nendpoint=[2001:db8::7]:51820\n" +
 				"last_handshake_time_sec=1700000000\nlast_handshake_time_nsec=5\n" +
+				"allowed_ip=10.0.0.3/32\nallowed_ip=10.20.0.0/16\n" +
 				"public_key=" + pubAHex + "\nendpoint=198.51.100.7:51820\n",
 			want: []PeerStat{
-				{PublicKey: pubB, Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"), LastHandshake: time.Unix(1700000000, 5)},
+				{
+					PublicKey: pubB, Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"), LastHandshake: time.Unix(1700000000, 5),
+					AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.3/32"), netip.MustParsePrefix("10.20.0.0/16")},
+				},
 				{PublicKey: pubA, Endpoint: netip.MustParseAddrPort("198.51.100.7:51820")},
 			},
 		},
@@ -814,6 +843,12 @@ func TestParseUAPIPeerStats_Errors(t *testing.T) {
 			wantPrefix: true,
 		},
 		{
+			name:       "unparseable allowed_ip",
+			dump:       device + peer + "allowed_ip=not-a-prefix\n",
+			want:       "wireguard: peer stats: parse allowed_ip:",
+			wantPrefix: true,
+		},
+		{
 			name:       "non-numeric rx_bytes",
 			dump:       device + peer + "rx_bytes=lots\n",
 			want:       "wireguard: peer stats: parse rx_bytes:",
@@ -831,6 +866,11 @@ func TestParseUAPIPeerStats_Errors(t *testing.T) {
 			name: "line without =",
 			dump: "listen_port=51820\n" + privHex + "\n" + peer,
 			want: "wireguard: peer stats: line 2 has no '='",
+		},
+		{
+			name: "allowed_ip before public_key",
+			dump: device + "allowed_ip=10.0.0.2/32\n" + peer,
+			want: "wireguard: peer stats: allowed_ip before public_key",
 		},
 		{
 			name: "endpoint before public_key",
@@ -897,7 +937,8 @@ func assertPeerStats(t *testing.T, got, want []PeerStat) {
 	for i := range want {
 		g, w := got[i], want[i]
 		if g.PublicKey != w.PublicKey || g.Endpoint != w.Endpoint ||
-			!g.LastHandshake.Equal(w.LastHandshake) || g.RxBytes != w.RxBytes || g.TxBytes != w.TxBytes {
+			!g.LastHandshake.Equal(w.LastHandshake) || g.RxBytes != w.RxBytes || g.TxBytes != w.TxBytes ||
+			!slices.Equal(g.AllowedIPs, w.AllowedIPs) {
 			t.Errorf("peer stat %d:\ngot  %+v\nwant %+v", i, g, w)
 		}
 	}

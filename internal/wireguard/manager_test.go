@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/reconcile"
 	"github.com/plexsphere/plexd/internal/registration"
 )
 
@@ -477,6 +478,100 @@ func TestManager_Teardown_DeleteError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("error %q does not wrap original error", err.Error())
+	}
+}
+
+// methodOrder returns the method of every call ctrl recorded, device calls
+// and the route calls of a mockRouter over it together, in call order.
+func methodOrder(ctrl *mockController) []string {
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	methods := make([]string, 0, len(ctrl.calls))
+	for _, c := range ctrl.calls {
+		methods = append(methods, c.Method)
+	}
+	return methods
+}
+
+// programPeerRoutes adds one peer whose routed_subnets are subnets through
+// the reconcile handler, so the manager holds their routes, and clears the
+// calls that recorded.
+func programPeerRoutes(t *testing.T, mgr *Manager, ctrl *mockController, subnets ...string) {
+	t.Helper()
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, subnets...)
+	if err := ReconcileHandler(mgr, nil)(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add a peer with routed subnets: %v", err)
+	}
+	if got := len(routeCalls(ctrl)); got != len(subnets) {
+		t.Fatalf("route calls = %d, want %d", got, len(subnets))
+	}
+	ctrl.mu.Lock()
+	ctrl.calls = nil
+	ctrl.mu.Unlock()
+}
+
+func TestManager_Teardown_RemovesPeerRoutesFirst(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, slogTextLogger(&logs))
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	programPeerRoutes(t, mgr, ctrl, "10.20.0.0/16", "10.30.0.0/16")
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if got, want := methodOrder(ctrl), []string{"RemoveRoute", "RemoveRoute", "DeleteInterface"}; !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+	if got, want := routeCalls(ctrl), []string{"RemoveRoute 10.20.0.0/16 plexd0", "RemoveRoute 10.30.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+	if out := logs.String(); !strings.Contains(out, "added=[] removed=\"[10.20.0.0/16 10.30.0.0/16]\"") {
+		t.Errorf("log does not name the removed routes:\n%s", out)
+	}
+
+	// A second Teardown has no route left to remove.
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("second Teardown: %v", err)
+	}
+	if got := len(routeCalls(ctrl)); got != 2 {
+		t.Errorf("route calls after a second Teardown = %d, want the 2 of the first", got)
+	}
+}
+
+func TestManager_Teardown_PeerRouteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, slogTextLogger(&logs))
+	router := &mockRouter{ctrl: ctrl}
+	mgr.SetPeerRouter(router)
+	programPeerRoutes(t, mgr, ctrl, "10.20.0.0/16")
+
+	router.removeRouteErr = errors.New("route: not permitted")
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown = %v, want nil: a route the delete takes along fails nothing", err)
+	}
+	if got, want := methodOrder(ctrl), []string{"RemoveRoute", "DeleteInterface"}; !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+	if out := logs.String(); !strings.Contains(out, `level=WARN msg="wireguard: peer route failed" component=wireguard subnet=10.20.0.0/16 op=remove error="route: not permitted"`) {
+		t.Errorf("log does not carry the Warn for the route:\n%s", out)
+	}
+}
+
+func TestManager_Teardown_NoPeerRouter(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	peer := routedPeer("peer-1", "10.99.0.2", 0x0a, "10.20.0.0/16")
+	if err := ReconcileHandler(mgr, nil)(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if got := routeCalls(ctrl); len(got) != 0 {
+		t.Errorf("route calls = %v, want none without a router", got)
 	}
 }
 
