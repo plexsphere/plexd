@@ -372,16 +372,22 @@ when that list is not empty. See
 **IngressRule**
 
 One rule of the block, the control plane's `NodeStateBridgeIngressRule`.
-`IngressModePassthrough`, `IngressModeTerminate` and `IngressModeACME` name its
-modes, and a bridge serves all three: a `terminate` rule ends TLS with the
-certificate of the Secret `CertificateSecretName` names, and an `acme` rule with
-a certificate the bridge obtains from the account of the block's `ACME` member.
+`IngressProtocolTCP` (`"tcp"`) and `IngressProtocolUDP` (`"udp"`) name its
+protocols: a `tcp` rule forwards the connections that reach its listen port,
+and a `udp` rule the datagrams. `IngressModePassthrough`, `IngressModeTerminate`
+and `IngressModeACME` name its modes, and a bridge serves all three: a
+`terminate` rule ends TLS with the certificate of the Secret
+`CertificateSecretName` names, and an `acme` rule with a certificate the bridge
+obtains from the account of the block's `ACME` member. A `udp` rule is a
+`passthrough` rule without `SNIHost`. `IngressRule` stays comparable with `==`.
+See [Forwarding Datagrams](/reference/bridge/public-ingress#forwarding-datagrams).
 
 | Field           | Type     | JSON Tag                 | Description                                  |
 |-----------------|----------|--------------------------|----------------------------------------------|
 | `ID`            | `string` | `"id"`                   | Rule id                                      |
 | `Slug`          | `string` | `"slug"`                 | Rule name within the bridge Resource         |
-| `ListenPort`    | `int`    | `"listen_port"`          | Public TCP port, 1 to 65535                  |
+| `Protocol`      | `string` | `"protocol,omitempty"`   | `tcp` or `udp`. A rule of a control plane older than [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) carries none and decodes to `""`, which a bridge serves as `tcp` |
+| `ListenPort`    | `int`    | `"listen_port"`          | Public port, 1 to 65535, TCP or UDP by `Protocol` |
 | `Mode`          | `string` | `"mode"`                 | `passthrough`, `terminate` or `acme`         |
 | `SNIHost`       | `string` | `"sni_host,omitempty"`   | Server name the rule matches, exact or `*.` plus a suffix; empty for the only rule on its port |
 | `TargetNodeID`  | `string` | `"target_node_id"`       | Target node; not dialed                      |
@@ -1342,7 +1348,7 @@ checks none of this and sends the request as passed.
 | `IngressCertificateNotRequired` | `"not_required"` | A `passthrough` rule, which needs no certificate at the bridge |
 | `IngressCertificateReady` | `"ready"` | A `terminate` or `acme` rule whose certificate is in place |
 | `IngressCertificateNotReady` | `"not_ready"` | A `terminate` or `acme` rule without its certificate; `CertificateReason` says why |
-| `IngressDialNone` | `"none"` | No client connection has dialled the rule's target yet |
+| `IngressDialNone` | `"none"` | No client connection has dialled the rule's target yet, or, for a `udp` rule, no flow has sent a client's datagram to it yet |
 | `IngressDialSucceeded` | `"succeeded"` | The last dial reached the target |
 | `IngressDialFailed` | `"failed"` | The last dial failed; `DialReason` says why |
 | `MaxIngressStatusRules` | `1024` | The most entries one report carries |
