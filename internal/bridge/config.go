@@ -9,6 +9,7 @@ import (
 
 const (
 	DefaultMaxIngressRules    = 20
+	DefaultMaxIngressUDPFlows = 1024
 	DefaultIngressDialTimeout = 10 * time.Second
 )
 
@@ -76,6 +77,11 @@ type Config struct {
 	// MaxIngressRules is the maximum number of concurrent ingress rules.
 	// Default: 20
 	MaxIngressRules int `yaml:"max_ingress_rules"`
+
+	// MaxIngressUDPFlows is the most flows one udp ingress rule holds, a
+	// flow being the datagrams of one client address and port.
+	// Default: 1024
+	MaxIngressUDPFlows int `yaml:"max_ingress_udp_flows"`
 
 	// IngressDialTimeout is the timeout for dialing target mesh peers.
 	// Default: 10s. Minimum: 1s.
@@ -207,6 +213,9 @@ func (c *Config) ApplyDefaults() {
 	if c.MaxIngressRules == 0 {
 		c.MaxIngressRules = DefaultMaxIngressRules
 	}
+	if c.MaxIngressUDPFlows == 0 {
+		c.MaxIngressUDPFlows = DefaultMaxIngressUDPFlows
+	}
 	if c.IngressDialTimeout == 0 {
 		c.IngressDialTimeout = DefaultIngressDialTimeout
 	}
@@ -257,6 +266,9 @@ func (c *Config) Validate() error {
 	if !c.IngressOptedOut() {
 		if c.MaxIngressRules <= 0 {
 			return fmt.Errorf("bridge: config: MaxIngressRules must be positive when ingress is enabled")
+		}
+		if c.MaxIngressUDPFlows < 1 {
+			return fmt.Errorf("bridge: config: MaxIngressUDPFlows must be positive when ingress is enabled")
 		}
 		if c.IngressDialTimeout < 1*time.Second {
 			return fmt.Errorf("bridge: config: IngressDialTimeout must be at least 1s")
