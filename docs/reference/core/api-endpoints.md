@@ -33,6 +33,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 21 | `GET` | `/v1/nodes/{node_id}/hooks/{name}/versions/{version}` | Published hook version fetch (signed envelope and script) |
 | 22 | `PUT` | `/v1/nodes/{node_id}/policy-status` | Policy status report |
 | 23 | `PUT` | `/v1/nodes/{node_id}/ingress-status` | Ingress status report, with the state of each ingress rule (bridges) |
+| 24 | `PUT` | `/v1/nodes/{node_id}/site-to-site-status` | Site-to-site status report, with the state of each site-to-site tunnel (bridges) |
 
 ## Registration & Identity
 
@@ -968,6 +969,142 @@ the operation's own answer, a verdict on the node rather than a missing route,
 so it is false. A `501` with any other code is an ordinary failure and logged at
 Warn. No answer stops the reporter, and none changes what the bridge serves.
 
+## Site-to-Site Status
+
+### PUT /v1/nodes/{node_id}/site-to-site-status
+
+Reports whether a bridge's local configuration serves site-to-site tunnels, so
+the control plane refuses a tunnel that no bridge would serve, and whether each
+site-to-site tunnel of the bridge's pull is up and answered by its remote site.
+The report is also how the public key of a `wireguard` tunnel's interface
+reaches the control plane, which the remote site's configuration names as its
+peer's key. While a bridge's report reads `opted_out`, the control plane answers
+a create or an update of a tunnel on its bridge Resource with
+`409 bridge_site_to_site_opted_out`. It keeps the tunnels stored before the
+opt-out, keeps delivering them in the
+[`bridge.site_to_site`](#get-v1-nodes-node-id-state) block with
+`enabled: true`, and allows a delete. A bridge that never reported reads
+`not_reported` and accepts tunnels. A report moves no other node's pull: the
+`routed_subnets` of the bridge's peer entry follow the stored tunnels whatever
+the bridge reports. The control plane's side is
+[plexsphere/plexsphere#1109](https://github.com/plexsphere/plexsphere/pull/1109).
+See [Site-to-Site VPN](../bridge/site-to-site-vpn.md) for how plexd derives the
+state and each entry.
+
+**Request body** (`SiteToSiteStatusRequest`, at most 64 KiB):
+
+```json
+{
+  "state": "enabled",
+  "tunnels": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", "health": "up",
+      "public_key": "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=", "established": true },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", "health": "down", "reason": "kind_not_served" }
+  ]
+}
+```
+
+- `state`: required, one of `enabled` and `opted_out`. `enabled` means the
+  local configuration serves the tunnels the pull enables:
+  [`bridge.site_to_site_enabled`](configuration.md#bridge) is absent or `true`.
+  `opted_out` means `bridge.site_to_site_enabled: false`: the bridge serves no
+  tunnel whatever the pull says.
+- `tunnels`: optional, at most 256 entries (`SiteToSiteStatusTunnel`), one per
+  tunnel of the bridge's last applied block, in the order of the pull. An
+  absent `tunnels`, a `null` and an empty array all mean no entries. An
+  `opted_out` report carries none, and plexd omits the member when it has no
+  entry. Each entry carries `id`, the tunnel's UUID, and `health`, `up` or
+  `down`; then `reason` exactly when `health` is `down`, `established` exactly
+  when it is `up`, and, only when it is `up`, `public_key`, the public key of a
+  `wireguard` tunnel's interface in 44 characters of standard base64. plexd
+  sends `public_key` for a `wireguard` tunnel that is up and never for an
+  `ipsec` or `openvpn` one. `established` is `true` when the remote site
+  answers: for a `wireguard` tunnel the latest handshake with the remote peer
+  is at most 180 seconds old, for an `ipsec` tunnel the IKE and child security
+  associations stand, and for an `openvpn` tunnel the peer is connected. A
+  reason is a token matching `^[a-z][a-z0-9_]{0,62}$`; the tokens plexd sends
+  are listed on [Site-to-Site VPN](../bridge/site-to-site-vpn.md). Besides the
+  contract's tokens, plexd sends `invalid_tunnel`, `setup_failed` and
+  `key_unavailable`, which the control plane stores verbatim like any token of
+  the grammar.
+
+The control plane decodes the body with unknown members refused, of the report
+and of each entry. A body that is not one JSON object, an unknown member, data
+after the report, a missing or `null` `state`, a value outside the two states,
+more than 256 entries, and an entry with a missing, malformed or zero `id`,
+without `health`, with a `health` outside its values, a reason outside the
+grammar, a malformed `public_key`, an `established` that is not a boolean, or a
+member the presence rules above forbid or require each answer
+`400 malformed_site_to_site_status`. An `opted_out` report with entries and an
+`id` that repeats an earlier entry each answer
+`400 invalid_site_to_site_status`. The `detail` names the entry by index, as
+`tunnels[3].reason is required while health is down`, and never repeats a
+value of the body. A member of an entry sent as `null` reads as omitted.
+`ReportSiteToSiteStatus` validates nothing, because the reporter builds only
+the shapes the contract admits: it reports no tunnel whose `id` is no UUID in
+canonical form or repeats an earlier one.
+
+**Response** (`200 OK`, `SiteToSiteStatusResponse`):
+
+```json
+{
+  "accepted_at": "2026-11-18T10:15:30.123Z"
+}
+```
+
+`accepted_at` is the server receive time. Every answer carries
+`Cache-Control: no-store`.
+
+**Cadence.** plexd reports from a loop of its own, started in bridge mode,
+whether or not the bridge opts out. It sends the report once right after each
+start, without waiting for the first state pull and so without entries; on
+every change of an entry's `id`, `health`, `reason`, `public_key` or
+`established`, at most once per 5 s; and once per `heartbeat.interval`
+(default 30s). A change of `established` alone raises no signal of its own, so
+it reaches the control plane with the next pull or the next tick, at most one
+interval late. The state comes from the local configuration, which plexd reads
+once per start, so a changed `bridge.site_to_site_enabled` takes effect, and is
+reported, with the restart. A failed report is not retried within its tick.
+plexd sends nothing at shutdown, and a node outside bridge mode sends nothing
+at all.
+
+**Sticky state, aging entries.** The control plane keeps the latest state per
+node and never ages it, so a bridge that reported `opted_out` and went offline
+stays opted out until it reports `enabled`. Each report replaces the tunnel
+entries of the one before, and a bridge that has not reported for three
+heartbeat intervals of its Domain, 90 seconds under the default policy, has its
+tunnels read `stale`. Every report renews that window, a repeat that changes
+nothing included, so the report once per interval is load-bearing. An entry
+whose `id` is no tunnel of the bridge Resource is ignored. The control plane
+derives each tunnel's state from the latest report: `established` while the
+tunnel is up and its remote site answers, `connecting` while it is up and the
+remote site does not answer, `down` with the reason, `stale`, `not_reported` or
+`opted_out`. The report never gates serving: a bridge serves as the pull says
+while a report fails or the control plane does not serve the operation.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Report accepted; body is a `SiteToSiteStatusResponse` | Logged at Debug as `accepted` on every send; also at Info as `reported` for the first accepted send, and once at Info after a not-served phase |
+| `400 Bad Request` | `malformed_site_to_site_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), names a `state` outside the two (`detail` `state is not one of enabled and opted_out`), carries more than 256 entries (`detail` `tunnels carries more than 256 entries`), or an entry that breaks a member rule or the presence rules (`detail` such as `tunnels[0].established is required while health is up`) | Logged at Warn as `send failed` on every send; the next tick sends the report again |
+| `400 Bad Request` | `invalid_site_to_site_status` | An `opted_out` report with entries (`detail` `an opted-out bridge reports no tunnels`) or an `id` that repeats an earlier entry (`detail` such as `tunnels[1].id repeats tunnels[0].id`) | Logged at Warn as `send failed`; the next tick sends the report again |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends the report again. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends the report again |
+| `404 Not Found` | `site_to_site_status_node_gone` | The node was removed while the request ran | Logged at Warn as `rejected, this node was removed` on every send; plexd keeps reporting every interval |
+| `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
+| `413 Payload Too Large` | `site_to_site_status_body_too_large` | Body exceeds 64 KiB | Logged at Warn as `send failed`; the next tick sends the report again |
+| `500 Internal Server Error` | `internal` | Server error, for example a failed write of the report | Logged at Warn as `send failed`; the next tick sends the report again |
+| `501 Not Implemented` | `site_to_site_status_not_provisioned` | The control plane has not provisioned the operation: its recording service is not wired | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
+
+`api.IsSiteToSiteStatusNotServed` classifies the two not-served answers: a
+`404` with any code but `site_to_site_status_node_gone`, and a `501` carrying
+`site_to_site_status_not_provisioned`. A `404 site_to_site_status_node_gone`
+is the operation's own answer, a verdict on the node rather than a missing
+route, so it is false. A `501` with any other code is an ordinary failure and
+logged at Warn. No answer stops the reporter, and none changes what the bridge
+serves.
+
 ## Policy Status
 
 ### PUT /v1/nodes/{node_id}/policy-status
@@ -1233,7 +1370,8 @@ absence.
       "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
       "fallback_endpoint": "203.0.113.2:51820",
       "fallback_endpoints": ["203.0.113.2:51820", "203.0.113.3:51820"],
-      "endpoint_candidates": ["192.0.2.10:51820"]
+      "endpoint_candidates": ["192.0.2.10:51820"],
+      "routed_subnets": ["10.50.0.0/16"]
     },
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
@@ -1389,6 +1527,22 @@ cap their number. It skips an empty or repeated entry. A change of the list,
 its order included, is enough for the differ to update the peer, so a pull that
 only changes a standby reaches the WireGuard handler.
 
+A peer's `routed_subnets` lists, as CIDRs, the networks behind the site-to-site
+tunnels of the peer's bridge Resource: the union of their `allowed_subnets`,
+each prefix once, sorted by address and then by prefix length. Only the nodes
+whose Resource belongs to the bridge Resource's Project receive it. The member
+is absent when the list would be empty, follows the stored tunnels whatever the
+bridge reports about them, and is never carried by the registration response,
+so a node programs it from its first pull. plexd adds the entries it accepts to
+the peer's allowed IPs, after the mesh address, and routes them through the
+mesh interface; it removes both when a pull no longer lists them. It skips an
+entry that is no IPv4 prefix or has host bits set, one that overlaps the Domain
+mesh prefix, one inside a network of one of the host's interfaces and one that
+repeats an earlier entry, each with a Warn. A route admits no traffic by
+itself: a Policy rule whose `destination_cidr` lies inside the network does.
+A change of the list, its order included, is enough for the differ to update
+the peer. See [Routed subnets](../networking/wireguard.md#routed-subnets).
+
 The pull carries no PSK: plexd fetches the pairwise PSK of each edge from
 [`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk).
 
@@ -1506,6 +1660,36 @@ so a rule missing from a later pull is removed, and a `null` block closes every
 public listener. A failed bind fails the reconcile cycle, and the next pull
 retries it. A node outside bridge mode ignores the block. See
 [Public Ingress](../bridge/public-ingress.md).
+
+`bridge.site_to_site` lists the site-to-site tunnels of the bridge Resource,
+by `slug` ascending, and carries `enabled`, the control plane's switch, which
+it sends as `true` on every block; a bridge without tunnels gets no block. A
+bridge serves the tunnels when `enabled` is true and its local configuration
+does not opt out with
+[`bridge.site_to_site_enabled: false`](configuration.md#bridge), and reports
+each tunnel's state with the
+[site-to-site status report](#site-to-site-status). Each tunnel carries `id`,
+`slug`, `kind` (`wireguard`, `ipsec` or `openvpn`), `remote_host`, the remote
+site's host name or IP address, `remote_port` and `allowed_subnets`, the 1 to
+64 networks behind the remote site. A `wireguard` tunnel also carries
+`listen_port`, `remote_public_key` and an optional `auth_secret_name`, the
+Secret that holds its preshared key; the bridge serves it on a WireGuard
+interface of its own with the remote site as its one peer and a private key it
+keeps across restarts. An `ipsec` tunnel carries `auth_secret_name`, the Secret
+that holds its IKE pre-shared key, and an `openvpn` tunnel the one that holds
+its static key; the bridge hands either to the host's strongSwan or to an
+`openvpn` process it starts. The bridge fetches a Secret in the version the
+`secrets` block lists. For every kind the bridge routes `allowed_subnets` into
+the tunnel and forwards what arrives from the tunnel into the mesh with the
+source rewritten to its mesh address. Only a Linux bridge serves tunnels; on
+macOS and Windows every tunnel that passes its checks reads `kind_not_served`.
+The block is whole, so a tunnel missing from a later pull is torn down, and a
+`null` block serves no tunnel. The control plane delivers the block in this
+shape since
+[plexsphere/plexsphere#1109](https://github.com/plexsphere/plexsphere/pull/1109).
+A node outside bridge mode ignores the block. See
+[Site-to-Site VPN](../bridge/site-to-site-vpn.md) and
+[Tunnel Providers](../bridge/tunnel-providers.md).
 
 `reachability` is the control plane's own verdict about this node, derived from
 the heartbeats it has admitted. `state` is one of `healthy`, `stale`,

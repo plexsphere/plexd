@@ -76,7 +76,7 @@ func developmentKubernetesTopology() *Figure {
 	return f
 }
 
-// developmentSystemdTopology draws the six containers of the systemd
+// developmentSystemdTopology draws the seven containers of the systemd
 // end-to-end test on their network, for
 // docs/reference/development/systemd-e2e-test.md (Container Topology).
 func developmentSystemdTopology() *Figure {
@@ -134,7 +134,18 @@ func developmentSystemdTopology() *Figure {
 	f.arrow(both, plexd.rightAt(wg), pt{right, wg}, pt{right, meshNode.cy()}, meshNode.left())
 	f.labelRight(pt{right, (wg + meshNode.cy()) / 2}, body("WireGuard"), code("plexd0 :51820"))
 
+	// The site-to-site phase: the site is the remote end of a wireguard
+	// tunnel of the bridge. Its tunnel leaves plexd.service below the
+	// mesh node's and turns down a lane inside the mesh node's, so the
+	// two never cross.
+	site := f.box(roleExternal, spec{x: target.x, y: meshNode.y + meshNode.h + 50, w: target.w, lines: []Line{
+		name("site"), code("wg0 10.40.0.1/16"), code(":7201 (nc -l)"),
+	}})
+	s2s, inner := wg+8, right-24
+	f.arrow(both, plexd.rightAt(s2s), pt{inner, s2s}, pt{inner, site.cy()}, site.left())
+	f.labelLeft(pt{inner, (meshNode.y + meshNode.h + site.cy()) / 2}, body("WireGuard"), code(":51930 (wg-s2s-…)"))
+
 	net.w = target.x + target.w + 30
-	net.h = max(pebble.y+pebble.h, device.y+device.h, meshNode.y+meshNode.h) + 30
+	net.h = max(pebble.y+pebble.h, device.y+device.h, site.y+site.h) + 30
 	return f
 }

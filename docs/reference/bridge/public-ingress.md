@@ -249,9 +249,9 @@ A new version replaces the certificate and closes nothing: an established connec
 
 When the leaf of a loaded certificate does not cover a rule's host (`x509.Certificate.VerifyHostname`, with `x` in place of the `*` of a wildcard host), the bridge logs `ingress certificate does not cover the rule's host` and serves the certificate anyway: the control plane checks no coverage, and the client reports the mismatch itself. plexd checks neither expiry, chain nor key strength.
 
-Certificates and their keys live in memory only. Nothing writes a Secret's value to disk, a restart fetches every certificate again, and `Teardown` forgets the inventory and every certificate. No log line and no error carries a Secret's value.
+Certificates and their keys live in memory only. Nothing writes a certificate Secret's value to disk, a restart fetches every certificate again, and `Teardown` forgets the inventory and every certificate. No log line and no error carries a Secret's value.
 
-`cmd/plexd/cmd/node_secrets.go` implements `CertificateSecretFetcher` with `nodeSecretFetcher`, over `ControlPlane.FetchSecret` and `nodeapi.DecryptSecret`. The same fetcher reads the join key of a `tailscale` or `netbird` user access provider through `FetchSecretValue`, which delegates to `FetchCertificateSecret` (see [VPN Providers](vpn-providers.md#the-join-key)):
+`cmd/plexd/cmd/node_secrets.go` implements `CertificateSecretFetcher` with `nodeSecretFetcher`, over `ControlPlane.FetchSecret` and `nodeapi.DecryptSecret`. The same fetcher reads the join key of a `tailscale` or `netbird` user access provider and the key of a site-to-site tunnel through `FetchSecretValue`, which delegates to `FetchCertificateSecret` (see [VPN Providers](vpn-providers.md#the-join-key) and [Tunnel Providers](tunnel-providers.md#the-key)):
 
 ```go
 type nodeSecretFetcher struct {
@@ -361,7 +361,7 @@ type IngressController interface {
 func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager, certs CertificateSecretFetcher) *IngressManager
 ```
 
-Neither `acme` nor `certs` may be nil. In bridge mode, `plexd up` reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`) and builds `nodeSecretFetcher` with it once, when the bridge serves public ingress or user access. Unless `bridge.ingress_enabled` is `false`, it builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`) and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress; it reads the key for user access unless `bridge.user_access_enabled` is `false` too.
+Neither `acme` nor `certs` may be nil. In bridge mode, `plexd up` reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`) and builds `nodeSecretFetcher` with it once, when the bridge serves public ingress, user access or site-to-site tunnels. Unless `bridge.ingress_enabled` is `false`, it builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`) and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress; it reads the key for user access or site-to-site tunnels unless `bridge.user_access_enabled` and `bridge.site_to_site_enabled` are `false` too.
 
 Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
 

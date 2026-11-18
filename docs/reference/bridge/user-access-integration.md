@@ -462,7 +462,7 @@ func (s *InterfaceKeyStore) LoadOrCreate(id string) (wgtypes.Key, error)
 func (s *InterfaceKeyStore) Prune(keep map[string]struct{}) error
 ```
 
-`plexd up` builds the store over `<data_dir>/user-access`. `LoadOrCreate` returns the key stored for the id, and generates, writes and returns one when there is none (see [The Key File](#the-key-file)). `Prune` deletes the key file of every id not in `keep`; a directory that does not exist is no error, and a failed deletion does not stop the others. The store is safe for concurrent use and carries no user access wording, because site-to-site tunnels will keep their keys with it ([#212](https://github.com/plexsphere/plexd/issues/212)).
+`plexd up` builds the store over `<data_dir>/user-access`. `LoadOrCreate` returns the key stored for the id, and generates, writes and returns one when there is none (see [The Key File](#the-key-file)). `Prune` deletes the key file of every id not in `keep`; a directory that does not exist is no error, and a failed deletion does not stop the others. The store is safe for concurrent use and carries no user access wording: site-to-site tunnels keep their keys in `<data_dir>/site-to-site` with the same store (see [The Key File](site-to-site-vpn.md#the-key-file)).
 
 ## Wiring in plexd up
 

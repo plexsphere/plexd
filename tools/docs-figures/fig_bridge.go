@@ -89,21 +89,41 @@ func bridgeNATRelay() *Figure {
 	return f
 }
 
-// bridgeNetlinkRouteController draws the Linux route controller and the
-// three kernel interfaces it programs, for
-// docs/reference/bridge/netlink-route-controller.md.
+// brgCallerH is the height of a manager box in the two route controller
+// figures: its name and two lines of what it asks for, clear of a chip
+// on its top edge.
+const brgCallerH = 100.0
+
+// bridgeNetlinkRouteController draws the Linux route controller, the
+// managers that call it and the three kernel interfaces it programs,
+// for docs/reference/bridge/netlink-route-controller.md. plexd up
+// builds one controller on every node and hands it to all four: the
+// three bridge managers run in bridge mode only, the WireGuard manager
+// adds the peer routes on every node.
 func bridgeNetlinkRouteController() *Figure {
 	f := &Figure{Name: "bridge-netlink-route-controller", Title: "The Linux route controller and what it programs"}
-	const w, gap = 300.0, 60.0
+	const w, gap, mgrW, mgrGap = 300.0, 60.0, 240.0, 20.0
 	center := (3*w + 2*gap) / 2
-	mgr := f.box(roleAgent, spec{x: center - 160, y: 0, w: 320, h: 64, lines: []Line{name("Bridge Manager")}})
-	ctrl := f.filled(roleAgent, spec{x: center - 200, y: 150, w: 400, h: 64, lines: []Line{codeName("NetlinkRouteController")}})
-	f.arrow(flow, mgr.bottom(), ctrl.top())
+	callers := [][]Line{
+		{name("Bridge Manager"), body("access routes,"), body("forwarding, NAT")},
+		{codeName("UserAccessManager"), body("forwarding,"), body("source rewrite")},
+		{codeName("SiteToSiteManager"), body("routes, forwarding,"), body("source rewrite")},
+		{codeName("wireguard.Manager"), body("peer routes,"), body("on every node")},
+	}
+	ctrl := f.filled(roleAgent, spec{x: center - 200, y: brgCallerH + 110, w: 400, h: 64, lines: []Line{codeName("NetlinkRouteController")}})
+	callBus := brgCallerH + 55
+	for i, lines := range callers {
+		m := f.box(roleAgent, spec{x: float64(i) * (mgrW + mgrGap), y: 0, w: mgrW, h: brgCallerH, lines: lines})
+		if i < 3 {
+			f.chipOn(m, "bridge mode", colorGrey)
+		}
+		f.arrow(flow, vhv(m.bottom(), ctrl.top(), callBus)...)
+	}
 	busY := ctrl.y + ctrl.h + 50
 	subs := [][]Line{
 		{name("netlink"), body("routes")},
 		{name("sysctl"), body("forwarding")},
-		{name("nftables"), body("NAT")},
+		{name("nftables"), body("NAT, mesh source rewrite")},
 	}
 	for i, l := range subs {
 		n := f.box(roleSubstrate, spec{x: float64(i) * (w + gap), y: busY + 50, w: w, h: 80, lines: l})
@@ -115,14 +135,23 @@ func bridgeNetlinkRouteController() *Figure {
 // bridgeRouteControllersMacOSWindows draws the macOS and Windows route
 // controllers, the managers that call them, and what each delegates
 // to, for docs/reference/bridge/route-controllers-macos-windows.md.
-// The user access manager is not among them: it serves no provider on
-// either platform, so it never calls the route controller there.
+// The bridge manager runs in bridge mode only; the WireGuard manager
+// adds the peer routes on every node. The user access and site-to-site
+// managers are not among them: they serve no provider and no tunnel on
+// either platform, so they never call the route controller there.
 func bridgeRouteControllersMacOSWindows() *Figure {
 	f := &Figure{Name: "bridge-route-controllers-macos-windows", Title: "The macOS and Windows route controllers and what they program"}
-	const leafY, leafW, leafGap = 330.0, 180.0, 30.0
+	const ctrlY = brgCallerH + 106
+	const leafY, leafW, leafGap = ctrlY + 160, 180.0, 30.0
+	bridgeMgr := f.box(roleAgent, spec{x: 150, y: 0, w: 300, h: brgCallerH, lines: []Line{
+		name("Bridge Manager"), body("access routes,"), body("forwarding, NAT"),
+	}})
+	f.chipOn(bridgeMgr, "bridge mode", colorGrey)
 	mgrs := []*node{
-		f.box(roleAgent, spec{x: 150, y: 0, w: 300, h: 64, lines: []Line{name("Bridge Manager")}}),
-		f.box(roleAgent, spec{x: 735, y: 0, w: 300, h: 64, lines: []Line{codeName("SiteToSiteManager")}}),
+		bridgeMgr,
+		f.box(roleAgent, spec{x: 735, y: 0, w: 300, h: brgCallerH, lines: []Line{
+			codeName("wireguard.Manager"), body("peer routes on every node,"), body("through utunN on macOS"),
+		}}),
 	}
 	leaf := func(i int, r role, label string) *node {
 		x := float64(i) * (leafW + leafGap)
@@ -137,12 +166,12 @@ func bridgeRouteControllersMacOSWindows() *Figure {
 	ipcfg := leaf(3, roleSubstrate, "winipcfg")
 	wfp := leaf(4, roleAgent, "WFPController")
 
-	darwin := f.filled(roleAgent, spec{y: 170, w: 300, h: 64, lines: []Line{codeName("DarwinRouteController")}})
+	darwin := f.filled(roleAgent, spec{y: ctrlY, w: 300, h: 64, lines: []Line{codeName("DarwinRouteController")}})
 	darwin.x = sysctl.cx() - darwin.w/2
-	windows := f.filled(roleAgent, spec{y: 170, w: 300, h: 64, lines: []Line{codeName("WindowsRouteController")}})
+	windows := f.filled(roleAgent, spec{y: ctrlY, w: 300, h: 64, lines: []Line{codeName("WindowsRouteController")}})
 	windows.x = (ipcfg.x+wfp.x+wfp.w)/2 - windows.w/2
 
-	busY := 117.0
+	busY := brgCallerH + 53
 	for _, m := range mgrs {
 		for _, c := range []*node{darwin, windows} {
 			f.arrow(flow, vhv(m.bottom(), c.top(), busY)...)

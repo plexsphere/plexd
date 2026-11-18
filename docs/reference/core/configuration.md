@@ -518,11 +518,12 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `user_access_provider_type` | string | — | Ignored. The state pull delivers each provider with its `kind` |
 | `auth_key_env` | string | — | Ignored. It named the environment variable a Tailscale client read its auth key from, such as `PLEXD_TAILSCALE_AUTH_KEY`, which plexd no longer reads: a `tailscale` provider joins with the key of the Secret its `auth_secret_name` names |
 | `setup_key_env` | string | — | Ignored. It named the environment variable a NetBird client read its setup key from, such as `PLEXD_NETBIRD_SETUP_KEY`, which plexd no longer reads: a `netbird` provider joins with the key of the Secret its `auth_secret_name` names |
-| `site_to_site_enabled` | bool | `false` | Enable site-to-site VPN |
-| `site_to_site_interface_prefix` | string | `wg-s2s-` | Prefix for site-to-site WireGuard interfaces |
-| `site_to_site_listen_port` | int | `51823` | Base listen port for site-to-site tunnels |
-| `max_site_to_site_tunnels` | int | `10` | Maximum site-to-site tunnels |
-| `tunnel_providers` | []string | — | Tunnel provider types for site-to-site: `ipsec`, `openvpn`. Empty means WireGuard-only. |
+| `site_to_site_enabled` | bool | `true` | Local switch for site-to-site tunnels. Absent or `true`, a bridge serves the tunnels of the state pull's `bridge.site_to_site` block when the block carries `enabled: true`. `false` opts the host out: plexd builds no site-to-site manager, creates no tunnel interface, starts no `openvpn` process and loads no strongSwan connection whatever the pull says, and removes the tunnel interfaces and the provider files an earlier process left behind. A bridge reports which of the two applies with the [site-to-site status report](../bridge/site-to-site-vpn.md) (`PUT /v1/nodes/{node_id}/site-to-site-status`), and the control plane refuses tunnel creates and updates for a bridge that reported `opted_out`. A bridge that upgrades without the key starts serving the tunnels the control plane delivers; set `false` before the upgrade to keep a host closed. An explicit `true` requires `enabled: true`. Linux bridges serve tunnels; on macOS and Windows every tunnel that passes its checks reads `kind_not_served`. plexd reads the key at start, so a change takes effect with a restart. See [Site-to-Site VPN](../bridge/site-to-site-vpn.md) |
+| `site_to_site_interface_prefix` | string | — | Ignored. Each tunnel's interface is named after its kind and its id: `wg-s2s-`, `xf-s2s-` or `ov-s2s-` and the last 8 hex digits |
+| `site_to_site_listen_port` | int | — | Ignored. Each `wireguard` tunnel listens on the `listen_port` the state pull delivers |
+| `max_site_to_site_tunnels` | int | — | Ignored. The control plane holds the bridge's tunnels |
+| `tunnel_providers` | []string | — | Ignored. The state pull delivers each tunnel with its `kind`, and plexd serves `wireguard`, `ipsec` and `openvpn` |
+| `swanctl_conf_dir` | string | `<run dir>/swanctl` | Directory plexd writes the strongSwan connection file of each `ipsec` tunnel into, `plexd-<id>.conf`; empty means `swanctl` under the [run directory](#platform-defaults), `/var/run/plexd/swanctl` on Linux. The host's `/etc/swanctl/swanctl.conf` must include `<dir>/*.conf`. A value must be an absolute path, checked also outside bridge mode: anything else fails the start with `bridge: config: swanctl_conf_dir: "<value>" is not an absolute path`. See [Tunnel Providers](../bridge/tunnel-providers.md) |
 | `acme_cache_dir` | string | `<data_dir>/acme` | Directory of the ACME account key and of the certificates the bridge obtains for `acme` ingress rules; empty means `<data_dir>/acme`. See [The Cache Directory](../bridge/acme-sni.md#the-cache-directory) |
 | `acme_directory_urls` | []string | — | The ACME directories the bridge accepts from the state pull's `bridge.ingress.acme` member; empty accepts any https directory. Every entry must be an absolute https URL, also with ingress disabled. See [The ACME Account](../bridge/acme-sni.md#the-acme-account) |
 
@@ -531,6 +532,8 @@ The keys `relay_listen_port`, `max_relay_sessions` and `session_ttl` are removed
 The keys `acme_enabled`, `acme_allowed_hosts`, `acme_email` and `acme_directory_url` are removed as well: an `acme` ingress rule needs no local switch, and the state pull's `bridge.ingress` block names the hosts, the contact and the directory. A config file that still sets them keeps loading, because unknown keys are ignored, and they have no effect. See [ACME and SNI Routing](../bridge/acme-sni.md#local-configuration).
 
 The six user access keys marked ignored above are replaced by what the control plane delivers in the `bridge.user_access` block. They still parse, so a config file written for an older plexd keeps loading, and they have no default, no validation and no effect. In bridge mode plexd names the ones that are set in one Warn at start, `bridge: config: user access keys are ignored, the control plane delivers providers`, with `keys=[...]`.
+
+The four site-to-site keys marked ignored above, `site_to_site_interface_prefix`, `site_to_site_listen_port`, `max_site_to_site_tunnels` and `tunnel_providers`, are replaced by what the control plane delivers in the `bridge.site_to_site` block. They still parse, so a config file written for an older plexd keeps loading, and they have no default, no validation and no effect; a `tunnel_providers` entry is no longer checked either. In bridge mode plexd names the ones that are set in one Warn at start, `bridge: config: site-to-site keys are ignored, the control plane delivers tunnels`, with `keys=[...]` in that order.
 
 Source: `internal/bridge/config.go`
 
@@ -743,7 +746,8 @@ dns:
 #   relay_enabled: false
 #   ingress_enabled: true    # false opts this host out of public ingress
 #   user_access_enabled: true  # false opts this host out of user access
-#   site_to_site_enabled: false
+#   site_to_site_enabled: true  # false opts this host out of site-to-site tunnels
+#   swanctl_conf_dir: ""     # empty = <run dir>/swanctl; include <dir>/*.conf in /etc/swanctl/swanctl.conf
 #   acme_cache_dir: ""       # empty = <data_dir>/acme
 #   acme_directory_urls: []  # empty accepts any https ACME directory
 ```
