@@ -1481,6 +1481,92 @@ type UserAccessStatusResponse struct {
 }
 
 // ---------------------------------------------------------------------------
+// Site-to-Site Status  PUT /v1/nodes/{node_id}/site-to-site-status
+// ---------------------------------------------------------------------------
+
+// Site-to-site states of a SiteToSiteStatusRequest.
+const (
+	// SiteToSiteStateEnabled marks a bridge whose local configuration serves
+	// the site-to-site tunnels the state pull enables.
+	SiteToSiteStateEnabled = "enabled"
+	// SiteToSiteStateOptedOut marks a bridge whose local configuration,
+	// bridge.site_to_site_enabled: false, rules site-to-site tunnels out: it
+	// serves no tunnel whatever the pull says.
+	SiteToSiteStateOptedOut = "opted_out"
+)
+
+// The health values of a SiteToSiteStatusTunnel.
+const (
+	// SiteToSiteHealthUp marks a tunnel the bridge serves.
+	SiteToSiteHealthUp = "up"
+	// SiteToSiteHealthDown marks a tunnel the bridge does not serve; Reason
+	// says why.
+	SiteToSiteHealthDown = "down"
+)
+
+// MaxSiteToSiteStatusTunnels is the contract's ceiling on the entries of one
+// site-to-site status report. A bridge with more tunnels reports the first
+// ones in the order of the pull.
+const MaxSiteToSiteStatusTunnels = 256
+
+// SiteToSiteStatusRequest is the body of
+// PUT /v1/nodes/{node_id}/site-to-site-status: whether the bridge's local
+// configuration serves site-to-site tunnels, and whether each tunnel of its
+// pull is up and answered by its remote site. The control plane keeps the
+// latest state per node and never ages it, and refuses tunnel creates and
+// updates on the bridge while it reads opted_out. The tunnel entries age
+// after three heartbeat intervals. Each report replaces the tunnel entries
+// of the one before it.
+//
+// A missing, null or unknown state, an unknown member, data after the report,
+// more than MaxSiteToSiteStatusTunnels entries, and an entry with a malformed
+// id or a value outside its member's rule answer
+// 400 malformed_site_to_site_status, and so does an entry that breaks the
+// presence rules of SiteToSiteStatusTunnel. An opted-out report with entries
+// and an id that repeats an earlier entry answer
+// 400 invalid_site_to_site_status. A body over 64 KiB answers
+// 413 site_to_site_status_body_too_large.
+type SiteToSiteStatusRequest struct {
+	// State is one of the SiteToSiteState* constants.
+	State string `json:"state"`
+	// Tunnels holds one entry per reported tunnel, in the order of the pull;
+	// nil omits the member, which the contract reads as no entries.
+	Tunnels []SiteToSiteStatusTunnel `json:"tunnels,omitempty"`
+}
+
+// SiteToSiteStatusTunnel is one entry of tunnels, the control plane's
+// SiteToSiteStatusReportTunnel. Reason is sent exactly when Health is down,
+// Established exactly when it is up, and PublicKey only when it is up: the
+// bridge sends it for a wireguard tunnel that is up and never for an ipsec
+// or openvpn one. omitempty drops an empty member, so a caller leaves every
+// member it must not send empty, and Established nil.
+type SiteToSiteStatusTunnel struct {
+	// ID is the tunnel's id from the pull, a UUID other than the zero UUID.
+	ID string `json:"id"`
+	// Health is one of the SiteToSiteHealth* constants.
+	Health string `json:"health"`
+	// Reason is a token of the grammar ^[a-z][a-z0-9_]{0,62}$.
+	Reason string `json:"reason,omitempty"`
+	// Established says whether the remote site answers: for a wireguard
+	// tunnel the latest handshake with the remote peer is at most 180
+	// seconds old, for an ipsec tunnel the IKE and child security
+	// associations stand, and for an openvpn tunnel the peer is connected.
+	// It is a pointer because false is a value the contract requires on a
+	// tunnel that is up, and an entry that is down must not carry it.
+	Established *bool `json:"established,omitempty"`
+	// PublicKey is the public half of the key of a wireguard tunnel's
+	// interface: 44 characters of standard base64 that decode to 32 bytes.
+	PublicKey string `json:"public_key,omitempty"`
+}
+
+// SiteToSiteStatusResponse is the 200 body of
+// PUT /v1/nodes/{node_id}/site-to-site-status.
+type SiteToSiteStatusResponse struct {
+	// AcceptedAt is the server receive time of the report.
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// ---------------------------------------------------------------------------
 // Policy Status  PUT /v1/nodes/{node_id}/policy-status
 // ---------------------------------------------------------------------------
 
