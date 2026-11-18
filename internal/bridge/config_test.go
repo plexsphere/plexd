@@ -329,8 +329,17 @@ func TestConfig_ApplyDefaults_IngressFields(t *testing.T) {
 	if cfg.MaxIngressRules != DefaultMaxIngressRules {
 		t.Errorf("MaxIngressRules = %d, want %d", cfg.MaxIngressRules, DefaultMaxIngressRules)
 	}
+	if cfg.MaxIngressUDPFlows != 1024 || DefaultMaxIngressUDPFlows != 1024 {
+		t.Errorf("MaxIngressUDPFlows = %d (default %d), want 1024", cfg.MaxIngressUDPFlows, DefaultMaxIngressUDPFlows)
+	}
 	if cfg.IngressDialTimeout != DefaultIngressDialTimeout {
 		t.Errorf("IngressDialTimeout = %v, want %v", cfg.IngressDialTimeout, DefaultIngressDialTimeout)
+	}
+
+	set := Config{MaxIngressUDPFlows: 7}
+	set.ApplyDefaults()
+	if set.MaxIngressUDPFlows != 7 {
+		t.Errorf("MaxIngressUDPFlows = %d after ApplyDefaults, want the set value 7", set.MaxIngressUDPFlows)
 	}
 }
 
@@ -392,6 +401,7 @@ func TestConfig_Validate_IngressValidConfig(t *testing.T) {
 		AccessSubnets:      []string{"10.0.0.0/24"},
 		IngressEnabled:     BoolPtr(true),
 		MaxIngressRules:    20,
+		MaxIngressUDPFlows: 1024,
 		IngressDialTimeout: 10 * time.Second,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -430,12 +440,71 @@ func TestConfig_Validate_IngressInvalidMaxRules(t *testing.T) {
 	}
 }
 
+// The flow bound of a udp rule is checked on a bridge that serves ingress,
+// with the switch unset.
+func TestConfig_Validate_IngressInvalidMaxUDPFlows(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxFlows int
+	}{
+		{"zero flows", 0},
+		{"negative flows", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:            true,
+				AccessInterface:    "eth1",
+				AccessSubnets:      []string{"10.0.0.0/24"},
+				MaxIngressRules:    20,
+				MaxIngressUDPFlows: tt.maxFlows,
+				IngressDialTimeout: 10 * time.Second,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid MaxIngressUDPFlows")
+			}
+			want := "bridge: config: MaxIngressUDPFlows must be positive when ingress is enabled"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+// A bridge that serves no ingress opens no UDP socket, so its flow bound is
+// not checked.
+func TestConfig_Validate_MaxUDPFlowsWithoutIngress(t *testing.T) {
+	for name, cfg := range map[string]Config{
+		"ingress disabled": {
+			Enabled:            true,
+			AccessInterface:    "eth1",
+			AccessSubnets:      []string{"10.0.0.0/24"},
+			IngressEnabled:     BoolPtr(false),
+			MaxIngressRules:    20,
+			MaxIngressUDPFlows: -1,
+			IngressDialTimeout: 10 * time.Second,
+		},
+		"bridge disabled": {
+			Enabled:            false,
+			MaxIngressUDPFlows: -1,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil: the bridge serves no ingress", err)
+			}
+		})
+	}
+}
+
 func TestConfig_Validate_IngressInvalidDialTimeout(t *testing.T) {
 	cfg := Config{
 		Enabled:            true,
 		AccessInterface:    "eth1",
 		AccessSubnets:      []string{"10.0.0.0/24"},
 		MaxIngressRules:    20,
+		MaxIngressUDPFlows: 1024,
 		IngressDialTimeout: 500 * time.Millisecond,
 	}
 	err := cfg.Validate()
@@ -683,6 +752,7 @@ func TestConfig_Validate_ACMEDirectoryURLs_Valid(t *testing.T) {
 				AccessSubnets:      []string{"10.0.0.0/24"},
 				IngressEnabled:     BoolPtr(true),
 				MaxIngressRules:    20,
+				MaxIngressUDPFlows: 1024,
 				IngressDialTimeout: 10 * time.Second,
 				ACMEDirectoryURLs:  urls,
 			}
@@ -702,6 +772,7 @@ func TestConfig_Validate_ACMEDirectoryURLs_Invalid(t *testing.T) {
 			AccessSubnets:      []string{"10.0.0.0/24"},
 			IngressEnabled:     BoolPtr(true),
 			MaxIngressRules:    20,
+			MaxIngressUDPFlows: 1024,
 			IngressDialTimeout: 10 * time.Second,
 		},
 		"ingress disabled": {
