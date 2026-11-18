@@ -102,8 +102,14 @@ func TestUserAccessManager_Setup_Enabled(t *testing.T) {
 	if createCalls[0].Args[0] != "wg-access" {
 		t.Errorf("CreateInterface name = %v, want wg-access", createCalls[0].Args[0])
 	}
-	if createCalls[0].Args[1] != 51822 {
-		t.Errorf("CreateInterface listenPort = %v, want 51822", createCalls[0].Args[1])
+	if key, ok := createCalls[0].Args[1].([]byte); !ok || len(key) != 32 {
+		t.Errorf("CreateInterface privateKey = %v, want 32 bytes", createCalls[0].Args[1])
+	}
+	if createCalls[0].Args[2] != 51822 {
+		t.Errorf("CreateInterface listenPort = %v, want 51822", createCalls[0].Args[2])
+	}
+	if createCalls[0].Args[3] != "" {
+		t.Errorf("CreateInterface address = %v, want an unnumbered interface", createCalls[0].Args[3])
 	}
 
 	// Verify EnableForwarding called.
