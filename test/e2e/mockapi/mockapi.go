@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"math/big"
 	"net"
@@ -88,6 +89,7 @@ type AssertionCounters struct {
 	HandshakeReportCount          int64 `json:"handshake_report_count"`
 	PolicyStatusCount             int64 `json:"policy_status_count"`
 	IngressStatusCount            int64 `json:"ingress_status_count"`
+	UserAccessStatusCount         int64 `json:"user_access_status_count"`
 	EdgePSKCount                  int64 `json:"edge_psk_count"`
 	HookFetchCount                int64 `json:"hook_fetch_count"`
 	InjectEventCount              int64 `json:"inject_event_count"`
@@ -156,6 +158,7 @@ type Server struct {
 	handshakeReportCount           atomic.Int64
 	policyStatusCount              atomic.Int64
 	ingressStatusCount             atomic.Int64
+	userAccessStatusCount          atomic.Int64
 	edgePSKCount                   atomic.Int64
 	hookFetchCount                 atomic.Int64
 	injectEventCount               atomic.Int64
@@ -354,6 +357,7 @@ func (s *Server) Assertions() AssertionCounters {
 		HandshakeReportCount:           s.handshakeReportCount.Load(),
 		PolicyStatusCount:              s.policyStatusCount.Load(),
 		IngressStatusCount:             s.ingressStatusCount.Load(),
+		UserAccessStatusCount:          s.userAccessStatusCount.Load(),
 		EdgePSKCount:                   s.edgePSKCount.Load(),
 		HookFetchCount:                 s.hookFetchCount.Load(),
 		InjectEventCount:               s.injectEventCount.Load(),
@@ -666,6 +670,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/policy-status", s.handlePolicyStatus)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/ingress-status", s.handleIngressStatus)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/user-access-status", s.handleUserAccessStatus)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/hooks/{name}/versions/{version}", s.handleHookVersion)
 
@@ -711,6 +716,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/policy-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/ingress-status", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/user-access-status", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/hooks/{name}/versions/{version}", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
@@ -3911,6 +3917,287 @@ func checkIngressStatusRulePresence(e ingressStatusRuleEntry) string {
 		}
 	}
 	return ""
+}
+
+// The contract's numbers for a user access status report, the mock's own
+// copies: the 64 KiB body cap, at most 256 provider entries, and the range
+// 0..1024 of an entry's connected_devices.
+const (
+	maxUserAccessStatusBody       = 64 << 10
+	maxUserAccessStatusProviders  = 256
+	maxUserAccessConnectedDevices = 1024
+)
+
+// The values of a user access status report's state and of an entry's
+// health, the mock's own copies of the contract's strings.
+const (
+	userAccessStateEnabled  = "enabled"
+	userAccessStateOptedOut = "opted_out"
+	userAccessHealthUp      = "up"
+	userAccessHealthDown    = "down"
+)
+
+// userAccessStatusDecodeDetail is the one detail of a body the JSON decoder
+// refuses as a whole: one that is no JSON object, carries an unknown member
+// of the report or data after it, or a providers that is no array. It is the
+// control plane's sentence and names no part of the body, which the
+// decoder's own message can quote.
+const userAccessStatusDecodeDetail = "request body is not a valid user access status report; it carries only state and providers"
+
+// handleUserAccessStatus handles PUT /v1/nodes/{id}/user-access-status, the
+// bridge's report of whether its local configuration serves user access and
+// of the health of each user access provider of its pull. It enforces the
+// contract's gates in order: the 64 KiB body cap (413
+// user_access_status_body_too_large), the strict decode of
+// decodeUserAccessStatus, which answers 400 malformed_user_access_status,
+// and the rules of checkUserAccessStatus, which answer 400
+// malformed_user_access_status or invalid_user_access_status. The body is
+// captured under user-access-status as it is read, before the decode and the
+// rules judge it, so a refused report can be read back too; a body over the
+// cap is not captured. The 200 answer carries accepted_at.
+// Every answer of the handler carries Cache-Control: no-store, as the
+// contract asks. The counter increments only on the 200. As for
+// ingress-status, the bearer gate is the only check of the node: the path id
+// is not compared with it.
+//
+// The decode target is mock-local rather than the agent's request type, for
+// the reason handleIngressStatus gives: a pointer keeps a missing or null
+// member missing, so an agent that drops one is refused with the detail the
+// control plane writes for it.
+func (s *Server) handleUserAccessStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, maxUserAccessStatusBody)
+	// The cap lies below maxCapturedBody, so the read of captureBody reaches
+	// the byte that trips the MaxBytesReader, and no drain is needed to tell a
+	// body at the cap from a longer one.
+	data, err := s.captureBody("user-access-status", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "user_access_status_body_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte user access status cap", maxUserAccessStatusBody))
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_user_access_status", "invalid request body")
+		return
+	}
+
+	req, ok := decodeUserAccessStatus(data)
+	if !ok {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_user_access_status", userAccessStatusDecodeDetail)
+		return
+	}
+	if code, detail := checkUserAccessStatus(req); code != "" {
+		writeProblem(w, r, http.StatusBadRequest, code, detail)
+		return
+	}
+
+	s.userAccessStatusCount.Add(1)
+	writeJSON(w, http.StatusOK, userAccessStatusResponse{AcceptedAt: time.Now().UTC()})
+}
+
+// userAccessStatusResponse is the 200 body of
+// PUT /v1/nodes/{id}/user-access-status, the mock's own copy of the
+// contract's UserAccessStatusReportResponse.
+type userAccessStatusResponse struct {
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// userAccessStatusBody is the mock's reading of a user access status report.
+// State is a pointer, so a missing or null state decodes to nil and reads as
+// missing, as the contract has it. The provider entries stay undecoded until
+// checkUserAccessStatus decodes each one on its own, so a detail names the
+// entry by its index; a null providers decodes to nil and reads as no
+// entries.
+type userAccessStatusBody struct {
+	State     *string            `json:"state"`
+	Providers *[]json.RawMessage `json:"providers"`
+}
+
+// userAccessStatusEntry is the mock's reading of one provider entry. Every
+// member is a pointer, so the presence rules can tell an omitted member from
+// a sent one; a member sent as null reads as omitted, as on the control
+// plane.
+type userAccessStatusEntry struct {
+	ID               *string `json:"id"`
+	Health           *string `json:"health"`
+	Reason           *string `json:"reason"`
+	PublicKey        *string `json:"public_key"`
+	ConnectedDevices *int64  `json:"connected_devices"`
+}
+
+// userAccessStatusEntryMembers maps each member of a provider entry onto the
+// sentence that refuses its value, without the entry's index. A value
+// outside the member's rule and a value of the wrong JSON type earn the same
+// sentence. A name outside the map is a member the contract does not define.
+var userAccessStatusEntryMembers = map[string]string{
+	"id":                ".id is not a provider id",
+	"health":            ".health is not one of up and down",
+	"reason":            ".reason is not a reason token",
+	"public_key":        ".public_key is not a WireGuard public key of 44 characters of standard base64",
+	"connected_devices": fmt.Sprintf(".connected_devices is not between 0 and %d", maxUserAccessConnectedDevices),
+}
+
+// decodeUserAccessStatus strict-decodes the body as exactly one user access
+// status report: a JSON object without unknown members and with nothing
+// after it. It reports false for a body that is no such object. A null body
+// decodes to a report without members, which checkUserAccessStatus refuses
+// for its missing state, as the control plane does.
+func decodeUserAccessStatus(data []byte) (userAccessStatusBody, bool) {
+	var req userAccessStatusBody
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return userAccessStatusBody{}, false
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return userAccessStatusBody{}, false
+	}
+	return req, true
+}
+
+// checkUserAccessStatus runs the contract's rules over a decoded report and
+// returns the code and detail of the first breach, or two empty strings when
+// the report is valid. The shape rules, over the state and over every
+// provider entry, the presence rules of an entry's health included, answer
+// malformed_user_access_status; then the consistency rules, an opted-out
+// report with entries and an id that repeats an earlier entry, answer
+// invalid_user_access_status. Every entry passes the shape rules first, so a
+// report that breaks both kinds answers malformed_user_access_status. The
+// details are the control plane's sentences
+// (plexsphere/plexsphere@4935e06 internal/transport/http/v1/useraccessstatus/handler.go),
+// and a detail never quotes an id, a reason or a key of the body. The mock
+// accepts canonical ids only (api.ValidIngressRuleID, the check the agent's
+// provider ids pass), which is narrower than the control plane's parser and
+// wide enough for what plexd sends. A reason is judged by
+// api.ValidIngressReason, whose grammar, ^[a-z][a-z0-9_]{0,62}$, is the one
+// the contract gives a user access reason.
+func checkUserAccessStatus(req userAccessStatusBody) (code, detail string) {
+	const malformed, invalid = "malformed_user_access_status", "invalid_user_access_status"
+	switch {
+	case req.State == nil:
+		return malformed, "state is missing"
+	case *req.State != userAccessStateEnabled && *req.State != userAccessStateOptedOut:
+		return malformed, "state is not one of enabled and opted_out"
+	case req.Providers == nil:
+		return "", ""
+	}
+	raw := *req.Providers
+	if len(raw) > maxUserAccessStatusProviders {
+		return malformed, fmt.Sprintf("providers carries more than %d entries", maxUserAccessStatusProviders)
+	}
+	entries := make([]userAccessStatusEntry, len(raw))
+	for i, entry := range raw {
+		var detail string
+		if entries[i], detail = decodeUserAccessStatusEntry(entry); detail == "" {
+			detail = checkUserAccessStatusEntry(entries[i])
+		}
+		if detail != "" {
+			return malformed, fmt.Sprintf("providers[%d]%s", i, detail)
+		}
+	}
+
+	if *req.State == userAccessStateOptedOut && len(entries) > 0 {
+		return invalid, "an opted-out bridge reports no providers"
+	}
+	first := make(map[string]int, len(entries))
+	for i, e := range entries {
+		// Two spellings of one UUID repeat each other.
+		id := strings.ToLower(*e.ID)
+		if j, seen := first[id]; seen {
+			return invalid, fmt.Sprintf("providers[%d].id repeats providers[%d].id", i, j)
+		}
+		first[id] = i
+	}
+	return "", ""
+}
+
+// decodeUserAccessStatusEntry decodes one provider entry and returns it, or
+// the detail naming what is wrong with it, without the entry's index: an
+// entry that is no JSON object, a member the contract does not define, or a
+// member of the wrong JSON type. Members match by their exact name. An
+// unknown member is named only when its name is a token of the reason
+// grammar, so nothing of the body beyond a short identifier reaches the
+// detail; of several, the first in sorted order is named, so one body always
+// earns one detail. A null entry decodes as an entry without members, which
+// checkUserAccessStatusEntry refuses for its missing id.
+func decodeUserAccessStatusEntry(raw json.RawMessage) (userAccessStatusEntry, string) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return userAccessStatusEntry{}, " is not an object"
+	}
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		if _, known := userAccessStatusEntryMembers[name]; known {
+			continue
+		}
+		if api.ValidIngressReason(name) {
+			return userAccessStatusEntry{}, " carries the unknown member " + name
+		}
+		return userAccessStatusEntry{}, " carries a member UserAccessStatusReportProvider does not define"
+	}
+	var e userAccessStatusEntry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			if detail, known := userAccessStatusEntryMembers[typeErr.Field]; known {
+				return userAccessStatusEntry{}, detail
+			}
+		}
+		return userAccessStatusEntry{}, " is not a valid provider entry"
+	}
+	return e, ""
+}
+
+// checkUserAccessStatusEntry applies the member rules of one provider entry
+// in the order the contract lists the members, then the presence rules of
+// its health, and returns the detail of the first broken one, without the
+// entry's index, or "". A down entry carries a reason and neither a
+// public_key nor a connected_devices; an up entry carries no reason, and
+// public_key and connected_devices are optional on it, since a vendor
+// provider that is up sends neither.
+func checkUserAccessStatusEntry(e userAccessStatusEntry) string {
+	members := userAccessStatusEntryMembers
+	switch {
+	case e.ID == nil:
+		return ".id is missing"
+	case !api.ValidIngressRuleID(*e.ID):
+		return members["id"]
+	case e.Health == nil:
+		return ".health is missing"
+	case *e.Health != userAccessHealthUp && *e.Health != userAccessHealthDown:
+		return members["health"]
+	case e.Reason != nil && !api.ValidIngressReason(*e.Reason):
+		return members["reason"]
+	case e.PublicKey != nil && !validUserAccessPublicKey(*e.PublicKey):
+		return members["public_key"]
+	case e.ConnectedDevices != nil && (*e.ConnectedDevices < 0 || *e.ConnectedDevices > maxUserAccessConnectedDevices):
+		return members["connected_devices"]
+	}
+	down := *e.Health == userAccessHealthDown
+	switch {
+	case down && e.Reason == nil:
+		return ".reason is required while health is down"
+	case down && e.PublicKey != nil:
+		return ".public_key is set while health is down"
+	case down && e.ConnectedDevices != nil:
+		return ".connected_devices is set while health is down"
+	case !down && e.Reason != nil:
+		return ".reason is set while health is up"
+	}
+	return ""
+}
+
+// validUserAccessPublicKey reports whether s is a WireGuard public key as the
+// contract spells it: 44 characters of standard base64 (pubKeyRe) that
+// decode to 32 bytes. The strict decode also refuses a last character whose
+// unused low bits are set, so one key has one spelling, as on the control
+// plane.
+func validUserAccessPublicKey(s string) bool {
+	if !pubKeyRe.MatchString(s) {
+		return false
+	}
+	key, err := base64.StdEncoding.Strict().DecodeString(s)
+	return err == nil && len(key) == 32
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state

@@ -2014,6 +2014,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/ingress-status", ingressStatusBody(t, api.IngressStateEnabled))
 	resp.Body.Close()
+	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/user-access-status", userAccessStatusContractExample)
+	resp.Body.Close()
 	// The hook version fetch serves only a version the hooks block lists.
 	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
 	resp = doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1), "")
@@ -2089,6 +2091,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.IngressStatusCount != 1 {
 		t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
 	}
+	if a.UserAccessStatusCount != 1 {
+		t.Errorf("user_access_status_count = %d, want 1", a.UserAccessStatusCount)
+	}
 	if a.HookFetchCount != 1 {
 		t.Errorf("hook_fetch_count = %d, want 1", a.HookFetchCount)
 	}
@@ -2144,6 +2149,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
 		{http.MethodPut, "/v1/nodes/node-1/policy-status", policyStatusBody(t, fixturePolicyReport())},
 		{http.MethodPut, "/v1/nodes/node-1/ingress-status", ingressStatusBody(t, api.IngressStateOptedOut)},
+		{http.MethodPut, "/v1/nodes/node-1/user-access-status", userAccessStatusContractExample},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/peers/" + testFixturePeerB1 + "/psk", ""},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/hooks/conc-hook/versions/1", ""},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
@@ -6420,6 +6426,503 @@ func TestIngressStatus_RequiresBearerEnvelope(t *testing.T) {
 			}
 			if a.IngressStatusCount != 0 {
 				t.Errorf("ingress_status_count = %d, want 0", a.IngressStatusCount)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// User access status report endpoint (issue #211)
+// ---------------------------------------------------------------------------
+
+// userAccessStatusPath is PUT /v1/nodes/{mockNode}/user-access-status.
+const userAccessStatusPath = "/v1/nodes/" + testMockNodeID + "/user-access-status"
+
+// userAccessStatusContractExample is the two-entry example of the agent
+// contract (plexsphere/plexsphere@4935e06 docs/reference/api/plexd-agent-contract.md,
+// "User access status").
+const userAccessStatusContractExample = `{
+  "state": "enabled",
+  "providers": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", "health": "up",
+      "public_key": "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=", "connected_devices": 1 },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", "health": "down", "reason": "auth_secret_not_listed" }
+  ]
+}`
+
+// userAccessStatusKey is the public key of the contract's example, a valid
+// WireGuard public key in standard base64.
+const userAccessStatusKey = "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M="
+
+// userAccessStatusProvider is one provider entry in the shape plexd sends it:
+// reason only while down, public_key and connected_devices only for a
+// wireguard provider that is up, and a connected_devices of 0 sent as 0.
+type userAccessStatusProvider struct {
+	ID               string `json:"id"`
+	Health           string `json:"health"`
+	Reason           string `json:"reason,omitempty"`
+	PublicKey        string `json:"public_key,omitempty"`
+	ConnectedDevices *int   `json:"connected_devices,omitempty"`
+}
+
+// userAccessStatusBody renders a report of state and entries, without a
+// providers member when there are no entries.
+func userAccessStatusBody(t *testing.T, state string, entries []userAccessStatusProvider) string {
+	t.Helper()
+	data, err := json.Marshal(struct {
+		State     string                     `json:"state"`
+		Providers []userAccessStatusProvider `json:"providers,omitempty"`
+	}{state, entries})
+	if err != nil {
+		t.Fatalf("marshal user access status report: %v", err)
+	}
+	return string(data)
+}
+
+// userAccessStatusProviderID returns a canonical provider id for the n-th
+// entry.
+func userAccessStatusProviderID(n int) string {
+	return fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", n+1)
+}
+
+// putUserAccessStatus sends body to the user access status route and returns
+// the answer.
+func putUserAccessStatus(t *testing.T, baseURL, body string) *http.Response {
+	t.Helper()
+	return doRequest(t, http.MethodPut, baseURL+userAccessStatusPath, body)
+}
+
+// decodeUserAccessStatusReceipt strict-decodes a 200 user access status
+// answer and returns its accepted_at.
+func decodeUserAccessStatusReceipt(t *testing.T, resp *http.Response) time.Time {
+	t.Helper()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+	}
+	var receipt struct {
+		AcceptedAt *time.Time `json:"accepted_at"`
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&receipt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	if receipt.AcceptedAt == nil {
+		t.Fatal("receipt carries no accepted_at")
+	}
+	return *receipt.AcceptedAt
+}
+
+// putUserAccessStatusProblem sends body to a fresh mock and requires a 400
+// problem with code and detail, the no-store directive and the route as its
+// instance, and that the refusal was not counted.
+func putUserAccessStatusProblem(t *testing.T, body, code, detail string) {
+	t.Helper()
+	_, ts := newTestServer(t)
+	resp := putUserAccessStatus(t, ts.URL, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, got)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != code || problem["detail"] != detail {
+		t.Errorf("problem = %v %q, want %s %q", problem["code"], problem["detail"], code, detail)
+	}
+	if problem["instance"] != userAccessStatusPath {
+		t.Errorf("instance = %v, want %q", problem["instance"], userAccessStatusPath)
+	}
+	if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 0 {
+		t.Errorf("user_access_status_count = %d after a refusal, want 0", a.UserAccessStatusCount)
+	}
+}
+
+// TestUserAccessStatus_AcceptsTheContractExample sends the contract's example
+// as it is printed: a 200 with a fresh accepted_at in UTC, the body captured
+// as sent, and one count.
+func TestUserAccessStatus_AcceptsTheContractExample(t *testing.T) {
+	_, ts := newTestServer(t)
+	before := time.Now().UTC()
+	resp := putUserAccessStatus(t, ts.URL, userAccessStatusContractExample)
+	defer resp.Body.Close()
+	acceptedAt := decodeUserAccessStatusReceipt(t, resp)
+	after := time.Now().UTC()
+
+	if acceptedAt.Before(before) || acceptedAt.After(after) {
+		t.Errorf("accepted_at = %v, want between %v and %v", acceptedAt, before, after)
+	}
+	if acceptedAt.Location() != time.UTC {
+		t.Errorf("accepted_at = %v, want UTC", acceptedAt)
+	}
+	if got := string(getCapturedBody(t, ts.URL, "user-access-status")); got != userAccessStatusContractExample {
+		t.Errorf("captured body = %s, want the example as sent", got)
+	}
+	if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 1 {
+		t.Errorf("user_access_status_count = %d, want 1", a.UserAccessStatusCount)
+	}
+}
+
+// TestUserAccessStatus_AcceptsEveryValidShape sends one report of each shape
+// the contract allows: both states without entries, an absent, null and
+// empty providers alike, the edges of connected_devices, an up entry without
+// public_key and connected_devices as a vendor provider sends it, members
+// sent as null where omitting them is allowed, and an id in upper case.
+// Each one is answered 200 and counted.
+func TestUserAccessStatus_AcceptsEveryValidShape(t *testing.T) {
+	zero, ceiling := 0, 1024
+	const id = `"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"`
+	tests := []struct {
+		name, body string
+	}{
+		{"enabled without providers", `{"state":"enabled"}`},
+		{"enabled with null providers", `{"state":"enabled","providers":null}`},
+		{"enabled with no entry", `{"state":"enabled","providers":[]}`},
+		{"opted out", `{"state":"opted_out"}`},
+		{"opted out with null providers", `{"state":"opted_out","providers":null}`},
+		{"opted out with no entry", `{"state":"opted_out","providers":[]}`},
+		{"no device connected", userAccessStatusBody(t, "enabled", []userAccessStatusProvider{
+			{ID: userAccessStatusProviderID(0), Health: "up", PublicKey: userAccessStatusKey, ConnectedDevices: &zero},
+		})},
+		{"1024 devices connected", userAccessStatusBody(t, "enabled", []userAccessStatusProvider{
+			{ID: userAccessStatusProviderID(0), Health: "up", PublicKey: userAccessStatusKey, ConnectedDevices: &ceiling},
+		})},
+		{"a vendor provider that is up", userAccessStatusBody(t, "enabled", []userAccessStatusProvider{
+			{ID: userAccessStatusProviderID(0), Health: "up"},
+		})},
+		{"every kind of entry", userAccessStatusBody(t, "enabled", []userAccessStatusProvider{
+			{ID: userAccessStatusProviderID(0), Health: "up", PublicKey: userAccessStatusKey, ConnectedDevices: &zero},
+			{ID: userAccessStatusProviderID(1), Health: "down", Reason: "bind_failed"},
+			{ID: userAccessStatusProviderID(2), Health: "up"},
+			{ID: userAccessStatusProviderID(3), Health: "down", Reason: "kind_not_served"},
+		})},
+		{"a reason of 63 characters", userAccessStatusBody(t, "enabled", []userAccessStatusProvider{
+			{ID: userAccessStatusProviderID(0), Health: "down", Reason: "r" + strings.Repeat("_9", 31)},
+		})},
+		{"an up entry with a null reason", `{"state":"enabled","providers":[{` + id + `,"health":"up","reason":null}]}`},
+		{"a down entry with null up members", `{"state":"enabled","providers":[{` + id + `,"health":"down","reason":"join_failed","public_key":null,"connected_devices":null}]}`},
+		{"an id in upper case", `{"state":"enabled","providers":[{"id":"0190A8B8-A0C0-7A0A-8A0A-A0A0A0A0A0E1","health":"up"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := putUserAccessStatus(t, ts.URL, tt.body)
+			defer resp.Body.Close()
+			decodeUserAccessStatusReceipt(t, resp)
+			if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 1 {
+				t.Errorf("user_access_status_count = %d, want 1", a.UserAccessStatusCount)
+			}
+		})
+	}
+}
+
+// TestUserAccessStatus_DenialTaxonomy walks the refusals of the report as a
+// whole, each malformed_user_access_status. What the JSON decoder refuses
+// carries the control plane's one fixed detail, which quotes nothing of the
+// body; a missing or null state, a null body among them, and a state outside
+// the two carry the contract's sentences.
+func TestUserAccessStatus_DenialTaxonomy(t *testing.T) {
+	const (
+		decodeDetail  = "request body is not a valid user access status report; it carries only state and providers"
+		missingDetail = "state is missing"
+		outsideDetail = "state is not one of enabled and opted_out"
+	)
+	tests := []struct {
+		name, body, detail string
+	}{
+		{"empty body", "", decodeDetail},
+		{"empty object", `{}`, missingDetail},
+		{"state null", `{"state":null}`, missingDetail},
+		{"providers without state", `{"providers":[]}`, missingDetail},
+		{"null body", "null", missingDetail},
+		{"state outside the two", `{"state":"paused"}`, outsideDetail},
+		{"empty state", `{"state":""}`, outsideDetail},
+		{"state in another case", `{"state":"Enabled"}`, outsideDetail},
+		{"an unknown member", `{"state":"enabled","provider":[]}`, decodeDetail},
+		{"providers of the wrong type", `{"state":"enabled","providers":{}}`, decodeDetail},
+		{"state of the wrong type", `{"state":true}`, decodeDetail},
+		{"data after the report", `{"state":"enabled"}{}`, decodeDetail},
+		{"not json", "not-json", decodeDetail},
+		{"an array", `[{"state":"enabled"}]`, decodeDetail},
+		{"a string", `"enabled"`, decodeDetail},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putUserAccessStatusProblem(t, tt.body, "malformed_user_access_status", tt.detail)
+		})
+	}
+}
+
+// TestUserAccessStatus_MalformedProviderEntries refuses an entry whose member
+// breaks its own rule or the presence rules of its health with
+// malformed_user_access_status and a detail that names the entry by index and
+// the member, and never a value of the body.
+func TestUserAccessStatus_MalformedProviderEntries(t *testing.T) {
+	const id = `"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"`
+	const key = `"public_key":"` + userAccessStatusKey + `"`
+	const keyDetail = "providers[0].public_key is not a WireGuard public key of 44 characters of standard base64"
+	const devicesDetail = "providers[0].connected_devices is not between 0 and 1024"
+	tests := []struct {
+		name, entry, detail string
+	}{
+		{"no id", `{"health":"up"}`, "providers[0].id is missing"},
+		{"a null id", `{"id":null,"health":"up"}`, "providers[0].id is missing"},
+		{"id x", `{"id":"x","health":"up"}`, "providers[0].id is not a provider id"},
+		{"the zero UUID", `{"id":"00000000-0000-0000-0000-000000000000","health":"up"}`, "providers[0].id is not a provider id"},
+		{"an id that is a number", `{"id":7,"health":"up"}`, "providers[0].id is not a provider id"},
+		{"no health", `{` + id + `}`, "providers[0].health is missing"},
+		{"health outside the two", `{` + id + `,"health":"degraded"}`, "providers[0].health is not one of up and down"},
+		{"health in another case", `{` + id + `,"health":"Up"}`, "providers[0].health is not one of up and down"},
+		{"a reason with a space", `{` + id + `,"health":"down","reason":"Auth Secret"}`, "providers[0].reason is not a reason token"},
+		{"a reason of 64 characters", `{` + id + `,"health":"down","reason":"` + strings.Repeat("r", 64) + `"}`, "providers[0].reason is not a reason token"},
+		{"a key of 43 characters", `{` + id + `,"health":"up","public_key":"` + userAccessStatusKey[1:] + `"}`, keyDetail},
+		{"a key in the URL alphabet", `{` + id + `,"health":"up","public_key":"` + strings.Replace(userAccessStatusKey, "2", "-", 1) + `"}`, keyDetail},
+		{"a key with set unused bits", `{` + id + `,"health":"up","public_key":"` + strings.Replace(userAccessStatusKey, "M=", "N=", 1) + `"}`, keyDetail},
+		{"a key that is a number", `{` + id + `,"health":"up","public_key":1}`, keyDetail},
+		{"1025 devices connected", `{` + id + `,"health":"up",` + key + `,"connected_devices":1025}`, devicesDetail},
+		{"a negative device count", `{` + id + `,"health":"up",` + key + `,"connected_devices":-1}`, devicesDetail},
+		{"a fractional device count", `{` + id + `,"health":"up",` + key + `,"connected_devices":1.5}`, devicesDetail},
+		{"a device count that is a string", `{` + id + `,"health":"up",` + key + `,"connected_devices":"1"}`, devicesDetail},
+		{"a down entry without reason", `{` + id + `,"health":"down"}`, "providers[0].reason is required while health is down"},
+		{"a down entry with a null reason", `{` + id + `,"health":"down","reason":null}`, "providers[0].reason is required while health is down"},
+		{"a down entry with a key", `{` + id + `,"health":"down","reason":"bind_failed",` + key + `}`, "providers[0].public_key is set while health is down"},
+		{"a down entry with a device count", `{` + id + `,"health":"down","reason":"bind_failed","connected_devices":0}`, "providers[0].connected_devices is set while health is down"},
+		{"an up entry with reason", `{` + id + `,"health":"up","reason":"bind_failed"}`, "providers[0].reason is set while health is up"},
+		{"an unknown member", `{` + id + `,"health":"up","pid":4242}`, "providers[0] carries the unknown member pid"},
+		{"two unknown members", `{` + id + `,"health":"up","zone":"a","kind":"wireguard"}`, "providers[0] carries the unknown member kind"},
+		{"an unknown member outside the grammar", `{` + id + `,"health":"up","Pid":4242}`, "providers[0] carries a member UserAccessStatusReportProvider does not define"},
+		{"a member in another case", `{"ID":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"up"}`, "providers[0] carries a member UserAccessStatusReportProvider does not define"},
+		{"an entry that is a string", `"x"`, "providers[0] is not an object"},
+		{"an entry that is an array", `[]`, "providers[0] is not an object"},
+		{"a null entry", `null`, "providers[0].id is missing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putUserAccessStatusProblem(t, `{"state":"enabled","providers":[`+tt.entry+`]}`, "malformed_user_access_status", tt.detail)
+		})
+	}
+
+	// The contract's own example of a detail: the fourth entry is named by
+	// its index once the three before it pass.
+	t.Run("the entry is named by its index", func(t *testing.T) {
+		zero := 0
+		entries := []userAccessStatusProvider{
+			{ID: userAccessStatusProviderID(0), Health: "up", PublicKey: userAccessStatusKey, ConnectedDevices: &zero},
+			{ID: userAccessStatusProviderID(1), Health: "down", Reason: "bind_failed"},
+			{ID: userAccessStatusProviderID(2), Health: "up"},
+			{ID: userAccessStatusProviderID(3), Health: "down"},
+		}
+		putUserAccessStatusProblem(t, userAccessStatusBody(t, "enabled", entries),
+			"malformed_user_access_status", "providers[3].reason is required while health is down")
+	})
+}
+
+// TestUserAccessStatus_InvalidReports refuses a report whose entries are each
+// well formed but disagree with the state or with each other with
+// invalid_user_access_status. An entry that is malformed as well answers
+// malformed_user_access_status, since every entry passes the shape rules
+// before the consistency rules run.
+func TestUserAccessStatus_InvalidReports(t *testing.T) {
+	const (
+		a      = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"down","reason":"bind_failed"}`
+		aUpper = `{"id":"0190A8B8-A0C0-7A0A-8A0A-A0A0A0A0A0E1","health":"up"}`
+		b      = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","health":"up"}`
+		bad    = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"down"}`
+	)
+	tests := []struct {
+		name, body, code, detail string
+	}{
+		{"an opted-out bridge with an entry", `{"state":"opted_out","providers":[` + a + `]}`, "invalid_user_access_status", "an opted-out bridge reports no providers"},
+		{"two entries with one id", `{"state":"enabled","providers":[` + a + `,` + a + `]}`, "invalid_user_access_status", "providers[1].id repeats providers[0].id"},
+		{"one id in two spellings", `{"state":"enabled","providers":[` + a + `,` + aUpper + `]}`, "invalid_user_access_status", "providers[1].id repeats providers[0].id"},
+		{"a repeat after another entry", `{"state":"enabled","providers":[` + a + `,` + b + `,` + a + `]}`, "invalid_user_access_status", "providers[2].id repeats providers[0].id"},
+		{"an opted-out bridge with a malformed entry", `{"state":"opted_out","providers":[` + bad + `]}`, "malformed_user_access_status", "providers[0].reason is required while health is down"},
+		{"a repeat that is malformed", `{"state":"enabled","providers":[` + a + `,` + bad + `]}`, "malformed_user_access_status", "providers[1].reason is required while health is down"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putUserAccessStatusProblem(t, tt.body, tt.code, tt.detail)
+		})
+	}
+}
+
+// TestUserAccessStatus_ProviderCeiling accepts 256 entries of the longest
+// form, which fit the 64 KiB cap, and refuses a 257th entry.
+func TestUserAccessStatus_ProviderCeiling(t *testing.T) {
+	longest := func(n int) []userAccessStatusProvider {
+		ceiling := 1024
+		entries := make([]userAccessStatusProvider, n)
+		for i := range entries {
+			entries[i] = userAccessStatusProvider{ID: userAccessStatusProviderID(i), Health: "up", PublicKey: userAccessStatusKey, ConnectedDevices: &ceiling}
+		}
+		return entries
+	}
+
+	t.Run("256 entries are accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		body := userAccessStatusBody(t, "enabled", longest(256))
+		if len(body) > 64<<10 {
+			t.Fatalf("256 entries take %d bytes, more than the 64 KiB cap", len(body))
+		}
+		resp := putUserAccessStatus(t, ts.URL, body)
+		defer resp.Body.Close()
+		decodeUserAccessStatusReceipt(t, resp)
+		if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 1 {
+			t.Errorf("user_access_status_count = %d, want 1", a.UserAccessStatusCount)
+		}
+	})
+
+	t.Run("257 entries are refused", func(t *testing.T) {
+		putUserAccessStatusProblem(t, userAccessStatusBody(t, "enabled", longest(257)),
+			"malformed_user_access_status", "providers carries more than 256 entries")
+	})
+}
+
+// The 64 KiB cap is inclusive and exact, and it is judged before the decode.
+func TestUserAccessStatus_BodyCap(t *testing.T) {
+	const capBytes = 64 << 10
+	padded := func(n int) string {
+		body := userAccessStatusContractExample
+		return body + strings.Repeat(" ", n-len(body))
+	}
+
+	t.Run("exactly 64 KiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := putUserAccessStatus(t, ts.URL, padded(capBytes))
+		defer resp.Body.Close()
+		decodeUserAccessStatusReceipt(t, resp)
+		if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 1 {
+			t.Errorf("user_access_status_count = %d, want 1", a.UserAccessStatusCount)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{"one byte more is refused", padded(capBytes + 1)},
+		{"the cap is judged before the decode", strings.Repeat("x", capBytes+1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := putUserAccessStatus(t, ts.URL, tt.body)
+			defer resp.Body.Close()
+			if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+			}
+			assertProblem(t, resp, http.StatusRequestEntityTooLarge, "user_access_status_body_too_large")
+			if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 0 {
+				t.Errorf("user_access_status_count = %d, want 0", a.UserAccessStatusCount)
+			}
+		})
+	}
+}
+
+// The body is captured under user-access-status before it is judged, so the
+// last report reads back whether the mock accepted it or not. Before any
+// report there is nothing to read.
+func TestUserAccessStatus_CapturesRequestBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	none, err := http.Get(ts.URL + "/test/last-request/user-access-status")
+	if err != nil {
+		t.Fatalf("GET last-request/user-access-status: %v", err)
+	}
+	none.Body.Close()
+	if none.StatusCode != http.StatusNotFound {
+		t.Errorf("before any report: status = %d, want %d", none.StatusCode, http.StatusNotFound)
+	}
+
+	for _, tt := range []struct {
+		body string
+		want int
+	}{
+		{userAccessStatusContractExample, http.StatusOK},
+		{`{"state":"opted_out"}`, http.StatusOK},
+		{`{"state":"paused"}`, http.StatusBadRequest},
+	} {
+		resp := putUserAccessStatus(t, ts.URL, tt.body)
+		resp.Body.Close()
+		if resp.StatusCode != tt.want {
+			t.Errorf("PUT %s: status = %d, want %d", tt.body, resp.StatusCode, tt.want)
+		}
+		if got := string(getCapturedBody(t, ts.URL, "user-access-status")); got != tt.body {
+			t.Errorf("captured body = %s, want %s", got, tt.body)
+		}
+	}
+}
+
+func TestUserAccessStatus_WrongMethod_Returns405(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, method, ts.URL+userAccessStatusPath, userAccessStatusContractExample)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+			}
+			if a := getAssertions(t, ts.URL); a.UserAccessStatusCount != 0 {
+				t.Errorf("user_access_status_count = %d, want 0", a.UserAccessStatusCount)
+			}
+		})
+	}
+}
+
+// The route sits behind the bearer-envelope gate like every node route: a
+// report without the envelope, or with any other credential, is a 401
+// unauthorized that reaches neither the handler nor its counter.
+func TestUserAccessStatus_RequiresBearerEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"no header", ""},
+		{"wrong credential", "Bearer wrong-token-value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockapi.New()
+			ts := httptest.NewServer(srv.Handler())
+			t.Cleanup(ts.Close)
+
+			req, err := http.NewRequest(http.MethodPut, ts.URL+userAccessStatusPath, strings.NewReader(userAccessStatusContractExample))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("PUT user-access-status: %v", err)
+			}
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusUnauthorized, "unauthorized")
+
+			a := srv.Assertions()
+			if a.UnauthorizedCount != 1 {
+				t.Errorf("unauthorized_count = %d, want 1", a.UnauthorizedCount)
+			}
+			if a.UserAccessStatusCount != 0 {
+				t.Errorf("user_access_status_count = %d, want 0", a.UserAccessStatusCount)
 			}
 		})
 	}
