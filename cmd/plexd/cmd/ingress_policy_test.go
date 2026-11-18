@@ -2,19 +2,36 @@ package cmd
 
 import (
 	"net/netip"
+	"slices"
 	"syscall"
 	"testing"
 )
 
-// fakeDialAdmitter answers AdmitsTCPDial with admitted and enforced and
-// counts the calls.
+// admitCall is one question a fakeDialAdmitter was asked: the method and its
+// arguments.
+type admitCall struct {
+	method string // "AdmitsTCPDial" or "AdmitsUDPDial"
+	src    netip.Addr
+	dst    netip.AddrPort
+}
+
+// fakeDialAdmitter answers AdmitsTCPDial and AdmitsUDPDial with admitted and
+// enforced, counts the calls and records each one.
 type fakeDialAdmitter struct {
 	admitted, enforced bool
 	calls              int
+	asked              []admitCall
 }
 
-func (f *fakeDialAdmitter) AdmitsTCPDial(netip.Addr, netip.AddrPort) (bool, bool) {
+func (f *fakeDialAdmitter) AdmitsTCPDial(src netip.Addr, dst netip.AddrPort) (bool, bool) {
 	f.calls++
+	f.asked = append(f.asked, admitCall{method: "AdmitsTCPDial", src: src, dst: dst})
+	return f.admitted, f.enforced
+}
+
+func (f *fakeDialAdmitter) AdmitsUDPDial(src netip.Addr, dst netip.AddrPort) (bool, bool) {
+	f.calls++
+	f.asked = append(f.asked, admitCall{method: "AdmitsUDPDial", src: src, dst: dst})
 	return f.admitted, f.enforced
 }
 
@@ -53,13 +70,15 @@ func TestIngressDialPolicy_DoesNotAskForADialOffTheMesh(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			enforcer := &fakeDialAdmitter{admitted: false, enforced: true}
-			p := ingressDialPolicy{enforcer: enforcer, meshIP: testIngressMeshIP, sourceFor: tt.sourceFor}
-			if p.DialDenied(tt.target) {
-				t.Errorf("DialDenied(%s) = true, want false", tt.target)
-			}
-			if enforcer.calls != 0 {
-				t.Errorf("the Enforcer was asked %d times, want not at all", enforcer.calls)
+			for _, protocol := range []string{"tcp", "udp"} {
+				enforcer := &fakeDialAdmitter{admitted: false, enforced: true}
+				p := ingressDialPolicy{enforcer: enforcer, meshIP: testIngressMeshIP, sourceFor: tt.sourceFor}
+				if p.DialDenied(protocol, tt.target) {
+					t.Errorf("DialDenied(%s, %s) = true, want false", protocol, tt.target)
+				}
+				if enforcer.calls != 0 {
+					t.Errorf("%s: the Enforcer was asked %d times, want not at all", protocol, enforcer.calls)
+				}
 			}
 		})
 	}
@@ -75,14 +94,23 @@ func TestIngressDialPolicy_AnswersFromTheEnforcer(t *testing.T) {
 		{admitted: true, enforced: false, want: false},
 	}
 	fromMesh := func(netip.AddrPort) (netip.Addr, error) { return testIngressMeshIP, nil }
-	for _, tt := range tests {
-		enforcer := &fakeDialAdmitter{admitted: tt.admitted, enforced: tt.enforced}
-		p := ingressDialPolicy{enforcer: enforcer, meshIP: testIngressMeshIP, sourceFor: fromMesh}
-		if got := p.DialDenied(testIngressTarget); got != tt.want {
-			t.Errorf("DialDenied with the Enforcer answering (%v, %v) = %v, want %v", tt.admitted, tt.enforced, got, tt.want)
-		}
-		if enforcer.calls != 1 {
-			t.Errorf("the Enforcer was asked %d times, want once", enforcer.calls)
+	for _, proto := range []struct{ protocol, method string }{
+		{"tcp", "AdmitsTCPDial"},
+		{"udp", "AdmitsUDPDial"},
+	} {
+		for _, tt := range tests {
+			enforcer := &fakeDialAdmitter{admitted: tt.admitted, enforced: tt.enforced}
+			p := ingressDialPolicy{enforcer: enforcer, meshIP: testIngressMeshIP, sourceFor: fromMesh}
+			if got := p.DialDenied(proto.protocol, testIngressTarget); got != tt.want {
+				t.Errorf("DialDenied(%s) with the Enforcer answering (%v, %v) = %v, want %v", proto.protocol, tt.admitted, tt.enforced, got, tt.want)
+			}
+			if enforcer.calls != 1 {
+				t.Errorf("DialDenied(%s): the Enforcer was asked %d times, want once", proto.protocol, enforcer.calls)
+			}
+			want := []admitCall{{method: proto.method, src: testIngressMeshIP, dst: testIngressTarget}}
+			if !slices.Equal(enforcer.asked, want) {
+				t.Errorf("DialDenied(%s) asked %+v, want %+v", proto.protocol, enforcer.asked, want)
+			}
 		}
 	}
 }

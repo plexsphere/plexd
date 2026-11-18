@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/policy"
 )
@@ -11,14 +12,15 @@ import (
 // dialAdmitter is the part of *policy.Enforcer the dial policy reads.
 type dialAdmitter interface {
 	AdmitsTCPDial(src netip.Addr, dst netip.AddrPort) (admitted, enforced bool)
+	AdmitsUDPDial(src netip.Addr, dst netip.AddrPort) (admitted, enforced bool)
 }
 
 var _ dialAdmitter = (*policy.Enforcer)(nil)
 
 // ingressDialPolicy tells the ingress manager whether the node's compiled
-// policy blocks a TCP dial to a target. Every firewall backend applies the
-// policy to what the node's own sockets send over the mesh interface from the
-// mesh address, so a dial counts only when the kernel would send it from
+// policy blocks a TCP or UDP dial to a target. Every firewall backend applies
+// the policy to what the node's own sockets send over the mesh interface from
+// the mesh address, so a dial counts only when the kernel would send it from
 // meshIP; a dial to meshIP itself takes the loopback.
 type ingressDialPolicy struct {
 	enforcer dialAdmitter
@@ -41,12 +43,13 @@ func newIngressDialPolicy(enforcer dialAdmitter, meshIP string) (ingressDialPoli
 	return ingressDialPolicy{enforcer: enforcer, meshIP: addr.Unmap(), sourceFor: udpSourceFor}, nil
 }
 
-// DialDenied reports whether the ruleset the Enforcer holds blocks a TCP dial
-// from the mesh address to target. It answers false, without asking the
-// Enforcer, for a target that is the mesh address, and for a target the
-// kernel would not reach from the mesh address or no route reaches; and false
-// while nothing is enforced.
-func (p ingressDialPolicy) DialDenied(target netip.AddrPort) bool {
+// DialDenied reports whether the ruleset the Enforcer holds blocks a dial of
+// protocol from the mesh address to target: a UDP dial for
+// api.IngressProtocolUDP and a TCP dial for every other protocol. It answers
+// false, without asking the Enforcer, for a target that is the mesh address,
+// and for a target the kernel would not reach from the mesh address or no
+// route reaches; and false while nothing is enforced.
+func (p ingressDialPolicy) DialDenied(protocol string, target netip.AddrPort) bool {
 	dst := netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	if dst.Addr() == p.meshIP {
 		return false
@@ -55,7 +58,11 @@ func (p ingressDialPolicy) DialDenied(target netip.AddrPort) bool {
 	if err != nil || src.Unmap() != p.meshIP {
 		return false
 	}
-	admitted, enforced := p.enforcer.AdmitsTCPDial(p.meshIP, dst)
+	admits := p.enforcer.AdmitsTCPDial
+	if protocol == api.IngressProtocolUDP {
+		admits = p.enforcer.AdmitsUDPDial
+	}
+	admitted, enforced := admits(p.meshIP, dst)
 	return enforced && !admitted
 }
 

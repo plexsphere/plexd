@@ -620,12 +620,13 @@ func (m *IngressManager) logClosed(l *ingressListener, conn net.Conn, serverName
 // route is cancelled.
 func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []byte) {
 	target, err := m.dialTarget(route)
-	reason := m.recordDial(route, err)
+	reason, _ := m.recordDial(route, err)
 	if err != nil {
 		attrs := []any{
 			"component", "bridge",
 			"rule_id", route.rule.ID,
 			"slug", route.rule.Slug,
+			"protocol", route.rule.Protocol,
 			"target", route.target,
 		}
 		if reason != "" {

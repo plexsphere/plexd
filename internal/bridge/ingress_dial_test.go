@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -114,7 +116,7 @@ func TestClassifyDialError(t *testing.T) {
 }
 
 func TestRecordDial_FailedThenSucceeded(t *testing.T) {
-	fx, ctrl, _, _ := newDialFixture(t, dialStep{err: refusedDial()}, dialStep{})
+	fx, ctrl, _, policy := newDialFixture(t, dialStep{err: refusedDial()}, dialStep{})
 	id := reportID("a1")
 	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(ingressRule("web", 7022, "", 9000), id))); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -131,6 +133,24 @@ func TestRecordDial_FailedThenSucceeded(t *testing.T) {
 	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
 		t.Errorf("after a refused dial: report = %+v, want %+v", got, want)
 	}
+	// The rule carries no protocol, which the plan reads as tcp.
+	wantAsked := []dialQuestion{{protocol: "tcp", target: netip.MustParseAddrPort("127.0.0.1:9000")}}
+	if got := policy.askedWith(); !slices.Equal(got, wantAsked) {
+		t.Errorf("the dial policy was asked %+v, want %+v", got, wantAsked)
+	}
+	fx.logs.waitFor(t, `msg="bridge: ingress: dial target failed"`, 1)
+	if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "rule_id="+id, "protocol=tcp", "reason=refused"); got != 1 {
+		t.Errorf("%d Error lines with rule_id=%s, protocol=tcp and reason=refused, want 1:\n%s", got, id, fx.logs.String())
+	}
+
+	// A second identical failure leaves the record as it was.
+	fx.mgr.mu.Lock()
+	route := fx.mgr.listeners[7022].table.Load().plain
+	fx.mgr.mu.Unlock()
+	if reason, recChanged := fx.mgr.recordDial(route, refusedDial()); reason != IngressDialReasonRefused || recChanged {
+		t.Errorf("recordDial of a second refused dial = (%q, %v), want (%q, false)", reason, recChanged, IngressDialReasonRefused)
+	}
+	requireNoSignal(t, changed, "a second identical failure")
 
 	connect(t, ctrl.addr(7022))
 	requireSignal(t, changed, "a dial that succeeded after a failed one")
