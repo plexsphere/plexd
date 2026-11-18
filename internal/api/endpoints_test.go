@@ -1720,6 +1720,232 @@ func TestReportUserAccessStatus_PathParametersEscaped(t *testing.T) {
 	}
 }
 
+// testSiteToSiteStatusAccepted is a 200 body of
+// PUT /v1/nodes/{node_id}/site-to-site-status.
+const testSiteToSiteStatusAccepted = `{"accepted_at":"2026-11-18T10:15:30.123Z"}`
+
+func TestReportSiteToSiteStatus_Success(t *testing.T) {
+	established := func(b bool) *bool { return &b }
+	const key = "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M="
+	tests := []struct {
+		name     string
+		req      SiteToSiteStatusRequest
+		wantBody string
+	}{
+		{name: SiteToSiteStateOptedOut, req: SiteToSiteStatusRequest{State: SiteToSiteStateOptedOut}, wantBody: `{"state":"opted_out"}`},
+		{name: SiteToSiteStateEnabled, req: SiteToSiteStatusRequest{State: SiteToSiteStateEnabled}, wantBody: `{"state":"enabled"}`},
+		{
+			// The report of the contract's section "Site-to-site status".
+			name: "the contract's example",
+			req: SiteToSiteStatusRequest{State: SiteToSiteStateEnabled, Tunnels: []SiteToSiteStatusTunnel{
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Health: SiteToSiteHealthUp, PublicKey: key, Established: established(true)},
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Health: SiteToSiteHealthDown, Reason: "kind_not_served"},
+			}},
+			wantBody: `{"state":"enabled","tunnels":[` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"up","established":true,"public_key":"` + key + `"},` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","health":"down","reason":"kind_not_served"}]}`,
+		},
+		{
+			// false is a value an up entry must carry, not an omission.
+			name: "a remote site that does not answer",
+			req: SiteToSiteStatusRequest{State: SiteToSiteStateEnabled, Tunnels: []SiteToSiteStatusTunnel{
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Health: SiteToSiteHealthUp, PublicKey: key, Established: established(false)},
+			}},
+			wantBody: `{"state":"enabled","tunnels":[` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"up","established":false,"public_key":"` + key + `"}]}`,
+		},
+		{
+			// An ipsec or openvpn tunnel that is up carries no public_key.
+			name: "an ipsec tunnel that is up",
+			req: SiteToSiteStatusRequest{State: SiteToSiteStateEnabled, Tunnels: []SiteToSiteStatusTunnel{
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Health: SiteToSiteHealthUp, Established: established(false)},
+			}},
+			wantBody: `{"state":"enabled","tunnels":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","health":"up","established":false}]}`,
+		},
+		{
+			// A nil Established is omitted, as a down entry must not carry it.
+			name: "a down entry",
+			req: SiteToSiteStatusRequest{State: SiteToSiteStateEnabled, Tunnels: []SiteToSiteStatusTunnel{
+				{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Health: SiteToSiteHealthDown, Reason: "bind_failed"},
+			}},
+			wantBody: `{"state":"enabled","tunnels":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","health":"down","reason":"bind_failed"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotMethod, gotPath, gotContentType, gotAuth string
+			var gotBody []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotContentType = r.Header.Get("Content-Type")
+				gotAuth = r.Header.Get("Authorization")
+				var err error
+				if gotBody, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, testSiteToSiteStatusAccepted)
+			})
+
+			resp, err := client.ReportSiteToSiteStatus(context.Background(), "node-1", tt.req)
+			if err != nil {
+				t.Fatalf("ReportSiteToSiteStatus: %v", err)
+			}
+
+			if gotMethod != http.MethodPut {
+				t.Errorf("method = %s, want PUT", gotMethod)
+			}
+			if gotPath != "/v1/nodes/node-1/site-to-site-status" {
+				t.Errorf("path = %s, want /v1/nodes/node-1/site-to-site-status", gotPath)
+			}
+			if gotContentType != "application/json" {
+				t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+			}
+			if gotAuth != "Bearer test-token" {
+				t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+			}
+
+			if got := strings.TrimSpace(string(gotBody)); got != tt.wantBody {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, tt.wantBody)
+			}
+
+			wantAcceptedAt := time.Date(2026, 11, 18, 10, 15, 30, 123_000_000, time.UTC)
+			if !resp.AcceptedAt.Equal(wantAcceptedAt) {
+				t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, wantAcceptedAt)
+			}
+		})
+	}
+}
+
+// A refusal must survive the client's error mapping in the shape the reporter
+// reads: the problem code of a 400 or a 404, and the bare 404 an older router
+// writes with no body, which IsSiteToSiteStatusNotServed takes for a missing
+// surface.
+func TestReportSiteToSiteStatus_ErrorAnswers(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		contentType   string
+		body          string
+		wantCode      string
+		wantNotServed bool
+	}{
+		{
+			"400 malformed_site_to_site_status", http.StatusBadRequest,
+			"application/problem+json", `{"title":"Bad Request","status":400,"detail":"tunnels[0].reason is required while health is down","code":"malformed_site_to_site_status"}`,
+			"malformed_site_to_site_status", false,
+		},
+		{
+			"400 invalid_site_to_site_status", http.StatusBadRequest,
+			"application/problem+json", `{"title":"Bad Request","status":400,"detail":"an opted-out bridge reports no tunnels","code":"invalid_site_to_site_status"}`,
+			"invalid_site_to_site_status", false,
+		},
+		{
+			"404 site_to_site_status_node_gone", http.StatusNotFound,
+			"application/problem+json", `{"title":"Not Found","status":404,"detail":"the node was removed","code":"site_to_site_status_node_gone"}`,
+			"site_to_site_status_node_gone", false,
+		},
+		{
+			"404 with an empty body", http.StatusNotFound,
+			"", "",
+			"", true,
+		},
+		{
+			"501 site_to_site_status_not_provisioned", http.StatusNotImplemented,
+			"application/problem+json", `{"title":"Not Implemented","status":501,"detail":"site-to-site status is not provisioned","code":"site_to_site_status_not_provisioned"}`,
+			"site_to_site_status_not_provisioned", true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			resp, err := client.ReportSiteToSiteStatus(context.Background(), "node-1", SiteToSiteStatusRequest{State: SiteToSiteStateEnabled})
+			if resp != nil {
+				t.Errorf("response = %+v, want nil", resp)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("errors.As failed to extract *APIError: %v", err)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", apiErr.Code, tt.wantCode)
+			}
+			if got := IsSiteToSiteStatusNotServed(err); got != tt.wantNotServed {
+				t.Errorf("IsSiteToSiteStatusNotServed(%v) = %v, want %v", err, got, tt.wantNotServed)
+			}
+		})
+	}
+}
+
+// The reporter's context ends at shutdown, possibly while a report waits on
+// a slow control plane. The call must end with it and say why.
+func TestReportSiteToSiteStatus_ContextCanceled(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	client, _ := newEndpointTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		// The server watches the connection for the client hanging up only
+		// once the request body is read, so the handler reads it before it
+		// waits, as in TestReportRelayStatus_ContextCanceled.
+		_, _ = io.Copy(io.Discard, r.Body)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(backstopContext(t))
+	defer cancel()
+	go func() {
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	resp, err := client.ReportSiteToSiteStatus(ctx, "node-1", SiteToSiteStatusRequest{State: SiteToSiteStateOptedOut})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want %v", err, context.Canceled)
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+}
+
+func TestReportSiteToSiteStatus_PathParametersEscaped(t *testing.T) {
+	// Verify the nodeID is escaped, so it cannot climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testSiteToSiteStatusAccepted)
+	})
+
+	_, err := client.ReportSiteToSiteStatus(context.Background(), "../../../etc/passwd", SiteToSiteStatusRequest{State: SiteToSiteStateEnabled})
+	if err != nil {
+		t.Fatalf("ReportSiteToSiteStatus: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/site-to-site-status"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 // testPolicyStatusAccepted is a 200 body of PUT /v1/nodes/{node_id}/policy-status.
 const testPolicyStatusAccepted = `{"accepted_at":"2026-11-13T10:15:30.123Z","status":"applied"}`
 

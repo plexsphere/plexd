@@ -278,6 +278,24 @@ func (c *ControlPlane) ReportUserAccessStatus(ctx context.Context, nodeID string
 	return &resp, nil
 }
 
+// ReportSiteToSiteStatus reports whether the bridge's local configuration
+// serves site-to-site tunnels, and whether each tunnel of its pull is up and
+// answered by its remote site, and returns the control plane's receipt.
+//
+// It validates nothing and sends the request as passed: the site-to-site
+// status reporter builds only the shapes the contract admits, and the control
+// plane refuses any other with 400 malformed_site_to_site_status or
+// invalid_site_to_site_status.
+// PUT /v1/nodes/{node_id}/site-to-site-status
+func (c *ControlPlane) ReportSiteToSiteStatus(ctx context.Context, nodeID string, req SiteToSiteStatusRequest) (*SiteToSiteStatusResponse, error) {
+	var resp SiteToSiteStatusResponse
+	path := fmt.Sprintf("/v1/nodes/%s/site-to-site-status", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPut, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ReportPolicyStatus reports what the node did with the policy block of its
 // pulls and returns the control plane's receipt.
 //
