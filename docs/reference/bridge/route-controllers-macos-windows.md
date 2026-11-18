@@ -11,9 +11,11 @@ The Linux implementation is [`NetlinkRouteController`](./netlink-route-controlle
 
 ## Architecture
 
-![The Bridge Manager and the SiteToSiteManager each call DarwinRouteController or WindowsRouteController. DarwinRouteController runs route(8) and sysctl(8) and delegates to PFController. WindowsRouteController uses winipcfg and delegates to WFPController.](../../diagrams/bridge-route-controllers-macos-windows.svg)
+![The Bridge Manager, in bridge mode only, for the access routes, forwarding and NAT, and wireguard.Manager, for the peer routes on every node through utunN on macOS, each call DarwinRouteController or WindowsRouteController. DarwinRouteController runs route(8) and sysctl(8) and delegates to PFController. WindowsRouteController uses winipcfg and delegates to WFPController.](../../diagrams/bridge-route-controllers-macos-windows.svg)
 
-The user access manager holds the route controller too, but serves no provider on macOS or Windows: neither platform has the mesh source rewrite, so no provider reaches the controller there: one that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_provider` (see [User Access Integration](user-access-integration.md)).
+`plexd up` builds the controller on every node, in bridge mode or not, and hands it to the WireGuard manager, which routes the `routed_subnets` of each peer through the mesh interface with `AddRoute` and `RemoveRoute` (see [Routed subnets](../networking/wireguard.md#routed-subnets)). In bridge mode the bridge manager uses the same instance for the access subnets, forwarding and NAT.
+
+The user access and site-to-site managers hold the route controller too, but serve nothing on macOS or Windows: neither platform has the mesh source rewrite, so no provider and no tunnel reaches the controller there. A provider that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_provider` (see [User Access Integration](user-access-integration.md)); a tunnel reads `kind_not_served` or `invalid_tunnel` the same way (see [Site-to-Site VPN](site-to-site-vpn.md)).
 
 ## Constructors
 
@@ -59,7 +61,7 @@ Only IPv4 is toggled, matching Linux. The mesh is IPv4, and on macOS the IPv6 kn
 
 ### The ledger
 
-Linux writes a per-interface sysctl and every manager writes its own, so `NetlinkRouteController` keeps no state. The other two platforms share a knob: macOS has exactly one, and on Windows the mesh adapter's flag is claimed by the bridge manager and the site-to-site manager alike. The user access manager claims no knob on either platform, because it serves no provider there. Without bookkeeping, tearing down a site-to-site tunnel would switch forwarding off under a live bridge.
+Linux writes a per-interface sysctl and every manager writes its own, so `NetlinkRouteController` keeps no state. The other two platforms share a knob: macOS has exactly one, and on Windows the mesh adapter's flag is claimed by every pair that names the mesh adapter. Without bookkeeping, releasing one pair would switch forwarding off under another. The bridge manager is the only claimant today: the user access and site-to-site managers claim no knob on either platform, because they serve no provider and no tunnel there, and the WireGuard manager adds routes and switches no forwarding.
 
 Both controllers track holders in a `forwardingLedger`, keyed by the knob:
 
@@ -93,7 +95,7 @@ Both are reported as success, which is the idempotency `NetlinkRouteController` 
 
 On macOS the duplicate is only idempotent when this interface holds the prefix. `File exists` names neither the prefix's owner nor a next hop, and `RemoveRoute` names the destination alone, so accepting a prefix another interface routes would let one tunnel delete another tunnel's route while both are still reported as carried. The controller therefore runs `route -n get <family> <prefix>` and compares the `interface:` line with the interface the add named; anything else fails with `the prefix is already routed via "<other>"`.
 
-macOS `route(8)` exits 0 on a routing-socket error and reports the failure only in its output, so the controller reads that output whatever the exit status is. `File exists` on an add and `not in table` on a delete are success; any other line carrying `writing to routing socket:` is a failure, reported with the command line and the message `route(8)` printed. A utun that carries no IPv4 address answers `Network is unreachable`, which is why a site-to-site tunnel utun carries the node's mesh IP as a `/32`; see [Site-to-Site VPN](./site-to-site-vpn.md#vpncontroller).
+macOS `route(8)` exits 0 on a routing-socket error and reports the failure only in its output, so the controller reads that output whatever the exit status is. `File exists` on an add and `not in table` on a delete are success; any other line carrying `writing to routing socket:` is a failure, reported with the command line and the message `route(8)` printed. A utun that carries no IPv4 address answers `Network is unreachable`. The mesh utun carries the node's mesh IP, so the peer routes install over it, which `TestPeerRoutes_RealUTUN` proves. For the same reason `plexd up` builds the site-to-site controller with the node's mesh IP as a `/32`, although no tunnel reaches it there; see [Site-to-Site VPN](./site-to-site-vpn.md#vpncontroller).
 
 ## Interface Names
 
@@ -107,7 +109,7 @@ Neither controller maps names. Each passes what it is given straight to the plat
 
 On Windows, `net.InterfaceByName` resolves the friendly name and `ConvertInterfaceIndexToLuid` turns it into the LUID the IP Helper API addresses. A Wintun adapter is created under the configured interface name, so `plexd0` resolves without a mapping; see [Windows controller](../networking/wireguard.md#windows-controller).
 
-macOS is the platform where this matters most. The kernel names a tunnel device `utunN`, not `plexd0`, so a caller routing over a WireGuard interface has to resolve the kernel name first and hand that in. The bridge manager routes over `access_interface`, which is already a kernel name. `SiteToSiteManager` resolves the name of a tunnel interface through `wireguard.OSInterfaceNamer`, which `WGVPNController` implements over `DarwinController`, and hands the resulting `utunN` to `AddRoute`, `RemoveRoute` and the two forwarding calls; see [Site-to-Site VPN](./site-to-site-vpn.md#sitetositemanager). User access serves no provider on macOS, so it makes no routing or forwarding call there, and `WGAccessController` exposes no mapping of its own.
+macOS is the platform where this matters most. The kernel names a tunnel device `utunN`, not `plexd0`, so a caller routing over a WireGuard interface has to resolve the kernel name first and hand that in. The bridge manager routes over `access_interface`, which is already a kernel name. The WireGuard manager adds each peer route on `Manager.OSInterfaceName()`, which is the mesh device's `utunN` on macOS and the configured name on Windows; see [The utunN name](../networking/wireguard.md#the-utunn-name). User access and site-to-site tunnels are served on neither platform, so their managers make no routing or forwarding call there, and `WGAccessController` exposes no mapping of its own.
 
 The mesh interface name reaches only `EnableForwarding`. macOS logs it and programs the global sysctl; Windows resolves it and programs its flag.
 
@@ -156,9 +158,9 @@ All entries are at `Debug` with `component=bridge`.
 
 ## Tests
 
-Both controllers reach the operating system through a seam, so every argument list and every idempotent case is exercised on an ordinary unprivileged runner: macOS through the package's `CommandExecutor` and its recording mock, Windows through the `ipRouter` interface and a fake. The macOS cases cover the outputs that arrive with exit status 0 (`Network is unreachable`, `File exists`, `not in table`, `Permission denied`), the `route get` answers the ownership check reads (the same interface, another interface, no `interface:` line, a failed `get`), and the two helpers that parse them, `routeSocketError` and `routeInterface`. `site_to_site_test.go` covers the kernel-name resolution with a `VPNController` that maps `wg-s2s-0` to `utun9` and one that reports no mapping.
+Both controllers reach the operating system through a seam, so every argument list and every idempotent case is exercised on an ordinary unprivileged runner: macOS through the package's `CommandExecutor` and its recording mock, Windows through the `ipRouter` interface and a fake. The macOS cases cover the outputs that arrive with exit status 0 (`Network is unreachable`, `File exists`, `not in table`, `Permission denied`), the `route get` answers the ownership check reads (the same interface, another interface, no `interface:` line, a failed `get`), and the two helpers that parse them, `routeSocketError` and `routeInterface`. `vpn_controller_wg_test.go` covers the kernel-name mapping of `WGVPNController` with a controller that maps `wg-s2s-0` to `utun9`, and the package `wireguard` pins with fakes which route calls the WireGuard manager makes for the peer routes.
 
-Four tests drive the real kernel and are gated:
+Six tests drive the real kernel and are gated:
 
 | Test | Gate | Locally |
 |------|------|---------|
@@ -166,10 +168,14 @@ Four tests drive the real kernel and are gated:
 | `TestWindowsRouteController_Real` | `PLEXD_TEST_REAL_ROUTES=1` and an elevated token | `$env:PLEXD_TEST_REAL_ROUTES='1'; go test -run TestWindowsRouteController_Real ./internal/bridge/` from an elevated shell |
 | `TestWGControllers_RealUTUN` | `os.Geteuid() == 0` | `sudo go test -run TestWGControllers_RealUTUN ./internal/bridge/` |
 | `TestWGControllers_RealWintun` | `PLEXD_TEST_REAL_WINTUN=1` and an elevated token | `$env:PLEXD_TEST_REAL_WINTUN='1'; go test -run TestWGControllers_RealWintun ./internal/bridge/` from an elevated shell |
+| `TestPeerRoutes_RealUTUN` | `os.Geteuid() == 0` | `sudo go test -run TestPeerRoutes_RealUTUN ./internal/bridge/` |
+| `TestPeerRoutes_RealWintun` | `PLEXD_TEST_REAL_WINTUN=1`, `PLEXD_TEST_REAL_ROUTES=1` and an elevated token | `$env:PLEXD_TEST_REAL_WINTUN='1'; $env:PLEXD_TEST_REAL_ROUTES='1'; go test -run TestPeerRoutes_RealWintun ./internal/bridge/` from an elevated shell |
 
 The two route-controller tests each add a `/30`, check the routing table for it, repeat the add to prove idempotency, remove it twice, then toggle forwarding and assert the prior value comes back.
 
-The other two drive the bridge access and site-to-site controllers over a real device. `TestWGControllers_RealUTUN` proves that `AddRoute` over an unnumbered tunnel utun fails with `Network is unreachable` and that the same route installs over a utun addressed `10.255.251.1/32`, where `netstat -rn -f inet` then lists it. It programs a peer through the UAPI socket, removes the interface and repeats the removal, and puts the access controller through the same create, peer and repeated remove. `TestWGControllers_RealWintun` proves that the adapter resolves on the first `net.InterfaceByName` call after creation, that `OSInterfaceName` reports the configured name there, and that the on-link route installs by LUID on an adapter carrying no address. CI runs all four; see [CI Workflow](../development/ci-workflow.md).
+The two `TestWGControllers_Real*` tests drive the bridge access and site-to-site controllers over a real device. `TestWGControllers_RealUTUN` proves that `AddRoute` over an unnumbered tunnel utun fails with `Network is unreachable` and that the same route installs over a utun addressed `10.255.251.1/32`, where `netstat -rn -f inet` then lists it. It programs a peer through the UAPI socket, removes the interface and repeats the removal, and puts the access controller through the same create, peer and repeated remove. `TestWGControllers_RealWintun` proves that the adapter resolves on the first `net.InterfaceByName` call after creation, that `OSInterfaceName` reports the configured name there, and that the on-link route installs by LUID on an adapter carrying no address.
+
+The two `TestPeerRoutes_Real*` tests prove the peer routes without traffic. Each builds a `wireguard.Manager` over the platform's controller with the platform's route controller as its `PeerRouter`, sets it up at `10.99.0.1` in `10.99.0.0/24`, and runs `wireguard.ReconcileHandler` with one peer at `10.99.0.2` whose `routed_subnets` are `["10.20.0.0/16"]`. They want the peer's allowed IPs on the mesh device to be `10.99.0.2/32` and `10.20.0.0/16`, read through `PeerStats`, and the system's route for the subnet to name the mesh interface: `route -n get 10.20.0.1` on macOS names the mesh `utunN`, and on Windows the route for `10.20.0.0/16` is found on the adapter's LUID. A second run without the member wants both gone. CI runs all six, and the macOS and Wintun steps fail unless the `--- PASS:` line of each `TestPeerRoutes_Real*` test is in their output; see [CI Workflow](../development/ci-workflow.md).
 
 ## Usage
 

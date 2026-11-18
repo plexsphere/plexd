@@ -6,11 +6,11 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, checks the bridge's ingress status report, closes every public listener for a block that does not enable ingress and on a bridge that opts out with `bridge.ingress_enabled: false`, serves a `wireguard` user access provider through which a device reaches a mesh node with the bridge's mesh address, reports each provider's state, keeps the provider's key across a restart and a killed process, and opts out with `bridge.user_access_enabled: false`, then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, checks the bridge's ingress status report, closes every public listener for a block that does not enable ingress and on a bridge that opts out with `bridge.ingress_enabled: false`, serves a `wireguard` user access provider through which a device reaches a mesh node with the bridge's mesh address, reports each provider's state, keeps the provider's key across a restart and a killed process, and opts out with `bridge.user_access_enabled: false`, serves a `wireguard` site-to-site tunnel through which a host of a remote site reaches a mesh node with the bridge's mesh address and a mesh node reaches the site under the bridge's policy, reports each tunnel's state, keeps the tunnel's key across a restart and a killed process, and opts out with `bridge.site_to_site_enabled: false`, then verifies clean shutdown.
 
 ## Container Topology
 
-![Six containers share the Docker network plexd-systemd-e2e. In the systemd container, Ubuntu 24.04 with systemd as PID 1, systemd manages plexd.service. plexd calls mock-api, which listens on port 8080 for HTTP and on port 8443 for TLS and serves /v1/health. plexd connects to the rule targets on the ingress target, which serves TLS on ports 9441 to 9443 and a banner on port 9022 and carries openssl and nc, and the ingress target probes plexd. plexd talks ACME to pebble, Let's Encrypt's test CA, on port 14000 over HTTPS, and pebble validates plexd with TLS-ALPN-01 on port 443. The device, with wg0 at 10.77.0.2 and an nc probe, reaches plexd over WireGuard on port 51900, a wg-ua- interface of the bridge. The mesh node, with wg0 at 10.99.0.3 and nc listening on port 7101, peers with plexd over WireGuard on plexd0 port 51820.](../../diagrams/development-systemd-topology.svg)
+![Seven containers share the Docker network plexd-systemd-e2e. In the systemd container, Ubuntu 24.04 with systemd as PID 1, systemd manages plexd.service. plexd calls mock-api, which listens on port 8080 for HTTP and on port 8443 for TLS and serves /v1/health. plexd connects to the rule targets on the ingress target, which serves TLS on ports 9441 to 9443 and a banner on port 9022 and carries openssl and nc, and the ingress target probes plexd. plexd talks ACME to pebble, Let's Encrypt's test CA, on port 14000 over HTTPS, and pebble validates plexd with TLS-ALPN-01 on port 443. The device, with wg0 at 10.77.0.2 and an nc probe, reaches plexd over WireGuard on port 51900, a wg-ua- interface of the bridge. The mesh node, with wg0 at 10.99.0.3 and nc listening on port 7101, peers with plexd over WireGuard on plexd0 port 51820. The site, with wg0 at 10.40.0.1/16 and nc listening on port 7201, is the remote end of a site-to-site tunnel of the bridge, a wg-s2s- interface on port 51930.](../../diagrams/development-systemd-topology.svg)
 
 | Container | Image | Source | Purpose |
 |-----------|-------|--------|---------|
@@ -20,8 +20,9 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 | `plexd-e2e-pebble` | `ghcr.io/letsencrypt/pebble:2.10.3`, pinned by digest | Pebble's release image, with `test/e2e/systemd/pebble-config.json` mounted | Pebble, Let's Encrypt's test CA; started by phase 16 with the network alias `pebble`, issues the certificate of the `acme` rule after it validated the bridge over TLS-ALPN-01 on port 443 |
 | `plexd-e2e-meshnode` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | Alpine with `wireguard-tools`, `iproute2` and `netcat-openbsd`; started by phase 17 with `NET_ADMIN`, the fixture's mesh peer `...a0b2` on a `wg0` of its own at `10.99.0.3`, and listens on port 7101 |
 | `plexd-e2e-device` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | The same image; started by phase 17 with `NET_ADMIN`, a device of a `wireguard` user access provider on a `wg0` of its own at `10.77.0.2`, and runs the probe to the mesh node |
+| `plexd-e2e-site` | `plexd-ingress-target:e2e` | `test/e2e/meshpeer/Dockerfile` | The same image; started by phase 18 with `NET_ADMIN`, the remote site of a `wireguard` site-to-site tunnel on a `wg0` of its own at `10.40.0.1/16`, listens on UDP 51940 and on TCP 7201, and runs the probe to the mesh node |
 
-Phase 17 also runs short-lived containers of the same image with `--network container:plexd-e2e-systemd` and `NET_ADMIN`, which share the systemd container's network namespace: the systemd image carries neither `ip` nor `wg`, so they read the kernel state of `plexd0` and of the provider's interface. They are removed as they exit.
+Phases 17 and 18 also run short-lived containers of the same image with `--network container:plexd-e2e-systemd` and `NET_ADMIN`, which share the systemd container's network namespace: the systemd image carries neither `ip` nor `wg`, so they read the kernel state of `plexd0`, of the provider's interface and of the tunnel's interface and its route. They are removed as they exit.
 
 The systemd image installs `dbus` and `systemd-resolved` next to `systemd`, `systemd-sysv`, `curl`, `ca-certificates`, `jq`, `openssh-client`, and `sshpass`. Both install enabled, so the container boots with a system bus and its own systemd-resolved, which plexd registers its mesh DNS resolver with. Docker mounts its own `/etc/resolv.conf` (`nameserver 127.0.0.11`) over the one the package would link, so systemd-resolved runs in foreign mode with Docker's DNS as its global server, `nsswitch.conf` keeps `hosts: files dns`, and the mesh DNS phases ask systemd-resolved directly with `resolvectl`. Every `resolvectl` call runs inside the container through `docker exec` and reaches the container's systemd-resolved, never the host's.
 
@@ -41,7 +42,7 @@ Builds the mock-api image, the systemd container image, and cross-compiles the p
 
 ### 4. Network and container startup
 
-Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, and phase 17 the mesh node and the device. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
+Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, phase 17 the mesh node and the device, and phase 18 the site. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
 
 ### 5. Service installation
 
@@ -168,7 +169,7 @@ bridge:
   acme_directory_urls: ["https://pebble:14000/dir"]
 ```
 
-Step 20 appends `  ingress_enabled: false` to it, and step 10 of phase 17 appends `  user_access_enabled: false` and `  user_access_listen_port: 51822`.
+Step 20 appends `  ingress_enabled: false` to it, step 10 of phase 17 appends `  user_access_enabled: false` and `  user_access_listen_port: 51822`, and step 10 of phase 18 appends `  site_to_site_enabled: false` and `  site_to_site_listen_port: 51823`.
 
 ### 17. User access through a bridge
 
@@ -191,13 +192,34 @@ The phase serves user access providers on the bridge of phase 16, which still op
 
 The phase ends by requiring that the journal holds no `user access status: send failed` line, so the mock refused no report.
 
-### 18. Shutdown verification
+### 18. Site-to-site through a bridge
 
-Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. The crash check leaves out the line `plexd.service: Sent signal SIGKILL to main process <pid> (plexd) on client request.` with which systemd records the deliberate kill of step 6 of phase 17, and checks every other line. It runs with the opt-out of phase 15, the bridge mode, environment file and ingress opt-out of phase 16 and the user access opt-out of phase 17 in place, so it stops a bridge that opts out of public ingress and of user access.
+The phase serves site-to-site tunnels on the bridge of phases 16 and 17, which opts out of public ingress and of user access and sets no `bridge.site_to_site_enabled`, so site-to-site runs on its default (see [Site-to-Site VPN](../bridge/site-to-site-vpn.md)). It keeps phase 17's mesh node, the fixture's peer `...a0b2` at `10.99.0.3` with its listener on 7101, and the policy phase 17 served, which allows `10.99.0.0/24` to itself and has no rule to the site's network. It ends with the bridge opted out of site-to-site.
 
-### 19. Cleanup
+**Setup.** It starts `plexd-e2e-site` from the image phase 16 built, with `--cap-add NET_ADMIN`, on `plexd-systemd-e2e`. The site holds `10.40.0.1/16` on a `wg0` with a key of its own, listens on UDP 51940, routes `10.99.0.0/24` into that interface, and listens on TCP 7201 with a listener that logs each peer. The mesh node runs no plexd, so the phase adds `10.40.0.0/16` to the allowed IPs of its peer, the bridge, and a route for it through its `wg0` by hand.
 
-The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the six containers and the Docker network.
+`configure_site_to_site <tag> <tunnels-json or null> [secrets-json]` and `wait_site_to_site_report <tag> <what> <jq-filter>` are modelled on `configure_user_access` and `wait_user_access_report` of phase 17: the first sets `.bridge.site_to_site` of the live snapshot to `{enabled: true, tunnels: <tunnels>}`, or to `null` for `null`, replaces `.secrets` with `secrets-json` when it is given, posts the result to `POST /test/configure-state` and injects a `node_state_updated` event; the second polls `GET /test/last-request/site-to-site-status` with `jq -e` until the filter holds. The probe is `nc -z -w 3 10.99.0.3 7101` in the site container.
+
+1. **No tunnel.** Before any tunnel is served, the last report reads exactly `{"state":"enabled"}`.
+2. **A tunnel.** It serves `branch` (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1e1`, `wireguard`, `listen_port` 51930) with the site's address and port 51940 as remote, the site's public key as `remote_public_key`, `allowed_subnets` `["10.40.0.0/16"]` and no Secret. The report must show it `up` with a `public_key` of 44 characters and `established` false. The interface `wg-s2s-a0a0a1e1` must exist, `ip route show 10.40.0.0/16` must name it, and `/var/lib/plexd/site-to-site/<id>.key` must have mode `600`.
+3. **The site answers.** The site takes the reported key as its peer, with the bridge's address and port 51930 as endpoint, `10.99.0.0/24` as allowed IPs and a keepalive of 5 s. Within 60 seconds a report must show `established` true. The probe must succeed, and the mesh node's listener must name `10.99.0.1`, the bridge's mesh address: the bridge rewrote the source.
+4. **The bridge's policy.** Under the policy of phase 17, which has no rule to `10.40.0.0/16`, the mesh node's `nc -z -w 3 10.40.0.1 7201` must fail. The phase then adds a rule `any` from `10.99.0.0/24` to `10.40.0.0/16` with `configure_policy`. The same probe must succeed, and the site's listener must name `10.99.0.3`. The pair proves that the bridge's compiled policy filters mesh traffic into the tunnel and that its source stays unchanged.
+5. **A preshared key.** The tunnel gains `auth_secret_name` `s2s-psk` while the inventory does not list it: the report must show `branch` `down` with `auth_secret_not_listed`. The phase posts the Secret with a value `wg genpsk` printed to `POST /test/configure-secrets` and lists it in the inventory, and the report must show `branch` `up`. The site sets the same preshared key; within 60 seconds `established` must be true and the probe of step 3 must succeed.
+6. **A restart.** `systemctl restart plexd`. The report's `public_key` must equal the one of step 2, `established` must return to true, and the probe of step 3 must succeed without a change on the site.
+7. **A killed process.** `systemctl kill --kill-whom=main -s KILL plexd`, which leaves the interface in the kernel. Once the unit has started the process again, the report must show `branch` `up` with the same `public_key`, the journal of the new process must hold no `site-to-site tunnel down` line for it, and the probe must succeed.
+8. **Tunnels that are down.** It adds a second `wireguard` tunnel on port 51820, which `plexd0` holds, with `allowed_subnets` `["10.41.0.0/16"]`: the report must show it `down` with `bind_failed`, and `branch` `up`. A third, with `remote_host` `nosuch.invalid` and `["10.42.0.0/16"]`, must read `down` with `remote_host_unresolved`. An `openvpn` tunnel with `["10.43.0.0/16"]` that names the Secret `s2s-ovpn`, listed in the inventory, whose value is a static key in OpenVPN's file format, must read `down` with `client_missing`: the image carries no `openvpn`. The step uses `openvpn` because its link is a tun device, which every runner has; whether a runner's kernel has the xfrm interface module is left to `TestNetlinkVPNController_RealLinks`.
+9. **A removed tunnel.** It serves the three tunnels of step 8 without `branch`. Its interface, its route and its key file must be gone, the report must carry no entry with its id, and the probe of step 3 must fail.
+10. **Opted out.** It serves `kept` (`wireguard`, port 51931, `["10.44.0.0/16"]`) beside the three tunnels of step 8 and waits for it to read `up`. It appends `  site_to_site_enabled: false` and `  site_to_site_listen_port: 51823` to the bridge block of `/etc/plexd/config.yaml` and runs `systemctl restart plexd`. `GET /test/last-request/site-to-site-status` must then return exactly `{"state":"opted_out"}`, no interface whose name starts with `wg-s2s-`, `xf-s2s-` or `ov-s2s-` may exist, and the key file of `kept` must still exist. The journal of the new process must hold `site-to-site: opted out by bridge.site_to_site_enabled, no tunnel is served`, the Warn `site-to-site: the control plane enables site-to-site tunnels, but bridge.site_to_site_enabled is false` with `tunnels=4`, and exactly one Warn `bridge: config: site-to-site keys are ignored, the control plane delivers tunnels` with `keys=[site_to_site_listen_port]`.
+
+The phase ends by requiring that the journal holds no `site-to-site status: send failed` line, so the mock refused no report.
+
+### 19. Shutdown verification
+
+Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. The crash check leaves out the lines `plexd.service: Sent signal SIGKILL to main process <pid> (plexd) on client request.` with which systemd records the deliberate kills of step 6 of phase 17 and step 7 of phase 18, and checks every other line. It runs with the opt-out of phase 15, the bridge mode, environment file and ingress opt-out of phase 16, the user access opt-out of phase 17 and the site-to-site opt-out of phase 18 in place, so it stops a bridge that opts out of public ingress, of user access and of site-to-site tunnels.
+
+### 20. Cleanup
+
+The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the seven containers and the Docker network.
 
 ## Assertion Logic
 
@@ -313,7 +335,7 @@ TIMEOUT=120 make test-e2e-systemd
 
 - Docker
 - `curl` and `jq` on the host
-- Kernel WireGuard on the host: the mesh DNS phase needs `plexd0`, which plexd creates in the container's network namespace, and the user access phase needs the provider's interface and the `wg0` of the mesh node and of the device
+- Kernel WireGuard on the host: the mesh DNS phase needs `plexd0`, which plexd creates in the container's network namespace, the user access phase needs the provider's interface and the `wg0` of the mesh node and of the device, and the site-to-site phase the tunnel's interface and the site's `wg0`
 
 ## Debugging Failures
 
@@ -420,12 +442,27 @@ Common causes:
 - The report shows the provider `down`: its `reason` names the step that failed (see [Reasons](../bridge/user-access-integration.md#reasons)), and the `user access provider down` line carries the error.
 - The probe fails although the provider is `up`: the peer key `wg show wg0` lists on the device must equal the report's `public_key`, which a restart or a kill must not change, and the mesh node's `wg show wg0` must list a recent handshake with `plexd0`.
 
+**A site-to-site step fails:**
+
+```bash
+curl -sS http://localhost:18080/test/last-request/site-to-site-status | jq .
+docker exec plexd-e2e-systemd journalctl -u plexd --no-pager | grep -E 'site-to-site|tunnel interface|mesh source rewrite'
+docker run --rm --network container:plexd-e2e-systemd --cap-add NET_ADMIN plexd-ingress-target:e2e wg show
+docker exec plexd-e2e-site wg show wg0
+docker exec plexd-e2e-meshnode wg show wg0
+```
+
+Common causes:
+- The report shows the tunnel `down`: its `reason` names the step that failed (see [Site-to-Site VPN](../bridge/site-to-site-vpn.md)), and the `site-to-site tunnel down` line carries the error.
+- The tunnel is `up` but `established` stays false: the peer key `wg show wg0` lists on the site must equal the report's `public_key`, which a restart or a kill must not change, and the site's endpoint must name the bridge's address and the tunnel's `listen_port`.
+- The site's probe fails although `established` is true: the mesh node must allow `10.40.0.0/16` from the bridge and route it through its `wg0`, and the bridge must route `10.40.0.0/16` through the tunnel's interface.
+
 **Leftover containers from previous run:**
 
 The script performs pre-cleanup, but if issues persist:
 
 ```bash
-docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target plexd-e2e-pebble plexd-e2e-meshnode plexd-e2e-device
+docker rm -f plexd-e2e-mockapi plexd-e2e-systemd plexd-e2e-ingress-target plexd-e2e-pebble plexd-e2e-meshnode plexd-e2e-device plexd-e2e-site
 docker network rm plexd-systemd-e2e
 ```
 
@@ -457,7 +494,7 @@ On any failure, the `print_diagnostics` function outputs:
 | `test/e2e/systemd/.dockerignore` | Prevents unnecessary files in Docker context |
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
 | `test/e2e/mockapi/mockapi.go` | Mock API server with `/test/assertions` endpoint |
-| `test/e2e/meshpeer/Dockerfile` | Alpine image with `wireguard-tools`, `iproute2`, `netcat-openbsd` and `openssl`; phase 16 runs it as the ingress target, and phase 17 as the mesh node, as the device and as the short-lived containers that read the systemd container's network state |
+| `test/e2e/meshpeer/Dockerfile` | Alpine image with `wireguard-tools`, `iproute2`, `netcat-openbsd` and `openssl`; phase 16 runs it as the ingress target, phase 17 as the mesh node, as the device and as the short-lived containers that read the systemd container's network state, and phase 18 as the site |
 | `deploy/systemd/plexd.service` | Production unit file (copied verbatim into container) |
 | `deploy/systemd/plexd-session-helper.socket`, `deploy/systemd/plexd-session-helper@.service` | Session helper units (copied verbatim into container) |
 | `Makefile` | `test-e2e-systemd` target |

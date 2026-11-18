@@ -71,8 +71,9 @@ SSE `peer_*` events.
 | `Endpoint`   | `string`   | `"endpoint"`   | First entry of `Endpoints`, or empty when the peer has no endpoint to dial |
 | `Endpoints`  | `[]string` | `"endpoints,omitempty"` | The peer's dial order: the endpoints the WireGuard manager tries one after another until a handshake completes (see [Dial order](../networking/wireguard.md#dial-order)) |
 | `Fallbacks`  | `[]string` | `"fallbacks,omitempty"` | The peer's relays as they end `Endpoints`, in dial order: the relay of its assigned bridge first, then its standby relays. Nil when the peer has no relay. Endpoint selection holds each relay as long as the entries before the first relay took together, and only a peer that connected over a relay dials the standbys (see [The trial](../networking/wireguard.md#the-trial)) |
-| `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32`, derived locally |
+| `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32` followed by `RoutedSubnets`, derived locally |
 | `PSK`        | `string`   | `"psk"`        | Edge PSK fetched for the peer's current public key, standard base64; empty when plexd holds none |
+| `RoutedSubnets` | `[]string` | `"routed_subnets,omitempty"` | The entries of the peer's `routed_subnets` this node accepted, in the list's order and in canonical form; nil when it accepted none. The WireGuard manager routes each through the mesh interface (see [Routed subnets](../networking/wireguard.md#routed-subnets)) |
 
 ## Heartbeat
 
@@ -153,8 +154,10 @@ every successful pull (see
 
 **SnapshotPeer**
 
-Carries the peer's direct `endpoint` and its `endpoint_candidates` but **no**
-`psk` or `allowed_ips`. plexd derives `AllowedIPs` locally as `mesh_ip/32`. plexd
+Carries the peer's direct `endpoint`, its `endpoint_candidates` and its
+`routed_subnets` but **no** `psk` or `allowed_ips`. plexd derives `AllowedIPs`
+locally as `mesh_ip/32` followed by the entries of `routed_subnets` it accepts
+(see [Routed subnets](../networking/wireguard.md#routed-subnets)). plexd
 builds the peer's dial order from the candidates on a subnet this node is also
 on, then `endpoint` when it is usable, then the remaining candidates, then the
 peer's relays (`fallback_endpoints`, or `fallback_endpoint` alone when that list
@@ -185,6 +188,7 @@ empty relay entry and a repeated one, and it does not cap the list. When
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | The first entry of `FallbackEndpoints`, and the only relay a control plane that predates the set sends. The dial order uses it only when `FallbackEndpoints` is empty. Absent while the peer has no relay |
 | `FallbackEndpoints` | `[]string` | `"fallback_endpoints,omitempty"` | The peer's relays as `host:port` (an IPv6 host in brackets) in dial order, at most 4 by the contract: the relay of the peer's assigned bridge first, then its standby relays. Both nodes of a pair receive the same list for each other, and it never names this node. Absent while the peer has no relay; `null` reads as absent |
 | `EndpointCandidates` | `[]string` | `"endpoint_candidates,omitempty"` | The peer's endpoint candidates as `host:port` strings, at most 8: first its peer-observed endpoints, the addresses at which at least two live nodes of the Domain report a direct handshake with it, then its last accepted, unexpired local candidates (`PUT /v1/nodes/{node_id}/endpoint-candidates`) in the order it sent them (see [State](api-endpoints.md#get-v1-nodes-node-id-state)); absent when the peer has none and on every control plane that does not deliver them |
+| `RoutedSubnets` | `[]string` | `"routed_subnets,omitempty"` | The IPv4 networks the control plane routes through the peer as CIDRs: the networks behind the site-to-site tunnels of a peer that is a bridge, each once, sorted. Delivered only to the nodes of the bridge Resource's Project, absent for a peer that routes no network, and never carried by the registration response. plexd adds the entries it accepts to the peer's allowed IPs and routes them through the mesh interface, and skips one that is malformed, overlaps the mesh prefix, lies inside a network of this host's interfaces or repeats an earlier one. The differ compares the list in order; absent and `[]` compare equal |
 
 **ReachabilitySnapshot**
 
@@ -254,16 +258,15 @@ A single inclusive destination port range (`from <= to`).
 
 Carries the four bridge subtrees. Each child is present-but-nullable; there are
 no base fields on the wire. `RelayConfig`, `RelayAssignment`, `UserAccessConfig`,
-`UserAccessProvider`, `UserAccessDevice`, `IngressConfig` and `IngressRule`
-follow below; the other inner shape (`SiteToSiteConfig`) is documented under
-[Bridge Mode](/reference/bridge/bridge-mode).
+`UserAccessProvider`, `UserAccessDevice`, `IngressConfig`, `IngressRule`,
+`SiteToSiteConfig` and `SiteToSiteTunnel` follow below.
 
 | Field        | Type                | JSON Tag           | Description                     |
 |--------------|---------------------|--------------------|---------------------------------|
 | `Relay`      | `*RelayConfig`      | `"relay"`          | Relay request: whether this bridge relays, on which UDP port, and the peers whose first relay it is |
 | `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access providers; `null` or absent serves no provider and deletes every provider's key file |
 | `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress rules; `null` or absent closes every public listener |
-| `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site VPN configuration  |
+| `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site tunnels; `null` or absent serves no tunnel and deletes every tunnel's key file |
 
 **RelayConfig**
 
@@ -385,6 +388,52 @@ a certificate the bridge obtains from the account of the block's `ACME` member.
 | `TargetAddress` | `string` | `"target_address"`       | Target node's mesh address, IPv4 or IPv6, without brackets |
 | `TargetPort`    | `int`    | `"target_port"`          | Port dialed on the target, 1 to 65535        |
 | `CertificateSecretName` | `string` | `"certificate_secret_name,omitempty"` | Secret of the bridge's Project that holds a `terminate` rule's certificate chain and key, one PEM document; empty on every other mode. The bridge fetches it in the version the pull's `secrets` block lists. See [Certificates from the Secret Store](/reference/bridge/public-ingress#certificates-from-the-secret-store) |
+
+**SiteToSiteConfig**
+
+The `bridge.site_to_site` block, the control plane's `NodeStateBridgeSiteToSite`,
+which it delivers since
+[plexsphere/plexsphere#1109](https://github.com/plexsphere/plexsphere/pull/1109).
+A bridge serves its tunnels when `Enabled` is true and its local configuration
+does not opt out with `bridge.site_to_site_enabled: false`; a bridge that opts
+out serves no tunnel whatever the block says and reports `opted_out` in its
+[site-to-site status report](#site-to-site-status). The block is applied whole:
+a tunnel a later pull no longer lists is torn down. A block in the shape before
+plexsphere/plexsphere#1107 decodes to tunnels without an id, which a bridge
+neither serves nor reports. See
+[Site-to-Site VPN](/reference/bridge/site-to-site-vpn).
+
+| Field     | Type                 | JSON Tag    | Description |
+|-----------|----------------------|-------------|-------------|
+| `Enabled` | `bool`               | `"enabled"` | The control plane's switch, `true` on every block it delivers. A block with `false` serves no tunnel and keeps the key files of the tunnels it lists |
+| `Tunnels` | `[]SiteToSiteTunnel` | `"tunnels"` | Every tunnel of the bridge Resource, by slug ascending; absent and `null` decode to none |
+
+**SiteToSiteTunnel**
+
+One tunnel of the block, the control plane's
+`NodeStateBridgeSiteToSiteTunnel`. Every tunnel carries `ID`, `Slug`, `Kind`,
+`RemoteHost`, `RemotePort` and `AllowedSubnets`; the other members follow from
+its kind. `SiteToSiteKindWireGuard`, `SiteToSiteKindIPsec` and
+`SiteToSiteKindOpenVPN` name the kinds, `"wireguard"`, `"ipsec"` and
+`"openvpn"`, and a Linux bridge serves all three. No member is a private key or
+the value of a Secret.
+
+| Field             | Type       | JSON Tag                        | Description |
+|-------------------|------------|---------------------------------|-------------|
+| `ID`              | `string`   | `"id"`                          | Tunnel id, a UUID; `ValidSiteToSiteTunnelID` checks it |
+| `Slug`            | `string`   | `"slug"`                        | Tunnel name within the bridge Resource |
+| `Kind`            | `string`   | `"kind"`                        | `wireguard`, `ipsec` or `openvpn` |
+| `RemoteHost`      | `string`   | `"remote_host"`                 | The remote site's host name of at most 253 characters, or its IP address |
+| `RemotePort`      | `int`      | `"remote_port"`                 | The remote site's port, 1 to 65535 |
+| `AllowedSubnets`  | `[]string` | `"allowed_subnets"`             | The 1 to 64 networks behind the remote site, in CIDR notation and in the order the operator wrote them |
+| `ListenPort`      | `int`      | `"listen_port,omitempty"`       | UDP port of a `wireguard` tunnel's interface |
+| `RemotePublicKey` | `string`   | `"remote_public_key,omitempty"` | The remote site's WireGuard public key of a `wireguard` tunnel, 44 characters of standard base64 that decode to 32 bytes |
+| `AuthSecretName`  | `string`   | `"auth_secret_name,omitempty"`  | The Secret that holds the tunnel's key as plain text: the preshared key of a `wireguard` tunnel, absent when it uses none, the IKE pre-shared key of an `ipsec` tunnel, or the static key of an `openvpn` tunnel |
+
+`ValidSiteToSiteTunnelID(s string) bool` applies the check of
+`ValidUserAccessProviderID`: a UUID in canonical form, in either case, other
+than the zero UUID, the id the control plane accepts in a site-to-site status
+report.
 
 **NodeStateBlock**
 
@@ -1378,6 +1427,81 @@ under [State](#state)).
 |---|---|
 | `(*ControlPlane).ReportUserAccessStatus(ctx, nodeID string, req UserAccessStatusRequest) (*UserAccessStatusResponse, error)` | Sends `PUT /v1/nodes/{node_id}/user-access-status` with the request as JSON and returns the receipt. It path-escapes the node ID and validates nothing |
 | `IsUserAccessStatusNotServed(err error) bool` | True for an `*APIError` with status `404` and any code but `user_access_status_node_gone`, and for a `501` carrying `user_access_status_not_provisioned`: the control plane does not serve the operation. False for everything else, a `404 user_access_status_node_gone` included |
+
+## Site-to-Site Status
+
+### `PUT /v1/nodes/{node_id}/site-to-site-status`
+
+Whether a bridge's local configuration serves site-to-site tunnels, which the
+control plane reads to refuse a tunnel no bridge would serve, and whether each
+tunnel of its pull is up and answered by its remote site. The control plane
+keeps the latest state per node and never ages it, and each report replaces the
+tunnel entries of the one before. The control plane's side is
+[plexsphere/plexsphere#1109](https://github.com/plexsphere/plexsphere/pull/1109).
+See [Control Plane API Endpoints](api-endpoints.md#site-to-site-status) for the
+wire example and error taxonomy, and
+[Site-to-Site VPN](../bridge/site-to-site-vpn.md) for how plexd derives the
+state and each entry.
+
+**SiteToSiteStatusRequest**
+
+| Field     | Type                       | JSON Tag              | Description |
+|-----------|----------------------------|-----------------------|-------------|
+| `State`   | `string`                   | `"state"`             | One of the `SiteToSiteState*` constants |
+| `Tunnels` | `[]SiteToSiteStatusTunnel` | `"tunnels,omitempty"` | One entry per reported tunnel, in the order of the pull, at most `MaxSiteToSiteStatusTunnels`; nil omits the member, which reads as no entries |
+
+**SiteToSiteStatusTunnel**, the control plane's
+`SiteToSiteStatusReportTunnel`. `Reason` is sent exactly when `Health` is
+`down`, `Established` exactly when it is `up`, and `PublicKey` only when it is
+`up`: plexd sends it for a `wireguard` tunnel that is up and never for an
+`ipsec` or `openvpn` one. `omitempty` drops an empty member, so a caller leaves
+every member it must not send empty, and `Established` nil:
+
+| Field         | Type     | JSON Tag                  | Description |
+|---------------|----------|---------------------------|-------------|
+| `ID`          | `string` | `"id"`                    | The tunnel's `id` from the pull, a UUID other than the zero UUID |
+| `Health`      | `string` | `"health"`                | One of the `SiteToSiteHealth*` constants |
+| `Reason`      | `string` | `"reason,omitempty"`      | A reason token of the grammar `^[a-z][a-z0-9_]{0,62}$`; exactly when `Health` is `down` |
+| `Established` | `*bool`  | `"established,omitempty"` | Whether the remote site answers: for a `wireguard` tunnel the latest handshake with the remote peer is at most 180 s old, for an `ipsec` tunnel the IKE and child security associations stand, and for an `openvpn` tunnel the peer is connected. A pointer, because `false` is a value the contract requires on a tunnel that is up: a nil pointer omits the member, a pointer to `false` sends `"established":false` |
+| `PublicKey`   | `string` | `"public_key,omitempty"`  | The public key of a `wireguard` tunnel's interface: 44 characters of standard base64 that decode to 32 bytes |
+
+A missing, `null` or unknown state, an unknown member, data after the report,
+more than `MaxSiteToSiteStatusTunnels` entries, an entry with a malformed id or
+a value outside its member's rule, and an entry that breaks the presence rules
+answer `400 malformed_site_to_site_status`; an opted-out report with entries
+and a repeated id answer `400 invalid_site_to_site_status`. A body over 64 KiB
+answers `413 site_to_site_status_body_too_large`. `ReportSiteToSiteStatus`
+checks none of this and sends the request as passed.
+
+**SiteToSiteStatusResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                    |
+|--------------|-------------|-----------------|--------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time of the report |
+
+**Constants**
+
+| Constant | Value | Description |
+|---|---|---|
+| `SiteToSiteStateEnabled` | `"enabled"` | The bridge's local configuration serves the site-to-site tunnels the state pull enables: `bridge.site_to_site_enabled` is absent or `true` |
+| `SiteToSiteStateOptedOut` | `"opted_out"` | The bridge's local configuration, `bridge.site_to_site_enabled: false`, rules site-to-site tunnels out: it serves no tunnel whatever the pull says |
+| `SiteToSiteHealthUp` | `"up"` | The bridge serves the tunnel |
+| `SiteToSiteHealthDown` | `"down"` | The bridge does not serve the tunnel; `Reason` says why |
+| `MaxSiteToSiteStatusTunnels` | `256` | The most entries one report carries; a bridge with more reports the first ones in the order of the pull |
+
+The reason tokens plexd sends, and what each means, are listed on
+[Site-to-Site VPN](../bridge/site-to-site-vpn.md); besides the contract's,
+plexd sends `invalid_tunnel`, `setup_failed` and `key_unavailable`, which the
+control plane stores as it stores any token of the grammar.
+`ValidSiteToSiteTunnelID` checks an entry's id (see `SiteToSiteTunnel` under
+[State](#state)).
+
+**Client and classifier**
+
+| Function | Description |
+|---|---|
+| `(*ControlPlane).ReportSiteToSiteStatus(ctx, nodeID string, req SiteToSiteStatusRequest) (*SiteToSiteStatusResponse, error)` | Sends `PUT /v1/nodes/{node_id}/site-to-site-status` with the request as JSON and returns the receipt. It path-escapes the node ID and validates nothing |
+| `IsSiteToSiteStatusNotServed(err error) bool` | True for an `*APIError` with status `404` and any code but `site_to_site_status_node_gone`, and for a `501` carrying `site_to_site_status_not_provisioned`: the control plane does not serve the operation. False for everything else, a `404 site_to_site_status_node_gone` included |
 
 ## Policy Status
 

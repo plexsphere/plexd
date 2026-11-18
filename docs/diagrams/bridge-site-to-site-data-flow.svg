@@ -1,57 +1,91 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="790" viewBox="0 0 1170 790" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Data flow of a site-to-site tunnel through a bridge node">
-<title>Data flow of a site-to-site tunnel through a bridge node</title>
-<rect width="1170" height="790" fill="#F6F5F1"/>
-<rect x="40" y="190" width="790" height="560" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="992" viewBox="0 0 1170 992" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Data flow of site-to-site tunnels through a bridge node">
+<title>Data flow of site-to-site tunnels through a bridge node</title>
+<rect width="1170" height="992" fill="#F6F5F1"/>
+<rect x="40" y="190" width="790" height="762" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
 <text x="56" y="223.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
-<rect x="90" y="40" width="320" height="65" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
-<text x="250" y="69.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">External network</text>
-<text x="250" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">remote site</text>
-<rect x="70" y="260" width="280" height="108" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="210" y="289.2" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">S2S WireGuard</text>
-<text x="210" y="313.2" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">interfaces</text>
-<text x="210" y="333.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg-s2s-{id}</text>
-<text x="210" y="353.55" font-size="17" fill="#55606E" text-anchor="middle">ports 51823, …</text>
-<rect x="500" y="260" width="300" height="108" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="650" y="299.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Mesh WireGuard</text>
-<text x="650" y="323.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">interface</text>
-<text x="650" y="343.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd0</text>
-<rect x="930" y="282" width="200" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="1030" y="311.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Mesh peers</text>
-<text x="1030" y="331.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.42.0.0/16</text>
-<polyline points="250,114 250,251" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<rect x="90" y="40" width="320" height="64" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="250" y="69.4" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">Remote site</text>
+<text x="250" y="89.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">allowed_subnets</text>
+<rect x="70" y="260" width="280" height="102" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="210" y="289.2" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Tunnel links</text>
+<text x="210" y="309.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg-s2s-a0a0a0e1</text>
+<text x="210" y="328.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">xf-s2s-a0a0a0e2</text>
+<text x="210" y="347.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ov-s2s-a0a0a0e3</text>
+<rect x="500" y="260" width="300" height="102" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="650" y="296.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">Mesh WireGuard</text>
+<text x="650" y="320.4" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">interface</text>
+<text x="650" y="340.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">plexd0</text>
+<rect x="930" y="248.5" width="200" height="125" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1030" y="277.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Mesh peers</text>
+<text x="1030" y="298" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">10.42.0.0/16</text>
+<text x="1030" y="318.15" font-size="17" fill="#55606E" text-anchor="middle">route the site's</text>
+<text x="1030" y="338.55" font-size="17" fill="#55606E" text-anchor="middle">networks through</text>
+<text x="1030" y="358.95" font-size="17" fill="#55606E" text-anchor="middle">the bridge</text>
+<polyline points="250,113 250,251" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
 <polygon points="250,260 244,247 256,247" fill="#2F8A57"/>
-<polygon points="250,105 256,118 244,118" fill="#2F8A57"/>
-<text x="260" y="153.45" font-size="17" fill="#55606E">WireGuard tunnel (UDP)</text>
-<polyline points="359,314 491,314" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
-<polygon points="500,314 487,320 487,308" fill="#2F8A57"/>
-<polygon points="350,314 363,308 363,320" fill="#2F8A57"/>
-<text x="425" y="303.45" font-size="17" fill="#55606E" text-anchor="middle">route</text>
-<polyline points="809,314 921,314" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
-<polygon points="930,314 917,320 917,308" fill="#2F8A57"/>
-<polygon points="800,314 813,308 813,320" fill="#2F8A57"/>
-<rect x="70" y="428" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="210" y="455.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">VPNController</text>
-<text x="210" y="476.15" font-size="17" fill="#55606E" text-anchor="middle">WireGuard operations</text>
-<polyline points="210,428 210,377" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
-<polygon points="210,368 216,381 204,381" fill="#2F8A57"/>
-<rect x="70" y="532" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="210" y="559.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">RouteController</text>
-<text x="210" y="580.15" font-size="17" fill="#55606E" text-anchor="middle">OS routing operations</text>
-<polyline points="210,492 210,532" fill="none" stroke="#7D8794" stroke-width="2.5"/>
-<rect x="500" y="428" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#B38A00" stroke-width="2"/>
-<text x="650" y="465.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#6F5600" text-anchor="middle">bridge_config_updated</text>
-<rect x="500" y="532" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="650" y="571" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">reconcile</text>
-<rect x="500" y="656" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="650" y="693.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteReconcileHandler</text>
-<polyline points="650,492 650,523" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="650,532 644,519 656,519" fill="#3A4452"/>
-<polyline points="650,596 650,647" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="650,656 644,643 656,643" fill="#3A4452"/>
-<text x="640" y="631.95" font-size="17" fill="#55606E" text-anchor="end">desired bridge state</text>
-<rect x="930" y="428" width="200" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
-<text x="1030" y="467" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control plane</text>
-<polyline points="930,460 809,460" fill="none" stroke="#B38A00" stroke-width="2.5"/>
-<polygon points="800,460 813,454 813,466" fill="#B38A00"/>
-<text x="880" y="449.45" font-size="17" fill="#55606E" text-anchor="middle">SSE</text>
+<polygon points="250,104 256,117 244,117" fill="#2F8A57"/>
+<text x="260" y="152.95" font-size="17" fill="#55606E">WireGuard, IPsec or OpenVPN</text>
+<polyline points="359,311 491,311" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="500,311 487,317 487,305" fill="#2F8A57"/>
+<polygon points="350,311 363,305 363,317" fill="#2F8A57"/>
+<text x="425" y="259.55" font-size="17" fill="#55606E" text-anchor="middle">routes,</text>
+<text x="425" y="279.95" font-size="17" fill="#55606E" text-anchor="middle">forwarding,</text>
+<text x="425" y="300.35" font-size="17" fill="#55606E" text-anchor="middle">source rewrite</text>
+<polyline points="809,311 921,311" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="930,311 917,317 917,305" fill="#2F8A57"/>
+<polygon points="800,311 813,305 813,317" fill="#2F8A57"/>
+<rect x="70" y="422" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="449.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">VPNController</text>
+<text x="210" y="470.15" font-size="17" fill="#55606E" text-anchor="middle">one link per tunnel</text>
+<polyline points="210,422 210,371" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="210,362 216,375 204,375" fill="#2F8A57"/>
+<rect x="70" y="526" width="280" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="210" y="553.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteManager</text>
+<text x="210" y="574.15" font-size="17" fill="#55606E" text-anchor="middle">one entry per tunnel</text>
+<polyline points="210,486 210,526" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="500" y="422" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#B38A00" stroke-width="2"/>
+<text x="650" y="459.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#6F5600" text-anchor="middle">bridge_config_updated</text>
+<rect x="500" y="526" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="650" y="565" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">reconcile</text>
+<rect x="500" y="650" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="650" y="687.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteReconcileHandler</text>
+<polyline points="650,486 650,517" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="650,526 644,513 656,513" fill="#3A4452"/>
+<polyline points="650,590 650,641" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="650,650 644,637 656,637" fill="#3A4452"/>
+<text x="640" y="625.95" font-size="17" fill="#55606E" text-anchor="end">desired bridge state</text>
+<rect x="930" y="422" width="200" height="64" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="1030" y="461" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control plane</text>
+<polyline points="930,454 809,454" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="800,454 813,448 813,460" fill="#B38A00"/>
+<text x="880" y="443.45" font-size="17" fill="#55606E" text-anchor="middle">SSE</text>
+<rect x="70" y="630" width="252" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="196" y="658.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">InterfaceKeyStore</text>
+<text x="196" y="677.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&lt;data_dir&gt;/site-to-site</text>
+<polyline points="70,558 55,558 55,662 70,662" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="70" y="734" width="252" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="196" y="761.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">RouteController,</text>
+<text x="196" y="782.15" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">MeshSourceRewriter</text>
+<polyline points="70,558 55,558 55,766 70,766" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<rect x="70" y="838" width="252" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="196" y="865.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">TunnelProvider</text>
+<text x="196" y="886.15" font-size="17" fill="#55606E" text-anchor="middle">ipsec, openvpn</text>
+<polyline points="70,558 55,558 55,870 70,870" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<polyline points="500,682 425,682 425,558 359,558" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="350,558 363,552 363,564" fill="#3A4452"/>
+<text x="387.5" y="547.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Apply()</text>
+<rect x="500" y="754" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="650" y="781.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSitePullHandler</text>
+<text x="650" y="802.15" font-size="17" fill="#55606E" text-anchor="middle">secret inventory, retry</text>
+<polyline points="800,558 815,558 815,786 809,786" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="800,786 813,780 813,792" fill="#3A4452"/>
+<polyline points="500,786 385,786 385,578 359,578" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="350,578 363,572 363,584" fill="#3A4452"/>
+<rect x="500" y="858" width="300" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="650" y="895.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteStatusReporter</text>
+<polyline points="332,590 332,890 491,890" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="500,890 487,896 487,884" fill="#3A4452"/>
+<polyline points="800,890 1030,890 1030,495" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="1030,486 1036,499 1024,499" fill="#2457C5"/>
+<text x="915" y="879.45" font-size="17" fill="#55606E" text-anchor="middle">status report</text>
 </svg>

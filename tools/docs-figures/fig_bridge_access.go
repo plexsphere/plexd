@@ -39,6 +39,9 @@ type accSpec struct {
 	transport []Line
 	entry     []Line
 	link      []Line
+	// peers labels the mesh peers outside the frame; nil gives their
+	// name and the mesh prefix alone.
+	peers []Line
 	// stack lists the parts of plexd under the entry interface, top
 	// down. The first one creates the entry interface; a relation
 	// joins each to the next.
@@ -94,7 +97,11 @@ func accDataFlow(f *Figure, s accSpec) *accLayout {
 	}})
 	h := max(l.entry.h, l.mesh.h)
 	l.entry.h, l.mesh.h = h, h
-	peers := f.box(roleAgent, spec{x: accOutX, w: accOutW, lines: []Line{name("Mesh peers"), code("10.42.0.0/16")}})
+	peerLines := s.peers
+	if peerLines == nil {
+		peerLines = []Line{name("Mesh peers"), code("10.42.0.0/16")}
+	}
+	peers := f.box(roleAgent, spec{x: accOutX, w: accOutW, lines: peerLines})
 	peers.y = l.mesh.cy() - peers.h/2
 
 	f.arrow(both, pt{accEntryX, source.y + source.h}, l.entry.topAt(accEntryX))
@@ -185,22 +192,83 @@ func bridgeUserAccessDataFlow() *Figure {
 	return f
 }
 
-// bridgeSiteToSiteDataFlow draws the data flow of a site-to-site
-// tunnel for docs/reference/bridge/site-to-site-vpn.md (Data Flow).
+// s2sPeers labels the mesh peers of the two site-to-site figures: every
+// node routes the networks behind a bridge's tunnels, which its pull
+// lists as the bridge's routed_subnets, through the bridge.
+var s2sPeers = []Line{name("Mesh peers"), code("10.42.0.0/16"), body("route the site's"), body("networks through"), body("the bridge")}
+
+// s2sLinks are the routes, the forwarding and the source rewrite the
+// site-to-site manager sets up between a tunnel's link and plexd0.
+var s2sLinks = []Line{body("routes,"), body("forwarding,"), body("source rewrite")}
+
+// bridgeSiteToSiteDataFlow draws the data flow of the site-to-site
+// tunnels for docs/reference/bridge/site-to-site-vpn.md (Data Flow):
+// the remote site reaches plexd0 through the link of its tunnel, the
+// manager routes the tunnel's allowed_subnets into the link and
+// rewrites the source of what the link forwards into the mesh, and the
+// mesh peers route the site's networks through the bridge. The
+// reconcile handler and the pull handler feed the manager, and the
+// reporter sends the state of each tunnel.
 func bridgeSiteToSiteDataFlow() *Figure {
-	f := &Figure{Name: "bridge-site-to-site-data-flow", Title: "Data flow of a site-to-site tunnel through a bridge node"}
+	f := &Figure{Name: "bridge-site-to-site-data-flow", Title: "Data flow of site-to-site tunnels through a bridge node"}
 	l := accDataFlow(f, accSpec{
-		source:    []Line{name("External network"), body("remote site")},
-		transport: []Line{body("WireGuard tunnel (UDP)")},
-		entry:     []Line{name("S2S WireGuard"), name("interfaces"), code("wg-s2s-{id}"), body("ports 51823, …")},
-		link:      []Line{body("route")},
+		source:    []Line{name("Remote site"), code("allowed_subnets")},
+		transport: []Line{body("WireGuard, IPsec or OpenVPN")},
+		entry:     []Line{name("Tunnel links"), code("wg-s2s-a0a0a0e1"), code("xf-s2s-a0a0a0e2"), code("ov-s2s-a0a0a0e3")},
+		link:      s2sLinks,
+		peers:     s2sPeers,
 		stack: [][]Line{
-			{codeName("VPNController"), body("WireGuard operations")},
-			{codeName("RouteController"), body("OS routing operations")},
+			{codeName("VPNController"), body("one link per tunnel")},
+			{codeName("SiteToSiteManager"), body("one entry per tunnel")},
 		},
 	})
 	hd := accReconcile(f, l, "SiteToSiteReconcileHandler")
-	l.accClose(hd, l.stack[len(l.stack)-1])
+	mgr := l.stack[1]
+
+	// What the manager drives hangs off its left side, a little narrower
+	// than the column, so the path to the reporter runs down the free
+	// strip on their right.
+	const partW = 252.0
+	busX := accLeftX - 15
+	var parts []*node
+	for i, lines := range [][]Line{
+		{codeName("InterfaceKeyStore"), code("<data_dir>/site-to-site")},
+		{codeName("RouteController,"), codeName("MeshSourceRewriter")},
+		{codeName("TunnelProvider"), body("ipsec, openvpn")},
+	} {
+		n := f.box(roleAgent, spec{x: accLeftX, y: l.accRow(i + 2), w: partW, h: accRowH, lines: lines})
+		f.arrow(relation, hvh(mgr.left(), n.left(), busX)...)
+		parts = append(parts, n)
+	}
+
+	// The reconcile handler hands the block to the manager through the
+	// gap between the two columns, as in the user access figure. The pull
+	// handler runs on every successful pull and enters the manager lower,
+	// on a path left of the first, so the two never cross.
+	applyX := (accLeftX + accLeftW + accRightX) / 2
+	f.arrow(flow, hvh(hd.left(), mgr.right(), applyX)...)
+	f.label(pt{(accLeftX + accLeftW + applyX) / 2, mgr.cy()}, code("Apply()"))
+	pull := f.box(roleAgent, spec{x: accRightX, y: l.accRow(3) + 20, w: accRightW, h: accRowH, lines: []Line{
+		codeName("SiteToSitePullHandler"), body("secret inventory, retry"),
+	}})
+	rec := pt{accRightX + accRightW, l.accRow(1) + accRowH/2}
+	f.arrow(flow, hvh(rec, pull.right(), accRightX+accRightW+15)...)
+	f.arrow(flow, hvh(pull.left(), mgr.rightAt(mgr.cy()+20), applyX-40)...)
+
+	// The manager's entries reach the reporter down the strip right of
+	// the parts it drives.
+	rep := f.box(roleAgent, spec{x: accRightX, y: l.accRow(4) + 20, w: accRightW, h: accRowH, lines: []Line{
+		codeName("SiteToSiteStatusReporter"),
+	}})
+	stripX := accLeftX + partW + 10
+	f.arrow(flow, vh(mgr.bottomAt(stripX), rep.left())...)
+
+	// The reporter sends to the control plane box accReconcile drew in
+	// the outside column.
+	cpBottom := pt{accOutX + accOutW/2, l.accRow(0) + accRowH}
+	f.arrow(call, hv(rep.right(), cpBottom)...)
+	f.label(pt{(accRightX + accRightW + cpBottom.X) / 2, rep.cy()}, body("status report"))
+	l.accClose(rep, parts[len(parts)-1])
 	return f
 }
 
@@ -242,28 +310,51 @@ func bridgeVpnProvidersDataFlow() *Figure {
 	return f
 }
 
-// bridgeTunnelProvidersDataFlow draws the data flow of a site-to-site
-// tunnel through a tunnel provider for
-// docs/reference/bridge/tunnel-providers.md (Data Flow).
+// bridgeTunnelProvidersDataFlow draws the data flow of an ipsec or
+// openvpn site-to-site tunnel for
+// docs/reference/bridge/tunnel-providers.md (Data Flow): the manager
+// creates the tunnel's link through the VPNController and hands the
+// tunnel with its key to the provider, which writes the daemon's files
+// and runs its commands through the CommandExecutor.
 func bridgeTunnelProvidersDataFlow() *Figure {
 	f := &Figure{Name: "bridge-tunnel-providers-data-flow", Title: "Data flow of a site-to-site tunnel through a tunnel provider"}
 	l := accDataFlow(f, accSpec{
-		source:    []Line{name("External network"), body("remote site")},
-		transport: []Line{body("IPsec or OpenVPN tunnel")},
-		entry:     []Line{name("IPsec / OpenVPN"), name("tunnels"), code("ipsec-{id}, tun-{id}")},
-		link:      []Line{body("route")},
+		source:    []Line{name("Remote site"), body("IKEv2 or OpenVPN peer")},
+		transport: []Line{body("IPsec (IKEv2) or OpenVPN")},
+		entry:     []Line{name("xfrm interface"), name("or tun device"), code("xf-s2s-a0a0a0e2"), code("ov-s2s-a0a0a0e3")},
+		link:      s2sLinks,
+		peers:     s2sPeers,
 		stack: [][]Line{
-			{codeName("TunnelProvider"), body("IPsec, OpenVPN")},
-			{codeName("CommandExecutor"), body("CLI invocations")},
-			{codeName("RouteController"), body("OS routing operations")},
+			{codeName("VPNController"), body("xfrm interface, tun device")},
+			{codeName("SiteToSiteManager"), body("one entry per tunnel")},
 		},
-		fromFirst: true,
 	})
-	prov := l.stack[0]
-	mgr := f.box(roleAgent, spec{x: accRightX, y: prov.y, w: accRightW, lines: []Line{
-		codeName("SiteToSiteManager"), body("delegates when"), code(`tunnel.ProviderType != ""`), code(`&& != "wireguard"`),
+	mgr := l.stack[1]
+
+	// The tunnel's key travels with the call into the provider.
+	prov := f.box(roleAgent, spec{x: accRightX, y: mgr.y, w: accRightW, h: accRowH, lines: []Line{
+		codeName("IPsecProvider"), codeName("OpenVPNProvider"),
 	}})
-	f.arrow(flow, mgr.leftAt(prov.cy()), prov.right())
-	l.accClose(mgr, l.stack[len(l.stack)-1])
+	f.arrow(secretFlow, mgr.right(), prov.left())
+	f.label(mid(mgr.right(), prov.left()), code("CreateTunnel()"), body("with the key"))
+
+	exec := f.box(roleAgent, spec{x: accRightX, y: l.accRow(2), w: accRightW, h: accRowH, lines: []Line{
+		codeName("CommandExecutor"), body("swanctl, openvpn"),
+	}})
+	f.arrow(flow, prov.bottom(), exec.top())
+	daemons := f.box(roleExternal, spec{x: accRightX, y: l.accRow(3), w: accRightW, lines: []Line{
+		name("strongSwan, OpenVPN"), body("the host's charon,"), body("one openvpn per tunnel"),
+	}})
+	f.arrow(flow, exec.bottom(), daemons.top())
+
+	// The provider writes the daemon's files, the key among them, under
+	// the run directory, left of the column, so the path leaves the
+	// provider below the call that comes in.
+	files := f.store(roleSecret, spec{x: accLeftX, y: l.accRow(2), w: accLeftW, lines: []Line{
+		name("Tunnel files, 0600"), code("/var/run/plexd/swanctl"), code("/run/plexd/tunnels"),
+	}})
+	writeX := (accLeftX + accLeftW + accRightX) / 2
+	f.arrow(secretFlow, hvh(prov.leftAt(prov.cy()+20), files.right(), writeX)...)
+	l.accClose(daemons, files)
 	return f
 }

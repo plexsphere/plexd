@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="604" viewBox="0 0 1170 604" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Containers of the systemd end-to-end test">
+<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="736" viewBox="0 0 1170 736" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Containers of the systemd end-to-end test">
 <title>Containers of the systemd end-to-end test</title>
-<rect width="1170" height="604" fill="#F6F5F1"/>
-<rect x="40" y="40" width="1090" height="524" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<rect width="1170" height="736" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1090" height="656" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
 <text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">plexd-systemd-e2e</text>
 <text x="311" y="71.45" font-size="17" fill="#55606E">Docker network</text>
 <rect x="70" y="181" width="200" height="102" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
@@ -56,4 +56,13 @@
 <polygon points="670,292 683,286 683,298" fill="#2F8A57"/>
 <text x="835" y="388.1" font-size="17" fill="#55606E">WireGuard</text>
 <text x="835" y="407.55" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">plexd0 :51820</text>
+<rect x="850" y="583" width="250" height="83" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="975" y="612.3" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">site</text>
+<text x="975" y="632.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg0 10.40.0.1/16</text>
+<text x="975" y="651.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:7201 (nc -l)</text>
+<polyline points="679,300 801,300 801,624.5 841,624.5" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="850,624.5 837,630.5 837,618.5" fill="#2F8A57"/>
+<polygon points="670,300 683,294 683,306" fill="#2F8A57"/>
+<text x="791" y="575.1" font-size="17" fill="#55606E" text-anchor="end">WireGuard</text>
+<text x="791" y="594.55" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="end">:51930 (wg-s2s-…)</text>
 </svg>

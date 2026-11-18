@@ -78,6 +78,7 @@ type PeerStat struct {
     LastHandshake time.Time      // zero when no handshake has completed
     RxBytes       uint64
     TxBytes       uint64
+    AllowedIPs    []netip.Prefix // in the device's order; nil when the peer has none
 }
 
 // PeerStatsReader is implemented by controllers that can read peer runtime state.
@@ -86,7 +87,7 @@ type PeerStatsReader interface {
 }
 ```
 
-`NetlinkController`, `UserspaceBackend`, `DarwinController` and `WindowsController` implement it. `NetlinkController.PeerStats` opens a wgctrl client per call, as `AddPeer` does, reads the device with `client.Device(name)` and maps each `wgtypes.Peer`: the key bytes, `Endpoint.AddrPort()` when the peer has an endpoint, `LastHandshakeTime` (wgctrl already yields a zero time when no handshake has completed), and the receive and transmit byte counters. Its errors are `wireguard: peer stats: open wgctrl: <cause>` and `wireguard: peer stats: read device: <cause>`; a missing interface wraps `os.ErrNotExist`. `DarwinController` and `WindowsController` delegate to the [userspace backend](#userspace-backend).
+`NetlinkController`, `UserspaceBackend`, `DarwinController` and `WindowsController` implement it. `NetlinkController.PeerStats` opens a wgctrl client per call, as `AddPeer` does, reads the device with `client.Device(name)` and maps each `wgtypes.Peer`: the key bytes, `Endpoint.AddrPort()` when the peer has an endpoint, `LastHandshakeTime` (wgctrl already yields a zero time when no handshake has completed), the receive and transmit byte counters, and the allowed IPs as prefixes in the device's order, an IPv4-mapped address unmapped and an entry whose mask does not fit its address left out. Its errors are `wireguard: peer stats: open wgctrl: <cause>` and `wireguard: peer stats: read device: <cause>`; a missing interface wraps `os.ErrNotExist`. `DarwinController` and `WindowsController` delegate to the [userspace backend](#userspace-backend).
 
 ## Userspace backend
 
@@ -110,13 +111,13 @@ func (b *UserspaceBackend) PeerStats(name string) ([]PeerStat, error)
 - **`SetPrivateKey`**, **`AddPeer`** and **`RemovePeer`** return an error wrapping `os.ErrNotExist` for an unknown device. `AddPeer` upserts by public key and validates its input in the same order and with the same error text as `NetlinkController`; `RemovePeer` is silent for a public key with no matching peer.
 - **`PeerStats`** implements [`PeerStatsReader`](#peerstatsreader). For an unknown device it returns `wireguard: peer stats: <cause>` wrapping `os.ErrNotExist`. It reads the device's UAPI dump with `device.Device.IpcGet` (a failure returns `wireguard: peer stats: read device: <cause>`) and parses it with `parseUAPIPeerStats`.
 
-`parseUAPIPeerStats` splits the dump into `key=value` lines. `public_key` (64 hex characters) starts a new peer; `endpoint` parses with `netip.ParseAddrPort`; `rx_bytes` and `tx_bytes` parse as `uint64`; `last_handshake_time_sec` and `last_handshake_time_nsec` give `time.Unix(sec, nsec)`. Both at 0 give the zero time. The parser does not copy wgctrl's `sec > 0 && nsec > 0` check, which drops a handshake that lands on a whole second. Empty lines and every other key (`private_key`, `listen_port`, `fwmark`, `preshared_key`, `protocol_version`, `persistent_keepalive_interval`, `allowed_ip`, `errno`) are skipped. A dump with device keys only yields an empty slice.
+`parseUAPIPeerStats` splits the dump into `key=value` lines. `public_key` (64 hex characters) starts a new peer; `endpoint` parses with `netip.ParseAddrPort`; `rx_bytes` and `tx_bytes` parse as `uint64`; `last_handshake_time_sec` and `last_handshake_time_nsec` give `time.Unix(sec, nsec)`. Both at 0 give the zero time. Each `allowed_ip` line parses with `netip.ParsePrefix` and appends one prefix to `AllowedIPs`. The parser does not copy wgctrl's `sec > 0 && nsec > 0` check, which drops a handshake that lands on a whole second. Empty lines and every other key (`private_key`, `listen_port`, `fwmark`, `preshared_key`, `protocol_version`, `persistent_keepalive_interval`, `errno`) are skipped. A dump with device keys only yields an empty slice.
 
 | Input | Error |
 |---|---|
 | A line without `=` | `wireguard: peer stats: line <n> has no '='` |
 | A peer key before any `public_key` | `wireguard: peer stats: <key> before public_key` |
-| An unparseable value of one of the six peer keys | `wireguard: peer stats: parse <key>: <cause>` |
+| An unparseable value of one of the seven peer keys | `wireguard: peer stats: parse <key>: <cause>` |
 
 No error text quotes a line or the value of a skipped key, because the dump carries `private_key` and `preshared_key`.
 
@@ -138,7 +139,7 @@ wireguard-go's own log lines are adapted to plexd's `slog.Logger`, appearing at 
 
 macOS names a WireGuard device `utunN` and accepts no other name. `tun.CreateTUN` is asked for `utun`, which lets the kernel pick the next free unit; an `interface_name` that already names a unit (`utun7`) is passed through, so an operator can pin one.
 
-Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, for the [pf policy rules](./pf-wfp-firewall.md#interface-names), for the readiness check and for the route calls the [site-to-site manager](../bridge/site-to-site-vpn.md#sitetositemanager) makes for a tunnel, because `net.InterfaceByName` knows only `utunN`. The first three resolve it through `Manager.OSInterfaceName()`, the last through the bridge controller's `OSInterfaceName`.
+Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, for the [pf policy rules](./pf-wfp-firewall.md#interface-names), for the readiness check and for the routes of a peer's [routed subnets](#routed-subnets), because `net.InterfaceByName` knows only `utunN`. All four resolve it through `Manager.OSInterfaceName()`. A macOS bridge serves no site-to-site tunnel, so no tunnel route names a utun (see [Site-to-Site VPN](../bridge/site-to-site-vpn.md)).
 
 The pairing is logged once per interface, at `info`:
 
@@ -158,7 +159,7 @@ utun device created  component=wireguard interface=plexd0 utun=utun4
 | `SetInterfaceUp` | `ifconfig utunN up` |
 | `DeleteInterface` | none |
 
-A utun is point-to-point, so the `inet` form takes the destination address after the local one, and the alias installs a host route only. Linux gets the route for the whole prefix implicitly when the address is added, so `ConfigureAddress` adds it here explicitly; otherwise every packet for a mesh peer would leave through the default route. A `/32` or `/128` needs no route, since the alias already installed it. Routes for peer `AllowedIPs` beyond the address prefix belong to the bridge route controller, as they do on Linux.
+A utun is point-to-point, so the `inet` form takes the destination address after the local one, and the alias installs a host route only. Linux gets the route for the whole prefix implicitly when the address is added, so `ConfigureAddress` adds it here explicitly; otherwise every packet for a mesh peer would leave through the default route. A `/32` or `/128` needs no route, since the alias already installed it. A peer's allowed IPs beyond the address prefix, its accepted [routed subnets](#routed-subnets), get their routes from the manager through its `PeerRouter`, the platform's route controller, as they do on Linux.
 
 `route(8)` reports every routing-socket failure in its output and still exits 0, so the controller reads that output whatever the exit status is. `File exists` is success, matching the idempotency `NetlinkRouteController` grants `EEXIST`; any other line carrying `writing to routing socket:` fails with the command line and the message `route(8)` printed. Trusting the exit status would leave the mesh prefix on the default route with nothing recording why.
 
@@ -199,7 +200,7 @@ The adapter is recorded before the wait starts, so the wait runs outside the con
 | `SetInterfaceUp` | nothing |
 | `DeleteInterface` | nothing beyond closing the device |
 
-The address carries its own prefix length, and Windows installs the on-link route for that prefix itself, the way Linux does when an address is added. macOS is the exception that needs the route added by hand. Routes for peer `AllowedIPs` beyond the address prefix belong to the bridge route controller, as they do everywhere else. An address already on the adapter is reported as `ERROR_OBJECT_ALREADY_EXISTS`, which the controller treats as success.
+The address carries its own prefix length, and Windows installs the on-link route for that prefix itself, the way Linux does when an address is added. macOS is the exception that needs the route added by hand. A peer's allowed IPs beyond the address prefix, its accepted [routed subnets](#routed-subnets), get their routes from the manager through its `PeerRouter`, the platform's route controller, as they do everywhere else. An address already on the adapter is reported as `ERROR_OBJECT_ALREADY_EXISTS`, which the controller treats as success.
 
 The MTU is programmed once at creation, to 1420, and again on every `SetMTU`: for a `Config.MTU` that pins another value, or when [MTU detection](#mtu-detection) changes it at startup or on a later round. Creating the adapter records the MTU in wireguard-go's own field without telling the interface, and no OS event ever reports an MTU change back on Windows, so the controller both programs the interface and pushes the value to the running device. With a `Config.MTU` of `0`, 1420 is the starting value, as it is on Linux and macOS, and detection can lower it from there.
 
@@ -279,7 +280,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | Method          | Signature                                                                    | Description                                                    |
 |-----------------|------------------------------------------------------------------------------|----------------------------------------------------------------|
 | `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Chooses the MTU, probing the uplink when no MTU is pinned, then creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU when it is pinned or not 1420, brings up. See [Setup Sequence](#setup-sequence) |
-| `Teardown`      | `() error`                                                                   | Deletes the WireGuard interface                                |
+| `Teardown`      | `() error`                                                                   | Removes the routes of the [routed subnets](#routed-subnets) it programmed, then deletes the WireGuard interface |
 | `OSInterfaceName` | `() string`                                                                | The name the OS knows the interface by (`utunN` on macOS), else `Config.InterfaceName` |
 | `AddPeer`       | `(peer api.Peer) error`                                                      | Writes the peer with the first entry of its dial order and starts its endpoint selection; updates index |
 | `RemovePeer`    | `(publicKey []byte) error`                                                   | Removes peer by raw public key                                 |
@@ -290,7 +291,8 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `MeshPeerStats` | `() ([]MeshPeerStat, error)`                                                 | Reads the mesh interface's peers and maps them to node IDs; see [Mesh peer stats](#mesh-peer-stats) |
 | `MeshPrefix`    | `() netip.Prefix`                                                            | The Domain mesh prefix the interface was set up with; see [Mesh prefix](#mesh-prefix) |
 | `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the stored peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
-| `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first. Call it before the handler runs. See [Dial order](#dial-order) |
+| `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first and to skip a routed subnet inside a local network. Call it before the handler runs. See [Dial order](#dial-order) |
+| `SetPeerRouter` | `(r PeerRouter)`                                                             | Sets the router the reconcile handler programs the routes of the peers' routed subnets with. Call it before the handler runs. Without one the manager programs the routed subnets as allowed IPs and adds no route. See [Routed subnets](#routed-subnets) |
 | `SetRelayProbe` | `(send func(meshIP netip.Addr) error)`                                       | Sets the function endpoint selection sends the relay liveness probe with; `plexd up` passes `SendRelayProbe`. Call it before `RunEndpointSelection`. Without it no probe goes out. See [Relay liveness probe](#relay-liveness-probe) |
 | `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, until `ctx` is done; see [Endpoint selection](#endpoint-selection) |
 | `SetPathMTUProbe` | `(probe func(context.Context) (int, error))`                              | Sets the function `Setup` and `RunMTUProbe` measure the uplink's path MTU with. Call it before `Setup`. See [MTU detection](#mtu-detection) |
@@ -300,7 +302,7 @@ The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint th
 
 ### Programmed peers
 
-The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. It also records whether the peer is [relayed](#the-trial), last seen connected over one of its relays, when a relay re-dial last replaced its device peer, the `LastHandshake` at the last pass that found it fresh, the session a [move back](#the-trial) was last written for, and the [relay liveness probe](#relay-liveness-probe)'s state: the device's `RxBytes` for the peer at the last pass, when the silence window started (the counter moved, the peer turned connected or came back on a relay, a pass followed a roam to another relay of its set, or a probe send failed), when the outstanding probe went out (zero when none is), and whether the last probe send failed. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths.
+The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. It also records whether the peer is [relayed](#the-trial), last seen connected over one of its relays, when a relay re-dial last replaced its device peer, the `LastHandshake` at the last pass that found it fresh, the session a [move back](#the-trial) was last written for, and the [relay liveness probe](#relay-liveness-probe)'s state: the device's `RxBytes` for the peer at the last pass, when the silence window started (the counter moved, the peer turned connected or came back on a relay, a pass followed a roam to another relay of its set, or a probe send failed), when the outstanding probe went out (zero when none is), and whether the last probe send failed. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, the [peer routes](#routed-subnets) follow the routed subnets of the stored peers, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths.
 
 ### Mesh prefix
 
@@ -322,7 +324,7 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 ```
 
 - It returns `ErrPeerStatsUnsupported` when the manager has no controller or the controller is not a `PeerStatsReader`, and wraps a read error as `wireguard: mesh peer stats: <cause>`.
-- It keeps only the device peers whose key `PeerIndex.NodeIDsByPublicKey` maps. A key the index does not know, such as one left on the device after a peer's key rotation, is dropped.
+- It keeps only the device peers whose key `PeerIndex.NodeIDsByPublicKey` maps. A key the index does not know, such as one two node IDs share, is dropped.
 - It keeps peers with no handshake (a zero `LastHandshake`), because the metrics report them.
 - It returns the result sorted by `NodeID`, and an empty, non-nil slice when nothing maps.
 - `Endpoint` passes through unfiltered. The handshake reporter applies the wire rules.
@@ -340,7 +342,7 @@ A peer's order is `api.Peer.Endpoints`, or `Endpoint` alone when `Endpoints` is 
 
 `UpdatePeer` checks its rules in this order:
 
-1. **No state, or a new key.** It behaves like `AddPeer` with the new order. WireGuard keys peers by public key, so a rotated key is a new device peer that has no endpoint yet. The new state is not relayed.
+1. **No state, or a new key.** It behaves like `AddPeer` with the new order. WireGuard keys peers by public key, so a rotated key is a new device peer that has no endpoint yet. The device peer of the old key is removed first: WireGuard moves to the new key only the allowed IPs its write names, so the old key would keep a routed subnet the update no longer lists. A failed removal fails the update and writes nothing, so the next run tries the rotation again. The new state is not relayed.
 2. **A relay taken away.** When the entry programmed is one of the peer's relays, the peer is relayed or not connected, and the update names relays, the peer moves at once if the relay programmed is not among them, or if the update's first relay changed and is not the relay programmed. A relayed peer on a standby it moved to on its own therefore follows the control plane once the control plane names a new first relay. A connected peer that is not relayed runs on a direct path WireGuard roamed to, which the move would cut, so rule 4 keeps it. `UpdatePeer` [dials](#relay-liveness-probe) the update's first relay on a fresh device peer, logs `wireguard: relay fallback changed, moving to the new relay`, and stores a new state at that relay's position: programmed now, not connected, relayed when the old state was, and the probe started over. A peer in its relay hold that never connected moves the same way, and its hold starts over on the new relay.
 3. **A relayed peer whose relay stays.** A [relayed](#the-trial) peer whose programmed relay is still among the update's relays keeps it, connected or not. This includes a standby it moved to on its own: a pull that still names the dead first relay first, or that names the standby first, does not move it back. The write carries an empty endpoint, the position moves to the relay's place in the new order, and the connected flag, the timestamp and the probe's state stay. A relayed peer that waits for its partner is never sent back to the first entry.
 4. **A connected peer.** The write carries an empty endpoint, which both controllers leave untouched on the device, so an endpoint WireGuard roamed to stays. It stores the new peer, sets the position to where the entry last programmed sits in the new order (0 when it is no longer there), and keeps the connected flag and the timestamp. A relayed peer gets here only when the update names no relays, and it stops being relayed.
@@ -642,7 +644,7 @@ if err := mgr.Teardown(); err != nil {
 
 1. Choose the MTU: `Config.MTU` when it is above 0; otherwise, with a probe set through `SetPathMTUProbe`, `MeshMTU` of the path MTU it measures, or 1420 when it returns an error; otherwise 1420. The probe runs before any controller call (see [At startup](#at-startup))
 2. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key. On Linux the kernel keeps a WireGuard link when the process that made it ends without its teardown, as a killed or crashed plexd does. `NetlinkController` therefore deletes a WireGuard link that already holds the name, with its addresses, routes and peers, creates the interface afresh and logs it at `warn`. A link of another type that holds the name fails the create with `wireguard: create interface: file exists: a <type> link holds the name <name>`
-3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
+3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, whose allowed IPs start with `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 4. `SetMTU(name, mtu)` — only if `Config.MTU > 0` or the chosen MTU is not 1420, the MTU every controller creates the device with
 5. `SetInterfaceUp(name)` — bring the interface up
 6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix)
@@ -672,7 +674,7 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |
 | `Error` | Peer operation failed (bulk) | `peer_id`, `error`                    |
 
-Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), and the reconcile handler the dial order lines in [Dial order](#dial-order).
+Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), and the reconcile handler the dial order lines in [Dial order](#dial-order) and the peer route lines in [Routed subnets](#routed-subnets).
 
 ## ReconcileHandler
 
@@ -692,13 +694,14 @@ type EdgePSKLookup interface {
 
 ### Processing Order
 
-1. **Removes** — `diff.PeersToRemove` (node IDs) via `RemovePeerByID`
+1. **Removes** — `diff.PeersToRemove` (node IDs) via `RemovePeerByID`; a node ID the peer index no longer holds is already gone and is skipped, because a failed cycle hands the same removal over again on the next tick
 2. **Updates** — `diff.PeersToUpdate` via `UpdatePeer`
 3. **Adds** — `diff.PeersToAdd` via `AddPeer`
+4. **Peer routes** — `syncPeerRoutes` routes the routed subnets of the peers now on the device through the mesh interface and removes the routes no peer lists any more (see [Routed subnets](#routed-subnets))
 
-Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, order, fallbacks, psk)`, where `order` is the peer's [dial order](#dial-order) and `fallbacks` its last `relays` entries, the relays that end it:
+Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, order, fallbacks, psk, routed)`, where `order` is the peer's [dial order](#dial-order), `fallbacks` its last `relays` entries, the relays that end it, and `routed` the entries of its `routed_subnets` that [`usableRoutedSubnets`](#routed-subnets) accepts:
 
-- `AllowedIPs` is derived locally as `mesh_ip/32`. The snapshot never sends allowed IPs. A `mesh_ip` that is not a bare IPv4 address fails the peer.
+- `AllowedIPs` is derived locally as `mesh_ip/32` followed by `routed`, in the list's order. The snapshot never sends allowed IPs. A `mesh_ip` that is not a bare IPv4 address fails the peer. `RoutedSubnets` carries `routed`, and is nil when it is empty.
 - `Endpoints` is the dial order and `Endpoint` its first entry, empty for an empty order. The manager programs the first entry and [endpoint selection](#endpoint-selection) moves along the order until a handshake completes. See [Dial order](#dial-order).
 - `Fallbacks` is the peer's relay set as it ends the order, in dial order, and nil for a peer without a relay. A candidate or direct endpoint equal to a relay is left out of the entries before the relays, so a relay it repeats is still in `Fallbacks`. [Endpoint selection](#the-trial) holds these entries longer and moves a relayed peer along them.
 - `PSK` is the key `psks.Lookup` returns for the peer's node ID and current `public_key`, base64-encoded. A PSK fetched for another public key is never returned, so a peer whose key changed gets no PSK until the store holds one for the new key. With no PSK the field stays empty, and the store writes the PSK through [`SetPeerPSK`](#installing-a-psk) once it arrives.
@@ -750,7 +753,58 @@ Refused candidates are counted in `dropped` and logged at `debug` as `wireguard:
 
 `ProgrammedEndpoint` returns what the pull gives a peer without its candidates: the direct `endpoint` when it is usable, the `fallback_endpoint` (the first relay) otherwise. `directRejected` is true only when the peer carried a non-empty `endpoint` that was refused, which is what the handler's `warn` line keys on. The node API's peer list shows this endpoint (see [Node API peer list](#node-api-peer-list)); the endpoint on the device is the one endpoint selection settles on.
 
-The differ compares `endpoint`, `fallback_endpoint`, `fallback_endpoints` and `endpoint_candidates`, the relays and the candidates in order, so a peer whose direct endpoint, relays or candidates appear, change, reorder or disappear lands in `PeersToUpdate` and is written again. A change of only a standby relay, or of the relays' order, updates the peer too. A missing and an empty `fallback_endpoints` or `endpoint_candidates` compare equal.
+The differ compares `endpoint`, `fallback_endpoint`, `fallback_endpoints`, `endpoint_candidates` and `routed_subnets`, the relays, the candidates and the routed subnets in order, so a peer whose direct endpoint, relays, candidates or routed subnets appear, change, reorder or disappear lands in `PeersToUpdate` and is written again. A change of only a standby relay, or of the relays' order, updates the peer too. A missing and an empty `fallback_endpoints`, `endpoint_candidates` or `routed_subnets` compare equal.
+
+### Routed subnets
+
+```go
+type PeerRouter interface {
+    AddRoute(subnet, iface string) error
+    RemoveRoute(subnet, iface string) error
+}
+
+func (m *Manager) SetPeerRouter(r PeerRouter)
+func usableRoutedSubnets(subnets []string, mesh netip.Prefix, local []netip.Prefix) (accepted []string, skipped []skippedSubnet)
+```
+
+A peer's `routed_subnets` lists the IPv4 networks the control plane routes through it: the networks behind the site-to-site tunnels of a peer that is a bridge, the union of their `allowed_subnets`, each prefix once. The control plane delivers the member only to the nodes of the bridge Resource's Project, and the registration response never carries it, so a node programs the subnets from its first pull. See [Site-to-Site VPN](../bridge/site-to-site-vpn.md) for the tunnels behind them.
+
+For each peer it adds or updates, the handler splits the list with `usableRoutedSubnets`, against the mesh prefix and the local prefixes it reads for the [dial order](#dial-order). The peer's allowed IPs are its mesh address as a `/32` followed by the accepted subnets, in the list's order and in canonical form. The first rule that applies skips an entry:
+
+| Reason | The entry |
+|---|---|
+| `invalid` | does not parse with `netip.ParsePrefix`, is not IPv4, or has host bits set, such as `10.20.0.1/16`, `fd00::/64` or `not-a-prefix` |
+| `overlaps_mesh` | overlaps the [mesh prefix](#mesh-prefix), such as `10.99.0.0/25` in the mesh `10.99.0.0/24`; `0.0.0.0/0` overlaps every mesh |
+| `inside_local_network` | lies inside a local prefix: one of the prefixes the handler orders endpoint candidates by contains its address and is no longer than it. On a host in `192.168.1.0/24`, `192.168.1.0/24` and `192.168.1.128/25` are skipped, and `192.168.0.0/16` is accepted |
+| `duplicate` | repeats an earlier entry of the list |
+
+The first two would let the peer's key send from addresses past the networks behind it, because the allowed IPs are WireGuard's authorization of a peer's source addresses. The third would route this host's own network, its gateway included, into the mesh. The local prefixes are those of `nat.EligiblePrefixes` (see below): they leave out loopback and point-to-point interfaces, container, VPN and other virtual interfaces, and every interface outside `nat.candidate_interfaces` when that list is set, so a network of such an interface is not protected and a routed subnet inside it is programmed. The contract has a node add a peer's `routed_subnets` as they are; plexd deviates from it in these three cases. When the local prefixes cannot be read, no entry is skipped as `inside_local_network`. Each skipped entry is logged at Warn whenever the handler adds or updates the peer:
+
+```
+wireguard: routed subnet not programmed  component=wireguard peer_id=<node id> subnet=10.20.0.1/16 reason=invalid
+```
+
+The handler ends with `syncPeerRoutes`, which brings the routes on the mesh interface in line with the [programmed peers](#programmed-peers), the peers the manager last wrote. The wanted set is the union of their `RoutedSubnets`. It removes the route of every subnet it programmed that no such peer lists any more, then adds a route for every wanted subnet that has none, in subnet order, each through the `PeerRouter` on `OSInterfaceName()`, the name the operating system knows the mesh interface by (`utunN` on macOS). A subnet two peers list is routed once and keeps its route until the last of them drops it. plexd does not arbitrate between two peers that list the same subnet: the control plane refuses a second tunnel of a Project to an overlapping subnet, and the device gives an equal prefix to the peer written last. A peer the handler removes, or whose update drops the member, loses its routes in the same run, and `SetPeerPSK` writes a peer's routed subnets again with its PSK, since every device write replaces the allowed IPs. A run that changed a route logs the change once at Info:
+
+```
+wireguard: peer routes changed  component=wireguard added=[10.20.0.0/16] removed=[]
+```
+
+A route call that fails is logged at Error and leaves that subnet's state as it was, so the next run tries it again. The handler returns the failure joined with its others, so the reconciler applies the snapshot again:
+
+```
+wireguard: peer route failed  component=wireguard subnet=10.20.0.0/16 op=add error=<cause>
+```
+
+The route calls run under a mutex of their own, never under the one that serializes peer writes, so a slow `route(8)` or IP Helper call holds up no peer write and no pass of endpoint selection.
+
+Every `bridge.RouteController` satisfies `PeerRouter`: `NetlinkRouteController` on Linux (see [Netlink Route Controller](../bridge/netlink-route-controller.md)), and `DarwinRouteController` and `WindowsRouteController` on macOS and Windows (see [Route Controllers on macOS and Windows](../bridge/route-controllers-macos-windows.md)). Both calls are idempotent: adding a route that exists and removing one that does not return nil. `plexd up` builds the route controller once, after the firewall controller and before the bridge subsystem (step 5e), and hands it to `SetPeerRouter` when the WireGuard interface came up; in bridge mode the bridge manager drives the same instance. Every node routes the networks behind a peer that way, on Linux, macOS and Windows, whether or not it runs in bridge mode. A manager without a router, on a platform without a route controller, programs the routed subnets as allowed IPs and adds no route.
+
+`Teardown` removes the routes it programmed before it deletes the interface. A route it cannot remove is logged at Warn as `wireguard: peer route failed` and stops nothing, since the delete takes the interface's routes with it, and the routes it removed are logged as `wireguard: peer routes changed` with `removed`.
+
+A route admits no traffic by itself. The node's [policy](./network-policy.md) filters what it sends into the mesh, and the control plane compiles a rule to a network behind a bridge with that network as `destination_cidr`. plexd does not guard against a routed subnet that holds the control plane's address or a peer's endpoint: it cannot tell which addresses the host must reach outside the mesh, and the control plane refuses the overlaps it can see.
+
+The [Docker e2e test](../development/docker-e2e-test.md) proves the routes on Linux with traffic, and `TestPeerRoutes_RealUTUN` and `TestPeerRoutes_RealWintun` read the allowed IPs, through `PeerStat.AllowedIPs`, and the route on macOS and Windows on the CI runners, without traffic (see [CI Workflow](../development/ci-workflow.md)).
 
 ### Registration
 
@@ -765,7 +819,7 @@ r.RegisterHandler(wireguard.ReconcileHandler(mgr, psks))
 
 Without edge PSKs, pass a nil `EdgePSKLookup` interface value, as `plexd up` does. A nil `*EdgePSKs` stored in the interface is not nil to the handler, and its `Lookup` panics.
 
-`plexd up` calls `mgr.SetLocalPrefixes` in step 5a-2, before the handler first runs, with a function that returns `nat.EligiblePrefixes` over `nat.SystemInterfaces()` and passes a read error through. Without that call the handler orders every candidate as off-link.
+`plexd up` calls `mgr.SetLocalPrefixes` in step 5a-2, before the handler first runs, with a function that returns `nat.EligiblePrefixes` over `nat.SystemInterfaces()` and passes a read error through. Without that call the handler orders every candidate as off-link and skips no routed subnet as `inside_local_network`. It calls `mgr.SetPeerRouter` with the route controller before that, right after `Setup` (see [Routed subnets](#routed-subnets)).
 
 The agent registers this handler **only when WireGuard `Setup` succeeded**. On hosts without a programmable WireGuard stack the interface fails to come up, the agent continues without WireGuard, and the peer reconcile handler is skipped — a handler that failed every cycle would hold the reconciler snapshot back and prevent convergence (for example, the policy fingerprint short-circuit could never hold).
 
@@ -779,12 +833,14 @@ plexd never decodes their payloads. The reconcile loop then pulls the snapshot, 
 [edge PSK store](#edge-psks) (when edge PSKs are on) syncs against its peers, and
 `ReconcileHandler` (see above) converges the interface.
 
-`peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte) (api.Peer, error)`
+`peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte, routed []string) (api.Peer, error)`
 builds each programmed peer from a snapshot entry: `AllowedIPs` derived locally as
-`mesh_ip/32`, `Endpoints` set to the [dial order](#dial-order) and `Endpoint` to its
+`mesh_ip/32` followed by `routed`, the [routed subnets](#routed-subnets) the node
+accepted, `Endpoints` set to the [dial order](#dial-order) and `Endpoint` to its
 first entry, `Fallbacks` set to `fallbacks`, the relays that end the order, and
 `psk` base64-encoded (none for a nil `psk`). The manager then adds,
-updates, or removes peers so the interface matches the desired set, and
+updates, or removes peers so the interface matches the desired set, routes the
+accepted subnets through the mesh interface, and
 [endpoint selection](#endpoint-selection) settles each peer's endpoint.
 
 ## Edge PSKs
@@ -941,7 +997,7 @@ endpoint on the device.
 
 ### Graceful Shutdown
 
-Call `Teardown()` on context cancellation to remove the WireGuard interface:
+Call `Teardown()` on context cancellation to remove the peer routes and the WireGuard interface:
 
 ```go
 <-ctx.Done()

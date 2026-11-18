@@ -556,6 +556,73 @@ node outside bridge mode, a bridge that opts out with
 `bridge.user_access_enabled: false`, and a bridge whose manager is not active
 publish `{"enabled": false}`.
 
+#### `status.site-to-site`
+
+The site-to-site status of a bridge, `api.SiteToSiteInfo`, as
+`SiteToSiteManager.SiteToSiteStatus` returns it (see
+[Site-to-Site VPN](../bridge/site-to-site-vpn.md)). It is sampled at the
+heartbeat's interval like the other `status.*` reports, and published when it
+differs from the stored value.
+
+```json
+{
+  "enabled": true,
+  "tunnels": [
+    {
+      "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+      "slug": "branch-berlin",
+      "kind": "wireguard",
+      "interface": "wg-s2s-a0a0a0e1",
+      "health": "up",
+      "established": true,
+      "listen_port": 51830,
+      "remote_host": "vpn.branch.example.com",
+      "remote_port": 51820,
+      "allowed_subnets": ["10.20.0.0/16"]
+    },
+    {
+      "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+      "slug": "dc-east",
+      "kind": "ipsec",
+      "health": "down",
+      "reason": "auth_secret_not_listed",
+      "established": false,
+      "remote_host": "203.0.113.10",
+      "remote_port": 500,
+      "allowed_subnets": ["10.30.0.0/16", "10.31.0.0/16"]
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `enabled` | bool | The `enabled` of the last `bridge.site_to_site` block the manager applied; `false` before the first one |
+| `tunnels` | array, optional | One entry per tunnel the manager holds, in block order; omitted when it holds none |
+
+Each tunnel entry carries:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | The tunnel's id as pulled |
+| `slug` | string | The tunnel's slug |
+| `kind` | string | The tunnel's kind as pulled |
+| `interface` | string, optional | The tunnel's link while it is up: `wg-s2s-`, `xf-s2s-` or `ov-s2s-` and the last 8 hex digits of its id; omitted while it is down |
+| `health` | string | `up` or `down` |
+| `reason` | string, optional | Why the tunnel is down, one of the reason tokens of the [site-to-site status report](../bridge/site-to-site-vpn.md); omitted while it is up |
+| `established` | bool | Whether the remote site of a tunnel that is up answers; `false` for a tunnel that is down |
+| `listen_port` | int, optional | A `wireguard` tunnel's `listen_port`, also while it is down |
+| `remote_host` | string | The tunnel's `remote_host` as pulled |
+| `remote_port` | int | The tunnel's `remote_port` as pulled |
+| `allowed_subnets` | array | The tunnel's `allowed_subnets` as pulled, in their order |
+
+A tunnel whose id is no UUID or repeats an earlier one has no entry, and a
+tunnel the manager is bringing up, or rebuilding for a new version of its
+Secret, has none while the attempt resolves the remote host and fetches the
+Secret. A node outside bridge mode, a bridge that opts out with
+`bridge.site_to_site_enabled: false`, and a bridge whose manager is not active
+publish `{"enabled": false}`.
+
 ### GET /v1/state/report/{key}
 
 Returns a full report entry.

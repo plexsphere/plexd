@@ -53,6 +53,8 @@ Validation is skipped entirely when `Enabled` is `false`.
 
 Interface abstracting OS-level routing and forwarding operations. The package has three production implementations: [`NetlinkRouteController`](./netlink-route-controller.md) on Linux (`route_linux.go`), and `DarwinRouteController` and `WindowsRouteController` on macOS and Windows (`route_darwin.go`, `route_windows.go`, described in [macOS & Windows Route Controllers](./route-controllers-macos-windows.md)).
 
+`plexd up` builds one route controller on every node, in bridge mode or not: the WireGuard manager routes the `routed_subnets` of the peers through the mesh interface with its `AddRoute` and `RemoveRoute` (see [Routed subnets](../networking/wireguard.md#routed-subnets)). In bridge mode the `Manager`, the user access manager and the site-to-site manager share that instance.
+
 ```go
 type RouteController interface {
     EnableForwarding(meshIface, accessIface string) error
@@ -237,7 +239,7 @@ dispatcher.Register(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdat
 
 ### Reconciliation Loop
 
-The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler. `plexd up` registers the relay handler whenever bridge mode runs, with `bridgeMgr.Relay()`, which is nil when `bridge.relay_enabled` is false, and `bridgeMgr.RelayStatusTracker()`, in which the handler records the relay's state for the [relay status report](nat-relay.md#relay-status-report). Without a relay the handler only warns and records `not_consented` when a pull enables the relay (see [NAT Relay](nat-relay.md#relayreconcilehandler)). The ingress handler is also registered whenever bridge mode runs, with a nil ingress manager on a bridge that opts out with `bridge.ingress_enabled: false`, where it only warns when a pull enables ingress with rules (see [IngressReconcileHandler](public-ingress.md#ingressreconcilehandler)). The ingress secret inventory handler is registered only when the ingress manager exists. The user access handlers follow the same pattern: the reconcile handler runs whenever bridge mode does, with a nil user access manager on a bridge that opts out with `bridge.user_access_enabled: false`, and the pull handler only when the manager exists (see [UserAccessReconcileHandler](user-access-integration.md#useraccessreconcilehandler)):
+The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler. `plexd up` registers the relay handler whenever bridge mode runs, with `bridgeMgr.Relay()`, which is nil when `bridge.relay_enabled` is false, and `bridgeMgr.RelayStatusTracker()`, in which the handler records the relay's state for the [relay status report](nat-relay.md#relay-status-report). Without a relay the handler only warns and records `not_consented` when a pull enables the relay (see [NAT Relay](nat-relay.md#relayreconcilehandler)). The ingress handler is also registered whenever bridge mode runs, with a nil ingress manager on a bridge that opts out with `bridge.ingress_enabled: false`, where it only warns when a pull enables ingress with rules (see [IngressReconcileHandler](public-ingress.md#ingressreconcilehandler)). The ingress secret inventory handler is registered only when the ingress manager exists. The user access handlers follow the same pattern: the reconcile handler runs whenever bridge mode does, with a nil user access manager on a bridge that opts out with `bridge.user_access_enabled: false`, and the pull handler only when the manager exists (see [UserAccessReconcileHandler](user-access-integration.md#useraccessreconcilehandler)). So do the site-to-site handlers: `SiteToSiteReconcileHandler` runs whenever bridge mode does, with a nil site-to-site manager on a bridge that opts out with `bridge.site_to_site_enabled: false`, where it only warns when a pull enables tunnels, and `SiteToSitePullHandler` only when the manager exists (see [SiteToSiteReconcileHandler](site-to-site-vpn.md#sitetositereconcilehandler)):
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
@@ -252,7 +254,10 @@ if uaMgr != nil {
     r.RegisterDispatchHandler(bridge.UserAccessPullHandler(uaMgr))
 }
 r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger)) // uaMgr is nil on an opted-out bridge
-r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
+if s2sMgr != nil {
+    r.RegisterDispatchHandler(bridge.SiteToSitePullHandler(s2sMgr))
+}
+r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger)) // s2sMgr is nil on an opted-out bridge
 ```
 
 ### SSE Real-Time Updates

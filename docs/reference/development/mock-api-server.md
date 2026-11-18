@@ -160,6 +160,16 @@ status report were gated from the start:
   the presence rules of its `health`; and `400 invalid_user_access_status` for
   an opted-out report with entries and a repeated `id`. See
   [the route](#put-v1-nodes-id-user-access-status).
+- **`PUT /v1/nodes/{id}/site-to-site-status`** caps the body at 64 KiB
+  (`413 site_to_site_status_body_too_large`) and strict-decodes it into a
+  mock-local struct whose `state` is a pointer, then each tunnel entry on its
+  own. It answers `400 malformed_site_to_site_status` for a body that is not
+  one JSON object, an unknown member, data after the report, a missing or
+  `null` `state`, a `state` outside `enabled` and `opted_out`, more than 256
+  entries, an entry whose member breaks its own rule, and an entry that breaks
+  the presence rules of its `health`; and `400 invalid_site_to_site_status` for
+  an opted-out report with entries and a repeated `id`. See
+  [the route](#put-v1-nodes-id-site-to-site-status).
 - **`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`** answers
   `403 node_id_mismatch` for an `id` other than the registered node, then
   `404 hook_not_assigned` for a pair the state fixture's `hooks` block does not
@@ -722,6 +732,64 @@ only the captured body.
 
 **Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
 
+### `PUT /v1/nodes/{id}/site-to-site-status`
+
+Enforces the site-to-site status report contract (`PutNodeSiteToSiteStatus`,
+the "Site-to-site status" section of the control plane's
+`docs/reference/api/plexd-agent-contract.md` at plexsphere/plexsphere@4935e06):
+a 64 KiB body cap, strict JSON decoding, the two states, and the rules of each
+tunnel entry. `handleSiteToSiteStatus` captures the body under
+`site-to-site-status` as it reads it, before the decode and the rules judge it,
+so `GET /test/last-request/site-to-site-status` returns the bytes of the last
+report, a refused one included; a body over the cap is not captured. It
+decodes the report into a mock-local struct whose `state` is a `*string`, so a
+missing or `null` state is told apart from an empty one, and each entry into a
+struct of pointer members, so an `established` of `false` is told apart from an
+omitted one. The handler does not compare the path `id` with the node, as the
+user access status route does not. `site_to_site_status_count` increments only
+when every check passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `site_to_site_status_body_too_large` if the body exceeds 64 KiB (65,536 bytes), read through `http.MaxBytesReader`.
+2. **Body decode** → `400` `malformed_site_to_site_status` with the fixed `detail` `request body is not a valid site-to-site status report; it carries only state and tunnels` if the body is empty or not one JSON object, carries an unknown member of the report, data after the report, a `state` that is neither a JSON string nor `null`, or a `tunnels` that is not an array. A body of `null` decodes to a report without members, which step 3 refuses as `state is missing`. The entries of `tunnels` stay undecoded here.
+3. **State** → `400` `malformed_site_to_site_status` with the `detail` `state is missing` if `state` is missing or `null`, and with the `detail` `state is not one of enabled and opted_out` for any other string than `enabled` and `opted_out`.
+4. **Entries** → `400` `malformed_site_to_site_status` with the `detail` `tunnels carries more than 256 entries`; then, for each entry in order, decoded on its own, `tunnels[i]` followed by the first broken rule: ` is not an object` for an entry that is no JSON object and not `null` (a `null` entry decodes to an entry without members and earns `.id is missing`); ` carries the unknown member <name>` for a member the contract does not define whose name is a token of the reason grammar, and ` carries a member SiteToSiteStatusReportTunnel does not define` for any other unknown member; the member's sentence for a member of the wrong JSON type, and ` is not a valid tunnel entry` for any other entry the decoder refuses; then, in the order the contract lists the members, `.id is missing`, `.id is not a tunnel id` (failing `api.ValidSiteToSiteTunnelID`), `.health is missing`, `.health is not one of up and down`, `.reason is not a reason token` (failing `api.ValidIngressReason`), `.established is not a boolean` and `.public_key is not a WireGuard public key of 44 characters of standard base64` (44 characters of standard base64 that decode strictly to 32 bytes); and last the presence rules, `.reason is required while health is down`, `.public_key is set while health is down`, `.established is set while health is down`, `.reason is set while health is up` and `.established is required while health is up`.
+5. **Consistency** → `400` `invalid_site_to_site_status` with the `detail` `an opted-out bridge reports no tunnels`; then `tunnels[i].id repeats tunnels[j].id`, compared without case.
+
+A `tunnels` of `null` or `[]` is a report without entries. A member of an entry sent as `null` reads as omitted. An `up` entry may omit `public_key`, since an `ipsec` or `openvpn` tunnel that is up sends none. The details are the control plane's sentences, and none quotes an id, a reason or a key of the body. The mock accepts canonical ids only, which is narrower than the control plane's parser and wide enough for what plexd sends.
+
+**Request body:**
+
+```json
+{
+  "state": "enabled",
+  "tunnels": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", "health": "up",
+      "public_key": "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=", "established": true },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", "health": "down", "reason": "kind_not_served" }
+  ]
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-11-18T10:15:30Z"
+}
+```
+
+`accepted_at` is the mock's clock in UTC. The mock keeps no report and refuses
+no tunnel: the state fixture serves whatever block `POST /test/configure-state`
+configured, whatever the node reported. It keeps only the captured body.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`). Every answer of the handler, the `200` and each refusal above, carries `Cache-Control: no-store`, as the contract asks.
+
+**Counter:** Increments `site_to_site_status_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
+
 ### `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`
 
 Serves the edge PSKs of the two fixture peers the way the control plane does:
@@ -839,13 +907,13 @@ therefore hands the node the new key.
 
 | Block | Default Value |
 |-------|---------------|
-| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint` and one `endpoint_candidates` entry (`192.0.2.10:51820`) but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
+| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint`, one `endpoint_candidates` entry (`192.0.2.10:51820`) and `routed_subnets` `["10.50.0.0/16"]` but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, 2 providers in the delivered shape: `field-team` (`...a0e1`), `wireguard` on port 51821 with the pool `10.98.0.0/24`, at most 64 devices and one device `alice-laptop` at `10.98.0.2`; and `tailnet` (`...a0e2`), `tailscale` with the Secret `ts-join`. No suite serves this block to a bridge: the systemd suite's bridge phases replace it |
 | `bridge.ingress` | `enabled: true`, 1 rule, `web`: port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
-| `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
+| `bridge.site_to_site` | `enabled: true`, 2 tunnels in the delivered shape: `branch-berlin` (`...a0e1`), `wireguard` on port 51830 to `vpn.branch.example.com:51820` for `10.20.0.0/16` with the Secret `branch-berlin-psk`; and `dc-east` (`...a0e2`), `ipsec` to `203.0.113.10:500` for `10.30.0.0/16` and `10.31.0.0/16` with the Secret `dc-east-ike`. No suite serves this block to a bridge: the systemd suite sets it to `null` before its node becomes one |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
 | `sessions` | `[]` — no session issued; phases configure entries explicitly |
@@ -891,6 +959,21 @@ provider. Its pool, `10.98.0.0/24`, differs from the contract's
 valid 44-character key. See
 [User Access Integration](../bridge/user-access-integration.md#the-bridge-user-access-block).
 
+The site-to-site block holds the two tunnels of the example of the contract's
+"Site-to-site tunnels" section, in the shape the control plane delivers since
+plexsphere/plexsphere#1109: a `wireguard` tunnel to a branch office with a
+preshared key and an `ipsec` tunnel to a data center. The Docker and Kubernetes
+suites run node mode and ignore it, and the systemd suite's `configure_ingress`
+sets `site_to_site` to `null` before its node becomes a bridge; its
+site-to-site phase serves a block of its own. See
+[Site-to-Site VPN](../bridge/site-to-site-vpn.md).
+
+Peer `...a0b1` carries `routed_subnets` `["10.50.0.0/16"]`, so the node of
+every suite routes that network through its mesh interface after its first
+pull, and the [Docker e2e run](docker-e2e-test.md#phase-1-cont-the-fixture-s-peer-route)
+asserts the route. No node answers in that network. See
+[Routed subnets](../networking/wireguard.md#routed-subnets).
+
 The policy block is in the allow-only format plexd reads: no rule carries
 `action`, every rule is an allow, and plexd appends the default deny. The second
 rule asks for logging, so plexd logs `policy rule allowed connection` with
@@ -922,7 +1005,8 @@ answers `applied`.
       "mesh_ip": "10.99.0.2",
       "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
       "fallback_endpoint": "203.0.113.1:51820",
-      "endpoint_candidates": ["192.0.2.10:51820"]
+      "endpoint_candidates": ["192.0.2.10:51820"],
+      "routed_subnets": ["10.50.0.0/16"]
     },
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
@@ -1017,13 +1101,24 @@ answers `applied`.
       "enabled": true,
       "tunnels": [
         {
-          "tunnel_id": "s2s-001",
-          "remote_endpoint": "198.51.100.1:51820",
-          "remote_public_key": "s2s-remote-pub-key-001",
-          "local_subnets": ["10.99.0.0/24"],
-          "remote_subnets": ["172.16.0.0/16"],
-          "interface_name": "wg-s2s0",
-          "listen_port": 51822
+          "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+          "slug": "branch-berlin",
+          "kind": "wireguard",
+          "remote_host": "vpn.branch.example.com",
+          "remote_port": 51820,
+          "allowed_subnets": ["10.20.0.0/16"],
+          "listen_port": 51830,
+          "remote_public_key": "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+          "auth_secret_name": "branch-berlin-psk"
+        },
+        {
+          "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+          "slug": "dc-east",
+          "kind": "ipsec",
+          "remote_host": "203.0.113.10",
+          "remote_port": 500,
+          "allowed_subnets": ["10.30.0.0/16", "10.31.0.0/16"],
+          "auth_secret_name": "dc-east-ike"
         }
       ]
     }
@@ -1500,6 +1595,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "policy_status_count": 0,
   "ingress_status_count": 0,
   "user_access_status_count": 0,
+  "site_to_site_status_count": 0,
   "edge_psk_count": 0,
   "hook_fetch_count": 0,
   "inject_event_count": 0,
@@ -2131,6 +2227,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `policy_status_count` | `PUT /v1/nodes/{id}/policy-status` (accepted reports only, `200`) |
 | `ingress_status_count` | `PUT /v1/nodes/{id}/ingress-status` (accepted reports only, `200`) |
 | `user_access_status_count` | `PUT /v1/nodes/{id}/user-access-status` (accepted reports only, `200`) |
+| `site_to_site_status_count` | `PUT /v1/nodes/{id}/site-to-site-status` (accepted reports only, `200`) |
 | `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |
 | `hook_fetch_count` | `GET /v1/nodes/{id}/hooks/{name}/versions/{version}` (served `200` versions only) |
 | `inject_event_count` | `POST /test/inject-event` |
