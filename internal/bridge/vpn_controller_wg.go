@@ -1,9 +1,11 @@
 package bridge
 
 import (
+	"fmt"
 	"log/slog"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // WGVPNController implements VPNController on top of the platform
@@ -16,6 +18,8 @@ import (
 // controller. RemoveTunnelInterface and RemoveTunnelPeer are idempotent.
 type WGVPNController struct {
 	wgOps
+
+	address string // CIDR assigned after creation; empty leaves the interface unnumbered
 }
 
 var (
@@ -31,18 +35,27 @@ var (
 // IP as a /32 there. An empty address leaves the interface unnumbered, which
 // is what Linux and Windows use.
 func NewWGVPNController(wg wireguard.WGController, address string, logger *slog.Logger) *WGVPNController {
-	return &WGVPNController{wgOps{
-		wg:      wg,
+	return &WGVPNController{
+		wgOps: wgOps{
+			wg:     wg,
+			prefix: "vpn",
+			noun:   "tunnel",
+			logger: logger,
+		},
 		address: address,
-		prefix:  "vpn",
-		noun:    "tunnel",
-		logger:  logger,
-	}}
+	}
 }
 
-// CreateTunnelInterface creates a WireGuard interface for a site-to-site tunnel.
+// CreateTunnelInterface creates a WireGuard interface for a site-to-site
+// tunnel under a freshly generated private key, carrying the address the
+// controller was built with.
 func (c *WGVPNController) CreateTunnelInterface(name string, listenPort int) error {
-	return c.create(name, listenPort)
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return fmt.Errorf("bridge: vpn: generate key: %w", err)
+	}
+
+	return c.create(name, key[:], listenPort, c.address)
 }
 
 // RemoveTunnelInterface deletes the named WireGuard tunnel interface.

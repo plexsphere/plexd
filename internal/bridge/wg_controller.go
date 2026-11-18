@@ -24,35 +24,34 @@ const endpointResolveTimeout = 5 * time.Second
 // The two differ only in the wording of their errors and log lines, so the
 // operations live here once and each controller supplies the wording.
 type wgOps struct {
-	wg      wireguard.WGController
-	address string // CIDR assigned after creation; empty leaves the interface unnumbered
-	prefix  string // "access" or "vpn": the error prefix
-	noun    string // "access" or "tunnel": the log wording
-	logger  *slog.Logger
+	wg     wireguard.WGController
+	prefix string // "access" or "vpn": the error prefix
+	noun   string // "access" or "tunnel": the log wording
+	logger *slog.Logger
 }
 
-// create generates a private key, creates the interface under name, assigns
-// the configured address when there is one and brings the interface up. A
-// failure after the interface exists deletes it again, so a retry starts from
-// a clean state.
+// create creates the interface under name with privateKey (32 raw bytes) and
+// listenPort, assigns address (a CIDR) when it is not empty and brings the
+// interface up. The key is checked before anything is created. A failure after
+// the interface exists deletes it again, so a retry starts from a clean state.
 //
 // A second create for the same name fails: DarwinController and
 // WindowsController return an error wrapping os.ErrExist, which is what
 // EEXIST is for the Linux netlink controllers.
-func (o *wgOps) create(name string, listenPort int) error {
-	key, err := wgtypes.GeneratePrivateKey()
+func (o *wgOps) create(name string, privateKey []byte, listenPort int, address string) error {
+	key, err := wgtypes.NewKey(privateKey)
 	if err != nil {
-		return fmt.Errorf("bridge: %s: generate key: %w", o.prefix, err)
+		return fmt.Errorf("bridge: %s: parse private key: %w", o.prefix, err)
 	}
 
 	if err := o.wg.CreateInterface(name, key[:], listenPort); err != nil {
 		return fmt.Errorf("bridge: %s: create interface %s: %w", o.prefix, name, err)
 	}
 
-	if o.address != "" {
-		if err := o.wg.ConfigureAddress(name, o.address); err != nil {
+	if address != "" {
+		if err := o.wg.ConfigureAddress(name, address); err != nil {
 			_ = o.wg.DeleteInterface(name)
-			return fmt.Errorf("bridge: %s: configure address %s: %w", o.prefix, o.address, err)
+			return fmt.Errorf("bridge: %s: configure address %s: %w", o.prefix, address, err)
 		}
 	}
 
@@ -67,11 +66,11 @@ func (o *wgOps) create(name string, listenPort int) error {
 		"listen_port", listenPort,
 	)
 
-	if o.address != "" {
+	if address != "" {
 		o.logger.Debug(o.noun+" interface addressed",
 			"component", "bridge",
 			"interface", name,
-			"address", o.address,
+			"address", address,
 		)
 	}
 

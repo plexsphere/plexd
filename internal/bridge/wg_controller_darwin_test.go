@@ -177,7 +177,7 @@ func TestWGControllers_RealUTUN(t *testing.T) {
 
 		wg := wireguard.NewDarwinController(discardLogger())
 		ctrl := NewWGAccessController(wg, discardLogger())
-		if err := ctrl.CreateInterface(name, 0); err != nil {
+		if err := ctrl.CreateInterface(name, testPrivateKey(t), 0, ""); err != nil {
 			t.Fatalf("CreateInterface: %v", err)
 		}
 		removed := false

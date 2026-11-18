@@ -141,6 +141,38 @@ func (f *namerWGController) OSInterfaceName(name string) (string, bool) {
 	return osName, ok
 }
 
+// statsWGController is a fakeWGController that can also read peer runtime
+// state, as DarwinController and WindowsController can. PeerStats records the
+// interface it was asked for and returns stats and err as configured.
+type statsWGController struct {
+	*fakeWGController
+
+	stats []wireguard.PeerStat
+	err   error
+}
+
+var _ wireguard.PeerStatsReader = (*statsWGController)(nil)
+
+func (f *statsWGController) PeerStats(name string) ([]wireguard.PeerStat, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, wgCall{Method: "PeerStats", Args: []interface{}{name}})
+	f.mu.Unlock()
+	return f.stats, f.err
+}
+
+// testPrivateKey returns a generated private key as its 32 raw bytes, which is
+// what an access interface is created with.
+func testPrivateKey(t *testing.T) []byte {
+	t.Helper()
+
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("GeneratePrivateKey() error = %v", err)
+	}
+
+	return key[:]
+}
+
 // testPeerKey returns a generated peer public key as base64 and as its 32 raw
 // bytes, which is what the controllers hand to the WGController.
 func testPeerKey(t *testing.T) (string, []byte) {

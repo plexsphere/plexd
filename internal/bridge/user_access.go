@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // UserAccessManager manages user access integration — a WireGuard interface
@@ -54,7 +55,12 @@ func (m *UserAccessManager) Setup() error {
 		return nil
 	}
 
-	if err := m.ctrl.CreateInterface(m.cfg.UserAccessInterfaceName, m.cfg.UserAccessListenPort); err != nil {
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return fmt.Errorf("bridge: user access: generate key: %w", err)
+	}
+
+	if err := m.ctrl.CreateInterface(m.cfg.UserAccessInterfaceName, key[:], m.cfg.UserAccessListenPort, ""); err != nil {
 		return fmt.Errorf("bridge: user access: create interface: %w", err)
 	}
 

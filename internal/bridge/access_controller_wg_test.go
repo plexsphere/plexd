@@ -7,22 +7,30 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 const (
-	testAccessIface = "wg-access"
-	testAccessPort  = 51822
+	testAccessIface   = "wg-access"
+	testAccessPort    = 51822
+	testAccessAddress = "10.98.0.1/24"
 )
 
 func TestWGAccessController_CreateInterface(t *testing.T) {
+	key := testPrivateKey(t)
 	fake := &fakeWGController{}
 	logger, buf := debugLogger()
 	c := NewWGAccessController(fake, logger)
 
-	if err := c.CreateInterface(testAccessIface, testAccessPort); err != nil {
+	if err := c.CreateInterface(testAccessIface, key, testAccessPort, testAccessAddress); err != nil {
 		t.Fatalf("CreateInterface() error = %v", err)
+	}
+
+	wantOrder := []string{"CreateInterface", "ConfigureAddress", "SetInterfaceUp"}
+	if got := fake.wgMethods(); !reflect.DeepEqual(got, wantOrder) {
+		t.Errorf("calls = %v, want %v", got, wantOrder)
 	}
 
 	created := fake.wgCallsFor("CreateInterface")
@@ -32,16 +40,22 @@ func TestWGAccessController_CreateInterface(t *testing.T) {
 	if got := created[0].Args[0]; got != testAccessIface {
 		t.Errorf("interface = %v, want %q", got, testAccessIface)
 	}
-	key, ok := created[0].Args[1].([]byte)
-	if !ok || len(key) != 32 {
-		t.Errorf("private key = %v, want 32 bytes", created[0].Args[1])
+	if got, ok := created[0].Args[1].([]byte); !ok || !bytes.Equal(got, key) {
+		t.Error("private key differs from the key passed to CreateInterface")
 	}
 	if got := created[0].Args[2]; got != testAccessPort {
 		t.Errorf("listen port = %v, want %d", got, testAccessPort)
 	}
 
-	if calls := fake.wgCallsFor("ConfigureAddress"); len(calls) != 0 {
-		t.Errorf("ConfigureAddress calls = %d, want 0 for an unnumbered interface", len(calls))
+	addressed := fake.wgCallsFor("ConfigureAddress")
+	if len(addressed) != 1 {
+		t.Fatalf("ConfigureAddress calls = %d, want 1", len(addressed))
+	}
+	if got := addressed[0].Args[0]; got != testAccessIface {
+		t.Errorf("ConfigureAddress interface = %v, want %q", got, testAccessIface)
+	}
+	if got := addressed[0].Args[1]; got != testAccessAddress {
+		t.Errorf("ConfigureAddress address = %v, want %q", got, testAccessAddress)
 	}
 
 	up := fake.wgCallsFor("SetInterfaceUp")
@@ -54,27 +68,49 @@ func TestWGAccessController_CreateInterface(t *testing.T) {
 
 	logged := buf.String()
 	for _, want := range []string{
-		"level=INFO",
-		`msg="access interface created"`,
+		`level=INFO msg="access interface created"`,
+		`level=DEBUG msg="access interface addressed"`,
 		"component=bridge",
 		"interface=wg-access",
 		"listen_port=51822",
+		"address=10.98.0.1/24",
 	} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("log = %q, want it to contain %q", logged, want)
 		}
 	}
-	if strings.Contains(logged, "interface addressed") {
+	if strings.Contains(logged, base64.StdEncoding.EncodeToString(key)) {
+		t.Errorf("log = %q, want no key material in it", logged)
+	}
+}
+
+func TestWGAccessController_CreateInterfaceUnnumbered(t *testing.T) {
+	fake := &fakeWGController{}
+	logger, buf := debugLogger()
+	c := NewWGAccessController(fake, logger)
+
+	if err := c.CreateInterface(testAccessIface, testPrivateKey(t), testAccessPort, ""); err != nil {
+		t.Fatalf("CreateInterface() error = %v", err)
+	}
+
+	wantOrder := []string{"CreateInterface", "SetInterfaceUp"}
+	if got := fake.wgMethods(); !reflect.DeepEqual(got, wantOrder) {
+		t.Errorf("calls = %v, want %v for an unnumbered interface", got, wantOrder)
+	}
+	if logged := buf.String(); strings.Contains(logged, "interface addressed") {
 		t.Errorf("log = %q, want no address line for an unnumbered interface", logged)
 	}
 }
 
-func TestWGAccessController_CreateInterfaceFreshKeys(t *testing.T) {
+// The caller owns the key, so an interface created again under the same key
+// keeps its public key, and every device configured against it keeps working.
+func TestWGAccessController_CreateInterfaceKeptKey(t *testing.T) {
+	key := testPrivateKey(t)
 	fake := &fakeWGController{}
 	c := NewWGAccessController(fake, discardLogger())
 
 	for i := range 2 {
-		if err := c.CreateInterface(testAccessIface, testAccessPort); err != nil {
+		if err := c.CreateInterface(testAccessIface, key, testAccessPort, testAccessAddress); err != nil {
 			t.Fatalf("CreateInterface() #%d error = %v", i, err)
 		}
 	}
@@ -83,21 +119,34 @@ func TestWGAccessController_CreateInterfaceFreshKeys(t *testing.T) {
 	if len(created) != 2 {
 		t.Fatalf("CreateInterface calls = %d, want 2", len(created))
 	}
-	first := created[0].Args[1].([]byte)
-	second := created[1].Args[1].([]byte)
-	if bytes.Equal(first, second) {
-		t.Error("both interfaces got the same private key, want a fresh key per interface")
+	for i, call := range created {
+		if got, ok := call.Args[1].([]byte); !ok || !bytes.Equal(got, key) {
+			t.Errorf("create #%d: private key differs from the key passed in, want the same key on every create", i)
+		}
 	}
 }
 
 func TestWGAccessController_CreateInterfaceErrors(t *testing.T) {
 	fakeErr := errors.New("wg failed")
 
+	t.Run("private key malformed", func(t *testing.T) {
+		for _, key := range [][]byte{nil, make([]byte, 31), make([]byte, 33)} {
+			fake := &fakeWGController{}
+			c := NewWGAccessController(fake, discardLogger())
+
+			err := c.CreateInterface(testAccessIface, key, testAccessPort, testAccessAddress)
+			wantWGErrPrefix(t, err, "bridge: access: parse private key:")
+			if got := fake.wgMethods(); len(got) != 0 {
+				t.Errorf("%d-byte key: calls = %v, want none", len(key), got)
+			}
+		}
+	})
+
 	t.Run("create fails", func(t *testing.T) {
 		fake := &fakeWGController{createInterfaceErr: fakeErr}
 		c := NewWGAccessController(fake, discardLogger())
 
-		err := c.CreateInterface(testAccessIface, testAccessPort)
+		err := c.CreateInterface(testAccessIface, testPrivateKey(t), testAccessPort, testAccessAddress)
 		wantWGErrPrefix(t, err, "bridge: access: create interface wg-access:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
@@ -109,11 +158,32 @@ func TestWGAccessController_CreateInterfaceErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("configure address fails", func(t *testing.T) {
+		fake := &fakeWGController{configureAddressErr: fakeErr}
+		c := NewWGAccessController(fake, discardLogger())
+
+		err := c.CreateInterface(testAccessIface, testPrivateKey(t), testAccessPort, testAccessAddress)
+		wantWGErrPrefix(t, err, "bridge: access: configure address 10.98.0.1/24:")
+		if !errors.Is(err, fakeErr) {
+			t.Errorf("errors.Is(err, fakeErr) = false, want true")
+		}
+		deleted := fake.wgCallsFor("DeleteInterface")
+		if len(deleted) != 1 {
+			t.Fatalf("DeleteInterface calls = %d, want 1", len(deleted))
+		}
+		if got := deleted[0].Args[0]; got != testAccessIface {
+			t.Errorf("DeleteInterface interface = %v, want %q", got, testAccessIface)
+		}
+		if calls := fake.wgCallsFor("SetInterfaceUp"); len(calls) != 0 {
+			t.Errorf("SetInterfaceUp calls = %d, want 0 after a failed address", len(calls))
+		}
+	})
+
 	t.Run("set up fails", func(t *testing.T) {
 		fake := &fakeWGController{setInterfaceUpErr: fakeErr}
 		c := NewWGAccessController(fake, discardLogger())
 
-		err := c.CreateInterface(testAccessIface, testAccessPort)
+		err := c.CreateInterface(testAccessIface, testPrivateKey(t), testAccessPort, testAccessAddress)
 		wantWGErrPrefix(t, err, "bridge: access: set interface up:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
@@ -163,6 +233,99 @@ func TestWGAccessController_RemoveInterface(t *testing.T) {
 		wantWGErrPrefix(t, err, "bridge: access: remove interface:")
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
+		}
+	})
+}
+
+// A userspace device ends with the process that created it, so there is
+// nothing a start would have to clear: RemoveInterfaces succeeds without
+// asking the controller anything.
+func TestWGAccessController_RemoveInterfaces(t *testing.T) {
+	fake := &fakeWGController{}
+	c := NewWGAccessController(fake, discardLogger())
+
+	if err := c.RemoveInterfaces("wg-ua-"); err != nil {
+		t.Fatalf("RemoveInterfaces() error = %v", err)
+	}
+	if got := fake.wgMethods(); len(got) != 0 {
+		t.Errorf("calls = %v, want none", got)
+	}
+}
+
+func TestWGAccessController_PeerHandshakes(t *testing.T) {
+	t.Run("reads the peer stats", func(t *testing.T) {
+		b64A, rawA := testPeerKey(t)
+		b64B, rawB := testPeerKey(t)
+		handshake := time.Unix(1700000000, 0)
+
+		fake := &statsWGController{
+			fakeWGController: &fakeWGController{},
+			stats: []wireguard.PeerStat{
+				{PublicKey: [32]byte(rawA), LastHandshake: handshake, RxBytes: 10},
+				{PublicKey: [32]byte(rawB)},
+			},
+		}
+		c := NewWGAccessController(fake, discardLogger())
+
+		got, err := c.PeerHandshakes(testAccessIface)
+		if err != nil {
+			t.Fatalf("PeerHandshakes() error = %v", err)
+		}
+
+		// The peer that never completed a handshake is kept, with the zero time.
+		want := map[string]time.Time{b64A: handshake, b64B: {}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("PeerHandshakes() = %v, want %v", got, want)
+		}
+
+		read := fake.wgCallsFor("PeerStats")
+		if len(read) != 1 || read[0].Args[0] != testAccessIface {
+			t.Errorf("PeerStats calls = %v, want one for %q", read, testAccessIface)
+		}
+	})
+
+	t.Run("no peers", func(t *testing.T) {
+		fake := &statsWGController{fakeWGController: &fakeWGController{}}
+		c := NewWGAccessController(fake, discardLogger())
+
+		got, err := c.PeerHandshakes(testAccessIface)
+		if err != nil {
+			t.Fatalf("PeerHandshakes() error = %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Errorf("PeerHandshakes() = %v, want an empty map", got)
+		}
+	})
+
+	t.Run("read fails", func(t *testing.T) {
+		fakeErr := errors.New("wg failed")
+		fake := &statsWGController{fakeWGController: &fakeWGController{}, err: fakeErr}
+		c := NewWGAccessController(fake, discardLogger())
+
+		got, err := c.PeerHandshakes(testAccessIface)
+		wantWGErrPrefix(t, err, "bridge: access: peer handshakes:")
+		if !errors.Is(err, fakeErr) {
+			t.Errorf("errors.Is(err, fakeErr) = false, want true")
+		}
+		if got != nil {
+			t.Errorf("PeerHandshakes() = %v, want nil on error", got)
+		}
+	})
+
+	t.Run("controller reads no stats", func(t *testing.T) {
+		fake := &fakeWGController{}
+		c := NewWGAccessController(fake, discardLogger())
+
+		got, err := c.PeerHandshakes(testAccessIface)
+		wantWGErrPrefix(t, err, "bridge: access: peer handshakes:")
+		if !errors.Is(err, wireguard.ErrPeerStatsUnsupported) {
+			t.Errorf("errors.Is(err, wireguard.ErrPeerStatsUnsupported) = false, want true")
+		}
+		if got != nil {
+			t.Errorf("PeerHandshakes() = %v, want nil on error", got)
+		}
+		if calls := fake.wgMethods(); len(calls) != 0 {
+			t.Errorf("calls = %v, want none", calls)
 		}
 	})
 }

@@ -152,7 +152,7 @@ func TestWGControllers_RealWintun(t *testing.T) {
 		const name = "plexd-accci"
 
 		ctrl := NewWGAccessController(wireguard.NewWindowsController(discardLogger()), discardLogger())
-		if err := ctrl.CreateInterface(name, 0); err != nil {
+		if err := ctrl.CreateInterface(name, testPrivateKey(t), 0, ""); err != nil {
 			t.Fatalf("CreateInterface: %v", err)
 		}
 		removed := false
