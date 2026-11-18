@@ -641,7 +641,7 @@ if err := mgr.Teardown(); err != nil {
 ### Setup Sequence
 
 1. Choose the MTU: `Config.MTU` when it is above 0; otherwise, with a probe set through `SetPathMTUProbe`, `MeshMTU` of the path MTU it measures, or 1420 when it returns an error; otherwise 1420. The probe runs before any controller call (see [At startup](#at-startup))
-2. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key
+2. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key. On Linux the kernel keeps a WireGuard link when the process that made it ends without its teardown, as a killed or crashed plexd does. `NetlinkController` therefore deletes a WireGuard link that already holds the name, with its addresses, routes and peers, creates the interface afresh and logs it at `warn`. A link of another type that holds the name fails the create with `wireguard: create interface: file exists: a <type> link holds the name <name>`
 3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 4. `SetMTU(name, mtu)` — only if `Config.MTU > 0` or the chosen MTU is not 1420, the MTU every controller creates the device with
 5. `SetInterfaceUp(name)` — bring the interface up
@@ -666,6 +666,7 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | Level   | Event                        | Keys                                  |
 |---------|------------------------------|---------------------------------------|
 | `Info`  | Interface configured         | `interface`, `listen_port`, `mesh_ip`, `mtu`, `mtu_source`, `path_mtu` (only with `mtu_source=probe`) |
+| `Warn`  | Linux only: a WireGuard link an earlier process left behind was replaced (`wireguard: replaced an interface an earlier process left behind`) | `interface` |
 | `Info`  | Peers configured (bulk)      | `count`                               |
 | `Debug` | Peer added/removed/updated   | `peer_id`                             |
 | `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |

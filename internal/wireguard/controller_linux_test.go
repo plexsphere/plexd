@@ -4,11 +4,15 @@ package wireguard
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/vishvananda/netlink"
 )
 
 type nopWriterLinux struct{}
@@ -95,6 +99,132 @@ func TestCreateInterfaceRequiresPrivileges(t *testing.T) {
 	expected := "wireguard: create interface:"
 	if len(err.Error()) < len(expected) || err.Error()[:len(expected)] != expected {
 		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+	}
+}
+
+// fakeLinkOps records what addLink asks of netlink. adds holds the errors
+// the successive adds return; existing is the link the name lookup finds.
+type fakeLinkOps struct {
+	adds     []error
+	existing netlink.Link
+	delErr   error
+	added    int
+	looked   int
+	deleted  []string
+}
+
+func (f *fakeLinkOps) ops() linkOps {
+	return linkOps{
+		add: func(netlink.Link) error {
+			f.added++
+			if f.added > len(f.adds) {
+				return nil
+			}
+			return f.adds[f.added-1]
+		},
+		byName: func(name string) (netlink.Link, error) {
+			f.looked++
+			if f.existing == nil {
+				return nil, netlink.LinkNotFoundError{}
+			}
+			return f.existing, nil
+		},
+		del: func(l netlink.Link) error {
+			f.deleted = append(f.deleted, l.Attrs().Name)
+			return f.delErr
+		},
+	}
+}
+
+func wireGuardLink(name string) *netlink.GenericLink {
+	la := netlink.NewLinkAttrs()
+	la.Name = name
+	return &netlink.GenericLink{LinkAttrs: la, LinkType: "wireguard"}
+}
+
+// A link left behind by a killed process keeps plexd0 in the kernel, and the
+// add answers EEXIST, wrapped the way netlink annotates an errno.
+func TestAddLink(t *testing.T) {
+	exists := fmt.Errorf("%w: link already exists", syscall.EEXIST)
+	leftover := &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: "plexd0"}}
+	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "plexd0"}}
+
+	tests := []struct {
+		name         string
+		fake         fakeLinkOps
+		wantReplaced bool
+		wantErr      error
+		wantText     string
+		wantAdds     int
+		wantDeleted  []string
+	}{
+		{name: "fresh name", wantAdds: 1},
+		{
+			name:         "leftover wireguard link replaced",
+			fake:         fakeLinkOps{adds: []error{exists}, existing: leftover},
+			wantReplaced: true, wantAdds: 2, wantDeleted: []string{"plexd0"},
+		},
+		{
+			name:     "link of another type keeps the name",
+			fake:     fakeLinkOps{adds: []error{exists}, existing: dummy},
+			wantErr:  syscall.EEXIST,
+			wantText: "a dummy link holds the name plexd0",
+			wantAdds: 1,
+		},
+		{
+			name:     "other add error is not a leftover",
+			fake:     fakeLinkOps{adds: []error{syscall.EPERM}, existing: leftover},
+			wantErr:  syscall.EPERM,
+			wantAdds: 1,
+		},
+		{
+			name:     "link gone before the lookup",
+			fake:     fakeLinkOps{adds: []error{exists}},
+			wantErr:  syscall.EEXIST,
+			wantAdds: 1,
+		},
+		{
+			name:        "delete fails",
+			fake:        fakeLinkOps{adds: []error{exists}, existing: leftover, delErr: syscall.EBUSY},
+			wantErr:     syscall.EBUSY,
+			wantText:    "delete the plexd0 link an earlier process left behind",
+			wantAdds:    1,
+			wantDeleted: []string{"plexd0"},
+		},
+		{
+			name:        "second add fails",
+			fake:        fakeLinkOps{adds: []error{exists, syscall.ENOBUFS}, existing: leftover},
+			wantErr:     syscall.ENOBUFS,
+			wantAdds:    2,
+			wantDeleted: []string{"plexd0"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := tt.fake
+			replaced, err := addLink(fake.ops(), wireGuardLink("plexd0"))
+			if replaced != tt.wantReplaced {
+				t.Errorf("replaced = %v, want %v", replaced, tt.wantReplaced)
+			}
+			switch {
+			case tt.wantErr == nil && err != nil:
+				t.Fatalf("err = %v, want nil", err)
+			case tt.wantErr != nil && !errors.Is(err, tt.wantErr):
+				t.Fatalf("err = %v, want it to wrap %v", err, tt.wantErr)
+			}
+			if tt.wantText != "" && !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("err = %q, want it to contain %q", err, tt.wantText)
+			}
+			if fake.added != tt.wantAdds {
+				t.Errorf("adds = %d, want %d", fake.added, tt.wantAdds)
+			}
+			if fmt.Sprint(fake.deleted) != fmt.Sprint(tt.wantDeleted) {
+				t.Errorf("deleted = %v, want %v", fake.deleted, tt.wantDeleted)
+			}
+			if tt.fake.adds == nil && fake.looked != 0 {
+				t.Errorf("looked the name up %d times after a successful add, want 0", fake.looked)
+			}
+		})
 	}
 }
 
