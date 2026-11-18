@@ -1286,7 +1286,8 @@ const (
 	IngressCertificateNotReady = "not_ready"
 
 	// IngressDialNone marks a rule whose target no client connection has
-	// dialled yet.
+	// dialled yet, or, for a udp rule, to which no flow has sent a client's
+	// datagram yet.
 	IngressDialNone = "none"
 	// IngressDialSucceeded marks a rule whose last dial reached its target.
 	IngressDialSucceeded = "succeeded"
@@ -2016,9 +2017,15 @@ type IngressACME struct {
 // IngressRule is one rule of the block, the control plane's
 // NodeStateBridgeIngressRule.
 type IngressRule struct {
-	ID         string `json:"id"`
-	Slug       string `json:"slug"`
-	ListenPort int    `json:"listen_port"`
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	// Protocol is IngressProtocolTCP or IngressProtocolUDP. A rule of a
+	// control plane before plexsphere/plexsphere#1110 carries none and
+	// decodes to an empty Protocol, which a bridge serves as tcp.
+	Protocol string `json:"protocol,omitempty"`
+	// ListenPort is the public port the bridge listens on, TCP or UDP by
+	// Protocol.
+	ListenPort int `json:"listen_port"`
 	// Mode is IngressModePassthrough, IngressModeTerminate or IngressModeACME.
 	Mode string `json:"mode"`
 	// SNIHost is the server name the rule matches on a shared port, exact or
@@ -2043,10 +2050,20 @@ const (
 	IngressModeACME        = "acme"
 )
 
+// The protocols of an ingress rule. A tcp rule forwards the connections that
+// reach its listen port, and a udp rule the datagrams.
+const (
+	IngressProtocolTCP = "tcp"
+	IngressProtocolUDP = "udp"
+)
+
 // IngressInfo is the ingress status reported by the node in heartbeats.
 type IngressInfo struct {
-	Enabled         bool `json:"enabled"`
-	RuleCount       int  `json:"rule_count"`
+	Enabled   bool `json:"enabled"`
+	RuleCount int  `json:"rule_count"`
+	// ConnectionCount counts the open client connections of the tcp rules
+	// and the open flows of the udp rules. A flow carries the datagrams of
+	// one client address and port and the target's answers to them.
 	ConnectionCount int  `json:"connection_count"`
 	ACMEEnabled     bool `json:"acme_enabled"`
 }
