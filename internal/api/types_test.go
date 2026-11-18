@@ -2275,16 +2275,25 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 }
 
 // TestIngressConfig_DecodesContractBlock decodes the example block of the
-// agent contract's Public ingress section (plexsphere/plexsphere@8458a7d,
-// docs/reference/api/plexd-agent-contract.md).
+// agent contract's Public ingress section (plexsphere/plexsphere@834500a,
+// docs/reference/api/plexd-agent-contract.md), wrapped in an object as the
+// pull carries it. The rules shop-api and shop-web carry conditions and
+// strip_path_prefix, members IngressRule does not have; the decode ignores
+// them.
 func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	const block = `{
+"bridge": {
   "ingress": {
+    "acme": {
+      "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
+      "contact_email": "ops@example.com"
+    },
     "enabled": true,
     "rules": [
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
         "slug": "api",
+        "protocol": "tcp",
         "listen_port": 443,
         "mode": "acme",
         "sni_host": "api.example.com",
@@ -2295,6 +2304,7 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2",
         "slug": "apps",
+        "protocol": "tcp",
         "listen_port": 443,
         "mode": "passthrough",
         "sni_host": "*.apps.example.com",
@@ -2303,8 +2313,19 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
         "target_port": 443
       },
       {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5",
+        "slug": "dns",
+        "protocol": "udp",
+        "listen_port": 53,
+        "mode": "passthrough",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "target_address": "10.42.0.7",
+        "target_port": 53
+      },
+      {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3",
         "slug": "mqtt",
+        "protocol": "tcp",
         "listen_port": 8883,
         "mode": "terminate",
         "sni_host": "mqtt.example.com",
@@ -2314,25 +2335,57 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
         "certificate_secret_name": "mqtt-cert"
       },
       {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6",
+        "slug": "shop-api",
+        "protocol": "tcp",
+        "listen_port": 443,
+        "mode": "terminate",
+        "sni_host": "shop.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+        "target_address": "10.42.0.8",
+        "target_port": 8080,
+        "certificate_secret_name": "shop-cert",
+        "conditions": {
+          "path_prefix": "/api"
+        },
+        "strip_path_prefix": true
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7",
+        "slug": "shop-web",
+        "protocol": "tcp",
+        "listen_port": 443,
+        "mode": "terminate",
+        "sni_host": "shop.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "target_address": "10.42.0.7",
+        "target_port": 3000,
+        "certificate_secret_name": "shop-cert",
+        "conditions": {
+          "path_prefix": "/"
+        }
+      },
+      {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4",
         "slug": "ssh",
+        "protocol": "tcp",
         "listen_port": 2222,
         "mode": "passthrough",
         "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
         "target_address": "10.42.0.8",
         "target_port": 22
       }
-    ],
-    "acme": {
-      "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
-      "contact_email": "ops@example.com"
-    }
+    ]
   }
+}
 }`
-	var bridge BridgeSnapshot
-	if err := json.Unmarshal([]byte(block), &bridge); err != nil {
+	var pull struct {
+		Bridge BridgeSnapshot `json:"bridge"`
+	}
+	if err := json.Unmarshal([]byte(block), &pull); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+	bridge := pull.Bridge
 	if bridge.Ingress == nil {
 		t.Fatal("Ingress is nil")
 	}
@@ -2340,17 +2393,31 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 		t.Error("Ingress.Enabled = false, want true")
 	}
 	want := []IngressRule{
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", Slug: "mqtt", ListenPort: 8883, Mode: IngressModeTerminate, SNIHost: "mqtt.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 1883, CertificateSecretName: "mqtt-cert"},
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", Slug: "ssh", ListenPort: 2222, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 22},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5", Slug: "dns", Protocol: IngressProtocolUDP, ListenPort: 53, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 53},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", Slug: "mqtt", Protocol: IngressProtocolTCP, ListenPort: 8883, Mode: IngressModeTerminate, SNIHost: "mqtt.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 1883, CertificateSecretName: "mqtt-cert"},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6", Slug: "shop-api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeTerminate, SNIHost: "shop.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 8080, CertificateSecretName: "shop-cert"},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7", Slug: "shop-web", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeTerminate, SNIHost: "shop.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 3000, CertificateSecretName: "shop-cert"},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", Slug: "ssh", Protocol: IngressProtocolTCP, ListenPort: 2222, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 22},
 	}
 	requireEqual(t, want, bridge.Ingress.Rules)
-	if got := bridge.Ingress.Rules[3]; got.Slug != "ssh" || got.SNIHost != "" {
+	bySlug := make(map[string]IngressRule, len(bridge.Ingress.Rules))
+	for _, r := range bridge.Ingress.Rules {
+		bySlug[r.Slug] = r
+	}
+	if got := bySlug["dns"]; got.Protocol != "udp" {
+		t.Errorf("rule dns Protocol = %q, want %q", got.Protocol, "udp")
+	}
+	if got := bySlug["ssh"]; got.Protocol != "tcp" {
+		t.Errorf("rule ssh Protocol = %q, want %q", got.Protocol, "tcp")
+	}
+	if got := bySlug["ssh"]; got.SNIHost != "" {
 		t.Errorf("rule ssh = %+v, want an empty SNIHost", got)
 	}
+	withSecret := map[string]bool{"mqtt": true, "shop-api": true, "shop-web": true}
 	for _, r := range bridge.Ingress.Rules {
-		if r.Slug != "mqtt" && r.CertificateSecretName != "" {
+		if !withSecret[r.Slug] && r.CertificateSecretName != "" {
 			t.Errorf("rule %s CertificateSecretName = %q, want empty", r.Slug, r.CertificateSecretName)
 		}
 	}
@@ -2358,6 +2425,16 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 		DirectoryURL: "https://acme-v02.api.letsencrypt.org/directory",
 		ContactEmail: "ops@example.com",
 	}, bridge.Ingress.ACME)
+
+	// A rule object without protocol, as a control plane before
+	// plexsphere/plexsphere#1110 sends it, decodes to an empty Protocol.
+	var bare IngressRule
+	if err := json.Unmarshal([]byte(`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4","slug":"ssh","listen_port":2222,"mode":"passthrough","target_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","target_address":"10.42.0.8","target_port":22}`), &bare); err != nil {
+		t.Fatalf("decode a rule without protocol: %v", err)
+	}
+	if bare.Protocol != "" {
+		t.Errorf("rule without protocol: Protocol = %q, want empty", bare.Protocol)
+	}
 }
 
 // TestIngressConfig_ACMEAndSecretNamePresence decodes a block without an acme
