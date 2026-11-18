@@ -69,6 +69,13 @@ const siteToSiteProviderTimeout = 30 * time.Second
 // allowed_subnets.
 const maxSiteToSiteSubnets = 64
 
+// siteToSiteEstablishedAge is the oldest latest handshake with the remote
+// peer that counts the remote site of a wireguard tunnel as answering.
+const siteToSiteEstablishedAge = 180 * time.Second
+
+// siteToSiteEstablishedTimeout bounds one call of a provider's Established.
+const siteToSiteEstablishedTimeout = 5 * time.Second
+
 // SiteToSiteDeps are what a SiteToSiteManager serves tunnels with.
 type SiteToSiteDeps struct {
 	// VPN creates and removes the link of each tunnel: the WireGuard
@@ -120,7 +127,10 @@ type SiteToSiteDeps struct {
 //
 // Apply, SyncSecretInventory and Retry are called from the reconciler's
 // goroutine alone. They resolve a tunnel's remote host and fetch its Secret
-// outside mu, so Teardown and the status readers do not wait for either.
+// outside mu, so Teardown and the status readers do not wait for either. The
+// status readers, TunnelReports and SiteToSiteStatus, read whether a remote
+// site answers outside mu as well, so neither the reconciler nor Teardown
+// waits for a device read or a provider's command.
 type SiteToSiteManager struct {
 	vpn       VPNController
 	routes    RouteController
@@ -511,12 +521,47 @@ func siteToSiteRetryable(reason string) bool {
 	return false
 }
 
+// TunnelReports returns one report per tunnel of the last applied block with
+// a valid id no earlier entry carried, in block order, and nil while the
+// manager is not active. A tunnel whose first attempt has no outcome yet,
+// because its remote host is resolved or its Secret fetched outside mu, is
+// left out until it has one.
+//
+// A tunnel that is down reports its reason. A tunnel that is up reports
+// whether its remote site answers, read outside mu with one device read or
+// one provider command: for a wireguard tunnel its latest handshake with the
+// remote peer is at most 180 s old on the manager's clock, and it reports the
+// public key of its interface; for an ipsec or openvpn tunnel the provider's
+// Established says so within 5 s. A failed read counts false.
+func (m *SiteToSiteManager) TunnelReports() []SiteToSiteTunnelReport {
+	_, views, active := m.settledTunnels()
+	if !active {
+		return nil
+	}
+	out := make([]SiteToSiteTunnelReport, 0, len(views))
+	for _, v := range views {
+		r := SiteToSiteTunnelReport{
+			TunnelID: v.entry.ID,
+			Kind:     v.entry.Kind,
+			Health:   api.SiteToSiteHealthDown,
+			Reason:   v.reason,
+		}
+		if v.up {
+			r.Health = api.SiteToSiteHealthUp
+			r.PublicKey = v.publicKey
+			r.Established = v.established
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 // ReportChanged returns the channel the manager signals, without blocking,
-// when what it reports may have changed: at the end of every Apply, every
-// Retry, and so every SyncSecretInventory, and Teardown. Several signals
-// before the reader wakes collapse into one. The signals are liberal; the
-// reader compares before it acts. A change of whether a remote site answers
-// signals nothing.
+// when what TunnelReports returns may have changed: at the end of every
+// Apply, every Retry, and so every SyncSecretInventory, and Teardown. Several
+// signals before the reader wakes collapse into one. The signals are liberal;
+// the reader compares before it acts. A change of whether a remote site
+// answers signals nothing.
 func (m *SiteToSiteManager) ReportChanged() <-chan struct{} {
 	return m.changed
 }
@@ -532,41 +577,121 @@ func (m *SiteToSiteManager) signalReport() {
 
 // SiteToSiteStatus returns the site-to-site status for the node API's
 // status.site-to-site report: the Enabled of the last applied block and one
-// entry per tunnel the manager holds with a settled first attempt, in block
-// order, with its health, the reason of a tunnel that is down and the link
-// of one that is up. It returns nil while the manager is not active.
+// entry per tunnel TunnelReports reports, in block order, with its health,
+// the reason of a tunnel that is down, and the link of one that is up and
+// whether its remote site answers, read as TunnelReports reads it. It returns
+// nil while the manager is not active.
 func (m *SiteToSiteManager) SiteToSiteStatus() *api.SiteToSiteInfo {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.active {
+	enabled, views, active := m.settledTunnels()
+	if !active {
 		return nil
 	}
-	info := &api.SiteToSiteInfo{Enabled: m.enabled}
-	for _, t := range m.tunnels {
-		if !t.settled {
-			continue
-		}
+	info := &api.SiteToSiteInfo{Enabled: enabled}
+	for _, v := range views {
 		ti := api.SiteToSiteTunnelInfo{
-			ID:             t.entry.ID,
-			Slug:           t.entry.Slug,
-			Kind:           t.entry.Kind,
-			Interface:      t.iface,
+			ID:             v.entry.ID,
+			Slug:           v.entry.Slug,
+			Kind:           v.entry.Kind,
+			Interface:      v.iface,
 			Health:         api.SiteToSiteHealthDown,
-			Reason:         t.reason,
-			RemoteHost:     t.entry.RemoteHost,
-			RemotePort:     t.entry.RemotePort,
-			AllowedSubnets: append([]string{}, t.entry.AllowedSubnets...),
+			Reason:         v.reason,
+			RemoteHost:     v.entry.RemoteHost,
+			RemotePort:     v.entry.RemotePort,
+			AllowedSubnets: append([]string{}, v.entry.AllowedSubnets...),
 		}
-		if t.up {
+		if v.up {
 			ti.Health = api.SiteToSiteHealthUp
+			ti.Established = v.established
 		}
-		if t.entry.Kind == api.SiteToSiteKindWireGuard {
-			ti.ListenPort = t.entry.ListenPort
+		if v.entry.Kind == api.SiteToSiteKindWireGuard {
+			ti.ListenPort = v.entry.ListenPort
 		}
 		info.Tunnels = append(info.Tunnels, ti)
 	}
 	return info
+}
+
+// siteToSiteView is a copy of what the manager holds for one tunnel with a
+// settled attempt, taken under mu, and whether the remote site of a tunnel
+// that is up answers, read outside it.
+type siteToSiteView struct {
+	entry       api.SiteToSiteTunnel
+	key         string
+	up          bool
+	reason      string
+	iface       string
+	publicKey   string
+	established bool
+}
+
+// settledTunnels returns the Enabled of the last applied block and a view of
+// each tunnel the manager holds with a settled attempt, in block order, and
+// active false while the manager is not active. It copies the tunnels under
+// mu and then reads, outside mu, whether the remote site of each one that is
+// up answers. TunnelReports and SiteToSiteStatus both read through it, so
+// the report and the local status agree.
+func (m *SiteToSiteManager) settledTunnels() (enabled bool, views []siteToSiteView, active bool) {
+	m.mu.Lock()
+	if !m.active {
+		m.mu.Unlock()
+		return false, nil, false
+	}
+	enabled = m.enabled
+	for _, t := range m.tunnels {
+		if !t.settled {
+			continue
+		}
+		views = append(views, siteToSiteView{
+			entry:     t.entry,
+			key:       t.key,
+			up:        t.up,
+			reason:    t.reason,
+			iface:     t.iface,
+			publicKey: t.publicKey,
+		})
+	}
+	m.mu.Unlock()
+
+	for i := range views {
+		if views[i].up {
+			views[i].established = m.established(views[i])
+		}
+	}
+	return enabled, views, true
+}
+
+// established reports whether the remote site of v, a tunnel that is up,
+// answers: for a wireguard tunnel its latest handshake with the remote peer,
+// read with TunnelPeerHandshake, is at most siteToSiteEstablishedAge old on
+// the manager's clock; for an ipsec or openvpn tunnel the provider's
+// Established says so, under a timeout of siteToSiteEstablishedTimeout. A
+// failed read counts false and is logged at Debug. It runs outside mu: a
+// tunnel torn down meanwhile fails its read or reads false.
+func (m *SiteToSiteManager) established(v siteToSiteView) bool {
+	var ok bool
+	var err error
+	if v.entry.Kind == api.SiteToSiteKindWireGuard {
+		var at time.Time
+		at, err = m.vpn.TunnelPeerHandshake(v.iface, v.entry.RemotePublicKey)
+		// The controller gives the zero time for a peer that never completed
+		// a handshake.
+		ok = !at.IsZero() && m.now().Sub(at) <= siteToSiteEstablishedAge
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), siteToSiteEstablishedTimeout)
+		ok, err = m.providers[v.entry.Kind].Established(ctx, v.key)
+		cancel()
+	}
+	if err != nil {
+		m.logger.Debug("bridge: site-to-site: read established failed",
+			"component", "bridge",
+			"tunnel_id", v.entry.ID,
+			"kind", v.entry.Kind,
+			"interface", v.iface,
+			"error", err,
+		)
+		return false
+	}
+	return ok
 }
 
 // planLocked returns the state of each entry with a valid id no earlier entry

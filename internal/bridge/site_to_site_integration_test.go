@@ -43,15 +43,21 @@ func siteToSiteState(inventory []api.NodeStateSecret, tunnels ...api.SiteToSiteT
 }
 
 // tunnelHealth returns the health of the tunnel with id, "" while the
-// manager reports none.
+// manager reports none. Like tunnelIDs it reads what the manager holds, so
+// polling it runs no provider command among those a test checks.
 func tunnelHealth(mgr *SiteToSiteManager, id string) string {
-	info := mgr.SiteToSiteStatus()
-	if info == nil {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if !mgr.active {
 		return ""
 	}
-	for _, ti := range info.Tunnels {
-		if ti.ID == id {
-			return ti.Health
+	for _, t := range mgr.tunnels {
+		switch {
+		case !t.settled || t.entry.ID != id:
+		case t.up:
+			return api.SiteToSiteHealthUp
+		default:
+			return api.SiteToSiteHealthDown
 		}
 	}
 	return ""

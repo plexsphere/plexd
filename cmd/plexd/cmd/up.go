@@ -1438,25 +1438,30 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
-	// 17d. Start the relay, ingress and user access status reporters on a
-	// bridge. The relay status reporter sends what the relay handler records
-	// on the tracker from a goroutine of its own, so a slow control plane
-	// never delays a reconcile cycle, and it ticks at the heartbeat's interval
-	// because the control plane keeps a report in force only while it is
-	// repeated within three of them. It does not wait for wgReady: the relay
-	// binds a UDP socket of its own and needs no WireGuard device. Cancelling
-	// ctx makes it send a last stopped report, bounded by 5 s, and the wg.Wait
-	// of the shutdown sequence waits for it. The ingress status reporter sends
-	// whether this bridge opts out of public ingress and, unless it does, the
-	// listener, certificate and last dial of each ingress rule the ingress
-	// manager reports: at once, on every change of the rule entries at most
-	// once per 5 s, and at the heartbeat's interval. It sends nothing at
-	// shutdown: the control plane keeps the report, and what it says never
-	// gates what the ingress handler serves. The user access status reporter
-	// does the same for user access: whether this bridge opts out and, unless
-	// it does, whether each provider the user access manager holds is up, why
-	// not, and for a wireguard provider its public key and connected devices;
-	// a change of the connected devices alone waits for the interval. A node
+	// 17d. Start the relay, ingress, user access and site-to-site status
+	// reporters on a bridge. The relay status reporter sends what the relay
+	// handler records on the tracker from a goroutine of its own, so a slow
+	// control plane never delays a reconcile cycle, and it ticks at the
+	// heartbeat's interval because the control plane keeps a report in force
+	// only while it is repeated within three of them. It does not wait for
+	// wgReady: the relay binds a UDP socket of its own and needs no WireGuard
+	// device. Cancelling ctx makes it send a last stopped report, bounded by
+	// 5 s, and the wg.Wait of the shutdown sequence waits for it. The ingress
+	// status reporter sends whether this bridge opts out of public ingress and,
+	// unless it does, the listener, certificate and last dial of each ingress
+	// rule the ingress manager reports: at once, on every change of the rule
+	// entries at most once per 5 s, and at the heartbeat's interval. It sends
+	// nothing at shutdown: the control plane keeps the report, and what it says
+	// never gates what the ingress handler serves. The user access status
+	// reporter does the same for user access: whether this bridge opts out and,
+	// unless it does, whether each provider the user access manager holds is
+	// up, why not, and for a wireguard provider its public key and connected
+	// devices; a change of the connected devices alone waits for the interval.
+	// The site-to-site status reporter does the same for site-to-site tunnels:
+	// whether this bridge opts out and, unless it does, whether each tunnel the
+	// site-to-site manager holds is up, why not, whether its remote site
+	// answers, and for a wireguard tunnel its public key; a change of whether a
+	// remote site answers alone waits for the next pull or the interval. A node
 	// outside bridge mode starts none of them.
 	if bridgeMgr != nil {
 		relayStatusReporter := bridge.NewRelayStatusReporter(statusInterval, identity.NodeID, client, bridgeMgr.RelayStatusTracker(), logger)
@@ -1491,6 +1496,19 @@ func runAgent(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			_ = userAccessStatusReporter.Run(ctx)
+		}()
+
+		// An opted-out bridge has no site-to-site manager either, and passes
+		// an untyped nil for the same reason.
+		var siteToSiteTunnels bridge.SiteToSiteTunnelReportSource
+		if s2sMgr != nil {
+			siteToSiteTunnels = s2sMgr
+		}
+		siteToSiteStatusReporter := bridge.NewSiteToSiteStatusReporter(statusInterval, identity.NodeID, client, cfg.Bridge.SiteToSiteOptedOut(), siteToSiteTunnels, logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = siteToSiteStatusReporter.Run(ctx)
 		}()
 	}
 
