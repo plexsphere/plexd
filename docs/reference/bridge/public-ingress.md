@@ -6,21 +6,21 @@ feature: PXD-0014
 
 # Public Ingress
 
-Public ingress lets a bridge node publish services that run on nodes of its Domain. A client outside the mesh connects to a public TCP port of the bridge, and the bridge forwards the connection over the mesh to a port on the target node. Each published service is a rule of the `bridge.ingress` block of the bridge's state pull, which an operator authors on the bridge Resource in the control plane.
+Public ingress lets a bridge node publish services that run on nodes of its Domain. A client outside the mesh connects to a public TCP port of the bridge, or sends datagrams to a public UDP port, and the bridge forwards the connection or the datagrams over the mesh to a port on the target node. Each published service is a rule of the `bridge.ingress` block of the bridge's state pull, which an operator authors on the bridge Resource in the control plane.
 
-The bridge opens one TCP listener per distinct listen port. A port with a rule that names no `sni_host` forwards every connection without reading it. On a port whose rules name hosts, the bridge reads the server name of each connection's TLS ClientHello and routes by it, so several HTTPS services share port 443. A `passthrough` rule forwards the TLS session to the target unchanged. A `terminate` rule ends TLS at the bridge with the certificate of the Secret it names, and an `acme` rule with a certificate the bridge obtains from an ACME CA; both forward plaintext to the target.
+Each rule has a protocol, `tcp` or `udp`. The bridge opens one TCP listener per distinct listen port of the `tcp` rules and one UDP socket per listen port of the `udp` rules, so a `tcp` and a `udp` rule can share a port number. A TCP port with a rule that names no `sni_host` forwards every connection without reading it. On a port whose rules name hosts, the bridge reads the server name of each connection's TLS ClientHello and routes by it, so several HTTPS services share port 443. A `passthrough` rule forwards the TLS session to the target unchanged. A `terminate` rule ends TLS at the bridge with the certificate of the Secret it names, and an `acme` rule with a certificate the bridge obtains from an ACME CA; both forward plaintext to the target. A `udp` rule is a `passthrough` rule without a host: the bridge keeps one flow per client address and port, sends each datagram unchanged to the rule's target, and returns the target's answers to the client (see [Forwarding Datagrams](#forwarding-datagrams)).
 
 ## Data Flow
 
 ![Public internet clients open TCP connections or send UDP datagrams to a listen port of the bridge node, which runs one listener per listen port and protocol. On the plain port :2222 a connection goes to the target dial without being read. On the UDP port :53 the bridge keeps one flow per client address, and each flow's datagrams go to the target dial. On the SNI port :443 the bridge peeks the ClientHello and matches the server name; a passthrough rule replays the peeked bytes, and a terminate or acme rule ends TLS at the bridge. Both go on to dial the target over plexd0, which reaches the target address and port on the target node. IngressReconcileHandler calls IngressManager.Apply, which swaps the ingressTable of each port in place. IngressSecretInventoryHandler supplies the terminate certificates, and ACMEManager the acme certificates and the challenges on :443.](../../diagrams/bridge-public-ingress.svg)
 
-The control plane delivers the block in the state pull and announces a change with a `bridge_config_updated` event, which only triggers a pull (see [SSE event handling](#sse-event-handling)). `IngressReconcileHandler` hands the block to `IngressManager.Apply`, which plans the rules, opens and closes listeners, swaps each port's routing table, and then configures the ACME account. `IngressSecretInventoryHandler` hands the pull's secret inventory to `IngressManager.SyncSecretInventory` on every successful pull, which loads, replaces and drops the certificates of the `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). The certificates of the `acme` rules come from `ACMEManager` (see [ACME and SNI Routing](acme-sni.md)).
+The control plane delivers the block in the state pull and announces a change with a `bridge_config_updated` event, which only triggers a pull (see [SSE event handling](#sse-event-handling)). `IngressReconcileHandler` hands the block to `IngressManager.Apply`, which plans the rules, opens and closes listeners and UDP sockets, swaps each TCP port's routing table and each UDP port's route, and then configures the ACME account. `IngressSecretInventoryHandler` hands the pull's secret inventory to `IngressManager.SyncSecretInventory` on every successful pull, which loads, replaces and drops the certificates of the `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). The certificates of the `acme` rules come from `ACMEManager` (see [ACME and SNI Routing](acme-sni.md)).
 
-The bridge's dial to a target is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). A rule grants no allow of its own: the policy needs a rule that allows TCP from the bridge's mesh IP to the target's address and port. A Project's allow-all policy covers every mesh address. Without such a rule the dial fails, the bridge logs `bridge: ingress: dial target failed` with `reason=policy_denied`, and the rule's entry in the [ingress status report](#rule-entries) reads `dial` `failed` with `dial_reason` `policy_denied`.
+The bridge's dial to a target, and every datagram it sends to the target of a `udp` rule, is traffic the bridge itself sends over the mesh, which its compiled policy governs (see [What the rules govern](../networking/pf-wfp-firewall.md#what-the-rules-govern)). A rule grants no allow of its own: the policy needs a rule that allows TCP from the bridge's mesh IP to the target's address and port for a `tcp` rule, and one that allows UDP for a `udp` rule. A Project's allow-all policy covers every mesh address. On Linux the target's answers to a `udp` rule's datagrams need no rule of their own: they travel in the reply direction of the flow the bridge's datagram opened (see [Connection Tracking](../networking/nftables-firewall.md#connection-tracking)). Without such a rule the dial or the send fails, the bridge logs `bridge: ingress: dial target failed` with `reason=policy_denied`, and the rule's entry in the [ingress status report](#rule-entries) reads `dial` `failed` with `dial_reason` `policy_denied`. Where a firewall backend drops a blocked datagram without an error, a `udp` rule reads `succeeded` instead (see [Rule Entries](#rule-entries)).
 
 ## The bridge.ingress Block
 
-The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStateBridgeIngressRule`, and its `acme` member a `NodeStateBridgeIngressACME`. The agent contract's `## Public ingress` section in plexsphere's `docs/reference/api/plexd-agent-contract.md` defines it, and its sections `### Terminate rules` and `### ACME rules` define where the certificates come from. The pull lists the rules by `slug` ascending. A bridge with one rule per mode and one plain TCP rule pulls:
+The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStateBridgeIngressRule`, and its `acme` member a `NodeStateBridgeIngressACME`. The agent contract's `## Public ingress` section in plexsphere's `docs/reference/api/plexd-agent-contract.md` defines it, and its sections `### Terminate rules` and `### ACME rules` define where the certificates come from. The pull lists the rules by `slug` ascending. A bridge with one rule per mode, one plain TCP rule and one UDP rule pulls:
 
 ```json
 "bridge": {
@@ -30,6 +30,7 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
         "slug": "api",
+        "protocol": "tcp",
         "listen_port": 443,
         "mode": "acme",
         "sni_host": "api.example.com",
@@ -40,6 +41,7 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2",
         "slug": "apps",
+        "protocol": "tcp",
         "listen_port": 443,
         "mode": "passthrough",
         "sni_host": "*.apps.example.com",
@@ -48,8 +50,19 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
         "target_port": 443
       },
       {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5",
+        "slug": "dns",
+        "protocol": "udp",
+        "listen_port": 53,
+        "mode": "passthrough",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "target_address": "10.42.0.7",
+        "target_port": 53
+      },
+      {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3",
         "slug": "mqtt",
+        "protocol": "tcp",
         "listen_port": 8883,
         "mode": "terminate",
         "sni_host": "mqtt.example.com",
@@ -61,6 +74,7 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4",
         "slug": "ssh",
+        "protocol": "tcp",
         "listen_port": 2222,
         "mode": "passthrough",
         "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
@@ -80,7 +94,8 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
 |---|---|---|
 | `id` | string | The rule's id. The bridge tells rules apart by it |
 | `slug` | string | The rule's name within the bridge Resource; logs and listener conflicts name it |
-| `listen_port` | int | The public TCP port, 1 to 65535, on all of the node's addresses |
+| `protocol` | string, optional | `tcp` or `udp`. A `tcp` rule forwards the connections that reach its listen port, and a `udp` rule the datagrams (see [Forwarding Datagrams](#forwarding-datagrams)). A rule without it, as a control plane older than [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) sends it, is a `tcp` rule. A `udp` rule is a `passthrough` rule without `sni_host` |
+| `listen_port` | int | The public port, 1 to 65535, on all of the node's addresses: a TCP port for a `tcp` rule and a UDP port for a `udp` rule |
 | `mode` | string | `passthrough`, `terminate` or `acme` (see [Modes](#modes)) |
 | `sni_host` | string, optional | The server name the rule matches, in lowercase: an exact name, or `*.` and a suffix for one label in place of the `*`. A rule without it is the only rule on its port |
 | `target_node_id` | string | The target node. It is not dialed |
@@ -116,10 +131,13 @@ The control plane enables ingress by default, a bridge host opts out in its loca
 - A bridge that upgrades without `bridge.ingress_enabled` in its configuration starts serving the rules the control plane delivers. A host that must stay closed sets `bridge.ingress_enabled: false` before it upgrades.
 - A control plane older than [plexsphere/plexsphere#1090](https://github.com/plexsphere/plexsphere/pull/1090) sends blocks without `enabled`. plexd then opens no public listener, as the contract states for a block without the member.
 
+An upgrade also changes how a bridge serves a `udp` rule. plexd v0.35.0 and earlier decode no `protocol`: they serve a `udp` rule as a TCP listener on its port, report it `listening`, and lose every datagram, and of a `tcp` and a `udp` rule on one port number they hold only one. A bridge that served a `udp` rule as a TCP listener until now opens a UDP socket for it instead, and a `tcp` rule on the same port number keeps a TCP listener of its own. A control plane older than [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) sends no `protocol`, and the bridge serves each of its rules as a `tcp` rule, as before.
+
 | Field                | Type            | Default | Description                                      |
 |----------------------|-----------------|---------|--------------------------------------------------|
 | `IngressEnabled`     | `*bool`         | `true`  | `bridge.ingress_enabled`: the local switch for public ingress (nil = true). nil and `true` serve, `false` opts out and is reported as `opted_out`. `ApplyDefaults` leaves it nil, and `IngressOptedOut()` is true exactly when it is non-nil and `false` |
 | `MaxIngressRules`    | `int`           | `20`    | `bridge.max_ingress_rules`: the most rules the bridge holds |
+| `MaxIngressUDPFlows` | `int`           | `1024`  | `bridge.max_ingress_udp_flows`: the most flows one `udp` rule holds, a flow being the datagrams of one client address and port; `ApplyDefaults` turns 0 into 1024 (`DefaultMaxIngressUDPFlows`). See [Forwarding Datagrams](#forwarding-datagrams) |
 | `IngressDialTimeout` | `time.Duration` | `10s`   | `bridge.ingress_dial_timeout`: the timeout for dialing a target |
 | `ACMECacheDir`       | `string`        | `""`    | `bridge.acme_cache_dir`: the directory of the ACME account key and the certificates of `acme` rules; empty means `<data_dir>/acme` (see [The Cache Directory](acme-sni.md#the-cache-directory)) |
 | `ACMEDirectoryURLs`  | `[]string`      | empty   | `bridge.acme_directory_urls`: the ACME directories the bridge accepts from the block's `acme` member; empty accepts any https directory |
@@ -130,9 +148,10 @@ Every reader of `IngressEnabled` outside `config.go` goes through `IngressOptedO
 |----------------------|-------------------------|-----------------------------------------------------------------------------|
 | `IngressEnabled`     | An explicit `true` requires `Enabled=true` | `bridge: config: ingress requires bridge mode to be enabled`                |
 | `MaxIngressRules`    | Must be > 0 when `Enabled` is true and `IngressOptedOut()` is false | `bridge: config: MaxIngressRules must be positive when ingress is enabled`  |
+| `MaxIngressUDPFlows` | Must be > 0 when `Enabled` is true and `IngressOptedOut()` is false | `bridge: config: MaxIngressUDPFlows must be positive when ingress is enabled` |
 | `IngressDialTimeout` | Must be >= 1s when `Enabled` is true and `IngressOptedOut()` is false | `bridge: config: IngressDialTimeout must be at least 1s`                    |
 
-An absent key and an explicit `false` are valid without `Enabled`, so a node outside bridge mode loads without the key. `ParseConfig` applies the defaults before anything validates, so only an explicit bad value fails: a bridge whose configuration never enabled ingress and carries `max_ingress_rules: -1` or `ingress_dial_timeout: 500ms` fails `plexd up` with these messages until it corrects the value or sets `bridge.ingress_enabled: false`.
+An absent key and an explicit `false` are valid without `Enabled`, so a node outside bridge mode loads without the key. `ParseConfig` applies the defaults before anything validates, so only an explicit bad value fails: a bridge whose configuration never enabled ingress and carries `max_ingress_rules: -1`, `max_ingress_udp_flows: -1` or `ingress_dial_timeout: 500ms` fails `plexd up` with these messages until it corrects the value or sets `bridge.ingress_enabled: false`. A bridge that opts out builds no ingress manager, so it opens no UDP socket either, whatever `max_ingress_udp_flows` says.
 
 `ACMEDirectoryURLs` is checked whether or not ingress is enabled: an entry that is not an absolute https URL fails with `bridge: config: acme_directory_urls: "<entry>" is not an absolute https URL`.
 
@@ -156,36 +175,37 @@ type acmeAvailability struct{ Reason, Detail string }
 func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) ingressPlan
 ```
 
-`planIngress` walks the rules in the order the pull lists them and gives each the first reason that applies:
+Before any check, `planIngress` sets an empty `protocol` to `tcp` on its copy of the rule, so every rule state and route carries `tcp` or `udp`. `Apply` keeps a route whose rule compares equal to the last one, so without this a control plane that starts to send the member would cut every established connection once. It walks the rules in the order the pull lists them and gives each the first reason that applies:
 
 | Order | Check | Reason | Detail |
 | --- | --- | --- | --- |
 | 1 | `id` is empty | `invalid_rule` | `id` |
 | 2 | an earlier rule has the same `id` | `duplicate_id` | |
-| 3 | `mode` is none of the three modes | `invalid_rule` | `mode` |
-| 4 | `listen_port` outside 1 to 65535 | `invalid_rule` | `listen_port` |
-| 5 | `sni_host`, lowercased: longer than 253 bytes, an empty label, or a `*` anywhere but as the whole first label of at least two; empty on `terminate` or `acme`; or on `acme`, a host that starts with `*.` or has one label | `invalid_rule` | `sni_host` |
-| 6 | `target_address` is not an IP address, or carries a port, brackets or a zone | `invalid_rule` | `target_address` |
-| 7 | `target_port` outside 1 to 65535 | `invalid_rule` | `target_port` |
-| 8 | on `terminate`, `certificate_secret_name` is outside the Secret name grammar `^[a-z][a-z0-9_-]{0,62}$` (`api.ValidSecretName`) | `invalid_rule` | `certificate_secret_name` |
-| 9 | a held rule has the same port and the same host, or one of the two has no host | `listener_conflict` | slug of the holder |
-| 10 | `max_ingress_rules` rules are held already | `max_rules` | |
+| 3 | `protocol` is neither `tcp` nor `udp`, compared with case, so `UDP` fails | `invalid_rule` | `protocol` |
+| 4 | `mode` is none of the three modes, or a `udp` rule's `mode` is not `passthrough` | `invalid_rule` | `mode` |
+| 5 | `listen_port` outside 1 to 65535 | `invalid_rule` | `listen_port` |
+| 6 | `sni_host`, lowercased: not empty on a `udp` rule; longer than 253 bytes, an empty label, or a `*` anywhere but as the whole first label of at least two; empty on `terminate` or `acme`; or on `acme`, a host that starts with `*.` or has one label | `invalid_rule` | `sni_host` |
+| 7 | `target_address` is not an IP address, or carries a port, brackets or a zone | `invalid_rule` | `target_address` |
+| 8 | `target_port` outside 1 to 65535 | `invalid_rule` | `target_port` |
+| 9 | on `terminate`, `certificate_secret_name` is outside the Secret name grammar `^[a-z][a-z0-9_-]{0,62}$` (`api.ValidSecretName`) | `invalid_rule` | `certificate_secret_name` |
+| 10 | a held rule of the same protocol holds the listener: for a `tcp` rule, a held `tcp` rule has the same port and the same host, or one of the two has no host; for a `udp` rule, a held `udp` rule has the same port | `listener_conflict` | slug of the holder |
+| 11 | `max_ingress_rules` rules are held already, of both protocols together | `max_rules` | |
 
-A rule that passes check 10 is held. After the walk, each held `acme` rule gets the first reason that applies:
+A rule that passes check 11 is held. A `udp` rule is a `passthrough` rule, so check 9 never applies to it and a `certificate_secret_name` on it is ignored, as on every mode but `terminate`. Listener conflicts are per protocol: a `tcp` and a `udp` rule on one port number are both held, and a `udp` rule, which has no host, conflicts with the held `udp` rule of its port. After the walk, each held `acme` rule gets the first reason that applies:
 
 | Order | Check | Reason | Detail |
 | --- | --- | --- | --- |
 | 1 | the block has no `acme` member, or its `directory_url` is not an absolute https URL | `acme_directory_invalid` | the URL |
 | 2 | `bridge.acme_directory_urls` is not empty and lists no entry equal to `directory_url` | `acme_directory_not_allowed` | the URL |
-| 3 | the table of port 443 has a plain rule, or routes the rule's host to a rule of another mode | `acme_challenge_port_taken` | slug of that rule |
+| 3 | the table of TCP port 443 has a plain rule, or routes the rule's host to a rule of another mode | `acme_challenge_port_taken` | slug of that rule |
 
 The first two are the `acmeAvailability` that `Apply` computes once per block with `checkACMEDirectory` (see [The ACME Account](acme-sni.md#the-acme-account)), so they apply to every `acme` rule of the block alike. The third keeps a rule whose challenge connection from the CA would reach another rule (see [The Challenge on Port 443](acme-sni.md#the-challenge-on-port-443)). An `acme` rule with a reason keeps its slot and is not served.
 
-Every port with a held rule gets a routing table and a listener, also a port whose rules are all `terminate` or `acme` rules without a certificate yet: the set of listeners follows the rules alone, not the state of a fetch. A route is served when its rule is `passthrough` or `terminate`, and when it is `acme` without a reason. When at least one `acme` rule has no reason and port 443 has no table, the plan adds an empty table for port 443, so that `Apply` opens the port for ACME challenges alone. When a bind fails, the port's rules read `listen_failed`, and an `acme` rule among them is left out of the ACME account (see [Applying the Block](#applying-the-block)). A failed bind of the challenge-only port 443 fails `Apply` like any other port's and is retried by the next one. That port holds no rule, so no rule reads `listen_failed` for it: the `acme` rules on other ports stay served, from the certificates the cache holds, and the CA cannot validate a new certificate until the bind succeeds.
+Every port with a held `tcp` rule gets a routing table and a listener, also a port whose rules are all `terminate` or `acme` rules without a certificate yet: the set of listeners follows the rules alone, not the state of a fetch. A route is served when its rule is `passthrough` or `terminate`, and when it is `acme` without a reason. Every port with a held `udp` rule gets that rule's route, served, in the plan's `udp` map, and a UDP socket. The routing tables hold TCP ports only, so the ACME challenge logic on port 443 neither sees a `udp` rule on 443 nor is blocked by one. When at least one `acme` rule has no reason and TCP port 443 has no table, the plan adds an empty table for port 443, so that `Apply` opens the port for ACME challenges alone. When a bind fails, the port's rules of that protocol read `listen_failed`, and an `acme` rule among them is left out of the ACME account (see [Applying the Block](#applying-the-block)). A failed bind of the challenge-only port 443 fails `Apply` like any other port's and is retried by the next one. That port holds no rule, so no rule reads `listen_failed` for it: the `acme` rules on other ports stay served, from the certificates the cache holds, and the CA cannot validate a new certificate until the bind succeeds.
 
 A held `terminate` rule's state also follows its certificate: `RuleStates()` reports it served exactly while the manager holds a certificate for its Secret, and otherwise with `certificate_secret_not_listed`, `certificate_fetch_failed` or `certificate_invalid` and the Secret name as detail (see [Certificates from the Secret Store](#certificates-from-the-secret-store)).
 
-The control plane refuses a rule set a bridge could not serve: a second rule on a listener another rule holds answers `409 bridge_port_conflict`, a `terminate` or `acme` rule without `sni_host` answers `400 ingress_rule_invalid`, and a `terminate` rule whose Secret the bridge Resource may not read answers `422 certificate_secret_not_readable`. A rule the bridge skips is therefore a defect report, not a routine path. The bridge serves the rest of the block and logs `ingress rule not served` for the rule.
+The control plane refuses a rule set a bridge could not serve: a second rule on a listener another rule holds answers `409 bridge_port_conflict`, a `terminate` or `acme` rule without `sni_host` answers `400 ingress_rule_invalid`, and a `terminate` rule whose Secret the bridge Resource may not read answers `422 certificate_secret_not_readable`. Since [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) it delivers a `udp` rule only as `passthrough`, without `sni_host` and `certificate_secret_name`, and lets a `tcp` and a `udp` rule share a port number. A rule the bridge skips is therefore a defect report, not a routine path. The bridge serves the rest of the block and logs `ingress rule not served` for the rule.
 
 `target_address` is checked for syntax only. The pull is the node's authenticated configuration, and the control plane resolves the address from the target node.
 
@@ -197,7 +217,7 @@ The reasons are exported constants:
 | `IngressReasonDuplicateID` | `duplicate_id` | Not held |
 | `IngressReasonListenerConflict` | `listener_conflict` | Not held |
 | `IngressReasonMaxRules` | `max_rules` | Not held |
-| `IngressReasonListenFailed` | `listen_failed` | Held; its port did not bind |
+| `IngressReasonListenFailed` | `listen_failed` | Held; its port did not bind for the rule's protocol |
 | `IngressReasonACMEDirectoryInvalid` | `acme_directory_invalid` | A held `acme` rule |
 | `IngressReasonACMEDirectoryNotAllowed` | `acme_directory_not_allowed` | A held `acme` rule |
 | `IngressReasonACMEChallengePortTaken` | `acme_challenge_port_taken` | A held `acme` rule |
@@ -303,6 +323,32 @@ The handshake is bounded by 10 s: the package constant `ingressHandshakeTimeout`
 
 On port 443, a ClientHello whose ALPN list is exactly `["acme-tls/1"]` and whose server name `ACMEManager.HasHost` knows is a TLS-ALPN-01 challenge when the port's table has no route for the name or routes it to an `acme` rule. The bridge answers it with a `tls.Config` of its own, `GetCertificate: m.acme.GetCertificate`, `NextProtos: []string{acme.ALPNProto}` and `MinVersion: tls.VersionTLS12`, within the same 10 s bound, logs `ingress acme challenge answered` at Debug and closes the connection. No target is dialed. The same hello for the host of a `passthrough` rule is forwarded like any other connection, so a target that runs its own ACME client keeps working. See [The Challenge on Port 443](acme-sni.md#the-challenge-on-port-443).
 
+## Forwarding Datagrams
+
+A `udp` rule is served on the UDP socket of its listen port, which `IngressController.ListenUDP(":<port>")` opens on the dual-stack wildcard address, as the relay's socket is. The socket's read loop, `serveUDP`, reads the datagrams into one buffer of 65,535 bytes (`ingressUDPBufSize`), the largest UDP payload, and forwards each, a zero-length datagram included, on the flow of its source address and port. A client that reaches the socket as an IPv4-mapped IPv6 address counts by its IPv4 address. A read error other than the socket's close is logged at Debug, and the loop reads on.
+
+A flow carries the datagrams of one client address and port. It owns a UDP socket toward the rule's target, so the target tells the clients of a rule apart by the bridge's source port, and its answers return to the client the flow belongs to. The target sees the bridge's mesh address as the source, as it does for a TCP connection; the client's address does not reach it. `openUDPFlowConn` opens the flow's socket: a probe UDP socket connected to the target, which sends nothing, picks the source address of the kernel's route to the target and is closed, and the flow's socket is bound to that address with a port the kernel picks. The flow's socket is unconnected, so a send reports only what the send itself fails with. A connected socket would report an ICMP error that an earlier datagram caused, such as port unreachable, on a later read or write, which would make the outcome of a send depend on a race. Bound to the mesh-side address, the flow's socket is not reachable through the bridge's public addresses.
+
+For each datagram the read loop:
+
+1. Looks the client's flow up under the lock of the socket's flows. A flow whose route is cancelled, because the rule changed or was removed, counts as absent and is closed with the reason `route_cancelled`. A flow it finds moves to the front of the socket's flows, ordered by the client's last datagram, and its last activity is set to now.
+2. Without a flow, opens one with the route the socket holds at that moment. A route that is cancelled already, in the moment between the cancel and the store of the next route in `Apply`, opens no flow, and the datagram is dropped. At the bound it first closes the least recently active flow (see below). When the flow's socket does not open, the datagram is dropped, no flow opens, and the failure is the rule's failed dial; the client's next datagram tries again. A new flow counts in `status.ingress.connection_count` until it is closed, and it closes itself when its route is cancelled: the rule changed or was removed, or the manager stopped.
+3. Sends the datagram to the target with `WriteToUDPAddrPort`, outside the lock. A failed send drops the datagram and leaves the flow open. Which sends are the rule's dial is listed in [Rule Entries](#rule-entries).
+
+Each flow's reply loop reads the target's datagrams and writes each to the client from the rule's socket. A datagram from any source but the target's address and port is dropped and changes nothing: it does not reach the client and does not count as the target's answer. Every other datagram marks the flow answered, sets its last activity, and is written to the client; a failed write is logged at Debug and leaves the flow open. A read error other than an expired deadline or the socket's close closes the flow with the reason `read_failed`, so no error can spin the loop.
+
+A flow is closed with the reason `idle` after a time without a datagram in either direction: 30 s (`ingressUDPUnansweredTimeout`) while the target has not answered it, and 120 s (`ingressUDPAnsweredTimeout`) once it has. A datagram that the reply loop drops for its source does not count. These are the Linux conntrack defaults `nf_conntrack_udp_timeout` and `nf_conntrack_udp_timeout_stream`, and 120 s is the floor RFC 4787 REQ-5 sets for a NAT mapping, so a flow outlives the client's own NAT mapping in the common case. The reply loop reads with a deadline of the last activity plus the timeout, and closes the flow when the deadline passes and no datagram moved the last activity meanwhile. It decides under the lock of the socket's flows, which the read loop holds while it sets the last activity of a flow it found, so a flow the read loop is about to send on is never closed as idle. The timeouts are constants, which the manager holds in its unexported fields `udpUnansweredTimeout` and `udpAnsweredTimeout` so that a test can shorten them.
+
+One `udp` rule holds at most `bridge.max_ingress_udp_flows` flows, 1024 by default, which the manager holds in its unexported field `maxUDPFlows`. At the bound, a datagram of a new client first closes the flow whose client sent least recently, with the reason `evicted`, and the bridge logs the Warn `ingress udp flow table full, closing the least recently active flow` at most once per minute (`ingressUDPFullWarnInterval`) per socket, with `evicted`, the flows evicted since the last such line. Dropping the new client's datagram instead would refuse the clients of a DNS rule above 34 queries per second: a resolver uses a new source port per query, and 1024 flows over 30 s make room for about 34 new ones per second.
+
+A flow is closed once, for the first of these reasons, which the Debug line `ingress udp flow closed` names: `idle`, `evicted`, `route_cancelled`, `read_failed`, and `listener_closed` when the rule's socket closes. `Apply` keeps the route of an unchanged rule, and with it every flow of the rule, so the target sees a client's next datagram from the same source port. A changed rule, such as one with another `target_port`, gets a new route: its flows are closed with `route_cancelled`, and the client's next datagram opens a flow to the new target. When the rule's socket is closed, because the rule left the block or the manager stopped, the read loop ends, closes every flow still open with `listener_closed` and waits for their reply loops, and only then does `Apply` or `Teardown` log `ingress listener closed`.
+
+Replies leave from the rule's socket, which is bound to the wildcard address, so their source address is the one the kernel's route to the client selects. The bridge does not read the address a datagram was sent to (`IP_PKTINFO`). When a client sent to the address the route to it selects, as on a bridge whose one public address carries the route to its clients, the two are the same. Otherwise, such as on a host with several addresses on one interface, the client gets the replies from another source address, and a client that checks the source of an answer, as a connected UDP socket does, drops them. Clients of such a host reach a `udp` rule only through the address the bridge's route to them selects.
+
+Each datagram travels as one datagram, unchanged, in both directions: the read buffers of the rule's socket and of every flow hold 65,535 bytes, so none is cut short. A datagram the kernel refuses to send is lost. A refused send to the target is a failed send of the flow (see [Rule Entries](#rule-entries)), and a refused write to the client, such as an answer larger than an IPv4 datagram carries, is logged at Debug.
+
+A flow holds one socket, one goroutine and one read buffer of 64 KiB, so a full table of 1024 flows holds about 67 MB of buffers per `udp` rule. A datagram on an open flow costs one lock, one map read and one send. A datagram that opens a flow also opens and closes the probe socket and opens the flow's socket. The unit's `LimitNOFILE=65536` covers 20 `udp` rules, the default `bridge.max_ingress_rules`, at the default bound.
+
 ## Applying the Block
 
 `Apply(ctx, block)` makes the manager serve exactly the block it is given:
@@ -310,21 +356,22 @@ On port 443, a ClientHello whose ALPN list is exactly `["acme-tls/1"]` and whose
 1. It returns `bridge: ingress: manager is not active` before `Setup` or after `Teardown`.
 2. It checks the block's `acme` member with `checkACMEDirectory(block.ACME, cfg.ACMEDirectoryURLs)` and plans the rules with the outcome.
 3. It deletes the certificate entries of the Secret names no held rule names any more.
-4. A route whose rule is unchanged, compared with `==` and so with `certificate_secret_name` included, keeps its context and its established connections. Every other planned route gets a new context. Every route of the last `Apply` that is not carried over is cancelled, which closes its connections. Other rules on the port keep theirs.
-5. For a port in the plan without a listener, it calls `IngressController.Listen(":<port>", nil)`, also for the challenge-only port 443. On an error it marks the port's rules `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on :<port>: <error>` to the result.
-6. For a port with a listener, it stores the new routing table. The listener is not rebound, also when the port changes between a plain rule and SNI rules.
-7. It closes the listener of a port that left the plan and waits for its accept loop.
-8. It calls `ACMEManager.Configure(block.ACME, hosts)` with the hosts of the `acme` rules that end the `Apply` without a reason, so an `acme` rule whose port failed to bind (`listen_failed`) does not keep the account. Without such a rule the call retires the ACME account. Because the call follows the binds, port 443 is bound before the account asks the CA for a certificate (see [The Challenge on Port 443](acme-sni.md#the-challenge-on-port-443)).
-9. It loads, replaces or drops the certificates of the held `terminate` rules with `loadCertificates` (see [Certificates from the Secret Store](#certificates-from-the-secret-store)).
-10. It returns the listen errors joined, or nil.
+4. A route whose rule is unchanged, compared with `==` and so with `protocol` and `certificate_secret_name` included, keeps its context and its established connections or flows. Every other planned route gets a new context. Every route of the last `Apply` that is not carried over is cancelled, which closes its connections and flows. Other rules on the port keep theirs.
+5. For a TCP port in the plan without a listener, it calls `IngressController.Listen(":<port>", nil)`, also for the challenge-only port 443. On an error it marks the port's `tcp` rules `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on :<port>: <error>` to the result.
+6. For a TCP port with a listener, it stores the new routing table. The listener is not rebound, also when the port changes between a plain rule and SNI rules.
+7. For each port of the `udp` rules, in ascending order, it stores the new route when the port has a UDP socket, and otherwise calls `IngressController.ListenUDP(":<port>")` and starts the socket's read loop. On an error it marks that port's `udp` rule `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on udp :<port>: <error>` to the result. The failed binds are kept per protocol, so a failed TCP bind of a port number leaves a `udp` rule on that number served, and the reverse.
+8. It closes the listener of a TCP port and the socket of a UDP port that left the plan. Once it released its lock, it waits for the accept loop of each such listener and for the read loop of each such socket, which waits for the reply loops of its flows: a read loop takes the lock to record a dial.
+9. It calls `ACMEManager.Configure(block.ACME, hosts)` with the hosts of the `acme` rules that end the `Apply` without a reason, so an `acme` rule whose port failed to bind (`listen_failed`) does not keep the account. Without such a rule the call retires the ACME account. Because the call follows the binds, port 443 is bound before the account asks the CA for a certificate (see [The Challenge on Port 443](acme-sni.md#the-challenge-on-port-443)).
+10. It loads, replaces or drops the certificates of the held `terminate` rules with `loadCertificates` (see [Certificates from the Secret Store](#certificates-from-the-secret-store)).
+11. It returns the listen errors joined, or nil.
 
 `Apply` does not read the block's `enabled` member: [IngressReconcileHandler](#ingressreconcilehandler) hands it the zero block when the pull does not enable ingress.
 
-A second `Apply` with the same block, after one whose binds all succeeded, binds nothing, cancels nothing, keeps the ACME account as it is and logs no rule or listener line again. It is not free of side effects: its `loadCertificates` still fetches a version whose last fetch failed once that version's next attempt is due, and logs `ingress certificate loaded` when the retry succeeds (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). A failed bind fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
+A second `Apply` with the same block, after one whose binds all succeeded, binds nothing, cancels nothing, keeps every connection and flow and the ACME account as they are, and logs no rule or listener line again. It is not free of side effects: its `loadCertificates` still fetches a version whose last fetch failed once that version's next attempt is due, and logs `ingress certificate loaded` when the retry succeeds (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). A failed bind fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
 
 ## Ports Below 1024
 
-A listen port below 1024, such as 443 or 80, needs `CAP_NET_BIND_SERVICE`. So does the challenge-only port 443 a bridge opens for an `acme` rule on another port. The systemd unit `plexd install` writes and `deploy/systemd/plexd.service` grant it (see [Bare-Metal Packaging](../deployment/bare-metal-packaging.md)). When the bind fails with a permission error on such a port, `bridge: ingress: listen failed` carries `hint="ports below 1024 need CAP_NET_BIND_SERVICE"`.
+A listen port below 1024, such as 443, 80 or 53, needs `CAP_NET_BIND_SERVICE`, for the UDP socket of a `udp` rule as for the TCP listener of a `tcp` rule. So does the challenge-only port 443 a bridge opens for an `acme` rule on another port. The systemd unit `plexd install` writes and `deploy/systemd/plexd.service` grant it (see [Bare-Metal Packaging](../deployment/bare-metal-packaging.md)). When the bind fails with a permission error on such a port, `bridge: ingress: listen failed` carries `hint="ports below 1024 need CAP_NET_BIND_SERVICE"` beside `protocol`, which names the socket that failed.
 
 A unit an earlier release wrote keeps `CAP_NET_ADMIN CAP_NET_RAW` until `plexd install` writes it again. Until then, this drop-in adds the capability, because systemd merges repeated capability lines:
 
@@ -335,25 +382,27 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ```
 
-Run `systemctl daemon-reload` and `systemctl restart plexd` after adding it. A host firewall plexd does not manage must open the listen ports too, and port 443 for a bridge that serves `acme` rules.
+Run `systemctl daemon-reload` and `systemctl restart plexd` after adding it. A host firewall plexd does not manage must open the listen ports too, TCP for the `tcp` rules and UDP for the `udp` rules, and TCP port 443 for a bridge that serves `acme` rules.
 
 ## IngressController
 
-Interface abstracting TCP listener operations for ingress testability.
+Interface abstracting the sockets of public ingress for testability: a TCP listener for each listen port of the `tcp` rules and a UDP socket for each listen port of the `udp` rules.
 
 ```go
 type IngressController interface {
     Listen(addr string, tlsCfg *tls.Config) (net.Listener, error)
     Close(listener net.Listener) error
+    ListenUDP(addr string) (*net.UDPConn, error)
 }
 ```
 
-| Method   | Description |
-|----------|-------------|
-| `Listen` | Creates a TCP listener on `addr`. The manager always passes a nil `tlsCfg`: it runs the TLS handshake of a terminating rule itself, after the peek |
-| `Close`  | Closes the given listener; idempotent |
+| Method      | Description |
+|-------------|-------------|
+| `Listen`    | Creates a TCP listener on `addr`. The manager always passes a nil `tlsCfg`: it runs the TLS handshake of a terminating rule itself, after the peek |
+| `Close`     | Closes the given listener; idempotent |
+| `ListenUDP` | Opens a UDP socket on `addr`. The manager closes the socket itself |
 
-`StdIngressController` implements it with `net.Listen`.
+`StdIngressController` implements `Listen` with `net.Listen`, and `ListenUDP` with `net.ResolveUDPAddr` and `net.ListenUDP`: an address without a host, such as `:53`, binds the dual-stack wildcard address, as the relay's socket does.
 
 ## IngressManager
 
@@ -363,7 +412,7 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 
 Neither `acme` nor `certs` may be nil. In bridge mode, `plexd up` reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`) and builds `nodeSecretFetcher` with it once, when the bridge serves public ingress, user access or site-to-site tunnels. Unless `bridge.ingress_enabled` is `false`, it builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`) and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress; it reads the key for user access or site-to-site tunnels unless `bridge.user_access_enabled` and `bridge.site_to_site_enabled` are `false` too.
 
-Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
+Concurrent-safe via `sync.Mutex`. The connection counter, which counts the open connections of the `tcp` rules and the open flows of the `udp` rules, is an `atomic.Int64`. Each UDP socket guards its own flows with a lock of its own, so a datagram on an open flow takes no manager lock.
 
 | Method                | Signature                                                   | Description |
 |-----------------------|-------------------------------------------------------------|-------------|
@@ -374,9 +423,9 @@ Concurrent-safe via `sync.Mutex`. The connection counter is an `atomic.Int64`.
 | `RuleReports`         | `() []IngressRuleReport`                                    | What the ingress status report says per rule: listener, certificate and last dial (see [Rule Entries](#rule-entries)); nil when inactive |
 | `ReportChanged`       | `() <-chan struct{}`                                        | Signalled, without blocking, when what `RuleReports` returns may have changed; capacity 1 |
 | `SetDialPolicy`       | `(p IngressDialPolicy)`                                     | Sets the policy that names a failed dial `policy_denied`; called before `Setup`. Without one, no dial reads `policy_denied` |
-| `Teardown`            | `() error`                                                  | Cancels every route, which closes every connection, closes every listener, and forgets the inventory and every certificate; joins close errors; a no-op when inactive |
+| `Teardown`            | `() error`                                                  | Cancels every route, which closes every connection and every flow, closes every listener and UDP socket, and forgets the inventory and every certificate; returns once every accept loop, read loop and reply loop has ended; joins close errors; a no-op when inactive |
 | `IngressStatus`       | `() *api.IngressInfo`                                       | The `status.ingress` report entry; nil when inactive |
-| `IngressCapabilities` | `() map[string]string`                                      | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when `IngressOptedOut()` is true |
+| `IngressCapabilities` | `() map[string]string`                                      | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when `IngressOptedOut()` is true. It names no UDP capability: the control plane reads none |
 
 ```go
 type IngressRuleState struct {
@@ -402,15 +451,17 @@ type IngressRuleReport struct {
     DialAt            time.Time // zero unless Dial is succeeded or failed
 }
 
-// IngressDialPolicy tells whether the node's compiled policy blocks a TCP dial to target.
+// IngressDialPolicy tells whether the node's compiled policy blocks a dial to target.
 type IngressDialPolicy interface {
-    DialDenied(target netip.AddrPort) bool
+    // DialDenied reports whether the compiled policy blocks a dial of
+    // protocol, tcp or udp, to target.
+    DialDenied(protocol string, target netip.AddrPort) bool
 }
 ```
 
-`NewIngressManager` registers with `ACMEManager.OnIssuedChange`, so an `acme` rule's certificate state signals `ReportChanged`. `plexd up` sets the dial policy before `Setup` from `cmd/plexd/cmd/ingress_policy.go`: `ingressDialPolicy` asks `Enforcer.AdmitsTCPDial` with the node's mesh address when a UDP connect to the target picks that address as its source. A mesh address that does not parse leaves the policy unset and logs the Warn `ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error`.
+`NewIngressManager` registers with `ACMEManager.OnIssuedChange`, so an `acme` rule's certificate state signals `ReportChanged`. It takes `maxUDPFlows` from `cfg.MaxIngressUDPFlows`, and `Setup` logs it as `max_udp_flows`. `plexd up` sets the dial policy before `Setup` from `cmd/plexd/cmd/ingress_policy.go`: when a UDP connect to the target picks the node's mesh address as its source, `ingressDialPolicy` asks `Enforcer.AdmitsUDPDial` with that address for a `udp` rule's protocol, and `Enforcer.AdmitsTCPDial` for every other protocol. The manager passes the protocol of the rule whose dial failed. A mesh address that does not parse leaves the policy unset and logs the Warn `ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error`.
 
-`IngressStatus().RuleCount` counts the served rules with the certificate state applied, so a `terminate` rule counts only while it has a certificate. `ConnectionCount` counts the connections from accept to close. `ACMEEnabled` reads `ACMEManager.Active()`: it is true exactly while the last `Apply` ended with an `acme` rule without a reason. An `acme` rule whose port failed to bind reads `listen_failed` and does not count.
+`IngressStatus().RuleCount` counts the served rules with the certificate state applied, so a `terminate` rule counts only while it has a certificate. `ConnectionCount` counts the connections of the `tcp` rules from accept to close and the flows of the `udp` rules from open to close. `ACMEEnabled` reads `ACMEManager.Active()`: it is true exactly while the last `Apply` ended with an `acme` rule without a reason. An `acme` rule whose port failed to bind reads `listen_failed` and does not count.
 
 ## IngressReconcileHandler
 
@@ -486,14 +537,14 @@ The listener is read from the ports the last `Apply` bound, not from the rule's 
 | Rule after the last `Apply` | `listener` | `listener_reason` |
 | --- | --- | --- |
 | not held | `not_listening` | its reason: `invalid_rule`, `listener_conflict` or `max_rules` |
-| held, and its listen port is not bound | `not_listening` | `listen_failed` |
-| held, and its listen port is bound | `listening` | none |
+| held, and its listen port is not bound for its protocol | `not_listening` | `listen_failed` |
+| held, and its listen port is bound for its protocol | `listening` | none |
 
-A held `acme` rule with a reason of the plan, such as `acme_directory_invalid`, on a port that failed to bind reads `listen_failed`. For a rule that listens:
+A `tcp` rule's port is bound when it has a TCP listener, and a `udp` rule's when it has a UDP socket, so a `udp` rule whose bind failed reads `listen_failed` while a `tcp` rule on the same port number reads `listening`, and the reverse. A held `acme` rule with a reason of the plan, such as `acme_directory_invalid`, on a port that failed to bind reads `listen_failed`. For a rule that listens:
 
 | Rule | `certificate` | `certificate_reason` |
 | --- | --- | --- |
-| `passthrough` | `not_required` | none |
+| `passthrough`, which every `udp` rule is | `not_required` | none |
 | `terminate`, certificate loaded | `ready` | none |
 | `terminate`, no certificate loaded | `not_ready` | `certificate_secret_not_listed`, `certificate_fetch_failed` or `certificate_invalid`, as `RuleStates` reads it |
 | `acme` with a reason of the plan | `not_ready` | `acme_directory_invalid`, `acme_directory_not_allowed` or `acme_challenge_port_taken` |
@@ -502,15 +553,19 @@ A held `acme` rule with a reason of the plan, such as `acme_directory_invalid`, 
 
 `acme_not_issued` reads until the last certificate request for the host succeeds: the obtain ahead of the first client or a client handshake (see [Obtaining a Certificate](acme-sni.md#obtaining-a-certificate)). A host whose obtain failed keeps it until a client's handshake makes `autocert` ask again and succeed; plexd does not retry an issuance on its own.
 
-The dial is the last one a client connection caused to the rule's target (see [Routing a Connection](#routing-a-connection)). The bridge never dials a target on its own to test it, so `dial` reads `none` until the first connection to a rule, and a failed dial stays the rule's state until a later client's dial succeeds. A rule whose target changed reads `none`, and so does a rule removed and applied again. The reason of a failed dial is the first of these that applies:
+The dial is the last one a client connection caused to the rule's target (see [Routing a Connection](#routing-a-connection)), and for a `udp` rule the last send of a client's datagram that counted as one (see below). The bridge never dials a target on its own to test it, so `dial` reads `none` until the first connection to a `tcp` rule or the first datagram to a `udp` rule, and a failed dial stays the rule's state until a later client's dial succeeds. A rule whose target changed reads `none`, and so does a rule removed and applied again. The reason of a failed dial is the first of these that applies:
 
-1. `policy_denied`: the dial policy says the node's compiled policy blocks a TCP dial to the target (see below).
+1. `policy_denied`: the dial policy says the node's compiled policy blocks a dial of the rule's protocol to the target (see below).
 2. `timeout`: the dial did not complete within `bridge.ingress_dial_timeout`, or failed with a timeout error (`WSAETIMEDOUT` on Windows).
 3. `refused`: the target's host refused the connection (`ECONNREFUSED`, `WSAECONNREFUSED`).
 4. `unreachable`: no route reaches the target's host or network (`EHOSTUNREACH`, `ENETUNREACH`, and their Winsock names).
 5. `other`.
 
-A rule grants no allow of its own, so the likeliest failure of a correct rule is a missing Policy for the bridge's dial, and its fix is in the control plane. On the bridge that failure looks like any other failed dial: the nftables backend ends a denied packet in a drop verdict, so the socket gets no error that names the policy, and what a blocked dial fails with differs by backend. `plexd up` therefore gives the manager a dial policy, which checks a failed dial against the ruleset the Enforcer installed, in user space, after the failure: `Enforcer.AdmitsTCPDial` (see [network policy](../networking/network-policy.md#methods)). The check applies only when the kernel would send the dial from the node's mesh address, which a UDP connect to the target tells without sending a packet. A target outside the mesh, the mesh address itself and a target no route reaches never read `policy_denied`. The kernel stays the only place that enforces: the bridge dials as before, and the check only names the reason. A failed dial costs one UDP socket and one pass over the installed rules; a dial that succeeds costs neither.
+For a `udp` rule a dial is a send of a client's datagram to the target (see [Forwarding Datagrams](#forwarding-datagrams)): the first send of each flow, and every later send on a flow that ends differently from the one before it, a failure after a success or a success after a failure. A flow socket that does not open is a failed dial as well. The record therefore costs one lock per flow and per change, not one per datagram on an open flow, and `dial_age_seconds` dates the last such dial, which is the first send of the newest flow while no outcome changes. The outcome is that of the send alone. A send the kernel accepts reads `succeeded` whether or not the target answers, and an ICMP answer of the target, such as port unreachable, never changes it, so a rule whose target service is down reads `succeeded`. A send that fails because its flow was closed meanwhile, by a cancelled route or a failed read, never reached the target and records nothing.
+
+A `udp` rule therefore reads `policy_denied`, `unreachable` or `other` when its dial failed, and never `refused` or `timeout`: the flow's socket is unconnected, so no ICMP answer reaches a send, and a send has no deadline. On Linux a send that the nftables output chain drops fails with `EPERM` (`write: operation not permitted`), measured on 2026-11-18 with `TestNftablesController_Real`, and so reads `policy_denied` with the dial policy and `other` without one. What a send returns that pf on macOS or WFP on Windows blocks is not measured. Where a backend drops the datagram without an error, the send succeeds and the rule reads `succeeded`, although nothing reaches the target.
+
+A rule grants no allow of its own, so the likeliest failure of a correct rule is a missing Policy for the bridge's dial, and its fix is in the control plane. On the bridge that failure looks like any other failed dial: the nftables backend ends a denied packet in a drop verdict, so the socket gets no error that names the policy, and what a blocked dial fails with differs by backend. `plexd up` therefore gives the manager a dial policy, which checks a failed dial against the ruleset the Enforcer installed, in user space, after the failure: `Enforcer.AdmitsTCPDial`, or `Enforcer.AdmitsUDPDial` for a `udp` rule (see [network policy](../networking/network-policy.md#methods)). The check applies only when the kernel would send the dial from the node's mesh address, which a UDP connect to the target tells without sending a packet. A target outside the mesh, the mesh address itself and a target no route reaches never read `policy_denied`. The kernel stays the only place that enforces: the bridge dials as before, and the check only names the reason. A failed dial costs one UDP socket and one pass over the installed rules; a dial that succeeds costs neither.
 
 ### Reporter
 
@@ -618,6 +673,7 @@ type IngressACME struct {
 type IngressRule struct {
     ID                    string `json:"id"`
     Slug                  string `json:"slug"`
+    Protocol              string `json:"protocol,omitempty"`
     ListenPort            int    `json:"listen_port"`
     Mode                  string `json:"mode"`
     SNIHost               string `json:"sni_host,omitempty"`
@@ -632,9 +688,16 @@ const (
     IngressModeTerminate   = "terminate"
     IngressModeACME        = "acme"
 )
+
+const (
+    IngressProtocolTCP = "tcp"
+    IngressProtocolUDP = "udp"
+)
 ```
 
-`IngressRule` is comparable with `==`, which is how `Apply` tells an unchanged rule from a changed one. A changed `certificate_secret_name` is a changed rule.
+`Protocol` is `IngressProtocolTCP` or `IngressProtocolUDP`. A rule of a control plane older than [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) carries none and decodes to an empty `Protocol`, which `planIngress` sets to `tcp`. `ListenPort` is a TCP or a UDP port by `Protocol`.
+
+`IngressRule` is comparable with `==`, which is how `Apply` tells an unchanged rule from a changed one. A changed `protocol` or `certificate_secret_name` is a changed rule.
 
 ### IngressInfo
 
@@ -644,7 +707,7 @@ Published as the `status.ingress` report entry, each field under its snake_case 
 |---|---|---|
 | `Enabled` | `bool` | Whether the ingress manager is active |
 | `RuleCount` | `int` | The served rules, a `terminate` rule only while it has a certificate |
-| `ConnectionCount` | `int` | The connections from accept to close |
+| `ConnectionCount` | `int` | The open client connections of the `tcp` rules, from accept to close, and the open flows of the `udp` rules, from open to close. A flow carries the datagrams of one client address and port and the target's answers to them |
 | `ACMEEnabled` | `bool` | `ACMEManager.Active()`: whether the last `Apply` ended with an `acme` rule without a reason; a rule that reads `listen_failed` does not count |
 
 ## Error Prefixes
@@ -653,6 +716,7 @@ Published as the `status.ingress` report entry, each field under its snake_case 
 |-----------------------------------------|------------------------------------------------|
 | `IngressManager.Apply` (inactive)       | `bridge: ingress: manager is not active`       |
 | `IngressManager.Apply` (listen)         | `bridge: ingress: listen on :<port>: `         |
+| `IngressManager.Apply` (listen UDP)     | `bridge: ingress: listen on udp :<port>: `     |
 | `IngressManager.Teardown` (close)       | `bridge: ingress: close listener <port>: `     |
 | `nodeSecretFetcher` (fetch)             | `fetch secret "<name>" version <v>: `          |
 | `nodeSecretFetcher` (version)           | `fetch secret "<name>": asked for version <v>, got <w>` |
@@ -666,14 +730,15 @@ All ingress log entries use `component=bridge`, the reporter's included. `bridge
 | Level   | Message                                  | Keys |
 |---------|------------------------------------------|------|
 | `Info`  | `public ingress: opted out by bridge.ingress_enabled, no public listener is opened` | (none); logged by step 5e of `plexd up` on a bridge with `bridge.ingress_enabled: false` |
-| `Info`  | `ingress manager started`                | `max_rules`, `dial_timeout` |
+| `Info`  | `ingress manager started`                | `max_rules`, `max_udp_flows`, `dial_timeout` |
 | `Info`  | `ingress manager stopped`                | (none) |
-| `Info`  | `ingress listener opened`                | `listen_port` |
-| `Info`  | `ingress listener closed`                | `listen_port` |
-| `Info`  | `ingress rule added`                     | `rule_id`, `slug`, `listen_port`, `mode`, `sni_host`, `target` |
+| `Info`  | `ingress listener opened`                | `listen_port`, `protocol` (`tcp` for a TCP listener, `udp` for the UDP socket of a `udp` rule) |
+| `Info`  | `ingress listener closed`                | `listen_port`, `protocol`; for a UDP socket, logged once its read loop and the reply loops of its flows have ended |
+| `Info`  | `ingress rule added`                     | `rule_id`, `slug`, `protocol`, `listen_port`, `mode`, `sni_host`, `target` |
 | `Info`  | `ingress rule updated`                   | the same; an id held before with another value |
 | `Info`  | `ingress rule removed`                   | the same |
-| `Warn`  | `ingress rule not served`                | `rule_id`, `slug`, `listen_port`, `reason`, `detail`; once per rule value and reason |
+| `Warn`  | `ingress rule not served`                | `rule_id`, `slug`, `protocol`, `listen_port`, `reason`, `detail`; once per rule value and reason |
+| `Warn`  | `ingress udp flow table full, closing the least recently active flow` | `rule_id`, `slug`, `listen_port`, `max_flows`, `evicted` (the flows evicted since the last such line); at most once per minute per UDP socket |
 | `Info`  | `ingress certificate loaded`             | `secret`, `version`, `not_after` |
 | `Warn`  | `ingress certificate not loaded`         | `secret`, `version`, `reason`, `error`, `serving_version` (0 when none); once per secret, version and reason |
 | `Info`  | `ingress certificate dropped`            | `secret`, `version`, `reason` (`certificate_secret_not_listed` or `rule_removed`) |
@@ -692,13 +757,18 @@ All ingress log entries use `component=bridge`, the reporter's included. `bridge
 | `Debug` | `ingress status: send failed`            | `error`; logged instead of the Warn while the client holds a refused credential (`api.ErrCredentialRefused`) |
 | `Debug` | `ingress connection closed`              | `listen_port`, `remote`, `server_name`, `reason` |
 | `Debug` | `ingress acme challenge answered`        | `server_name`, `remote`, `error` |
-| `Error` | `bridge: ingress: listen failed`         | `listen_port`, `error`, and `hint` for a permission error below port 1024 |
+| `Debug` | `ingress udp flow opened`                | `rule_id`, `listen_port`, `remote` |
+| `Debug` | `ingress udp flow closed`                | `listen_port`, `remote`, `reason` (`idle`, `evicted`, `route_cancelled`, `read_failed` or `listener_closed`) |
+| `Debug` | `ingress datagram not forwarded`         | `listen_port`, `remote`, `error`; a client's datagram that did not reach the target and left the rule's dial record as it was, or whose flow was closed meanwhile |
+| `Debug` | `ingress udp reply not forwarded`        | `listen_port`, `remote`, `error`; a datagram of the target whose write to the client failed |
+| `Debug` | `ingress udp read failed`                | `listen_port`, `error`; a read of a `udp` rule's socket that failed for another reason than its close |
+| `Error` | `bridge: ingress: listen failed`         | `listen_port`, `protocol`, `error`, and `hint` for a permission error below port 1024 |
 | `Error` | `bridge: ingress: close listener failed` | `listen_port`, `error` |
-| `Error` | `bridge: ingress: dial target failed`    | `rule_id`, `slug`, `target`, `reason`, `error`; `reason` is absent for a dial whose route was cancelled meanwhile |
+| `Error` | `bridge: ingress: dial target failed`    | `rule_id`, `slug`, `protocol`, `target`, `reason`, `error`; `reason` is absent for a dial whose route was cancelled meanwhile. For a `udp` rule only when the failure changed the rule's dial record, so a client that keeps sending into a blocked rule writes one line, not one per datagram |
 | `Error` | `ingress reconcile: apply failed`        | `error` |
 
-A rule logs `ingress rule not served` once: an `Apply` that leaves its value and reason unchanged logs nothing for it. The line carries the reasons of the plan. A `terminate` rule's certificate state is logged by the `ingress certificate` lines instead. The ACME account's lines are listed in [ACME and SNI Routing](acme-sni.md#logging).
+A rule logs `ingress rule not served` once: an `Apply` that leaves its value and reason unchanged logs nothing for it. The flow lines of a `udp` rule are Debug, as `ingress connection closed` is: a public port draws scanners. The line carries the reasons of the plan. A `terminate` rule's certificate state is logged by the `ingress certificate` lines instead. The ACME account's lines are listed in [ACME and SNI Routing](acme-sni.md#logging).
 
 ## Limits
 
-The bridge sets no connection limit and no idle timeout on a public listener. It bounds the ClientHello peek, to 16 KiB and 5 s per connection, and the TLS handshake of a terminating rule or an ACME challenge, to 10 s (`ingressHandshakeTimeout`). For an `acme` rule the 10 s include the wait for a certificate that is still being issued; a client whose certificate is not ready by then is closed with `tls_handshake_failed`, and the issuance goes on in the background. The bounds of the ACME account's own requests are listed in [ACME and SNI Routing](acme-sni.md#limits).
+The bridge sets no connection limit and no idle timeout on a public TCP listener. A `udp` rule holds at most `bridge.max_ingress_udp_flows` flows, 1024 by default, and closes the flow whose client sent least recently to make room for a new client. It closes a flow after 30 s without a datagram in either direction while the target has not answered, and after 120 s once it has (see [Forwarding Datagrams](#forwarding-datagrams)). The bridge sets no rate limit per client address and does not check that a client owns its source address: it answers a datagram's source address, as the published service would. The flow bound and the idle timeouts limit what a flood can hold. The bridge bounds the ClientHello peek, to 16 KiB and 5 s per connection, and the TLS handshake of a terminating rule or an ACME challenge, to 10 s (`ingressHandshakeTimeout`). For an `acme` rule the 10 s include the wait for a certificate that is still being issued; a client whose certificate is not ready by then is closed with `tls_handshake_failed`, and the issuance goes on in the background. The bounds of the ACME account's own requests are listed in [ACME and SNI Routing](acme-sni.md#limits).

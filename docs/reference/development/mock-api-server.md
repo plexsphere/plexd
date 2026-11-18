@@ -912,7 +912,7 @@ therefore hands the node the new key.
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, 2 providers in the delivered shape: `field-team` (`...a0e1`), `wireguard` on port 51821 with the pool `10.98.0.0/24`, at most 64 devices and one device `alice-laptop` at `10.98.0.2`; and `tailnet` (`...a0e2`), `tailscale` with the Secret `ts-join`. No suite serves this block to a bridge: the systemd suite's bridge phases replace it |
-| `bridge.ingress` | `enabled: true`, 1 rule, `web`: port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
+| `bridge.ingress` | `enabled: true`, 1 rule, `web`: `protocol` `tcp`, port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The rule carries `protocol`, as the control plane sends it on every rule. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
 | `bridge.site_to_site` | `enabled: true`, 2 tunnels in the delivered shape: `branch-berlin` (`...a0e1`), `wireguard` on port 51830 to `vpn.branch.example.com:51820` for `10.20.0.0/16` with the Secret `branch-berlin-psk`; and `dc-east` (`...a0e2`), `ipsec` to `203.0.113.10:500` for `10.30.0.0/16` and `10.31.0.0/16` with the Secret `dc-east-ike`. No suite serves this block to a bridge: the systemd suite sets it to `null` before its node becomes one |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
@@ -1088,6 +1088,7 @@ answers `applied`.
         {
           "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
           "slug": "web",
+          "protocol": "tcp",
           "listen_port": 443,
           "mode": "passthrough",
           "sni_host": "web.e2e.internal",
