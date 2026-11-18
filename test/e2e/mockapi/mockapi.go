@@ -486,13 +486,14 @@ func newStateFixture() api.NodeStateSnapshot {
 			},
 			// The one ingress rule targets peer ...a0b1 on its mesh IP. The
 			// block carries enabled, as every block the control plane sends
-			// does.
+			// does, and the rule carries protocol, as every rule does.
 			Ingress: &api.IngressConfig{
 				Enabled: true,
 				Rules: []api.IngressRule{
 					{
 						ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
 						Slug:          "web",
+						Protocol:      api.IngressProtocolTCP,
 						ListenPort:    443,
 						Mode:          api.IngressModePassthrough,
 						SNIHost:       "web.e2e.internal",

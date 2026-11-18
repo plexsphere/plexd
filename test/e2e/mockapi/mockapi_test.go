@@ -9950,6 +9950,7 @@ func TestState_ReturnsIngressChild(t *testing.T) {
 	want := api.IngressRule{
 		ID:            "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
 		Slug:          "web",
+		Protocol:      api.IngressProtocolTCP,
 		ListenPort:    443,
 		Mode:          api.IngressModePassthrough,
 		SNIHost:       "web.e2e.internal",

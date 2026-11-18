@@ -26,21 +26,24 @@
 #   - Start after a reboot cleared /run/plexd, with the registration gone
 #     while plexd is stopped and back after the start
 #   - Mesh DNS opt-out with dns.enabled: false
-#   - Public ingress on a bridge: one listener per listen port, TLS server
-#     names routed to their targets on a shared port 443, a plain port whose
-#     target speaks first, a terminate rule that serves the certificate of its
-#     Secret, follows a new version, keeps it when the next one does not load
-#     and drops it when the inventory no longer lists the Secret, an acme rule
-#     whose certificate Pebble issues over TLS-ALPN-01 and that is not served
-#     for a directory outside bridge.acme_directory_urls, a changed target and
-#     a removed block, under the unit's CAP_NET_BIND_SERVICE and without
-#     bridge.ingress_enabled; the ingress status report enabled at start and
-#     on the heartbeat interval, with an entry per rule that follows its
-#     listener, certificate and last dial, a dial to a mesh target that the
-#     policy blocks reported as policy_denied, a block whose enabled is false
-#     closing every listener, and the opt-out with bridge.ingress_enabled:
-#     false, which opens no listener for an enabled block and reports
-#     opted_out
+#   - Public ingress on a bridge: one listener per listen port and protocol,
+#     TLS server names routed to their targets on a shared port 443, a plain
+#     port whose target speaks first, a terminate rule that serves the
+#     certificate of its Secret, follows a new version, keeps it when the
+#     next one does not load and drops it when the inventory no longer lists
+#     the Secret, an acme rule whose certificate Pebble issues over
+#     TLS-ALPN-01 and that is not served for a directory outside
+#     bridge.acme_directory_urls, a changed target and a removed block, under
+#     the unit's CAP_NET_BIND_SERVICE and without bridge.ingress_enabled; the
+#     ingress status report enabled at start and on the heartbeat interval,
+#     with an entry per rule that follows its listener, certificate and last
+#     dial, a dial to a mesh target that the policy blocks reported as
+#     policy_denied, a udp rule that shares its port number with a tcp rule
+#     and carries datagrams to an echo server and back, a udp rule whose
+#     sends to a mesh target the policy blocks reported as policy_denied with
+#     one Error line, a block whose enabled is false closing every listener,
+#     and the opt-out with bridge.ingress_enabled: false, which opens no
+#     listener for an enabled block and reports opted_out
 #   - User access through a bridge: a wireguard provider on an interface of
 #     its own, with the pool's first address and a key file that survives a
 #     restart and a killed process, a device that reaches a mesh node only
@@ -2265,9 +2268,10 @@ echo "=== Mesh DNS opt-out PASSED ==="
 # The restart below turns this node into a bridge without ingress_enabled, and
 # the mock serves a bridge.ingress block whose rules target a container on the
 # suite's network: three openssl s_server instances with certificates of their
-# own and a plain TCP server that writes a banner first. A terminate rule ends
-# TLS at the bridge with the certificate of a Secret the mock serves, and an
-# acme rule with a certificate the bridge obtains from Pebble, which runs as a
+# own, a plain TCP server that writes a banner first, and a socat server that
+# echoes each UDP datagram to its sender. A terminate rule ends TLS at the
+# bridge with the certificate of a Secret the mock serves, and an acme rule
+# with a certificate the bridge obtains from Pebble, which runs as a
 # container on the same network and validates the bridge over TLS-ALPN-01 on
 # port 443. The probes run from the target container against the systemd
 # container's address on the network, which is outside the mesh. Docker sets
@@ -2308,6 +2312,10 @@ for spec in 9441:a 9442:b 9443:wild; do
         -cert "/srv/ingress/${spec#*:}.pem" -key "/srv/ingress/${spec#*:}.key" -www
 done
 docker exec -d "${INGRESS_TARGET_CONTAINER}" sh -c 'while true; do printf "plexd-e2e-banner\n" | nc -N -l 9022; done'
+# socat hands each datagram to a child of its own, whose cat writes it back
+# to the sender, so every datagram of every sender is answered. -T 5 ends a
+# child after 5 s without a datagram.
+docker exec -d "${INGRESS_TARGET_CONTAINER}" socat -T 5 UDP4-RECVFROM:9053,fork,reuseaddr EXEC:/bin/cat
 TARGET_START=${SECONDS}
 until TARGET_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -ltn 2>&1) \
     && case "${TARGET_LISTEN}" in *"0.0.0.0:9441 "*) ;; *) false ;; esac \
@@ -2321,6 +2329,16 @@ until TARGET_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -ltn 2>&1) \
     sleep 1
 done
 echo "  PASS: the target listens on 9441, 9442, 9443 (TLS) and 9022 (banner)"
+TARGET_UDP_START=${SECONDS}
+until TARGET_UDP_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -lun 2>&1) \
+    && case "${TARGET_UDP_LISTEN}" in *"0.0.0.0:9053 "*) ;; *) false ;; esac; do
+    if [ $((SECONDS - TARGET_UDP_START)) -ge 10 ]; then
+        echo "${TARGET_UDP_LISTEN}"
+        fail "the target's UDP echo server did not listen on 9053 within 10s"
+    fi
+    sleep 1
+done
+echo "  PASS: the target listens on UDP 9053 (echo)"
 
 # Pebble's listener certificate names localhost and pebble, so plexd reaches
 # the directory under the network alias pebble. Its validator resolves
@@ -2355,15 +2373,16 @@ until PEBBLE_DIR=$(docker exec "${SYSTEMD_CONTAINER}" curl -sSf --cacert /etc/pl
 done
 echo "  PASS: https://pebble:14000/dir answers ${SYSTEMD_CONTAINER} under Pebble's test CA"
 
-# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port> [secret name or ""] [target address]
+# ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port> [secret name or ""] [target address or ""] [protocol]
 # renders one rule of the block, targeting the target container unless a
-# target address is given. A Secret name becomes the rule's
-# certificate_secret_name.
+# target address is given, with the protocol tcp unless a protocol is given.
+# Every rule carries protocol, as the control plane sends it. A Secret name
+# becomes the rule's certificate_secret_name.
 ingress_rule() {
     jq -cn --arg id "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1$1" --arg slug "$2" --argjson port "$3" \
         --arg mode "$4" --arg host "$5" --arg addr "${8:-${INGRESS_TARGET_IP}}" --argjson tport "$6" \
-        --arg secret "${7:-}" \
-        '{id: $id, slug: $slug, listen_port: $port, mode: $mode}
+        --arg secret "${7:-}" --arg proto "${9:-tcp}" \
+        '{id: $id, slug: $slug, protocol: $proto, listen_port: $port, mode: $mode}
          + (if $host == "" then {} else {sni_host: $host} end)
          + {target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", target_address: $addr, target_port: $tport}
          + (if $secret == "" then {} else {certificate_secret_name: $secret} end)'
@@ -2433,6 +2452,8 @@ RULE_ID_PLAIN="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1"
 RULE_ID_TERM="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f4"
 RULE_ID_ACME="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"
 RULE_ID_MESH="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f7"
+RULE_ID_UDP_ECHO="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f8"
+RULE_ID_UDP_MESH="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f9"
 RULE_IDS_SIX='["0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f2","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f3","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f4","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f5","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"]'
 
 # wait_ingress_report <tag> <what> <jq-filter> [<jq-option>...] reads the last
@@ -2913,7 +2934,124 @@ until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRES
 done
 echo "  PASS: plexd[${INGRESS_PID}] applied the fixture's policy again"
 
-# An ingress child of null closes every public listener.
+# Datagrams of udp rules. The rules of the retarget step are served with two
+# udp rules: udp-echo on 7022, the port number of the tcp rule plain, which
+# targets the target's echo server, and udp-mesh on 7023, which targets
+# 10.99.0.2 as the rule mesh did. The block leaves mesh out, since plain and
+# udp-echo already share a port number. The dial of a udp rule is the outcome
+# of its last send: under the fixture's policy a send to 10.99.0.2 reads
+# anything but policy_denied, and under the policy of the step before, whose
+# only rule allows TCP 443, the kernel refuses the send, which reads
+# policy_denied. The bridge logs that failure once, not once per datagram.
+UDP_RULES=$(ingress_rules 9441 | jq -c \
+    --argjson e "$(ingress_rule f8 udp-echo 7022 passthrough "" 9053 "" "" udp)" \
+    --argjson m "$(ingress_rule f9 udp-mesh 7023 passthrough "" 9053 "" 10.99.0.2 udp)" \
+    '. + [$e, $m] | sort_by(.slug)')
+configure_ingress udp "${UDP_RULES}" "${PEBBLE_ACME}"
+UDP_START=${SECONDS}
+until ingress_journal \
+    && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=7022" "protocol=udp" \
+    && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=7023" "protocol=udp"; do
+    if [ $((SECONDS - UDP_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not log 'ingress listener opened' with protocol=udp for listen_port=7022 and listen_port=7023 within 60s of the rules udp-echo and udp-mesh being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress listener opened' with protocol=udp for listen_port=7022 and listen_port=7023"
+
+# ingress_udp <port> sends the datagram plexd-e2e-udp to the UDP port of the
+# bridge from the target container and prints what came back until nc read
+# nothing for 2 s, which is nothing when no datagram came back. Each call
+# sends from a new source port, so it opens a flow of its own.
+ingress_udp() {
+    docker exec "${INGRESS_TARGET_CONTAINER}" sh -c 'printf plexd-e2e-udp | timeout 10 nc -u -w 2 "$1" "$2"' \
+        _ "${BRIDGE_IP}" "$1" 2>/dev/null || true
+}
+
+# UDP gives no delivery guarantee, so the echo is probed until it comes back,
+# and the step prints how many probes that took.
+UDP_ECHO_START=${SECONDS}
+UDP_PROBES=0
+while :; do
+    UDP_ECHO=$(ingress_udp 7022)
+    UDP_PROBES=$((UDP_PROBES + 1))
+    if [ "${UDP_ECHO}" = "plexd-e2e-udp" ]; then
+        break
+    fi
+    if [ $((SECONDS - UDP_ECHO_START)) -ge 60 ]; then
+        fail "${UDP_PROBES} datagrams plexd-e2e-udp to UDP port 7022 of the bridge in 60s read '${UDP_ECHO}' at last, want plexd-e2e-udp"
+    fi
+    sleep 2
+done
+echo "  PASS: a datagram plexd-e2e-udp to UDP port 7022 read plexd-e2e-udp back (probe ${UDP_PROBES})"
+BANNER=$(docker exec "${INGRESS_TARGET_CONTAINER}" sh -c 'timeout 10 nc -w 5 "$1" 7022 </dev/null' _ "${BRIDGE_IP}" 2>&1 || true)
+if [ "${BANNER}" = "plexd-e2e-banner" ]; then
+    echo "  PASS: beside udp-echo, a client that sends nothing to TCP port 7022 still read plexd-e2e-banner"
+else
+    fail "beside udp-echo, a client that sends nothing to TCP port 7022 read '${BANNER}', want plexd-e2e-banner"
+fi
+wait_ingress_report udp-echo "udp-echo listening, not_required and dial succeeded" \
+    'any(.rules[]?; .id == $echo and .listener == "listening" and .certificate == "not_required" and .dial == "succeeded")' \
+    --arg echo "${RULE_ID_UDP_ECHO}"
+
+# One datagram to 7023 under the fixture's policy. The filter waits for a
+# recorded dial, so a report from before the datagram, with dial none, does
+# not pass it.
+ingress_udp 7023 >/dev/null
+wait_ingress_report udp-mesh-send "udp-mesh's dial recorded and other than failed with policy_denied" \
+    'any(.rules[]?; .id == $m and (.dial == "succeeded" or (.dial == "failed" and .dial_reason != "policy_denied")))' \
+    --arg m "${RULE_ID_UDP_MESH}"
+UDP_MESH_DIAL=$(printf '%s' "${INGRESS_REPORT}" | jq -r --arg m "${RULE_ID_UDP_MESH}" \
+    '.rules[] | select(.id == $m) | "dial=\(.dial)" + (if has("dial_reason") then " dial_reason=\(.dial_reason)" else "" end)' || true)
+echo "  the send to 10.99.0.2:9053 under the fixture's policy reads ${UDP_MESH_DIAL}"
+
+# The deny policy of the step before, served again. Its revision was applied
+# once already, so the step waits for a second 'policy ruleset applied' line.
+ingress_journal
+UDP_DENY_BEFORE=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${DENY_REV}")
+configure_policy udp-deny "${DENY_POLICY}"
+UDP_DENY_START=${SECONDS}
+until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${DENY_REV}")" -gt "${UDP_DENY_BEFORE}" ]; do
+    if [ $((SECONDS - UDP_DENY_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not apply the policy revision ${DENY_REV} again within 60s of it being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] applied the policy whose only rule allows TCP 443 again"
+for _ in 1 2 3; do
+    ingress_udp 7023 >/dev/null
+done
+wait_ingress_report udp-mesh-denied "udp-mesh's dial failed with policy_denied" \
+    'any(.rules[]?; .id == $m and .dial == "failed" and .dial_reason == "policy_denied")' --arg m "${RULE_ID_UDP_MESH}"
+# The report shows the failure once the bridge recorded it, and journald
+# may hold the line a moment later, so the step waits for the first line
+# and then counts them.
+UDP_DENIED_NEEDLES=("plexd[${INGRESS_PID}]:" 'msg="bridge: ingress: dial target failed"' "rule_id=${RULE_ID_UDP_MESH}" "protocol=udp" "reason=policy_denied")
+UDP_DENIED_START=${SECONDS}
+until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "${UDP_DENIED_NEEDLES[@]}")" -ge 1 ]; do
+    if [ $((SECONDS - UDP_DENIED_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'bridge: ingress: dial target failed' with rule_id=${RULE_ID_UDP_MESH}, protocol=udp and reason=policy_denied within 60s of the report showing it"
+    fi
+    sleep 2
+done
+UDP_DENIED=$(journal_count "${INGRESS_JOURNAL}" "${UDP_DENIED_NEEDLES[@]}")
+if [ "${UDP_DENIED}" -eq 1 ]; then
+    echo "  PASS: for three datagrams, plexd[${INGRESS_PID}] logged one 'bridge: ingress: dial target failed' for the rule udp-mesh with protocol=udp and reason=policy_denied"
+else
+    fail "for three datagrams, plexd[${INGRESS_PID}] logged ${UDP_DENIED} 'bridge: ingress: dial target failed' lines with rule_id=${RULE_ID_UDP_MESH}, protocol=udp and reason=policy_denied, want 1"
+fi
+UDP_RESTORED_BEFORE=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_REV}")
+configure_policy udp-restore "${FIXTURE_POLICY}"
+UDP_RESTORE_START=${SECONDS}
+until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_REV}")" -gt "${UDP_RESTORED_BEFORE}" ]; do
+    if [ $((SECONDS - UDP_RESTORE_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not apply the fixture's policy revision ${FIXTURE_REV} again within 60s of it being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] applied the fixture's policy again"
+
+# An ingress child of null closes every public listener, of both protocols.
 configure_ingress remove null
 REMOVE_START=${SECONDS}
 until ingress_refused 443 && ingress_refused 7022; do
@@ -2925,12 +3063,28 @@ done
 echo "  PASS: connections to 443 and 7022 are refused after the block was served as null"
 ingress_journal
 for port in 443 7022; do
-    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener closed"' "listen_port=${port}"; then
-        echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress listener closed' for port ${port}"
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener closed"' "listen_port=${port}" "protocol=tcp"; then
+        echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress listener closed' with protocol=tcp for port ${port}"
     else
-        fail "plexd[${INGRESS_PID}] logged no 'ingress listener closed' for port ${port}"
+        fail "plexd[${INGRESS_PID}] logged no 'ingress listener closed' with protocol=tcp for port ${port}"
     fi
 done
+UDP_CLOSED_START=${SECONDS}
+until ingress_journal \
+    && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener closed"' "listen_port=7022" "protocol=udp" \
+    && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener closed"' "listen_port=7023" "protocol=udp"; do
+    if [ $((SECONDS - UDP_CLOSED_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not log 'ingress listener closed' with protocol=udp for listen_port=7022 and listen_port=7023 within 60s of the block being served as null"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress listener closed' with protocol=udp for listen_port=7022 and listen_port=7023"
+UDP_ECHO=$(ingress_udp 7022)
+if [ -z "${UDP_ECHO}" ]; then
+    echo "  PASS: a datagram plexd-e2e-udp to UDP port 7022 read nothing back after the block was served as null"
+else
+    fail "a datagram plexd-e2e-udp to UDP port 7022 read '${UDP_ECHO}' back after the block was served as null, want nothing"
+fi
 
 # Without a block the report carries no entries.
 wait_ingress_report remove 'exactly {"state":"enabled"}' '. == {"state":"enabled"}'

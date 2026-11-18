@@ -9,9 +9,10 @@
 #
 # The systemd suite's public ingress phase runs the same image, without
 # CAP_NET_ADMIN, as the ingress rules' target: openssl serves TLS on three
-# ports, nc writes a banner, and both tools probe the bridge.
+# ports, nc writes a banner, socat echoes UDP datagrams, and openssl and nc
+# probe the bridge.
 FROM alpine:3.22
 
-RUN apk add --no-cache wireguard-tools iproute2 netcat-openbsd openssl
+RUN apk add --no-cache wireguard-tools iproute2 netcat-openbsd openssl socat
 
 CMD ["sleep", "infinity"]
