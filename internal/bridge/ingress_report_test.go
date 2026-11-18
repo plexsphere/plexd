@@ -171,6 +171,62 @@ func TestRuleReports_PassthroughNobodyConnected(t *testing.T) {
 	}
 }
 
+func TestRuleReports_UDPRule(t *testing.T) {
+	udpID, tcpID := reportID("a1"), reportID("b2")
+	block := rulesBlock(
+		withID(udpIngressRule("dns", 7053, 9053), udpID),
+		withID(ingressRule("dns-tcp", 7053, "", 9053), tcpID),
+	)
+	listening := func(id string) IngressRuleReport {
+		return IngressRuleReport{RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired, Dial: api.IngressDialNone}
+	}
+	listenFailed := func(id string) IngressRuleReport {
+		return IngressRuleReport{RuleID: id, Listener: api.IngressListenerNotListening, ListenerReason: IngressReasonListenFailed}
+	}
+
+	t.Run("before any datagram", func(t *testing.T) {
+		fx := newIngressFixture(t, newLoopbackIngressController(t))
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(udpIngressRule("dns", 7053, 9053), udpID))); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if got, want := reportFor(t, fx.mgr.RuleReports(), udpID), listening(udpID); got != want {
+			t.Errorf("report = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("the udp bind failed", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		ctrl.failListenUDP(7053, syscall.EADDRINUSE)
+		fx := newIngressFixture(t, ctrl)
+		if err := fx.mgr.Apply(t.Context(), block); !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("Apply = %v, want the bind error", err)
+		}
+		reports := fx.mgr.RuleReports()
+		if got, want := reportFor(t, reports, udpID), listenFailed(udpID); got != want {
+			t.Errorf("udp rule: report = %+v, want %+v", got, want)
+		}
+		if got, want := reportFor(t, reports, tcpID), listening(tcpID); got != want {
+			t.Errorf("tcp rule on the same port number: report = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("the tcp bind failed", func(t *testing.T) {
+		ctrl := newLoopbackIngressController(t)
+		ctrl.failListen(7053, syscall.EADDRINUSE)
+		fx := newIngressFixture(t, ctrl)
+		if err := fx.mgr.Apply(t.Context(), block); !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("Apply = %v, want the bind error", err)
+		}
+		reports := fx.mgr.RuleReports()
+		if got, want := reportFor(t, reports, tcpID), listenFailed(tcpID); got != want {
+			t.Errorf("tcp rule: report = %+v, want %+v", got, want)
+		}
+		if got, want := reportFor(t, reports, udpID), listening(udpID); got != want {
+			t.Errorf("udp rule on the same port number: report = %+v, want %+v", got, want)
+		}
+	})
+}
+
 func TestRuleReports_TerminateCertificate(t *testing.T) {
 	fx := newIngressFixture(t, newLoopbackIngressController(t))
 	id := reportID("a1")

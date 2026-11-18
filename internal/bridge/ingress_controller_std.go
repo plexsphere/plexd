@@ -42,3 +42,14 @@ func (c *StdIngressController) Listen(addr string, tlsCfg *tls.Config) (net.List
 func (c *StdIngressController) Close(listener net.Listener) error {
 	return listener.Close()
 }
+
+// ListenUDP resolves addr and opens a UDP socket on it. An address without a
+// host, such as ":53", binds the dual-stack wildcard address, as the relay's
+// socket does.
+func (c *StdIngressController) ListenUDP(addr string) (*net.UDPConn, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp", udpAddr)
+}

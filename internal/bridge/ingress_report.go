@@ -28,13 +28,16 @@ type IngressRuleReport struct {
 // report for one such entry; the Warn "ingress rule not served" names both.
 //
 // A rule that is not held does not listen, for its reason: invalid_rule,
-// listener_conflict or max_rules. A held rule listens when its port is bound,
-// and otherwise reads listen_failed. For a rule that listens, the certificate
-// is not_required for passthrough; ready or not_ready with the overlay's
-// reason for terminate; and for acme, not_ready with the plan's reason when it
-// has one, ready once the ACME manager reports the host issued, and
-// acme_not_issued until then. The dial is the last one a client connection
-// caused to the rule's current target, and none without one.
+// listener_conflict or max_rules. A held rule listens when its port is bound
+// for its protocol, a TCP listener for a tcp rule and a UDP socket for a udp
+// rule, and otherwise reads listen_failed. For a rule that listens, the
+// certificate is not_required for passthrough, which every udp rule is; ready
+// or not_ready with the overlay's reason for terminate; and for acme,
+// not_ready with the plan's reason when it has one, ready once the ACME
+// manager reports the host issued, and acme_not_issued until then. The dial is
+// the last one a client connection caused to the rule's current target, for a
+// udp rule the last send of a client's datagram that counted as one (see
+// forwardUDP), and none without one.
 func (m *IngressManager) RuleReports() []IngressRuleReport {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -61,11 +64,15 @@ func (m *IngressManager) RuleReports() []IngressRuleReport {
 // ruleReportLocked returns the report of one rule state. The caller holds mu.
 func (m *IngressManager) ruleReportLocked(st IngressRuleState) IngressRuleReport {
 	r := IngressRuleReport{RuleID: st.Rule.ID}
+	bound := m.listeners[st.Rule.ListenPort] != nil
+	if st.Rule.Protocol == api.IngressProtocolUDP {
+		bound = m.udp[st.Rule.ListenPort] != nil
+	}
 	switch {
 	case !st.held:
 		r.Listener, r.ListenerReason = api.IngressListenerNotListening, st.Reason
 		return r
-	case m.listeners[st.Rule.ListenPort] == nil:
+	case !bound:
 		r.Listener, r.ListenerReason = api.IngressListenerNotListening, IngressReasonListenFailed
 		return r
 	}
