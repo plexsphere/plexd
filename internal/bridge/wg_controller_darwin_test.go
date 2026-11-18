@@ -52,7 +52,7 @@ func TestWGControllers_RealUTUN(t *testing.T) {
 		const name = "plexd-s2sroot0"
 
 		ctrl := NewWGVPNController(wireguard.NewDarwinController(discardLogger()), "", discardLogger())
-		if err := ctrl.CreateTunnelInterface(name, 0); err != nil {
+		if err := ctrl.CreateTunnelInterface(name, testPrivateKey(t), 0); err != nil {
 			t.Fatalf("CreateTunnelInterface: %v", err)
 		}
 		t.Cleanup(func() { _ = ctrl.RemoveTunnelInterface(name) })
@@ -96,7 +96,7 @@ func TestWGControllers_RealUTUN(t *testing.T) {
 		const name = "plexd-s2sroot1"
 
 		ctrl := NewWGVPNController(wireguard.NewDarwinController(discardLogger()), meshAddress, discardLogger())
-		if err := ctrl.CreateTunnelInterface(name, 0); err != nil {
+		if err := ctrl.CreateTunnelInterface(name, testPrivateKey(t), 0); err != nil {
 			t.Fatalf("CreateTunnelInterface: %v", err)
 		}
 		removed := false

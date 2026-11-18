@@ -11,6 +11,7 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/wireguard"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // activeTunnel holds the state of a running site-to-site tunnel.
@@ -191,8 +192,16 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 
 	iface := tunnel.InterfaceName
 
+	// The controller takes the key from its caller. This manager keeps none,
+	// so every interface gets a fresh one, as it did when the controller
+	// generated it.
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return fmt.Errorf("bridge: site-to-site: generate key for tunnel %s: %w", tunnel.TunnelID, err)
+	}
+
 	// Create the WireGuard interface.
-	if err := m.ctrl.CreateTunnelInterface(iface, tunnel.ListenPort); err != nil {
+	if err := m.ctrl.CreateTunnelInterface(iface, key[:], tunnel.ListenPort); err != nil {
 		return fmt.Errorf("bridge: site-to-site: create interface for tunnel %s: %w", tunnel.TunnelID, err)
 	}
 

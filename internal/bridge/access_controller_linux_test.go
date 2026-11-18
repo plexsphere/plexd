@@ -29,7 +29,7 @@ func TestListenPortErr(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := listenPortErr("set interface up", tt.err)
+			err := listenPortErr("access", "set interface up", tt.err)
 
 			wantWGErrPrefix(t, err, "bridge: access: set interface up:")
 			if got := errors.Is(err, ErrListenPortInUse); got != tt.wantInUse {
@@ -41,9 +41,17 @@ func TestListenPortErr(t *testing.T) {
 		})
 	}
 
-	got := listenPortErr("configure device", syscall.EADDRINUSE).Error()
-	if want := "bridge: access: configure device: listen port in use: address already in use"; got != want {
-		t.Errorf("error = %q, want %q", got, want)
+	// Each controller passes its own prefix, so the access and the
+	// site-to-site interface read apart in the log.
+	for _, tt := range []struct {
+		prefix, want string
+	}{
+		{prefix: "access", want: "bridge: access: configure device: listen port in use: address already in use"},
+		{prefix: "vpn", want: "bridge: vpn: configure device: listen port in use: address already in use"},
+	} {
+		if got := listenPortErr(tt.prefix, "configure device", syscall.EADDRINUSE).Error(); got != tt.want {
+			t.Errorf("error = %q, want %q", got, tt.want)
+		}
 	}
 }
 
