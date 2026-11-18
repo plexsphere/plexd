@@ -381,8 +381,9 @@ func (s *Server) Assertions() AssertionCounters {
 // fallback 203.0.113.1:51820: no node holds its key, so no handshake ever
 // completes, and on a device that came up the agent's endpoint selection
 // switches it from the first entry to the second once the first times out. The
-// Docker e2e run asserts that switch. The merged
-// policy fingerprint is derived with policyFingerprint; the bridge subtree
+// Docker e2e run asserts that switch. Peer ...a0b1 also routes 10.50.0.0/16, so
+// every suite's node programs one peer route through its mesh interface. The
+// merged policy fingerprint is derived with policyFingerprint; the bridge subtree
 // carries the four child configs; and both state and reports mirror one another
 // (the contract splits them for forward compatibility). The dns block names the
 // node at the mesh IP register assigns it and each peer at the mesh IP of its
@@ -415,6 +416,7 @@ func newStateFixture() api.NodeStateSnapshot {
 				PublicKey:          "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
 				FallbackEndpoint:   "203.0.113.1:51820",
 				EndpointCandidates: []string{"192.0.2.10:51820"},
+				RoutedSubnets:      []string{"10.50.0.0/16"},
 			},
 			{
 				NodeID:    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",

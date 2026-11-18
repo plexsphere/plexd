@@ -8,6 +8,8 @@
 #   - Rate-limited registration: the mock refuses the first registration with
 #     429 token_rate_limited, and plexd names the wait on /readyz, logs it,
 #     and registers once Retry-After has passed (phase 1b)
+#   - The fixture's peer route: the first reconcile routes the routed subnet
+#     of peer ...a0b1 through the mesh interface (phase 2a)
 #   - Periodic loop verification (counters >= 2 after additional wait)
 #   - Handshake report and tunnel_health samples (skipped when WireGuard
 #     did not come up in the container)
@@ -35,8 +37,10 @@
 #   - Policy enforcement on the mesh interface: a WireGuard peer in the meshpeer
 #     container reaches the ports the served policy allows and no other, plexd's
 #     container reaches meshpeer only where a rule allows it, UDP to the relay
-#     probe port aside, a revision with a legacy deny rule is rejected, and mesh
-#     DNS inside the container still answers under an empty policy
+#     probe port aside, a revision with a legacy deny rule is rejected, mesh
+#     DNS inside the container still answers under an empty policy, and a
+#     network a peer's routed_subnets lists is routed through the mesh
+#     interface and reached under a rule until a pull drops it
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -644,6 +648,48 @@ if [ "${POLL_ELAPSED}" -ge "${POLL_TIMEOUT}" ]; then
     fi
     fail "initial assertions not met"
 fi
+
+# ===================================================================
+# Phase 2a: the fixture's peer route
+# ===================================================================
+# Peer ...a0b1 of the fixture routes 10.50.0.0/16, so the first reconcile
+# routes that network through plexd's mesh interface, which plexd-e2e.yaml
+# names wg-plexd. Phase 2 saw the first state pull counted, and the WireGuard
+# handler programs the route as it applies that pull, so the step waits up to
+# 30 s for it. The route needs kernel WireGuard, which Phase 12e needs as
+# well, so the step fails without it. Phase 12e proves a peer route with
+# traffic.
+echo "=== Testing the fixture's peer route ==="
+MESH_IFACE="wg-plexd"
+FIXTURE_ROUTED_SUBNET="10.50.0.0/16"
+
+# mesh_route_names <subnet> succeeds when plexd's container routes exactly the
+# prefix subnet through the mesh interface, and leaves what busybox ip printed
+# in MESH_ROUTE_OUT. busybox ip route show <prefix> prints the route as
+# "<prefix> dev <iface> scope link " and nothing when there is none.
+mesh_route_names() {
+    MESH_ROUTE_OUT=$(dc exec -T plexd /bin/busybox ip route show "$1" 2>&1) \
+        || fail "[peer route] ip route show $1 in the plexd container failed: ${MESH_ROUTE_OUT}"
+    case " ${MESH_ROUTE_OUT} " in
+        *" dev ${MESH_IFACE} "*) return 0 ;;
+    esac
+    return 1
+}
+
+PEER_ROUTE_LOG=$(dc logs plexd 2>&1) || fail "[peer route] dc logs plexd failed: ${PEER_ROUTE_LOG}"
+case "${PEER_ROUTE_LOG}" in
+    *"wireguard interface configured"*) ;;
+    *) fail "[peer route] WireGuard did not come up in the plexd container: the route of peer ...a0b1's routed subnet ${FIXTURE_ROUTED_SUBNET} needs plexd's mesh interface" ;;
+esac
+PEER_ROUTE_START=${SECONDS}
+until mesh_route_names "${FIXTURE_ROUTED_SUBNET}"; do
+    if [ $((SECONDS - PEER_ROUTE_START)) -ge 30 ]; then
+        fail "[peer route] 30s after the first state pull, ip route show ${FIXTURE_ROUTED_SUBNET} in the plexd container prints '${MESH_ROUTE_OUT}', want a route through ${MESH_IFACE}: peer ...a0b1 of the fixture routes that network"
+    fi
+    sleep 2
+done
+echo "  PASS: [peer route] plexd's container routes ${FIXTURE_ROUTED_SUBNET}, the routed subnet of the fixture's peer ...a0b1, through ${MESH_IFACE}"
+echo "=== Phase 2a PASSED: the fixture's peer route ==="
 
 # ===================================================================
 # Phase 3: Request body validation
@@ -5309,6 +5355,7 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 #   C  one rule carrying "action": "deny", which rejects the revision
 #   D  A without its 7001 rules
 #   E  no rules
+#   F  tcp 7005 from plexd to 10.21.0.0/16, a network behind meshpeer
 #
 # meshpeer probes plexd with nc -z, and every probe meets a listener of its
 # own in plexd's container, so a probe that fails was dropped by the input
@@ -5346,6 +5393,15 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # container says that C is not applied and lists B's rules, and the node API
 # counts a second attempt once a nudge has pulled C again. After D it reports
 # D as applied and nothing rejected.
+#
+# Under F, peer ...a0b2 gains routed_subnets ["10.21.0.0/16"], and meshpeer
+# holds 10.21.0.1 on its loopback. The reconcile that applies the member logs
+# the peer route as added, and plexd's container then routes the network
+# through its mesh interface and reaches meshpeer's listener at 10.21.0.1:7005.
+# meshpeer's answers carry 10.21.0.1 as their source, which plexd's WireGuard
+# lets in only because the network is one of the peer's allowed IPs. The
+# reconcile that drops the member again logs the route as removed, the route is
+# gone, and the same connection fails.
 #
 # The phase runs before Phase 13, which replaces the fixture, and ends by
 # serving the saved peers and policy again. Like Phase 12d it needs kernel
@@ -5697,19 +5753,24 @@ probe_plexd_port() {
     echo "  PASS: [${tag}] meshpeer's connection to ${MESH_NODE_IP}:${port} times out while a listener runs there"
 }
 
-# probe_meshpeer_port <tag> <port> <open|closed> starts a one-connection
-# listener on port in meshpeer and connects to it from plexd's container with
-# busybox nc -w 3, which exits 0 once connected. The connection leaves through
-# the output chain on plexd's mesh interface, so open needs a rule from plexd's
-# mesh IP to meshpeer's port. closed wants nc to exit non-zero while meshpeer's
-# listener still listens after the probe, so the connection failed with a
-# listener waiting for it, not at a closed port.
+# probe_meshpeer_port <tag> <port> <open|closed> [<address> [<why>]] starts a
+# one-connection listener on port in meshpeer and connects to it at address,
+# MESH_PEER_IP when left out, from plexd's container with busybox nc -w 3,
+# which exits 0 once connected. The connection leaves through the output chain
+# on plexd's mesh interface, so open needs a rule from plexd's mesh IP to
+# meshpeer's port. closed wants nc to exit non-zero while meshpeer's listener
+# still listens after the probe, so the connection failed with a listener
+# waiting for it, not at a closed port. why names what keeps the connection
+# from meshpeer under closed: the output chain when left out.
 probe_meshpeer_port() {
-    local tag=$1 port=$2 want=$3 rc=0 out listening=no
+    local tag=$1 port=$2 want=$3 addr=${4:-${MESH_PEER_IP}} why=${5:-} rc=0 out listening=no
+    if [ -z "${why}" ]; then
+        why="the output chain on plexd's mesh interface drops the connection, since no rule allows it"
+    fi
     dc exec -d -T meshpeer nc -l "${port}" \
         || fail "[${tag}] could not start a listener on port ${port} in meshpeer"
     await_listening "${tag}" meshpeer_listening "${port}" yes
-    out=$(dc exec -T plexd /bin/busybox sh -c "/bin/busybox nc -w 3 ${MESH_PEER_IP} ${port} </dev/null" 2>&1) || rc=$?
+    out=$(dc exec -T plexd /bin/busybox sh -c "/bin/busybox nc -w 3 ${addr} ${port} </dev/null" 2>&1) || rc=$?
     if [ "${want}" = closed ] && meshpeer_listening "${port}"; then
         listening=yes
     fi
@@ -5719,18 +5780,18 @@ probe_meshpeer_port() {
     await_listening "${tag}" meshpeer_listening "${port}" no
     if [ "${want}" = open ]; then
         if [ "${rc}" -ne 0 ]; then
-            fail "[${tag}] plexd's container could not connect to meshpeer's listener at ${MESH_PEER_IP}:${port}: busybox nc exited ${rc}, want 0, since a rule allows plexd's mesh IP to reach that port (output: ${out})"
+            fail "[${tag}] plexd's container could not connect to meshpeer's listener at ${addr}:${port}: busybox nc exited ${rc}, want 0, since a rule allows plexd's mesh IP to reach that port (output: ${out})"
         fi
-        echo "  PASS: [${tag}] plexd's container connects to meshpeer's listener at ${MESH_PEER_IP}:${port}, which a rule allows"
+        echo "  PASS: [${tag}] plexd's container connects to meshpeer's listener at ${addr}:${port}, which a rule allows"
         return 0
     fi
     if [ "${rc}" -eq 0 ]; then
-        fail "[${tag}] plexd's container connected to meshpeer's listener at ${MESH_PEER_IP}:${port}, want the output chain on plexd's mesh interface to drop the connection, since no rule allows it (output: ${out})"
+        fail "[${tag}] plexd's container connected to meshpeer's listener at ${addr}:${port}, want the connection to fail: ${why} (output: ${out})"
     fi
     if [ "${listening}" != yes ]; then
-        fail "[${tag}] busybox nc -w 3 ${MESH_PEER_IP} ${port} in plexd's container exited ${rc}, but meshpeer's listener no longer listened after the probe, so the failure does not show that the output chain dropped the connection (output: ${out})"
+        fail "[${tag}] busybox nc -w 3 ${addr} ${port} in plexd's container exited ${rc}, but meshpeer's listener no longer listened after the probe, so the failure does not show that ${why} (output: ${out})"
     fi
-    echo "  PASS: [${tag}] plexd's container fails to connect to ${MESH_PEER_IP}:${port} while meshpeer's listener still listens there"
+    echo "  PASS: [${tag}] plexd's container fails to connect to ${addr}:${port} while meshpeer's listener still listens there"
 }
 
 # probe_meshpeer_udp <tag> <port> <arrives|dropped> starts a UDP listener on
@@ -5777,8 +5838,29 @@ probe_meshpeer_udp() {
     echo "  PASS: [${tag}] a UDP datagram from plexd's container to ${MESH_PEER_IP}:${port} does not arrive in meshpeer, whose listener still waits there"
 }
 
-# (a) Save the snapshot's peers and policy, which step (h) serves again. The
-# policy must be the fixture's, whose revision step (h) waits for.
+# wait_peer_route_line <tag> <needle> <baseline> reads the plexd log every 2 s
+# for up to 30 s until it holds more than baseline "wireguard: peer routes
+# changed" lines that carry needle, which the WireGuard handler logs in the
+# reconcile that changed the route.
+MESH_ROUTES_MSG='msg="wireguard: peer routes changed"'
+wait_peer_route_line() {
+    local tag=$1 needle=$2 base=$3 start=${SECONDS} log n
+    while :; do
+        log=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${log}"
+        n=$(count_log_lines "${log}" "${MESH_ROUTES_MSG}" "${needle}")
+        if [ "${n}" -gt "${base}" ]; then
+            echo "  PASS: [${tag}] plexd logged 'wireguard: peer routes changed' with ${needle}"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge 30 ]; then
+            fail "[${tag}] 30s after the splice, the plexd log holds ${n} 'wireguard: peer routes changed' line(s) with ${needle}, want more than ${base}"
+        fi
+        sleep 2
+    done
+}
+
+# (a) Save the snapshot's peers and policy, which step (i) serves again. The
+# policy must be the fixture's, whose revision step (i) waits for.
 MESH_SAVED=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null \
     | jq -c '{peers: .peers, policy: .policy}' 2>/dev/null || true)
 MESH_SAVED_PEER=$(printf '%s' "${MESH_SAVED}" | jq -r --arg id "${FIXTURE_PEER_B2}" '[.peers[]? | select(.node_id == $id)] | length' 2>/dev/null || true)
@@ -6020,7 +6102,51 @@ probe_meshpeer_port "mesh policy E" 7003 closed
 probe_meshpeer_udp "mesh policy E" 9 arrives
 probe_meshpeer_udp "mesh policy E" 7006 dropped
 
-# (h) The saved peers and policy are served again, plexd applies the fixture's
+# (h) Policy F allows plexd's mesh IP to reach 10.21.0.0/16 on port 7005, and
+# meshpeer holds 10.21.0.1 on its loopback. Peer ...a0b2 of the served
+# snapshot, meshpeer, gains routed_subnets ["10.21.0.0/16"]: the reconcile that
+# applies it logs the route as added, plexd's container routes the network
+# through its mesh interface, and it reaches meshpeer's listener at
+# 10.21.0.1:7005. The member goes again: the reconcile that applies that logs
+# the route as removed, the route is gone, and the same connection fails while
+# meshpeer's listener waits for it. The address leaves meshpeer's loopback.
+MESH_ROUTED_SUBNET="10.21.0.0/16"
+MESH_ROUTED_IP="10.21.0.1"
+MESH_ROUTED_OUT=$(dc exec -T meshpeer ip address add "${MESH_ROUTED_IP}/32" dev lo 2>&1) \
+    || fail "[peer route] adding ${MESH_ROUTED_IP}/32 to meshpeer's loopback failed: ${MESH_ROUTED_OUT}"
+MESH_REV_F="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c9"
+MESH_RULES_F='[{"protocol":"tcp","source_cidr":"10.99.0.1/32","destination_cidr":"10.21.0.0/16","ports":{"from":7005,"to":7005}}]'
+serve_policy "mesh-policy-f" "${MESH_REV_F}" "${MESH_RULES_F}"
+expect_policy_applied "mesh policy F" "${MESH_REV_F}" 1
+
+POLICY_LOG=$(dc logs plexd 2>&1) || fail "[peer route] dc logs plexd failed: ${POLICY_LOG}"
+MESH_ROUTE_ADDED=$(count_log_lines "${POLICY_LOG}" "${MESH_ROUTES_MSG}" "added=[${MESH_ROUTED_SUBNET}]")
+splice_state "peer-route-add" \
+    '.peers |= map(if .node_id == $v.id then .routed_subnets = $v.subnets else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg subnet "${MESH_ROUTED_SUBNET}" '{id: $id, subnets: [$subnet]}')"
+wait_peer_route_line "peer route" "added=[${MESH_ROUTED_SUBNET}]" "${MESH_ROUTE_ADDED}"
+if ! mesh_route_names "${MESH_ROUTED_SUBNET}"; then
+    fail "[peer route] plexd logged the route to ${MESH_ROUTED_SUBNET} as added, but ip route show ${MESH_ROUTED_SUBNET} in the plexd container prints '${MESH_ROUTE_OUT}', want a route through ${MESH_IFACE}"
+fi
+echo "  PASS: [peer route] plexd's container routes ${MESH_ROUTED_SUBNET}, the routed subnet of peer ...a0b2, through ${MESH_IFACE}"
+probe_meshpeer_port "peer route" 7005 open "${MESH_ROUTED_IP}"
+
+POLICY_LOG=$(dc logs plexd 2>&1) || fail "[peer route] dc logs plexd failed: ${POLICY_LOG}"
+MESH_ROUTE_REMOVED=$(count_log_lines "${POLICY_LOG}" "${MESH_ROUTES_MSG}" "removed=[${MESH_ROUTED_SUBNET}]")
+splice_state "peer-route-remove" \
+    '.peers |= map(if .node_id == $v then del(.routed_subnets) else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" '$id')"
+wait_peer_route_line "peer route" "removed=[${MESH_ROUTED_SUBNET}]" "${MESH_ROUTE_REMOVED}"
+if mesh_route_names "${MESH_ROUTED_SUBNET}"; then
+    fail "[peer route] plexd logged the route to ${MESH_ROUTED_SUBNET} as removed, but ip route show ${MESH_ROUTED_SUBNET} in the plexd container still prints '${MESH_ROUTE_OUT}'"
+fi
+echo "  PASS: [peer route] the reconcile that dropped peer ...a0b2's routed subnet removed the route to ${MESH_ROUTED_SUBNET} through ${MESH_IFACE}"
+probe_meshpeer_port "peer route" 7005 closed "${MESH_ROUTED_IP}" \
+    "no route leads there through plexd's mesh interface, and the network is no longer one of peer ...a0b2's allowed IPs"
+MESH_ROUTED_OUT=$(dc exec -T meshpeer ip address del "${MESH_ROUTED_IP}/32" dev lo 2>&1) \
+    || fail "[peer route] removing ${MESH_ROUTED_IP}/32 from meshpeer's loopback failed: ${MESH_ROUTED_OUT}"
+
+# (i) The saved peers and policy are served again, plexd applies the fixture's
 # revision once more, and meshpeer's wg0 goes, so no later phase meets it.
 POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh restore] dc logs plexd failed: ${POLICY_LOG}"
 MESH_FIXTURE_APPLIED=$(count_log_lines "${POLICY_LOG}" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_POLICY_REVISION}")
@@ -6035,7 +6161,7 @@ else
 fi
 MESH_DEL_OUT=$(dc exec -T meshpeer ip link del wg0 2>&1) || fail "[mesh restore] deleting wg0 in meshpeer failed: ${MESH_DEL_OUT}"
 
-# (i) No apply in the phase, B's and D's included, logged "policy connection
+# (j) No apply in the phase, B's and D's included, logged "policy connection
 # logging unavailable", and the mock refused no policy status report.
 POLICY_LOG=$(dc logs plexd 2>&1) || fail "[mesh conn log] dc logs plexd failed: ${POLICY_LOG}"
 expect_no_conn_unavailable "mesh conn log" "${POLICY_LOG}"
