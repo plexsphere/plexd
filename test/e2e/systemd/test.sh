@@ -41,6 +41,16 @@
 #     closing every listener, and the opt-out with bridge.ingress_enabled:
 #     false, which opens no listener for an enabled block and reports
 #     opted_out
+#   - User access through a bridge: a wireguard provider on an interface of
+#     its own, with the pool's first address and a key file that survives a
+#     restart and a killed process, a device that reaches a mesh node only
+#     once the block admits it and arrives there with the bridge's mesh
+#     address, a second provider on the port plexd0 holds reported
+#     bind_failed, a tailscale provider whose Secret is fetched once the
+#     inventory lists it and whose missing client is reported, a removed
+#     provider whose interface and key file go, and the opt-out with
+#     bridge.user_access_enabled: false, which serves no provider, keeps the
+#     keys, reports opted_out and names an ignored local key
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -57,6 +67,10 @@ INGRESS_TARGET_IMAGE="plexd-ingress-target:e2e"
 # rule obtains its certificate from it.
 PEBBLE_CONTAINER="plexd-e2e-pebble"
 PEBBLE_IMAGE="ghcr.io/letsencrypt/pebble:2.10.3@sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef"
+# The user access phase's mesh node and device, both of the ingress target's
+# meshpeer image.
+UA_MESHNODE_CONTAINER="plexd-e2e-meshnode"
+UA_DEVICE_CONTAINER="plexd-e2e-device"
 TIMEOUT="${TIMEOUT:-60}"
 TEST_FAILED=1
 # Set while the mesh DNS phase holds the mock API container paused, so a
@@ -143,6 +157,9 @@ print_diagnostics() {
     # The container's own systemd-resolved, never the host's.
     echo "==> Systemd container resolvectl status:"
     docker exec "${SYSTEMD_CONTAINER}" resolvectl status --no-pager 2>&1 || true
+    echo "==> User access mesh node and device wg show:"
+    docker exec "${UA_MESHNODE_CONTAINER}" wg show 2>&1 || true
+    docker exec "${UA_DEVICE_CONTAINER}" wg show 2>&1 || true
     echo "--- End diagnostics ---"
 }
 
@@ -173,6 +190,8 @@ cleanup() {
     docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
     docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
     docker rm -f "${PEBBLE_CONTAINER}" 2>/dev/null || true
+    docker rm -f "${UA_MESHNODE_CONTAINER}" 2>/dev/null || true
+    docker rm -f "${UA_DEVICE_CONTAINER}" 2>/dev/null || true
     docker network rm "${NETWORK_NAME}" 2>/dev/null || true
     rm -f "${REPO_ROOT}/plexd-linux-amd64"
 }
@@ -192,6 +211,8 @@ docker rm -f "${MOCKAPI_CONTAINER}" 2>/dev/null || true
 docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
 docker rm -f "${INGRESS_TARGET_CONTAINER}" 2>/dev/null || true
 docker rm -f "${PEBBLE_CONTAINER}" 2>/dev/null || true
+docker rm -f "${UA_MESHNODE_CONTAINER}" 2>/dev/null || true
+docker rm -f "${UA_DEVICE_CONTAINER}" 2>/dev/null || true
 docker network rm "${NETWORK_NAME}" 2>/dev/null || true
 
 # --- Build images ---
@@ -3041,6 +3062,465 @@ for msg in "ingress manager started" "ingress listener opened"; do
 done
 echo "=== Public ingress on a bridge PASSED ==="
 
+# --- User access through a bridge ---
+# The bridge of the ingress phase, still opted out of ingress and without
+# bridge.user_access_enabled, serves the user access providers the mock's
+# bridge.user_access block lists. Two containers of the meshpeer image join
+# the suite's network: a mesh node, which becomes the fixture's peer ...a0b2
+# at 10.99.0.3 and listens on 7101, and a device, which reaches the mesh node
+# through a wireguard provider of the bridge. The systemd image carries no ip
+# or wg, so the kernel state of the systemd container is read by a throwaway
+# meshpeer container that shares its network namespace. The phase ends with
+# bridge.user_access_enabled: false, the opt-out.
+echo "=== Testing user access through a bridge ==="
+docker run -d --name "${UA_MESHNODE_CONTAINER}" --network "${NETWORK_NAME}" --cap-add NET_ADMIN --init \
+    "${INGRESS_TARGET_IMAGE}" >/dev/null
+docker run -d --name "${UA_DEVICE_CONTAINER}" --network "${NETWORK_NAME}" --cap-add NET_ADMIN --init \
+    "${INGRESS_TARGET_IMAGE}" >/dev/null
+UA_MESHNODE_IP=$(container_ip "${UA_MESHNODE_CONTAINER}")
+if [ -z "${UA_MESHNODE_IP}" ]; then
+    fail "could not read the address of ${UA_MESHNODE_CONTAINER}"
+fi
+
+# bridge_netns <command>... runs the command in a meshpeer container that
+# shares the network namespace of the systemd container.
+bridge_netns() {
+    docker run --rm --network "container:${SYSTEMD_CONTAINER}" --cap-add NET_ADMIN \
+        "${INGRESS_TARGET_IMAGE}" "$@"
+}
+
+# ua_journal leaves the plexd unit's journal in UA_JOURNAL.
+ua_journal() {
+    UA_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) \
+        || fail "journalctl -u plexd failed: ${UA_JOURNAL}"
+}
+
+# configure_user_access <tag> <providers-json or null> [secrets-json] serves
+# the providers as an enabled bridge.user_access block, or no block for null,
+# and leaves the rest of the bridge block as it is. With a third argument it
+# also replaces the snapshot's secret inventory.
+configure_user_access() {
+    local tag=$1 providers=$2 secrets=${3:-} set_secrets=false snapshot spliced status
+    if [ "$#" -ge 3 ]; then
+        set_secrets=true
+    fi
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson p "${providers}" \
+        --arg secrets "${secrets}" --argjson set_secrets "${set_secrets}" \
+        '.bridge.user_access = (if $p == null then null else {enabled: true, providers: $p} end)
+         | if $set_secrets then .secrets = ($secrets | fromjson) else . end') \
+        || fail "[${tag}] could not splice the providers into the live snapshot"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-user-access-nudge-${tag}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] user access nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# wait_user_access_report <tag> <what> <jq-filter> [jq-args...] waits until
+# the last user access status report matches the filter and leaves it in
+# UA_REPORT. It waits UA_REPORT_WAIT seconds, 60 unless set.
+wait_user_access_report() {
+    local tag=$1 what=$2 filter=$3 start=${SECONDS} wait=${UA_REPORT_WAIT:-60}
+    shift 3
+    while :; do
+        UA_REPORT=$(curl -sf "http://localhost:18080/test/last-request/user-access-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+        if [ -n "${UA_REPORT}" ] && printf '%s' "${UA_REPORT}" | jq -e "$@" "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${tag}] the last user access status report shows ${what}"
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge "${wait}" ]; then
+            fail "[${tag}] ${wait}s on, the last user access status report is '${UA_REPORT}', want one that shows ${what}"
+        fi
+        sleep 2
+    done
+}
+
+# ua_probe succeeds when the device opens a TCP connection to port 7101 of the
+# mesh node through the bridge.
+ua_probe() {
+    docker exec "${UA_DEVICE_CONTAINER}" nc -z -w 3 10.99.0.3 7101 2>/dev/null
+}
+
+# ua_wait_probe <tag> waits up to 60s for the probe to succeed.
+ua_wait_probe() {
+    local tag=$1 start=${SECONDS}
+    until ua_probe; do
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            fail "[${tag}] the device reached no listener at 10.99.0.3:7101 through the bridge within 60s; device wg0: $(docker exec "${UA_DEVICE_CONTAINER}" wg show wg0 2>&1)"
+        fi
+        sleep 2
+    done
+    echo "  PASS: [${tag}] the device reaches 10.99.0.3:7101 through the bridge"
+}
+
+# ua_provider <id> <slug> <port> [devices-json] prints a wireguard provider
+# with the pool 10.77.0.0/24.
+ua_provider() {
+    jq -cn --arg id "$1" --arg slug "$2" --argjson port "$3" --argjson devices "${4:-[]}" \
+        '{id: $id, slug: $slug, kind: "wireguard", listen_port: $port,
+          address_pool: "10.77.0.0/24", max_devices: 64, devices: $devices}'
+}
+
+UA_FIELD_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"
+UA_FIELD_IFACE="wg-ua-a0a0a0e1"
+UA_TS_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2"
+UA_CLASH_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e3"
+UA_KEPT_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e4"
+UA_KEY_DIR="/var/lib/plexd/user-access"
+
+# The mesh node: peer ...a0b2 of the fixture with a key of its own, the edge
+# PSK the mock derives for that peer and the bridge as its one peer at the
+# bridge's address and port 51820, the recipe of the Docker suite's policy
+# phase. plexd's public key is read from plexd0 itself.
+UA_PLEXD_PUBKEY=$(bridge_netns wg show plexd0 public-key 2>&1) || fail "wg show plexd0 public-key failed: ${UA_PLEXD_PUBKEY}"
+if [ "${#UA_PLEXD_PUBKEY}" -ne 44 ]; then
+    fail "wg show plexd0 public-key printed '${UA_PLEXD_PUBKEY}', want 44 characters of base64"
+fi
+UA_FIXTURE_PEER_B2="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+UA_MESH_SETUP='
+set -o pipefail
+umask 077
+wg genkey > /tmp/wg0.key
+printf "%s" "mock-edge-psk|$2" | openssl dgst -sha256 -binary | base64 > /tmp/wg0.psk
+ip link add wg0 type wireguard
+wg set wg0 listen-port 51820 private-key /tmp/wg0.key \
+    peer "$1" preshared-key /tmp/wg0.psk endpoint "$5" \
+    allowed-ips "$3/32" persistent-keepalive 5
+ip address add "$4/24" dev wg0
+ip link set wg0 up
+wg pubkey < /tmp/wg0.key
+'
+UA_MESH_OUT=$(docker exec "${UA_MESHNODE_CONTAINER}" sh -euc "${UA_MESH_SETUP}" sh \
+    "${UA_PLEXD_PUBKEY}" "${UA_FIXTURE_PEER_B2}" 10.99.0.1 10.99.0.3 "${BRIDGE_IP}:51820" 2>&1) \
+    || fail "setting up wg0 in ${UA_MESHNODE_CONTAINER} failed: ${UA_MESH_OUT}"
+UA_MESHNODE_PUBKEY=${UA_MESH_OUT##*$'\n'}
+if [ "${#UA_MESHNODE_PUBKEY}" -ne 44 ]; then
+    fail "the mesh node's wg0 setup printed '${UA_MESH_OUT}', want its 44-character public key on the last line"
+fi
+docker exec -d "${UA_MESHNODE_CONTAINER}" sh -c 'nc -l -k -v 7101 >> /tmp/listen.log 2>&1'
+
+# Peer ...a0b2 of the served snapshot becomes the mesh node, under a policy
+# that allows the mesh to itself, and the two complete a handshake.
+UA_SNAPSHOT=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+if [ -z "${UA_SNAPSHOT}" ]; then
+    fail "could not read the live node state snapshot"
+fi
+UA_SPLICED=$(printf '%s' "${UA_SNAPSHOT}" | jq --arg id "${UA_FIXTURE_PEER_B2}" --arg key "${UA_MESHNODE_PUBKEY}" \
+    --arg endpoint "${UA_MESHNODE_IP}:51820" \
+    '.peers |= map(if .node_id == $id then .public_key = $key | .endpoint = $endpoint else . end)') \
+    || fail "could not splice the mesh node into the peers of the live snapshot"
+UA_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" \
+    -d "${UA_SPLICED}" "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+if [ "${UA_STATUS}" != "204" ]; then
+    fail "configure-state with the mesh node as peer ...a0b2 returned status ${UA_STATUS}, want 204"
+fi
+# The fixture's policy, which the ingress phase restored, allows the mesh to
+# itself in its first rule; the phase serves it again as its own.
+UA_POLICY=$(printf '%s' "${UA_SNAPSHOT}" | jq -c '.policy')
+if ! printf '%s' "${UA_POLICY}" | jq -e 'any(.rules[]; .source_cidr == "10.99.0.0/24" and .destination_cidr == "10.99.0.0/24" and .protocol == "any" and .ports == null)' >/dev/null 2>&1; then
+    fail "the live policy '${UA_POLICY}' has no rule that allows 10.99.0.0/24 to itself"
+fi
+configure_policy user-access-mesh "${UA_POLICY}"
+UA_HS_START=${SECONDS}
+while :; do
+    UA_HS=$(docker exec "${UA_MESHNODE_CONTAINER}" wg show wg0 latest-handshakes 2>&1) \
+        || fail "wg show wg0 latest-handshakes in ${UA_MESHNODE_CONTAINER} failed: ${UA_HS}"
+    UA_HS_TIME=${UA_HS##*[[:space:]]}
+    case "${UA_HS_TIME}" in
+        *[!0-9]* | '') UA_HS_TIME=0 ;;
+    esac
+    if [ "${UA_HS_TIME}" -gt 0 ]; then
+        break
+    fi
+    if [ $((SECONDS - UA_HS_START)) -ge 60 ]; then
+        fail "the mesh node completed no handshake with plexd0 within 60s; wg show wg0: $(docker exec "${UA_MESHNODE_CONTAINER}" wg show wg0 2>&1)"
+    fi
+    sleep 2
+done
+echo "  PASS: the mesh node at 10.99.0.3 completed a handshake with the bridge's plexd0"
+
+# 1. Before any provider is served, the report carries no entries.
+wait_user_access_report none 'exactly {"state":"enabled"}' '. == {"state":"enabled"}'
+
+# 2. A wireguard provider without devices comes up on its own interface with
+# the pool's first host address and a key file of mode 600.
+configure_user_access field-team "[$(ua_provider "${UA_FIELD_ID}" field-team 51900)]"
+wait_user_access_report field-team "field-team up with a public key and no connected device" \
+    '.state == "enabled" and (.providers | length) == 1
+     and (.providers[0] | .id == $id and .health == "up" and (.public_key | length) == 44
+          and .connected_devices == 0 and (has("reason") | not))' --arg id "${UA_FIELD_ID}"
+UA_PUBKEY=$(printf '%s' "${UA_REPORT}" | jq -r '.providers[0].public_key')
+UA_ADDR=$(bridge_netns ip -4 -o address show dev "${UA_FIELD_IFACE}" 2>&1) || fail "ip address show dev ${UA_FIELD_IFACE} failed: ${UA_ADDR}"
+case "${UA_ADDR}" in
+    *" inet 10.77.0.1/24 "*) echo "  PASS: ${UA_FIELD_IFACE} carries 10.77.0.1/24" ;;
+    *) fail "ip address show dev ${UA_FIELD_IFACE} printed '${UA_ADDR}', want inet 10.77.0.1/24" ;;
+esac
+UA_KEY_MODE=$(docker exec "${SYSTEMD_CONTAINER}" stat -c %a "${UA_KEY_DIR}/${UA_FIELD_ID}.key" 2>&1) \
+    || fail "stat ${UA_KEY_DIR}/${UA_FIELD_ID}.key failed: ${UA_KEY_MODE}"
+if [ "${UA_KEY_MODE}" != "600" ]; then
+    fail "${UA_KEY_DIR}/${UA_FIELD_ID}.key has mode ${UA_KEY_MODE}, want 600"
+fi
+echo "  PASS: ${UA_KEY_DIR}/${UA_FIELD_ID}.key has mode 600"
+
+# 3. The device names the reported key as its peer. While the block lists no
+# device, the bridge does not answer it and the probe fails.
+UA_DEVICE_SETUP='
+set -o pipefail
+umask 077
+wg genkey > /tmp/wg0.key
+ip link add wg0 type wireguard
+wg set wg0 private-key /tmp/wg0.key peer "$1" endpoint "$2" allowed-ips 10.99.0.0/24 persistent-keepalive 5
+ip address add 10.77.0.2/24 dev wg0
+ip link set wg0 up
+ip route add 10.99.0.0/24 dev wg0
+wg pubkey < /tmp/wg0.key
+'
+UA_DEVICE_OUT=$(docker exec "${UA_DEVICE_CONTAINER}" sh -euc "${UA_DEVICE_SETUP}" sh "${UA_PUBKEY}" "${BRIDGE_IP}:51900" 2>&1) \
+    || fail "setting up wg0 in ${UA_DEVICE_CONTAINER} failed: ${UA_DEVICE_OUT}"
+UA_DEVICE_PUBKEY=${UA_DEVICE_OUT##*$'\n'}
+if [ "${#UA_DEVICE_PUBKEY}" -ne 44 ]; then
+    fail "the device's wg0 setup printed '${UA_DEVICE_OUT}', want its 44-character public key on the last line"
+fi
+if ua_probe; then
+    fail "[no-device] the device reached 10.99.0.3:7101 although the block lists no device"
+fi
+echo "  PASS: [no-device] the device does not reach 10.99.0.3:7101 while the block lists no device"
+
+# 4. Admitted, the device reaches the mesh node, which sees the bridge's mesh
+# address, and the report counts it as connected.
+UA_DEVICES=$(jq -cn --arg key "${UA_DEVICE_PUBKEY}" \
+    '[{id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", slug: "e2e-device", public_key: $key, address: "10.77.0.2"}]')
+configure_user_access device "[$(ua_provider "${UA_FIELD_ID}" field-team 51900 "${UA_DEVICES}")]"
+ua_wait_probe device
+UA_LISTEN=$(docker exec "${UA_MESHNODE_CONTAINER}" cat /tmp/listen.log 2>&1) || fail "reading the mesh node's listener log failed: ${UA_LISTEN}"
+case "${UA_LISTEN}" in
+    *10.99.0.1*) echo "  PASS: [device] the mesh node's listener names the bridge's mesh address 10.99.0.1 as the peer" ;;
+    *) fail "[device] the mesh node's listener logged '${UA_LISTEN}', want a connection from 10.99.0.1" ;;
+esac
+case "${UA_LISTEN}" in
+    *10.77.0.*) fail "[device] the mesh node's listener logged '${UA_LISTEN}', which names the device's own address" ;;
+esac
+wait_user_access_report device "field-team up with one connected device" \
+    '.providers[0] | .id == $id and .health == "up" and .connected_devices == 1' --arg id "${UA_FIELD_ID}"
+
+# 5. A restart keeps the interface's key: the device connects again unchanged.
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+UA_RESTART_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+UA_START=${SECONDS}
+while :; do
+    ua_journal
+    if journal_has "${UA_JOURNAL}" "plexd[${UA_RESTART_PID}]:" 'msg="user access provider up"' "provider_id=${UA_FIELD_ID}"; then
+        break
+    fi
+    if [ $((SECONDS - UA_START)) -ge 60 ]; then
+        fail "[restart] plexd[${UA_RESTART_PID}] logged no 'user access provider up' for ${UA_FIELD_ID} within 60s of the restart"
+    fi
+    sleep 2
+done
+echo "  PASS: [restart] plexd[${UA_RESTART_PID}] brought field-team up again"
+wait_user_access_report restart "field-team up with the key of step 2" \
+    '.providers[0] | .id == $id and .health == "up" and .public_key == $key' \
+    --arg id "${UA_FIELD_ID}" --arg key "${UA_PUBKEY}"
+ua_wait_probe restart
+
+# 6. A killed process leaves its interface in the kernel. The process the unit
+# starts next removes it and brings the provider up again with the same key.
+# The signal goes to the main process alone: in this container systemd cannot
+# signal the unit's other processes and would fail the command. systemd
+# records the kill in one line, which the shutdown phase knows is no crash.
+docker exec "${SYSTEMD_CONTAINER}" systemctl kill --kill-whom=main -s KILL plexd
+UA_KILLED_LINE="plexd.service: Sent signal SIGKILL to main process ${UA_RESTART_PID} (plexd) on client request."
+if docker exec "${SYSTEMD_CONTAINER}" test -e "/sys/class/net/${UA_FIELD_IFACE}"; then
+    echo "  PASS: [kill] ${UA_FIELD_IFACE} is left in the kernel after the kill"
+else
+    fail "[kill] ${UA_FIELD_IFACE} is gone right after the kill, want it left behind by the killed process"
+fi
+UA_START=${SECONDS}
+while :; do
+    UA_KILL_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+    if [ -n "${UA_KILL_PID}" ] && [ "${UA_KILL_PID}" != "0" ] && [ "${UA_KILL_PID}" != "${UA_RESTART_PID}" ]; then
+        ua_journal
+        if journal_has "${UA_JOURNAL}" "plexd[${UA_KILL_PID}]:" 'msg="user access provider up"' "provider_id=${UA_FIELD_ID}"; then
+            break
+        fi
+    fi
+    if [ $((SECONDS - UA_START)) -ge 60 ]; then
+        fail "[kill] no restarted plexd logged 'user access provider up' for ${UA_FIELD_ID} within 60s of the kill (MainPID ${UA_KILL_PID})"
+    fi
+    sleep 2
+done
+echo "  PASS: [kill] the unit restarted plexd as plexd[${UA_KILL_PID}], which brought field-team up"
+if [ "$(journal_count "${UA_JOURNAL}" "${UA_KILLED_LINE}")" != "1" ]; then
+    fail "[kill] the journal holds $(journal_count "${UA_JOURNAL}" "${UA_KILLED_LINE}") lines '${UA_KILLED_LINE}', want 1"
+fi
+echo "  PASS: [kill] systemd recorded the kill of plexd[${UA_RESTART_PID}] once"
+# The killed process left plexd0 in the kernel as well. The next one replaces
+# it and keeps its mesh interface.
+if journal_has "${UA_JOURNAL}" "plexd[${UA_KILL_PID}]:" 'msg="wireguard setup failed'; then
+    fail "[kill] plexd[${UA_KILL_PID}] logged 'wireguard setup failed' after the kill"
+fi
+for msg in "wireguard: replaced an interface an earlier process left behind" "wireguard interface configured"; do
+    if ! journal_has "${UA_JOURNAL}" "plexd[${UA_KILL_PID}]:" "msg=\"${msg}\"" "interface=plexd0"; then
+        fail "[kill] plexd[${UA_KILL_PID}] logged no '${msg}' for plexd0 after the kill"
+    fi
+    echo "  PASS: [kill] plexd[${UA_KILL_PID}] logged '${msg}' for plexd0"
+done
+if journal_has "${UA_JOURNAL}" "plexd[${UA_KILL_PID}]:" 'msg="user access provider down"' "provider_id=${UA_FIELD_ID}"; then
+    fail "[kill] plexd[${UA_KILL_PID}] logged 'user access provider down' for ${UA_FIELD_ID}"
+fi
+echo "  PASS: [kill] plexd[${UA_KILL_PID}] logged no 'user access provider down' for field-team"
+wait_user_access_report kill "field-team up with the key of step 2" \
+    '.providers[0] | .id == $id and .health == "up" and .public_key == $key' \
+    --arg id "${UA_FIELD_ID}" --arg key "${UA_PUBKEY}"
+ua_wait_probe kill
+
+# 7. A second wireguard provider on the port plexd0 holds cannot bind, and
+# field-team keeps serving.
+UA_CLASH=$(ua_provider "${UA_CLASH_ID}" clash 51820)
+UA_FIELD=$(ua_provider "${UA_FIELD_ID}" field-team 51900 "${UA_DEVICES}")
+configure_user_access clash "[${UA_CLASH}, ${UA_FIELD}]"
+wait_user_access_report clash "clash down with bind_failed and field-team up" \
+    '(.providers | map({key: .id, value: .}) | from_entries) as $p
+     | $p[$clash].health == "down" and $p[$clash].reason == "bind_failed"
+       and $p[$field].health == "up"' \
+    --arg clash "${UA_CLASH_ID}" --arg field "${UA_FIELD_ID}"
+ua_wait_probe clash
+
+# 8. A tailscale provider whose Secret the inventory does not list is down
+# with auth_secret_not_listed. Once the inventory lists it, the bridge fetches
+# it and starts the client, which the image does not carry: client_missing.
+UA_TS=$(jq -cn --arg id "${UA_TS_ID}" '{id: $id, slug: "tailnet", kind: "tailscale", auth_secret_name: "ts-join"}')
+configure_user_access tailnet "[${UA_CLASH}, ${UA_FIELD}, ${UA_TS}]" '[]'
+wait_user_access_report tailnet "tailnet down with auth_secret_not_listed" \
+    '.providers[] | select(.id == $id) | .health == "down" and .reason == "auth_secret_not_listed"' \
+    --arg id "${UA_TS_ID}"
+UA_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" \
+    -d '{"secrets": [{"name": "ts-join", "version": 1, "value": "tskey-auth-e2e-not-a-real-key"}]}' \
+    "http://localhost:18080/test/configure-secrets" 2>/dev/null || true)
+if [ "${UA_STATUS}" != "204" ]; then
+    fail "[tailnet] configure-secrets returned status ${UA_STATUS}, want 204"
+fi
+configure_user_access tailnet-listed "[${UA_CLASH}, ${UA_FIELD}, ${UA_TS}]" '[{"name": "ts-join", "version": 1}]'
+UA_REPORT_WAIT=90 wait_user_access_report tailnet-listed "tailnet down with client_missing" \
+    '.providers[] | select(.id == $id) | .health == "down" and .reason == "client_missing"' \
+    --arg id "${UA_TS_ID}"
+
+# 9. Removed from the block, field-team loses its interface and its key file,
+# and the device no longer reaches the mesh node.
+configure_user_access remove "[${UA_CLASH}, ${UA_TS}]" '[{"name": "ts-join", "version": 1}]'
+wait_user_access_report remove "no entry for field-team" \
+    '.providers | map(.id) | index($id) == null' --arg id "${UA_FIELD_ID}"
+UA_START=${SECONDS}
+while docker exec "${SYSTEMD_CONTAINER}" test -e "/sys/class/net/${UA_FIELD_IFACE}"; do
+    if [ $((SECONDS - UA_START)) -ge 30 ]; then
+        fail "[remove] ${UA_FIELD_IFACE} still exists 30s after field-team left the block"
+    fi
+    sleep 2
+done
+echo "  PASS: [remove] ${UA_FIELD_IFACE} is gone"
+if docker exec "${SYSTEMD_CONTAINER}" test -e "${UA_KEY_DIR}/${UA_FIELD_ID}.key"; then
+    fail "[remove] ${UA_KEY_DIR}/${UA_FIELD_ID}.key still exists after field-team left the block"
+fi
+echo "  PASS: [remove] ${UA_KEY_DIR}/${UA_FIELD_ID}.key is gone"
+if ua_probe; then
+    fail "[remove] the device still reaches 10.99.0.3:7101 after field-team left the block"
+fi
+echo "  PASS: [remove] the device no longer reaches 10.99.0.3:7101"
+
+# 10. bridge.user_access_enabled: false opts the bridge out. The restarted
+# process serves no provider, removes the interfaces the last one left, keeps
+# their keys, reports opted_out and names the ignored local key.
+configure_user_access kept "[${UA_CLASH}, ${UA_TS}, $(ua_provider "${UA_KEPT_ID}" kept 51901)]" '[{"name": "ts-join", "version": 1}]'
+UA_REPORT_WAIT=90 wait_user_access_report kept "kept up" \
+    '.providers[] | select(.id == $id) | .health == "up"' --arg id "${UA_KEPT_ID}"
+UA_CONFIG=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/config.yaml 2>&1) || fail "could not read /etc/plexd/config.yaml: ${UA_CONFIG}"
+UA_LAST_TOP=""
+UA_LAST_LINE=""
+while IFS= read -r line; do
+    case "${line}" in
+        "  user_access_enabled:"* | "  user_access_listen_port:"*) fail "/etc/plexd/config.yaml already has the line '${line}', so the opt-out cannot be appended" ;;
+        "" | " "* | "#"*) ;;
+        *) UA_LAST_TOP=${line} ;;
+    esac
+    if [ -n "${line}" ]; then
+        UA_LAST_LINE=${line}
+    fi
+done <<< "${UA_CONFIG}"
+case "${UA_LAST_LINE}" in
+    " "*) ;;
+    *) fail "the last line of /etc/plexd/config.yaml is '${UA_LAST_LINE}', want an indented line of the bridge block" ;;
+esac
+if [ "${UA_LAST_TOP}" != "bridge:" ]; then
+    fail "the last block of /etc/plexd/config.yaml is '${UA_LAST_TOP}', want bridge:"
+fi
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf "  user_access_enabled: false\n  user_access_listen_port: 51822\n" >> /etc/plexd/config.yaml' \
+    || fail "could not append the opt-out to the bridge block of /etc/plexd/config.yaml"
+echo "  bridge.user_access_enabled: false and bridge.user_access_listen_port: 51822 appended to /etc/plexd/config.yaml"
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
+UA_OPTOUT_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
+UA_START=${SECONDS}
+while :; do
+    UA_REPORT=$(curl -sf "http://localhost:18080/test/last-request/user-access-status" 2>/dev/null | jq -c . 2>/dev/null || true)
+    ua_journal
+    if [ "${UA_REPORT}" = '{"state":"opted_out"}' ] \
+        && journal_has "${UA_JOURNAL}" "plexd[${UA_OPTOUT_PID}]:" "level=WARN" \
+            'msg="user access: the control plane enables user access, but bridge.user_access_enabled is false"' "providers=3"; then
+        break
+    fi
+    if [ $((SECONDS - UA_START)) -ge 60 ]; then
+        fail "[opt-out] 60s after the restart the last report is '${UA_REPORT}', want {\"state\":\"opted_out\"}, and plexd[${UA_OPTOUT_PID}] must warn that the control plane enables user access with providers=3"
+    fi
+    sleep 2
+done
+echo "  PASS: [opt-out] the last report reads {\"state\":\"opted_out\"} and plexd[${UA_OPTOUT_PID}] warned that the control plane enables user access (providers=3)"
+if journal_has "${UA_JOURNAL}" "plexd[${UA_OPTOUT_PID}]:" "level=INFO" 'msg="user access: opted out by bridge.user_access_enabled, no provider is served"'; then
+    echo "  PASS: [opt-out] plexd[${UA_OPTOUT_PID}] logged 'user access: opted out by bridge.user_access_enabled, no provider is served' at Info"
+else
+    fail "[opt-out] plexd[${UA_OPTOUT_PID}] logged no Info 'user access: opted out by bridge.user_access_enabled, no provider is served'"
+fi
+UA_IGNORED=$(journal_count "${UA_JOURNAL}" "plexd[${UA_OPTOUT_PID}]:" "level=WARN" \
+    'msg="bridge: config: user access keys are ignored, the control plane delivers providers"' "keys=[user_access_listen_port]")
+if [ "${UA_IGNORED}" != "1" ]; then
+    fail "[opt-out] plexd[${UA_OPTOUT_PID}] logged ${UA_IGNORED} Warn lines 'bridge: config: user access keys are ignored, the control plane delivers providers' with keys=[user_access_listen_port], want 1"
+fi
+echo "  PASS: [opt-out] plexd[${UA_OPTOUT_PID}] warned once that user_access_listen_port is ignored"
+if journal_has "${UA_JOURNAL}" "plexd[${UA_OPTOUT_PID}]:" 'msg="bridge subsystem initialized"' "user_access=false"; then
+    echo "  PASS: [opt-out] plexd[${UA_OPTOUT_PID}] logged 'bridge subsystem initialized' with user_access=false"
+else
+    fail "[opt-out] plexd[${UA_OPTOUT_PID}] logged no 'bridge subsystem initialized' with user_access=false"
+fi
+UA_LINKS=$(docker exec "${SYSTEMD_CONTAINER}" ls /sys/class/net 2>&1) || fail "ls /sys/class/net failed: ${UA_LINKS}"
+case "${UA_LINKS}" in
+    *wg-ua-*) fail "[opt-out] interfaces starting with wg-ua- remain on the opted-out bridge: ${UA_LINKS}" ;;
+esac
+echo "  PASS: [opt-out] no interface starting with wg-ua- exists"
+if docker exec "${SYSTEMD_CONTAINER}" test -e "${UA_KEY_DIR}/${UA_KEPT_ID}.key"; then
+    echo "  PASS: [opt-out] ${UA_KEY_DIR}/${UA_KEPT_ID}.key is kept"
+else
+    fail "[opt-out] ${UA_KEY_DIR}/${UA_KEPT_ID}.key is gone, want the opt-out to keep the keys"
+fi
+
+# No report the mock refused: every refusal makes plexd log a send failure.
+ua_journal
+if journal_has "${UA_JOURNAL}" 'msg="user access status: send failed"'; then
+    fail "plexd logged 'user access status: send failed', so the mock refused a report"
+fi
+echo "  PASS: plexd logged no 'user access status: send failed'"
+echo "=== User access through a bridge PASSED ==="
+
 # --- Clean shutdown verification ---
 echo "=== Stopping plexd service ==="
 docker exec "${SYSTEMD_CONTAINER}" systemctl stop plexd
@@ -3064,6 +3544,12 @@ fi
 # Check journalctl for crash indicators.
 echo "=== Checking for crash indicators in journalctl ==="
 CRASH_OUTPUT=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>/dev/null || true)
+# The user access phase kills plexd on purpose, and systemd records that kill
+# in one line naming SIGKILL. That line is no crash; every other line is
+# checked.
+if [ -n "${UA_KILLED_LINE:-}" ]; then
+    CRASH_OUTPUT=$(printf '%s\n' "${CRASH_OUTPUT}" | grep -vF "${UA_KILLED_LINE}" || true)
+fi
 CRASH_FOUND=0
 for indicator in "core dumped" "segfault" "SIGABRT" "SIGKILL"; do
     if echo "${CRASH_OUTPUT}" | grep -qi "${indicator}"; then
