@@ -237,18 +237,21 @@ dispatcher.Register(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdat
 
 ### Reconciliation Loop
 
-The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler. `plexd up` registers the relay handler whenever bridge mode runs, with `bridgeMgr.Relay()`, which is nil when `bridge.relay_enabled` is false, and `bridgeMgr.RelayStatusTracker()`, in which the handler records the relay's state for the [relay status report](nat-relay.md#relay-status-report). Without a relay the handler only warns and records `not_consented` when a pull enables the relay (see [NAT Relay](nat-relay.md#relayreconcilehandler)). The ingress handler is also registered whenever bridge mode runs, with a nil ingress manager on a bridge that opts out with `bridge.ingress_enabled: false`, where it only warns when a pull enables ingress with rules (see [IngressReconcileHandler](public-ingress.md#ingressreconcilehandler)). The ingress secret inventory handler is registered only when the ingress manager exists:
+The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler. `plexd up` registers the relay handler whenever bridge mode runs, with `bridgeMgr.Relay()`, which is nil when `bridge.relay_enabled` is false, and `bridgeMgr.RelayStatusTracker()`, in which the handler records the relay's state for the [relay status report](nat-relay.md#relay-status-report). Without a relay the handler only warns and records `not_consented` when a pull enables the relay (see [NAT Relay](nat-relay.md#relayreconcilehandler)). The ingress handler is also registered whenever bridge mode runs, with a nil ingress manager on a bridge that opts out with `bridge.ingress_enabled: false`, where it only warns when a pull enables ingress with rules (see [IngressReconcileHandler](public-ingress.md#ingressreconcilehandler)). The ingress secret inventory handler is registered only when the ingress manager exists. The user access handlers follow the same pattern: the reconcile handler runs whenever bridge mode does, with a nil user access manager on a bridge that opts out with `bridge.user_access_enabled: false`, and the pull handler only when the manager exists (see [UserAccessReconcileHandler](user-access-integration.md#useraccessreconcilehandler)):
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 r.RegisterDispatchHandler(policy.DispatchHandler(enforcer, "plexd0"))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger)) // relay may be nil
-r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger))
 if ingressMgr != nil {
     r.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
 }
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger)) // ingressMgr is nil on an opted-out bridge
+if uaMgr != nil {
+    r.RegisterDispatchHandler(bridge.UserAccessPullHandler(uaMgr))
+}
+r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger)) // uaMgr is nil on an opted-out bridge
 r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 ```
 

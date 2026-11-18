@@ -1,41 +1,59 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="557" viewBox="0 0 1170 557" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Containers of the systemd end-to-end test">
+<svg xmlns="http://www.w3.org/2000/svg" width="1170" height="604" viewBox="0 0 1170 604" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Containers of the systemd end-to-end test">
 <title>Containers of the systemd end-to-end test</title>
-<rect width="1170" height="557" fill="#F6F5F1"/>
-<rect x="40" y="40" width="1090" height="477" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<rect width="1170" height="604" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1090" height="524" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
 <text x="56" y="73.2" font-size="22" font-weight="700" fill="#2B3440">plexd-systemd-e2e</text>
 <text x="311" y="71.45" font-size="17" fill="#55606E">Docker network</text>
-<rect x="70" y="177.5" width="200" height="102" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
-<text x="170" y="206.7" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">mock-api</text>
-<text x="170" y="226.9" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8080 (HTTP)</text>
-<text x="170" y="246.1" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8443 (TLS)</text>
-<text x="170" y="265.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">/v1/health</text>
-<rect x="370" y="110" width="330" height="173" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<rect x="70" y="181" width="200" height="102" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<text x="170" y="210.2" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">mock-api</text>
+<text x="170" y="230.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8080 (HTTP)</text>
+<text x="170" y="249.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:8443 (TLS)</text>
+<text x="170" y="268.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">/v1/health</text>
+<rect x="370" y="110" width="330" height="220" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
 <text x="386" y="143.2" font-size="22" font-weight="700" fill="#2B3440">systemd container</text>
 <text x="386" y="174.45" font-size="17" fill="#55606E">Ubuntu 24.04, systemd PID 1</text>
-<rect x="400" y="198" width="270" height="61" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="535" y="224.25" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">plexd.service</text>
-<text x="535" y="244.65" font-size="17" fill="#55606E" text-anchor="middle">managed by systemd</text>
-<rect x="850" y="177" width="250" height="103" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="975" y="206.1" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">ingress target</text>
-<text x="975" y="226.3" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:9441-9443 (TLS)</text>
-<text x="975" y="245.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:9022 (banner)</text>
-<text x="975" y="265.65" font-size="17" fill="#55606E" text-anchor="middle">openssl, nc</text>
-<polyline points="400,228.5 279,228.5" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="270,228.5 283,222.5 283,234.5" fill="#2457C5"/>
-<polyline points="670,214.5 841,214.5" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="850,214.5 837,220.5 837,208.5" fill="#2457C5"/>
-<text x="775" y="203.95" font-size="17" fill="#55606E" text-anchor="middle">rule targets</text>
-<polyline points="850,242.5 679,242.5" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="670,242.5 683,236.5 683,248.5" fill="#2457C5"/>
-<text x="775" y="264.95" font-size="17" fill="#55606E" text-anchor="middle">probes</text>
-<rect x="390" y="403" width="290" height="84" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
-<text x="535" y="432.2" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">pebble</text>
-<text x="535" y="452.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:14000 (ACME, HTTPS)</text>
-<text x="535" y="472.55" font-size="17" fill="#55606E" text-anchor="middle">Let's Encrypt test CA</text>
-<polyline points="465,259 465,394" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="465,403 459,390 471,390" fill="#2457C5"/>
-<text x="455" y="336.95" font-size="17" fill="#55606E" text-anchor="end">ACME</text>
-<polyline points="605,403 605,268" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="605,259 611,272 599,272" fill="#2457C5"/>
-<text x="615" y="336.95" font-size="17" fill="#55606E">TLS-ALPN-01 on :443</text>
+<rect x="400" y="198" width="270" height="108" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="535" y="247.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">plexd.service</text>
+<text x="535" y="268.15" font-size="17" fill="#55606E" text-anchor="middle">managed by systemd</text>
+<rect x="850" y="180.5" width="250" height="103" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="975" y="209.6" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">ingress target</text>
+<text x="975" y="229.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:9441-9443 (TLS)</text>
+<text x="975" y="249" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:9022 (banner)</text>
+<text x="975" y="269.15" font-size="17" fill="#55606E" text-anchor="middle">openssl, nc</text>
+<polyline points="400,232 279,232" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="270,232 283,226 283,238" fill="#2457C5"/>
+<polyline points="670,218 841,218" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="850,218 837,224 837,212" fill="#2457C5"/>
+<text x="775" y="207.45" font-size="17" fill="#55606E" text-anchor="middle">rule targets</text>
+<polyline points="850,246 679,246" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="670,246 683,240 683,252" fill="#2457C5"/>
+<text x="775" y="268.45" font-size="17" fill="#55606E" text-anchor="middle">probes</text>
+<rect x="390" y="450" width="290" height="84" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
+<text x="535" y="479.2" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">pebble</text>
+<text x="535" y="499.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:14000 (ACME, HTTPS)</text>
+<text x="535" y="519.55" font-size="17" fill="#55606E" text-anchor="middle">Let's Encrypt test CA</text>
+<polyline points="465,306 465,441" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="465,450 459,437 471,437" fill="#2457C5"/>
+<text x="455" y="383.95" font-size="17" fill="#55606E" text-anchor="end">ACME</text>
+<polyline points="605,450 605,315" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="605,306 611,319 599,319" fill="#2457C5"/>
+<text x="615" y="383.95" font-size="17" fill="#55606E">TLS-ALPN-01 on :443</text>
+<rect x="70" y="450" width="200" height="84" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="170" y="479.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">device</text>
+<text x="170" y="499.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg0 10.77.0.2</text>
+<text x="170" y="519.55" font-size="17" fill="#55606E" text-anchor="middle">nc probe</text>
+<rect x="850" y="450" width="250" height="83" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="975" y="479.3" font-size="20" font-weight="700" fill="#A44E07" text-anchor="middle">mesh node</text>
+<text x="975" y="499.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">wg0 10.99.0.3</text>
+<text x="975" y="518.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">:7101 (nc -l)</text>
+<polyline points="391,292 320,292 320,492 279,492" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="270,492 283,486 283,498" fill="#2F8A57"/>
+<polygon points="400,292 387,298 387,286" fill="#2F8A57"/>
+<text x="310" y="388.35" font-size="17" fill="#55606E" text-anchor="end">WireGuard</text>
+<text x="310" y="407.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="end">:51900 (wg-ua-…)</text>
+<polyline points="679,292 825,292 825,491.5 841,491.5" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="850,491.5 837,497.5 837,485.5" fill="#2F8A57"/>
+<polygon points="670,292 683,286 683,298" fill="#2F8A57"/>
+<text x="835" y="388.1" font-size="17" fill="#55606E">WireGuard</text>
+<text x="835" y="407.55" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">plexd0 :51820</text>
 </svg>

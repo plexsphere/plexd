@@ -511,12 +511,13 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `ingress_enabled` | bool | `true` | Local switch for public ingress. Absent or `true`, a bridge serves the state pull's `bridge.ingress` block when the block carries `enabled: true`. `false` opts the host out: plexd builds no ingress manager and opens no public listener whatever the pull says. A bridge reports which of the two applies with the [ingress status report](../bridge/public-ingress.md#ingress-status-report) (`PUT /v1/nodes/{node_id}/ingress-status`), and the control plane refuses rule creates and updates for a bridge that reported `opted_out`. A bridge that upgrades without the key starts serving the rules the control plane delivers; set `false` before the upgrade to keep a host closed. An explicit `true` requires `enabled: true`. plexd reads the key at start, so a change takes effect with a restart. See [Activation](../bridge/public-ingress.md#activation) |
 | `max_ingress_rules` | int | `20` | The most ingress rules the bridge holds; a rule past the bound is not served, with the reason `max_rules` |
 | `ingress_dial_timeout` | duration | `10s` | Timeout for dialing backend targets. A dial that the node's policy blocks gets no answer and ends when the timeout does; the [ingress status report](../bridge/public-ingress.md#rule-entries) then names it `policy_denied` |
-| `user_access_enabled` | bool | `false` | Enable user access VPN integration |
-| `user_access_interface_name` | string | `wg-access` | WireGuard interface for user access |
-| `user_access_listen_port` | int | `51822` | User access WireGuard listen port |
-| `max_access_peers` | int | `50` | Maximum user access peers |
-| `user_access_provider_type` | string | — | External VPN provider for user access: `tailscale`, `netbird`, or empty (disabled) |
-| `auth_key_env` | string | — | Environment variable name containing the auth key for the user access provider (e.g. `PLEXD_TAILSCALE_AUTH_KEY`) |
+| `user_access_enabled` | bool | `true` | Local switch for user access. Absent or `true`, a bridge serves the user access providers of the state pull's `bridge.user_access` block when the block carries `enabled: true`. `false` opts the host out: plexd builds no user access manager, creates no provider interface and starts no vendor client whatever the pull says, and on Linux removes the `wg-ua-` interfaces an earlier process left behind. A bridge reports which of the two applies with the [user access status report](../bridge/user-access-integration.md#user-access-status-report) (`PUT /v1/nodes/{node_id}/user-access-status`), and the control plane refuses provider creates and updates and device admissions for a bridge that reported `opted_out`. A bridge that upgrades without the key starts serving the providers the control plane delivers; set `false` before the upgrade to keep a host closed. An explicit `true` requires `enabled: true`. plexd reads the key at start, so a change takes effect with a restart. See [Activation](../bridge/user-access-integration.md#activation) |
+| `user_access_interface_name` | string | — | Ignored. Each `wireguard` user access provider's interface is named after its id, `wg-ua-` and the last 8 hex digits. See [The Replaced Keys](../bridge/user-access-integration.md#the-replaced-keys) |
+| `user_access_listen_port` | int | — | Ignored. Each `wireguard` provider listens on the `listen_port` the state pull delivers |
+| `max_access_peers` | int | — | Ignored. The control plane holds each provider's `max_devices` |
+| `user_access_provider_type` | string | — | Ignored. The state pull delivers each provider with its `kind` |
+| `auth_key_env` | string | — | Ignored. It named the environment variable a Tailscale client read its auth key from, such as `PLEXD_TAILSCALE_AUTH_KEY`, which plexd no longer reads: a `tailscale` provider joins with the key of the Secret its `auth_secret_name` names |
+| `setup_key_env` | string | — | Ignored. It named the environment variable a NetBird client read its setup key from, such as `PLEXD_NETBIRD_SETUP_KEY`, which plexd no longer reads: a `netbird` provider joins with the key of the Secret its `auth_secret_name` names |
 | `site_to_site_enabled` | bool | `false` | Enable site-to-site VPN |
 | `site_to_site_interface_prefix` | string | `wg-s2s-` | Prefix for site-to-site WireGuard interfaces |
 | `site_to_site_listen_port` | int | `51823` | Base listen port for site-to-site tunnels |
@@ -528,6 +529,8 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 The keys `relay_listen_port`, `max_relay_sessions` and `session_ttl` are removed: the relay's port comes from the state pull, and the relay keeps no session cap or session TTL. A config file that still sets them keeps loading, because unknown keys are ignored, and they have no effect. See [NAT Relay](../bridge/nat-relay.md).
 
 The keys `acme_enabled`, `acme_allowed_hosts`, `acme_email` and `acme_directory_url` are removed as well: an `acme` ingress rule needs no local switch, and the state pull's `bridge.ingress` block names the hosts, the contact and the directory. A config file that still sets them keeps loading, because unknown keys are ignored, and they have no effect. See [ACME and SNI Routing](../bridge/acme-sni.md#local-configuration).
+
+The six user access keys marked ignored above are replaced by what the control plane delivers in the `bridge.user_access` block. They still parse, so a config file written for an older plexd keeps loading, and they have no default, no validation and no effect. In bridge mode plexd names the ones that are set in one Warn at start, `bridge: config: user access keys are ignored, the control plane delivers providers`, with `keys=[...]`.
 
 Source: `internal/bridge/config.go`
 
@@ -739,7 +742,7 @@ dns:
 #   enable_nat: false
 #   relay_enabled: false
 #   ingress_enabled: true    # false opts this host out of public ingress
-#   user_access_enabled: false
+#   user_access_enabled: true  # false opts this host out of user access
 #   site_to_site_enabled: false
 #   acme_cache_dir: ""       # empty = <data_dir>/acme
 #   acme_directory_urls: []  # empty accepts any https ACME directory

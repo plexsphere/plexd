@@ -253,14 +253,15 @@ A single inclusive destination port range (`from <= to`).
 **BridgeSnapshot**
 
 Carries the four bridge subtrees. Each child is present-but-nullable; there are
-no base fields on the wire. `RelayConfig`, `RelayAssignment`, `IngressConfig` and
-`IngressRule` follow below; the other inner shapes (`UserAccessConfig`,
-`SiteToSiteConfig`) are documented under [Bridge Mode](/reference/bridge/bridge-mode).
+no base fields on the wire. `RelayConfig`, `RelayAssignment`, `UserAccessConfig`,
+`UserAccessProvider`, `UserAccessDevice`, `IngressConfig` and `IngressRule`
+follow below; the other inner shape (`SiteToSiteConfig`) is documented under
+[Bridge Mode](/reference/bridge/bridge-mode).
 
 | Field        | Type                | JSON Tag           | Description                     |
 |--------------|---------------------|--------------------|---------------------------------|
 | `Relay`      | `*RelayConfig`      | `"relay"`          | Relay request: whether this bridge relays, on which UDP port, and the peers whose first relay it is |
-| `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access configuration       |
+| `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access providers; `null` or absent serves no provider and deletes every provider's key file |
 | `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress rules; `null` or absent closes every public listener |
 | `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site VPN configuration  |
 
@@ -284,6 +285,59 @@ See [NAT Relay](/reference/bridge/nat-relay).
 | `PeerNodeID`           | `string` | `"peer_node_id"`           | Node ID of a peer whose first relay is this bridge |
 | `FallbackEndpoint`     | `string` | `"fallback_endpoint"`      | Host of that peer's first relay          |
 | `FallbackEndpointPort` | `int`    | `"fallback_endpoint_port"` | Port of that peer's first relay          |
+
+**UserAccessConfig**
+
+The `bridge.user_access` block, the control plane's `NodeStateBridgeUserAccess`,
+which it delivers since
+[plexsphere/plexsphere#1108](https://github.com/plexsphere/plexsphere/pull/1108).
+A bridge serves its providers when `Enabled` is true and its local configuration
+does not opt out with `bridge.user_access_enabled: false`; a bridge that opts
+out serves no provider whatever the block says and reports `opted_out` in its
+[user access status report](#user-access-status). The block is applied whole,
+and a block in the shape before plexsphere/plexsphere#1108 (`interface_name`,
+`listen_port`, `peers`) decodes to no providers. See
+[User Access Integration](/reference/bridge/user-access-integration).
+
+| Field       | Type                   | JSON Tag      | Description |
+|-------------|------------------------|---------------|-------------|
+| `Enabled`   | `bool`                 | `"enabled"`   | The control plane's switch, `true` on every block it delivers. A block with `false` serves no provider and keeps the key files of the providers it lists |
+| `Providers` | `[]UserAccessProvider` | `"providers"` | Every provider of the bridge Resource, by slug ascending; absent and `null` decode to none |
+
+**UserAccessProvider**
+
+One provider of the block, the control plane's
+`NodeStateBridgeUserAccessProvider`. It carries the members of its kind and no
+others. `UserAccessKindWireGuard`, `UserAccessKindTailscale` and
+`UserAccessKindNetbird` name the kinds, `"wireguard"`, `"tailscale"` and
+`"netbird"`, and a Linux bridge serves all three.
+
+| Field            | Type                 | JSON Tag                       | Description |
+|------------------|----------------------|--------------------------------|-------------|
+| `ID`             | `string`             | `"id"`                         | Provider id, a UUID; `ValidUserAccessProviderID` checks it |
+| `Slug`           | `string`             | `"slug"`                       | Provider name within the bridge Resource |
+| `Kind`           | `string`             | `"kind"`                       | `wireguard`, `tailscale` or `netbird` |
+| `ListenPort`     | `int`                | `"listen_port,omitempty"`      | UDP port of a `wireguard` provider's interface |
+| `AddressPool`    | `string`             | `"address_pool,omitempty"`     | IPv4 network of a `wireguard` provider; its interface takes the first host address with the pool's prefix length |
+| `MaxDevices`     | `int`                | `"max_devices,omitempty"`      | The most devices a `wireguard` provider admits; decoded, not enforced |
+| `Devices`        | `[]UserAccessDevice` | `"devices,omitempty"`          | The devices a `wireguard` provider admits |
+| `AuthSecretName` | `string`             | `"auth_secret_name,omitempty"` | The Secret that holds a `tailscale` or `netbird` provider's join key |
+
+**UserAccessDevice**
+
+One device of a `wireguard` provider, the control plane's
+`NodeStateBridgeUserAccessDevice`: a WireGuard peer of the provider's interface.
+
+| Field       | Type     | JSON Tag       | Description |
+|-------------|----------|----------------|-------------|
+| `ID`        | `string` | `"id"`         | Device id |
+| `Slug`      | `string` | `"slug"`       | Device name within the provider |
+| `PublicKey` | `string` | `"public_key"` | The device's WireGuard public key, standard base64 |
+| `Address`   | `string` | `"address"`    | The device's IPv4 address in the pool, its one allowed IP as a `/32` |
+
+`ValidUserAccessProviderID(s string) bool` applies the check of
+`ValidIngressRuleID`: a UUID in canonical form, in either case, other than the
+zero UUID, the id the control plane accepts in a user access status report.
 
 **IngressConfig**
 
@@ -1251,6 +1305,79 @@ checks none of this and sends the request as passed.
 |----------|-------------|
 | `ValidIngressRuleID(s string) bool` | `s` is a UUID in canonical form, groups of 8, 4, 4, 4 and 12 hex digits in either case joined by hyphens, other than the zero UUID. Written by hand: `github.com/google/uuid` stays an indirect dependency |
 | `ValidIngressReason(s string) bool` | `s` matches `^[a-z][a-z0-9_]{0,62}$` |
+
+## User Access Status
+
+### `PUT /v1/nodes/{node_id}/user-access-status`
+
+Whether a bridge's local configuration serves user access, which the control
+plane reads to refuse a provider or a device that no bridge would serve, and
+whether each user access provider of its pull is up. The control plane keeps
+the latest state per node and never ages it, and each report replaces the
+provider entries of the one before. The control plane's side is
+[plexsphere/plexsphere#1108](https://github.com/plexsphere/plexsphere/pull/1108).
+See [Control Plane API Endpoints](api-endpoints.md#user-access-status) for the
+wire example and error taxonomy, and
+[User Access Integration](../bridge/user-access-integration.md#user-access-status-report)
+for how plexd derives the state and each entry.
+
+**UserAccessStatusRequest**
+
+| Field       | Type                         | JSON Tag                | Description |
+|-------------|------------------------------|-------------------------|-------------|
+| `State`     | `string`                     | `"state"`               | One of the `UserAccessState*` constants |
+| `Providers` | `[]UserAccessStatusProvider` | `"providers,omitempty"` | One entry per reported provider, in the order of the pull, at most `MaxUserAccessStatusProviders`; nil omits the member, which reads as no entries |
+
+**UserAccessStatusProvider**, the control plane's
+`UserAccessStatusReportProvider`. `Reason` is sent exactly when `Health` is
+`down`; `PublicKey` and `ConnectedDevices` only when it is `up`, and plexd sends
+both for a `wireguard` provider that is up and neither for a `tailscale` or
+`netbird` one. `omitempty` drops an empty member, so a caller leaves every
+member it must not send empty:
+
+| Field              | Type     | JSON Tag                         | Description |
+|--------------------|----------|----------------------------------|-------------|
+| `ID`               | `string` | `"id"`                           | The provider's `id` from the pull, a UUID other than the zero UUID |
+| `Health`           | `string` | `"health"`                       | One of the `UserAccessHealth*` constants |
+| `Reason`           | `string` | `"reason,omitempty"`             | A reason token of the grammar `^[a-z][a-z0-9_]{0,62}$`; exactly when `Health` is `down` |
+| `PublicKey`        | `string` | `"public_key,omitempty"`         | The public key of a `wireguard` provider's interface: 44 characters of standard base64 that decode to 32 bytes |
+| `ConnectedDevices` | `*int`   | `"connected_devices,omitempty"`  | The provider's devices whose latest WireGuard handshake is at most 180 s old, 0 to 1024. A pointer, because 0 is a valid count: a nil pointer omits the member, a pointer to 0 sends `"connected_devices":0` |
+
+A missing, `null` or unknown state, an unknown member, data after the report,
+more than `MaxUserAccessStatusProviders` entries, an entry with a malformed id
+or a value outside its member's rule, and an entry that breaks the presence
+rules answer `400 malformed_user_access_status`; an opted-out report with
+entries and a repeated id answer `400 invalid_user_access_status`. A body over
+64 KiB answers `413 user_access_status_body_too_large`.
+`ReportUserAccessStatus` checks none of this and sends the request as passed.
+
+**UserAccessStatusResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                    |
+|--------------|-------------|-----------------|--------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time of the report |
+
+**Constants**
+
+| Constant | Value | Description |
+|---|---|---|
+| `UserAccessStateEnabled` | `"enabled"` | The bridge's local configuration serves the user access providers the state pull enables: `bridge.user_access_enabled` is absent or `true` |
+| `UserAccessStateOptedOut` | `"opted_out"` | The bridge's local configuration, `bridge.user_access_enabled: false`, rules user access out: it serves no provider whatever the pull says |
+| `UserAccessHealthUp` | `"up"` | The bridge serves the provider |
+| `UserAccessHealthDown` | `"down"` | The bridge does not serve the provider; `Reason` says why |
+| `MaxUserAccessStatusProviders` | `256` | The most entries one report carries; a bridge with more reports the first ones in the order of the pull |
+
+The reason tokens plexd sends, and what each means, are listed in
+[Reasons](../bridge/user-access-integration.md#reasons).
+`ValidUserAccessProviderID` checks an entry's id (see `UserAccessProvider`
+under [State](#state)).
+
+**Client and classifier**
+
+| Function | Description |
+|---|---|
+| `(*ControlPlane).ReportUserAccessStatus(ctx, nodeID string, req UserAccessStatusRequest) (*UserAccessStatusResponse, error)` | Sends `PUT /v1/nodes/{node_id}/user-access-status` with the request as JSON and returns the receipt. It path-escapes the node ID and validates nothing |
+| `IsUserAccessStatusNotServed(err error) bool` | True for an `*APIError` with status `404` and any code but `user_access_status_node_gone`, and for a `501` carrying `user_access_status_not_provisioned`: the control plane does not serve the operation. False for everything else, a `404 user_access_status_node_gone` included |
 
 ## Policy Status
 

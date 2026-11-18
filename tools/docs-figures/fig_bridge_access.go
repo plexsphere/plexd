@@ -142,20 +142,46 @@ func accReconcile(f *Figure, l *accLayout, handler string) *node {
 	return hd
 }
 
-// bridgeUserAccessDataFlow draws the data flow of user access for
-// docs/reference/bridge/user-access-integration.md (Data Flow).
+// bridgeUserAccessDataFlow draws the data flow of a wireguard user
+// access provider for docs/reference/bridge/user-access-integration.md
+// (Data Flow): the devices reach plexd0 through the provider's
+// interface and the source rewrite, the manager serves the pulled
+// block, and the reporter sends the state of each provider.
 func bridgeUserAccessDataFlow() *Figure {
 	f := &Figure{Name: "bridge-user-access-data-flow", Title: "Data flow of user access through a bridge node"}
 	l := accDataFlow(f, accSpec{
 		user:      true,
-		source:    []Line{name("External VPN clients"), body("Tailscale, Netbird, WireGuard")},
-		transport: []Line{body("WireGuard tunnel")},
-		entry:     []Line{name("Access WireGuard"), name("interface"), code("wg-access"), body("port 51822")},
-		link:      []Line{body("IP forwarding")},
-		stack:     [][]Line{{codeName("AccessController"), body("WireGuard operations")}},
+		source:    []Line{name("Devices"), body("of a wireguard provider")},
+		transport: []Line{body("WireGuard, UDP listen_port")},
+		entry:     []Line{name("Provider WireGuard"), name("interface"), code("wg-ua-a0a0a0e1"), body("10.99.0.1/24")},
+		link:      []Line{body("forwarding,"), body("source rewrite")},
+		stack: [][]Line{
+			{codeName("AccessController"), body("interface and devices")},
+			{codeName("UserAccessManager"), body("one entry per provider")},
+			{codeName("InterfaceKeyStore"), code("<data_dir>/user-access")},
+		},
 	})
 	hd := accReconcile(f, l, "UserAccessReconcileHandler")
-	l.accClose(hd)
+	mgr := l.stack[1]
+
+	// The handler hands the block to the manager through the gap
+	// between the two columns. The manager's entries reach the reporter
+	// round the left of the stack and under it, so the two paths never
+	// meet.
+	applyX := (accLeftX + accLeftW + accRightX) / 2
+	f.arrow(flow, hvh(hd.left(), mgr.right(), applyX)...)
+	f.label(pt{(accLeftX + accLeftW + applyX) / 2, mgr.cy()}, code("Apply()"))
+	rep := f.box(roleAgent, spec{x: accRightX, y: l.accRow(3) + 20, w: accRightW, h: accRowH, lines: []Line{
+		codeName("UserAccessStatusReporter"),
+	}})
+	f.arrow(flow, hvh(mgr.left(), rep.left(), accLeftX-15)...)
+
+	// The reporter sends to the control plane box accReconcile drew in
+	// the outside column.
+	cpBottom := pt{accOutX + accOutW/2, l.accRow(0) + accRowH}
+	f.arrow(call, hv(rep.right(), cpBottom)...)
+	f.label(pt{(accRightX + accRightW + cpBottom.X) / 2, rep.cy()}, body("status report"))
+	l.accClose(rep, l.stack[len(l.stack)-1])
 	return f
 }
 
@@ -178,27 +204,41 @@ func bridgeSiteToSiteDataFlow() *Figure {
 	return f
 }
 
-// bridgeVpnProvidersDataFlow draws the data flow of user access
-// through a VPN provider for docs/reference/bridge/vpn-providers.md
-// (Data Flow).
+// bridgeVpnProvidersDataFlow draws the data flow of a tailscale or
+// netbird user access provider for
+// docs/reference/bridge/vpn-providers.md (Data Flow): the vendor's
+// users reach plexd0 through the client's interface and the source
+// rewrite, and the manager starts the client with the key the Secret
+// fetch returns.
 func bridgeVpnProvidersDataFlow() *Figure {
 	f := &Figure{Name: "bridge-vpn-providers-data-flow", Title: "Data flow of user access through a VPN provider"}
 	l := accDataFlow(f, accSpec{
 		user:      true,
-		source:    []Line{name("External VPN users"), body("Tailscale, Netbird")},
-		transport: []Line{body("provider overlay network")},
-		entry:     []Line{name("Provider interface"), code("tailscale0, wt0, …")},
-		link:      []Line{body("IP forwarding")},
+		source:    []Line{name("Tailscale or NetBird users"), body("of the vendor's network")},
+		transport: []Line{body("vendor overlay network")},
+		entry:     []Line{name("Client interface"), code("tailscale0, wt0, …")},
+		link:      []Line{body("forwarding,"), body("source rewrite")},
 		stack: [][]Line{
-			{codeName("UserAccessProvider"), body("Tailscale, Netbird")},
-			{codeName("CommandExecutor"), body("CLI invocations")},
+			{codeName("UserAccessClient"), body("Tailscale, NetBird")},
+			{codeName("CommandExecutor"), body("tailscale, netbird CLI")},
 		},
 	})
-	prov := l.stack[0]
-	mgr := f.box(roleAgent, spec{x: accRightX, y: prov.y, w: accRightW, h: accRowH, lines: []Line{codeName("UserAccessManager")}})
-	f.arrow(flow, mgr.left(), prov.right())
-	f.label(mid(prov.right(), mgr.left()), code("Start()"), code("Stop()"))
-	l.accClose(mgr, l.stack[len(l.stack)-1])
+	client := l.stack[0]
+	mgr := f.box(roleAgent, spec{x: accRightX, y: client.y, w: accRightW, h: accRowH, lines: []Line{codeName("UserAccessManager")}})
+	f.arrow(flow, mgr.left(), client.right())
+	f.label(mid(client.right(), mgr.left()), code("Start()"), code("Stop()"))
+
+	// The join key comes from the Secret the provider names, fetched
+	// from the control plane in the version the inventory lists.
+	fetch := f.box(roleAgent, spec{x: accRightX, y: l.accRow(1), w: accRightW, h: accRowH, lines: []Line{
+		codeName("nodeSecretFetcher"), body("the Secret's value"),
+	}})
+	f.arrow(secretFlow, fetch.top(), mgr.bottom())
+	f.labelRight(mid(fetch.top(), mgr.bottom()), body("join key"))
+	cp := f.box(roleCore, spec{x: accOutX, y: fetch.y, w: accOutW, h: accRowH, lines: []Line{name("Control plane")}})
+	f.arrow(call, fetch.right(), cp.left())
+	f.label(mid(fetch.right(), cp.left()), body("fetch"))
+	l.accClose(fetch, l.stack[len(l.stack)-1])
 	return f
 }
 

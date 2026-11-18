@@ -6,7 +6,7 @@ feature: PXD-0027
 
 # Netlink Route Controller
 
-`NetlinkRouteController` is the Linux production implementation of the `RouteController` interface defined in `internal/bridge`. It manages IP routes via netlink, IP forwarding via sysctl, and NAT masquerading via nftables. It requires `CAP_NET_ADMIN` and the `//go:build linux` constraint.
+`NetlinkRouteController` is the Linux production implementation of the `RouteController` interface defined in `internal/bridge`. It manages IP routes via netlink, IP forwarding via sysctl, and NAT masquerading via nftables. It also implements `MeshSourceRewriter`, the source rewrite of user access traffic into the mesh, in an nftables table of its own (see [Mesh Source Rewrite](#mesh-source-rewrite)). It requires `CAP_NET_ADMIN` and the `//go:build linux` constraint.
 
 The macOS and Windows implementations are described in [macOS & Windows Route Controllers](./route-controllers-macos-windows.md).
 
@@ -94,12 +94,48 @@ Deletes the entire `plexd-nat` table. Lists all IPv4 tables, finds `plexd-nat`, 
 
 ### Table Separation
 
-| Table        | Package           | Purpose                    |
-|--------------|-------------------|----------------------------|
-| `plexd`      | `internal/policy` | Firewall filter rules      |
-| `plexd-nat`  | `internal/bridge` | NAT masquerade for bridge  |
+| Table            | Package           | Purpose                                      |
+|------------------|-------------------|----------------------------------------------|
+| `plexd`          | `internal/policy` | Firewall filter rules                        |
+| `plexd-nat`      | `internal/bridge` | NAT masquerade for bridge                    |
+| `plexd-mesh-nat` | `internal/bridge` | Mesh source rewrite of user access providers |
 
-The tables are deliberately separated to avoid conflicts between the policy firewall and bridge NAT subsystems.
+The tables are deliberately separated to avoid conflicts between the policy firewall and bridge NAT subsystems. `plexd-nat` cannot hold a second translation, because `AddNATMasquerade` flushes its chain and `RemoveNATMasquerade` deletes the table whole, so the mesh source rewrite has a table of its own.
+
+## Mesh Source Rewrite
+
+`NetlinkRouteController` implements `MeshSourceRewriter`, which the user access manager calls for each provider's interface (see [User Access Integration](user-access-integration.md#policy-and-device-traffic)):
+
+| Method                    | Mechanism | Linux Subsystem                                      |
+|---------------------------|-----------|------------------------------------------------------|
+| `AddMeshSourceRewrite`    | nftables  | `plexd-mesh-nat` table, one tagged postrouting rule per interface |
+| `RemoveMeshSourceRewrite` | nftables  | Delete the rule tagged with the interface's name     |
+| `ResetMeshSourceRewrite`  | nftables  | Delete the `plexd-mesh-nat` table                    |
+
+### AddMeshSourceRewrite
+
+`AddMeshSourceRewrite(fromIface, meshIface)` masquerades the packets that arrive on `fromIface` and leave through `meshIface`, which gives them the address of `meshIface`, the bridge's mesh address. It adds the IPv4 table `plexd-mesh-nat` and its chain `postrouting` when they are missing, and one rule per interface, which carries `fromIface` as a comment in its user data:
+
+```
+table ip plexd-mesh-nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat;
+        iifname "wg-ua-a0a0a0e1" oifname "plexd0" counter masquerade comment "wg-ua-a0a0a0e1"
+    }
+}
+```
+
+The operation is idempotent: a rule that carries `fromIface` is left alone, whatever `meshIface` it names. An empty interface name, or one that does not fit `IFNAMSIZ` with its terminator, is refused before any nftables call. `meshSourceRewriteExprs(fromIface, meshIface)` builds the rule's expressions, which a test checks without the kernel: the incoming interface name, then the outgoing one, each compared with its terminating NUL, a counter, and the masquerade.
+
+### RemoveMeshSourceRewrite
+
+Finds the rule by its comment and deletes it. `meshIface` is only logged. A missing rule, chain or table returns `nil` (idempotent).
+
+### ResetMeshSourceRewrite
+
+Deletes the whole `plexd-mesh-nat` table with every rule in it, also the rules of a process that was killed. It touches neither `plexd-nat` nor the policy table `plexd`. Returns `nil` if the table does not exist (idempotent). `bridge.CleanupUserAccess` calls it when the user access manager starts, and once at start on a bridge that opts out of user access.
+
+The rewrite logs at Debug with `component=bridge`: `mesh source rewrite added`, `mesh source rewrite already present, idempotent success`, `mesh source rewrite removed` and `mesh source rewrite not found, idempotent success` with `from_iface` and `mesh_iface`, and `mesh source rewrite table removed` and `mesh source rewrite table not found, idempotent success` with `table`.
 
 ## Error Prefixes
 
@@ -111,6 +147,9 @@ The tables are deliberately separated to avoid conflicts between the policy fire
 | `RemoveRoute`         | `bridge: remove route:`                   |
 | `AddNATMasquerade`    | `bridge: add NAT masquerade:`             |
 | `RemoveNATMasquerade` | `bridge: remove NAT masquerade:`          |
+| `AddMeshSourceRewrite` | `bridge: add mesh source rewrite:`; `bridge: add mesh source rewrite from "<fromIface>" to "<meshIface>":` when the commit to the kernel fails |
+| `RemoveMeshSourceRewrite` | `bridge: remove mesh source rewrite:`; `bridge: remove mesh source rewrite from "<fromIface>":` when the deletion of the rule or its commit fails |
+| `ResetMeshSourceRewrite` | `bridge: reset mesh source rewrite:`   |
 
 ## Dependencies
 
@@ -119,6 +158,7 @@ The tables are deliberately separated to avoid conflicts between the policy fire
 | `github.com/vishvananda/netlink` | Route add/remove via netlink |
 | `github.com/google/nftables`    | NAT masquerade via nftables  |
 | `github.com/google/nftables/expr`| nftables expression types   |
+| `github.com/google/nftables/userdata` | The comment that tags a mesh source rewrite |
 | `golang.org/x/sys` (indirect)   | syscall errno constants      |
 
 ## Privileges

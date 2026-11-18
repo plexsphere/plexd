@@ -38,8 +38,8 @@ The mock refuses what the real handlers refuse, because a fixture that accepts
 more than the contract hides exactly the defects the suite exists to catch. The
 first three gates were added after a release shipped past them; the handshake
 report, the edge PSK route, the endpoint candidates route, the hook version
-route, the policy status report and the ingress status report were gated from
-the start:
+route, the policy status report, the ingress status report and the user access
+status report were gated from the start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** caps the body at 1 MiB
   (`413 capabilities_body_too_large`), strict-decodes a `CapabilityManifestRequest`
@@ -150,6 +150,16 @@ the start:
   `400 invalid_ingress_status` for an opted-out report with entries, a
   repeated `id` and an entry that breaks the presence rules. See
   [the route](#put-v1-nodes-id-ingress-status).
+- **`PUT /v1/nodes/{id}/user-access-status`** caps the body at 64 KiB
+  (`413 user_access_status_body_too_large`) and strict-decodes it into a
+  mock-local struct whose `state` is a pointer, then each provider entry on its
+  own. It answers `400 malformed_user_access_status` for a body that is not
+  one JSON object, an unknown member, data after the report, a missing or
+  `null` `state`, a `state` outside `enabled` and `opted_out`, more than 256
+  entries, an entry whose member breaks its own rule, and an entry that breaks
+  the presence rules of its `health`; and `400 invalid_user_access_status` for
+  an opted-out report with entries and a repeated `id`. See
+  [the route](#put-v1-nodes-id-user-access-status).
 - **`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`** answers
   `403 node_id_mismatch` for an `id` other than the registered node, then
   `404 hook_not_assigned` for a pair the state fixture's `hooks` block does not
@@ -655,6 +665,63 @@ only the captured body.
 
 **Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
 
+### `PUT /v1/nodes/{id}/user-access-status`
+
+Enforces the user access status report contract (`PutNodeUserAccessStatus`,
+the "User access status" section of the control plane's
+`docs/reference/api/plexd-agent-contract.md` at plexsphere/plexsphere@4935e06):
+a 64 KiB body cap, strict JSON decoding, the two states, and the rules of each
+provider entry. `handleUserAccessStatus` captures the body under
+`user-access-status` as it reads it, before the decode and the rules judge it,
+so `GET /test/last-request/user-access-status` returns the bytes of the last
+report, a refused one included; a body over the cap is not captured. It
+decodes the report into a mock-local struct whose `state` is a `*string`, so a
+missing or `null` state is told apart from an empty one. The handler does not
+compare the path `id` with the node, as the ingress status route does not.
+`user_access_status_count` increments only when every check passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `user_access_status_body_too_large` if the body exceeds 64 KiB (65,536 bytes), read through `http.MaxBytesReader`.
+2. **Body decode** → `400` `malformed_user_access_status` with the fixed `detail` `request body is not a valid user access status report; it carries only state and providers` if the body is empty or not one JSON object, carries an unknown member of the report, data after the report, a `state` that is neither a JSON string nor `null`, or a `providers` that is not an array. A body of `null` decodes to a report without members, which step 3 refuses as `state is missing`. The entries of `providers` stay undecoded here.
+3. **State** → `400` `malformed_user_access_status` with the `detail` `state is missing` if `state` is missing or `null`, and with the `detail` `state is not one of enabled and opted_out` for any other string than `enabled` and `opted_out`.
+4. **Entries** → `400` `malformed_user_access_status` with the `detail` `providers carries more than 256 entries`; then, for each entry in order, decoded on its own into a struct of pointer members, `providers[i]` followed by the first broken rule: ` is not an object` for an entry that is no JSON object and not `null` (a `null` entry decodes to an entry without members and earns `.id is missing`); ` carries the unknown member <name>` for a member the contract does not define whose name is a token of the reason grammar, and ` carries a member UserAccessStatusReportProvider does not define` for any other unknown member; the member's sentence for a member of the wrong JSON type, and ` is not a valid provider entry` for any other entry the decoder refuses; then, in the order the contract lists the members, `.id is missing`, `.id is not a provider id` (failing `api.ValidIngressRuleID`), `.health is missing`, `.health is not one of up and down`, `.reason is not a reason token` (failing `api.ValidIngressReason`), `.public_key is not a WireGuard public key of 44 characters of standard base64` (44 characters of standard base64 that decode strictly to 32 bytes) and `.connected_devices is not between 0 and 1024`; and last the presence rules, `.reason is required while health is down`, `.public_key is set while health is down`, `.connected_devices is set while health is down` and `.reason is set while health is up`.
+5. **Consistency** → `400` `invalid_user_access_status` with the `detail` `an opted-out bridge reports no providers`; then `providers[i].id repeats providers[j].id`, compared without case.
+
+A `providers` of `null` or `[]` is a report without entries. A member of an entry sent as `null` reads as omitted. An `up` entry may omit `public_key` and `connected_devices`, since a vendor provider that is up sends neither. The details are the control plane's sentences, and none quotes an id, a reason or a key of the body. The mock accepts canonical ids only, which is narrower than the control plane's parser and wide enough for what plexd sends.
+
+**Request body:**
+
+```json
+{
+  "state": "enabled",
+  "providers": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", "health": "up",
+      "public_key": "hT2bUq7k3mS0eQ4vJ9xR1nC6pW8aL5dF2gH7jK0zY3M=", "connected_devices": 1 },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", "health": "down", "reason": "auth_secret_not_listed" }
+  ]
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-11-18T10:15:30Z"
+}
+```
+
+`accepted_at` is the mock's clock in UTC. The mock keeps no report and refuses
+no provider: the state fixture serves whatever block
+`POST /test/configure-state` configured, whatever the node reported. It keeps
+only the captured body.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`). Every answer of the handler, the `200` and each refusal above, carries `Cache-Control: no-store`, as the contract asks.
+
+**Counter:** Increments `user_access_status_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
+
 ### `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`
 
 Serves the edge PSKs of the two fixture peers the way the control plane does:
@@ -776,7 +843,7 @@ therefore hands the node the new key.
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
-| `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
+| `bridge.user_access` | `enabled: true`, 2 providers in the delivered shape: `field-team` (`...a0e1`), `wireguard` on port 51821 with the pool `10.98.0.0/24`, at most 64 devices and one device `alice-laptop` at `10.98.0.2`; and `tailnet` (`...a0e2`), `tailscale` with the Secret `ts-join`. No suite serves this block to a bridge: the systemd suite's bridge phases replace it |
 | `bridge.ingress` | `enabled: true`, 1 rule, `web`: port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
 | `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
@@ -815,6 +882,14 @@ The relay block's one assignment is peer `...a0b1`, whose `fallback_endpoint`
 `203.0.113.1:51820` names the relay. No Docker e2e phase reads the block,
 because the Docker suite runs node mode only, and a node outside bridge mode
 ignores it.
+
+The user access block follows the example of the contract's "User access"
+section in the shape the control plane delivers since
+plexsphere/plexsphere#1108, with one `wireguard` and one `tailscale`
+provider. Its pool, `10.98.0.0/24`, differs from the contract's
+`10.99.0.0/24`, which is the fixture's mesh. The device's `public_key` is a
+valid 44-character key. See
+[User Access Integration](../bridge/user-access-integration.md#the-bridge-user-access-block).
 
 The policy block is in the allow-only format plexd reads: no rule carries
 `action`, every rule is an allow, and plexd appends the default deny. The second
@@ -898,13 +973,28 @@ answers `applied`.
     },
     "user_access": {
       "enabled": true,
-      "interface_name": "wg-access0",
-      "listen_port": 51821,
-      "peers": [
+      "providers": [
         {
-          "public_key": "ua-pub-key-001",
-          "allowed_ips": ["10.100.0.1/32"],
-          "label": "admin-laptop"
+          "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+          "slug": "field-team",
+          "kind": "wireguard",
+          "listen_port": 51821,
+          "address_pool": "10.98.0.0/24",
+          "max_devices": 64,
+          "devices": [
+            {
+              "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1",
+              "slug": "alice-laptop",
+              "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+              "address": "10.98.0.2"
+            }
+          ]
+        },
+        {
+          "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2",
+          "slug": "tailnet",
+          "kind": "tailscale",
+          "auth_secret_name": "ts-join"
         }
       ]
     },
@@ -1409,6 +1499,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "handshake_report_count": 0,
   "policy_status_count": 0,
   "ingress_status_count": 0,
+  "user_access_status_count": 0,
   "edge_psk_count": 0,
   "hook_fetch_count": 0,
   "inject_event_count": 0,
@@ -2039,6 +2130,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
 | `policy_status_count` | `PUT /v1/nodes/{id}/policy-status` (accepted reports only, `200`) |
 | `ingress_status_count` | `PUT /v1/nodes/{id}/ingress-status` (accepted reports only, `200`) |
+| `user_access_status_count` | `PUT /v1/nodes/{id}/user-access-status` (accepted reports only, `200`) |
 | `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |
 | `hook_fetch_count` | `GET /v1/nodes/{id}/hooks/{name}/versions/{version}` (served `200` versions only) |
 | `inject_event_count` | `POST /test/inject-event` |
@@ -2068,7 +2160,7 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `Envelope` — `internal/api.Envelope`
 - `Peer` — `internal/api.Peer`
 - `RelayConfig` / `RelayAssignment` — `internal/api.RelayConfig` / `internal/api.RelayAssignment`
-- `UserAccessConfig` / `UserAccessPeer` — `internal/api.UserAccessConfig` / `internal/api.UserAccessPeer`
+- `UserAccessConfig` / `UserAccessProvider` / `UserAccessDevice` — `internal/api.UserAccessConfig` / `internal/api.UserAccessProvider` / `internal/api.UserAccessDevice`
 - `IngressConfig` / `IngressRule` — `internal/api.IngressConfig` / `internal/api.IngressRule`
 - `SiteToSiteConfig` / `SiteToSiteTunnel` — `internal/api.SiteToSiteConfig` / `internal/api.SiteToSiteTunnel`
 
