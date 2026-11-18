@@ -588,6 +588,8 @@ func TestUserAccessManager_ApplyDiffsDevicesAndRebuilds(t *testing.T) {
 	if p := requireUp(t, fx.mgr, uaID1); p.Slug != "field-crew" {
 		t.Errorf("slug = %q, want the renamed one", p.Slug)
 	}
+	// The status read the interface's handshakes.
+	fx.reset()
 
 	fx.mgr.Apply(t.Context(), uaBlock(wgProvider(uaID1, "field-team", 51821, "10.99.0.0/24", alice)))
 	if got := fx.calls(); !slices.Equal(got, []string{"access.RemovePeer"}) {
@@ -733,6 +735,9 @@ func TestUserAccessManager_ApplyEmptyBlocks(t *testing.T) {
 			fx.requireNoCalls(t, "Apply of "+name)
 			if info := fx.mgr.UserAccessStatus(); info == nil || len(info.Providers) != 0 || info.Enabled != block.Enabled {
 				t.Errorf("UserAccessStatus() = %+v, want Enabled %v and no providers", info, block.Enabled)
+			}
+			if got := fx.mgr.ProviderReports(); got == nil || len(got) != 0 {
+				t.Errorf("ProviderReports() = %#v, want an empty list from the active manager", got)
 			}
 			if got := fx.keyFiles(t); len(got) != 0 {
 				t.Errorf("key files = %q, want none", got)

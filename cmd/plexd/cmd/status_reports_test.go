@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -165,8 +166,11 @@ func TestStatusReportPublisher_NilBridgeManagersDisabled(t *testing.T) {
 
 // fakeBridgeKernel stands in for the kernel a user access manager programs:
 // it is the access controller, the route controller and the mesh source
-// rewriter at once, and every call succeeds.
-type fakeBridgeKernel struct{}
+// rewriter at once, and every call succeeds. PeerHandshakes answers
+// handshakes for every interface.
+type fakeBridgeKernel struct {
+	handshakes map[string]time.Time
+}
 
 var (
 	_ bridge.AccessController   = fakeBridgeKernel{}
@@ -179,8 +183,8 @@ func (fakeBridgeKernel) RemoveInterface(string) error                         { 
 func (fakeBridgeKernel) RemoveInterfaces(string) error                        { return nil }
 func (fakeBridgeKernel) ConfigurePeer(string, string, []string, string) error { return nil }
 func (fakeBridgeKernel) RemovePeer(string, string) error                      { return nil }
-func (fakeBridgeKernel) PeerHandshakes(string) (map[string]time.Time, error) {
-	return map[string]time.Time{}, nil
+func (k fakeBridgeKernel) PeerHandshakes(string) (map[string]time.Time, error) {
+	return maps.Clone(k.handshakes), nil
 }
 func (fakeBridgeKernel) EnableForwarding(string, string) error        { return nil }
 func (fakeBridgeKernel) DisableForwarding(string, string) error       { return nil }
@@ -193,8 +197,9 @@ func (fakeBridgeKernel) RemoveMeshSourceRewrite(string, string) error { return n
 func (fakeBridgeKernel) ResetMeshSourceRewrite() error                { return nil }
 
 // TestStatusReportPublisher_UserAccess publishes status.user-access with one
-// entry per provider a real user access manager holds, and {"enabled":false}
-// without a manager and once the manager is torn down.
+// entry per provider a real user access manager holds, its connected devices
+// counted from the interface's handshakes, and {"enabled":false} without a
+// manager and once the manager is torn down.
 func TestStatusReportPublisher_UserAccess(t *testing.T) {
 	fake := &fakeReportPublisher{}
 	p := newTestPublisher(fake, func() int { return 0 })
@@ -203,8 +208,11 @@ func TestStatusReportPublisher_UserAccess(t *testing.T) {
 		t.Errorf("status.user-access without a manager = %s, want {\"enabled\":false}", got)
 	}
 
+	const aliceKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 	mgr := bridge.NewUserAccessManager(bridge.UserAccessDeps{
-		Access:        fakeBridgeKernel{},
+		// alice completed a handshake a minute ago, well inside the 180 s
+		// that count a device as connected on the manager's wall clock.
+		Access:        fakeBridgeKernel{handshakes: map[string]time.Time{aliceKey: time.Now().Add(-time.Minute)}},
 		Routes:        fakeBridgeKernel{},
 		Rewriter:      fakeBridgeKernel{},
 		Keys:          bridge.NewInterfaceKeyStore(t.TempDir()),
@@ -220,7 +228,7 @@ func TestStatusReportPublisher_UserAccess(t *testing.T) {
 		{
 			ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1", Slug: "field-team", Kind: api.UserAccessKindWireGuard,
 			ListenPort: 51821, AddressPool: "10.98.0.0/24", MaxDevices: 64,
-			Devices: []api.UserAccessDevice{{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", Slug: "alice-laptop", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", Address: "10.98.0.2"}},
+			Devices: []api.UserAccessDevice{{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1", Slug: "alice-laptop", PublicKey: aliceKey, Address: "10.98.0.2"}},
 		},
 		// No tailscale client is built in, so the provider is not served.
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2", Slug: "tailnet", Kind: api.UserAccessKindTailscale, AuthSecretName: "ts-join"},
@@ -230,7 +238,7 @@ func TestStatusReportPublisher_UserAccess(t *testing.T) {
 	fake.calls = nil
 	p.publishOnce()
 	const want = `{"enabled":true,"providers":[` +
-		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"field-team","kind":"wireguard","interface":"wg-ua-a0a0a0e1","health":"up","listen_port":51821,"devices":1,"connected_devices":0},` +
+		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1","slug":"field-team","kind":"wireguard","interface":"wg-ua-a0a0a0e1","health":"up","listen_port":51821,"devices":1,"connected_devices":1},` +
 		`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e2","slug":"tailnet","kind":"tailscale","health":"down","reason":"kind_not_served","devices":0,"connected_devices":0}]}`
 	if got := string(findPayload(t, fake, statusUserAccessKey)); got != want {
 		t.Errorf("status.user-access =\n  %s\nwant\n  %s", got, want)
