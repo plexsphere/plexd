@@ -48,3 +48,33 @@ type RouteController interface {
 
 	NATController
 }
+
+// UserAccessInterfacePrefix begins the name of every kernel interface plexd
+// creates for a wireguard user access provider, so that the interfaces a
+// killed process left behind can be found by their name.
+const UserAccessInterfacePrefix = "wg-ua-"
+
+// MeshSourceRewriter rewrites the source address of packets forwarded from a
+// user access interface into the mesh to the address of the mesh interface,
+// the bridge's mesh address. A mesh node accepts from the bridge only that
+// address, so a packet that kept a device's address would be dropped by the
+// first peer it meets.
+// It is a dependency of its own rather than a method of NATController, so the
+// pf and WinNAT backends that implement NATController on macOS and Windows do
+// not implement it. NetlinkRouteController implements it through nftables.
+// All methods must be idempotent.
+type MeshSourceRewriter interface {
+	// AddMeshSourceRewrite rewrites the source of packets that arrive on
+	// fromIface and leave through meshIface. A rewrite that exists for
+	// fromIface is left alone.
+	AddMeshSourceRewrite(fromIface, meshIface string) error
+
+	// RemoveMeshSourceRewrite removes the rewrite for fromIface.
+	// Idempotent: removing a rewrite that does not exist returns nil.
+	RemoveMeshSourceRewrite(fromIface, meshIface string) error
+
+	// ResetMeshSourceRewrite removes every rewrite, also those a process
+	// that was killed left behind.
+	// Idempotent: resetting when no rewrite exists returns nil.
+	ResetMeshSourceRewrite() error
+}

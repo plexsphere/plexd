@@ -109,6 +109,45 @@ func (m *mockRouteController) reset() {
 	m.mu.Unlock()
 }
 
+// mockMeshSourceRewriter is a test double for MeshSourceRewriter.
+// It records all calls and supports configurable error returns per method.
+type mockMeshSourceRewriter struct {
+	mu sync.Mutex
+
+	calls []mockCall
+
+	addMeshSourceRewriteErr    error
+	removeMeshSourceRewriteErr error
+	resetMeshSourceRewriteErr  error
+}
+
+// Verify mockMeshSourceRewriter satisfies MeshSourceRewriter at compile time.
+var _ MeshSourceRewriter = (*mockMeshSourceRewriter)(nil)
+
+func (m *mockMeshSourceRewriter) AddMeshSourceRewrite(fromIface, meshIface string) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "AddMeshSourceRewrite", Args: []interface{}{fromIface, meshIface}})
+	err := m.addMeshSourceRewriteErr
+	m.mu.Unlock()
+	return err
+}
+
+func (m *mockMeshSourceRewriter) RemoveMeshSourceRewrite(fromIface, meshIface string) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "RemoveMeshSourceRewrite", Args: []interface{}{fromIface, meshIface}})
+	err := m.removeMeshSourceRewriteErr
+	m.mu.Unlock()
+	return err
+}
+
+func (m *mockMeshSourceRewriter) ResetMeshSourceRewrite() error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "ResetMeshSourceRewrite"})
+	err := m.resetMeshSourceRewriteErr
+	m.mu.Unlock()
+	return err
+}
+
 type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }

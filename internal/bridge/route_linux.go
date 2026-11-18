@@ -3,6 +3,7 @@
 package bridge
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/google/nftables/userdata"
 	"github.com/vishvananda/netlink"
 )
 
@@ -21,11 +23,24 @@ const natTableName = "plexd-nat"
 // natChainName is the nftables chain name for postrouting NAT masquerade.
 const natChainName = "postrouting"
 
+// meshNATTableName is the nftables table that holds the mesh source rewrites.
+// It is a table of its own because AddNATMasquerade flushes the chain of
+// natTableName and RemoveNATMasquerade deletes that table whole, so the
+// table cannot hold a second translation.
+const meshNATTableName = "plexd-mesh-nat"
+
+// meshNATChainName is the chain of meshNATTableName that holds the rewrites.
+const meshNATChainName = "postrouting"
+
 // NetlinkRouteController implements RouteController using Linux netlink for
 // route management, sysctl for IP forwarding, and nftables for NAT masquerade.
+// It implements MeshSourceRewriter through nftables as well.
 type NetlinkRouteController struct {
 	logger *slog.Logger
 }
+
+// Compile-time check that NetlinkRouteController implements MeshSourceRewriter.
+var _ MeshSourceRewriter = (*NetlinkRouteController)(nil)
 
 // NewNetlinkRouteController returns a new NetlinkRouteController.
 func NewNetlinkRouteController(logger *slog.Logger) *NetlinkRouteController {
@@ -258,6 +273,207 @@ func (c *NetlinkRouteController) RemoveNATMasquerade(iface string) error {
 		"interface", iface,
 	)
 	return nil
+}
+
+// AddMeshSourceRewrite masquerades packets that arrive on fromIface and leave
+// through meshIface, which gives them the address of meshIface. The rule lives
+// in the IPv4 table plexd-mesh-nat, in the chain postrouting (type nat, hook
+// postrouting, priority srcnat); both are added when they are missing. The
+// rule carries fromIface as a comment in its user data, by which
+// RemoveMeshSourceRewrite finds it again.
+// Idempotent: a rule that carries fromIface is left alone, whatever meshIface
+// it names.
+func (c *NetlinkRouteController) AddMeshSourceRewrite(fromIface, meshIface string) error {
+	// ifaceNameBytes panics on a name that does not fit IFNAMSIZ with its
+	// terminator; no kernel interface carries such a name.
+	for _, name := range []string{fromIface, meshIface} {
+		if name == "" || len(name) >= syscall.IFNAMSIZ {
+			return fmt.Errorf("bridge: add mesh source rewrite: invalid interface name %q", name)
+		}
+	}
+
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("bridge: add mesh source rewrite: %w", err)
+	}
+
+	chain, rules, err := meshSourceRewriteRules(conn)
+	if err != nil {
+		return fmt.Errorf("bridge: add mesh source rewrite: %w", err)
+	}
+	if findMeshSourceRewrite(rules, fromIface) != nil {
+		c.logger.Debug("mesh source rewrite already present, idempotent success",
+			"component", "bridge",
+			"from_iface", fromIface,
+			"mesh_iface", meshIface,
+		)
+		return nil
+	}
+
+	if chain == nil {
+		table := conn.AddTable(&nftables.Table{
+			Family: nftables.TableFamilyIPv4,
+			Name:   meshNATTableName,
+		})
+		chain = conn.AddChain(&nftables.Chain{
+			Name:     meshNATChainName,
+			Table:    table,
+			Type:     nftables.ChainTypeNAT,
+			Hooknum:  nftables.ChainHookPostrouting,
+			Priority: nftables.ChainPriorityNATSource,
+		})
+	}
+
+	// nft equivalent: iifname "wg-ua-a0a0a0e1" oifname "plexd0" counter
+	// masquerade comment "wg-ua-a0a0a0e1"
+	conn.AddRule(&nftables.Rule{
+		Table:    chain.Table,
+		Chain:    chain,
+		Exprs:    meshSourceRewriteExprs(fromIface, meshIface),
+		UserData: meshSourceRewriteTag(fromIface),
+	})
+
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("bridge: add mesh source rewrite from %q to %q: %w", fromIface, meshIface, err)
+	}
+
+	c.logger.Debug("mesh source rewrite added",
+		"component", "bridge",
+		"from_iface", fromIface,
+		"mesh_iface", meshIface,
+	)
+	return nil
+}
+
+// RemoveMeshSourceRewrite deletes the rule AddMeshSourceRewrite added for
+// fromIface. meshIface is not needed to find it and is only logged.
+// Idempotent: a missing rule, chain or table returns nil.
+func (c *NetlinkRouteController) RemoveMeshSourceRewrite(fromIface, meshIface string) error {
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("bridge: remove mesh source rewrite: %w", err)
+	}
+
+	_, rules, err := meshSourceRewriteRules(conn)
+	if err != nil {
+		return fmt.Errorf("bridge: remove mesh source rewrite: %w", err)
+	}
+	rule := findMeshSourceRewrite(rules, fromIface)
+	if rule == nil {
+		c.logger.Debug("mesh source rewrite not found, idempotent success",
+			"component", "bridge",
+			"from_iface", fromIface,
+			"mesh_iface", meshIface,
+		)
+		return nil
+	}
+
+	if err := conn.DelRule(rule); err != nil {
+		return fmt.Errorf("bridge: remove mesh source rewrite from %q: %w", fromIface, err)
+	}
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("bridge: remove mesh source rewrite from %q: %w", fromIface, err)
+	}
+
+	c.logger.Debug("mesh source rewrite removed",
+		"component", "bridge",
+		"from_iface", fromIface,
+		"mesh_iface", meshIface,
+	)
+	return nil
+}
+
+// ResetMeshSourceRewrite deletes the table plexd-mesh-nat with every rewrite
+// in it. It touches neither the table plexd-nat nor the policy table plexd.
+// Idempotent: a missing table returns nil.
+func (c *NetlinkRouteController) ResetMeshSourceRewrite() error {
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("bridge: reset mesh source rewrite: %w", err)
+	}
+
+	tables, err := conn.ListTablesOfFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return fmt.Errorf("bridge: reset mesh source rewrite: list tables: %w", err)
+	}
+
+	for _, t := range tables {
+		if t.Name == meshNATTableName {
+			conn.DelTable(t)
+			if err := conn.Flush(); err != nil {
+				return fmt.Errorf("bridge: reset mesh source rewrite: %w", err)
+			}
+			c.logger.Debug("mesh source rewrite table removed",
+				"component", "bridge",
+				"table", meshNATTableName,
+			)
+			return nil
+		}
+	}
+
+	// Table does not exist — idempotent success.
+	c.logger.Debug("mesh source rewrite table not found, idempotent success",
+		"component", "bridge",
+		"table", meshNATTableName,
+	)
+	return nil
+}
+
+// meshSourceRewriteRules returns the chain that holds the mesh source
+// rewrites and its rules, or a nil chain and no rules when the table or the
+// chain does not exist.
+func meshSourceRewriteRules(conn *nftables.Conn) (*nftables.Chain, []*nftables.Rule, error) {
+	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list chains: %w", err)
+	}
+	for _, ch := range chains {
+		if ch.Table == nil || ch.Table.Name != meshNATTableName || ch.Name != meshNATChainName {
+			continue
+		}
+		rules, err := conn.GetRules(ch.Table, ch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list rules: %w", err)
+		}
+		return ch, rules, nil
+	}
+	return nil, nil, nil
+}
+
+// findMeshSourceRewrite returns the rule of rules that carries the tag of
+// fromIface, or nil when none does.
+func findMeshSourceRewrite(rules []*nftables.Rule, fromIface string) *nftables.Rule {
+	tag := meshSourceRewriteTag(fromIface)
+	for _, r := range rules {
+		if bytes.Equal(r.UserData, tag) {
+			return r
+		}
+	}
+	return nil
+}
+
+// meshSourceRewriteTag returns the user data that tags the rewrite of
+// fromIface: a comment TLV in the encoding of libnftnl, so nft list ruleset
+// shows it as comment "<fromIface>". The rule is found again by comparing the
+// bytes, which needs no parsing of user data another program may have written.
+func meshSourceRewriteTag(fromIface string) []byte {
+	return userdata.AppendString(nil, userdata.TypeComment, fromIface)
+}
+
+// meshSourceRewriteExprs returns the expressions of the rule that masquerades
+// packets arriving on fromIface and leaving through meshIface.
+// nft equivalent: iifname "<fromIface>" oifname "<meshIface>" counter masquerade
+// Each name is compared with its terminating NUL, which is an exact match: the
+// kernel loads an interface name padded with zeros to IFNAMSIZ.
+func meshSourceRewriteExprs(fromIface, meshIface string) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceNameBytes(fromIface)},
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceNameBytes(meshIface)},
+		&expr.Counter{},
+		&expr.Masq{},
+	}
 }
 
 // ifaceNameBytes returns the interface name as a null-terminated byte slice
