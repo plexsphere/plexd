@@ -132,7 +132,7 @@ func TestRecordDial_FailedThenSucceeded(t *testing.T) {
 		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
 		Dial: api.IngressDialFailed, DialReason: IngressDialReasonRefused, DialAt: relayStart,
 	}
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("after a refused dial: report = %+v, want %+v", got, want)
 	}
 	// The rule carries no protocol, which the plan reads as tcp.
@@ -157,7 +157,7 @@ func TestRecordDial_FailedThenSucceeded(t *testing.T) {
 	connect(t, ctrl.addr(7022))
 	requireSignal(t, changed, "a dial that succeeded after a failed one")
 	want.Dial, want.DialReason = api.IngressDialSucceeded, ""
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("after a dial that succeeded: report = %+v, want %+v", got, want)
 	}
 }
@@ -313,7 +313,7 @@ func TestRecordDial_AllTargetsFail(t *testing.T) {
 		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
 		Dial: api.IngressDialFailed, DialReason: IngressDialReasonTimeout, DialAt: relayStart,
 	}
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("report = %+v, want %+v", got, want)
 	}
 	lb := balancerFor(t, fx.mgr, id)
@@ -373,8 +373,9 @@ func TestRecordDial_ChangedTargetsStartIn(t *testing.T) {
 		return route
 	}
 
+	// Node ids the report accepts, so each rule entry carries its targets.
 	base := withID(ingressRule("web", 443, "a.example.com", 9000), id)
-	base.Targets = twoTargets()
+	base.Targets = reportTargets(2)
 
 	t.Run("another sni_host keeps the records and hold-outs", func(t *testing.T) {
 		old := dirty(t, base)
@@ -390,8 +391,12 @@ func TestRecordDial_ChangedTargetsStartIn(t *testing.T) {
 		want := IngressRuleReport{
 			RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
 			Dial: api.IngressDialSucceeded, DialAt: relayStart,
+			Targets: []IngressTargetReport{
+				{NodeID: base.Targets[0].NodeID, Port: 9000, Dial: api.IngressDialFailed, DialReason: IngressDialReasonRefused, DialAt: relayStart},
+				{NodeID: base.Targets[1].NodeID, Port: 9001, Dial: api.IngressDialSucceeded, DialAt: relayStart},
+			},
 		}
-		if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+		if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 			t.Errorf("report = %+v, want %+v", got, want)
 		}
 		if _, targets := route.lb.snapshot(); !targets[0].failed || targets[1].failed || targets[1].at.IsZero() {
@@ -409,9 +414,9 @@ func TestRecordDial_ChangedTargetsStartIn(t *testing.T) {
 		targets []api.IngressTarget
 		port    int // the target_port of a rule without targets
 	}{
-		{name: "an added target", before: base, targets: append(twoTargets(), api.IngressTarget{NodeID: "node-c", Address: "127.0.0.1", Port: 9002})},
-		{name: "a removed target", before: base, targets: twoTargets()[:1]},
-		{name: "reordered targets", before: base, targets: []api.IngressTarget{twoTargets()[1], twoTargets()[0]}},
+		{name: "an added target", before: base, targets: reportTargets(3)},
+		{name: "a removed target", before: base, targets: reportTargets(1)},
+		{name: "reordered targets", before: base, targets: []api.IngressTarget{base.Targets[1], base.Targets[0]}},
 		{name: "another target_port without targets", before: legacy, port: 9001},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -428,9 +433,17 @@ func TestRecordDial_ChangedTargetsStartIn(t *testing.T) {
 			if route.lb == old.lb {
 				t.Fatal("the rule kept its balancer, want a new one")
 			}
-			got := reportFor(t, fx.mgr.RuleReports(), id)
-			if got.Dial != api.IngressDialNone || got.DialReason != "" || !got.DialAt.IsZero() {
-				t.Errorf("report = %+v, want dial none without a reason or a time", got)
+			// Every target reads none; a rule without targets has no
+			// target entries.
+			want := IngressRuleReport{
+				RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
+				Dial: api.IngressDialNone,
+			}
+			for _, target := range changed.Targets {
+				want.Targets = append(want.Targets, IngressTargetReport{NodeID: target.NodeID, Port: target.Port, Dial: api.IngressDialNone})
+			}
+			if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
+				t.Errorf("report = %+v, want %+v", got, want)
 			}
 			unit, targets := route.lb.snapshot()
 			if !unit.at.IsZero() {
@@ -475,7 +488,7 @@ func TestRecordDial_FailedBindKeepsTheBalancer(t *testing.T) {
 		if got := balancerFor(t, fx.mgr, id); got != lb {
 			t.Errorf("after the retried bind: balancer %p, want the rule's balancer %p", got, lb)
 		}
-		if got := reportFor(t, fx.mgr.RuleReports(), id); got != before {
+		if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, before) {
 			t.Errorf("after the retried bind: report = %+v, want %+v", got, before)
 		}
 	}

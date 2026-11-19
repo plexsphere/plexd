@@ -1024,14 +1024,14 @@ func TestIngressIntegration_DialSucceededIsRecorded(t *testing.T) {
 		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
 		Dial: api.IngressDialSucceeded, DialAt: relayStart,
 	}
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("after the first dial: report = %+v, want %+v", got, want)
 	}
 
 	clock.Add(5 * time.Second)
 	requireEcho(t, connect(t, ctrl.addr(7022)), "two")
 	want.DialAt = relayStart.Add(5 * time.Second)
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("after the second dial: report = %+v, want %+v", got, want)
 	}
 	requireNoSignal(t, changed, "a second dial that succeeded")
@@ -1124,7 +1124,7 @@ func TestIngressIntegration_HeldPortReadsListenFailed(t *testing.T) {
 		t.Fatalf("Apply on port %d, which another socket holds: nil error, want the bind error", port)
 	}
 	want := IngressRuleReport{RuleID: id, Listener: api.IngressListenerNotListening, ListenerReason: IngressReasonListenFailed}
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("report = %+v, want %+v", got, want)
 	}
 }
@@ -1253,6 +1253,8 @@ func TestIngressIntegration_AllTargetsFail(t *testing.T) {
 	ctrl := newLoopbackIngressController(t)
 	fx, _, dials := newDialLogFixture(t, ctrl)
 	first, second := targetOn(closedPort(t)), targetOn(closedPort(t))
+	// Node ids the report accepts, so the rule entry carries both targets.
+	first.NodeID, second.NodeID = targetNodeID("b1"), targetNodeID("b2")
 	id := reportID("a1")
 	rule := withID(ingressRule("web", 7022, "", first.Port), id)
 	rule.Targets = []api.IngressTarget{first, second}
@@ -1261,11 +1263,15 @@ func TestIngressIntegration_AllTargetsFail(t *testing.T) {
 	}
 
 	requireClosed(t, connect(t, ctrl.addr(7022)))
+	refused := func(target api.IngressTarget) IngressTargetReport {
+		return IngressTargetReport{NodeID: target.NodeID, Port: target.Port, Dial: api.IngressDialFailed, DialReason: IngressDialReasonRefused, DialAt: relayStart}
+	}
 	want := IngressRuleReport{
 		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
 		Dial: api.IngressDialFailed, DialReason: IngressDialReasonRefused, DialAt: relayStart,
+		Targets: []IngressTargetReport{refused(first), refused(second)},
 	}
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("report = %+v, want %+v", got, want)
 	}
 	failed := dialRecord{failed: true, reason: IngressDialReasonRefused, at: relayStart}
