@@ -38,6 +38,10 @@ const (
 	udpFlowReasonRouteCancelled = "route_cancelled"
 	udpFlowReasonReadFailed     = "read_failed"
 	udpFlowReasonListenerClosed = "listener_closed"
+	// udpFlowReasonTargetFailed closes a flow after a send to its target
+	// failed, so that its client moves to another target of the rule (see
+	// forwardUDP).
+	udpFlowReasonTargetFailed = "target_failed"
 )
 
 // udpFlowConn is the part of *net.UDPConn a flow uses; a test injects one.
@@ -73,14 +77,17 @@ type udpIngressListener struct {
 	warnedAt time.Time                   // when the last Warn was logged
 }
 
-// udpFlow carries the datagrams of one client address and port: it owns one
-// socket toward the target, so the target tells the clients of a rule apart
-// by the bridge's source port, and its replies return to the client the flow
-// belongs to.
+// udpFlow carries the datagrams of one client address and port to one of the
+// rule's targets: it owns one socket toward that target, so the target tells
+// the clients of a rule apart by the bridge's source port, and its replies
+// return to the client the flow belongs to. A flow keeps its target until it
+// is closed; only a failed send closes it for another target (see
+// forwardUDP).
 type udpFlow struct {
 	client netip.AddrPort
 	route  *ingressRoute
-	target netip.AddrPort // the rule's first target, unmapped
+	idx    int            // the index of the flow's target in the rule's targets
+	target netip.AddrPort // the address of that target, unmapped
 	conn   udpFlowConn
 
 	// lastActive is the time of the last datagram in either direction, in
@@ -91,9 +98,9 @@ type udpFlow struct {
 	lastActive atomic.Int64
 	answered   atomic.Bool
 
-	// sent and failed are the outcome of the last send, which only the read
-	// loop touches.
-	sent, failed bool
+	// failed is whether the flow's last send failed. Only the read loop
+	// touches it.
+	failed bool
 
 	// stop unregisters the flow's context.AfterFunc. It is set before the
 	// flow can be closed.
@@ -128,8 +135,9 @@ func closeUDPListener(l *udpIngressListener) {
 
 // serveUDP reads the datagrams of l's socket into one buffer until the socket
 // is closed and forwards each, zero-length ones included, on the flow of its
-// unmapped source. A read error other than net.ErrClosed is logged at Debug
-// and the loop continues. Once the socket is closed it closes every flow,
+// unmapped source to the flow's target, one of the rule's targets (see
+// forwardUDP). A read error other than net.ErrClosed is logged at Debug and
+// the loop continues. Once the socket is closed it closes every flow,
 // waits for their reply loops, and closes l.done.
 func (m *IngressManager) serveUDP(l *udpIngressListener) {
 	defer close(l.done)
@@ -162,49 +170,67 @@ func (m *IngressManager) serveUDP(l *udpIngressListener) {
 	l.replies.Wait()
 }
 
-// forwardUDP sends b, a datagram of the client src, to the target on src's
-// flow, and opens the flow first when src has none. A failed send drops the
-// datagram and leaves the flow open.
+// forwardUDP sends b, a datagram of the client src, to a target of the rule:
 //
-// The flow's first send, and every later send that ends differently from the
-// one before it, is a dial of the rule's first target: recordDial records it,
-// a failed one also fails the rule's unit, and a failed one that changed the
-// target's record logs "bridge: ingress: dial target failed". Every
-// other failed send logs "ingress datagram not forwarded" at Debug, so a
-// client that keeps sending into a blocked rule writes one Error line, not one
-// per datagram. A send that fails with net.ErrClosed is no dial: the flow was
-// closed between the lookup and the send, by a cancelled route or a failed
-// read, and the target was never asked.
+//   - When src has no flow, placeUDPFlow sends b on a new flow to a target the
+//     rule's balancer picks.
+//   - When the last send of src's flow failed and a target other than the
+//     flow's is in, the flow is closed with the reason target_failed and
+//     placeUDPFlow sends b on a new flow.
+//   - Otherwise b goes out on src's flow. A send that ends differently from
+//     the one before it on the flow is a dial of the flow's target, which
+//     recordDial records. When that dial failed and the rule has another
+//     target, the flow is closed with the reason target_failed and
+//     placeUDPFlow sends b on a new flow to another target. When that dial
+//     failed and the rule has one target, the rule's unit fails as well, the
+//     datagram is dropped, and the flow stays open.
+//
+// A send that ends as the one before it on the flow is no dial. So a client
+// that keeps sending into a blocked rule costs one send per datagram and
+// writes one Error line, not one per datagram: a failed send that changed its
+// target's record logs "bridge: ingress: dial target failed", and every other
+// failed send logs "ingress datagram not forwarded" at Debug. A send that
+// fails with net.ErrClosed is no dial either: the flow was closed between the
+// lookup and the send, by a cancelled route or a failed read, and the target
+// was never asked.
 func (m *IngressManager) forwardUDP(l *udpIngressListener, src netip.AddrPort, b []byte) {
 	now := time.Now()
 	f, stale := l.lookup(src, now)
 	if stale != nil {
 		_ = stale.conn.Close()
 	}
-	if f == nil {
-		if f = m.openUDPFlow(l, src, now); f == nil {
-			return
-		}
+	switch {
+	case f == nil:
+		m.placeUDPFlow(l, l.route.Load(), src, b, 0, now)
+		return
+	case f.failed && f.route.lb.otherIn(f.idx, m.now()):
+		l.closeFlow(f, udpFlowReasonTargetFailed)
+		m.placeUDPFlow(l, f.route, src, b, 0, now)
+		return
 	}
 
 	_, err := f.conn.WriteToUDPAddrPort(b, f.target)
-	if errors.Is(err, net.ErrClosed) {
-		m.logDatagramNotForwarded(l, src, err)
+	if errors.Is(err, net.ErrClosed) || f.failed == (err != nil) {
+		if err != nil {
+			m.logDatagramNotForwarded(l, src, err)
+		}
 		return
 	}
-	var reason string
-	var changed bool
-	if !f.sent || f.failed != (err != nil) {
-		f.sent, f.failed = true, err != nil
-		if err != nil {
-			reason, changed = m.recordLastDial(f.route, 0, err)
-		} else {
-			reason, changed = m.recordDial(f.route, 0, nil)
-		}
+	f.failed = err != nil
+	if err == nil {
+		m.recordDial(f.route, f.idx, nil)
+		return
 	}
-	if err != nil {
-		m.logSendFailed(l, f.route, src, err, reason, changed)
+	addr := f.route.lb.targets[f.idx].addr
+	if len(f.route.lb.targets) == 1 {
+		reason, changed := m.recordLastDial(f.route, f.idx, err)
+		m.logSendFailed(l, f.route, src, addr, err, reason, changed)
+		return
 	}
+	reason, changed := m.recordDial(f.route, f.idx, err)
+	m.logSendFailed(l, f.route, src, addr, err, reason, changed)
+	l.closeFlow(f, udpFlowReasonTargetFailed)
+	m.placeUDPFlow(l, f.route, src, b, 1<<f.idx, now)
 }
 
 // lookup returns the open flow of src, moved to the front of order with
@@ -229,57 +255,103 @@ func (l *udpIngressListener) lookup(src netip.AddrPort, now time.Time) (f, stale
 	return f, nil
 }
 
-// openUDPFlow opens the flow of src to the first target of the route l holds
-// now, registers its close for when the route is cancelled, and starts its
-// reply loop. At maxUDPFlows it first closes the least recently active flow.
-// It returns nil, and the datagram is dropped, when the route is cancelled,
-// which Apply does before it stores the next one, or when the flow's socket
-// does not open; a socket that does not open is recorded as a failed dial of
-// that target and fails the rule's unit.
-func (m *IngressManager) openUDPFlow(l *udpIngressListener, src netip.AddrPort, now time.Time) *udpFlow {
-	route := l.route.Load()
+// placeUDPFlow sends b, a datagram of the client src, on a new flow to a
+// target of route, and registers the flow with l. tried holds a bit per
+// target index b was sent to already. It returns at once, and the datagram
+// is dropped, when the route is cancelled, which Apply does before it stores
+// the next one. At maxUDPFlows it first closes the least recently active
+// flow.
+//
+// For each target the route's balancer picks, it opens a flow socket toward
+// the target and sends b on it. A socket that does not open and a send that
+// fails are a failed dial of that target, and the next pick follows; a
+// socket whose send failed is closed once a later pick's socket opened. The
+// first send that succeeds is recorded as its target's dial, and its flow is
+// registered. When no target takes b, the last dial also fails the rule's
+// unit (see recordLastDial), the datagram is dropped, and the flow of the
+// last pick whose socket opened is registered with its send failed, so each
+// later datagram of the client costs one send (see forwardUDP). It stops
+// without a further pick once the route is cancelled. A flow is registered
+// before its dial is recorded, so a reader the record wakes finds the flow.
+func (m *IngressManager) placeUDPFlow(l *udpIngressListener, route *ingressRoute, src netip.AddrPort, b []byte, tried uint8, now time.Time) {
 	if route.ctx.Err() != nil {
-		return nil
+		return
 	}
 	m.evictUDPFlow(l, route, now)
 
+	every := 1<<len(route.lb.targets) - 1 // tried, once b went to every target
+	var kept *udpFlow                     // the flow of the last pick whose socket opened
+	for idx, ok := route.lb.pick(tried, m.now()); ok; idx, ok = route.lb.pick(tried, m.now()) {
+		tried |= 1 << idx
+		addr := route.lb.targets[idx].addr
+		target, conn, err := m.openUDPFlowSocket(addr)
+		if err == nil {
+			if kept != nil {
+				_ = kept.conn.Close()
+			}
+			kept = &udpFlow{client: src, route: route, idx: idx, target: target, conn: conn}
+			if _, err = conn.WriteToUDPAddrPort(b, target); err == nil {
+				m.registerUDPFlow(l, kept, now)
+				m.recordDial(route, idx, nil)
+				return
+			}
+		}
+		if int(tried) != every && route.ctx.Err() == nil {
+			reason, changed := m.recordDial(route, idx, err)
+			m.logSendFailed(l, route, src, addr, err, reason, changed)
+			continue
+		}
+
+		if kept != nil {
+			kept.failed = true
+			m.registerUDPFlow(l, kept, now)
+		}
+		reason, changed := m.recordLastDial(route, idx, err)
+		m.logSendFailed(l, route, src, addr, err, reason, changed)
+		return
+	}
+}
+
+// openUDPFlowSocket opens a flow socket toward addr, a target's address,
+// through the test seam when one is set, and returns it with addr unmapped.
+func (m *IngressManager) openUDPFlowSocket(addr string) (netip.AddrPort, udpFlowConn, error) {
 	open := m.openUDP
 	if open == nil {
 		open = openUDPFlowConn
 	}
-	target, err := netip.ParseAddrPort(route.lb.targets[0].addr)
-	var conn udpFlowConn
-	if err == nil {
-		target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-		conn, err = open(target)
-	}
+	target, err := netip.ParseAddrPort(addr)
 	if err != nil {
-		reason, changed := m.recordLastDial(route, 0, err)
-		m.logSendFailed(l, route, src, err, reason, changed)
-		return nil
+		return netip.AddrPort{}, nil, err
 	}
+	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+	conn, err := open(target)
+	return target, conn, err
+}
 
-	f := &udpFlow{client: src, route: route, target: target, conn: conn}
+// registerUDPFlow adds f, whose socket is open, to l's flows as the most
+// recently active one at now, counts it in connCount, registers its close for
+// when its route is cancelled, and starts its reply loop. A route that is
+// cancelled already closes f at once.
+func (m *IngressManager) registerUDPFlow(l *udpIngressListener, f *udpFlow, now time.Time) {
 	f.lastActive.Store(int64(now.Sub(l.epoch)))
 	m.connCount.Add(1)
 	l.replies.Add(1)
 	l.mu.Lock()
 	f.elem = l.order.PushFront(f)
-	l.flows[src] = f
+	l.flows[f.client] = f
 	// Registered under mu, so the callback, which takes mu, finds the flow
 	// in flows and order.
-	f.stop = context.AfterFunc(route.ctx, func() { l.closeFlow(f, udpFlowReasonRouteCancelled) })
+	f.stop = context.AfterFunc(f.route.ctx, func() { l.closeFlow(f, udpFlowReasonRouteCancelled) })
 	l.mu.Unlock()
 
 	// Logged before the reply loop starts, which logs the flow's close.
 	m.logger.Debug("ingress udp flow opened",
 		"component", "bridge",
-		"rule_id", route.rule.ID,
+		"rule_id", f.route.rule.ID,
 		"listen_port", l.port,
-		"remote", src.String(),
+		"remote", f.client.String(),
 	)
 	go m.udpReplyLoop(l, f)
-	return f
 }
 
 // evictUDPFlow closes the flow at the back of order with the reason evicted
@@ -440,10 +512,11 @@ func (l *udpIngressListener) closeIdle(f *udpFlow, at int64) bool {
 	return idle
 }
 
-// logSendFailed logs err, a send to route's first target for the client src
-// that failed or a flow socket that did not open, as recordDial left it: at
-// Error when it changed the target's dial record, and otherwise at Debug.
-func (m *IngressManager) logSendFailed(l *udpIngressListener, route *ingressRoute, src netip.AddrPort, err error, reason string, changed bool) {
+// logSendFailed logs err, a send for the client src to addr, a target of
+// route, that failed or a flow socket toward addr that did not open, as
+// recordDial left it: at Error when it changed the target's dial record, and
+// otherwise at Debug.
+func (m *IngressManager) logSendFailed(l *udpIngressListener, route *ingressRoute, src netip.AddrPort, addr string, err error, reason string, changed bool) {
 	if !changed {
 		m.logDatagramNotForwarded(l, src, err)
 		return
@@ -453,7 +526,7 @@ func (m *IngressManager) logSendFailed(l *udpIngressListener, route *ingressRout
 		"rule_id", route.rule.ID,
 		"slug", route.rule.Slug,
 		"protocol", route.rule.Protocol,
-		"target", route.lb.targets[0].addr,
+		"target", addr,
 		"reason", reason,
 		"error", err,
 	)
