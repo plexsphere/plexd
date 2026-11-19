@@ -31,7 +31,7 @@ plexd can run entirely from flags and environment variables. For a fresh registr
 
 Fields that have no flag or environment override remain reachable only through the file, which stays the primary configuration surface for host installs.
 
-One default is inverted on this path: `actions.enabled` comes up `false` without a config file, where a file that omits the `actions` block leaves it `true`. `actions.enabled` is the only switch that stops the control plane from executing actions and hooks on the node, so a file that has gone missing — a deleted ConfigMap, a mistyped `--config`, a broken mount — must not silently enable it. A deliberately file-less deployment that wants action execution sets `PLEXD_ACTIONS_ENABLED=true`.
+One default is inverted on this path: `actions.enabled` comes up `false` without a config file, where a file that omits the `actions` block leaves it `true`. `actions.enabled` is the only switch that stops the control plane from executing actions and hooks on the node, so a file that has gone missing — a deleted ConfigMap, a mistyped `--config`, a broken mount — must not silently enable it. A deliberately file-less deployment that wants action execution sets `PLEXD_ACTIONS_ENABLED=true`. The `false` default also refuses local runs through `plexd actions run`, so a file-less node that should run built-ins locally sets `PLEXD_ACTIONS_ENABLED=true` too.
 
 > For the full list of overrides, see [Environment Variables](environment-variables.md).
 
@@ -203,7 +203,7 @@ Remote action execution and hook management.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable action execution. An omitted key leaves it `true`; an explicit `false` disables execution and survives defaulting. Without a config file it defaults to `false` — see [Running without a config file](#running-without-a-config-file). |
+| `enabled` | bool | `true` | Enable action execution: control-plane dispatches and local runs through `plexd actions run`. An omitted key leaves it `true`. An explicit `false` rejects every dispatch with `actions_disabled` and refuses every local run, and it survives defaulting. Without a config file it defaults to `false`; see [Running without a config file](#running-without-a-config-file). |
 | `rollouts_enabled` | bool | `true` | Install the hooks the control plane rolls out. An omitted key leaves it `true`, also without a config file; an explicit `false` survives defaulting and is the node owner's veto on delivered scripts: plexd removes every rolled-out hook at start, fetches none, and reports each version the pull lists as `install_failed`. Builtins and the hooks in `hooks_dir` keep working. `plexd up` reports the effective value as `rollouts_enabled` in its startup log line. See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks). |
 | `hooks_dir` | string | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts. Per platform; see [Platform defaults](#platform-defaults). A name it holds blocks a rollout of that name. |
 | `max_concurrent` | int | `5` | Maximum number of concurrent actions. Minimum: `1`. |

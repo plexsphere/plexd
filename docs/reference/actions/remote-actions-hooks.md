@@ -770,7 +770,18 @@ Runs a built-in action synchronously and returns the result. The action provider
 }
 ```
 
-Status values: `success` (exit 0), `failed` (non-zero exit), `error` (internal error).
+Status values: `success` (exit 0), `failed` (non-zero exit), `error` (the run did not start, or the built-in returned an error).
+
+The route refuses every run while `actions.enabled` is `false`, whatever the name, and every name that is not a registered built-in, hooks included. A refusal is not an HTTP error: the route answers `200` with `status: "error"`, `exit_code` `1` and the reason in `stderr`. When a built-in returns an error, `stderr` carries the error's text in place of the built-in's own `stderr`.
+
+| Status | Condition | Body |
+|--------|-----------|------|
+| `200`  | The built-in ran | `status` `success` or `failed`, with the built-in's `exit_code`, `stdout` and `stderr` |
+| `200`  | `actions.enabled` is `false` | `status` `error`, `exit_code` `1`, `stderr` `actions are disabled on this node` |
+| `200`  | The name is not a registered built-in | `status` `error`, `exit_code` `1`, `stderr` `unknown builtin action: <name>` |
+| `200`  | The built-in returned an error | `status` `error`, the built-in's `exit_code` and `stdout`, the error's text in `stderr` |
+| `400`  | The body does not decode as the request above | `{"error": "invalid JSON body"}` |
+| `400`  | `action` is missing or empty | `{"error": "action is required"}` |
 
 ### GET /v1/hooks
 
@@ -805,7 +816,19 @@ Lists available actions via `GET /v1/actions` over Unix socket. Output is a tab-
 
 ### plexd actions run \<name\>
 
-Runs an action via `POST /v1/actions/run`. Accepts `--param key=value` flags for passing parameters.
+Runs a built-in action via `POST /v1/actions/run`. Accepts `--param key=value` flags for passing parameters. Only built-ins run: the route refuses a hook's name, and every run while `actions.enabled` is `false`.
+
+The command prints `Status` and `Exit code`, then the answer's `stdout` and `stderr` when they are not empty:
+
+```text
+Status:    error
+Exit code: 1
+
+--- stderr ---
+actions are disabled on this node
+```
+
+It exits 0 for every `200` answer, whatever its `status`, so a refusal and a failed run exit 0 too. It exits 1 when the request fails, for example when the node API cannot be reached, or when the answer is not `200`.
 
 ### plexd hooks list
 
@@ -2091,7 +2114,7 @@ The output is the pod's log, read through the Kubernetes API with `limitBytes` s
 
 ## Security Considerations
 
-- **Authenticated delivery** -- Action dispatches arrive in the `executions` block of the NSK-authenticated state pull, so a dispatch is only ever as trustworthy as the control-plane connection itself; no SSE payload can inject one. Local action requests via Unix socket require a valid session JWT.
+- **Authenticated delivery** -- Action dispatches arrive in the `executions` block of the NSK-authenticated state pull, so a dispatch is only ever as trustworthy as the control-plane connection itself; no SSE payload can inject one. A local run through `POST /v1/actions/run` is authorized by reaching the node API alone; see [Action Authorization](session-authorization.md).
 - **Signed delivery** -- All SSE events (including `action_request`, `node_state_updated`, `rotate_keys`, etc.) are signed with the control plane's Ed25519 key. plexd verifies every signature before processing.
 - **Signature verification** -- Every SSE event carries `issued_at` (max staleness: 5 minutes) and is verified with a kid-indexed Ed25519 signature selected by the envelope's `key_id`. Signature and staleness checks are applied uniformly to all event types; there is no nonce.
 - **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
@@ -2099,6 +2122,5 @@ The output is the pod's log, read through the Kubernetes API with `limitBytes` s
 - **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered a hand-placed hook (the dispatch carries no checksum), or against the checksum the pull delivered for a rolled-out hook, which plexd verified under the Domain signature before it installed the script. Binary checksums are reported continuously. On Kubernetes, a PlexdHook's image digest serves as its checksum: plexd reports only a hook whose image is pinned by a `sha256` digest (`@sha256:...`) and refuses to run any other. The pull entry carries no digest, so plexd runs the image the resource names when it creates the Job, and the next manifest reports a changed one as drift.
 - **Resource isolation** -- Script hooks run directly on the host as plexd's user, with no CPU or memory limit from plexd. plexd implements sandbox level `none` only and refuses a hook that declares any other (see [Sandbox Options](sandbox-options.md)), and it kills a hook's whole process group at the run deadline. On Kubernetes, a PlexdHook runs in a pod of its own, in a Job pinned to plexd's Node, with no ServiceAccount token and, unless it sets `privileged: true`, a read-only root filesystem and every capability dropped. plexd sets no CPU or memory limit on it either, because the CRD has no field for one.
 - **CRD privilege control** -- A PlexdHook's container runs privileged only when its spec sets `privileged: true`. plexd never sets `hostPID`, `hostNetwork`, or a host volume on the Job, and does not veto the field: under managed push, the control plane's `domain#manage` gate decides who may set it. plexd's Job grants are a Role in its own namespace, so it can create Jobs and read pod logs there and nowhere else.
-- **Session token scoping** -- JWTs are bound to a specific node (`node_id` claim) and a specific set of actions (`actions` claim). Tokens cannot be used on other nodes or for unauthorized actions.
+- **Local runs** -- `plexd actions run` runs built-in actions only, never a hook, with no check beyond the node API endpoint's permissions. `actions.enabled: false` refuses it, and nothing about the run reaches the control plane. See [Action Authorization](session-authorization.md).
 - **Session revocation** -- A verified `session_revoked` SSE event closes the live session its payload names at once, reports the `terminated_by` the payload's `revoke_reason` maps to on that session's `session_ended` row (`operator_revoke` for an operator-driven reason, `ttl_expired` or `idle_timeout` for the control plane's sweeper), and then triggers a reconcile. When a session ends, the control plane also drops its entry from the `sessions` block of the state pull; the next reconcile observes the absence and tears down a session that is still open, so the drain stays the teardown for a revocation whose event never arrives.
-- **Local emergency access** -- `plexd actions run --local` requires root or plexd user, bypasses JWT authorization, but is logged as `local_emergency` and reported to the control plane.
