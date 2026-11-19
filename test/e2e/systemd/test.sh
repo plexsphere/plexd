@@ -3607,7 +3607,7 @@ UA_MESHNODE_PUBKEY=${UA_MESH_OUT##*$'\n'}
 if [ "${#UA_MESHNODE_PUBKEY}" -ne 44 ]; then
     fail "the mesh node's wg0 setup printed '${UA_MESH_OUT}', want its 44-character public key on the last line"
 fi
-docker exec -d "${UA_MESHNODE_CONTAINER}" sh -c 'nc -l -k -v 7101 >> /tmp/listen.log 2>&1'
+docker exec -d "${UA_MESHNODE_CONTAINER}" sh -c 'nc -l -k -v -n 7101 >> /tmp/listen.log 2>&1'
 
 # Peer ...a0b2 of the served snapshot becomes the mesh node, under a policy
 # that allows the mesh to itself, and the two complete a handshake.
