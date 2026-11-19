@@ -379,8 +379,11 @@ and `IngressModeACME` name its modes, and a bridge serves all three: a
 `terminate` rule ends TLS with the certificate of the Secret
 `CertificateSecretName` names, and an `acme` rule with a certificate the bridge
 obtains from the account of the block's `ACME` member. A `udp` rule is a
-`passthrough` rule without `SNIHost`. `IngressRule` stays comparable with `==`.
-See [Forwarding Datagrams](/reference/bridge/public-ingress#forwarding-datagrams).
+`passthrough` rule without `SNIHost`. See
+[Forwarding Datagrams](/reference/bridge/public-ingress#forwarding-datagrams).
+A `terminate` or `acme` rule may carry `Conditions`; rules with conditions
+share one listen port and SNI host, and the bridge hands each request to one of
+them. See [Routing a Request](/reference/bridge/public-ingress#routing-a-request).
 
 | Field           | Type     | JSON Tag                 | Description                                  |
 |-----------------|----------|--------------------------|----------------------------------------------|
@@ -394,6 +397,37 @@ See [Forwarding Datagrams](/reference/bridge/public-ingress#forwarding-datagrams
 | `TargetAddress` | `string` | `"target_address"`       | Target node's mesh address, IPv4 or IPv6, without brackets |
 | `TargetPort`    | `int`    | `"target_port"`          | Port dialed on the target, 1 to 65535        |
 | `CertificateSecretName` | `string` | `"certificate_secret_name,omitempty"` | Secret of the bridge's Project that holds a `terminate` rule's certificate chain and key, one PEM document; empty on every other mode. The bridge fetches it in the version the pull's `secrets` block lists. See [Certificates from the Secret Store](/reference/bridge/public-ingress#certificates-from-the-secret-store) |
+| `Conditions` | `IngressConditions` | `"conditions,omitzero"` | The request conditions of a `terminate` or `acme` rule. A rule without conditions marshals without the key, and an absent, `null` or empty member, or one with an empty `headers` list, decodes to a rule without conditions |
+| `StripPathPrefix` | `bool` | `"strip_path_prefix,omitempty"` | The bridge removes the matched path prefix from the front of the path the target receives. Only a rule whose path prefix is present and not `/` carries it |
+
+The `Conditions.Headers` slice rules out `==` on two rules, so the compiler
+refuses it. `Equal(o IngressRule) bool` compares two rules with
+`reflect.DeepEqual` and treats a nil and an empty `Conditions.Headers` as
+equal; the order of the headers counts. The bridge calls it to tell an
+unchanged rule from a changed one.
+
+**IngressConditions**
+
+The request conditions of an ingress rule, the control plane's
+`NodeStateBridgeIngressConditions`: a path prefix and up to 8 header
+conditions, all of which a request must match. `IsZero() bool` reports a rule
+without conditions, one with no path prefix and no header; `encoding/json`
+calls it for `omitzero`.
+
+| Field        | Type                       | JSON Tag                  | Description |
+|--------------|----------------------------|---------------------------|-------------|
+| `PathPrefix` | `string`                   | `"path_prefix,omitempty"` | A path the request path equals or continues with `/` after; empty and `/` match every path |
+| `Headers`    | `[]IngressHeaderCondition` | `"headers,omitempty"`     | The header conditions, in name order |
+
+**IngressHeaderCondition**
+
+One header condition: the request carries a field of `Name` with exactly
+`Value`.
+
+| Field   | Type     | JSON Tag  | Description |
+|---------|----------|-----------|-------------|
+| `Name`  | `string` | `"name"`  | The field name, a lowercase RFC 9110 token of 1 to 64 characters, never `host` |
+| `Value` | `string` | `"value"` | The value, 1 to 256 printable ASCII characters without a leading or trailing space, compared with case |
 
 **SiteToSiteConfig**
 

@@ -6,7 +6,7 @@ feature: PXD-0028
 
 # ACME and SNI Routing
 
-`ACMEManager` obtains and renews the certificates of the `acme` rules of the [public ingress](public-ingress.md) block through the ACME protocol (RFC 8555), at the directory and with the contact the block's `acme` member names. It proves control of a host with the TLS-ALPN-01 challenge (RFC 8737) on port 443. SNI routing lets several rules share one listen port: the bridge reads the server name of each connection's TLS ClientHello and routes the connection to the rule whose host matches. Both live in `internal/bridge`.
+`ACMEManager` obtains and renews the certificates of the `acme` rules of the [public ingress](public-ingress.md) block through the ACME protocol (RFC 8555), at the directory and with the contact the block's `acme` member names. It proves control of a host with the TLS-ALPN-01 challenge (RFC 8737) on port 443. SNI routing lets several rules share one listen port: the bridge reads the server name of each connection's TLS ClientHello and routes the connection to the rule whose host matches. On a host whose `terminate` or `acme` rules have request conditions, the bridge then hands each request to one of them (see [Routing a Request](public-ingress.md#routing-a-request)). Both live in `internal/bridge`.
 
 ## Data Flow
 
@@ -144,7 +144,7 @@ The CA validates a host by connecting to port 443 of the name and offering the A
 - The same hello for the host of a `passthrough` rule is forwarded to that rule's target like any other connection, so a target that runs its own ACME client keeps working.
 - The same hello for a host the account does not hold is no challenge, and is routed or closed like any other connection.
 
-The challenge gets its own `tls.Config` because a terminating rule offers no ALPN protocol, and a server whose only protocol is `acme-tls/1` fails the handshake of an ordinary client with `tls: no application protocol`. The bridge chooses the configuration from the peeked ClientHello.
+The challenge gets its own `tls.Config` because a terminating host offers no ALPN protocol, or `h2` and `http/1.1` when its rules have request conditions (see [TLS Termination](public-ingress.md#tls-termination)), and a server whose only protocol is `acme-tls/1` fails the handshake of an ordinary client with `tls: no application protocol`. The bridge chooses the configuration from the peeked ClientHello, before it reads any request, so an `acme` host whose rules have conditions answers its challenges as one without.
 
 When at least one `acme` rule has no reason and no rule listens on port 443, the plan adds an empty table for port 443, and `Apply` opens the port for challenges alone. Every other connection to it is closed (see [Routing a Connection](public-ingress.md#routing-a-connection)). `Apply` binds the ports before it calls `Configure`, so port 443 listens before the account asks the CA for a certificate and the CA's validation finds it open. A failed bind of the challenge-only port fails `Apply` like any other port's and is retried by the next one. The port holds no rule, so no rule reads `listen_failed` for it: the `acme` rules on other ports stay served from the cache, and the CA cannot validate a new certificate until the bind succeeds.
 
@@ -232,9 +232,9 @@ func newPeekConn(conn net.Conn, peeked []byte) *peekConn
 
 ## Host Matching
 
-Each SNI port has an `ingressTable` with an exact map by lowercase host and a wildcard map by the suffix after `*.`. `match` lowercases the server name, returns the exact route when one exists, and otherwise cuts the name at its first dot and looks the rest up in the wildcard map:
+Each SNI port has an `ingressTable` with an exact map by lowercase host and a wildcard map by the suffix after `*.`. Each entry is an `ingressHost`: the route of the host's one rule, or the routes of the rules that share the host by their request conditions. `match` lowercases the server name, returns the exact host when one exists, and otherwise cuts the name at its first dot and looks the rest up in the wildcard map:
 
-| Rules on the port | Server name | Route |
+| Rules on the port | Server name | Host |
 |---|---|---|
 | `api.example.com`, `*.example.com` | `api.example.com` | `api.example.com`: an exact host wins |
 | `*.example.com` | `a.example.com`, `A.EXAMPLE.COM` | `*.example.com` |
@@ -242,7 +242,7 @@ Each SNI port has an `ingressTable` with an exact map by lowercase host and a wi
 | `*.example.com` | `a.b.example.com` | none: the `*` stands for one label |
 | any | empty | none |
 
-A connection without a route is closed (see [Routing a Connection](public-ingress.md#routing-a-connection)).
+A connection without a host is closed (see [Routing a Connection](public-ingress.md#routing-a-connection)). On a host whose rules have conditions, `serveHTTP` also looks up the authority of each request with `match`, and answers `421` when the port routes it to another host (see [Routing a Request](public-ingress.md#routing-a-request)).
 
 ## Error Prefixes
 
