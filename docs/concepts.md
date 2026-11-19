@@ -139,10 +139,10 @@ at all: its payload names a connection to open.
 | `session_revoked` | contract | Closes the live session the payload names with the reason it carries (`tunnel.Dispatcher.SessionRevokedHandler`), then triggers a reconcile; the block drain stays the teardown when the event is missed |
 | `session_connect` | contract | Opens the connection the payload names for a live ssh session and serves the session's SSH login on it (`tunnel.Dispatcher.SessionConnectHandler`); triggers no reconcile. Only a control plane with [plexsphere/plexsphere#928](https://github.com/plexsphere/plexsphere/issues/928) emits it |
 | `node_secrets_updated` | contract | Triggers a reconcile; the inventory rides the `secrets` block of the resulting pull, which feeds the node API's secret index |
+| `peer_endpoint_changed` | contract | Triggers a reconcile |
 | `peer_registered` | documented-coming | Triggers a reconcile |
 | `peer_psk_assigned` | documented-coming | Triggers a reconcile |
 | `peer_deregistered` | documented-coming | Triggers a reconcile |
-| `peer_endpoint_changed` | documented-coming | Triggers a reconcile |
 | `peer_key_rotated` | documented-coming | Triggers a reconcile |
 | `rotate_keys` | documented-coming | Starts a key rotation (`rotator.RotateNow`) |
 | `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`); every state pull also installs the key its `signing_key` block carries (`verifier.Install`) |
