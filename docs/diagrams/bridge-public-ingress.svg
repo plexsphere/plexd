@@ -85,7 +85,7 @@
 <polygon points="510,1125 497,1131 497,1119" fill="#B0387F"/>
 <rect x="884" y="1260" width="350" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="1059" y="1292.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Target node</text>
-<text x="1059" y="1312.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&lt;target_address&gt;:&lt;target_port&gt;</text>
+<text x="1059" y="1312.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">targets[i]: address:port</text>
 <polyline points="1127,595 1127,1251" fill="none" stroke="#2457C5" stroke-width="2.5"/>
 <polygon points="1127,1260 1121,1247 1133,1247" fill="#2457C5"/>
 </svg>

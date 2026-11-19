@@ -729,8 +729,9 @@ control plane does not serve the report, plexd sends no `stopped` at shutdown.
 
 Reports whether a bridge's local configuration serves public ingress, so the
 control plane refuses an ingress rule that no listener would serve, and the
-state of each ingress rule: its listener, its certificate and the last dial to
-its target. While a bridge's report reads `opted_out`, the control plane
+state of each ingress rule: its listener, its certificate, whether a target
+took its last connection, request or client flow, and the last dial to each of
+its targets. While a bridge's report reads `opted_out`, the control plane
 answers a create or an update of an ingress rule on its bridge Resource with
 `409 bridge_ingress_opted_out`. It keeps the rules stored before the opt-out,
 keeps delivering them in the [`bridge.ingress`](#get-v1-nodes-node-id-state)
@@ -739,14 +740,19 @@ reads `not_reported` and accepts rules. See
 [Ingress Status Report](../bridge/public-ingress.md#ingress-status-report) for
 how plexd derives the state and each entry.
 
-**Request body** (`IngressStatusRequest`, at most 256 KiB):
+**Request body** (`IngressStatusRequest`, at most 2 MiB), for a rule whose
+second target fails:
 
 ```json
 {
   "state": "enabled",
   "rules": [
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", "listener": "listening",
-      "certificate": "ready", "dial": "failed", "dial_reason": "policy_denied", "dial_age_seconds": 12 },
+      "certificate": "ready", "dial": "succeeded", "dial_age_seconds": 2,
+      "targets": [
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 8443, "dial": "succeeded", "dial_age_seconds": 2 },
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "port": 8443, "dial": "failed", "dial_reason": "timeout", "dial_age_seconds": 14 }
+      ] },
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", "listener": "not_listening", "listener_reason": "listen_failed" }
   ]
 }
@@ -770,7 +776,22 @@ how plexd derives the state and each entry.
   whole seconds from the dial to the report from 0 to 2147483647, exactly when
   `dial` is `succeeded` or `failed`. A reason is a token matching
   `^[a-z][a-z0-9_]{0,62}$`; the tokens plexd sends are listed in
-  [Rule Entries](../bridge/public-ingress.md#rule-entries).
+  [Rule Entries](../bridge/public-ingress.md#rule-entries). A rule's `dial` is
+  how its last connection, request or client flow ended: `succeeded` when a
+  target took it, and `failed` only when no target took it, with the reason of
+  the last target dialled for it.
+- `targets`: optional on a rule entry, at most 8 entries
+  (`IngressStatusTarget`), one per target of the rule, only on a `listening`
+  entry. An absent `targets`, a `null` and an empty array all mean no entries.
+  Each entry carries `node_id` and `port`, the target as the pull names it,
+  and `dial`, how the last dial to that target ended; then `dial_reason`
+  exactly when `dial` is `failed`, and `dial_age_seconds` exactly when it is
+  `succeeded` or `failed`. The control plane matches an entry to a target of
+  the rule by `node_id` and `port`, and reads a rule whose report shows a
+  failed target while the rule's own `dial` did not fail as `degraded`. plexd
+  sends `targets` only for a rule whose pull entry carried `targets`: a
+  control plane that predates them refuses them as an unknown member, and its
+  pull carries none.
 
 The control plane decodes the body with unknown members refused, of the report
 and of each entry. A body that is not one JSON object, an unknown member, data
@@ -778,15 +799,26 @@ after the report, a missing or `null` `state`, a value outside the two states,
 more than 1,024 entries, and an entry with a missing, malformed or zero `id`,
 without `listener`, with a facet outside its values, a reason outside the
 grammar or a `dial_age_seconds` outside its range each answer
-`400 malformed_ingress_status`. An `opted_out` report with entries, an `id`
-that repeats an earlier entry, and an entry that breaks the presence rules
-above each answer `400 invalid_ingress_status`. The `detail` names the entry by
-index, as `rules[3] misses certificate while listener is listening`, and never
-repeats an `id` or a reason of the body; a missing or `null` `state` carries
-`state is missing`, and another value
-`state is not one of enabled and opted_out`. `ReportIngressStatus` validates
-nothing, because the reporter builds only the shapes the contract admits: it
-skips a rule whose `id` is no UUID in canonical form or repeats an earlier one.
+`400 malformed_ingress_status`. So do a `targets` that is not an array or holds
+more than 8 entries, and a target entry that is not an object, carries an
+unknown member or a member of the wrong type, or whose `node_id` is missing,
+not a UUID or the zero UUID, whose `port` is outside 1..65535, whose `dial` is
+missing or outside its values, or whose `dial_reason` or `dial_age_seconds`
+breaks its rule. An `opted_out` report with entries, an `id` that repeats an
+earlier entry, and an entry that breaks the presence rules above each answer
+`400 invalid_ingress_status`, and so do target entries on a `not_listening`
+entry, a target entry that breaks the presence rules of its `dial_reason` or
+`dial_age_seconds`, and two target entries of one rule with the same `node_id`
+and `port`. The `detail` names the entry by index, as
+`rules[3] misses certificate while listener is listening` or
+`rules[0].targets[1] repeats rules[0].targets[0]`, and never repeats an `id` or
+a reason of the body; a missing or `null` `state` carries `state is missing`,
+and another value `state is not one of enabled and opted_out`.
+`ReportIngressStatus` validates nothing, because the reporter builds only the
+shapes the contract admits: it skips a rule whose `id` is no UUID in canonical
+form or repeats an earlier one, and a target whose `node_id` is no such UUID or
+whose `node_id`, compared without case, and `port` repeat an earlier target of
+the rule.
 
 **Response** (`200 OK`, `IngressStatusResponse`):
 
@@ -802,7 +834,8 @@ skips a rule whose `id` is no UUID in canonical form or repeats an earlier one.
 **Cadence.** plexd reports from a loop of its own, started in bridge mode,
 whether or not the bridge opts out. It sends the report once right after each
 start, without waiting for the first state pull and so without entries; on
-every change of an entry, at most once per 5 s; and once per
+every change of a rule entry or a target entry, at most once per 5 s; and once
+per
 `heartbeat.interval` (default 30s). The state comes from the local
 configuration, which plexd reads once per start, so the send after each start
 is the report on every change of the setting that the contract asks for: a
@@ -812,7 +845,9 @@ accepted report; a moving `dial_age_seconds` alone sends nothing. A failed
 report is not retried within its tick; the next tick, at most one interval
 later, sends the report as it then is. plexd sends nothing at shutdown, and a
 node outside bridge mode sends nothing at all. A bridge sends at most one
-report per 5 s on change and one per interval, each under 250 bytes per entry.
+report per 5 s on change and one per interval, each under 250 bytes per rule
+entry and 150 bytes per target entry, so 1,024 rules of eight targets each
+stay under 1.5 MB, within the 2 MiB cap.
 
 **Sticky state, aging entries.** The control plane keeps the latest state per
 node and never ages it, unlike the [relay status report](#relay-status), so a
@@ -829,13 +864,13 @@ the control plane does not serve the operation.
 | Status | Problem `code` | Meaning | plexd behavior |
 |---|---|---|---|
 | `200 OK` | — | Report accepted; body is an `IngressStatusResponse` | Logged at Debug as `accepted` on every send; also at Info as `reported` for the first accepted send, and once at Info after a not-served phase |
-| `400 Bad Request` | `malformed_ingress_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), names a `state` outside the two (`detail` `state is not one of enabled and opted_out`), carries more than 1,024 entries, or an entry whose member breaks its own rule (`detail` such as `rules[0].listener is not one of listening and not_listening`). A control plane that predates `rules` answers it to every `enabled` report with entries | Logged at Warn as `send failed` on every send; the next tick sends the report again. plexd has no fallback for a control plane that predates `rules` |
-| `400 Bad Request` | `invalid_ingress_status` | An `opted_out` report with entries, an `id` that repeats an earlier entry, or an entry that breaks the presence rules (`detail` such as `rules[1].id repeats rules[0].id`) | Logged at Warn as `send failed`; the next tick sends the report again |
+| `400 Bad Request` | `malformed_ingress_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), names a `state` outside the two (`detail` `state is not one of enabled and opted_out`), carries more than 1,024 entries, an entry whose member breaks its own rule (`detail` such as `rules[0].listener is not one of listening and not_listening`), more than 8 target entries on a rule, or a target entry whose member breaks its own rule (`detail` such as `rules[0].targets[1].port is outside 1..65535`). A control plane that predates `rules` answers it to every `enabled` report with entries | Logged at Warn as `send failed` on every send; the next tick sends the report again. plexd has no fallback for a control plane that predates `rules` |
+| `400 Bad Request` | `invalid_ingress_status` | An `opted_out` report with entries, an `id` that repeats an earlier entry, an entry that breaks the presence rules (`detail` such as `rules[1].id repeats rules[0].id`), target entries on a `not_listening` entry, or a target entry that breaks the presence rules or repeats the `node_id` and `port` of an earlier one (`detail` such as `rules[0].targets[1] repeats rules[0].targets[0]`) | Logged at Warn as `send failed`; the next tick sends the report again |
 | `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends the report again. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
 | `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends the report again |
 | `404 Not Found` | `ingress_status_node_gone` | The node was removed while the request ran | Logged at Warn as `rejected, this node was removed` on every send; plexd keeps reporting every interval |
 | `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
-| `413 Payload Too Large` | `ingress_status_body_too_large` | Body exceeds 256 KiB | Logged at Warn as `send failed`; the next tick sends the report again |
+| `413 Payload Too Large` | `ingress_status_body_too_large` | Body exceeds 2 MiB | Logged at Warn as `send failed`; the next tick sends the report again |
 | `500 Internal Server Error` | `internal` | Server error, for example a failed write of the report | Logged at Warn as `send failed`; the next tick sends the report again |
 | `501 Not Implemented` | `ingress_status_not_provisioned` | The control plane has not provisioned the operation: its recording service is not wired | Logged once at Info as not served; plexd keeps reporting every interval and keeps serving as the pull says |
 
@@ -1644,7 +1679,9 @@ out opens none whatever the block says and reports `opted_out` with the
 [ingress status report](#ingress-status). Each rule carries
 `id`, `slug`, `protocol` (`tcp` or `udp`; a rule without it is a `tcp` rule),
 `listen_port`, `mode` (`passthrough`, `terminate` or `acme`), an optional
-`sni_host`, `target_node_id`, `target_address` and `target_port`, and a
+`sni_host`, `targets`, one to eight entries of a `node_id`, an `address` and a
+`port` in round-robin order, the deprecated `target_node_id`, `target_address`
+and `target_port`, which repeat the first entry of `targets`, and a
 `terminate` rule also `certificate_secret_name`, the Secret of the bridge's
 Project that holds its certificate chain and key. A `terminate` or `acme` rule
 may carry `conditions`, an optional `path_prefix` and at most 8 `headers` of a
@@ -1656,18 +1693,23 @@ optional `contact_email` of the ACME account the `acme` rules share. The
 bridge opens one TCP listener per distinct `listen_port` of the `tcp` rules,
 forwards a port whose rule names no `sni_host` without reading the stream, and
 routes a port whose rules name hosts by the server name of each connection's
-TLS ClientHello to
-`target_address:target_port`. A `passthrough` rule forwards the TLS session
-unchanged. A `terminate` rule ends TLS with the certificate of its Secret, which
+TLS ClientHello to one of the rule's targets. It forwards each connection,
+request or client flow of a rule to one target by round robin, dials the next
+target when a dial fails, and passes a target whose dial failed over for 30 s
+(see [Several Targets](../bridge/public-ingress.md#several-targets)). A rule
+without `targets`, as a control plane older than
+[plexsphere/plexsphere#1120](https://github.com/plexsphere/plexsphere/pull/1120)
+sends it, is served on `target_address:target_port` as its one target. A
+`passthrough` rule forwards the TLS session unchanged. A `terminate` rule ends TLS with the certificate of its Secret, which
 the bridge fetches in the version the `secrets` block lists, and an `acme` rule
 with a certificate the bridge obtains at `directory_url`; both forward
 plaintext to the target. Rules with `conditions` share one `listen_port` and
 `sni_host`: the bridge reads each request of such a host and forwards it over
-HTTP/1.1 to the target of the rule whose conditions it matches (see
+HTTP/1.1 to a target of the rule whose conditions it matches (see
 [Routing a Request](../bridge/public-ingress.md#routing-a-request)). A `udp`
 rule is a `passthrough` rule without `sni_host`: the bridge opens one UDP socket on its `listen_port`, which may be
 the port number of a `tcp` rule, and forwards the datagrams of each client
-address and port on a flow of their own to the target (see
+address and port on a flow of their own to the flow's target (see
 [Forwarding Datagrams](../bridge/public-ingress.md#forwarding-datagrams)).
 The block is whole,
 so a rule missing from a later pull is removed, and a `null` block closes every
