@@ -436,3 +436,36 @@ func TestRuleReports_CarryNoSecretName(t *testing.T) {
 		t.Errorf("body = %s, want %s and not the Secret name tls-term", body, IngressReasonCertificateSecretNotListed)
 	}
 }
+
+// TestRuleReports_SharedHost reports each rule of a host shared by conditions
+// with the last dial to its own target: one that nothing listens on reads
+// failed while its neighbour reads succeeded, and a rule no request matched
+// reads none.
+func TestRuleReports_SharedHost(t *testing.T) {
+	webT := startHTTPTarget(t, "web")
+	fx := newHTTPFixture(t, nil)
+	down := withID(httpRule("down", "shop.example.com", closedPort(t), "/down"), reportID("a1"))
+	web := withID(httpRule("web", "shop.example.com", webT.port(t), "/"), reportID("a2"))
+	idle := withID(httpRule("idle", "shop.example.com", webT.port(t), "/idle"), reportID("a3"))
+	fx.apply(t, down, web, idle)
+	c := fx.client(t, false)
+	get(t, c, "https://shop.example.com/down")
+	get(t, c, "https://shop.example.com/")
+
+	reports := fx.mgr.RuleReports()
+	if len(reports) != 3 {
+		t.Fatalf("%d reports, want 3: %+v", len(reports), reports)
+	}
+	for _, tc := range []struct {
+		id, dial, reason string
+	}{
+		{down.ID, api.IngressDialFailed, IngressDialReasonRefused},
+		{web.ID, api.IngressDialSucceeded, ""},
+		{idle.ID, api.IngressDialNone, ""},
+	} {
+		got := reportFor(t, reports, tc.id)
+		if got.Listener != api.IngressListenerListening || got.Certificate != api.IngressCertificateReady || got.Dial != tc.dial || got.DialReason != tc.reason {
+			t.Errorf("rule %s: report = %+v, want listening, ready and dial %s %s", tc.id, got, tc.dial, tc.reason)
+		}
+	}
+}

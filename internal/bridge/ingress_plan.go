@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"net/http"
+	"net/http/httputil"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -146,6 +147,11 @@ type ingressHost struct {
 	// http is set when the rules have conditions: the bridge reads each
 	// request.
 	http bool
+	// ctx, for an http host only, is done when the host's client
+	// connections must close: its mode or Secret changed, it left the
+	// block, or its certificate was dropped.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // lead returns the host's first route, whose rule names the host's mode and
@@ -172,6 +178,10 @@ type ingressRoute struct {
 	served bool   // false for a held acme rule with a reason
 	ctx    context.Context
 	cancel context.CancelFunc
+	// proxy forwards the requests of a rule with conditions, on target
+	// connections it keeps until ctx is done; nil for a rule without
+	// conditions.
+	proxy *httputil.ReverseProxy
 }
 
 // matches reports whether a request matches the route's conditions: its path
@@ -217,6 +227,18 @@ func (t *ingressTable) match(serverName string) *ingressHost {
 		return nil
 	}
 	return t.wildcard[rest]
+}
+
+// hosts returns every host of the table.
+func (t *ingressTable) hosts() []*ingressHost {
+	out := make([]*ingressHost, 0, len(t.exact)+len(t.wildcard))
+	for _, h := range t.exact {
+		out = append(out, h)
+	}
+	for _, h := range t.wildcard {
+		out = append(out, h)
+	}
+	return out
 }
 
 // routes returns every route of the table.
