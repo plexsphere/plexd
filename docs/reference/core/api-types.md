@@ -384,6 +384,9 @@ obtains from the account of the block's `ACME` member. A `udp` rule is a
 A `terminate` or `acme` rule may carry `Conditions`; rules with conditions
 share one listen port and SNI host, and the bridge hands each request to one of
 them. See [Routing a Request](/reference/bridge/public-ingress#routing-a-request).
+A rule names one to eight `Targets`, over which the bridge spreads its
+connections, requests or client flows by round robin. See
+[Several Targets](/reference/bridge/public-ingress#several-targets).
 
 | Field           | Type     | JSON Tag                 | Description                                  |
 |-----------------|----------|--------------------------|----------------------------------------------|
@@ -393,18 +396,33 @@ them. See [Routing a Request](/reference/bridge/public-ingress#routing-a-request
 | `ListenPort`    | `int`    | `"listen_port"`          | Public port, 1 to 65535, TCP or UDP by `Protocol` |
 | `Mode`          | `string` | `"mode"`                 | `passthrough`, `terminate` or `acme`         |
 | `SNIHost`       | `string` | `"sni_host,omitempty"`   | Server name the rule matches, exact or `*.` plus a suffix; empty for the only rule on its port |
-| `TargetNodeID`  | `string` | `"target_node_id"`       | Target node; not dialed                      |
-| `TargetAddress` | `string` | `"target_address"`       | Target node's mesh address, IPv4 or IPv6, without brackets |
-| `TargetPort`    | `int`    | `"target_port"`          | Port dialed on the target, 1 to 65535        |
+| `Targets`       | `[]IngressTarget` | `"targets,omitempty"` | The rule's targets, one to eight, in round-robin order, as a control plane since [plexsphere/plexsphere#1120](https://github.com/plexsphere/plexsphere/pull/1120) sends them. A rule of an earlier control plane carries none and marshals without the key; an absent, `null` or empty member decodes to an empty `Targets` |
+| `TargetNodeID`  | `string` | `"target_node_id"`       | Deprecated: the first target's node; not dialed. A bridge reads `TargetNodeID`, `TargetAddress` and `TargetPort` only when `Targets` is empty, as a control plane before [plexsphere/plexsphere#1120](https://github.com/plexsphere/plexsphere/pull/1120) sends a rule |
+| `TargetAddress` | `string` | `"target_address"`       | Deprecated: the first target's mesh address, IPv4 or IPv6, without brackets |
+| `TargetPort`    | `int`    | `"target_port"`          | Deprecated: the port dialed on the first target, 1 to 65535 |
 | `CertificateSecretName` | `string` | `"certificate_secret_name,omitempty"` | Secret of the bridge's Project that holds a `terminate` rule's certificate chain and key, one PEM document; empty on every other mode. The bridge fetches it in the version the pull's `secrets` block lists. See [Certificates from the Secret Store](/reference/bridge/public-ingress#certificates-from-the-secret-store) |
 | `Conditions` | `IngressConditions` | `"conditions,omitzero"` | The request conditions of a `terminate` or `acme` rule. A rule without conditions marshals without the key, and an absent, `null` or empty member, or one with an empty `headers` list, decodes to a rule without conditions |
 | `StripPathPrefix` | `bool` | `"strip_path_prefix,omitempty"` | The bridge removes the matched path prefix from the front of the path the target receives. Only a rule whose path prefix is present and not `/` carries it |
 
-The `Conditions.Headers` slice rules out `==` on two rules, so the compiler
-refuses it. `Equal(o IngressRule) bool` compares two rules with
+The `Conditions.Headers` and `Targets` slices rule out `==` on two rules, so
+the compiler refuses it. `Equal(o IngressRule) bool` compares two rules with
 `reflect.DeepEqual` and treats a nil and an empty `Conditions.Headers` as
-equal; the order of the headers counts. The bridge calls it to tell an
-unchanged rule from a changed one.
+equal, and a nil and an empty `Targets`; the order of the headers and of the
+targets counts. The bridge calls it to tell an unchanged rule from a changed
+one.
+
+**IngressTarget**
+
+One target of an ingress rule, the control plane's
+`NodeStateBridgeIngressRuleTarget`: a target node, its mesh address and a port
+on it. The control plane sends no two targets of a rule with the same `NodeID`
+and `Port`, while one node may appear with several ports.
+
+| Field     | Type     | JSON Tag    | Description |
+|-----------|----------|-------------|-------------|
+| `NodeID`  | `string` | `"node_id"` | Target node; not dialed |
+| `Address` | `string` | `"address"` | Target node's mesh address, IPv4 or IPv6, without brackets |
+| `Port`    | `int`    | `"port"`    | Port dialed on the target, 1 to 65535 |
 
 **IngressConditions**
 
@@ -1357,13 +1375,36 @@ send empty:
 | `Dial`              | `string` | `"dial,omitempty"`              | One of the `IngressDial*` constants; exactly when `Listener` is `listening` |
 | `DialReason`        | `string` | `"dial_reason,omitempty"`       | A reason token; exactly when `Dial` is `failed` |
 | `DialAgeSeconds`    | `*int64` | `"dial_age_seconds,omitempty"`  | Whole seconds from the dial to the report, 0 to `MaxIngressStatusDialAgeSeconds`; exactly when `Dial` is `succeeded` or `failed`. A pointer, because 0 is a valid age |
+| `Targets`           | `[]IngressStatusTarget` | `"targets,omitempty"` | At most `MaxIngressStatusTargets` entries, one per target of the rule, only beside a `Listener` of `listening`; nil omits the member, which reads as no entries |
+
+**IngressStatusTarget**, the control plane's `IngressStatusReportRuleTarget`:
+the target as the pull names it and the last dial the bridge made to it.
+`DialReason` is sent exactly when `Dial` is `failed`, and `DialAgeSeconds`
+exactly when `Dial` is `succeeded` or `failed`. No two entries of one rule name
+the same `NodeID` and `Port`:
+
+| Field            | Type     | JSON Tag                       | Description |
+|------------------|----------|--------------------------------|-------------|
+| `NodeID`         | `string` | `"node_id"`                    | The target's `node_id` from the pull, a UUID other than the zero UUID |
+| `Port`           | `int`    | `"port"`                       | The target's `port` from the pull, 1 to 65535 |
+| `Dial`           | `string` | `"dial"`                       | One of the `IngressDial*` constants |
+| `DialReason`     | `string` | `"dial_reason,omitempty"`      | A reason token; exactly when `Dial` is `failed` |
+| `DialAgeSeconds` | `*int64` | `"dial_age_seconds,omitempty"` | Whole seconds from the last dial to the target to the report, 0 to `MaxIngressStatusDialAgeSeconds`; exactly when `Dial` is `succeeded` or `failed` |
+
+The `Targets` slice makes a rule entry incomparable with `==`, so the reporter
+compares two entries member by member, the dial ages of the rule and of its
+targets ignored.
 
 A missing, `null` or unknown state, an unknown member, data after the report,
 more than `MaxIngressStatusRules` entries, and an entry with a malformed id or
-a value outside its member's rule answer `400 malformed_ingress_status`; an
-opted-out report with entries, a repeated id and an entry that breaks the
-presence rules answer `400 invalid_ingress_status`. `ReportIngressStatus`
-checks none of this and sends the request as passed.
+a value outside its member's rule answer `400 malformed_ingress_status`, and so
+do more than `MaxIngressStatusTargets` target entries and a target entry with a
+malformed `node_id` or a value outside its member's rule. An opted-out report
+with entries, a repeated id, an entry that breaks the presence rules, target
+entries on a rule that is not listening, a target entry that breaks the
+presence rules, and two target entries of one rule with the same `node_id` and
+`port` answer `400 invalid_ingress_status`. `ReportIngressStatus` checks none
+of this and sends the request as passed.
 
 **IngressStatusResponse** (`200 OK`)
 
@@ -1382,17 +1423,19 @@ checks none of this and sends the request as passed.
 | `IngressCertificateNotRequired` | `"not_required"` | A `passthrough` rule, which needs no certificate at the bridge |
 | `IngressCertificateReady` | `"ready"` | A `terminate` or `acme` rule whose certificate is in place |
 | `IngressCertificateNotReady` | `"not_ready"` | A `terminate` or `acme` rule without its certificate; `CertificateReason` says why |
-| `IngressDialNone` | `"none"` | No client connection has dialled the rule's target yet, or, for a `udp` rule, no flow has sent a client's datagram to it yet |
-| `IngressDialSucceeded` | `"succeeded"` | The last dial reached the target |
-| `IngressDialFailed` | `"failed"` | The last dial failed; `DialReason` says why |
+| `IngressDialNone` | `"none"` | On a rule entry, the bridge has not dialled a target of the rule for a client yet, or, for a `udp` rule, not sent a client's datagram yet; on a target entry, the bridge has not dialled the target yet |
+| `IngressDialSucceeded` | `"succeeded"` | On a rule entry, a target took the rule's last unit; on a target entry, the last dial reached the target |
+| `IngressDialFailed` | `"failed"` | On a rule entry, no target took the rule's last unit; on a target entry, the last dial to the target failed. `DialReason` says why |
 | `MaxIngressStatusRules` | `1024` | The most entries one report carries |
 | `MaxIngressStatusDialAgeSeconds` | `2147483647` | The ceiling of `dial_age_seconds`, the largest signed 32-bit integer |
+| `MaxIngressStatusTargets` | `8` | The most target entries one rule entry carries, the most targets a rule holds |
 
 **Validators**
 
 | Function | Description |
 |----------|-------------|
 | `ValidIngressRuleID(s string) bool` | `s` is a UUID in canonical form, groups of 8, 4, 4, 4 and 12 hex digits in either case joined by hyphens, other than the zero UUID. Written by hand: `github.com/google/uuid` stays an indirect dependency |
+| `ValidIngressTargetNodeID(s string) bool` | `s` is a `node_id` the control plane accepts in a target entry: a UUID in canonical form other than the zero UUID, as `ValidIngressRuleID` checks it |
 | `ValidIngressReason(s string) bool` | `s` matches `^[a-z][a-z0-9_]{0,62}$` |
 
 ## User Access Status

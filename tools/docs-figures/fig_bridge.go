@@ -272,7 +272,7 @@ func bridgePublicIngress() *Figure {
 	fr.h = acme.y + acme.h + 30 - fr.y
 
 	target := f.box(roleAgent, spec{y: fr.y + fr.h + 70, w: 350, h: 70, lines: []Line{
-		name("Target node"), code("<target_address>:<target_port>"),
+		name("Target node"), code("targets[i]: address:port"),
 	}})
 	target.x = fr.x + fr.w - target.w
 	f.arrow(call, dial.bottom(), target.topAt(dial.cx()))
