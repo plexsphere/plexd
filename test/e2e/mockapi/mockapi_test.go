@@ -6110,30 +6110,62 @@ func TestIngressStatus_AcceptsNoRules(t *testing.T) {
 	}
 }
 
-// ingressStatusContractExample is the three-entry example of the agent
-// contract (plexsphere/plexsphere@16f468b docs/reference/api/plexd-agent-contract.md,
-// "Ingress status").
+// ingressStatusContractExample is the four-entry example of the agent
+// contract (plexsphere/plexsphere@8c76f19 docs/reference/api/plexd-agent-contract.md,
+// "Ingress status") without the client_auth_enforced and client_refusals
+// members of its first entry, which the mock does not read yet (#201).
 const ingressStatusContractExample = `{
   "state": "enabled",
   "rules": [
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", "listener": "listening",
-      "certificate": "ready", "dial": "failed", "dial_reason": "policy_denied", "dial_age_seconds": 12 },
+      "certificate": "ready", "dial": "succeeded", "dial_age_seconds": 2,
+      "targets": [
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 8443, "dial": "succeeded", "dial_age_seconds": 2 },
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "port": 8443, "dial": "failed", "dial_reason": "timeout", "dial_age_seconds": 14 }
+      ] },
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5", "listener": "listening",
+      "certificate": "not_required", "dial": "failed", "dial_reason": "policy_denied", "dial_age_seconds": 3,
+      "targets": [
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 53, "dial": "failed", "dial_reason": "policy_denied", "dial_age_seconds": 3 }
+      ] },
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", "listener": "listening",
-      "certificate": "not_ready", "certificate_reason": "certificate_secret_not_listed", "dial": "none" },
+      "certificate": "not_ready", "certificate_reason": "certificate_secret_not_listed", "dial": "none",
+      "targets": [
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 1883, "dial": "none" }
+      ] },
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", "listener": "not_listening", "listener_reason": "listen_failed" }
   ]
 }`
 
+// TestIngressStatus_AcceptsTheContractExample sends the contract's example,
+// and then reports whose targets are null and [], on a listening and on a
+// not_listening entry: both carry no target entries, so neither breaks the
+// rule that target entries stand only beside a listening entry.
 func TestIngressStatus_AcceptsTheContractExample(t *testing.T) {
-	_, ts := newTestServer(t)
-	resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, ingressStatusContractExample)
-	defer resp.Body.Close()
-	decodeIngressStatusReceipt(t, resp)
-	if got := string(getCapturedBody(t, ts.URL, "ingress-status")); got != ingressStatusContractExample {
-		t.Errorf("captured body = %s, want the example as sent", got)
+	const (
+		listening    = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"none","targets":`
+		notListening = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4","listener":"not_listening","listener_reason":"listen_failed","targets":`
+	)
+	bodies := []struct {
+		name, body string
+	}{
+		{"the contract's example", ingressStatusContractExample},
+		{"targets null", `{"state":"enabled","rules":[` + listening + `null},` + notListening + `null}]}`},
+		{"targets []", `{"state":"enabled","rules":[` + listening + `[]},` + notListening + `[]}]}`},
 	}
-	if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
-		t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
+	for _, tt := range bodies {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, tt.body)
+			defer resp.Body.Close()
+			decodeIngressStatusReceipt(t, resp)
+			if got := string(getCapturedBody(t, ts.URL, "ingress-status")); got != tt.body {
+				t.Errorf("captured body = %s, want the report as sent", got)
+			}
+			if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
+				t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
+			}
+		})
 	}
 }
 
@@ -6192,6 +6224,160 @@ func TestIngressStatus_InvalidRuleEntries(t *testing.T) {
 			"a not_listening entry with dial",
 			`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"not_listening","listener_reason":"listen_failed","dial":"none"}]}`,
 			"rules[0] carries dial while listener is not_listening",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putIngressStatusProblem(t, tt.body, "invalid_ingress_status", tt.detail)
+		})
+	}
+}
+
+// The rule entries the target entry tests build on: a valid entry that does
+// not listen, a listening entry up to the start of its targets, and a valid
+// target entry.
+const (
+	ingressStatusNotListeningEntry = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"not_listening","listener_reason":"listen_failed"}`
+	ingressStatusListeningTargets  = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"none","targets":[`
+	ingressStatusTarget            = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":8443,"dial":"none"}`
+)
+
+// ingressStatusTargetsBody renders a report whose first rule entry does not
+// listen and whose second listens with targets, the given target entries, so
+// a detail about them names rules[1].
+func ingressStatusTargetsBody(targets ...string) string {
+	return `{"state":"enabled","rules":[` + ingressStatusNotListeningEntry + `,` +
+		ingressStatusListeningTargets + strings.Join(targets, ",") + `]}]}`
+}
+
+// ingressStatusTargetEntries returns n valid target entries, each on a Node of
+// its own.
+func ingressStatusTargetEntries(n int) []string {
+	entries := make([]string, n)
+	for j := range entries {
+		entries[j] = fmt.Sprintf(`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0%02x","port":8443,"dial":"none"}`, 0xb1+j)
+	}
+	return entries
+}
+
+// TestIngressStatus_MalformedTargetEntries refuses a rule entry whose targets
+// hold more than eight entries, and a target entry whose member breaks its own
+// rule, with malformed_ingress_status and a detail that names the rule entry,
+// the target entry and the member. These shape rules run with those of the
+// rule entry, so they answer before a presence breach of an earlier entry.
+func TestIngressStatus_MalformedTargetEntries(t *testing.T) {
+	t.Run("eight entries are accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, ingressStatusTargetsBody(ingressStatusTargetEntries(8)...))
+		defer resp.Body.Close()
+		decodeIngressStatusReceipt(t, resp)
+	})
+
+	const node = `"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"`
+	tests := []struct {
+		name, body, detail string
+	}{
+		{
+			"targets that is no array",
+			`{"state":"enabled","rules":[` + ingressStatusNotListeningEntry + `,{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"none","targets":{}}]}`,
+			"rules[1] is not a valid rule entry",
+		},
+		{"nine entries", ingressStatusTargetsBody(ingressStatusTargetEntries(9)...), "rules[1].targets carries more than 8 entries"},
+		{"an entry that is no object", ingressStatusTargetsBody(ingressStatusTarget, `"x"`), "rules[1].targets[1] is not a valid target entry"},
+		{"an unknown member", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":8443,"dial":"none","address":"10.99.0.3"}`), "rules[1].targets[1] is not a valid target entry"},
+		{"a member of the wrong type", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":"8443","dial":"none"}`), "rules[1].targets[1] is not a valid target entry"},
+		{"no node_id", ingressStatusTargetsBody(ingressStatusTarget, `{"port":8443,"dial":"none"}`), "rules[1].targets[1].node_id is not a Node id"},
+		{"node_id null", ingressStatusTargetsBody(ingressStatusTarget, `{"node_id":null,"port":8443,"dial":"none"}`), "rules[1].targets[1].node_id is not a Node id"},
+		{"node_id x", ingressStatusTargetsBody(ingressStatusTarget, `{"node_id":"x","port":8443,"dial":"none"}`), "rules[1].targets[1].node_id is not a Node id"},
+		{"the zero UUID", ingressStatusTargetsBody(ingressStatusTarget, `{"node_id":"00000000-0000-0000-0000-000000000000","port":8443,"dial":"none"}`), "rules[1].targets[1].node_id is not a Node id"},
+		{"a null entry", ingressStatusTargetsBody(ingressStatusTarget, `null`), "rules[1].targets[1].node_id is not a Node id"},
+		{"no port", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"none"}`), "rules[1].targets[1].port is outside 1..65535"},
+		{"port 0", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":0,"dial":"none"}`), "rules[1].targets[1].port is outside 1..65535"},
+		{"port 65536", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":65536,"dial":"none"}`), "rules[1].targets[1].port is outside 1..65535"},
+		{"no dial", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":8443}`), "rules[1].targets[1].dial is not one of none, succeeded and failed"},
+		{"dial up", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":8443,"dial":"up"}`), "rules[1].targets[1].dial is not one of none, succeeded and failed"},
+		{"a reason with a space", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":8443,"dial":"failed","dial_reason":"Timed Out","dial_age_seconds":1}`), "rules[1].targets[1].dial_reason is not a reason token"},
+		{"a negative dial age", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":8443,"dial":"succeeded","dial_age_seconds":-1}`), "rules[1].targets[1].dial_age_seconds is outside 0..2147483647"},
+		{"a dial age past the range", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":8443,"dial":"succeeded","dial_age_seconds":2147483648}`), "rules[1].targets[1].dial_age_seconds is outside 0..2147483647"},
+		{"the members in the contract's order", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"port":0,"dial":"up"}`), "rules[1].targets[1].port is outside 1..65535"},
+		{
+			"the rule entry's own members before its targets",
+			`{"state":"enabled","rules":[` + ingressStatusNotListeningEntry + `,{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"failed","dial_reason":"Refused","dial_age_seconds":1,"targets":["x"]}]}`,
+			"rules[1].dial_reason is not a reason token",
+		},
+		{
+			"before a presence breach of an earlier entry",
+			`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"not_listening","listener_reason":"listen_failed","dial":"none"},` +
+				ingressStatusListeningTargets + `"x"]}]}`,
+			"rules[1].targets[0] is not a valid target entry",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putIngressStatusProblem(t, tt.body, "malformed_ingress_status", tt.detail)
+		})
+	}
+}
+
+// TestIngressStatus_InvalidTargetEntries refuses target entries beside an
+// entry that does not listen, a target entry that repeats the node_id and
+// port of an earlier one of its rule, and one that breaks the presence rules
+// of a target, with invalid_ingress_status. The rule entry's presence rows
+// run first, then its target entries in body order, each checked for a
+// repeat before its presence rows.
+func TestIngressStatus_InvalidTargetEntries(t *testing.T) {
+	t.Run("one Node with two ports is no repeat", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath,
+			ingressStatusTargetsBody(ingressStatusTarget, `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":8444,"dial":"none"}`))
+		defer resp.Body.Close()
+		decodeIngressStatusReceipt(t, resp)
+	})
+
+	const (
+		node        = `"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","port":8443`
+		notListenID = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"not_listening","listener_reason":"listen_failed"`
+	)
+	tests := []struct {
+		name, body, detail string
+	}{
+		{
+			"target entries beside not_listening",
+			`{"state":"enabled","rules":[` + ingressStatusNotListeningEntry + `,` + notListenID + `,"targets":[` + ingressStatusTarget + `]}]}`,
+			"rules[1] carries targets while listener is not_listening",
+		},
+		{
+			"the targets row after dial_age_seconds",
+			`{"state":"enabled","rules":[` + ingressStatusNotListeningEntry + `,` + notListenID + `,"dial_age_seconds":1,"targets":[` + ingressStatusTarget + `]}]}`,
+			"rules[1] carries dial_age_seconds while listener is not_listening",
+		},
+		{"a repeated node_id and port", ingressStatusTargetsBody(ingressStatusTarget, ingressStatusTarget), "rules[1].targets[1] repeats rules[1].targets[0]"},
+		{
+			"a repeat in another case",
+			ingressStatusTargetsBody(ingressStatusTarget, `{"node_id":"0190A8B8-A0C0-7A0A-8A0A-A0A0A0A0A0B1","port":8443,"dial":"none"}`),
+			"rules[1].targets[1] repeats rules[1].targets[0]",
+		},
+		{
+			"a repeat before the presence rows",
+			ingressStatusTargetsBody(ingressStatusTarget, `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":8443,"dial":"none","dial_reason":"refused"}`),
+			"rules[1].targets[1] repeats rules[1].targets[0]",
+		},
+		{"dial_reason beside none", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"none","dial_reason":"refused"}`), "rules[1].targets[1] carries dial_reason while dial is none"},
+		{"dial_reason beside succeeded", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"succeeded","dial_reason":"refused","dial_age_seconds":1}`), "rules[1].targets[1] carries dial_reason while dial is succeeded"},
+		{"failed without dial_reason", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"failed","dial_age_seconds":1}`), "rules[1].targets[1] misses dial_reason while dial is failed"},
+		{"dial_age_seconds beside none", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"none","dial_age_seconds":0}`), "rules[1].targets[1] carries dial_age_seconds while dial is none"},
+		{"succeeded without dial_age_seconds", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"succeeded"}`), "rules[1].targets[1] misses dial_age_seconds while dial is succeeded"},
+		{"failed without dial_age_seconds", ingressStatusTargetsBody(ingressStatusTarget, `{`+node+`,"dial":"failed","dial_reason":"refused"}`), "rules[1].targets[1] misses dial_age_seconds while dial is failed"},
+		{
+			"the rule entry's presence rows before its targets",
+			`{"state":"enabled","rules":[` + ingressStatusNotListeningEntry + `,{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"failed","dial_age_seconds":1,"targets":[{` + node + `,"dial":"none","dial_reason":"refused"}]}]}`,
+			"rules[1] misses dial_reason while dial is failed",
+		},
+		{
+			"an earlier entry's targets before a later repeated id",
+			`{"state":"enabled","rules":[` + ingressStatusListeningTargets + `{` + node + `,"dial":"none","dial_reason":"refused"}]},` +
+				`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"not_listening","listener_reason":"listen_failed"}]}`,
+			"rules[0].targets[0] carries dial_reason while dial is none",
 		},
 	}
 	for _, tt := range tests {
@@ -6300,21 +6486,68 @@ func TestIngressStatus_DenialTaxonomy(t *testing.T) {
 	}
 }
 
-// The 256 KiB cap is inclusive and exact, and it is judged before the decode.
+// The 2 MiB cap is inclusive and exact, and it is judged before the decode. A
+// report at the cap is larger than the 1 MiB other routes capture, and the
+// capture keeps it whole.
 func TestIngressStatus_BodyCap(t *testing.T) {
-	const capBytes = 256 << 10
+	const capBytes = 2 << 20
 	padded := func(n int) string {
 		body := ingressStatusBody(t, api.IngressStateEnabled)
 		return body + strings.Repeat(" ", n-len(body))
 	}
 
-	t.Run("exactly 256 KiB is accepted", func(t *testing.T) {
+	t.Run("exactly 2 MiB is accepted and captured whole", func(t *testing.T) {
 		_, ts := newTestServer(t)
-		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, padded(capBytes))
+		body := padded(capBytes)
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
 		defer resp.Body.Close()
 		decodeIngressStatusReceipt(t, resp)
+		if got := getCapturedBody(t, ts.URL, "ingress-status"); string(got) != body {
+			t.Errorf("captured body of %d bytes differs from the %d bytes sent", len(got), len(body))
+		}
 		if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
 			t.Errorf("ingress_status_count = %d, want 1", a.IngressStatusCount)
+		}
+	})
+
+	// The contract sizes the cap for 1,024 rules of eight targets each. With
+	// the longest reason tokens plexd sends and the largest ages, such a
+	// report passes 1 MiB and stays under the cap.
+	t.Run("1,024 rules of eight targets each are accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		age := int64(api.MaxIngressStatusDialAgeSeconds)
+		entries := make([]api.IngressStatusRule, api.MaxIngressStatusRules)
+		for i := range entries {
+			targets := make([]api.IngressStatusTarget, api.MaxIngressStatusTargets)
+			for j := range targets {
+				targets[j] = api.IngressStatusTarget{
+					NodeID:         fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0%02x", 0xb1+j),
+					Port:           65535,
+					Dial:           api.IngressDialFailed,
+					DialReason:     "policy_denied",
+					DialAgeSeconds: &age,
+				}
+			}
+			entries[i] = api.IngressStatusRule{
+				ID:                ingressStatusRuleID(i),
+				Listener:          api.IngressListenerListening,
+				Certificate:       api.IngressCertificateNotReady,
+				CertificateReason: "certificate_secret_not_listed",
+				Dial:              api.IngressDialFailed,
+				DialReason:        "policy_denied",
+				DialAgeSeconds:    &age,
+				Targets:           targets,
+			}
+		}
+		body := ingressStatusRulesBody(t, api.IngressStateEnabled, entries)
+		if len(body) <= 1<<20 || len(body) > capBytes {
+			t.Fatalf("the report takes %d bytes, want more than 1 MiB and at most 2 MiB", len(body))
+		}
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
+		defer resp.Body.Close()
+		decodeIngressStatusReceipt(t, resp)
+		if got := getCapturedBody(t, ts.URL, "ingress-status"); string(got) != body {
+			t.Errorf("captured body of %d bytes differs from the %d bytes sent", len(got), len(body))
 		}
 	})
 
@@ -9954,12 +10187,65 @@ func TestState_ReturnsIngressChild(t *testing.T) {
 		ListenPort:    443,
 		Mode:          api.IngressModePassthrough,
 		SNIHost:       "web.e2e.internal",
+		Targets:       []api.IngressTarget{{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.99.0.2", Port: 8443}},
 		TargetNodeID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
 		TargetAddress: "10.99.0.2",
 		TargetPort:    8443,
 	}
 	if got := ing.Rules[0]; !got.Equal(want) {
 		t.Errorf("Ingress.Rules[0] = %+v, want %+v", got, want)
+	}
+}
+
+// TestConfigureState_IngressRuleTargets posts the served state back to
+// /test/configure-state and reads the fixture rule's targets from the next
+// pull, then posts the rule with a second target and reads both back in
+// their order.
+func TestConfigureState_IngressRuleTargets(t *testing.T) {
+	_, ts := newTestServer(t)
+	first := api.IngressTarget{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.99.0.2", Port: 8443}
+	second := api.IngressTarget{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Address: "10.99.0.3", Port: 8443}
+
+	// servedTargets returns the targets of the served rule as the wire
+	// carries them, so the test reads the member and not a default of the
+	// decode.
+	servedTargets := func() []api.IngressTarget {
+		t.Helper()
+		var bridge struct {
+			Ingress struct {
+				Rules []struct {
+					Targets *[]api.IngressTarget `json:"targets"`
+				} `json:"rules"`
+			} `json:"ingress"`
+		}
+		if err := json.Unmarshal(stateEnvelope(t, ts.URL)["bridge"], &bridge); err != nil {
+			t.Fatalf("decode served bridge: %v", err)
+		}
+		if len(bridge.Ingress.Rules) != 1 || bridge.Ingress.Rules[0].Targets == nil {
+			t.Fatalf("served ingress rules = %+v, want one rule that carries targets", bridge.Ingress.Rules)
+		}
+		return *bridge.Ingress.Rules[0].Targets
+	}
+
+	envelope := stateEnvelope(t, ts.URL)
+	configureStateEnvelope(t, ts.URL, envelope)
+	if got := servedTargets(); !reflect.DeepEqual(got, []api.IngressTarget{first}) {
+		t.Errorf("targets after the round trip = %+v, want the fixture's one target %+v", got, first)
+	}
+
+	var bridge api.BridgeSnapshot
+	if err := json.Unmarshal(envelope["bridge"], &bridge); err != nil {
+		t.Fatalf("decode bridge: %v", err)
+	}
+	bridge.Ingress.Rules[0].Targets = append(bridge.Ingress.Rules[0].Targets, second)
+	raw, err := json.Marshal(bridge)
+	if err != nil {
+		t.Fatalf("marshal bridge: %v", err)
+	}
+	envelope["bridge"] = raw
+	configureStateEnvelope(t, ts.URL, envelope)
+	if got, want := servedTargets(), []api.IngressTarget{first, second}; !reflect.DeepEqual(got, want) {
+		t.Errorf("targets after configure-state = %+v, want %+v", got, want)
 	}
 }
 
