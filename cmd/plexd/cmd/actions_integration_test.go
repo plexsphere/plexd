@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -261,6 +263,44 @@ func TestIntegration_ActionsRunUnknown(t *testing.T) {
 
 	if result.Status != "error" {
 		t.Errorf("status = %q, want %q", result.Status, "error")
+	}
+}
+
+func TestIntegration_ActionsRunDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := actions.Config{Enabled: boolPtr(false)}
+	cfg.ApplyDefaults()
+	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
+
+	// The built-in would run on the server's goroutine, so the record of its
+	// run is atomic.
+	var ran atomic.Bool
+	executor.RegisterBuiltin("test.echo", "Echo action", nil, func(context.Context, map[string]string) (string, string, int, error) {
+		ran.Store(true)
+		return "echo", "", 0, nil
+	})
+
+	socketPath := startTestNodeAPI(t, ctx, executor, nil)
+	overrideSocketPath(t, socketPath)
+
+	output, err := executeCmd(t, "actions", "run", "test.echo")
+	if err != nil {
+		t.Fatalf("plexd actions run test.echo: %v\noutput:\n%s", err, output)
+	}
+
+	for _, want := range []string{"Status:    error", "Exit code: 1", "actions are disabled on this node"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output does not contain %q:\n%s", want, output)
+		}
+	}
+	if ran.Load() {
+		t.Error("the built-in test.echo ran while actions are disabled")
 	}
 }
 
