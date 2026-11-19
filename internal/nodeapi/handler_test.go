@@ -1386,6 +1386,46 @@ func TestHandler_RunAction_Failed(t *testing.T) {
 	}
 }
 
+func TestHandler_RunAction_RunnerError(t *testing.T) {
+	runner := &mockActionRunner{
+		err:      errors.New("actions are disabled on this node"),
+		exitCode: 1,
+	}
+	srv := newTestHandlerWithActions(t, runner, nil)
+
+	body := `{"action":"diagnostics.collect"}`
+	req, err := http.NewRequest("POST", srv.URL+"/v1/actions/run", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var result struct {
+		Status   string `json:"status"`
+		ExitCode int    `json:"exit_code"`
+		Stderr   string `json:"stderr"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Status != "error" {
+		t.Errorf("status = %q, want %q", result.Status, "error")
+	}
+	if result.ExitCode != 1 {
+		t.Errorf("exit_code = %d, want 1", result.ExitCode)
+	}
+	if result.Stderr != "actions are disabled on this node" {
+		t.Errorf("stderr = %q, want %q", result.Stderr, "actions are disabled on this node")
+	}
+}
+
 func TestHandler_RunAction_MissingAction(t *testing.T) {
 	runner := &mockActionRunner{
 		mockActionProvider: mockActionProvider{},
