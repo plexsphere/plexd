@@ -280,8 +280,11 @@ func bridgePublicIngress() *Figure {
 }
 
 // bridgeACMESNIRouting draws how a bridge routes a TLS connection on an
-// SNI port by its ClientHello, answers an ACME challenge, and where
-// ACMEManager keeps its account, for docs/reference/bridge/acme-sni.md.
+// SNI port in the order of IngressManager.serveConn: the ClientHello
+// peek, the server-name match, the ACME challenge the match leaves to
+// the bridge, the mode of the matched rule, and the three stages that
+// close a connection. It also draws where ACMEManager keeps its
+// account, for docs/reference/bridge/acme-sni.md.
 func bridgeACMESNIRouting() *Figure {
 	f := &Figure{Name: "bridge-acme-sni-routing", Title: "How a bridge routes a TLS connection by its server name"}
 	const mainX, mainW, sideX = 60.0, 480.0, 590.0
@@ -309,34 +312,42 @@ func bridgeACMESNIRouting() *Figure {
 		body("it returns the server name and the offered ALPN"),
 	}})
 	f.arrow(flow, lsn.bottom(), peek.top())
-	challenge := f.state(stateNormal, spec{x: 800, y: 0, w: 250, h: 80, lines: []Line{brgSub("answer the challenge,"), body("then close")}})
-	challenge.y = peek.cy() - challenge.h/2
-	f.arrow(flow, peek.right(), challenge.left())
-	f.label(pt{(peek.x + peek.w + challenge.x) / 2, peek.cy()}, body("on :443, ALPN exactly"), body("acme-tls/1 for a host"), body("of an acme rule"))
 
 	match := f.state(stateNormal, spec{x: mainX, y: peek.y + peek.h + 60, w: mainW, h: 90, lines: []Line{
 		codeName("ingressTable.match(server name)"), body("exact host first, then a wildcard of one label"),
 	}})
 	f.arrow(flow, peek.bottom(), match.top())
 
-	const outW, outH, outGap = 300.0, 110.0, 40.0
+	const outW, outH, outGap = 300.0, 150.0, 40.0
 	outY := match.y + match.h + 90
 	busY := match.y + match.h + 45
-	pass := f.state(stateNormal, spec{x: mainX, y: outY, w: outW, h: outH, lines: []Line{
+	challenge := f.state(stateNormal, spec{x: mainX, y: outY, w: outW, h: outH, lines: []Line{
+		brgSub("TLS-ALPN-01 challenge"), body("on :443 with exactly the ALPN"), body("acme-tls/1, for a host of the"),
+		body("account that no rule or an"), body("acme rule matched:"), body("answer it, then close"),
+	}})
+	pass := f.state(stateNormal, spec{x: mainX + outW + outGap, y: outY, w: outW, h: outH, lines: []Line{
 		brgSub("passthrough rule"), body("dial the target, replay"), body("the peeked bytes,"), body("copy both ways"),
 	}})
-	term := f.state(stateNormal, spec{x: mainX + outW + outGap, y: outY, w: outW, h: outH, lines: []Line{
-		brgSub("terminate or acme rule"), body("TLS handshake at the bridge,"), body("dial the target,"), body("copy the plaintext"),
+	term := f.state(stateNormal, spec{x: mainX + 2*(outW+outGap), y: outY, w: outW, h: outH, lines: []Line{
+		brgSub("terminate or acme rule"), body("TLS handshake at the bridge,"), body("then copy the plaintext to the"),
+		body("target, or route each request"), body("of a host with conditions"),
 	}})
-	closed := f.state(stateFailed, spec{x: mainX + 2*(outW+outGap), y: outY, w: outW, h: outH, lines: []Line{
-		brgSub("no rule, no server name,"), brgSub("a rule with a reason,"), brgSub("or no certificate"), body("close the connection"),
-	}})
-	for _, n := range []*node{pass, term} {
+	for _, n := range []*node{challenge, pass, term} {
 		f.arrow(flow, vhv(match.bottom(), n.top(), busY)...)
 	}
-	// The refusal leaves on its own side, so its red never covers the
-	// stem the two rules share.
-	f.arrow(refuse, hv(match.right(), closed.top())...)
+
+	// Each stage that closes a connection has its own red arrow into
+	// the close state, which spans from beside peek to beside match.
+	closed := f.state(stateFailed, spec{x: 710, y: peek.y + 30, w: 340, h: match.y + match.h - 15 - (peek.y + 30), lines: []Line{
+		brgSub("no ClientHello, no server name,"), brgSub("no rule, a rule with a reason,"), brgSub("no certificate,"),
+		brgSub("or a failed TLS handshake"), body("close the connection"),
+	}})
+	f.arrow(refuse, peek.right(), pt{closed.x, peek.cy()})
+	f.arrow(refuse, match.right(), pt{closed.x, match.cy()})
+	// The stem from term lies right of the bus, which ends at term.cx(),
+	// so its red crosses no grey line.
+	stemX := term.x + term.w - 40
+	f.arrow(refuse, term.topAt(stemX), closed.bottomAt(stemX))
 	fr.h = outY + outH + 30 - fr.y
 	return f
 }

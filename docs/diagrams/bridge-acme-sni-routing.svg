@@ -1,13 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="950" viewBox="0 0 1120 950" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge routes a TLS connection by its server name">
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="990" viewBox="0 0 1120 990" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge routes a TLS connection by its server name">
 <title>How a bridge routes a TLS connection by its server name</title>
-<rect width="1120" height="950" fill="#F6F5F1"/>
+<rect width="1120" height="990" fill="#F6F5F1"/>
 <rect x="70" y="40" width="340" height="76" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
 <text x="240" y="74.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Public internet clients</text>
 <text x="240" y="95.95" font-size="17" fill="#55606E" text-anchor="middle">HTTPS / TLS</text>
 <rect x="650" y="40" width="260" height="76" rx="8" fill="#FDFCF9" stroke="#5E43A8" stroke-width="2"/>
 <text x="780" y="74.8" font-size="20" font-weight="700" fill="#4B3592" text-anchor="middle">ACME CA</text>
 <text x="780" y="95.95" font-size="17" fill="#55606E" text-anchor="middle">TLS-ALPN-01</text>
-<rect x="40" y="190" width="1040" height="720" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<rect x="40" y="190" width="1040" height="760" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
 <text x="56" y="223.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
 <rect x="70" y="270" width="480" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="310" y="300.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressManager</text>
@@ -38,38 +38,45 @@
 <text x="310" y="506.55" font-size="17" fill="#55606E" text-anchor="middle">it returns the server name and the offered ALPN</text>
 <polyline points="310,340 310,401" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="310,410 304,397 316,397" fill="#3A4452"/>
-<rect x="810" y="430" width="250" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="935" y="465.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">answer the challenge,</text>
-<text x="935" y="486.15" font-size="17" fill="#55606E" text-anchor="middle">then close</text>
-<polyline points="550,470 801,470" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="810,470 797,476 797,464" fill="#3A4452"/>
-<text x="680" y="418.55" font-size="17" fill="#55606E" text-anchor="middle">on :443, ALPN exactly</text>
-<text x="680" y="438.95" font-size="17" fill="#55606E" text-anchor="middle">acme-tls/1 for a host</text>
-<text x="680" y="459.35" font-size="17" fill="#55606E" text-anchor="middle">of an acme rule</text>
 <rect x="70" y="590" width="480" height="90" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
 <text x="310" y="630.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#2B3440" text-anchor="middle">ingressTable.match(server name)</text>
 <text x="310" y="651.15" font-size="17" fill="#55606E" text-anchor="middle">exact host first, then a wildcard of one label</text>
 <polyline points="310,530 310,581" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="310,590 304,577 316,577" fill="#3A4452"/>
-<rect x="70" y="770" width="300" height="110" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="220" y="800.35" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">passthrough rule</text>
-<text x="220" y="820.75" font-size="17" fill="#55606E" text-anchor="middle">dial the target, replay</text>
-<text x="220" y="841.15" font-size="17" fill="#55606E" text-anchor="middle">the peeked bytes,</text>
-<text x="220" y="861.55" font-size="17" fill="#55606E" text-anchor="middle">copy both ways</text>
-<rect x="410" y="770" width="300" height="110" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="560" y="800.35" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">terminate or acme rule</text>
-<text x="560" y="820.75" font-size="17" fill="#55606E" text-anchor="middle">TLS handshake at the bridge,</text>
-<text x="560" y="841.15" font-size="17" fill="#55606E" text-anchor="middle">dial the target,</text>
-<text x="560" y="861.55" font-size="17" fill="#55606E" text-anchor="middle">copy the plaintext</text>
-<rect x="750" y="770" width="300" height="110" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
-<text x="900" y="800.35" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">no rule, no server name,</text>
-<text x="900" y="820.75" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">a rule with a reason,</text>
-<text x="900" y="841.15" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">or no certificate</text>
-<text x="900" y="861.55" font-size="17" fill="#A3262E" text-anchor="middle">close the connection</text>
+<rect x="70" y="770" width="300" height="150" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="220" y="799.95" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">TLS-ALPN-01 challenge</text>
+<text x="220" y="820.35" font-size="17" fill="#55606E" text-anchor="middle">on :443 with exactly the ALPN</text>
+<text x="220" y="840.75" font-size="17" fill="#55606E" text-anchor="middle">acme-tls/1, for a host of the</text>
+<text x="220" y="861.15" font-size="17" fill="#55606E" text-anchor="middle">account that no rule or an</text>
+<text x="220" y="881.55" font-size="17" fill="#55606E" text-anchor="middle">acme rule matched:</text>
+<text x="220" y="901.95" font-size="17" fill="#55606E" text-anchor="middle">answer it, then close</text>
+<rect x="410" y="770" width="300" height="150" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="560" y="820.35" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">passthrough rule</text>
+<text x="560" y="840.75" font-size="17" fill="#55606E" text-anchor="middle">dial the target, replay</text>
+<text x="560" y="861.15" font-size="17" fill="#55606E" text-anchor="middle">the peeked bytes,</text>
+<text x="560" y="881.55" font-size="17" fill="#55606E" text-anchor="middle">copy both ways</text>
+<rect x="750" y="770" width="300" height="150" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="900" y="810.15" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">terminate or acme rule</text>
+<text x="900" y="830.55" font-size="17" fill="#55606E" text-anchor="middle">TLS handshake at the bridge,</text>
+<text x="900" y="850.95" font-size="17" fill="#55606E" text-anchor="middle">then copy the plaintext to the</text>
+<text x="900" y="871.35" font-size="17" fill="#55606E" text-anchor="middle">target, or route each request</text>
+<text x="900" y="891.75" font-size="17" fill="#55606E" text-anchor="middle">of a host with conditions</text>
 <polyline points="310,680 310,725 220,725 220,761" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="220,770 214,757 226,757" fill="#3A4452"/>
 <polyline points="310,680 310,725 560,725 560,761" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="560,770 554,757 566,757" fill="#3A4452"/>
-<polyline points="550,635 900,635 900,761" fill="none" stroke="#C6343C" stroke-width="2.5"/>
-<polygon points="900,770 894,757 906,757" fill="#C6343C"/>
+<polyline points="310,680 310,725 900,725 900,761" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="900,770 894,757 906,757" fill="#3A4452"/>
+<rect x="720" y="440" width="340" height="225" rx="6" fill="#F8E8E9" stroke="#C6343C" stroke-width="2"/>
+<text x="890" y="517.65" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">no ClientHello, no server name,</text>
+<text x="890" y="538.05" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">no rule, a rule with a reason,</text>
+<text x="890" y="558.45" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">no certificate,</text>
+<text x="890" y="578.85" font-size="17" font-weight="700" fill="#A3262E" text-anchor="middle">or a failed TLS handshake</text>
+<text x="890" y="599.25" font-size="17" fill="#A3262E" text-anchor="middle">close the connection</text>
+<polyline points="550,470 711,470" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="720,470 707,476 707,464" fill="#C6343C"/>
+<polyline points="550,635 711,635" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="720,635 707,641 707,629" fill="#C6343C"/>
+<polyline points="1010,770 1010,674" fill="none" stroke="#C6343C" stroke-width="2.5"/>
+<polygon points="1010,665 1016,678 1004,678" fill="#C6343C"/>
 </svg>
