@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -16,7 +17,7 @@ import (
 )
 
 // The limits of the HTTP server that reads the requests of a host whose rules
-// have conditions, and of the connections to each rule's target. A request
+// have conditions, and of the connections to each target of a rule. A request
 // body and a response have no size or time bound, as a forwarded connection
 // has none.
 const (
@@ -29,7 +30,7 @@ const (
 	// 431 from net/http.
 	ingressHTTPMaxHeaderBytes = 64 << 10
 	// ingressTargetMaxIdleConns is the most idle connections a rule keeps to
-	// its target.
+	// each of its targets.
 	ingressTargetMaxIdleConns = 32
 	// ingressTargetIdleConnTimeout closes an idle target connection.
 	ingressTargetIdleConnTimeout = 90 * time.Second
@@ -146,7 +147,7 @@ func (c *ingressHTTPConn) Close() error {
 // request arrived on.
 type ingressConnKey struct{}
 
-// ingressDialError is the error of a failed dial to a rule's target, with
+// ingressDialError is the error of a failed dial to a target of a rule, with
 // the reason recordDial gave it.
 type ingressDialError struct {
 	reason string
@@ -248,26 +249,79 @@ func (m *IngressManager) notForwarded(w http.ResponseWriter, r *http.Request, c 
 	http.Error(w, http.StatusText(status), status)
 }
 
+// ingressFailoverTransport is the transport of a route's proxy. Each request
+// is one unit of the rule: it goes to the target the route's balancer picks,
+// and to the next pick when the dial to that target fails, until a target
+// takes it. A request that reuses a pooled connection to its target causes no
+// dial and records nothing. Any other error ends the request, a target that
+// closes the connection without a response included: the target may have
+// read the request. It never takes the manager's mu.
+type ingressFailoverTransport struct {
+	m     *IngressManager
+	route *ingressRoute
+	next  *http.Transport // dials the host of a request's URL through dialTarget
+}
+
+// RoundTrip sends req to the targets the route's balancer picks, as a clone
+// per target whose URL has the target's address as its host, and returns the
+// first result that is not a failed dial. A failed dial moves the request to
+// the next pick while the route's context is live. When no target takes the
+// request, RoundTrip records the rule's unit failed with the reason of the
+// last dial and returns that dial's *ingressDialError, which the proxy's
+// ErrorHandler answers with 504 for a timeout and 502 otherwise.
+func (t *ingressFailoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	route := t.route
+	var tried uint8
+	var dialErr *ingressDialError
+	for idx, ok := route.lb.pick(tried, t.m.now()); ok; idx, ok = route.lb.pick(tried, t.m.now()) {
+		tried |= 1 << idx
+		out := req.Clone(req.Context())
+		out.URL.Host = route.lb.targets[idx].addr
+		if req.Body != nil {
+			out.Body = ingressRetryBody{req.Body}
+		}
+		resp, err := t.next.RoundTrip(out)
+		if !errors.As(err, &dialErr) || route.ctx.Err() != nil {
+			return resp, err
+		}
+	}
+	t.m.recordUnitFailed(route, dialErr.reason)
+	return nil, dialErr
+}
+
+// ingressRetryBody is the body of a request the failover transport hands to
+// one target. Its Close does nothing, so the next target reads the same body:
+// http.Transport closes a request's body when the dial fails, before it reads
+// any of it, and the body ReverseProxy passes refuses every read after its
+// Close. ReverseProxy closes that body itself when the request ends.
+type ingressRetryBody struct {
+	io.Reader
+}
+
+// Close does nothing.
+func (ingressRetryBody) Close() error { return nil }
+
 // newRouteProxy returns the proxy of a route with conditions. It speaks
-// HTTP/1.1 in cleartext to the rule's first target, on kept-alive connections
-// it pools until the route's context is done, and dials through dialTarget,
-// never through a proxy of the environment. A failed dial also fails the
-// rule's unit (see recordLastDial). The target receives the request's Host,
-// query and fields, without the client's Forwarded and
-// X-Forwarded-* fields, with X-Forwarded-For (the client's address alone),
-// X-Forwarded-Host and X-Forwarded-Proto, and on a rule with
-// strip_path_prefix the path without the prefix and X-Forwarded-Prefix.
+// HTTP/1.1 in cleartext to the rule's targets, on kept-alive connections it
+// pools per target until the route's context is done, and dials through
+// dialTarget, never through a proxy of the environment. Each request goes to
+// a target the route's balancer picks, and to the next one when the dial
+// fails (see ingressFailoverTransport); every dial is recorded on its target,
+// and a failed one is logged. The target receives the request's Host, query
+// and fields, without the client's Forwarded and X-Forwarded-* fields, with
+// X-Forwarded-For (the client's address alone), X-Forwarded-Host and
+// X-Forwarded-Proto, and on a rule with strip_path_prefix the path without
+// the prefix and X-Forwarded-Prefix.
 func (m *IngressManager) newRouteProxy(route *ingressRoute) *httputil.ReverseProxy {
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
 			conn, err := m.dialTarget(route, addr)
+			reason, _ := m.recordDial(route, route.lb.index(addr), err)
 			if err != nil {
-				reason, _ := m.recordLastDial(route, route.lb.index(addr), err)
 				m.logDialFailed(route, addr, reason, err)
 				return nil, &ingressDialError{reason: reason, err: err}
 			}
-			m.recordDial(route, route.lb.index(addr), nil)
 			return conn, nil
 		},
 		DisableCompression:  true,
@@ -276,9 +330,11 @@ func (m *IngressManager) newRouteProxy(route *ingressRoute) *httputil.ReversePro
 	}
 	context.AfterFunc(route.ctx, transport.CloseIdleConnections)
 	return &httputil.ReverseProxy{
-		Transport: transport,
+		Transport: &ingressFailoverTransport{m: m, route: route, next: transport},
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "http"
+			// A placeholder: the failover transport sets the address of
+			// each target it sends the request to.
 			pr.Out.URL.Host = route.lb.targets[0].addr
 			pr.Out.URL.User = nil
 			pr.Out.Host = pr.In.Host
