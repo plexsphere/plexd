@@ -45,8 +45,8 @@ const nskSize = 32
 
 // SecretKey decodes NodeSecretKey into the raw AES-256-GCM key used to open
 // secret envelopes. Per the register contract nsk travels — and is stored — as
-// standard-padded base64; the bearer credential sent in the Authorization
-// header stays the encoded string.
+// standard-padded base64. The encoded string is never sent as a credential:
+// BearerToken builds the Authorization bearer from the node id and this key.
 func (id *NodeIdentity) SecretKey() ([]byte, error) {
 	return decodeNSK(id.NodeSecretKey)
 }
@@ -239,11 +239,12 @@ func LoadIdentity(dataDir string) (*NodeIdentity, error) {
 	if id.MeshIP == "" {
 		return nil, fmt.Errorf("registration: load identity: mesh_ip is empty")
 	}
-	// nsk is required by everything that follows: it is the bearer credential
-	// and, decoded, the AES-256-GCM key for secret envelopes. Reject an
-	// undecodable one here so the caller takes the fresh-registration path,
-	// rather than surfacing a decode error deep inside startup. Identities
-	// written before nsk became base64 hold a raw 32-byte secret and land here.
+	// nsk is required by everything that follows: decoded, it goes into the
+	// bearer envelope (see BearerToken) and is the AES-256-GCM key for secret
+	// envelopes. Reject an undecodable one here so the caller takes the
+	// fresh-registration path, rather than surfacing a decode error deep inside
+	// startup. Identities written before nsk became base64 hold a raw 32-byte
+	// secret and land here.
 	if _, err := decodeNSK(id.NodeSecretKey); err != nil {
 		return nil, fmt.Errorf("registration: load identity: %w", err)
 	}
