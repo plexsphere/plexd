@@ -195,12 +195,19 @@ func bridgeRouteControllersMacOSWindows() *Figure {
 // port are TCP listeners. The UDP port keeps one flow per client
 // address and sends each datagram through the same target dial. A TCP
 // and a UDP rule may share a port number, so the bridge runs one
-// listener per listen port and protocol.
+// listener per listen port and protocol. After the bridge ends TLS, a
+// host whose rules have no conditions copies bytes to the dial, and a
+// host whose rules have conditions reads each request and hands it to
+// one rule by path and headers.
 func bridgePublicIngress() *Figure {
 	f := &Figure{Name: "bridge-public-ingress", Title: "How a bridge routes a public connection to a target node"}
 	const lsnX, lsnW, yA, yU, yB, gap = 60.0, 160.0, 210.0, 345.0, 515.0, 64.0
+	// modeGap is the room between two boxes of the mode column, and
+	// busGap the room between the column and the bus into the dial,
+	// wide enough for the label of the terminating host's byte copy.
+	const modeW, modeGap, busGap = 240.0, 50.0, 130.0
 	clients := f.actor(spec{x: -20, y: 0, w: 360, h: 64, lines: []Line{name("Public internet clients")}})
-	fr := f.frame(roleSubstrate, 30, 130, 1046, 0, "", "Bridge node", "one listener per listen port and protocol")
+	fr := f.frame(roleSubstrate, 30, 130, 0, 0, "", "Bridge node", "one listener per listen port and protocol")
 
 	plain := f.box(roleAgent, spec{x: lsnX, y: yA, w: lsnW, h: 70, lines: []Line{codeName(":2222"), body("plain port")}})
 	udp := f.box(roleAgent, spec{x: lsnX, y: yU, w: lsnW, h: 70, lines: []Line{codeName(":53"), body("UDP port")}})
@@ -214,20 +221,31 @@ func bridgePublicIngress() *Figure {
 		brgSub("peek the ClientHello,"), brgSub("match the server name"),
 	}})
 	modeX := peek.x + peek.w + gap
-	pass := f.state(stateNormal, spec{x: modeX, y: yB - 95, w: 240, h: 80, lines: []Line{
+	pass := f.state(stateNormal, spec{x: modeX, y: yB - modeGap/2 - 80, w: modeW, h: 80, lines: []Line{
 		brgSub("passthrough"), body("replay the peeked bytes"),
 	}})
-	term := f.state(stateNormal, spec{x: modeX, y: yB + 15, w: 240, h: 80, lines: []Line{
+	term := f.state(stateNormal, spec{x: modeX, y: yB + modeGap/2, w: modeW, h: 80, lines: []Line{
 		brgSub("terminate, acme"), body("end TLS at the bridge"),
 	}})
-	dial := f.state(stateNormal, spec{x: modeX + 240 + gap, y: yB - 40, w: 150, h: 80, lines: []Line{
+	// A host whose rules have conditions: the bridge reads each request
+	// and hands it to one rule.
+	route := f.state(stateNormal, spec{x: modeX, y: term.y + term.h + modeGap, w: modeW, h: 100, lines: []Line{
+		brgSub("route each request"), body("by path and headers,"), body("one rule each"),
+	}})
+	busX := modeX + modeW + busGap
+	dial := f.state(stateNormal, spec{x: busX + gap/2, y: yB - 40, w: 150, h: 80, lines: []Line{
 		brgSub("dial target"), body("over plexd0"),
 	}})
+	fr.w = dial.x + dial.w + 32 - fr.x
 	f.arrow(flow, sni.right(), peek.left())
 	f.arrow(flow, hvh(peek.right(), pass.left(), modeX-gap/2)...)
 	f.arrow(flow, hvh(peek.right(), term.left(), modeX-gap/2)...)
-	f.arrow(flow, hvh(pass.right(), dial.left(), dial.x-gap/2)...)
-	f.arrow(flow, hvh(term.right(), dial.left(), dial.x-gap/2)...)
+	f.arrow(flow, hvh(pass.right(), dial.left(), busX)...)
+	f.arrow(flow, hvh(term.right(), dial.left(), busX)...)
+	f.label(pt{(term.x + term.w + busX) / 2, term.cy()}, body("copy bytes"))
+	f.arrow(flow, term.bottom(), route.top())
+	f.labelRight(pt{term.cx(), (term.y + term.h + route.y) / 2}, body("read requests"))
+	f.arrow(flow, hvh(route.right(), dial.left(), busX)...)
 	// The plain port's edge enters the dial right of the UDP port's, so
 	// its descent never crosses the UDP edge below it.
 	plainIn, udpIn := dial.topAt(dial.x+dial.w*2/3), dial.topAt(dial.x+dial.w/3)
@@ -237,7 +255,7 @@ func bridgePublicIngress() *Figure {
 	f.label(pt{(udp.x + udp.w + udpIn.X) / 2, udp.cy()}, body("one flow per client address"))
 
 	const colX, colW, tgtX, tgtW, rowH = lsnX, 330.0, lsnX + 390, 300.0, 70.0
-	rowY := term.y + term.h + 80
+	rowY := route.y + route.h + 80
 	reconcile := f.box(roleAgent, spec{x: colX, y: rowY, w: colW, h: rowH, lines: []Line{codeName("IngressReconcileHandler")}})
 	apply := f.box(roleAgent, spec{x: tgtX, y: rowY, w: tgtW, h: rowH, lines: []Line{codeName("IngressManager.Apply")}})
 	f.arrow(flow, reconcile.right(), apply.left())
