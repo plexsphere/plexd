@@ -242,7 +242,7 @@ Each SNI port has an `ingressTable` with an exact map by lowercase host and a wi
 | `*.example.com` | `a.b.example.com` | none: the `*` stands for one label |
 | any | empty | none |
 
-A connection without a host is closed (see [Routing a Connection](public-ingress.md#routing-a-connection)). On a host whose rules have conditions, `serveHTTP` also looks up the authority of each request with `match`, and answers `421` when the port routes it to another host (see [Routing a Request](public-ingress.md#routing-a-request)).
+A connection without a host is closed (see [Routing a Connection](public-ingress.md#routing-a-connection)), unless it is a challenge on port 443 (see [The Challenge on Port 443](#the-challenge-on-port-443)). On a host whose rules have conditions, `serveHTTP` also looks up the authority of each request with `match`, and answers `421` when the port routes it to another host (see [Routing a Request](public-ingress.md#routing-a-request)).
 
 ## Error Prefixes
 
