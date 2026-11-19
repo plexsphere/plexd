@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1176" height="1210" viewBox="0 0 1176 1210" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge routes a public connection to a target node">
+<svg xmlns="http://www.w3.org/2000/svg" width="1274" height="1370" viewBox="0 0 1274 1370" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge routes a public connection to a target node">
 <title>How a bridge routes a public connection to a target node</title>
-<rect width="1176" height="1210" fill="#F6F5F1"/>
+<rect width="1274" height="1370" fill="#F6F5F1"/>
 <rect x="40" y="40" width="360" height="64" rx="4" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
 <text x="220" y="79" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Public internet clients</text>
-<rect x="90" y="170" width="1046" height="860" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<rect x="90" y="170" width="1144" height="1020" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
 <text x="106" y="203.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
 <text x="275" y="201.45" font-size="17" fill="#55606E">one listener per listen port and protocol</text>
 <rect x="120" y="250" width="160" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
@@ -26,56 +26,66 @@
 <rect x="320" y="515" width="266" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
 <text x="453" y="550.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">peek the ClientHello,</text>
 <text x="453" y="571.15" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">match the server name</text>
-<rect x="650" y="460" width="240" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="770" y="495.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">passthrough</text>
-<text x="770" y="516.15" font-size="17" fill="#55606E" text-anchor="middle">replay the peeked bytes</text>
-<rect x="650" y="570" width="240" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="770" y="605.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">terminate, acme</text>
-<text x="770" y="626.15" font-size="17" fill="#55606E" text-anchor="middle">end TLS at the bridge</text>
-<rect x="954" y="515" width="150" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="1029" y="550.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">dial target</text>
-<text x="1029" y="571.15" font-size="17" fill="#55606E" text-anchor="middle">over plexd0</text>
+<rect x="650" y="450" width="240" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="770" y="485.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">passthrough</text>
+<text x="770" y="506.15" font-size="17" fill="#55606E" text-anchor="middle">replay the peeked bytes</text>
+<rect x="650" y="580" width="240" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="770" y="615.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">terminate, acme</text>
+<text x="770" y="636.15" font-size="17" fill="#55606E" text-anchor="middle">end TLS at the bridge</text>
+<rect x="650" y="710" width="240" height="100" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="770" y="745.55" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">route each request</text>
+<text x="770" y="765.95" font-size="17" fill="#55606E" text-anchor="middle">by path and headers,</text>
+<text x="770" y="786.35" font-size="17" fill="#55606E" text-anchor="middle">one rule each</text>
+<rect x="1052" y="515" width="150" height="80" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1127" y="550.75" font-size="17" font-weight="700" fill="#2B3440" text-anchor="middle">dial target</text>
+<text x="1127" y="571.15" font-size="17" fill="#55606E" text-anchor="middle">over plexd0</text>
 <polyline points="280,555 311,555" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="320,555 307,561 307,549" fill="#3A4452"/>
-<polyline points="586,555 618,555 618,500 641,500" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="650,500 637,506 637,494" fill="#3A4452"/>
-<polyline points="586,555 618,555 618,610 641,610" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="650,610 637,616 637,604" fill="#3A4452"/>
-<polyline points="890,500 922,500 922,555 945,555" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="954,555 941,561 941,549" fill="#3A4452"/>
-<polyline points="890,610 922,610 922,555 945,555" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="954,555 941,561 941,549" fill="#3A4452"/>
-<polyline points="280,285 1054,285 1054,506" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="1054,515 1048,502 1060,502" fill="#3A4452"/>
-<text x="667" y="274.45" font-size="17" fill="#55606E" text-anchor="middle">forward without reading</text>
-<polyline points="280,420 1004,420 1004,506" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="1004,515 998,502 1010,502" fill="#3A4452"/>
-<text x="642" y="409.45" font-size="17" fill="#55606E" text-anchor="middle">one flow per client address</text>
-<rect x="120" y="730" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="285" y="770.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressReconcileHandler</text>
-<rect x="510" y="730" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="660" y="770.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressManager.Apply</text>
-<polyline points="450,765 501,765" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="510,765 497,771 497,759" fill="#3A4452"/>
-<polyline points="660,730 660,690 200,690 200,599" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="586,555 618,555 618,490 641,490" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="650,490 637,496 637,484" fill="#3A4452"/>
+<polyline points="586,555 618,555 618,620 641,620" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="650,620 637,626 637,614" fill="#3A4452"/>
+<polyline points="890,490 1020,490 1020,555 1043,555" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1052,555 1039,561 1039,549" fill="#3A4452"/>
+<polyline points="890,620 1020,620 1020,555 1043,555" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1052,555 1039,561 1039,549" fill="#3A4452"/>
+<text x="955" y="609.45" font-size="17" fill="#55606E" text-anchor="middle">copy bytes</text>
+<polyline points="770,660 770,701" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="770,710 764,697 776,697" fill="#3A4452"/>
+<text x="780" y="690.95" font-size="17" fill="#55606E">read requests</text>
+<polyline points="890,760 1020,760 1020,555 1043,555" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1052,555 1039,561 1039,549" fill="#3A4452"/>
+<polyline points="280,285 1152,285 1152,506" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1152,515 1146,502 1158,502" fill="#3A4452"/>
+<text x="716" y="274.45" font-size="17" fill="#55606E" text-anchor="middle">forward without reading</text>
+<polyline points="280,420 1102,420 1102,506" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1102,515 1096,502 1108,502" fill="#3A4452"/>
+<text x="691" y="409.45" font-size="17" fill="#55606E" text-anchor="middle">one flow per client address</text>
+<rect x="120" y="890" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="285" y="930.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressReconcileHandler</text>
+<rect x="510" y="890" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="660" y="930.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressManager.Apply</text>
+<polyline points="450,925 501,925" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="510,925 497,931 497,919" fill="#3A4452"/>
+<polyline points="660,890 660,850 200,850 200,599" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="200,590 206,603 194,603" fill="#3A4452"/>
-<text x="430" y="679.45" font-size="17" fill="#55606E" text-anchor="middle">ingressTable per port, swapped in place</text>
-<rect x="120" y="830" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="285" y="870.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressSecretInventoryHandler</text>
-<rect x="510" y="830" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
-<text x="660" y="872" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">terminate certs</text>
-<polyline points="450,865 501,865" fill="none" stroke="#B0387F" stroke-width="2.5"/>
-<polygon points="510,865 497,871 497,859" fill="#B0387F"/>
-<rect x="120" y="930" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="285" y="970.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ACMEManager</text>
-<rect x="510" y="930" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
-<text x="660" y="961.8" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">acme certs</text>
-<text x="660" y="982.95" font-size="17" fill="#55606E" text-anchor="middle">and the challenges on :443</text>
-<polyline points="450,965 501,965" fill="none" stroke="#B0387F" stroke-width="2.5"/>
-<polygon points="510,965 497,971 497,959" fill="#B0387F"/>
-<rect x="786" y="1100" width="350" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="961" y="1132.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Target node</text>
-<text x="961" y="1152.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&lt;target_address&gt;:&lt;target_port&gt;</text>
-<polyline points="1029,595 1029,1091" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="1029,1100 1023,1087 1035,1087" fill="#2457C5"/>
+<text x="430" y="839.45" font-size="17" fill="#55606E" text-anchor="middle">ingressTable per port, swapped in place</text>
+<rect x="120" y="990" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="285" y="1030.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">IngressSecretInventoryHandler</text>
+<rect x="510" y="990" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<text x="660" y="1032" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">terminate certs</text>
+<polyline points="450,1025 501,1025" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="510,1025 497,1031 497,1019" fill="#B0387F"/>
+<rect x="120" y="1090" width="330" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="285" y="1130.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">ACMEManager</text>
+<rect x="510" y="1090" width="300" height="70" rx="8" fill="#FDFCF9" stroke="#B0387F" stroke-width="2"/>
+<text x="660" y="1121.8" font-size="20" font-weight="700" fill="#8A2B63" text-anchor="middle">acme certs</text>
+<text x="660" y="1142.95" font-size="17" fill="#55606E" text-anchor="middle">and the challenges on :443</text>
+<polyline points="450,1125 501,1125" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="510,1125 497,1131 497,1119" fill="#B0387F"/>
+<rect x="884" y="1260" width="350" height="70" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1059" y="1292.4" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Target node</text>
+<text x="1059" y="1312.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">&lt;target_address&gt;:&lt;target_port&gt;</text>
+<polyline points="1127,595 1127,1251" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="1127,1260 1121,1247 1133,1247" fill="#2457C5"/>
 </svg>
