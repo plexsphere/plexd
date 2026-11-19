@@ -317,25 +317,21 @@ func architectureShutdownSequence() *Figure {
 	f := &Figure{Name: "architecture-shutdown-sequence", Title: "Shutdown sequence of plexd up"}
 	const gap = 60.0
 	sh := archStepHeight([]Line{name("Cancel context")})
-	sse := f.state(stateNormal, spec{y: 0, w: 210, h: sh, lines: []Line{name("SSE shutdown")}})
-	drain := f.state(stateNormal, spec{y: sh + 40, w: 210, h: sh, lines: []Line{name("Drain actions")}})
-	c1 := (sse.y + drain.y + drain.h) / 2
-
 	sig := f.actor(spec{x: 0, lines: []Line{name("SIGTERM"), body("or SIGINT")}})
-	sig.y = c1 - sig.h/2
-	cancel := f.state(stateNormal, spec{x: sig.x + sig.w + gap, y: c1 - sh/2, h: sh, lines: []Line{name("Cancel context")}})
-	f.arrow(flow, sig.right(), cancel.left())
-	sse.x = cancel.x + cancel.w + gap
-	drain.x = sse.x
-	forkX := cancel.x + cancel.w + gap/2
-	f.arrow(flow, hvh(cancel.right(), sse.left(), forkX)...)
-	f.arrow(flow, hvh(cancel.right(), drain.left(), forkX)...)
-	mesh := f.state(stateNormal, spec{x: sse.x + sse.w + gap, y: c1 - sh/2, h: sh, lines: []Line{name("Mesh server shutdown")}})
-	joinX := sse.x + sse.w + gap/2
-	f.arrow(flow, hvh(sse.right(), mesh.left(), joinX)...)
-	f.arrow(flow, hvh(drain.right(), mesh.left(), joinX)...)
+	top := f.archChain(sig.x+sig.w+gap, 0, gap,
+		[]Line{name("Cancel context")},
+		[]Line{name("Revert mesh DNS"), body("if the resolver runs")},
+		[]Line{name("SSE shutdown")},
+		[]Line{name("Cancel and"), name("drain actions")},
+		[]Line{name("Mesh server"), name("shutdown")},
+	)
+	sig.y = top[0].cy() - sig.h/2
+	f.arrow(flow, sig.right(), top[0].left())
+	mesh := top[len(top)-1]
 
 	// The bridge teardown runs right to left, under the mesh server.
+	// f.frame places its title when it is called, so the frame's x and
+	// width come from the widths of the states before it is drawn.
 	teardown := [][]Line{
 		{name("Ingress"), body("teardown")},
 		{name("User access"), body("teardown")},
@@ -344,42 +340,49 @@ func architectureShutdownSequence() *Figure {
 		{name("Bridge"), body("teardown")},
 	}
 	th := archStepHeight(teardown...)
-	fy := drain.y + drain.h + 60
-	fr := f.frame(roleNeutral, 0, fy, 0, th+84, "", "Bridge teardown", "bridge mode only")
-	var bridge []*node
+	xs := make([]float64, len(teardown))
 	right := mesh.cx()
 	for i, l := range teardown {
-		n := f.state(stateNormal, spec{y: fy + 60, h: th, lines: l})
-		n.dash = "3 2"
 		if i == 0 {
-			n.x = right - n.w/2
+			xs[i] = right - archStepWidth(l)/2
 		} else {
-			n.x = right - gap - n.w
+			xs[i] = right - gap - archStepWidth(l)
+		}
+		right = xs[i]
+	}
+	fy := mesh.y + mesh.h + 60
+	fx := xs[len(xs)-1] - 24
+	fr := f.frame(roleNeutral, fx, fy, xs[0]+archStepWidth(teardown[0])+24-fx, th+84, "", "Bridge teardown", "bridge mode only")
+	var bridge []*node
+	for i, l := range teardown {
+		n := f.state(stateNormal, spec{x: xs[i], y: fy + 60, h: th, lines: l})
+		n.dash = "3 2"
+		if i > 0 {
 			f.arrow(flow, bridge[i-1].left(), n.right())
 		}
-		right = n.x
 		bridge = append(bridge, n)
 	}
 	f.arrow(flow, mesh.bottom(), bridge[0].top())
-	first, lastB := bridge[0], bridge[len(bridge)-1]
-	fr.x = lastB.x - 24
-	fr.w = first.x + first.w + 24 - fr.x
+	lastB := bridge[len(bridge)-1]
 
 	fw := f.state(stateNormal, spec{y: fr.y + fr.h + 84, h: sh, lines: []Line{name("Firewall teardown")}})
 	fw.x = lastB.cx() - fw.w/2
 	f.arrow(flow, lastB.bottom(), fw.top())
 	wg := f.state(stateNormal, spec{x: fw.x + fw.w + gap, y: fw.y, h: sh, lines: []Line{name("WireGuard teardown")}})
 	f.arrow(flow, fw.right(), wg.left())
-	done := f.state(stateNormal, spec{x: wg.x + wg.w + gap, lines: []Line{name("WaitGroup done"), body("within 30 s?")}})
-	done.y = wg.cy() - done.h/2
-	f.arrow(flow, wg.right(), done.left())
-	ex := done.x + done.w + 110
-	exit := f.state(stateNormal, spec{x: ex, y: done.cy() - 30 - sh, h: sh, lines: []Line{name("Exit 0")}})
-	force := f.state(stateFailed, spec{x: ex, y: done.cy() + 30, h: sh, lines: []Line{name("Force exit")}})
-	branchX := done.x + done.w + 40
-	f.arrow(flow, hvh(done.rightAt(done.cy()-8), exit.left(), branchX)...)
-	f.label(pt{(branchX + ex) / 2, exit.cy()}, body("yes"))
-	f.arrow(refuse, hvh(done.rightAt(done.cy()+8), force.left(), branchX)...)
-	f.labelUnder(pt{(branchX + ex) / 2, force.cy()}, body("no"))
+	wait := f.state(stateNormal, spec{x: wg.x + wg.w + gap, lines: []Line{name("Wait for goroutines"), body("at most 30 s")}})
+	wait.y = wg.cy() - wait.h/2
+	f.arrow(flow, wg.right(), wait.left())
+	ret := f.state(stateNormal, spec{x: wait.x + wait.w + 150, lines: []Line{name("Return nil"), body("exit 0")}})
+	ret.y = wait.cy() - ret.h/2
+	f.arrow(flow, wait.right(), ret.left())
+	f.label(mid(wait.right(), ret.left()), body("all exited"))
+	warn := f.state(stateFailed, spec{y: wait.y + wait.h + 80, lines: []Line{
+		body("Warn:"), code("drain timeout exceeded,"), code("forcing exit"),
+	}})
+	warn.x = wait.cx() - warn.w/2
+	f.arrow(refuse, wait.bottom(), warn.top())
+	f.labelRight(pt{wait.cx(), (wait.y + wait.h + warn.y) / 2}, body("after 30 s"))
+	f.arrow(flow, hv(warn.right(), ret.bottom())...)
 	return f
 }
