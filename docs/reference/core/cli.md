@@ -361,10 +361,10 @@ plexd actions
 
 #### `plexd actions run <name>`
 
-Dispatch an action to the local agent.
+Run a built-in action on the local agent through the node API. Hooks are refused, and so is every run while `actions.enabled` is `false`.
 
 ```
-plexd actions run restart-service --param name=nginx --param force=true
+plexd actions run diagnostics.collect --param include_network=false
 ```
 
 | Flag      | Default | Description                         |

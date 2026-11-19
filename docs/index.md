@@ -78,7 +78,7 @@ Operator and admin reference for configuring and deploying plexd.
 ### Actions
 
 - [Remote Actions and Hooks](reference/actions/remote-actions-hooks.md) — Remote action execution and hook system
-- [Session-Based Action Authorization](reference/actions/session-authorization.md) — Session JWT authorization for SSH-triggered actions
+- [Action Authorization](reference/actions/session-authorization.md) — Who may run an action: control-plane dispatch, and local runs through the node API
 - [Sandbox Options](reference/actions/sandbox-options.md) — Sandbox levels for hook execution
 - [PlexdHook CRD Reference](reference/actions/plexdhook-crd.md) — Kubernetes CRD for hooks that run as Jobs when the control plane dispatches them
 

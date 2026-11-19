@@ -62,7 +62,7 @@ export default defineConfig({
             collapsed: true,
             items: [
               { text: 'Remote Actions & Hooks', link: '/reference/actions/remote-actions-hooks' },
-              { text: 'Session Authorization', link: '/reference/actions/session-authorization' },
+              { text: 'Action Authorization', link: '/reference/actions/session-authorization' },
               { text: 'Sandbox Options', link: '/reference/actions/sandbox-options' },
               { text: 'PlexdHook CRD', link: '/reference/actions/plexdhook-crd' },
             ],
