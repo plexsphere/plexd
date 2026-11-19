@@ -8,7 +8,7 @@ feature: PXD-0014
 
 Public ingress lets a bridge node publish services that run on nodes of its Domain. A client outside the mesh connects to a public TCP port of the bridge, or sends datagrams to a public UDP port, and the bridge forwards the connection or the datagrams over the mesh to a port on the target node. Each published service is a rule of the `bridge.ingress` block of the bridge's state pull, which an operator authors on the bridge Resource in the control plane.
 
-Each rule has a protocol, `tcp` or `udp`. The bridge opens one TCP listener per distinct listen port of the `tcp` rules and one UDP socket per listen port of the `udp` rules, so a `tcp` and a `udp` rule can share a port number. A TCP port with a rule that names no `sni_host` forwards every connection without reading it. On a port whose rules name hosts, the bridge reads the server name of each connection's TLS ClientHello and routes by it, so several HTTPS services share port 443. A `passthrough` rule forwards the TLS session to the target unchanged. A `terminate` rule ends TLS at the bridge with the certificate of the Secret it names, and an `acme` rule with a certificate the bridge obtains from an ACME CA; both forward plaintext to the target. A `udp` rule is a `passthrough` rule without a host: the bridge keeps one flow per client address and port, sends each datagram unchanged to the rule's target, and returns the target's answers to the client (see [Forwarding Datagrams](#forwarding-datagrams)).
+Each rule has a protocol, `tcp` or `udp`. The bridge opens one TCP listener per distinct listen port of the `tcp` rules and one UDP socket per listen port of the `udp` rules, so a `tcp` and a `udp` rule can share a port number. A TCP port with a rule that names no `sni_host` forwards every connection without reading it. On a port whose rules name hosts, the bridge reads the server name of each connection's TLS ClientHello and routes by it, so several HTTPS services share port 443. A `passthrough` rule forwards the TLS session to the target unchanged. A `terminate` rule ends TLS at the bridge with the certificate of the Secret it names, and an `acme` rule with a certificate the bridge obtains from an ACME CA; both forward plaintext to the target. A `terminate` or `acme` rule without request conditions holds its host alone, and the bridge copies the plaintext of each connection to its target. Rules with request conditions, a path prefix and header conditions, share one listen port and host: the bridge reads each HTTP request on such a host and forwards it to the target of the one rule the request matches (see [Routing a Request](#routing-a-request)). A `udp` rule is a `passthrough` rule without a host: the bridge keeps one flow per client address and port, sends each datagram unchanged to the rule's target, and returns the target's answers to the client (see [Forwarding Datagrams](#forwarding-datagrams)).
 
 ## Data Flow
 
@@ -20,7 +20,7 @@ The bridge's dial to a target, and every datagram it sends to the target of a `u
 
 ## The bridge.ingress Block
 
-The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStateBridgeIngressRule`, and its `acme` member a `NodeStateBridgeIngressACME`. The agent contract's `## Public ingress` section in plexsphere's `docs/reference/api/plexd-agent-contract.md` defines it, and its sections `### Terminate rules` and `### ACME rules` define where the certificates come from. The pull lists the rules by `slug` ascending. A bridge with one rule per mode, one plain TCP rule and one UDP rule pulls:
+The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStateBridgeIngressRule`, and its `acme` member a `NodeStateBridgeIngressACME`. The agent contract's `## Public ingress` section in plexsphere's `docs/reference/api/plexd-agent-contract.md` defines it, its sections `### Terminate rules` and `### ACME rules` define where the certificates come from, and its section `### Request conditions` defines how a bridge hands each request of a shared host to one rule. The pull lists the rules by `slug` ascending. A bridge with one `tcp` rule per mode, two `terminate` rules that share one host by their request conditions, one plain TCP rule and one UDP rule pulls:
 
 ```json
 "bridge": {
@@ -72,6 +72,37 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
         "certificate_secret_name": "mqtt-cert"
       },
       {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6",
+        "slug": "shop-api",
+        "protocol": "tcp",
+        "listen_port": 443,
+        "mode": "terminate",
+        "sni_host": "shop.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+        "target_address": "10.42.0.8",
+        "target_port": 8080,
+        "certificate_secret_name": "shop-cert",
+        "conditions": {
+          "path_prefix": "/api"
+        },
+        "strip_path_prefix": true
+      },
+      {
+        "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7",
+        "slug": "shop-web",
+        "protocol": "tcp",
+        "listen_port": 443,
+        "mode": "terminate",
+        "sni_host": "shop.example.com",
+        "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "target_address": "10.42.0.7",
+        "target_port": 3000,
+        "certificate_secret_name": "shop-cert",
+        "conditions": {
+          "path_prefix": "/"
+        }
+      },
+      {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4",
         "slug": "ssh",
         "protocol": "tcp",
@@ -102,6 +133,8 @@ The block is the control plane's `NodeStateBridgeIngress`, each rule a `NodeStat
 | `target_address` | string | The target node's mesh address, IPv4 or IPv6, without brackets |
 | `target_port` | int | The port the bridge dials on the target, 1 to 65535 |
 | `certificate_secret_name` | string, `terminate` only | The Secret of the bridge's Project that holds the rule's certificate chain and key, one PEM document (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). The bridge ignores it on the other modes |
+| `conditions` | object, `terminate` and `acme` only, optional | The request conditions: `path_prefix`, a path the request path equals or continues with `/` after, and `headers`, at most 8 entries of a `name` and a `value`, each a field the request carries with exactly that value. A request must match all of them. A rule has conditions when it names a path prefix, a header, or both; a rule whose member is absent, `null` or empty, or holds an empty `headers`, has none. Rules with conditions share their listen port and host, and the bridge hands each request to one of them (see [Routing a Request](#routing-a-request)) |
+| `strip_path_prefix` | bool, optional | The bridge removes the matched `path_prefix` from the front of the path the target receives, forwards `/` when nothing is left, and keeps the query. Only a rule whose `path_prefix` is present and not `/` carries it, and only when it is `true` |
 
 The `enabled` member is the control plane's switch for the block: a bridge serves the rules only when it is `true` and the bridge's local configuration does not opt out (see [Activation](#activation)). The control plane sends `true` on every block it delivers, and a bridge without rules gets no block at all.
 
@@ -133,6 +166,8 @@ The control plane enables ingress by default, a bridge host opts out in its loca
 
 An upgrade also changes how a bridge serves a `udp` rule. plexd v0.35.0 and earlier decode no `protocol`: they serve a `udp` rule as a TCP listener on its port, report it `listening`, and lose every datagram, and of a `tcp` and a `udp` rule on one port number they hold only one. A bridge that served a `udp` rule as a TCP listener until now opens a UDP socket for it instead, and a `tcp` rule on the same port number keeps a TCP listener of its own. A control plane older than [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) sends no `protocol`, and the bridge serves each of its rules as a `tcp` rule, as before.
 
+An upgrade also changes how a bridge serves the rules with request conditions. plexd v0.35.0 decodes neither `conditions` nor `strip_path_prefix`. It serves a rule with conditions alone on its host as bytes, so every request for the host reaches that rule's target with its path unstripped, whatever the conditions say, and of several rules on one port and host it holds the first in the pull's order and refuses the others with `listener_conflict`. plexd keeps no compatibility path here either: after the upgrade, a rule with conditions that v0.35.0 served as bytes is served as HTTP, with `h2` and `http/1.1` offered in the handshake and each request routed by the rule's conditions, and the rules v0.35.0 refused with `listener_conflict` share their host.
+
 | Field                | Type            | Default | Description                                      |
 |----------------------|-----------------|---------|--------------------------------------------------|
 | `IngressEnabled`     | `*bool`         | `true`  | `bridge.ingress_enabled`: the local switch for public ingress (nil = true). nil and `true` serve, `false` opts out and is reported as `opted_out`. `ApplyDefaults` leaves it nil, and `IngressOptedOut()` is true exactly when it is non-nil and `false` |
@@ -160,12 +195,14 @@ An absent key and an explicit `false` are valid without `Enabled`, so a node out
 | Mode | Behavior |
 |---|---|
 | `passthrough` | The bridge forwards the bytes unchanged, the TLS handshake included, so the target ends TLS |
-| `terminate` | The bridge ends TLS with the certificate of the Secret `certificate_secret_name` names, in the version the secret inventory lists, and forwards plaintext to the target (see [Certificates from the Secret Store](#certificates-from-the-secret-store)) |
-| `acme` | The bridge ends TLS with a certificate it obtains for `sni_host` at the block's `acme` directory, and forwards plaintext to the target (see [ACME and SNI Routing](acme-sni.md)) |
+| `terminate` | The bridge ends TLS with the certificate of the Secret `certificate_secret_name` names, in the version the secret inventory lists, and forwards plaintext to the target (see [Certificates from the Secret Store](#certificates-from-the-secret-store)): the bytes of the session for a rule without conditions, and each request of the host as HTTP/1.1 for rules with conditions (see [Routing a Request](#routing-a-request)) |
+| `acme` | The bridge ends TLS with a certificate it obtains for `sni_host` at the block's `acme` directory, and forwards plaintext to the target as a `terminate` rule does (see [ACME and SNI Routing](acme-sni.md)) |
 
-A `terminate` or `acme` rule needs `sni_host`, because the bridge picks the certificate by the server name. An `acme` rule names an exact host of at least two labels: TLS-ALPN-01 cannot prove a wildcard, and `autocert` refuses a name without a dot. A terminating rule offers no ALPN protocol (see [TLS Termination](#tls-termination)), and the bridge opens no TLS connection to the target.
+A `terminate` or `acme` rule needs `sni_host`, because the bridge picks the certificate by the server name. An `acme` rule names an exact host of at least two labels: TLS-ALPN-01 cannot prove a wildcard, and `autocert` refuses a name without a dot. A terminating host whose rule has no conditions offers no ALPN protocol, and one whose rules have conditions offers `h2` and `http/1.1` (see [TLS Termination](#tls-termination)). The bridge opens no TLS connection to the target.
 
-A held `terminate` or `acme` rule that cannot serve yet keeps its `(listen_port, sni_host)` slot, so no other rule takes its host, not even a wildcard `passthrough` rule that covers it, and its port keeps its listener. A `terminate` rule waits for its certificate, and an `acme` rule with a reason is not served while the reason holds.
+Only a `terminate` or `acme` rule may carry request conditions: the bridge reads no request of a `passthrough` rule, which every `udp` rule is. A terminating rule without conditions holds its listen port and host alone. Rules with conditions share one listen port and host when they all name the same mode and, on `terminate`, the same `certificate_secret_name`, and no two have the same conditions: the bridge ends TLS once per connection, before it reads a request, so one host has one TLS configuration (see [The Listener Plan](#the-listener-plan)).
+
+A held `terminate` or `acme` rule that cannot serve yet keeps its `(listen_port, sni_host)` slot: no rule takes its host but one that shares the host by its conditions, not even a wildcard `passthrough` rule that covers it, and its port keeps its listener. A `terminate` rule waits for its certificate, and an `acme` rule with a reason is not served while the reason holds.
 
 ## The Listener Plan
 
@@ -175,7 +212,7 @@ type acmeAvailability struct{ Reason, Detail string }
 func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) ingressPlan
 ```
 
-Before any check, `planIngress` sets an empty `protocol` to `tcp` on its copy of the rule, so every rule state and route carries `tcp` or `udp`. `Apply` keeps a route whose rule compares equal to the last one, so without this a control plane that starts to send the member would cut every established connection once. It walks the rules in the order the pull lists them and gives each the first reason that applies:
+Before any check, `planIngress` sets an empty `protocol` to `tcp` on its copy of the rule, so every rule state and route carries `tcp` or `udp`. `Apply` keeps a route whose rule compares equal to the last one (`IngressRule.Equal`), so without this a control plane that starts to send the member would cut every established connection once. It also sets an empty list of header conditions to nil, since an empty list is no condition, as an absent one is. It walks the rules in the order the pull lists them and gives each the first reason that applies:
 
 | Order | Check | Reason | Detail |
 | --- | --- | --- | --- |
@@ -188,10 +225,24 @@ Before any check, `planIngress` sets an empty `protocol` to `tcp` on its copy of
 | 7 | `target_address` is not an IP address, or carries a port, brackets or a zone | `invalid_rule` | `target_address` |
 | 8 | `target_port` outside 1 to 65535 | `invalid_rule` | `target_port` |
 | 9 | on `terminate`, `certificate_secret_name` is outside the Secret name grammar `^[a-z][a-z0-9_-]{0,62}$` (`api.ValidSecretName`) | `invalid_rule` | `certificate_secret_name` |
-| 10 | a held rule of the same protocol holds the listener: for a `tcp` rule, a held `tcp` rule has the same port and the same host, or one of the two has no host; for a `udp` rule, a held `udp` rule has the same port | `listener_conflict` | slug of the holder |
-| 11 | `max_ingress_rules` rules are held already, of both protocols together | `max_rules` | |
+| 10 | the rule has conditions and its `mode` is `passthrough`, which every `udp` rule is | `invalid_rule` | `conditions` |
+| 11 | `conditions.path_prefix` is neither empty nor `/`, and does not start with `/`, is longer than 1024 bytes, ends in `/`, or has a segment that is empty, is `.` or `..`, or holds a byte outside letters, digits and `- . _ ~ ! $ & ' ( ) * + , ; = : @` (`validPathPrefix`) | `invalid_rule` | `conditions.path_prefix` |
+| 12 | `conditions.headers` holds more than 8 entries; a `name` that is not 1 to 64 characters of lowercase letters, digits and ``! # $ % & ' * + - . ^ _ ` \| ~``, that is `host`, or that an earlier entry carries; or a `value` that is not 1 to 256 bytes of 0x20 to 0x7E, or that starts or ends with a space (`validHeaderConditions`) | `invalid_rule` | `conditions.headers` |
+| 13 | `strip_path_prefix` is set while `conditions.path_prefix` is empty or `/` | `invalid_rule` | `strip_path_prefix` |
+| 14 | a held rule of the same protocol holds the listener: for a `tcp` rule, a held `tcp` rule has the same port and the same host and the two may not share it (see below), or one of the two has no host; for a `udp` rule, a held `udp` rule has the same port | `listener_conflict` | slug of the held rule it conflicts with |
+| 15 | `max_ingress_rules` rules are held already, of both protocols together | `max_rules` | |
 
-A rule that passes check 11 is held. A `udp` rule is a `passthrough` rule, so check 9 never applies to it and a `certificate_secret_name` on it is ignored, as on every mode but `terminate`. Listener conflicts are per protocol: a `tcp` and a `udp` rule on one port number are both held, and a `udp` rule, which has no host, conflicts with the held `udp` rule of its port. After the walk, each held `acme` rule gets the first reason that applies:
+A `tcp` rule whose port and host a held rule already holds may join the host. The first case that applies gives it `listener_conflict` instead:
+
+| Case | Detail |
+| --- | --- |
+| the rule has no conditions, or the host's rules have none | slug of the host's first held rule |
+| the rule names another `mode` than the host's rules, or on `terminate` another `certificate_secret_name` | slug of the host's first held rule |
+| a held rule of the host has the same conditions: the same path prefix, an empty one counting as `/`, and the same header conditions in any order (`conditionsKey`) | slug of that rule |
+
+Any other rule joins the host and counts toward `max_ingress_rules` like every held rule. The table maps the host to an `ingressHost`, which holds one route for a rule without conditions and otherwise the routes of every rule that shares the host, with `http` set: the bridge reads each request of such a host. After the walk, `planIngress` sorts the routes of each host by precedence (`comparePrecedence`): the longer path prefix first, an empty one counting as `/`, then more header conditions, then the lower slug in byte order, then the lower id (see [Routing a Request](#routing-a-request)). The host's first route after the sort, its lead route, names the host's mode and Secret and gives its served state: the rules of a host share them.
+
+A rule that passes check 15 is held. A `udp` rule is a `passthrough` rule, so check 9 never applies to it and a `certificate_secret_name` on it is ignored, as on every mode but `terminate`. Listener conflicts are per protocol: a `tcp` and a `udp` rule on one port number are both held, and a `udp` rule, which has no host, conflicts with the held `udp` rule of its port. After the walk, each held `acme` rule gets the first reason that applies:
 
 | Order | Check | Reason | Detail |
 | --- | --- | --- | --- |
@@ -205,7 +256,7 @@ Every port with a held `tcp` rule gets a routing table and a listener, also a po
 
 A held `terminate` rule's state also follows its certificate: `RuleStates()` reports it served exactly while the manager holds a certificate for its Secret, and otherwise with `certificate_secret_not_listed`, `certificate_fetch_failed` or `certificate_invalid` and the Secret name as detail (see [Certificates from the Secret Store](#certificates-from-the-secret-store)).
 
-The control plane refuses a rule set a bridge could not serve: a second rule on a listener another rule holds answers `409 bridge_port_conflict`, a `terminate` or `acme` rule without `sni_host` answers `400 ingress_rule_invalid`, and a `terminate` rule whose Secret the bridge Resource may not read answers `422 certificate_secret_not_readable`. Since [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) it delivers a `udp` rule only as `passthrough`, without `sni_host` and `certificate_secret_name`, and lets a `tcp` and a `udp` rule share a port number. A rule the bridge skips is therefore a defect report, not a routine path. The bridge serves the rest of the block and logs `ingress rule not served` for the rule.
+The control plane refuses a rule set a bridge could not serve: a second rule on a listener another rule holds answers `409 bridge_port_conflict` unless the two share it by their request conditions, a `terminate` or `acme` rule without `sni_host` answers `400 ingress_rule_invalid`, and a `terminate` rule whose Secret the bridge Resource may not read answers `422 certificate_secret_not_readable`. Since [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) it delivers a `udp` rule only as `passthrough`, without `sni_host` and `certificate_secret_name`, and lets a `tcp` and a `udp` rule share a port number. Since [plexsphere/plexsphere#1119](https://github.com/plexsphere/plexsphere/pull/1119) it delivers `conditions` only on a `terminate` or `acme` rule and within the grammar of checks 11 and 12, `strip_path_prefix` only with a path prefix other than `/`, and rules on one port and host only under the terms of the table above. A rule the bridge skips is therefore a defect report, not a routine path. The bridge serves the rest of the block and logs `ingress rule not served` for the rule.
 
 `target_address` is checked for syntax only. The pull is the node's authenticated configuration, and the control plane resolves the address from the target node.
 
@@ -250,7 +301,7 @@ The unexported `loadCertificates` runs at the end of every `SyncSecretInventory`
 | Inventory | Entry | Outcome |
 | --- | --- | --- |
 | does not list the name (or no inventory yet) | no certificate | reason `certificate_secret_not_listed`; no fetch |
-| does not list the name | a certificate | the certificate is dropped, the connections of every rule naming it are closed, `ingress certificate dropped` is logged |
+| does not list the name | a certificate | the certificate is dropped, the connections of every rule naming it are closed, the client connections of a host whose rules have conditions included, `ingress certificate dropped` is logged |
 | lists version v | a certificate of version v | nothing |
 | lists version v | none, or another version | fetch v, unless v failed as invalid, or failed to fetch and the next attempt is not due |
 
@@ -265,7 +316,7 @@ The value is one PEM document (RFC 7468): the certificate chain, leaf first, as 
 
 In both cases a certificate the entry already holds keeps serving, and the rule stays served with it: a rotation that fails never takes a working certificate away. `ingress certificate not loaded` names the version that failed and the `serving_version`, and is logged once per Secret, version and reason. A `403` for a listed name is a fetch failure like any other, so the bridge retries it on the schedule above; only an inventory that leaves the name out drops the certificate.
 
-A new version replaces the certificate and closes nothing: an established connection keeps its session, and the next handshake gets the new certificate. An inventory that stops listing a name drops its certificate and closes the established connections of every rule that names the Secret, while the other rules of the port keep theirs and the listener stays open. A rule's connections are closed by cancelling its route and storing a copy of the port's table with a fresh route for the rule. An entry that no held rule names any more is deleted, so a rule that names the Secret again fetches it again.
+A new version replaces the certificate and closes nothing: an established connection keeps its session, and the next handshake gets the new certificate. An inventory that stops listing a name drops its certificate and closes the established connections of every rule that names the Secret, while the other rules of the port keep theirs and the listener stays open. A rule's connections are closed by cancelling its route and storing a copy of the port's table with a fresh route for the rule (`renewRoutesLocked`). A fresh route of a rule with conditions gets a fresh proxy, so the rule's target connections close and its requests in flight are aborted, and a host whose rules have conditions gets a fresh context, so its client connections close too. The rules of a host name one Secret, so all of its routes are renewed together. An entry that no held rule names any more is deleted, so a rule that names the Secret again fetches it again.
 
 When the leaf of a loaded certificate does not cover a rule's host (`x509.Certificate.VerifyHostname`, with `x` in place of the `*` of a wildcard host), the bridge logs `ingress certificate does not cover the rule's host` and serves the certificate anyway: the control plane checks no coverage, and the client reports the mismatch itself. plexd checks neither expiry, chain nor key strength.
 
@@ -292,7 +343,7 @@ type nodeSecretFetcher struct {
 The accept loop of a port loads the port's routing table for each connection:
 
 - **A plain port.** The rule without `sni_host` takes every connection. The bridge reads nothing and dials the target, so a protocol whose server speaks first, such as SSH or SMTP, works as well as TLS.
-- **An SNI port.** `peekClientHello` reads the TLS ClientHello without answering it: `crypto/tls` parses it, so a hello that spans several reads or records, or that orders the server name behind a large key share, is read in full. The peek reads at most 16 KiB and waits at most 5 s, and returns the server name and the ALPN protocols the client offers. On port 443 a hello that offers only `acme-tls/1` can be an ACME challenge (see [ACME Challenges](#acme-challenges)). Otherwise the server name is compared with the rules' hosts case-insensitively. An exact host wins over a wildcard, and `*.example.com` matches exactly one label in place of the `*`: it matches `a.example.com` and neither `example.com` nor `a.b.example.com`. A `passthrough` rule dials the target and replays the bytes it peeked to it first. A `terminate` or `acme` rule ends TLS at the bridge (see [TLS Termination](#tls-termination)).
+- **An SNI port.** `peekClientHello` reads the TLS ClientHello without answering it: `crypto/tls` parses it, so a hello that spans several reads or records, or that orders the server name behind a large key share, is read in full. The peek reads at most 16 KiB and waits at most 5 s, and returns the server name and the ALPN protocols the client offers. On port 443 a hello that offers only `acme-tls/1` can be an ACME challenge (see [ACME Challenges](#acme-challenges)). Otherwise the server name is compared with the rules' hosts case-insensitively. An exact host wins over a wildcard, and `*.example.com` matches exactly one label in place of the `*`: it matches `a.example.com` and neither `example.com` nor `a.b.example.com`. The name selects one host, an `ingressHost`, whose lead route gives the mode, the Secret and the served state of all its rules. A `passthrough` rule dials the target and replays the bytes it peeked to it first. A `terminate` or `acme` rule ends TLS at the bridge (see [TLS Termination](#tls-termination)). On a host whose rules have conditions, the bridge then reads each request and picks one of the host's rules for it (see [Routing a Request](#routing-a-request)).
 
 A connection that matches no served rule is closed without a byte from any target and logged at Debug, with one of these reasons:
 
@@ -301,27 +352,109 @@ A connection that matches no served rule is closed without a byte from any targe
 | `no_client_hello` | The client sent no ClientHello within 5 s or 16 KiB, closed the connection, or sent bytes that are not TLS |
 | `no_server_name` | The ClientHello carries no server name |
 | `no_matching_rule` | No rule's host matches the server name |
-| `rule_not_served` | The matching rule is an `acme` rule with a reason |
-| `no_certificate` | The matching rule is a `terminate` rule whose certificate is not loaded |
+| `rule_not_served` | The matching host's rules are `acme` rules with a reason |
+| `no_certificate` | The matching host's rules are `terminate` rules whose certificate is not loaded |
 | `tls_handshake_failed` | The TLS handshake of a `terminate` or `acme` rule failed, or did not complete within 10 s. For an `acme` rule the 10 s include the wait for a certificate that is still being issued |
 
 The level is Debug because a public port draws scanners: a line per connection at Warn would let any client fill the log and the log forwarder.
 
-The bridge dials `target_address:target_port` with `ingress_dial_timeout` and copies both ways, the plaintext of a terminated session included, until one side ends or the rule is removed or changed. A failed dial closes the client connection and logs `bridge: ingress: dial target failed` with the dial's `reason`.
+For a plain port, a `passthrough` rule and a terminating host whose rule has no conditions, the bridge dials `target_address:target_port` with `ingress_dial_timeout` once per connection and copies both ways, the plaintext of a terminated session included, until one side ends or the rule is removed or changed. A failed dial closes the client connection and logs `bridge: ingress: dial target failed` with the dial's `reason`. A host whose rules have conditions dials when a request needs a new target connection, and answers a failed dial with `502` or `504` on a client connection that stays open (see [Routing a Request](#routing-a-request)).
 
-Right after each dial, the manager records its outcome per rule id, with the target it dialled and the time on its clock, and the ingress status report reads it as the rule's `dial` (see [Rule Entries](#rule-entries)). A dial whose route was cancelled meanwhile, because the rule changed or was removed or the manager stopped, records nothing, and its error, `context.Canceled` or a failure of a target the rule no longer names, is not classified. `Apply` drops the records of rules it no longer holds and `Teardown` drops them all, so the manager holds at most `bridge.max_ingress_rules` records. A connection costs one lock and one map write more for the record.
+Right after each dial, the manager records its outcome per rule id, with the target it dialled and the time on its clock, and the ingress status report reads it as the rule's `dial` (see [Rule Entries](#rule-entries)). A dial of a rule with conditions is recorded the same way. A dial whose route was cancelled meanwhile, because the rule changed or was removed or the manager stopped, records nothing, and its error, `context.Canceled` or a failure of a target the rule no longer names, is not classified. `Apply` drops the records of rules it no longer holds and `Teardown` drops them all, so the manager holds at most `bridge.max_ingress_rules` records. A connection costs one lock and one map write more for the record.
 
 ### TLS Termination
 
-For a `terminate` or `acme` rule the bridge completes the TLS handshake itself, with `tls.Server` over `newPeekConn(conn, peeked)`, so the handshake reads the ClientHello it peeked first. Its `tls.Config` has `MinVersion: tls.VersionTLS12`, no `NextProtos`, and either `Certificates` holding the rule's loaded certificate (`terminate`) or `GetCertificate: m.acme.GetCertificate` (`acme`). A `terminate` rule without a loaded certificate closes the connection with `no_certificate` before any handshake. After the handshake the bridge dials the target and copies the plaintext both ways.
+For a `terminate` or `acme` rule the bridge completes the TLS handshake itself, with `tls.Server` over a connection that replays the ClientHello it peeked first. Its `tls.Config` has `MinVersion: tls.VersionTLS12` and either `Certificates` holding the loaded certificate of the host's Secret (`terminate`) or `GetCertificate: boundedGetCertificate(m.acme.GetCertificate)` (`acme`). A `terminate` host without a loaded certificate closes the connection with `no_certificate` before any handshake.
 
-A terminating rule offers no ALPN protocol. The bridge forwards plaintext to the target, and a negotiated `h2` would hand the target HTTP/2 frames it did not ask for. A client that offers `h2` and `http/1.1` completes the handshake, and no protocol is negotiated.
+The host decides the ALPN protocols and what follows the handshake:
 
-The handshake is bounded by 10 s: the package constant `ingressHandshakeTimeout`, which the manager holds in its unexported field `handshakeTimeout` so that a test can shorten it. The bound covers the whole handshake, and for an `acme` rule also the wait for a certificate that is still being issued. A client that sends a ClientHello and then stays silent is closed with `tls_handshake_failed` when the bound ends. So is a client of an `acme` host whose certificate is not ready within the bound; `autocert` finishes the issuance in the background, and a later handshake gets the certificate (see [Obtaining a Certificate](acme-sni.md#obtaining-a-certificate)). The bound ends with the handshake: the plaintext copy that follows has no deadline.
+| Host | `NextProtos` | Connection `tls.Server` wraps | After the handshake |
+| --- | --- | --- | --- |
+| Its rule has no conditions | none | `newPeekConn(conn, peeked)` | The bridge dials the target and copies the plaintext both ways |
+| Its rules have conditions | `[]string{"h2", "http/1.1"}` | an `ingressHTTPConn` around `newPeekConn(conn, peeked)` | `serveConn` hands the `*tls.Conn` to the manager's HTTP server and returns without closing it (see [Routing a Request](#routing-a-request)) |
+
+A host without conditions offers no ALPN protocol. The bridge copies the plaintext to the target, and a negotiated `h2` would hand the target HTTP/2 frames it did not ask for. A client that offers `h2` and `http/1.1` completes the handshake, and no protocol is negotiated. A host with conditions offers `h2` and `http/1.1`, in that order of preference, because the bridge reads the requests itself and speaks HTTP/1.1 to the target whatever the client negotiated. A client that offers no ALPN protocol speaks HTTP/1.1, and one that offers ALPN protocols but neither of the two fails the handshake (`tls_handshake_failed`). The HTTP server receives the `*tls.Conn` itself: `net/http` serves HTTP/2 only on a `*tls.Conn`, not on a type that wraps one.
+
+The handshake is bounded by 10 s: the package constant `ingressHandshakeTimeout`, which the manager holds in its unexported field `handshakeTimeout` so that a test can shorten it. The bound covers the whole handshake, and for an `acme` rule also the wait for a certificate that is still being issued. A client that sends a ClientHello and then stays silent is closed with `tls_handshake_failed` when the bound ends. So is a client of an `acme` host whose certificate is not ready within the bound; `autocert` finishes the issuance in the background, and a later handshake gets the certificate (see [Obtaining a Certificate](acme-sni.md#obtaining-a-certificate)). The bound ends with the handshake: the plaintext copy that follows has no deadline, and on a host whose rules have conditions the bounds of the HTTP server take over (see [Limits](#limits)).
 
 ### ACME Challenges
 
 On port 443, a ClientHello whose ALPN list is exactly `["acme-tls/1"]` and whose server name `ACMEManager.HasHost` knows is a TLS-ALPN-01 challenge when the port's table has no route for the name or routes it to an `acme` rule. The bridge answers it with a `tls.Config` of its own, `GetCertificate: m.acme.GetCertificate`, `NextProtos: []string{acme.ALPNProto}` and `MinVersion: tls.VersionTLS12`, within the same 10 s bound, logs `ingress acme challenge answered` at Debug and closes the connection. No target is dialed. The same hello for the host of a `passthrough` rule is forwarded like any other connection, so a target that runs its own ACME client keeps working. See [The Challenge on Port 443](acme-sni.md#the-challenge-on-port-443).
+
+## Routing a Request
+
+The bridge reads HTTP on a host of an SNI port whose `terminate` or `acme` rules have request conditions. The host's table entry, an `ingressHost` with `http` set, holds the routes of every rule that shares the host, in precedence order. After the TLS handshake (see [TLS Termination](#tls-termination)) the bridge reads each request on the client connection, in HTTP/2 or HTTP/1.1 as the handshake negotiated, picks one of the host's rules for it by its path and header fields, and forwards it to that rule's target. A host whose rule has no conditions, and every `passthrough` rule, are forwarded as bytes (see [Routing a Connection](#routing-a-connection)).
+
+`Setup` starts one `http.Server` per manager on an `ingressConnQueue`, a `net.Listener` whose `Accept` returns the handshaken connections `serveConn` pushes. `Teardown` closes the server and waits for its `Serve` to return, and a connection pushed after that is closed. The connection under each TLS session is an `ingressHTTPConn`: it replays the peeked ClientHello, carries the listener and the ClientHello's server name that the requests are routed by, and closes when the manager's context or the host's context is done. Its `Close` runs once, closes the socket and counts the connection out of `status.ingress.connection_count`, and never takes the manager's lock. The server's `ConnContext` puts the `ingressHTTPConn` into the context of each request. The server sets `DisableGeneralOptionsHandler`: without it `net/http` would answer an `OPTIONS *` request with `200` by itself, and with it the request reaches the handler, which answers `400` as for any other request target that does not start with `/`.
+
+### Matching a Request
+
+The handler, `serveHTTP`, takes these steps for each request:
+
+1. It loads the listener's current routing table and matches the connection's server name, so each request follows the rules of the last `Apply`. When the name no longer routes to a served host whose rules have conditions, it aborts the request with `http.ErrAbortHandler`: an HTTP/1.1 client sees its connection close, and an HTTP/2 client sees the request's stream reset.
+2. It answers `421 Misdirected Request` when the request's authority, `Host` in HTTP/1.1 and `:authority` in HTTP/2, names a host this one does not serve. `hostCovers` compares the authority without its port and without one trailing dot, in lowercase, as `match` compares a server name, so `*.example.com` covers one label in place of the `*`. The port's table must also route the authority to the host that serves the connection, so a name of an exact host beside the wildcard that matched the server name gets `421` too. An HTTP/2 client reuses a connection for every name its certificate covers (RFC 9113, section 9.1.1), and without the check a request for another host would be routed by this host's rules. An empty authority, which an HTTP/1.0 request without `Host` has, is covered by no host.
+3. It answers `400 Bad Request` for a `CONNECT` request, for a request target that does not start with `/`, such as the `*` of `OPTIONS *`, and for a path with a `.` or `..` segment, written literally or with `%2e` in either case (`hasDotSegment`). Without that refusal `/api/../internal` would match the prefix `/api` and reach a path of that target the rule does not publish. Browsers, curl and every RFC 3986 client remove dot segments before they send.
+4. It picks the first of the host's routes, in precedence order, whose conditions the request matches (`ingressHost.route`). When none matches, it answers `404 Not Found` and dials nothing, also on a host whose only rule the request does not match.
+5. It forwards the request through the route's proxy, under a context that ends with the request's context or with the route's (see [Forwarding a Request](#forwarding-a-request)).
+
+The path a route matches is `r.URL.EscapedPath()`: the path as the client sent it, percent-encoded, without the query. The bridge compares it byte for byte, with case, and decodes nothing, merges no slashes and resolves no dot segment: a normalized path could differ from the one the target receives. A route matches when its path prefix matches and each of its header conditions matches:
+
+- A path prefix matches the path equal to it and every path that continues with `/` after it: `/api` matches `/api` and `/api/users`, and neither `/apix` nor `/API`. An empty prefix and `/` match every path.
+- A header condition matches when one field line of its name carries exactly its value. The name compares without case, as `net/http` keys the fields, and the value with case, after the whitespace trim of HTTP parsing. A second field line of the name with the value matches. A list value `a, b` on one line does not match `a`, and neither does a request without the field.
+
+Of the routes that match, the first in precedence order wins: the longer path prefix, an empty one counting as `/`; then more header conditions; then the lower slug in byte order; then the lower id. The control plane keeps slugs unique within a bridge, so a request that several rules match has one winner. For the sample block, `/api/users?x=1` on `shop.example.com` reaches the target of `shop-api` as `/users?x=1`, and `/apix` and `/` reach the target of `shop-web` as they arrived.
+
+### Answers of the Bridge
+
+The bridge answers a request by itself in five cases, each with its status text as a `text/plain; charset=utf-8` body written by `http.Error`, such as `Not Found`:
+
+| Status | `reason` | Cause |
+| --- | --- | --- |
+| `400 Bad Request` | `bad_path` | A `CONNECT` request, a request target that does not start with `/`, or a path with a dot segment |
+| `404 Not Found` | `no_matching_rule` | No route of the host matches the request; nothing is dialed |
+| `421 Misdirected Request` | `misdirected` | The host does not cover the authority, or the port routes the authority to another host |
+| `502 Bad Gateway` | `dial_failed` | The dial to the target failed with a reason other than `timeout`: `refused`, `unreachable`, `policy_denied` or `other` |
+| `502 Bad Gateway` | `target_error` | The target broke the exchange before its response header: it closed the connection, or sent something that is no HTTP response |
+| `504 Gateway Timeout` | `dial_failed` | The dial to the target failed with the reason `timeout` |
+
+`net/http` answers two more cases itself, before `serveHTTP` runs: `400` for a malformed request, and `431 Request Header Fields Too Large` for a request header over 64 KiB (see [Limits](#limits)). A client that goes away while the target works on its request gets nothing: the request to the target ends with the client's, the rule's dial record stays as it was, and the bridge logs no line for it.
+
+Each answer of the bridge logs the Debug line `ingress request not forwarded` with `listen_port`, `remote`, `server_name`, `status` and `reason`, with `rule_id` and `slug` once a rule matched, and with `error` for a `502` or `504`. No line of the bridge carries a header value, nor a request's path or query: a header value can be a routing token, and a URL can hold a credential. The level is Debug because a public port draws scanners. A forwarded request logs nothing.
+
+A request in flight is aborted, as in step 1, when:
+
+- its rule changes or leaves the block: `Apply` cancels the rule's route, which ends the request's context;
+- the host's mode or Secret changes, the host leaves the block, or its certificate is dropped: the host's context ends, which closes the client connection;
+- the manager stops;
+- the target breaks the exchange after its response header, when no status can be sent any more.
+
+When only one rule of a host changes, the requests in flight on the host's other rules complete, and of the host's client connections only an HTTP/1.1 connection whose request was aborted closes.
+
+### Forwarding a Request
+
+Each route with conditions has an `httputil.ReverseProxy` of its own, which `newRouteProxy` builds whenever the route gets a new context, over an `http.Transport` of its own:
+
+- The transport speaks HTTP/1.1 in cleartext to `target_address:target_port` over the mesh, whatever the client negotiated, as a terminating rule's target receives plaintext. It keeps the target connections alive and pools them per rule: at most 32 idle ones (`MaxIdleConnsPerHost`), each closed after 90 s without a request (`IdleConnTimeout`). A gRPC service needs HTTP/2 to its target and stays a `passthrough` rule.
+- Its `Proxy` is nil, so no dial goes through `HTTP_PROXY` or `HTTPS_PROXY`. `DisableCompression` keeps it from asking for a compressed response of its own, so the client's `Accept-Encoding` and the encoding of the target's response pass unchanged.
+- Its `DialContext` dials with `dialTarget`, under the route's context and within `bridge.ingress_dial_timeout`, records the outcome with `recordDial`, and logs a failed dial with `bridge: ingress: dial target failed` through `logDialFailed`, the line of the byte forwarding. The error it returns, an `ingressDialError`, carries the dial's reason, which tells a `504` from a `502`.
+- When the route's context ends, the transport closes its idle connections.
+
+`Apply` carries the proxy of an unchanged rule with the rule's context, so the rule keeps its target connections across a pull.
+
+The proxy's `Rewrite` sends the target:
+
+- The path and the query as the client sent them. `httputil.ReverseProxy` drops query parameters it cannot parse before `Rewrite`, and `Rewrite` puts the raw query back (`Out.URL.RawQuery = In.URL.RawQuery`).
+- On a rule with `strip_path_prefix`, the path without the rule's prefix: `Rewrite` removes the prefix from the front of `In.URL.EscapedPath()`, sends `/` when nothing is left, keeps the percent-encoding of the rest, and sets `X-Forwarded-Prefix` to the prefix. For the prefix `/api`, `/api/users%2Fx?a=1;b=2&c` reaches the target as `/users%2Fx?a=1;b=2&c`, and `/api` as `/`. A rule without `strip_path_prefix` sends no `X-Forwarded-Prefix`.
+- The client's `Host`, unchanged.
+- `X-Forwarded-For` with the client's address alone, `X-Forwarded-Host` with the request's `Host`, and `X-Forwarded-Proto: https` (`ProxyRequest.SetXForwarded`). The target connection comes from the bridge, so these fields are where the target learns the client.
+
+The bridge is the first proxy, so a client's value in one of these fields is a claim. `httputil.ReverseProxy` removes the client's `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` before `Rewrite`, and `Rewrite` removes every other field whose name starts with `X-Forwarded-`, a client's `X-Forwarded-Prefix` included, before it sets its own. Every other field passes unchanged, apart from the hop-by-hop fields of the client's connection, such as `Connection`, the fields it names, and `Keep-Alive`, which `httputil.ReverseProxy` removes. The target's response reaches the client with its status, fields and body, again without its hop-by-hop fields.
+
+### Upgrades
+
+An HTTP/1.1 upgrade, such as a WebSocket, is carried. The proxy forwards the upgrade request with its `Connection: Upgrade` and `Upgrade` fields, and after the target's `101 Switching Protocols` it copies bytes both ways until one side closes or the request's context ends, so a change or removal of the rule closes the upgraded connection. The upgraded connection counts in `connection_count` until it closes, and closes with the host's and the manager's context like any other client connection.
+
+WebSocket over HTTP/2 (RFC 8441) is not offered. Go's HTTP/2 server announces `SETTINGS_ENABLE_CONNECT_PROTOCOL` only under `GODEBUG=http2xconnect=1`, which plexd does not set, so a browser opens an HTTP/1.1 connection for a WebSocket by itself. `net/http` refuses an extended `CONNECT` over HTTP/2, one that carries `:protocol`, with a stream error, and `serveHTTP` answers any other `CONNECT` with `400`.
 
 ## Forwarding Datagrams
 
@@ -356,8 +489,8 @@ A flow holds one socket, one goroutine and one read buffer of 64 KiB, so a full 
 1. It returns `bridge: ingress: manager is not active` before `Setup` or after `Teardown`.
 2. It checks the block's `acme` member with `checkACMEDirectory(block.ACME, cfg.ACMEDirectoryURLs)` and plans the rules with the outcome.
 3. It deletes the certificate entries of the Secret names no held rule names any more.
-4. A route whose rule is unchanged, compared with `==` and so with `protocol` and `certificate_secret_name` included, keeps its context and its established connections or flows. Every other planned route gets a new context. Every route of the last `Apply` that is not carried over is cancelled, which closes its connections and flows. Other rules on the port keep theirs.
-5. For a TCP port in the plan without a listener, it calls `IngressController.Listen(":<port>", nil)`, also for the challenge-only port 443. On an error it marks the port's `tcp` rules `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on :<port>: <error>` to the result.
+4. A route whose rule is unchanged, compared with `IngressRule.Equal` and so with `protocol`, `certificate_secret_name`, `conditions` and `strip_path_prefix` included, keeps its context and its established connections or flows, and a route with conditions also keeps its proxy and with it its target connections. Every other planned route gets a new context, and one with conditions a new proxy. Every route of the last `Apply` that is not carried over is cancelled, which closes its connections and flows and aborts its requests in flight. Other rules on the port keep theirs. A host whose rules have conditions then takes over the context of the host the port's current table holds under the same key, the exact host or the wildcard suffix, when that host's rules have conditions too and its lead rule names the same mode and `certificate_secret_name` (`sameTermination`); otherwise it gets a new context. Every current host with conditions that no planned host took over is cancelled, which closes its client connections. A pull that adds, changes or removes one rule of such a host therefore keeps the host's client connections, and a changed mode or Secret closes them.
+5. For a TCP port in the plan without a listener, it calls `IngressController.Listen(":<port>", nil)`, also for the challenge-only port 443. On an error it cancels the port's planned routes and hosts, marks the port's `tcp` rules `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on :<port>: <error>` to the result.
 6. For a TCP port with a listener, it stores the new routing table. The listener is not rebound, also when the port changes between a plain rule and SNI rules.
 7. For each port of the `udp` rules, in ascending order, it stores the new route when the port has a UDP socket, and otherwise calls `IngressController.ListenUDP(":<port>")` and starts the socket's read loop. On an error it marks that port's `udp` rule `listen_failed`, goes on with the other ports, and adds `bridge: ingress: listen on udp :<port>: <error>` to the result. The failed binds are kept per protocol, so a failed TCP bind of a port number leaves a `udp` rule on that number served, and the reverse.
 8. It closes the listener of a TCP port and the socket of a UDP port that left the plan. Once it released its lock, it waits for the accept loop of each such listener and for the read loop of each such socket, which waits for the reply loops of its flows: a read loop takes the lock to record a dial.
@@ -367,7 +500,7 @@ A flow holds one socket, one goroutine and one read buffer of 64 KiB, so a full 
 
 `Apply` does not read the block's `enabled` member: [IngressReconcileHandler](#ingressreconcilehandler) hands it the zero block when the pull does not enable ingress.
 
-A second `Apply` with the same block, after one whose binds all succeeded, binds nothing, cancels nothing, keeps every connection and flow and the ACME account as they are, and logs no rule or listener line again. It is not free of side effects: its `loadCertificates` still fetches a version whose last fetch failed once that version's next attempt is due, and logs `ingress certificate loaded` when the retry succeeds (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). A failed bind fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
+A second `Apply` with the same block, after one whose binds all succeeded, binds nothing, cancels nothing, keeps every connection and flow, every target connection of a rule with conditions, and the ACME account as they are, and logs no rule or listener line again. It is not free of side effects: its `loadCertificates` still fetches a version whose last fetch failed once that version's next attempt is due, and logs `ingress certificate loaded` when the retry succeeds (see [Certificates from the Secret Store](#certificates-from-the-secret-store)). A failed bind fails the reconcile cycle, so the reconciler keeps its snapshot, and the next pull tries the bind again.
 
 ## Ports Below 1024
 
@@ -412,18 +545,18 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 
 Neither `acme` nor `certs` may be nil. In bridge mode, `plexd up` reads the node secret key with `identity.SecretKey()` (an error fails `plexd up` as `plexd up: <error>`) and builds `nodeSecretFetcher` with it once, when the bridge serves public ingress, user access or site-to-site tunnels. Unless `bridge.ingress_enabled` is `false`, it builds the `ACMEManager` over the cache directory (`bridge.acme_cache_dir`, or `<data_dir>/acme`) and passes the two to `NewIngressManager`. A bridge that opts out builds neither manager and reads no node secret key for ingress; it reads the key for user access or site-to-site tunnels unless `bridge.user_access_enabled` and `bridge.site_to_site_enabled` are `false` too.
 
-Concurrent-safe via `sync.Mutex`. The connection counter, which counts the open connections of the `tcp` rules and the open flows of the `udp` rules, is an `atomic.Int64`. Each UDP socket guards its own flows with a lock of its own, so a datagram on an open flow takes no manager lock.
+Concurrent-safe via `sync.Mutex`. The connection counter, which counts the open connections of the `tcp` rules and the open flows of the `udp` rules, is an `atomic.Int64`. Each UDP socket guards its own flows with a lock of its own, so a datagram on an open flow takes no manager lock. A request on a host whose rules have conditions takes no manager lock either until it dials: `serveHTTP` reads the listener's table without one, and `recordDial` takes the lock to record a dial.
 
 | Method                | Signature                                                   | Description |
 |-----------------------|-------------------------------------------------------------|-------------|
-| `Setup`               | `() error`                                                  | Marks the manager active; a no-op when `IngressOptedOut()` is true |
+| `Setup`               | `() error`                                                  | Marks the manager active and starts the HTTP server that reads the requests of the hosts whose rules have conditions (see [Routing a Request](#routing-a-request)); a no-op when `IngressOptedOut()` is true |
 | `Apply`               | `(ctx context.Context, block api.IngressConfig) error`      | Serves exactly this block (see [Applying the Block](#applying-the-block)) |
 | `SyncSecretInventory` | `(ctx context.Context, inventory []api.NodeStateSecret)`    | Takes the pull's secret inventory and loads, replaces or drops the certificates of the held `terminate` rules (see [Certificates from the Secret Store](#certificates-from-the-secret-store)); a no-op when inactive |
 | `RuleStates`          | `() []IngressRuleState`                                     | The outcome of the last `Apply`, one entry per rule, in block order, with each `terminate` rule's certificate state |
 | `RuleReports`         | `() []IngressRuleReport`                                    | What the ingress status report says per rule: listener, certificate and last dial (see [Rule Entries](#rule-entries)); nil when inactive |
 | `ReportChanged`       | `() <-chan struct{}`                                        | Signalled, without blocking, when what `RuleReports` returns may have changed; capacity 1 |
 | `SetDialPolicy`       | `(p IngressDialPolicy)`                                     | Sets the policy that names a failed dial `policy_denied`; called before `Setup`. Without one, no dial reads `policy_denied` |
-| `Teardown`            | `() error`                                                  | Cancels every route, which closes every connection and every flow, closes every listener and UDP socket, and forgets the inventory and every certificate; returns once every accept loop, read loop and reply loop has ended; joins close errors; a no-op when inactive |
+| `Teardown`            | `() error`                                                  | Cancels every route and host, which closes every connection and every flow, closes every listener and UDP socket and the HTTP server, and forgets the inventory and every certificate; returns once every accept loop, read loop and reply loop has ended and the HTTP server's `Serve` has returned; joins close errors; a no-op when inactive |
 | `IngressStatus`       | `() *api.IngressInfo`                                       | The `status.ingress` report entry; nil when inactive |
 | `IngressCapabilities` | `() map[string]string`                                      | `{"ingress": "true", "max_ingress_rules": "<n>"}`; nil when `IngressOptedOut()` is true. It names no UDP capability: the control plane reads none |
 
@@ -432,7 +565,7 @@ type IngressRuleState struct {
     Rule   api.IngressRule
     Served bool
     Reason string // empty when served
-    Detail string // the field of an invalid rule, the slug of the rule that holds the listener or the challenge port, the ACME directory URL, or the Secret name
+    Detail string // the field of an invalid rule, the slug of the held rule it conflicts with or of the rule that takes the challenge port, the ACME directory URL, or the Secret name
     held   bool   // the rule keeps its slot
 }
 ```
@@ -553,7 +686,7 @@ A `tcp` rule's port is bound when it has a TCP listener, and a `udp` rule's when
 
 `acme_not_issued` reads until the last certificate request for the host succeeds: the obtain ahead of the first client or a client handshake (see [Obtaining a Certificate](acme-sni.md#obtaining-a-certificate)). A host whose obtain failed keeps it until a client's handshake makes `autocert` ask again and succeed; plexd does not retry an issuance on its own.
 
-The dial is the last one a client connection caused to the rule's target (see [Routing a Connection](#routing-a-connection)), and for a `udp` rule the last send of a client's datagram that counted as one (see below). The bridge never dials a target on its own to test it, so `dial` reads `none` until the first connection to a `tcp` rule or the first datagram to a `udp` rule, and a failed dial stays the rule's state until a later client's dial succeeds. A rule whose target changed reads `none`, and so does a rule removed and applied again. The reason of a failed dial is the first of these that applies:
+The dial is the last one a client connection caused to the rule's target (see [Routing a Connection](#routing-a-connection)), for a rule with conditions the last one a request caused (see [Routing a Request](#routing-a-request)), and for a `udp` rule the last send of a client's datagram that counted as one (see below). The bridge never dials a target on its own to test it, so `dial` reads `none` until the first connection to a `tcp` rule or the first datagram to a `udp` rule, and a failed dial stays the rule's state until a later client's dial succeeds. A rule whose target changed reads `none`, and so does a rule removed and applied again. Each rule of a host whose rules have conditions reports its own entry, with the dials to its own target: a request answered with `404` dials nothing, so a rule that no request matched reads `none` while its neighbours read their dials. A request on a pooled target connection dials nothing either: the rule dials when a request needs a new target connection, so its `dial_age_seconds` can exceed the age of its last request. The reason of a failed dial is the first of these that applies:
 
 1. `policy_denied`: the dial policy says the node's compiled policy blocks a dial of the rule's protocol to the target (see below).
 2. `timeout`: the dial did not complete within `bridge.ingress_dial_timeout`, or failed with a timeout error (`WSAETIMEDOUT` on Windows).
@@ -671,17 +804,36 @@ type IngressACME struct {
 
 ```go
 type IngressRule struct {
-    ID                    string `json:"id"`
-    Slug                  string `json:"slug"`
-    Protocol              string `json:"protocol,omitempty"`
-    ListenPort            int    `json:"listen_port"`
-    Mode                  string `json:"mode"`
-    SNIHost               string `json:"sni_host,omitempty"`
-    TargetNodeID          string `json:"target_node_id"`
-    TargetAddress         string `json:"target_address"`
-    TargetPort            int    `json:"target_port"`
-    CertificateSecretName string `json:"certificate_secret_name,omitempty"`
+    ID                    string            `json:"id"`
+    Slug                  string            `json:"slug"`
+    Protocol              string            `json:"protocol,omitempty"`
+    ListenPort            int               `json:"listen_port"`
+    Mode                  string            `json:"mode"`
+    SNIHost               string            `json:"sni_host,omitempty"`
+    TargetNodeID          string            `json:"target_node_id"`
+    TargetAddress         string            `json:"target_address"`
+    TargetPort            int               `json:"target_port"`
+    CertificateSecretName string            `json:"certificate_secret_name,omitempty"`
+    Conditions            IngressConditions `json:"conditions,omitzero"`
+    StripPathPrefix       bool              `json:"strip_path_prefix,omitempty"`
 }
+
+// IngressConditions are the request conditions of an ingress rule, the
+// control plane's NodeStateBridgeIngressConditions.
+type IngressConditions struct {
+    PathPrefix string                   `json:"path_prefix,omitempty"`
+    Headers    []IngressHeaderCondition `json:"headers,omitempty"`
+}
+
+// IngressHeaderCondition is one header condition: a field of Name, a
+// lowercase token, that carries exactly Value.
+type IngressHeaderCondition struct {
+    Name  string `json:"name"`
+    Value string `json:"value"`
+}
+
+func (c IngressConditions) IsZero() bool
+func (r IngressRule) Equal(o IngressRule) bool
 
 const (
     IngressModePassthrough = "passthrough"
@@ -697,7 +849,9 @@ const (
 
 `Protocol` is `IngressProtocolTCP` or `IngressProtocolUDP`. A rule of a control plane older than [plexsphere/plexsphere#1110](https://github.com/plexsphere/plexsphere/pull/1110) carries none and decodes to an empty `Protocol`, which `planIngress` sets to `tcp`. `ListenPort` is a TCP or a UDP port by `Protocol`.
 
-`IngressRule` is comparable with `==`, which is how `Apply` tells an unchanged rule from a changed one. A changed `protocol` or `certificate_secret_name` is a changed rule.
+`Conditions` are the request conditions of a `terminate` or `acme` rule: a path prefix and up to 8 header conditions, which arrive in name order. `IsZero` reports a rule without conditions, one with no path prefix and no header, and `encoding/json` calls it for `omitzero`: a rule without conditions marshals without the key, and an absent, `null` or `{}` member, or one with `"headers": []`, decodes to a rule without conditions, as the contract defines it. `StripPathPrefix` marshals only when it is true.
+
+The `Headers` slice rules out `==` on two rules, so the compiler refuses it. `Equal` compares two rules with `reflect.DeepEqual` and treats a nil and an empty `Conditions.Headers` as equal; the order of the headers counts. `Apply` and `logRuleChanges` call it to tell an unchanged rule from a changed one, so a changed `protocol`, `certificate_secret_name`, `conditions` or `strip_path_prefix` is a changed rule. The manager remembers the `ingress rule not served` lines it logged by the rule's JSON (`newNotServedKey`), since a rule with header conditions is no map key.
 
 ### IngressInfo
 
@@ -707,7 +861,7 @@ Published as the `status.ingress` report entry, each field under its snake_case 
 |---|---|---|
 | `Enabled` | `bool` | Whether the ingress manager is active |
 | `RuleCount` | `int` | The served rules, a `terminate` rule only while it has a certificate |
-| `ConnectionCount` | `int` | The open client connections of the `tcp` rules, from accept to close, and the open flows of the `udp` rules, from open to close. A flow carries the datagrams of one client address and port and the target's answers to them |
+| `ConnectionCount` | `int` | The open client connections of the `tcp` rules, from accept to close, and the open flows of the `udp` rules, from open to close. A client connection of a host whose rules have conditions counts once however many requests it carries, and an upgraded one counts until it closes; the target connections of a rule's pool do not count. A flow carries the datagrams of one client address and port and the target's answers to them |
 | `ACMEEnabled` | `bool` | `ACMEManager.Active()`: whether the last `Apply` ended with an `acme` rule without a reason; a rule that reads `listen_failed` does not count |
 
 ## Error Prefixes
@@ -734,7 +888,7 @@ All ingress log entries use `component=bridge`, the reporter's included. `bridge
 | `Info`  | `ingress manager stopped`                | (none) |
 | `Info`  | `ingress listener opened`                | `listen_port`, `protocol` (`tcp` for a TCP listener, `udp` for the UDP socket of a `udp` rule) |
 | `Info`  | `ingress listener closed`                | `listen_port`, `protocol`; for a UDP socket, logged once its read loop and the reply loops of its flows have ended |
-| `Info`  | `ingress rule added`                     | `rule_id`, `slug`, `protocol`, `listen_port`, `mode`, `sni_host`, `target` |
+| `Info`  | `ingress rule added`                     | `rule_id`, `slug`, `protocol`, `listen_port`, `mode`, `sni_host`, `target`, `path_prefix` (empty without one), `header_names` (the names of the header conditions joined by `,`, never a value), `strip_path_prefix` |
 | `Info`  | `ingress rule updated`                   | the same; an id held before with another value |
 | `Info`  | `ingress rule removed`                   | the same |
 | `Warn`  | `ingress rule not served`                | `rule_id`, `slug`, `protocol`, `listen_port`, `reason`, `detail`; once per rule value and reason |
@@ -757,6 +911,8 @@ All ingress log entries use `component=bridge`, the reporter's included. `bridge
 | `Debug` | `ingress status: send failed`            | `error`; logged instead of the Warn while the client holds a refused credential (`api.ErrCredentialRefused`) |
 | `Debug` | `ingress connection closed`              | `listen_port`, `remote`, `server_name`, `reason` |
 | `Debug` | `ingress acme challenge answered`        | `server_name`, `remote`, `error` |
+| `Debug` | `ingress request not forwarded`          | `listen_port`, `remote`, `server_name`, `status`, `reason` (`misdirected`, `bad_path`, `no_matching_rule`, `dial_failed` or `target_error`), `rule_id` and `slug` once a rule matched, `error` for a `502` or `504`; a request on a host whose rules have conditions that the bridge answered by itself (see [Answers of the Bridge](#answers-of-the-bridge)) |
+| `Debug` | the messages of `net/http` and `net/http/httputil`, such as `httputil: ReverseProxy read error during body copy: <error>` | (none); the `ErrorLog` of the HTTP server and of each route's `httputil.ReverseProxy`, a `log.Logger` that writes each message to the bridge's logger at Debug (`debugLog`) |
 | `Debug` | `ingress udp flow opened`                | `rule_id`, `listen_port`, `remote` |
 | `Debug` | `ingress udp flow closed`                | `listen_port`, `remote`, `reason` (`idle`, `evicted`, `route_cancelled`, `read_failed` or `listener_closed`) |
 | `Debug` | `ingress datagram not forwarded`         | `listen_port`, `remote`, `error`; a client's datagram that did not reach the target and left the rule's dial record as it was, or whose flow was closed meanwhile |
@@ -767,8 +923,20 @@ All ingress log entries use `component=bridge`, the reporter's included. `bridge
 | `Error` | `bridge: ingress: dial target failed`    | `rule_id`, `slug`, `protocol`, `target`, `reason`, `error`; `reason` is absent for a dial whose route was cancelled meanwhile. For a `udp` rule only when the failure changed the rule's dial record, so a client that keeps sending into a blocked rule writes one line, not one per datagram |
 | `Error` | `ingress reconcile: apply failed`        | `error` |
 
-A rule logs `ingress rule not served` once: an `Apply` that leaves its value and reason unchanged logs nothing for it. The flow lines of a `udp` rule are Debug, as `ingress connection closed` is: a public port draws scanners. The line carries the reasons of the plan. A `terminate` rule's certificate state is logged by the `ingress certificate` lines instead. The ACME account's lines are listed in [ACME and SNI Routing](acme-sni.md#logging).
+A rule logs `ingress rule not served` once: an `Apply` that leaves its value and reason unchanged logs nothing for it. The line carries the reasons of the plan. The flow lines of a `udp` rule are Debug, as `ingress connection closed` and `ingress request not forwarded` are: a public port draws scanners. A forwarded request logs nothing. No line of the bridge carries a header value of a request or of a rule, nor a request's path or query: a header value can be a routing token, and a URL can hold a credential. The `ErrorLog` lines carry the text of `net/http` and `net/http/httputil`. A `terminate` rule's certificate state is logged by the `ingress certificate` lines instead. The ACME account's lines are listed in [ACME and SNI Routing](acme-sni.md#logging).
 
 ## Limits
 
-The bridge sets no connection limit and no idle timeout on a public TCP listener. A `udp` rule holds at most `bridge.max_ingress_udp_flows` flows, 1024 by default, and closes the flow whose client sent least recently to make room for a new client. It closes a flow after 30 s without a datagram in either direction while the target has not answered, and after 120 s once it has (see [Forwarding Datagrams](#forwarding-datagrams)). The bridge sets no rate limit per client address and does not check that a client owns its source address: it answers a datagram's source address, as the published service would. The flow bound and the idle timeouts limit what a flood can hold. The bridge bounds the ClientHello peek, to 16 KiB and 5 s per connection, and the TLS handshake of a terminating rule or an ACME challenge, to 10 s (`ingressHandshakeTimeout`). For an `acme` rule the 10 s include the wait for a certificate that is still being issued; a client whose certificate is not ready by then is closed with `tls_handshake_failed`, and the issuance goes on in the background. The bounds of the ACME account's own requests are listed in [ACME and SNI Routing](acme-sni.md#limits).
+The bridge sets no connection limit on a public TCP listener, and no idle timeout on a connection it forwards as bytes. A `udp` rule holds at most `bridge.max_ingress_udp_flows` flows, 1024 by default, and closes the flow whose client sent least recently to make room for a new client. It closes a flow after 30 s without a datagram in either direction while the target has not answered, and after 120 s once it has (see [Forwarding Datagrams](#forwarding-datagrams)). The bridge sets no rate limit per client address and does not check that a client owns its source address: it answers a datagram's source address, as the published service would. The flow bound and the idle timeouts limit what a flood can hold. The bridge bounds the ClientHello peek, to 16 KiB and 5 s per connection, and the TLS handshake of a terminating rule or an ACME challenge, to 10 s (`ingressHandshakeTimeout`). For an `acme` rule the 10 s include the wait for a certificate that is still being issued; a client whose certificate is not ready by then is closed with `tls_handshake_failed`, and the issuance goes on in the background. The bounds of the ACME account's own requests are listed in [ACME and SNI Routing](acme-sni.md#limits).
+
+The HTTP server of the hosts whose rules have conditions, and the transport of each rule with conditions, have these bounds:
+
+| Bound | Value | Name |
+| --- | --- | --- |
+| The read of a request header, the server's `ReadHeaderTimeout` | 10 s | `ingressHTTPReadHeaderTimeout` |
+| A client connection without a request, the server's `IdleTimeout` | 120 s | `ingressHTTPIdleTimeout` |
+| A request header, the server's `MaxHeaderBytes`; `net/http` answers a larger one with `431` | 64 KiB | `ingressHTTPMaxHeaderBytes` |
+| The idle connections a rule keeps to its target, the transport's `MaxIdleConnsPerHost` | 32 | `ingressTargetMaxIdleConns` |
+| An idle target connection, the transport's `IdleConnTimeout` | 90 s | `ingressTargetIdleConnTimeout` |
+
+`net/http` applies `ReadHeaderTimeout` to each HTTP/1.1 request: a client that has not sent a whole request header by then is closed. Its HTTP/2 server does not apply it, and closes a connection without an open stream after `IdleTimeout`. A request body and a response have no size or time bound, as a forwarded connection has none. The bounds are constants with no configuration key. The manager holds the first two in its unexported fields `httpReadHeaderTimeout` and `httpIdleTimeout`, so that a test can shorten them before `Setup`.

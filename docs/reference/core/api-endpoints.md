@@ -1646,8 +1646,12 @@ out opens none whatever the block says and reports `opted_out` with the
 `listen_port`, `mode` (`passthrough`, `terminate` or `acme`), an optional
 `sni_host`, `target_node_id`, `target_address` and `target_port`, and a
 `terminate` rule also `certificate_secret_name`, the Secret of the bridge's
-Project that holds its certificate chain and key. The block's `acme` member,
-present exactly when a rule has mode `acme`, carries the `directory_url` and the
+Project that holds its certificate chain and key. A `terminate` or `acme` rule
+may carry `conditions`, an optional `path_prefix` and at most 8 `headers` of a
+`name` and a `value`, and, with a path prefix other than `/`,
+`strip_path_prefix`; both members are absent on a rule without them. The
+block's `acme` member, present exactly when a rule has mode `acme`, carries the
+`directory_url` and the
 optional `contact_email` of the ACME account the `acme` rules share. The
 bridge opens one TCP listener per distinct `listen_port` of the `tcp` rules,
 forwards a port whose rule names no `sni_host` without reading the stream, and
@@ -1657,8 +1661,11 @@ TLS ClientHello to
 unchanged. A `terminate` rule ends TLS with the certificate of its Secret, which
 the bridge fetches in the version the `secrets` block lists, and an `acme` rule
 with a certificate the bridge obtains at `directory_url`; both forward
-plaintext to the target. A `udp` rule is a `passthrough` rule without
-`sni_host`: the bridge opens one UDP socket on its `listen_port`, which may be
+plaintext to the target. Rules with `conditions` share one `listen_port` and
+`sni_host`: the bridge reads each request of such a host and forwards it over
+HTTP/1.1 to the target of the rule whose conditions it matches (see
+[Routing a Request](../bridge/public-ingress.md#routing-a-request)). A `udp`
+rule is a `passthrough` rule without `sni_host`: the bridge opens one UDP socket on its `listen_port`, which may be
 the port number of a `tcp` rule, and forwards the datagrams of each client
 address and port on a flow of their own to the target (see
 [Forwarding Datagrams](../bridge/public-ingress.md#forwarding-datagrams)).
