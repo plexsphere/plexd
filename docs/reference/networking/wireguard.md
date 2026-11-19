@@ -619,10 +619,9 @@ if err := mgr.Setup(ctx, identity); err != nil {
 // Measure the uplink again every 10 minutes (blocks until ctx is done)
 go mgr.RunMTUProbe(ctx, wireguard.MTUProbeInterval)
 
-// Configure initial peers from registration response
-if err := mgr.ConfigurePeers(ctx, registerResponse.Peers); err != nil {
-    log.Fatal(err)
-}
+// Peers come from the state pull, not from the registration response:
+// the reconcile handler adds, updates and removes them (see ReconcileHandler).
+r.RegisterHandler(wireguard.ReconcileHandler(mgr, psks))
 
 // Probe relayed peers that fall silent, then try each peer's dial order
 // every 5 seconds (blocks until ctx is done)
@@ -958,12 +957,11 @@ During a rolling upgrade, set `edge_psk: false` on the upgraded nodes, and turn 
 
 ### Registration Bootstrap
 
-After registration, pass initial peers to `ConfigurePeers`:
+After registration, `Setup` takes the identity. The `peer_snapshot` of the registration response is not programmed: the reconcile handler programs the peers from the `peers` block of the state pull.
 
 ```go
 identity, _ := reg.Register(ctx)
 mgr.Setup(ctx, identity)
-mgr.ConfigurePeers(ctx, registerResponse.Peers)
 ```
 
 ### Reconciliation Loop

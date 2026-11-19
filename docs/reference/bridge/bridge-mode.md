@@ -107,7 +107,7 @@ func NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager
 | `Teardown`          | `() error`                            | Removes all routes, NAT, and forwarding; aggregates errors    |
 | `UpdateRoutes`      | `(subnets []string) error`            | Diffs desired vs active routes; adds/removes incrementally    |
 | `BridgeStatus`      | `() *api.BridgeInfo`                  | Returns status for heartbeat; nil when inactive               |
-| `BridgeCapabilities`| `() map[string]string`                | Returns capability metadata for registration; nil when disabled |
+| `BridgeCapabilities`| `() map[string]string`                | Returns a map that describes the bridge configuration; nil when disabled. Nothing in `plexd up` calls it |
 
 ### Lifecycle
 
@@ -285,9 +285,9 @@ heartbeat := api.HeartbeatRequest{
 }
 ```
 
-### Registration Capabilities
+### Bridge Capabilities Map
 
-Use `BridgeCapabilities()` to advertise bridge support during node registration:
+`BridgeCapabilities()` returns a map that describes the bridge configuration. `plexd up` does not call it: `POST /v1/register` carries no capabilities, and the capability manifest (`PUT /v1/nodes/{node_id}/capabilities`) has no bridge member.
 
 ```go
 caps := bridgeMgr.BridgeCapabilities()

@@ -136,8 +136,8 @@ The plexd process should run as a dedicated `plexd` user. No other user or group
 
 1. **Bootstrap token** is provisioned out-of-band (file, env var, metadata).
 2. Node generates a **Curve25519 keypair** locally.
-3. Node calls `POST /v1/nodes/register` with the bootstrap token and public key.
-4. Control plane responds with `node_id`, `mesh_ip`, `node_secret_key`, `signing_public_key`, and peer list (including PSKs).
+3. Node calls `POST /v1/register` with `project_id`, `resource_handle`, the bootstrap token, a nonce and the public key, without an `Authorization` header.
+4. Control plane responds with `node_id`, `mesh_ip`, `signing_public_key`, `signing_key_id`, `nsk`, `peer_snapshot` and `domain_mesh_cidr`. The peer snapshot carries no PSKs, and plexd programs its peers from the state pull.
 5. `SaveIdentity` writes `identity.json`, `private_key`, `node_secret_key`, and `signing_public_key` atomically with `0600` permissions.
 6. Bootstrap token file is removed from disk, or emptied when it cannot be removed (as under plexd's systemd unit).
 
