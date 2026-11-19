@@ -65,8 +65,8 @@ func communicationChannels() *Figure {
 
 	done := commPhase(f, s, x0, x1, "1", "Registration (one-time)")
 	s.self(0, body("Generate Curve25519 keypair"))
-	s.msg(call, 0, 1, code("POST /v1/register"), code("{token, public_key, hostname, capabilities}"))
-	s.msg(secretFlow, 1, 0, code("{node_id, mesh_ip, signing_key, NSK, peers[]}"))
+	s.msg(call, 0, 1, code("POST /v1/register"), code("{project_id, resource_handle, bootstrap_token,"), code("nonce, public_key, requested_resource_id (optional)}"))
+	s.msg(secretFlow, 1, 0, code("{node_id, mesh_ip, signing_public_key, signing_key_id,"), code("nsk, peer_snapshot, domain_mesh_cidr}"))
 	s.self(0, body("Delete bootstrap token from disk"))
 	done()
 

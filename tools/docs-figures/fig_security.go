@@ -54,14 +54,13 @@ func securityRegistration() *Figure {
 	f := &Figure{Name: "security-registration", Title: "Registration: only the public key leaves the node"}
 	s := secParts(f)
 	s.self(0, body("Generate Curve25519 keypair"))
-	s.msg(call, 0, 1, code("POST /v1/register"), code("{token, public_key, hostname,"), code("metadata, capabilities}"))
+	s.msg(call, 0, 1, code("POST /v1/register"), code("{project_id, resource_handle,"), code("bootstrap_token, nonce, public_key,"), code("requested_resource_id (optional)}"))
 	s.self(1, body("Validate token (redemption under"), body("its BootstrapToken policy)"))
-	s.self(1, body("Assign mesh IP (10.100.x.x)"))
+	s.self(1, body("Assign mesh IP from the"), body("Domain mesh CIDR"))
 	s.self(1, body("Store public key"))
-	s.self(1, body("Generate PSK per peer pair"))
 	s.self(1, body("Generate Node Secret Key (NSK)"))
-	s.msg(secretFlow, 1, 0, code("{node_id, mesh_ip, signing_public_key,"), code("node_secret_key, peers[]}"))
-	s.self(0, body("Set NSK as auth token"))
+	s.msg(secretFlow, 1, 0, code("{node_id, mesh_ip, signing_public_key,"), code("signing_key_id, nsk, peer_snapshot,"), code("domain_mesh_cidr}"))
+	s.self(0, body("Build the bearer envelope from"), body("node ID and NSK, set it as auth token"))
 	s.end()
 	return f
 }
