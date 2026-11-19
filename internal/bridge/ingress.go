@@ -931,7 +931,8 @@ func (m *IngressManager) IngressStatus() *api.IngressInfo {
 	}
 }
 
-// IngressCapabilities returns capability metadata for registration.
+// IngressCapabilities returns a map that describes the ingress configuration.
+// Registration carries no capabilities, and plexd up does not call it.
 // Returns nil when the node opts out of public ingress.
 func (m *IngressManager) IngressCapabilities() map[string]string {
 	if m.cfg.IngressOptedOut() {

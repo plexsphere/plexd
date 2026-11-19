@@ -275,7 +275,8 @@ func (m *Manager) BridgeStatus() *api.BridgeInfo {
 	return info
 }
 
-// BridgeCapabilities returns bridge capability metadata for registration.
+// BridgeCapabilities returns a map that describes the bridge configuration.
+// Registration carries no capabilities, and plexd up does not call it.
 // Returns nil when bridge mode is disabled.
 func (m *Manager) BridgeCapabilities() map[string]string {
 	if !m.cfg.Enabled {
