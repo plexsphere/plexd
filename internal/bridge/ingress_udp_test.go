@@ -710,7 +710,7 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 		conn := newScriptedFlowConn(nil)
 		fx, ctrl, id := newScriptedUDPFixture(t, &scriptedFlowOpener{steps: []openStep{{conn: conn}}}, &fakeDialPolicy{})
 		sendUDP(t, udpClient(t, ctrl.udpAddr(7053)), "query")
-		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialSucceeded), report(id, api.IngressDialSucceeded, ""); got != want {
+		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialSucceeded), report(id, api.IngressDialSucceeded, ""); !sameReport(got, want) {
 			t.Errorf("report = %+v, want %+v", got, want)
 		}
 		if sent := conn.sent(); len(sent) != 1 || string(sent[0].payload) != "query" || sent[0].to != target {
@@ -732,7 +732,7 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 		notForwarded := []string{"level=DEBUG", `msg="ingress datagram not forwarded"`, "listen_port=7053", "remote=" + clientAddr(client).String(), "error="}
 		waitForCondition(t, 2*time.Second, func() bool { return logLines(fx.logs, notForwarded...) == 2 })
 
-		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialFailed), report(id, api.IngressDialFailed, IngressDialReasonPolicyDenied); got != want {
+		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialFailed), report(id, api.IngressDialFailed, IngressDialReasonPolicyDenied); !sameReport(got, want) {
 			t.Errorf("report = %+v, want %+v", got, want)
 		}
 		if got, want := policy.askedWith(), []dialQuestion{{protocol: "udp", target: target}}; !slices.Equal(got, want) {
@@ -761,7 +761,7 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 			conn := newScriptedFlowConn(tc.err)
 			fx, ctrl, id := newScriptedUDPFixture(t, &scriptedFlowOpener{steps: []openStep{{conn: conn}}}, tc.policy)
 			sendUDP(t, udpClient(t, ctrl.udpAddr(7053)), "query")
-			if got, want := waitForDial(t, fx.mgr, id, api.IngressDialFailed), report(id, api.IngressDialFailed, tc.reason); got != want {
+			if got, want := waitForDial(t, fx.mgr, id, api.IngressDialFailed), report(id, api.IngressDialFailed, tc.reason); !sameReport(got, want) {
 				t.Errorf("report = %+v, want %+v", got, want)
 			}
 			if tc.policy != nil {
@@ -781,13 +781,13 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 
 		sendUDP(t, client, "one")
 		requireSignal(t, changed, "a failed send")
-		if got, want := reportFor(t, fx.mgr.RuleReports(), id), report(id, api.IngressDialFailed, IngressDialReasonOther); got != want {
+		if got, want := reportFor(t, fx.mgr.RuleReports(), id), report(id, api.IngressDialFailed, IngressDialReasonOther); !sameReport(got, want) {
 			t.Errorf("after a failed send: report = %+v, want %+v", got, want)
 		}
 
 		sendUDP(t, client, "two")
 		requireSignal(t, changed, "a send that succeeded after a failed one")
-		if got, want := reportFor(t, fx.mgr.RuleReports(), id), report(id, api.IngressDialSucceeded, ""); got != want {
+		if got, want := reportFor(t, fx.mgr.RuleReports(), id), report(id, api.IngressDialSucceeded, ""); !sameReport(got, want) {
 			t.Errorf("after a send that succeeded: report = %+v, want %+v", got, want)
 		}
 	})
@@ -800,7 +800,7 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 		client := udpClient(t, ctrl.udpAddr(7053))
 
 		sendUDP(t, client, "one")
-		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialFailed), report(id, api.IngressDialFailed, IngressDialReasonUnreachable); got != want {
+		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialFailed), report(id, api.IngressDialFailed, IngressDialReasonUnreachable); !sameReport(got, want) {
 			t.Errorf("after a socket that did not open: report = %+v, want %+v", got, want)
 		}
 		if got := connectionCount(t, fx.mgr); got != 0 {
@@ -814,7 +814,7 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 		}
 
 		sendUDP(t, client, "two")
-		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialSucceeded), report(id, api.IngressDialSucceeded, ""); got != want {
+		if got, want := waitForDial(t, fx.mgr, id, api.IngressDialSucceeded), report(id, api.IngressDialSucceeded, ""); !sameReport(got, want) {
 			t.Errorf("after the next datagram: report = %+v, want %+v", got, want)
 		}
 		if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{target, target}) {

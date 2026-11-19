@@ -1027,7 +1027,7 @@ func TestIngressHTTP_AllTargetsFail(t *testing.T) {
 				RuleID: rule.ID, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateReady,
 				Dial: api.IngressDialFailed, DialReason: tc.reason, DialAt: relayStart,
 			}
-			if got := reportFor(t, fx.mgr.RuleReports(), rule.ID); got != want {
+			if got := reportFor(t, fx.mgr.RuleReports(), rule.ID); !sameReport(got, want) {
 				t.Errorf("report = %+v, want %+v", got, want)
 			}
 			_, targets := balancerFor(t, fx.mgr, rule.ID).snapshot()
@@ -1090,7 +1090,7 @@ func TestIngressHTTP_ClientGone(t *testing.T) {
 		t.Fatal("the target's request did not end with the client")
 	}
 	time.Sleep(50 * time.Millisecond) // the handler returns after the target's request
-	if got := reportFor(t, fx.mgr.RuleReports(), rule.ID); got != before {
+	if got := reportFor(t, fx.mgr.RuleReports(), rule.ID); !sameReport(got, before) {
 		t.Errorf("report after the client went away = %+v, want %+v", got, before)
 	}
 	for _, needle := range []string{`msg="ingress request not forwarded"`, `msg="bridge: ingress: dial target failed"`} {

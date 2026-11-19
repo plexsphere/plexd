@@ -21,11 +21,12 @@ const testIngressStatusNSK = "test-nsk"
 // ingressStatusControlPlane is an httptest control plane serving
 // PUT /v1/nodes/{node_id}/ingress-status with the gates the contract,
 // plexsphere/plexsphere docs/reference/api/plexd-agent-contract.md, puts on
-// it: the NSK bearer, the node, a 256 KiB body cap, a strict decode that
-// refuses unknown members of the report and of each rule entry, a member of
-// the wrong type, and data after the report, and a state that is present and
-// one of the two the contract names. It answers 200 with its own receive time
-// as accepted_at and records the body, and counts every 400 it answers.
+// it: the NSK bearer, the node, a 2 MiB body cap, a strict decode that
+// refuses unknown members of the report, of each rule entry and of each
+// target entry, a member of the wrong type, and data after the report, and a
+// state that is present and one of the two the contract names. It answers
+// 200 with its own receive time as accepted_at and records the body, and
+// counts every 400 it answers.
 type ingressStatusControlPlane struct {
 	srv      *httptest.Server
 	client   *api.ControlPlane
@@ -45,18 +46,30 @@ type ingressStatusWire struct {
 // ingressStatusWireRule is one rule entry as the control plane decodes it. A
 // dial_age_seconds that is not an integer fails the decode.
 type ingressStatusWireRule struct {
-	ID                *string `json:"id"`
-	Listener          *string `json:"listener"`
-	ListenerReason    *string `json:"listener_reason"`
-	Certificate       *string `json:"certificate"`
-	CertificateReason *string `json:"certificate_reason"`
-	Dial              *string `json:"dial"`
-	DialReason        *string `json:"dial_reason"`
-	DialAgeSeconds    *int64  `json:"dial_age_seconds"`
+	ID                *string                    `json:"id"`
+	Listener          *string                    `json:"listener"`
+	ListenerReason    *string                    `json:"listener_reason"`
+	Certificate       *string                    `json:"certificate"`
+	CertificateReason *string                    `json:"certificate_reason"`
+	Dial              *string                    `json:"dial"`
+	DialReason        *string                    `json:"dial_reason"`
+	DialAgeSeconds    *int64                     `json:"dial_age_seconds"`
+	Targets           *[]ingressStatusWireTarget `json:"targets"`
 }
 
-// maxIngressStatusWireBody is the contract's cap on a report body.
-const maxIngressStatusWireBody = 256 << 10
+// ingressStatusWireTarget is one target entry of a rule entry as the control
+// plane decodes it, every member a pointer as in a rule entry. A port or a
+// dial_age_seconds that is not an integer fails the decode.
+type ingressStatusWireTarget struct {
+	NodeID         *string `json:"node_id"`
+	Port           *int    `json:"port"`
+	Dial           *string `json:"dial"`
+	DialReason     *string `json:"dial_reason"`
+	DialAgeSeconds *int64  `json:"dial_age_seconds"`
+}
+
+// maxIngressStatusWireBody is the contract's cap on a report body, 2 MiB.
+const maxIngressStatusWireBody = 2 << 20
 
 func newIngressStatusControlPlane(t *testing.T) *ingressStatusControlPlane {
 	t.Helper()
@@ -113,9 +126,9 @@ func (cp *ingressStatusControlPlane) serve(w http.ResponseWriter, r *http.Reques
 
 // ingressStatusMalformed returns why the contract answers 400
 // malformed_ingress_status for body, or "" when it does not: a body that is not
-// one JSON object, an unknown member of the report or of a rule entry, a
-// member of the wrong type, data after the report, a missing or null state,
-// or a state that is neither enabled nor opted_out.
+// one JSON object, an unknown member of the report, of a rule entry or of a
+// target entry, a member of the wrong type, data after the report, a missing
+// or null state, or a state that is neither enabled nor opted_out.
 func ingressStatusMalformed(body []byte) string {
 	report, err := decodeIngressStatusWire(body)
 	if err != nil {
@@ -211,6 +224,8 @@ func TestIngressStatusIntegration_ReportsBothStatesOverTheWire(t *testing.T) {
 			{`{"state":"paused"}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","up":true}]}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","dial_age_seconds":1.5}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","targets":[{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":9000,"dial":"none","up":true}]}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","targets":[{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":9000,"dial":"succeeded","dial_age_seconds":1.5}]}]}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled"}{}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`["enabled"]`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled"}` + strings.Repeat(" ", maxIngressStatusWireBody+1-len(`{"state":"enabled"}`)), http.StatusRequestEntityTooLarge, "ingress_status_body_too_large"},
@@ -291,5 +306,86 @@ func TestIngressStatusIntegration_ReportsRuleEntriesOverTheWire(t *testing.T) {
 	}
 	if rules[1].DialAgeSeconds != nil || rules[2].DialAgeSeconds != nil {
 		t.Errorf("entries without a dial carry dial_age_seconds: %s", body)
+	}
+}
+
+// TestIngressStatusIntegration_ReportsTargetEntriesOverTheWire sends a
+// manager's report through the real client: the control plane decodes the
+// two target entries of a rule from a pull with targets strictly, and finds
+// no targets member on a rule from a pull without them.
+func TestIngressStatusIntegration_ReportsTargetEntriesOverTheWire(t *testing.T) {
+	fx, ctrl, _, _ := newDialFixture(t, dialStep{err: refusedDial()}, dialStep{})
+	poolID, legacyID := reportID("a1"), reportID("b2")
+	pool := withID(ingressRule("pool", 7022, "", 9000), poolID)
+	pool.Targets = reportTargets(2)
+	legacy := withID(ingressRule("legacy", 7023, "", 9100), legacyID)
+	legacy.TargetNodeID = targetNodeID("c1")
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(pool, legacy)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// The first target refuses and the second takes the connection.
+	connect(t, ctrl.addr(7022))
+	waitForCondition(t, 2*time.Second, func() bool {
+		return reportFor(t, fx.mgr.RuleReports(), poolID).Dial == api.IngressDialSucceeded
+	})
+	drain(fx.mgr.ReportChanged())
+
+	cp := newIngressStatusControlPlane(t)
+	reporter := NewIngressStatusReporter(time.Hour, testIngressNodeID, cp.client, false, fx.mgr, discardLogger())
+	// The manager dates its dials on the fixture's clock.
+	reporter.now = func() time.Time { return relayStart.Add(12500 * time.Millisecond) }
+	stop := startIngressStatusReporter(t, reporter)
+	var body string
+	select {
+	case body = <-cp.accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no report accepted within 2s")
+	}
+	stop()
+	cp.wantNoMore(t)
+
+	report, err := decodeIngressStatusWire([]byte(body))
+	if err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	if report.Rules == nil || len(*report.Rules) != 2 {
+		t.Fatalf("rules of %s, want two entries", body)
+	}
+	rules := *report.Rules
+	if rules[0].Targets == nil || len(*rules[0].Targets) != 2 {
+		t.Fatalf("targets of the first entry of %s, want two entries", body)
+	}
+	str := func(p *string) string {
+		if p == nil {
+			return "<absent>"
+		}
+		return *p
+	}
+	type entry struct {
+		nodeID     string
+		port       int
+		dial       string
+		dialReason string
+		age        int64
+	}
+	want := []entry{
+		{targetNodeID("b1"), 9000, "failed", "refused", 12},
+		{targetNodeID("b2"), 9001, "succeeded", "<absent>", 12},
+	}
+	for j, e := range *rules[0].Targets {
+		if e.Port == nil || e.DialAgeSeconds == nil {
+			t.Errorf("target entry %d of %s misses its port or its dial_age_seconds", j, body)
+			continue
+		}
+		got := entry{str(e.NodeID), *e.Port, str(e.Dial), str(e.DialReason), *e.DialAgeSeconds}
+		if got != want[j] {
+			t.Errorf("target entry %d = %+v, want %+v", j, got, want[j])
+		}
+	}
+	if rules[1].Targets != nil || strings.Count(body, `"targets"`) != 1 {
+		t.Errorf("the entry of the rule from a pull without targets carries targets: %s", body)
+	}
+	if got := str(rules[1].Dial); got != api.IngressDialNone {
+		t.Errorf("dial of the rule from a pull without targets = %s, want none", got)
 	}
 }

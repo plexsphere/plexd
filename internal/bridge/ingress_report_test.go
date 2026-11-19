@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -11,6 +13,12 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 )
+
+// sameReport reports whether a and b are equal in every member, their target
+// entries included.
+func sameReport(a, b IngressRuleReport) bool {
+	return reflect.DeepEqual(a, b)
+}
 
 // reportID returns a rule id in canonical UUID form, ending in suffix, two
 // hex digits.
@@ -118,7 +126,7 @@ func TestRuleReports_RulesNotHeld(t *testing.T) {
 		{reportID("e5"), IngressReasonMaxRules},
 	} {
 		want := IngressRuleReport{RuleID: tc.id, Listener: api.IngressListenerNotListening, ListenerReason: tc.reason}
-		if got := reportFor(t, reports, tc.id); got != want {
+		if got := reportFor(t, reports, tc.id); !sameReport(got, want) {
 			t.Errorf("report = %+v, want %+v", got, want)
 		}
 	}
@@ -153,7 +161,7 @@ func TestRuleReports_ListenFailed(t *testing.T) {
 	reports := fx.mgr.RuleReports()
 	for _, id := range []string{reportID("a1"), reportID("b2"), reportID("c3")} {
 		want := IngressRuleReport{RuleID: id, Listener: api.IngressListenerNotListening, ListenerReason: IngressReasonListenFailed}
-		if got := reportFor(t, reports, id); got != want {
+		if got := reportFor(t, reports, id); !sameReport(got, want) {
 			t.Errorf("report = %+v, want %+v", got, want)
 		}
 	}
@@ -166,7 +174,7 @@ func TestRuleReports_PassthroughNobodyConnected(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 	want := IngressRuleReport{RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired, Dial: api.IngressDialNone}
-	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
 		t.Errorf("report = %+v, want %+v", got, want)
 	}
 }
@@ -189,7 +197,7 @@ func TestRuleReports_UDPRule(t *testing.T) {
 		if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(udpIngressRule("dns", 7053, 9053), udpID))); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
-		if got, want := reportFor(t, fx.mgr.RuleReports(), udpID), listening(udpID); got != want {
+		if got, want := reportFor(t, fx.mgr.RuleReports(), udpID), listening(udpID); !sameReport(got, want) {
 			t.Errorf("report = %+v, want %+v", got, want)
 		}
 	})
@@ -202,10 +210,10 @@ func TestRuleReports_UDPRule(t *testing.T) {
 			t.Fatalf("Apply = %v, want the bind error", err)
 		}
 		reports := fx.mgr.RuleReports()
-		if got, want := reportFor(t, reports, udpID), listenFailed(udpID); got != want {
+		if got, want := reportFor(t, reports, udpID), listenFailed(udpID); !sameReport(got, want) {
 			t.Errorf("udp rule: report = %+v, want %+v", got, want)
 		}
-		if got, want := reportFor(t, reports, tcpID), listening(tcpID); got != want {
+		if got, want := reportFor(t, reports, tcpID), listening(tcpID); !sameReport(got, want) {
 			t.Errorf("tcp rule on the same port number: report = %+v, want %+v", got, want)
 		}
 	})
@@ -218,10 +226,10 @@ func TestRuleReports_UDPRule(t *testing.T) {
 			t.Fatalf("Apply = %v, want the bind error", err)
 		}
 		reports := fx.mgr.RuleReports()
-		if got, want := reportFor(t, reports, tcpID), listenFailed(tcpID); got != want {
+		if got, want := reportFor(t, reports, tcpID), listenFailed(tcpID); !sameReport(got, want) {
 			t.Errorf("tcp rule: report = %+v, want %+v", got, want)
 		}
-		if got, want := reportFor(t, reports, udpID), listening(udpID); got != want {
+		if got, want := reportFor(t, reports, udpID), listening(udpID); !sameReport(got, want) {
 			t.Errorf("udp rule on the same port number: report = %+v, want %+v", got, want)
 		}
 	})
@@ -467,5 +475,200 @@ func TestRuleReports_SharedHost(t *testing.T) {
 		if got.Listener != api.IngressListenerListening || got.Certificate != api.IngressCertificateReady || got.Dial != tc.dial || got.DialReason != tc.reason {
 			t.Errorf("rule %s: report = %+v, want listening, ready and dial %s %s", tc.id, got, tc.dial, tc.reason)
 		}
+	}
+}
+
+// targetNodeID returns a node id in canonical UUID form, ending in suffix,
+// two hex digits.
+func targetNodeID(suffix string) string {
+	return "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0" + suffix
+}
+
+// reportTargets returns n targets on the loopback, on 9000 and up, each on a
+// node of its own whose id ends in b1, b2 and so on.
+func reportTargets(n int) []api.IngressTarget {
+	targets := make([]api.IngressTarget, n)
+	for i := range targets {
+		targets[i] = api.IngressTarget{NodeID: targetNodeID("b" + strconv.Itoa(i+1)), Address: "127.0.0.1", Port: 9000 + i}
+	}
+	return targets
+}
+
+// TestRuleReports_Targets reports a listening rule from a pull with targets
+// with one entry per target in list order, none before a dial and the last
+// dial to each target after one, and a rule that does not listen without
+// entries.
+func TestRuleReports_Targets(t *testing.T) {
+	fx, ctrl, _, _ := newDialFixture(t, dialStep{err: refusedDial()}, dialStep{})
+	ctrl.failListen(7023, syscall.EADDRINUSE)
+	webID, conflictID, downID := reportID("a1"), reportID("b2"), reportID("c3")
+	web := withID(ingressRule("web", 7022, "", 9000), webID)
+	web.Targets = reportTargets(3)
+	conflict := withID(ingressRule("conflict", 7022, "", 9000), conflictID)
+	conflict.Targets = reportTargets(2)
+	down := withID(ingressRule("down", 7023, "", 9000), downID)
+	down.Targets = reportTargets(2)
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(web, conflict, down)); !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("Apply = %v, want the bind error of port 7023", err)
+	}
+	entry := func(i int, dial, reason string, at time.Time) IngressTargetReport {
+		return IngressTargetReport{NodeID: web.Targets[i].NodeID, Port: web.Targets[i].Port, Dial: dial, DialReason: reason, DialAt: at}
+	}
+
+	reports := fx.mgr.RuleReports()
+	want := IngressRuleReport{
+		RuleID: webID, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
+		Dial: api.IngressDialNone,
+		Targets: []IngressTargetReport{
+			entry(0, api.IngressDialNone, "", time.Time{}),
+			entry(1, api.IngressDialNone, "", time.Time{}),
+			entry(2, api.IngressDialNone, "", time.Time{}),
+		},
+	}
+	if got := reportFor(t, reports, webID); !sameReport(got, want) {
+		t.Errorf("before a dial: report = %+v, want %+v", got, want)
+	}
+	for _, tc := range []struct{ id, reason string }{
+		{conflictID, IngressReasonListenerConflict},
+		{downID, IngressReasonListenFailed},
+	} {
+		want := IngressRuleReport{RuleID: tc.id, Listener: api.IngressListenerNotListening, ListenerReason: tc.reason}
+		if got := reportFor(t, reports, tc.id); !sameReport(got, want) {
+			t.Errorf("a rule that does not listen: report = %+v, want %+v without target entries", got, want)
+		}
+	}
+
+	// The first target refuses and the second takes the connection; the
+	// third is not dialled.
+	connect(t, ctrl.addr(7022))
+	waitForCondition(t, 2*time.Second, func() bool {
+		return reportFor(t, fx.mgr.RuleReports(), webID).Dial != api.IngressDialNone
+	})
+	want.Dial, want.DialAt = api.IngressDialSucceeded, relayStart
+	want.Targets = []IngressTargetReport{
+		entry(0, api.IngressDialFailed, IngressDialReasonRefused, relayStart),
+		entry(1, api.IngressDialSucceeded, "", relayStart),
+		entry(2, api.IngressDialNone, "", time.Time{}),
+	}
+	if got := reportFor(t, fx.mgr.RuleReports(), webID); !sameReport(got, want) {
+		t.Errorf("after a connection: report = %+v, want %+v", got, want)
+	}
+}
+
+// TestRuleReports_NoTargetsWithoutThePullMember reports a rule from a pull
+// without targets without target entries while its dial follows its one
+// target, and with that target's entry once the pull carries targets.
+func TestRuleReports_NoTargetsWithoutThePullMember(t *testing.T) {
+	fx, ctrl, _, _ := newDialFixture(t, dialStep{err: refusedDial()}, dialStep{})
+	id := reportID("a1")
+	legacy := withID(ingressRule("web", 7022, "", 9000), id)
+	legacy.TargetNodeID = targetNodeID("b1")
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(legacy)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	lb := balancerFor(t, fx.mgr, id)
+	want := IngressRuleReport{RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired, Dial: api.IngressDialNone}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
+		t.Errorf("before a dial: report = %+v, want %+v", got, want)
+	}
+
+	for _, step := range []struct{ name, dial, reason string }{
+		{"a refused dial", api.IngressDialFailed, IngressDialReasonRefused},
+		{"a dial that succeeded", api.IngressDialSucceeded, ""},
+	} {
+		connect(t, ctrl.addr(7022))
+		waitForCondition(t, 2*time.Second, func() bool {
+			return reportFor(t, fx.mgr.RuleReports(), id).Dial == step.dial
+		})
+		want.Dial, want.DialReason, want.DialAt = step.dial, step.reason, relayStart
+		if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
+			t.Errorf("after %s: report = %+v, want %+v", step.name, got, want)
+		}
+		wantTarget := dialRecord{failed: step.dial == api.IngressDialFailed, reason: step.reason, at: relayStart}
+		if _, targets := lb.snapshot(); len(targets) != 1 || targets[0] != wantTarget {
+			t.Errorf("after %s: target records = %+v, want the one target %+v", step.name, targets, wantTarget)
+		}
+	}
+
+	// A control plane that starts to send targets names the same target, so
+	// the rule keeps its balancer and reports the entry with its last dial.
+	current := legacy
+	current.Targets = []api.IngressTarget{{NodeID: legacy.TargetNodeID, Address: legacy.TargetAddress, Port: legacy.TargetPort}}
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(current)); err != nil {
+		t.Fatalf("Apply with targets: %v", err)
+	}
+	if got := balancerFor(t, fx.mgr, id); got != lb {
+		t.Fatalf("balancer %p after the pull carried targets, want the rule's balancer %p", got, lb)
+	}
+	want.Targets = []IngressTargetReport{{NodeID: legacy.TargetNodeID, Port: legacy.TargetPort, Dial: api.IngressDialSucceeded, DialAt: relayStart}}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want) {
+		t.Errorf("after the pull carried targets: report = %+v, want %+v", got, want)
+	}
+}
+
+// TestRuleReports_SkipsMalformedAndRepeatedTargets gives no entry to a
+// target whose node_id the control plane refuses, or whose node_id and port
+// an earlier entry carried in another case, while the rule dials every
+// target; a rule none of whose targets has an entry has nil Targets.
+func TestRuleReports_SkipsMalformedAndRepeatedTargets(t *testing.T) {
+	n1, n2 := targetNodeID("b1"), targetNodeID("b2")
+	targets := []api.IngressTarget{
+		{NodeID: n1, Address: "127.0.0.1", Port: 9000},
+		{NodeID: "", Address: "127.0.0.1", Port: 9001},
+		{NodeID: "not-a-uuid", Address: "127.0.0.1", Port: 9002},
+		{NodeID: "00000000-0000-0000-0000-000000000000", Address: "127.0.0.1", Port: 9003},
+		{NodeID: strings.ToUpper(n1), Address: "127.0.0.1", Port: 9000},
+		// The same node on another port is another target.
+		{NodeID: n1, Address: "127.0.0.1", Port: 9005},
+		{NodeID: n2, Address: "127.0.0.1", Port: 9006},
+	}
+	fx, ctrl, _, _ := newDialFixture(t, make([]dialStep, len(targets))...)
+	id, otherID := reportID("a1"), reportID("b2")
+	rule := withID(ingressRule("web", 7022, "", 9000), id)
+	rule.Targets = targets
+	other := withID(ingressRule("other", 7023, "", 9000), otherID)
+	other.Targets = twoTargets()
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule, other)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if st := stateOf(t, fx.mgr, "web"); !st.Served || st.Reason != "" {
+		t.Fatalf("rule state = %+v, want served", st)
+	}
+	lb := balancerFor(t, fx.mgr, id)
+
+	// One connection per target: round robin dials each target once.
+	for range targets {
+		connect(t, ctrl.addr(7022))
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		_, records := lb.snapshot()
+		for _, rec := range records {
+			if rec.at.IsZero() {
+				return false
+			}
+		}
+		return true
+	})
+	_, records := lb.snapshot()
+	for i, rec := range records {
+		if want := (dialRecord{at: relayStart}); rec != want {
+			t.Errorf("target %d = %+v, want succeeded at %v", i, rec, relayStart)
+		}
+	}
+
+	reports := fx.mgr.RuleReports()
+	succeeded := func(nodeID string, port int) IngressTargetReport {
+		return IngressTargetReport{NodeID: nodeID, Port: port, Dial: api.IngressDialSucceeded, DialAt: relayStart}
+	}
+	want := IngressRuleReport{
+		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
+		Dial: api.IngressDialSucceeded, DialAt: relayStart,
+		Targets: []IngressTargetReport{succeeded(n1, 9000), succeeded(n1, 9005), succeeded(n2, 9006)},
+	}
+	if got := reportFor(t, reports, id); !sameReport(got, want) {
+		t.Errorf("report = %+v, want %+v", got, want)
+	}
+	if got := reportFor(t, reports, otherID); got.Targets != nil {
+		t.Errorf("a rule whose node ids are no UUIDs: Targets = %#v, want nil", got.Targets)
 	}
 }

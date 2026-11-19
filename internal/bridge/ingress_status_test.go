@@ -549,6 +549,44 @@ func TestBuildIngressStatusRequest_DialAge(t *testing.T) {
 	}
 }
 
+// TestBuildIngressStatusRequest_Targets maps the target entries of a report
+// in order, each with its dial_age_seconds by the rule of the rule entry's,
+// and gives a report without target entries no targets member.
+func TestBuildIngressStatusRequest_Targets(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	n1, n2, n3, n4 := targetNodeID("b1"), targetNodeID("b2"), targetNodeID("b3"), targetNodeID("b4")
+	pool := dialledReport(reportID("a1"), api.IngressDialSucceeded, "", now.Add(-2*time.Second))
+	pool.Targets = []IngressTargetReport{
+		{NodeID: n1, Port: 9000, Dial: api.IngressDialFailed, DialReason: IngressDialReasonRefused, DialAt: now.Add(-12900 * time.Millisecond)},
+		{NodeID: n2, Port: 9001, Dial: api.IngressDialSucceeded, DialAt: now.Add(time.Second)},
+		{NodeID: n3, Port: 9002, Dial: api.IngressDialSucceeded, DialAt: now.AddDate(-100, 0, 0)},
+		{NodeID: n4, Port: 9003, Dial: api.IngressDialNone},
+	}
+	bare := listeningReport(reportID("b2"))
+
+	req := buildIngressStatusRequest(api.IngressStateEnabled, []IngressRuleReport{pool, bare}, now)
+	if len(req.Rules) != 2 {
+		t.Fatalf("rules = %+v, want two entries", req.Rules)
+	}
+	want := fmt.Sprintf(`[`+
+		`{"node_id":%q,"port":9000,"dial":"failed","dial_reason":"refused","dial_age_seconds":12},`+
+		`{"node_id":%q,"port":9001,"dial":"succeeded","dial_age_seconds":0},`+
+		`{"node_id":%q,"port":9002,"dial":"succeeded","dial_age_seconds":2147483647},`+
+		`{"node_id":%q,"port":9003,"dial":"none"}]`, n1, n2, n3, n4)
+	if got := mustJSON(t, req.Rules[0].Targets); got != want {
+		t.Errorf("targets = %s, want %s", got, want)
+	}
+	if age := req.Rules[0].DialAgeSeconds; age == nil || *age != 2 {
+		t.Errorf("the rule entry's DialAgeSeconds = %v, want 2, its own", age)
+	}
+	if got := req.Rules[1].Targets; got != nil {
+		t.Errorf("targets of a report without target entries = %+v, want nil", got)
+	}
+	if body := mustJSON(t, req.Rules[1]); strings.Contains(body, "targets") {
+		t.Errorf("entry = %s, want no targets member", body)
+	}
+}
+
 func TestBuildIngressStatusRequest_OptedOutCarriesNoRules(t *testing.T) {
 	req := buildIngressStatusRequest(api.IngressStateOptedOut, []IngressRuleReport{listeningReport(reportID("a1"))}, time.Now())
 	if req.Rules != nil {
@@ -643,6 +681,63 @@ func TestIngressStatusReporter_DialAgeAloneSendsNothing(t *testing.T) {
 		synctest.Wait()
 		if got := client.calls(); got != 1 {
 			t.Errorf("reports before the tick after a change of DialAt alone = %d, want only the one at start", got)
+		}
+	})
+}
+
+// TestIngressStatusReporter_TargetChangeSends sends on change when a target's
+// dial changes from none to failed while the rule's own dial stays, and sends
+// nothing before the tick when only the dial ages of the targets move.
+func TestIngressStatusReporter_TargetChangeSends(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		at := time.Now()
+		first := IngressTargetReport{NodeID: targetNodeID("b1"), Port: 9000, Dial: api.IngressDialSucceeded, DialAt: at}
+		second := IngressTargetReport{NodeID: targetNodeID("b2"), Port: 9001, Dial: api.IngressDialNone}
+		withTargets := func(first, second IngressTargetReport) IngressRuleReport {
+			r := dialledReport(reportID("a1"), api.IngressDialSucceeded, "", at)
+			r.Targets = []IngressTargetReport{first, second}
+			return r
+		}
+		source := newFakeRuleSource(withTargets(first, second))
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, source, discardLogger())
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		time.Sleep(10 * time.Second)
+		second.Dial, second.DialReason, second.DialAt = api.IngressDialFailed, IngressDialReasonRefused, time.Now()
+		source.set(withTargets(first, second))
+		synctest.Wait()
+		_, reqs := client.recorded()
+		if len(reqs) != 2 {
+			t.Fatalf("reports after a target's dial changed = %d, want 2: the one at start and one on change, before any tick", len(reqs))
+		}
+		if got := reqs[1].Rules; len(got) != 1 || got[0].Dial != api.IngressDialSucceeded || len(got[0].Targets) != 2 ||
+			got[0].Targets[1].Dial != api.IngressDialFailed || got[0].Targets[1].DialReason != IngressDialReasonRefused {
+			t.Errorf("on-change report rules = %s, want the rule succeeded and its second target failed with refused", mustJSON(t, got))
+		}
+
+		// With the gap long over, both targets dial again with the outcomes
+		// they had: only their ages move.
+		time.Sleep(10 * time.Second)
+		first.DialAt, second.DialAt = time.Now(), time.Now()
+		source.set(withTargets(first, second))
+		synctest.Wait()
+		time.Sleep(interval - 10*time.Second - time.Millisecond)
+		synctest.Wait()
+		if got := client.calls(); got != 2 {
+			t.Errorf("reports before the tick after a change of the target dial ages alone = %d, want 2", got)
+		}
+		// The tick carries the moved ages.
+		time.Sleep(2 * time.Millisecond)
+		synctest.Wait()
+		_, reqs = client.recorded()
+		if len(reqs) != 3 {
+			t.Fatalf("reports after the tick = %d, want 3", len(reqs))
+		}
+		if got := reqs[2].Rules[0].Targets; len(got) != 2 || got[1].DialAgeSeconds == nil || *got[1].DialAgeSeconds != 50 {
+			t.Errorf("tick report targets = %s, want the second target's dial_age_seconds 50", mustJSON(t, got))
 		}
 	})
 }
@@ -750,7 +845,7 @@ func TestIngressStatusReporter_ControlPlaneWithoutRules(t *testing.T) {
 		if n, sends := logs.count(`level=WARN msg="ingress status: send failed"`), client.calls(); n != sends {
 			t.Errorf("%d Warns 'ingress status: send failed' over %d refused sends, want one per send", n, sends)
 		}
-		if after := fx.mgr.RuleReports(); !slices.Equal(after, before) {
+		if after := fx.mgr.RuleReports(); !slices.EqualFunc(after, before, sameReport) {
 			t.Errorf("RuleReports after the refused sends = %+v, want it unchanged from %+v", after, before)
 		}
 	})
