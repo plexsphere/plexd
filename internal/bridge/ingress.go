@@ -606,7 +606,11 @@ func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn
 	case hello.ServerName == "":
 		reason = connReasonNoServerName
 	default:
-		route = table.match(hello.ServerName)
+		// A host's rules share their mode, Secret and served state, so its
+		// lead route decides the connection.
+		if host := table.match(hello.ServerName); host != nil {
+			route = host.lead()
+		}
 		if l.port == acmeChallengePort && slices.Equal(hello.ALPN, []string{acme.ALPNProto}) &&
 			(route == nil || route.rule.Mode == api.IngressModeACME) && m.acme.HasHost(hello.ServerName) {
 			m.answerChallenge(ctx, conn, hello, peeked)

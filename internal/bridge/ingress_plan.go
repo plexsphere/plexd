@@ -1,7 +1,9 @@
 package bridge
 
 import (
+	"cmp"
 	"context"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -19,8 +21,12 @@ const (
 	IngressReasonDuplicateID = "duplicate_id"
 	// IngressReasonListenerConflict: a held rule of the same protocol has the
 	// same listen port and host, or one of the two has no host; Detail is the
-	// holder's slug. A udp rule has no host, so it conflicts with every held
-	// udp rule on its port, and a tcp and a udp rule never conflict.
+	// holder's slug. Rules with request conditions share a port and host when
+	// they all name the same mode and certificate_secret_name and no two have
+	// the same conditions; a rule that breaks this conflicts with the host's
+	// first held rule, or with the held rule whose conditions equal its own.
+	// A udp rule has no host, so it conflicts with every held udp rule on its
+	// port, and a tcp and a udp rule never conflict.
 	IngressReasonListenerConflict = "listener_conflict"
 	// IngressReasonMaxRules: bridge.max_ingress_rules rules are held already.
 	IngressReasonMaxRules = "max_rules"
@@ -61,12 +67,23 @@ const acmeChallengePort = 443
 // maxHostLen is the longest DNS name, in bytes, without a trailing dot.
 const maxHostLen = 253
 
+// The bounds of a rule's request conditions, as the control plane validates
+// them.
+const (
+	maxPathPrefixLen      = 1024
+	maxHeaderConditions   = 8
+	maxHeaderNameLen      = 64
+	maxHeaderValueLen     = 256
+	pathPrefixPunctuation = "-._~!$&'()*+,;=:@"
+	headerNamePunctuation = "!#$%&'*+-.^_`|~"
+)
+
 // IngressRuleState is the outcome of one rule of the last Apply.
 type IngressRuleState struct {
 	Rule   api.IngressRule
 	Served bool
 	Reason string // empty when served
-	Detail string // the field of an invalid rule, the slug of the rule that holds the listener, a directory URL or a Secret name
+	Detail string // the field of an invalid rule, the slug of the held rule it conflicts with, a directory URL or a Secret name
 
 	// held is set for a rule that keeps its listener slot, served or not.
 	held bool
@@ -116,9 +133,36 @@ type ingressPlan struct {
 
 // ingressTable routes the connections of one listen port.
 type ingressTable struct {
-	plain    *ingressRoute            // the rule without sni_host; nil on an SNI port
-	exact    map[string]*ingressRoute // by lowercase host
-	wildcard map[string]*ingressRoute // by the suffix after "*."
+	plain    *ingressRoute           // the rule without sni_host; nil on an SNI port
+	exact    map[string]*ingressHost // by lowercase host
+	wildcard map[string]*ingressHost // by the suffix after "*."
+}
+
+// ingressHost is what one sni_host of a port routes to.
+type ingressHost struct {
+	// routes holds one route for a rule without conditions; otherwise the
+	// rules that share the host, in precedence order.
+	routes []*ingressRoute
+	// http is set when the rules have conditions: the bridge reads each
+	// request.
+	http bool
+}
+
+// lead returns the host's first route, whose rule names the host's mode and
+// Secret and whose served state is the host's.
+func (h *ingressHost) lead() *ingressRoute {
+	return h.routes[0]
+}
+
+// route returns the first route, in precedence order, whose conditions the
+// request matches, or nil.
+func (h *ingressHost) route(path string, hdr http.Header) *ingressRoute {
+	for _, r := range h.routes {
+		if r.matches(path, hdr) {
+			return r
+		}
+	}
+	return nil
 }
 
 // ingressRoute is one held rule in a table.
@@ -130,19 +174,37 @@ type ingressRoute struct {
 	cancel context.CancelFunc
 }
 
+// matches reports whether a request matches the route's conditions: its path
+// prefix is empty or "/", equals the path, or is followed by "/" in the path,
+// and every header condition's value is the value of one field line of its
+// name. The comparison is case-sensitive, and the path is compared as the
+// client sent it, without the query.
+func (r *ingressRoute) matches(path string, hdr http.Header) bool {
+	if p := r.rule.Conditions.PathPrefix; p != "" && p != "/" && path != p &&
+		(!strings.HasPrefix(path, p) || path[len(p)] != '/') {
+		return false
+	}
+	for _, c := range r.rule.Conditions.Headers {
+		if !slices.Contains(hdr.Values(c.Name), c.Value) {
+			return false
+		}
+	}
+	return true
+}
+
 // newIngressTable returns a table without routes.
 func newIngressTable() *ingressTable {
 	return &ingressTable{
-		exact:    make(map[string]*ingressRoute),
-		wildcard: make(map[string]*ingressRoute),
+		exact:    make(map[string]*ingressHost),
+		wildcard: make(map[string]*ingressHost),
 	}
 }
 
-// match returns the route for a ClientHello's server name, or nil. It compares
+// match returns the host for a ClientHello's server name, or nil. It compares
 // case-insensitively, prefers an exact host, and otherwise looks the name up
 // with its first label cut off, so *.example.com matches a.example.com and
 // neither example.com nor a.b.example.com.
-func (t *ingressTable) match(serverName string) *ingressRoute {
+func (t *ingressTable) match(serverName string) *ingressHost {
 	name := strings.ToLower(serverName)
 	if name == "" {
 		return nil
@@ -163,24 +225,30 @@ func (t *ingressTable) routes() []*ingressRoute {
 	if t.plain != nil {
 		out = append(out, t.plain)
 	}
-	for _, r := range t.exact {
-		out = append(out, r)
+	for _, h := range t.exact {
+		out = append(out, h.routes...)
 	}
-	for _, r := range t.wildcard {
-		out = append(out, r)
+	for _, h := range t.wildcard {
+		out = append(out, h.routes...)
 	}
 	return out
 }
 
 // planIngress decides which rules of a block are held, builds the routing
 // table of each TCP listen port and picks the route of each UDP listen port.
-// It sets an empty protocol to tcp on its copy of each rule before any check,
-// so every state and route carries tcp or udp. It walks the rules in the order
-// the pull lists them and gives each the first reason that applies; a rule
-// that passes every check up to the bound is held, and the rules of both
-// protocols count toward the bound. Listener conflicts are per protocol: a
-// tcp rule conflicts only with held tcp rules, and a udp rule with the held
-// udp rule of its port. Every port with a held tcp rule gets a table, and
+// It sets an empty protocol to tcp and an empty list of header conditions to
+// nil on its copy of each rule before any check, so every state and route
+// carries tcp or udp. It walks the rules in the order the pull lists them and
+// gives each the first reason that applies; a rule that passes every check up
+// to the bound is held, and the rules of both protocols count toward the
+// bound. Listener conflicts are per protocol: a tcp rule conflicts only with
+// held tcp rules, and a udp rule with the held udp rule of its port. Rules
+// with request conditions share a host of a port under the terms the control
+// plane guarantees (see IngressReasonListenerConflict); after the walk the
+// routes of each host are sorted by precedence: the longer path prefix first,
+// an empty one counting as "/", then more header conditions, then the lower
+// slug in byte order, then the lower id. Every port with a held tcp rule gets
+// a table, and
 // every port with a held udp rule gets that rule's route in plan.udp, served.
 // A held passthrough or terminate rule is served once its port is bound (a
 // terminate rule also needs its certificate, which the manager overlays). A
@@ -200,9 +268,9 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 
 	// portHolders is what the held rules of one port occupy.
 	type portHolders struct {
-		first string            // slug of the first rule held on the port
-		plain string            // slug of the held rule without a host
-		hosts map[string]string // slug by lowercase host
+		first string                  // slug of the first rule held on the port
+		plain string                  // slug of the held rule without a host
+		hosts map[string]*ingressHost // by lowercase host
 		table *ingressTable
 	}
 	// heldACME is a held acme rule: its state's index and its route.
@@ -222,6 +290,11 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		// not change when the control plane starts to send the member.
 		if r.Protocol == "" {
 			r.Protocol = api.IngressProtocolTCP
+		}
+		// An empty list of header conditions is no condition, as an absent
+		// one is.
+		if len(r.Conditions.Headers) == 0 {
+			r.Conditions.Headers = nil
 		}
 		udp := r.Protocol == api.IngressProtocolUDP
 		st := IngressRuleState{Rule: r}
@@ -256,6 +329,16 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			st.Reason, st.Detail = IngressReasonInvalid, "target_port"
 		case r.Mode == api.IngressModeTerminate && !api.ValidSecretName(r.CertificateSecretName):
 			st.Reason, st.Detail = IngressReasonInvalid, "certificate_secret_name"
+		case !r.Conditions.IsZero() && r.Mode == api.IngressModePassthrough:
+			// The bridge reads no request of a passthrough rule, which
+			// every udp rule is.
+			st.Reason, st.Detail = IngressReasonInvalid, "conditions"
+		case !validPathPrefix(r.Conditions.PathPrefix):
+			st.Reason, st.Detail = IngressReasonInvalid, "conditions.path_prefix"
+		case !validHeaderConditions(r.Conditions.Headers):
+			st.Reason, st.Detail = IngressReasonInvalid, "conditions.headers"
+		case r.StripPathPrefix && (r.Conditions.PathPrefix == "" || r.Conditions.PathPrefix == "/"):
+			st.Reason, st.Detail = IngressReasonInvalid, "strip_path_prefix"
 		}
 		if st.Reason == "" {
 			if udp {
@@ -268,8 +351,10 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 					st.Reason, st.Detail = IngressReasonListenerConflict, h.plain
 				case host == "":
 					st.Reason, st.Detail = IngressReasonListenerConflict, h.first
-				case h.hosts[host] != "":
-					st.Reason, st.Detail = IngressReasonListenerConflict, h.hosts[host]
+				case h.hosts[host] != nil:
+					if holder := hostConflict(h.hosts[host], r); holder != "" {
+						st.Reason, st.Detail = IngressReasonListenerConflict, holder
+					}
 				}
 			}
 		}
@@ -293,7 +378,7 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		if h == nil {
 			h = &portHolders{
 				first: r.Slug,
-				hosts: make(map[string]string),
+				hosts: make(map[string]*ingressHost),
 				table: newIngressTable(),
 			}
 			ports[r.ListenPort] = h
@@ -303,16 +388,21 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			target: ingressTarget(r),
 			served: r.Mode != api.IngressModeACME || acme.Reason == "",
 		}
-		switch {
-		case host == "":
+		if host == "" {
 			h.plain = r.Slug
 			h.table.plain = route
-		case strings.HasPrefix(host, "*."):
-			h.hosts[host] = r.Slug
-			h.table.wildcard[host[2:]] = route
-		default:
-			h.hosts[host] = r.Slug
-			h.table.exact[host] = route
+		} else {
+			ih := h.hosts[host]
+			if ih == nil {
+				ih = &ingressHost{http: !r.Conditions.IsZero()}
+				h.hosts[host] = ih
+				if strings.HasPrefix(host, "*.") {
+					h.table.wildcard[host[2:]] = ih
+				} else {
+					h.table.exact[host] = ih
+				}
+			}
+			ih.routes = append(ih.routes, route)
 		}
 		st.held = true
 		st.Served = route.served
@@ -326,6 +416,9 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 	}
 
 	for port, h := range ports {
+		for _, ih := range h.hosts {
+			slices.SortFunc(ih.routes, comparePrecedence)
+		}
 		plan.tables[port] = h.table
 	}
 
@@ -341,7 +434,9 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		if challenge != nil {
 			holder := challenge.plain
 			if holder == nil {
-				holder = challenge.match(st.Rule.SNIHost)
+				if h := challenge.match(st.Rule.SNIHost); h != nil {
+					holder = h.lead()
+				}
 			}
 			if holder != nil && holder.rule.Mode != api.IngressModeACME {
 				a.route.served = false
@@ -356,6 +451,151 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		plan.tables[acmeChallengePort] = newIngressTable()
 	}
 	return plan
+}
+
+// hostConflict returns the slug of the held rule a rule for the held host
+// conflicts with, or "" when the rule may join the host: the host's first
+// held rule when the rule or the host's rules have no conditions, or the
+// rule's mode or, on terminate, its certificate_secret_name differs; the held
+// rule whose conditions equal the rule's otherwise. The caller walks the rules
+// in block order, so routes[0] is the host's first held rule.
+func hostConflict(h *ingressHost, r api.IngressRule) string {
+	first := h.routes[0].rule
+	switch {
+	case r.Conditions.IsZero() || !h.http,
+		r.Mode != first.Mode,
+		r.Mode == api.IngressModeTerminate && r.CertificateSecretName != first.CertificateSecretName:
+		return first.Slug
+	}
+	key := conditionsKey(r.Conditions)
+	for _, route := range h.routes {
+		if conditionsKey(route.rule.Conditions) == key {
+			return route.rule.Slug
+		}
+	}
+	return ""
+}
+
+// conditionsKey returns what tells two rules' conditions apart: the path
+// prefix, "/" when it is empty, then name:value per header condition in name
+// order, each ended by a line feed. A valid name holds no colon and a valid
+// value no line feed.
+func conditionsKey(c api.IngressConditions) string {
+	prefix := c.PathPrefix
+	if prefix == "" {
+		prefix = "/"
+	}
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteByte('\n')
+	headers := slices.Clone(c.Headers)
+	slices.SortFunc(headers, func(x, y api.IngressHeaderCondition) int { return strings.Compare(x.Name, y.Name) })
+	for _, h := range headers {
+		b.WriteString(h.Name)
+		b.WriteByte(':')
+		b.WriteString(h.Value)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// comparePrecedence orders the routes of a host: the longer path prefix
+// first, an empty one counting as "/", then more header conditions, then the
+// lower slug in byte order, then the lower id.
+func comparePrecedence(a, b *ingressRoute) int {
+	prefixLen := func(r *ingressRoute) int { return max(len(r.rule.Conditions.PathPrefix), 1) }
+	if c := cmp.Compare(prefixLen(b), prefixLen(a)); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(len(b.rule.Conditions.Headers), len(a.rule.Conditions.Headers)); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.rule.Slug, b.rule.Slug); c != 0 {
+		return c
+	}
+	return strings.Compare(a.rule.ID, b.rule.ID)
+}
+
+// validPathPrefix reports whether a path prefix is empty or one the bridge
+// can match: "/", or at most 1024 bytes that start with "/", do not end in
+// "/", and hold segments that are not empty, "." or "..", made of letters,
+// digits and - . _ ~ ! $ & ' ( ) * + , ; = : @.
+func validPathPrefix(p string) bool {
+	if p == "" || p == "/" {
+		return true
+	}
+	if p[0] != '/' || len(p) > maxPathPrefixLen || strings.HasSuffix(p, "/") {
+		return false
+	}
+	for seg := range strings.SplitSeq(p[1:], "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+		for i := range len(seg) {
+			if !isAlnum(seg[i]) && !strings.ContainsRune(pathPrefixPunctuation, rune(seg[i])) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validHeaderConditions reports whether header conditions are at most 8, each
+// with a name of 1 to 64 lowercase RFC 9110 token characters that is not host
+// and that no earlier condition carries, and a value of 1 to 256 bytes of
+// 0x20 to 0x7E without a leading or trailing space.
+func validHeaderConditions(headers []api.IngressHeaderCondition) bool {
+	if len(headers) > maxHeaderConditions {
+		return false
+	}
+	seen := make(map[string]struct{}, len(headers))
+	for _, h := range headers {
+		if !validHeaderName(h.Name) || h.Name == "host" {
+			return false
+		}
+		if _, dup := seen[h.Name]; dup {
+			return false
+		}
+		seen[h.Name] = struct{}{}
+		if !validHeaderValue(h.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// validHeaderName reports whether name is 1 to 64 characters of lowercase
+// letters, digits and ! # $ % & ' * + - . ^ _ ` | ~.
+func validHeaderName(name string) bool {
+	if name == "" || len(name) > maxHeaderNameLen {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && !strings.ContainsRune(headerNamePunctuation, rune(c)) {
+			return false
+		}
+	}
+	return true
+}
+
+// validHeaderValue reports whether value is 1 to 256 bytes of 0x20 to 0x7E
+// that neither start nor end with a space.
+func validHeaderValue(value string) bool {
+	if value == "" || len(value) > maxHeaderValueLen || value[0] == ' ' || value[len(value)-1] == ' ' {
+		return false
+	}
+	for i := range len(value) {
+		if value[i] < 0x20 || value[i] > 0x7E {
+			return false
+		}
+	}
+	return true
+}
+
+// isAlnum reports whether c is an ASCII letter or digit.
+func isAlnum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // validSNIHost reports whether a lowercase sni_host is empty or a name the
