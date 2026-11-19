@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"reflect"
 	"slices"
 	"time"
 )
@@ -2015,7 +2016,8 @@ type IngressACME struct {
 }
 
 // IngressRule is one rule of the block, the control plane's
-// NodeStateBridgeIngressRule.
+// NodeStateBridgeIngressRule. It is not comparable with ==; Equal compares
+// two rules.
 type IngressRule struct {
 	ID   string `json:"id"`
 	Slug string `json:"slug"`
@@ -2041,6 +2043,50 @@ type IngressRule struct {
 	// holds a terminate rule's certificate chain and key, one PEM document.
 	// It is empty on every other mode.
 	CertificateSecretName string `json:"certificate_secret_name,omitempty"`
+	// Conditions are the request conditions of a terminate or acme rule:
+	// rules with conditions share one listen port and SNI host, and the
+	// bridge hands each request to the rule they pick. A rule without
+	// conditions marshals without the key, and an absent, null or empty
+	// member decodes to a rule without conditions.
+	Conditions IngressConditions `json:"conditions,omitzero"`
+	// StripPathPrefix removes the matched path prefix from the front of the
+	// path the target receives. Only a rule whose path prefix is present
+	// and not "/" carries it.
+	StripPathPrefix bool `json:"strip_path_prefix,omitempty"`
+}
+
+// IngressConditions are the request conditions of an ingress rule, the
+// control plane's NodeStateBridgeIngressConditions: a path prefix and up to 8
+// header conditions, all of which a request must match. The headers arrive in
+// name order.
+type IngressConditions struct {
+	PathPrefix string                   `json:"path_prefix,omitempty"`
+	Headers    []IngressHeaderCondition `json:"headers,omitempty"`
+}
+
+// IngressHeaderCondition is one header condition: a field of Name, a
+// lowercase token, that carries exactly Value.
+type IngressHeaderCondition struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// IsZero reports whether c names no path prefix and no header, which is a
+// rule without conditions. encoding/json's omitzero calls it.
+func (c IngressConditions) IsZero() bool {
+	return c.PathPrefix == "" && len(c.Headers) == 0
+}
+
+// Equal reports whether two rules carry the same members. A nil and an empty
+// Conditions.Headers are equal; the order of the headers counts.
+func (r IngressRule) Equal(o IngressRule) bool {
+	if len(r.Conditions.Headers) == 0 {
+		r.Conditions.Headers = nil
+	}
+	if len(o.Conditions.Headers) == 0 {
+		o.Conditions.Headers = nil
+	}
+	return reflect.DeepEqual(r, o)
 }
 
 // The modes of an ingress rule.

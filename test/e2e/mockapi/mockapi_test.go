@@ -9958,8 +9958,45 @@ func TestState_ReturnsIngressChild(t *testing.T) {
 		TargetAddress: "10.99.0.2",
 		TargetPort:    8443,
 	}
-	if got := ing.Rules[0]; got != want {
+	if got := ing.Rules[0]; !got.Equal(want) {
 		t.Errorf("Ingress.Rules[0] = %+v, want %+v", got, want)
+	}
+}
+
+// TestConfigureState_IngressRuleConditions posts a bridge block whose rules
+// carry request conditions and strip_path_prefix, as the control plane sends
+// them, and reads both members back from the next pull.
+func TestConfigureState_IngressRuleConditions(t *testing.T) {
+	_, ts := newTestServer(t)
+	envelope := stateEnvelope(t, ts.URL)
+	envelope["bridge"] = json.RawMessage(`{"ingress": {"enabled": true, "rules": [
+		{"id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6", "slug": "shop-api", "protocol": "tcp", "listen_port": 443,
+		 "mode": "terminate", "sni_host": "shop.example.com", "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+		 "target_address": "10.42.0.8", "target_port": 8080, "certificate_secret_name": "shop-cert",
+		 "conditions": {"path_prefix": "/api", "headers": [{"name": "x-tenant", "value": "acme"}]},
+		 "strip_path_prefix": true},
+		{"id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7", "slug": "shop-web", "protocol": "tcp", "listen_port": 443,
+		 "mode": "terminate", "sni_host": "shop.example.com", "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		 "target_address": "10.42.0.7", "target_port": 3000, "certificate_secret_name": "shop-cert",
+		 "conditions": {"path_prefix": "/"}}]}}`)
+	configureStateEnvelope(t, ts.URL, envelope)
+
+	state := getState(t, ts.URL)
+	if state.Bridge == nil || state.Bridge.Ingress == nil || len(state.Bridge.Ingress.Rules) != 2 {
+		t.Fatalf("Bridge after configure-state = %+v, want two ingress rules", state.Bridge)
+	}
+	api1, web := state.Bridge.Ingress.Rules[0], state.Bridge.Ingress.Rules[1]
+	wantAPI := api.IngressConditions{PathPrefix: "/api", Headers: []api.IngressHeaderCondition{{Name: "x-tenant", Value: "acme"}}}
+	if !reflect.DeepEqual(api1.Conditions, wantAPI) || !api1.StripPathPrefix {
+		t.Errorf("shop-api Conditions, StripPathPrefix = %+v, %v, want %+v, true", api1.Conditions, api1.StripPathPrefix, wantAPI)
+	}
+	if web.Conditions.PathPrefix != "/" || len(web.Conditions.Headers) != 0 || web.StripPathPrefix {
+		t.Errorf("shop-web Conditions, StripPathPrefix = %+v, %v, want the prefix / alone, false", web.Conditions, web.StripPathPrefix)
+	}
+
+	raw := stateEnvelope(t, ts.URL)["bridge"]
+	if strings.Count(string(raw), `"strip_path_prefix"`) != 1 {
+		t.Errorf("served bridge %s carries strip_path_prefix %d times, want once (shop-api only)", raw, strings.Count(string(raw), `"strip_path_prefix"`))
 	}
 }
 
