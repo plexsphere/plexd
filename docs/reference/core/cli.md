@@ -69,7 +69,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 
 **Goroutines:** Health Listener, SSE, Heartbeat, Handshake Reporter, Endpoint Selection, Mesh MTU Re-probe, Policy Status Reporter, Reconciler, Key Rotation Recovery, Node API, Status Report Publisher, Hook Watcher, Rollout Hook Watcher, Rollout Installer, Capability Reporter, PlexdHook Inventory, Integrity Verifier, Metrics, Log Forwarder, Connection Log Summary, Audit Forwarder, Peer Exchange, Endpoint Candidate Publisher, Mesh Server, Mesh DNS Resolver, and in bridge mode the relay, ingress, user access and site-to-site status reporters. The capability reporter sends the boot manifest when it starts and retries it until one is accepted, then reports each hook or `PlexdHook` change. The PlexdHook inventory returns at once outside a cluster. A bridge's NAT relay starts and stops from the reconciler when the state pull enables or disables it, not as a startup goroutine.
 
-**Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, mesh server shutdown, bridge teardowns (bridge mode), policy enforcer teardown, WireGuard teardown, wait for goroutines with 30s drain timeout.
+**Shutdown:** On SIGTERM/SIGINT — cancel context, revert the mesh DNS registration (when the resolver runs), `sseMgr.Shutdown()`, then `executor.Shutdown()`, mesh server shutdown, bridge teardowns (bridge mode), policy enforcer teardown, WireGuard teardown, wait for the goroutines for at most 30s. `plexd up` exits with 0 whether or not the wait timed out.
 
 For the full startup and shutdown sequence, see [Architecture and Concepts](../../concepts.md).
 

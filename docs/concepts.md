@@ -98,20 +98,21 @@ In bridge mode `plexd up` also starts the ingress status reporter, whether or no
 
 On SIGTERM or SIGINT:
 
-![SIGTERM or SIGINT cancels the context. The SSE shutdown and the draining of actions both follow, and both lead to the mesh server shutdown. In bridge mode the bridge teardown comes next: the ingress, user access, site-to-site, ACME and bridge teardowns, in that order. Then the firewall and WireGuard are torn down. If the WaitGroup is done within 30 seconds, plexd exits with 0; if not, it forces the exit.](./diagrams/architecture-shutdown-sequence.svg)
+![SIGTERM or SIGINT cancels the context. Then, one after the other, the mesh DNS registration is reverted if the resolver runs, the SSE manager shuts down, the running actions are cancelled and drained, and the mesh server shuts down. In bridge mode the bridge teardown comes next: the ingress, user access, site-to-site, ACME and bridge teardowns, in that order. Then the firewall and WireGuard are torn down, and plexd waits for its goroutines for at most 30 seconds. When all have exited, it returns nil and exits with 0. After 30 seconds it logs the warning drain timeout exceeded, forcing exit, and then returns nil and exits with 0 as well.](./diagrams/architecture-shutdown-sequence.svg)
 
-1. **Context cancel** — the signal-notify context is cancelled, which signals all goroutines to stop
-2. **`sseMgr.Shutdown()`** — close the SSE connection
-3. **`executor.Shutdown()`** — drain running actions
-4. **`meshServer.Shutdown()`** — stop tunnel SSH server and drain sessions
-5. **`ingressMgr.Teardown()`** — close ingress listeners (bridge mode, unless `bridge.ingress_enabled` is `false`)
-6. **`userAccessMgr.Teardown()`** — stop the vendor clients and remove the provider interfaces and their source rewrites, keeping the key files (bridge mode, unless `bridge.user_access_enabled` is `false`)
-7. **`s2sMgr.Teardown()`** — remove every tunnel: stop its `openvpn` process or unload its strongSwan connection, and remove its routes, its source rewrite and its interface, keeping the key files (bridge mode, unless `bridge.site_to_site_enabled` is `false`)
-8. **`acmeMgr.Teardown()`** — retire the ACME account and wait at most 10 s for its certificate requests in flight (bridge mode, unless `bridge.ingress_enabled` is `false`; see [Teardown](reference/bridge/acme-sni.md#teardown))
-9. **`bridgeMgr.Teardown()`** — remove bridge routes and forwarding (bridge mode)
-10. **`enforcer.Teardown()`** — remove firewall chains and rules
-11. **`wgMgr.Teardown()`** — remove the routes of the peers' routed subnets, then delete the WireGuard interface (last, others depend on it)
-12. **`wg.Wait()` with 30s timeout** — wait for all goroutines to exit; force exit if timeout exceeded
+1. **Context cancel** — the signal-notify context is cancelled, which signals all goroutines to stop, and plexd logs `shutting down`
+2. **`dnsMgr.Shutdown()`** — revert the mesh DNS registration within 5 s (`meshDNSRegistrarTimeout`), only when step 5a-3 started a resolver. It goes first because the resolver stopped answering when the context ended, and because the mesh interface still exists. An error logs `mesh dns shutdown error` (see [Stop, Crash and Opt-Out](reference/networking/mesh-dns.md#stop-crash-and-opt-out))
+3. **`sseMgr.Shutdown()`** — close the SSE connection
+4. **`executor.Shutdown()`** — runs after the SSE shutdown returned: cancel the running actions, refuse new ones, and wait until they have ended
+5. **`meshServer.Shutdown()`** — stop tunnel SSH server and drain sessions
+6. **`ingressMgr.Teardown()`** — close ingress listeners (bridge mode, unless `bridge.ingress_enabled` is `false`)
+7. **`userAccessMgr.Teardown()`** — stop the vendor clients and remove the provider interfaces and their source rewrites, keeping the key files (bridge mode, unless `bridge.user_access_enabled` is `false`)
+8. **`s2sMgr.Teardown()`** — remove every tunnel: stop its `openvpn` process or unload its strongSwan connection, and remove its routes, its source rewrite and its interface, keeping the key files (bridge mode, unless `bridge.site_to_site_enabled` is `false`)
+9. **`acmeMgr.Teardown()`** — retire the ACME account and wait at most 10 s for its certificate requests in flight (bridge mode, unless `bridge.ingress_enabled` is `false`; see [Teardown](reference/bridge/acme-sni.md#teardown))
+10. **`bridgeMgr.Teardown()`** — remove bridge routes and forwarding (bridge mode)
+11. **`enforcer.Teardown()`** — remove firewall chains and rules
+12. **`wgMgr.Teardown()`** — remove the routes of the peers' routed subnets, then delete the WireGuard interface (last, others depend on it); skipped on a platform without a WireGuard controller
+13. **`wg.Wait()` for at most 30 s** — wait for all goroutines to exit (`drainTimeout`). When they have not all exited by then, plexd logs the Warn `drain timeout exceeded, forcing exit`. In both cases it logs `plexd stopped`, and `plexd up` returns nil and exits with 0. There is no separate forced exit
 
 ## Authentication Flow
 
