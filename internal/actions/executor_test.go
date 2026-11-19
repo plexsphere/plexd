@@ -2391,3 +2391,151 @@ func TestExecutor_MeshReconnectDeadlineExceeded(t *testing.T) {
 		t.Errorf("output = %+v, want status failed with error %q", result, context.DeadlineExceeded.Error())
 	}
 }
+
+// localRunBuiltin is a built-in for the RunLocal tests. It records whether it
+// ran and the parameter map it got, and returns the values it holds.
+// RunLocal calls it on the test's goroutine, so it needs no lock.
+type localRunBuiltin struct {
+	ran      bool
+	params   map[string]string
+	stdout   string
+	stderr   string
+	exitCode int
+	err      error
+}
+
+func (b *localRunBuiltin) run(_ context.Context, params map[string]string) (string, string, int, error) {
+	b.ran = true
+	b.params = params
+	return b.stdout, b.stderr, b.exitCode, b.err
+}
+
+func TestExecutor_RunLocal_ActionsDisabled(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(false)}, &mockReporter{}, &mockVerifier{ok: true})
+	builtin := &localRunBuiltin{stdout: "ran"}
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, builtin.run)
+
+	stdout, stderr, exitCode, err := exec.RunLocal(context.Background(), "test.echo", map[string]string{"key": "value"})
+
+	if stdout != "" || stderr != "" || exitCode != 1 {
+		t.Errorf("RunLocal = (%q, %q, %d), want (\"\", \"\", 1)", stdout, stderr, exitCode)
+	}
+	if !errors.Is(err, ErrActionsDisabled) {
+		t.Errorf("err = %v, want ErrActionsDisabled", err)
+	}
+	if builtin.ran {
+		t.Error("the built-in ran while actions are disabled")
+	}
+}
+
+func TestExecutor_RunLocal_ActionsDisabledUnknownName(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(false)}, &mockReporter{}, &mockVerifier{ok: true})
+	builtin := &localRunBuiltin{}
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, builtin.run)
+
+	_, _, _, err := exec.RunLocal(context.Background(), "no.such.action", nil)
+
+	if !errors.Is(err, ErrActionsDisabled) {
+		t.Errorf("err = %v, want ErrActionsDisabled", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "unknown builtin action") {
+		t.Errorf("err = %q, want the disabled refusal, not the unknown-name one", err)
+	}
+}
+
+func TestExecutor_RunLocal_RunsBuiltin(t *testing.T) {
+	exec := newTestExecutor(Config{}, &mockReporter{}, &mockVerifier{ok: true})
+	builtin := &localRunBuiltin{stdout: "hello from builtin", stderr: "a warning", exitCode: 3}
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, builtin.run)
+	params := map[string]string{"include_network": "false"}
+
+	stdout, stderr, exitCode, err := exec.RunLocal(context.Background(), "test.echo", params)
+
+	if err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+	if stdout != "hello from builtin" || stderr != "a warning" || exitCode != 3 {
+		t.Errorf("RunLocal = (%q, %q, %d), want (%q, %q, 3)", stdout, stderr, exitCode, "hello from builtin", "a warning")
+	}
+	if !builtin.ran {
+		t.Fatal("the built-in did not run")
+	}
+	if !reflect.DeepEqual(builtin.params, params) {
+		t.Errorf("built-in params = %v, want %v", builtin.params, params)
+	}
+}
+
+func TestExecutor_RunLocal_NilParams(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(true)}, &mockReporter{}, &mockVerifier{ok: true})
+	builtin := &localRunBuiltin{}
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, builtin.run)
+
+	if _, _, _, err := exec.RunLocal(context.Background(), "test.echo", nil); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+
+	if !builtin.ran {
+		t.Fatal("the built-in did not run")
+	}
+	if builtin.params != nil {
+		t.Errorf("built-in params = %v, want a nil map", builtin.params)
+	}
+}
+
+func TestExecutor_RunLocal_RefusesHook(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(true)}, &mockReporter{}, &mockVerifier{ok: true})
+	exec.SetHooks([]api.HookInfo{{Name: "deploy", Source: api.HookSourceLocal, Checksum: "abc123"}})
+
+	stdout, stderr, exitCode, err := exec.RunLocal(context.Background(), "deploy", nil)
+
+	if stdout != "" || stderr != "" || exitCode != 1 {
+		t.Errorf("RunLocal = (%q, %q, %d), want (\"\", \"\", 1)", stdout, stderr, exitCode)
+	}
+	if err == nil || err.Error() != "unknown builtin action: deploy" {
+		t.Errorf("err = %v, want %q", err, "unknown builtin action: deploy")
+	}
+}
+
+func TestExecutor_RunLocal_UnknownName(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(true)}, &mockReporter{}, &mockVerifier{ok: true})
+
+	_, _, exitCode, err := exec.RunLocal(context.Background(), "no.such.action", nil)
+
+	if exitCode != 1 {
+		t.Errorf("exit code = %d, want 1", exitCode)
+	}
+	if err == nil || err.Error() != "unknown builtin action: no.such.action" {
+		t.Errorf("err = %v, want %q", err, "unknown builtin action: no.such.action")
+	}
+}
+
+func TestExecutor_RunLocal_EmptyName(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(true)}, &mockReporter{}, &mockVerifier{ok: true})
+	builtin := &localRunBuiltin{}
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, builtin.run)
+
+	_, _, exitCode, err := exec.RunLocal(context.Background(), "", nil)
+
+	if exitCode != 1 {
+		t.Errorf("exit code = %d, want 1", exitCode)
+	}
+	if err == nil || err.Error() != "unknown builtin action: " {
+		t.Errorf("err = %v, want %q", err, "unknown builtin action: ")
+	}
+	if builtin.ran {
+		t.Error("a built-in ran for an empty action name")
+	}
+}
+
+func TestExecutor_RunLocal_BuiltinError(t *testing.T) {
+	exec := newTestExecutor(Config{Enabled: boolPtr(true)}, &mockReporter{}, &mockVerifier{ok: true})
+	boom := errors.New("boom")
+	builtin := &localRunBuiltin{stdout: "partial", stderr: "warn", exitCode: 2, err: boom}
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, builtin.run)
+
+	stdout, stderr, exitCode, err := exec.RunLocal(context.Background(), "test.echo", nil)
+
+	if stdout != "partial" || stderr != "warn" || exitCode != 2 || err != boom {
+		t.Errorf("RunLocal = (%q, %q, %d, %v), want (%q, %q, 2, %v)", stdout, stderr, exitCode, err, "partial", "warn", boom)
+	}
+}

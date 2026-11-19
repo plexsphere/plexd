@@ -67,6 +67,9 @@ const deadlineLapsedError = "execution deadline lapsed before the run started"
 // the caller must retry it on a later cycle instead of suppressing it.
 var ErrDispatchDeferred = errors.New("actions: dispatch deferred")
 
+// ErrActionsDisabled is what RunLocal returns while actions.enabled is false.
+var ErrActionsDisabled = errors.New("actions are disabled on this node")
+
 // errClaimRefused reports that the control plane refused a transition of the
 // claim handshake. The refusal is deliberate and permanent, so the execution is
 // settled: the node neither runs it nor reports a terminal status.
@@ -1079,8 +1082,13 @@ func (e *Executor) uploadOutput(ctx context.Context, nodeID, executionID, combin
 // This is used by the local node API for CLI-triggered action execution.
 // Only built-in actions are supported: hooks are arbitrary operator scripts, and
 // dispatch from the pull's executions block is the only path the control plane
-// authorizes server-side.
+// authorizes server-side. It refuses every run while actions.enabled is false,
+// as the dispatcher refuses every dispatch.
 func (e *Executor) RunLocal(ctx context.Context, action string, params map[string]string) (string, string, int, error) {
+	if !e.cfg.IsEnabled() {
+		return "", "", 1, ErrActionsDisabled
+	}
+
 	e.mu.Lock()
 	_, ok := e.builtins[action]
 	e.mu.Unlock()
