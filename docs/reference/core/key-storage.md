@@ -10,11 +10,11 @@ plexd stores cryptographic keys and identity material in a single directory on t
 
 ## Overview
 
-During registration, the control plane provisions the node with several cryptographic artifacts. These are persisted to `data_dir` so that the node can rejoin the mesh, decrypt secrets, and verify SSE events across restarts. The stored keys are:
+The node holds several cryptographic artifacts. The Curve25519 private key, the NSK and the Ed25519 signing public key are persisted to `data_dir` so that the node can rejoin the mesh, decrypt secrets, and verify SSE events across restarts; the PSKs are held in memory only. The keys are:
 
 - **Curve25519 private key** -- mesh encryption (WireGuard)
-- **Pre-Shared Keys (PSK)** -- per-peer-pair post-quantum defense layer
-- **Node Secret Key (NSK)** -- AES-256-GCM secret decryption
+- **Pre-Shared Keys (PSK)** -- per-edge post-quantum defense layer, fetched after registration and held in memory only
+- **Node Secret Key (NSK)** -- source of the bearer envelope; AES-256-GCM key for secret and edge PSK envelopes
 - **Ed25519 signing public key** -- SSE event and JWT verification
 - **Bootstrap token** -- registration credential whose validity the control plane's BootstrapToken policy decides (its file is removed after use, or emptied where it cannot be removed)
 
@@ -34,8 +34,8 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 |------|----------|-----------|---------|---------------|
 | `private_key` | Curve25519 private key | X25519 (WireGuard) | Mesh traffic encryption and authentication | Generated locally during registration |
 | `rotation_pending_key` | Curve25519 private key (staged) | X25519 (WireGuard) | Staged private key for an in-flight rotation; same base64 encoding as `private_key`; removed on completion or discard | Generated locally when a rotation is signaled |
-| (in-memory, per peer) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, delivered with peer configuration |
-| `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Decrypts secret values fetched from the control plane | Control plane, issued during registration |
+| (in-memory, per peer) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, fetched per edge from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`, sealed under the NSK |
+| `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Source of the bearer envelope; opens secret values and edge PSK envelopes fetched from the control plane | Control plane, issued during registration |
 | `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration and carried by the state pull's `signing_key` block |
 | `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, `signing_key_id`, and `signing_public_key` | Control plane registration response; the two signing fields are rewritten from the state pull |
 | (bootstrap token file) | Bootstrap token | N/A | Authentication for initial registration (validity set by its BootstrapToken policy) | Provisioned externally (file, env var, or metadata service) |
@@ -48,20 +48,15 @@ WireGuard uses this keypair for all mesh traffic encryption. When keys are rotat
 
 ### Pre-Shared Keys (PSK)
 
-PSKs are 256-bit symmetric keys assigned per peer pair by the control plane. They are delivered as part of the `Peer` structure (field `psk`, base64-encoded) and applied to the WireGuard interface at configuration time. PSKs provide a post-quantum defense layer: even if Curve25519 is broken in the future, an attacker who did not also compromise the PSK cannot decrypt captured traffic.
+Each peer pair (an edge) has its own 256-bit PSK. The control plane derives it from the per-node PSKs of both nodes and serves it to each end sealed under that node's NSK; it is part of neither the registration response nor a peer of the state pull. plexd fetches it from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`, opens the envelope with AES-256-GCM under the NSK and installs it on the WireGuard peer. PSKs provide a post-quantum defense layer: even if Curve25519 is broken in the future, an attacker who did not also compromise the PSK cannot decrypt captured traffic.
 
-PSKs are not written to individual files on disk. They are part of the peer configuration that the WireGuard subsystem applies to the kernel interface. They are refreshed whenever the control plane distributes updated peer lists (e.g., after key rotation or reconciliation).
+PSKs are never written to disk: they and their epochs live in memory only, so a restarted node fetches every PSK again. plexd fetches an edge's PSK when the peer first appears, when the peer's public key changes, and after this node completes its own key rotation (see [Fetch rule](../networking/wireguard.md#fetch-rule) and [Pre-Shared Keys](../../guide/security.md#pre-shared-keys-psk)).
 
 ### Node Secret Key (NSK)
 
-The NSK is an AES-256 symmetric key used with GCM mode to decrypt secret values fetched from the control plane (`GET /v1/nodes/{node_id}/secrets/{key}`). It is received during registration and stored as a raw string in `data_dir/node_secret_key`.
+The NSK is a 32-byte key with two uses. Together with the node ID it forms the bearer envelope plexd presents on every call after registration (see [BearerToken](registration.md#bearertoken)); the NSK itself is never sent. As an AES-256-GCM key it opens the secret values (`GET /v1/nodes/{node_id}/secrets/{key}`) and the edge PSK envelopes fetched from the control plane. `POST /v1/register` returns it once, as `nsk`, and plexd stores that string, 44 characters of standard-padded base64, in `data_dir/node_secret_key`.
 
-The NSK is rotated independently of the mesh keypair:
-
-- **Mesh keypair only** -- when the control plane signals `rotate_keys` via heartbeat response or SSE event, only the Curve25519 mesh keypair is rotated. The `POST /v1/keys/rotate` response carries no NSK.
-- **NSK rotation** -- the control plane rotates the NSK as an independent concern, without rotating the Curve25519 mesh keypair.
-
-After rotation, the control plane re-encrypts all secrets with the new NSK. The old NSK is overwritten atomically on disk.
+The NSK is never rotated. `POST /v1/register` is the only call that returns one, and only `SaveIdentity` writes `node_secret_key`, so the file changes only when the node registers afresh. A mesh key rotation does not touch it: the `POST /v1/keys/rotate` response carries no NSK. On the control plane the NSK lives as long as the Node: removing the Node deletes it, and every call authenticated with it then answers `401 nsk_invalid`. To replace a host's NSK, remove its Node on the control plane, run `plexd deregister`, provide a fresh bootstrap token, and restart plexd.
 
 ### Ed25519 Signing Public Key
 
@@ -125,7 +120,7 @@ All key files are written with mode `0600` (owner read/write only). The `data_di
 | `data_dir/identity.json` | `0600` | `node_id`, `mesh_ip`, `signing_key_id`, `signing_public_key`, `last_rotation` (rotation receipt) (JSON) |
 | `data_dir/private_key` | `0600` | Base64-encoded Curve25519 private key |
 | `data_dir/rotation_pending_key` | `0600` | Base64-encoded staged rotation private key |
-| `data_dir/node_secret_key` | `0600` | Raw AES-256 Node Secret Key |
+| `data_dir/node_secret_key` | `0600` | Node Secret Key: the 32-byte key in standard-padded base64 (44 characters); an identity written before `nsk` became base64 holds the 32 raw bytes |
 | `data_dir/signing_public_key` | `0600` | Raw Ed25519 public key string |
 
 The plexd process should run as a dedicated `plexd` user. No other user or group needs read access to these files.
@@ -157,17 +152,13 @@ The Domain signing key also changes through the state pull's `signing_key` block
 3. Node calls `POST /v1/keys/rotate` with `{new_public_key}`.
 4. On a `200` receipt carrying `rotation_id` and `kid` -- or a `422 keys_rotate_public_key_unchanged`, which means an earlier submission already landed -- the node commits: it swaps `private_key`, persists the receipt as `last_rotation` in `identity.json`, and removes the staging file. The commit re-reads `identity.json` first, so it only ever advances `private_key` and `last_rotation` and never writes back an identity that a re-registration has replaced.
 5. Node updates the WireGuard device private key, retrying a failed install with a backoff that spans about two minutes: the committed key is already published to every peer, so a device left on the old key would reject every handshake.
-6. Node triggers a reconcile -- the propagated peer and PSK changes arrive via the state pull, not as a rotate response.
+6. Node triggers a reconcile: the peer changes arrive via the state pull, not as a rotate response, and the node fetches every edge PSK again.
 
 On `409 keys_rotate_no_pending_rotation` the signal is stale or cancelled, so the staged key is discarded. A permanent rejection -- `400`, `403`, `413`, `404 keys_rotate_peer_not_found`, or `422 keys_rotate_public_key_invalid` -- discards it too, because no resubmit changes the answer. A staged key that never received a terminal answer -- after a crash between a landed submit and the local commit, a `5xx`, or a `200` whose body carries no receipt because the control plane predates this contract -- is resubmitted by `RecoverPending` with a capped exponential backoff (5s doubling to 2min). That sweep runs for the lifetime of the process, not only at startup: a rotation the control plane completed is never signalled again, so a submit whose response was lost would otherwise leave the node on the old key until a restart.
 
-#### NSK Rotation
+#### NSK
 
-The NSK is rotated together with mesh keys or independently via the control plane. After rotation:
-
-- The new NSK is written atomically to `data_dir/node_secret_key`, overwriting the old value.
-- The control plane re-encrypts all secrets with the new NSK.
-- Secrets are fetched in real-time (not cached as plaintext), so no historical ciphertext accumulates on-node.
+The NSK is not rotated. It changes only when the node registers afresh (see [Node Secret Key (NSK)](#node-secret-key-nsk)).
 
 #### Signing Key from the State Pull
 
@@ -202,7 +193,7 @@ The event updates the verifier in memory only. A later pull that carries a diffe
 - **Bootstrap token removed after registration**: plexd removes its own copy of the token after registration, limiting the window for stealing it from the disk; the token's BootstrapToken policy on the control plane decides how often and how long the token can be redeemed.
 - **Transition period for signing keys**: during a rotation announced by a `signing_key_rotated` event that names the previous key and a deadline, both old and new signing keys are accepted, preventing event verification failures during rollover. After the transition expires, only the new key is trusted. A key installed from the state pull has no transition period: it replaces the current key, because a node trusts exactly one Domain key.
 - **PSK as post-quantum layer**: even if the Curve25519 key exchange is compromised (e.g., by a future quantum computer), the per-peer PSK provides an additional symmetric encryption layer that protects captured traffic.
-- **NSK rotation invalidates old ciphertext**: after NSK rotation, secrets encrypted with the old key cannot be decrypted by the node. The control plane re-encrypts with the new NSK.
+- **The NSK lives as long as the Node**: removing the Node on the control plane deletes its NSK, and every call authenticated with it answers `401 nsk_invalid`. plexd never rotates the NSK; a host gets another one only by enrolling again.
 - **TLS on all control plane communication**: key material is exchanged over TLS-protected channels, mitigating interception during registration and key rotation.
 
 ## Source Reference
