@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -157,6 +158,47 @@ func newHTTPFixture(t *testing.T, setup func(*IngressManager)) *httpFixture {
 	fx.certs.set("tls", 1, doc)
 	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
 	return &httpFixture{ingressFixture: fx, ctrl: ctrl, roots: certPool(t, doc), doc: doc}
+}
+
+// newDialLogHTTPFixture returns an HTTP fixture on a settable clock that
+// dials through a dialLog.
+func newDialLogHTTPFixture(t *testing.T) (*httpFixture, *dialLog) {
+	t.Helper()
+	dials := &dialLog{}
+	fx := newHTTPFixture(t, func(m *IngressManager) {
+		m.now = (&relayClock{now: relayStart}).Now
+		m.dial = dials.dial
+	})
+	return fx, dials
+}
+
+// poolRule returns an httpRule with the slug pool and the id reportID("a1")
+// that takes every path of shop.example.com to the targets, in their order.
+func poolRule(targets ...api.IngressTarget) api.IngressRule {
+	r := withID(httpRule("pool", "shop.example.com", targets[0].Port, "/"), reportID("a1"))
+	r.Targets = targets
+	return r
+}
+
+// startBodyTarget starts a target that answers each request with its name in
+// the field X-Target, the request's length and transfer coding as the target
+// read them in X-Content-Length and X-Transfer-Encoding, and the request body
+// as it arrived.
+func startBodyTarget(t *testing.T, name string) *httpTarget {
+	t.Helper()
+	tg := &httpTarget{srv: httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Target", name)
+		w.Header().Set("X-Content-Length", strconv.FormatInt(r.ContentLength, 10))
+		w.Header().Set("X-Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
+		_, _ = w.Write(body)
+	}))}
+	t.Cleanup(tg.srv.Close)
+	return tg
 }
 
 // apply applies the rules and fails the test on an error.
@@ -406,8 +448,8 @@ func TestIngressHTTP_IgnoresProxyEnvironment(t *testing.T) {
 	}
 	requireLine(t, body, "target=api")
 	route := fx.mgr.listeners[443].table.Load().exact["shop.example.com"].lead()
-	if tr, ok := route.proxy.Transport.(*http.Transport); !ok || tr.Proxy != nil {
-		t.Errorf("the route's transport = %T with a Proxy func, want an *http.Transport without one", route.proxy.Transport)
+	if tr, ok := route.proxy.Transport.(*ingressFailoverTransport); !ok || tr.next.Proxy != nil {
+		t.Errorf("the route's transport = %T with a Proxy func, want an *ingressFailoverTransport over an *http.Transport without one", route.proxy.Transport)
 	}
 }
 
@@ -652,7 +694,8 @@ func TestIngressHTTP_NoExtendedConnect(t *testing.T) {
 }
 
 // TestIngressHTTP_WebSocketUpgrade carries a WebSocket through a rule with
-// conditions and closes it when the rule leaves the block.
+// conditions on its second target, the first refusing, and closes it when the
+// rule leaves the block.
 func TestIngressHTTP_WebSocketUpgrade(t *testing.T) {
 	wsT := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
@@ -675,7 +718,9 @@ func TestIngressHTTP_WebSocketUpgrade(t *testing.T) {
 	wsPort, _ := strconv.Atoi(p)
 	webT := startHTTPTarget(t, "web")
 	fx := newHTTPFixture(t, nil)
-	wsRule := httpRule("ws", "shop.example.com", wsPort, "/ws")
+	refusing := targetOn(closedPort(t))
+	wsRule := httpRule("ws", "shop.example.com", refusing.Port, "/ws")
+	wsRule.Targets = []api.IngressTarget{refusing, targetOn(wsPort)}
 	webRule := httpRule("web", "shop.example.com", webT.port(t), "/")
 	fx.apply(t, wsRule, webRule)
 
@@ -695,6 +740,9 @@ func TestIngressHTTP_WebSocketUpgrade(t *testing.T) {
 	}
 	if n := connectionCount(t, fx.mgr); n != 1 {
 		t.Errorf("connection_count with the upgraded connection = %d, want 1", n)
+	}
+	if got := logLines(fx.logs, `msg="bridge: ingress: dial target failed"`, "slug=ws", "target="+addrOf(refusing)+" ", "reason=refused"); got != 1 {
+		t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
 	}
 
 	fx.apply(t, webRule)
@@ -835,13 +883,16 @@ func TestIngressHTTP_DialTimeoutIs504(t *testing.T) {
 }
 
 // TestIngressHTTP_TargetErrorIs502 answers 502 for a target that closes the
-// connection without a response, after a dial that succeeded.
+// connection without a response, after a dial that succeeded, and asks no
+// other target of the rule: the target may have read the request.
 func TestIngressHTTP_TargetErrorIs502(t *testing.T) {
 	backend := startBackend(t, "tcp", "127.0.0.1:0", func(conn net.Conn) {
 		_, _ = conn.Read(make([]byte, 4096))
 	})
+	second := startHTTPTarget(t, "second")
 	fx := newHTTPFixture(t, nil)
 	rule := withID(httpRule("broken", "shop.example.com", backend.port(t), "/"), reportID("a1"))
+	rule.Targets = []api.IngressTarget{targetOn(backend.port(t)), targetOn(second.port(t))}
 	fx.apply(t, rule)
 
 	status, body := get(t, fx.client(t, false), "https://shop.example.com/x")
@@ -853,6 +904,151 @@ func TestIngressHTTP_TargetErrorIs502(t *testing.T) {
 	}
 	if got := logLines(fx.logs, `msg="ingress request not forwarded"`, "status=502", "reason=target_error", "rule_id="+rule.ID); got != 1 {
 		t.Errorf("%d target_error lines, want 1:\n%s", got, fx.logs.String())
+	}
+	if n := second.conns.Load(); n != 0 {
+		t.Errorf("the second target accepted %d connections, want none", n)
+	}
+	if _, targets := balancerFor(t, fx.mgr, rule.ID).snapshot(); !targets[1].at.IsZero() {
+		t.Errorf("the second target's record = %+v, want no dial", targets[1])
+	}
+}
+
+// TestIngressHTTP_FailoverKeepsTheRequestBody sends a request whose first
+// target refuses to the second target, its body whole, with Content-Length,
+// chunked and without a body.
+func TestIngressHTTP_FailoverKeepsTheRequestBody(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789"), 10_000)
+	for _, tc := range []struct {
+		name    string
+		method  string
+		body    []byte
+		chunked bool
+		// The length and the transfer coding the target reads.
+		wantLength, wantCoding string
+	}{
+		{name: "POST with Content-Length", method: http.MethodPost, body: payload, wantLength: "100000"},
+		{name: "chunked POST", method: http.MethodPost, body: payload, chunked: true, wantLength: "-1", wantCoding: "chunked"},
+		{name: "GET without a body", method: http.MethodGet, wantLength: "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			two := startBodyTarget(t, "two")
+			fx, dials := newDialLogHTTPFixture(t)
+			refusing, serving := targetOn(closedPort(t)), targetOn(two.port(t))
+			rule := poolRule(refusing, serving)
+			fx.apply(t, rule)
+
+			var body io.Reader
+			if tc.body != nil {
+				body = bytes.NewReader(tc.body)
+			}
+			req, err := http.NewRequestWithContext(t.Context(), tc.method, "https://shop.example.com/upload", body)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			if tc.chunked {
+				req.ContentLength = -1
+			}
+			resp, err := fx.client(t, false).Do(req)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.method, err)
+			}
+			got, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatalf("read the response: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Target") != "two" {
+				t.Fatalf("status %d from %q, want 200 from the second target:\n%s", resp.StatusCode, resp.Header.Get("X-Target"), got)
+			}
+			if !bytes.Equal(got, tc.body) {
+				t.Errorf("the second target read %d bytes, want the %d sent", len(got), len(tc.body))
+			}
+			if l, c := resp.Header.Get("X-Content-Length"), resp.Header.Get("X-Transfer-Encoding"); l != tc.wantLength || c != tc.wantCoding {
+				t.Errorf("the second target read the length %s and the coding %q, want %s and %q", l, c, tc.wantLength, tc.wantCoding)
+			}
+
+			if got, want := dials.dialled(), []string{addrOf(refusing), addrOf(serving)}; !slices.Equal(got, want) {
+				t.Errorf("dials = %v, want %v", got, want)
+			}
+			unit, targets := balancerFor(t, fx.mgr, rule.ID).snapshot()
+			if want := []dialRecord{{failed: true, reason: IngressDialReasonRefused, at: relayStart}, {at: relayStart}}; !slices.Equal(targets, want) {
+				t.Errorf("targets = %+v, want the first failed with refused and the second succeeded", targets)
+			}
+			if want := (dialRecord{at: relayStart}); unit != want {
+				t.Errorf("unit = %+v, want succeeded at %v", unit, relayStart)
+			}
+			if got := reportFor(t, fx.mgr.RuleReports(), rule.ID); got.Dial != api.IngressDialSucceeded {
+				t.Errorf("report = %+v, want dial succeeded", got)
+			}
+			if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "slug=pool", "target="+addrOf(refusing)+" ", "reason=refused"); got != 1 {
+				t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
+			}
+			if got := logLines(fx.logs, `msg="ingress request not forwarded"`); got != 0 {
+				t.Errorf("%d 'ingress request not forwarded' lines, want none:\n%s", got, fx.logs.String())
+			}
+		})
+	}
+}
+
+// TestIngressHTTP_AllTargetsFail answers a request no target of its rule
+// takes with 502, or 504 when the last dial timed out, and reports the rule
+// failed with the reason of the last dial.
+func TestIngressHTTP_AllTargetsFail(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		timesOut bool // the last target's dial fails with context.DeadlineExceeded
+		status   int
+		body     string
+		reason   string // of the last dial and the rule
+	}{
+		{name: "both refuse", status: http.StatusBadGateway, body: "Bad Gateway\n", reason: IngressDialReasonRefused},
+		{name: "the last times out", timesOut: true, status: http.StatusGatewayTimeout, body: "Gateway Timeout\n", reason: IngressDialReasonTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first, last := targetOn(closedPort(t)), targetOn(closedPort(t))
+			fx := newHTTPFixture(t, func(m *IngressManager) {
+				m.now = (&relayClock{now: relayStart}).Now
+				m.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if tc.timesOut && addr == addrOf(last) {
+						return nil, fmt.Errorf("dial: %w", context.DeadlineExceeded)
+					}
+					var d net.Dialer
+					return d.DialContext(ctx, network, addr)
+				}
+			})
+			rule := poolRule(first, last)
+			fx.apply(t, rule)
+
+			status, body := get(t, fx.client(t, false), "https://shop.example.com/x")
+			if status != tc.status || body != tc.body {
+				t.Errorf("%d %q, want %d %q", status, body, tc.status, tc.body)
+			}
+			want := IngressRuleReport{
+				RuleID: rule.ID, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateReady,
+				Dial: api.IngressDialFailed, DialReason: tc.reason, DialAt: relayStart,
+			}
+			if got := reportFor(t, fx.mgr.RuleReports(), rule.ID); got != want {
+				t.Errorf("report = %+v, want %+v", got, want)
+			}
+			_, targets := balancerFor(t, fx.mgr, rule.ID).snapshot()
+			if want := []dialRecord{{failed: true, reason: IngressDialReasonRefused, at: relayStart}, {failed: true, reason: tc.reason, at: relayStart}}; !slices.Equal(targets, want) {
+				t.Errorf("targets = %+v, want %+v", targets, want)
+			}
+			if got := logLines(fx.logs, `msg="ingress request not forwarded"`, "status="+strconv.Itoa(tc.status), "reason=dial_failed", "rule_id="+rule.ID); got != 1 {
+				t.Errorf("%d 'ingress request not forwarded' lines with dial_failed, want 1:\n%s", got, fx.logs.String())
+			}
+			if got := logLines(fx.logs, `msg="ingress request not forwarded"`); got != 1 {
+				t.Errorf("%d 'ingress request not forwarded' lines, want 1:\n%s", got, fx.logs.String())
+			}
+			for _, tg := range []struct {
+				target api.IngressTarget
+				reason string
+			}{{first, IngressDialReasonRefused}, {last, tc.reason}} {
+				if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "target="+addrOf(tg.target)+" ", "reason="+tg.reason); got != 1 {
+					t.Errorf("%d 'dial target failed' lines for %s with reason=%s, want 1:\n%s", got, addrOf(tg.target), tg.reason, fx.logs.String())
+				}
+			}
+		})
 	}
 }
 
@@ -940,6 +1136,36 @@ func TestIngressHTTP_KeepAlive(t *testing.T) {
 	}
 	if n := connectionCount(t, fx.mgr); n != 1 {
 		t.Errorf("connection_count = %d, want the one client connection", n)
+	}
+}
+
+// TestIngressHTTP_RoundRobinPerRequest sends the requests of one kept-alive
+// client connection to the two targets of a rule in turn, on one target
+// connection each.
+func TestIngressHTTP_RoundRobinPerRequest(t *testing.T) {
+	one, two := startHTTPTarget(t, "one"), startHTTPTarget(t, "two")
+	fx, dials := newDialLogHTTPFixture(t)
+	rule := poolRule(targetOn(one.port(t)), targetOn(two.port(t)))
+	fx.apply(t, rule)
+	conn := fx.dialRaw(t, "shop.example.com")
+
+	var got []string
+	for i := range 4 {
+		status, body := conn.roundTrip(t, getHead("/x", "shop.example.com"))
+		if status != http.StatusOK {
+			t.Fatalf("request %d: status %d, want 200:\n%s", i+1, status, body)
+		}
+		first, _, _ := strings.Cut(body, "\n")
+		got = append(got, first)
+	}
+	if want := []string{"target=one", "target=two", "target=one", "target=two"}; !slices.Equal(got, want) {
+		t.Errorf("the requests reached %q, want %q", got, want)
+	}
+	if got, want := dials.dialled(), []string{addrOf(rule.Targets[0]), addrOf(rule.Targets[1])}; !slices.Equal(got, want) {
+		t.Errorf("dials = %v, want one per target: %v", got, want)
+	}
+	if a, b := one.conns.Load(), two.conns.Load(); a != 1 || b != 1 {
+		t.Errorf("the targets accepted %d and %d connections, want 1 each", a, b)
 	}
 }
 
