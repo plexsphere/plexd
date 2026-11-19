@@ -39,7 +39,7 @@ Capabilities are published after registration via `PUT /v1/nodes/{node_id}/capab
 | `MeshIP`           | `string`        | `"mesh_ip"`            | Assigned mesh IP address           |
 | `SigningPublicKey` | `string`        | `"signing_public_key"` | Control plane signing public key   |
 | `SigningKeyID`     | `string`        | `"signing_key_id"`     | Signing key id for rotation-aware signature verification (e.g. `did:web:plexsphere.com#key-2026-04`) |
-| `NSK`              | `string`        | `"nsk"`                | Node secret key, returned exactly once: 44-char standard-padded base64 that decodes to the 32-byte AES-256-GCM key. Sent verbatim as the bearer credential; decoded before use as a key |
+| `NSK`              | `string`        | `"nsk"`                | Node secret key, returned exactly once: 44-char standard-padded base64 that decodes to the 32-byte AES-256-GCM key. Never sent as it is: the bearer credential is the envelope `BearerToken()` builds from the node ID and the decoded key (see [BearerToken](registration.md#bearertoken)). Decoded before use as a key |
 | `PeerSnapshot`     | `[]RegisterPeer`| `"peer_snapshot"`      | Initial peer snapshot              |
 | `DomainMeshCIDR`   | `string`        | `"domain_mesh_cidr"`   | Domain mesh address range (e.g. `100.64.0.0/10`) |
 

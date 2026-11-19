@@ -850,7 +850,7 @@ mgr.Run(ctx)
 When `LocalEndpoint.URL` is configured, the pipeline manager receives a `MultiReporter` that wraps both the `PlatformReporter` and a `LocalReporter`. When not configured, the `PlatformReporter` is used directly—no extra goroutines, no `SecretFetcher` calls, no `MultiReporter` wrapping.
 
 ```go
-nsk := []byte(identity.NodeSecretKey)
+nsk, _ := identity.SecretKey()
 
 var metricsReporter metrics.MetricsReporter = metrics.NewPlatformReporter(controlPlane, logger)
 if cfg.Metrics.LocalEndpoint.URL != "" {

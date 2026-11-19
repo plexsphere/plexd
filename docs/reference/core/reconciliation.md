@@ -115,7 +115,8 @@ func NewReconciler(client StateFetcher, cfg Config, logger *slog.Logger) *Reconc
 logger := slog.Default()
 
 client, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
-client.SetAuthToken(identity.NodeSecretKey)
+// Register arms the client with the NSK bearer envelope.
+identity, _ := registration.NewRegistrar(client, regCfg, logger).Register(ctx)
 
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 
@@ -131,7 +132,7 @@ r.RegisterDispatchHandler(func(ctx context.Context, desired *api.NodeStateSnapsh
 // Run blocks until context cancelled
 ctx, cancel := context.WithCancel(context.Background())
 go func() {
-    if err := r.Run(ctx, nodeID); err != nil && err != context.Canceled {
+    if err := r.Run(ctx, identity.NodeID); err != nil && err != context.Canceled {
         logger.Error("reconciler failed", "error", err)
     }
 }()
