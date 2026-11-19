@@ -1,69 +1,41 @@
 ---
-title: Session-Based Action Authorization
+title: Action Authorization
 ---
 
-# Session-Based Action Authorization
+# Action Authorization
 
-Actions dispatched by the control plane are implicitly authorized: they arrive in the `executions` block of the node's authenticated state pull, so the control plane has already decided the node may run them. Actions triggered locally via `plexd actions run` in an SSH session require explicit authorization through a session-scoped JWT.
+A dispatch from the control plane arrives in the `executions` block of the node's NSK-authenticated state pull, and that entry is the authorization.
 
-## Authorization Flow
-
-![A sequence between the user, the platform's control plane and plexd on the target Node. The user requests an SSH session. The control plane checks RBAC for the user, the node and the actions, and issues a session JWT that carries sub, node_id, actions and exp. The session reaches plexd in the sessions block of the state pull. plexd starts the SSH session, which is relayed over plexd's socket between the user and plexd, and injects PLEXD_SESSION_TOKEN. The user runs plexd actions run diagnostics.collect, and plexd reads the token from the environment, validates the JWT locally, checks the action scope and executes the action. plexd returns the result to the user and sends the control plane a callback with the result and the session context.](../../diagrams/actions-session-authorization.svg)
-
-## Session JWT Structure
-
-```json
-{
-  "iss": "plexsphere",
-  "sub": "user_abc123",
-  "email": "admin@example.com",
-  "node_id": "n_xyz789",
-  "session_id": "sess_a1b2c3",
-  "actions": [
-    "diagnostics.*",
-    "health.check",
-    "hooks/backup"
-  ],
-  "iat": 1705312200,
-  "exp": 1705341000
-}
-```
-
-The JWT is signed with the control plane's Ed25519 key. plexd receives the corresponding public key during registration and uses it for local validation - no roundtrip required.
-
-## Action Scope Patterns
-
-| Pattern | Matches |
-|---|---|
-| `*` | All actions and hooks |
-| `diagnostics.*` | All actions in the `diagnostics` namespace |
-| `hooks/*` | All hooks (script and CRD) |
-| `hooks/backup` | Only the `backup` hook |
-| `health.check` | Exactly one action |
+A local run through `plexd actions run` is authorized by reaching the node API and nothing else. It runs built-in actions only, never a hook, and nothing about it reaches the control plane. `actions.enabled: false` refuses it as it refuses dispatches.
 
 ## Authorization Tiers
 
 | Trigger | Authentication | Authorization |
 |---|---|---|
-| Pull (control plane) | NSK-authenticated state pull | Pre-authorized by the control plane: an entry in the `executions` block *is* the authorization, and the dispatch decision is the control plane's alone |
-| SSH via access proxy | `PLEXD_SESSION_TOKEN` (JWT) | Local JWT validation + action scope check |
-| Direct SSH (no token) | No token present | Denied (or control-plane roundtrip if online) |
-| Local root access | `--local` flag, root or plexd user only | No scope limit, emergency use |
+| Pull (control plane) | NSK-authenticated state pull | Pre-authorized by the control plane: an entry in the `executions` block *is* the authorization, and the dispatch decision is the control plane's alone. `actions.enabled: false` rejects it with `actions_disabled` |
+| `plexd actions run` over the node API socket or pipe | The endpoint's permissions: on Linux and macOS the socket admits root, or the `plexd` group when it is `root:plexd` with mode `0660`; on Windows the pipe admits LocalSystem and elevated Administrators (see [Local peer authorization](../core/nodeapi.md#local-peer-authorization)) | None beyond reaching the endpoint: any built-in action, no hook. Refused while `actions.enabled` is `false` |
+| `POST /v1/actions/run` on the optional HTTP listener (`node_api.http_enabled`) | The bearer token in `node_api.http_token_file` | The same as over the socket |
 
 Trigger attribution — who asked for a control-plane execution — lives in the
 control plane's audit trail, not on the node: the pull entry carries no
 requester identity.
 
-## Token Revocation
+## Running an Action from an SSH Session
 
-Revocation does not depend on a pushed command. When a session ends (disconnect, admin termination, timeout), the control plane drops its entry from the `sessions` block of the node's state pull, and the next reconcile observes the absence: that absence *is* the teardown signal for every session the node has not already closed. plexd closes the session and, for a session whose listener it provisioned, reports a `session_ended` activity row with `terminated_by: plexd_close` (or `ttl_expired` once the session's capped expiry has passed) — the node cannot tell a revocation from a control plane that failed to serve the block, so a drain does not claim an operator action. There is no revocation callback to answer and no terminal status to report — see [Secure Access Tunneling](../networking/secure-access-tunneling.md) for the dispatcher that performs the teardown.
+![A sequence between the user, the platform's control plane and plexd on the target Node. The user requests an SSH session, and the control plane issues a session token that carries the session id as jti, the login user and exp. The session reaches plexd in the sessions block of the state pull. The user logs in over SSH with the token as password, and plexd verifies the token's signature, session id, user and expiry and starts the user's shell. In that shell the user runs plexd actions run diagnostics.collect, which opens the node API socket, whose mode admits root or the plexd group. plexd runs the action only while actions are enabled and only if the name is a built-in, and returns the result to the user. Nothing is reported to the control plane.](../../diagrams/actions-session-authorization.svg)
 
-The signed `session_revoked` SSE event closes the session without waiting for the drain. Its payload names the session (`session_id`, and `jti`, which must equal it) and carries `revoked_at` and `revoke_reason`. When the named session is live, plexd closes it, and its `session_ended` row reports `terminated_by: operator_revoke` for an operator-driven reason (`operator_request`, `policy_violation`, `identity_compromise`, `resource_decommissioned`), or `ttl_expired` or `idle_timeout` for the reason of the same name, which the control plane's sweeper sets. An empty or unrecognised reason is reported as `operator_revoke`, with a warning. plexd triggers a reconcile only after the close, so the pull cannot drain the session first, and a later pull that still lists the revoked session does not provision it again. A payload that does not decode, or whose `session_id` is empty or differs from its `jti`, closes nothing and only triggers the reconcile. A node that misses the event converges on its own cadence through the drain, which reports `plexd_close` (or `ttl_expired` once the session's capped expiry has passed). A pull that drains the session before the event arrives reports `plexd_close` too, and the late event then finds no live session to close.
+A mediated SSH session's token authorizes the SSH login only. plexd checks it at login (see [Authentication](../networking/secure-access-tunneling.md#authentication)), and the token has no action scope. The session refuses `env` requests, and the session helper starts the shell with a scrubbed environment of `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH` and, with a pty, `TERM`, so no token reaches it.
 
-The session JWT itself is not revoked on the node. Token validation consults no revocation set: local validation covers the signature and `exp`, so a token already handed out stays usable for its remaining lifetime. Keeping session tokens short-lived is what bounds that window.
+`plexd actions run` from that shell reaches the daemon when the login user can open the socket. When the user cannot, the command fails with `plexd actions run: agent not running or socket unavailable at /var/run/plexd/api.sock: ...`, ending in `permission denied`. A plain SSH login or a console shell follows the same rule.
 
-## Local Transport via Unix Socket
+The run belongs to the CLI's HTTP request, not to the session, and has no Execution to cancel (see [Cancel](remote-actions-hooks.md#cancel)).
 
-The `plexd actions run` CLI does not execute actions directly. It connects to the plexd daemon via a Unix socket (`/var/run/plexd.sock`), ensuring locally triggered actions go through the same path as control-plane-dispatched ones: token validation, integrity checks, and audit.
+## Local Transport
 
-![plexd actions run diagnostics.collect --param include_network=true connects to the plexd daemon over the Unix socket /var/run/plexd.sock. The daemon validates the session JWT, checks the action scope, verifies the hook integrity, executes the action and reports to the control plane.](../../diagrams/actions-local-transport.svg)
+![plexd actions run diagnostics.collect --param include_network=false opens the node API socket /var/run/plexd/api.sock, whose mode admits root or the plexd group. In the plexd daemon, handleRunAction decodes the action and its parameters and calls Executor.RunLocal, which refuses the run while actions.enabled is false, refuses a name that is not a registered built-in, and otherwise runs the built-in. The status, exit code, stdout and stderr go back to the command, and nothing reaches the control plane.](../../diagrams/actions-local-transport.svg)
+
+The CLI dials the platform default: `/var/run/plexd/api.sock` on Linux and macOS, and `\\.\pipe\plexd` on Windows. It does not read `node_api.socket_path` or `PLEXD_NODE_API_SOCKET`, so a daemon moved off the default is out of its reach. It sends `{"action", "parameters"}` to `POST /v1/actions/run`.
+
+`Executor.RunLocal` refuses the run while `actions.enabled` is `false` (`actions are disabled on this node`), refuses any name that is not a registered built-in (`unknown builtin action: <name>`), and otherwise runs the built-in synchronously under the request's context. No hook runs, so no hook integrity check applies. The run gets no execution id and no callback, `handleRunAction` logs nothing, and nothing reaches the control plane.
+
+A refusal comes back as `200` with `status: "error"`, and the CLI prints it and exits 0, as it does for every `200`. See [POST /v1/actions/run](remote-actions-hooks.md#post-v1-actions-run) for the wire format.

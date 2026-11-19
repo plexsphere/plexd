@@ -263,72 +263,76 @@ func actionsRunFlow() *Figure {
 	return f
 }
 
-// actionsSessionAuthorization draws the authorization flow of a
-// locally triggered action for
-// docs/reference/actions/session-authorization.md (Authorization
-// Flow).
+// actionsSessionAuthorization draws an action run from a mediated SSH
+// session for docs/reference/actions/session-authorization.md (Running
+// an Action from an SSH Session): the session token authorizes the
+// login only, the run from the user's shell needs the node API socket
+// alone, and nothing is reported to the control plane.
 func actionsSessionAuthorization() *Figure {
-	f := &Figure{Name: "actions-session-authorization", Title: "Authorizing an action run in an SSH session"}
+	f := &Figure{Name: "actions-session-authorization", Title: "An action run from a mediated SSH session"}
 	s := f.sequence(
 		seqPart{x: 70, r: role{stroke: colorLine, text: colorInk}, lines: []Line{name("User")}},
-		seqPart{x: 380, r: roleCore, lines: []Line{name("Platform"), body("control plane")}},
-		seqPart{x: 760, r: roleAgent, lines: []Line{name("plexd"), body("target Node")}},
+		seqPart{x: 500, r: roleCore, lines: []Line{name("Platform"), body("control plane")}},
+		seqPart{x: 880, r: roleAgent, lines: []Line{name("plexd"), body("target Node")}},
 	)
 	s.msg(call, 0, 1, body("request an SSH session"))
-	s.self(1, body("check RBAC:"), body("user × node × actions"))
-	s.self(1, body("issue the session JWT"), code("{ sub, node_id, actions, exp }"))
+	s.self(1, body("issue the session token"), code("{ jti, target.user, exp }"))
 	s.msg(reply, 1, 2, body("the session, in the state"), body("pull's sessions block"))
-	s.self(2, body("start the SSH session"))
-	s.msg(both, 0, 2, body("SSH session, relayed over plexd's socket"))
-	s.self(2, body("inject"), code("PLEXD_SESSION_TOKEN"))
+	s.msg(both, 0, 2, body("SSH login, the token as password"))
+	s.self(2, body("verify the token:"), body("signature, jti, user, exp"))
+	s.self(2, body("start the user's shell"))
 	s.msg(call, 0, 2, code("plexd actions run diagnostics.collect"))
-	s.self(2, body("read the token from env"))
-	s.self(2, body("validate the JWT locally"))
-	s.self(2, body("check the action scope"))
-	s.self(2, body("execute"))
+	s.self(2, body("open the node API socket:"), body("root or the plexd group"))
+	s.self(2, body("actions enabled? a built-in?"))
+	s.self(2, body("run the built-in"))
 	s.msg(reply, 2, 0, body("result"))
-	s.msg(publish, 2, 1, body("callback: the result and"), body("the session context"))
+	s.note(2, body("nothing is reported"), body("to the control plane"))
 	s.end()
 	return f
 }
 
 // actionsLocalTransport draws how plexd actions run reaches the
-// daemon over its Unix socket, for
-// docs/reference/actions/session-authorization.md (Local Transport via
-// Unix Socket).
+// daemon over the node API socket, for
+// docs/reference/actions/session-authorization.md (Local Transport):
+// handleRunAction hands the action to Executor.RunLocal, which refuses
+// the run while actions are disabled or for a name that is not a
+// registered built-in and otherwise runs the built-in, and nothing
+// reaches the control plane.
 func actionsLocalTransport() *Figure {
-	f := &Figure{Name: "actions-local-transport", Title: "plexd actions run through the Unix socket"}
+	f := &Figure{Name: "actions-local-transport", Title: "plexd actions run through the node API socket"}
+	// hx puts handleRunAction far enough right that the call and the
+	// reply, d to either side of its centre, enter the frame right of
+	// the frame's title. Their labels sit in the band between the
+	// actor and the frame.
+	const hx, d, band = 110.0, 40.0, 110.0
 	daemon := f.frame(roleAgent, 0, 0, 0, 0, "", "plexd daemon", "")
-	x := 30.0
-	var steps []*node
-	for _, l := range [][]Line{
-		{name("validate"), body("the session JWT")},
-		{name("check"), body("the action scope")},
-		{name("verify"), body("the hook integrity")},
-		{name("execute"), body("the action")},
-	} {
-		n := f.state(stateNormal, spec{x: x, y: daemon.y + 70, w: 200, lines: l})
-		if len(steps) > 0 {
-			f.arrow(flow, steps[len(steps)-1].right(), n.left())
-		}
-		steps = append(steps, n)
-		x = n.x + n.w + 50
-	}
-	last := steps[len(steps)-1]
-	daemon.w = last.x + last.w + 30
-	daemon.h = last.y + last.h + 30 - daemon.y
+	h := f.state(stateNormal, spec{x: hx, y: daemon.y + 70, lines: []Line{
+		codeName("handleRunAction"), body("decode action and parameters"),
+	}})
+	run := f.actRules(roleAgent, h.x+h.w+70, h.y, 0,
+		[]Line{codeName("Executor.RunLocal")},
+		[]actRow{
+			{"1", body("actions.enabled is false"), body("refuse")},
+			{"2", body("not a registered built-in"), body("refuse")},
+			{"3", body("run the built-in"), Line{}},
+		})
+	h.y = run.cy() - h.h/2
+	f.arrow(flow, h.right(), run.leftAt(h.cy()))
+	daemon.w = run.x + run.w + 30 - daemon.x
+	daemon.h = run.y + run.h + 30 - daemon.y
 
 	cli := f.actor(spec{lines: []Line{
-		codeName("plexd actions run"), code("diagnostics.collect --param include_network=true"),
+		codeName("plexd actions run"), code("diagnostics.collect --param include_network=false"),
 	}})
-	cli.x, cli.y = daemon.cx()-cli.w/2, daemon.y-110-cli.h
-	f.arrow(call, cli.bottom(), pt{cli.cx(), daemon.y})
-	f.labelRight(pt{cli.cx(), daemon.y - 55}, body("Unix socket"), code("/var/run/plexd.sock"))
+	cli.x, cli.y = h.cx()-cli.w/2, daemon.y-band-cli.h
+	in, out := h.cx()-d, h.cx()+d
+	f.arrow(call, cli.bottomAt(in), h.topAt(in))
+	f.labelLeft(pt{in, daemon.y - band/2}, body("node API socket, root or the plexd group"), code("/var/run/plexd/api.sock"))
+	f.arrow(reply, h.topAt(out), cli.bottomAt(out))
+	f.labelRight(pt{out, daemon.y - band/2}, body("status, exit_code, stdout, stderr"))
 
-	cp := f.box(roleCore, spec{y: daemon.y + daemon.h + 90, w: 300, lines: []Line{name("control plane")}})
-	cp.x = daemon.x + daemon.w - cp.w
-	f.arrow(publish, last.bottom(), cp.topAt(last.cx()))
-	f.labelLeft(pt{last.cx(), (daemon.y + daemon.h + cp.y) / 2}, body("report"))
+	f.notePanel(run.x, daemon.y+daemon.h+50, 0, pt{run.cx(), daemon.y + daemon.h},
+		body("no execution id, no callback:"), body("nothing reaches the control plane"))
 	return f
 }
 
