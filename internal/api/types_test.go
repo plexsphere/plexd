@@ -2263,6 +2263,27 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 		t.Errorf("sni_host should be omitted when empty, got: %s", s)
 	}
 
+	// A rule with request conditions and strip_path_prefix round-trips with
+	// both members.
+	cond := orig
+	cond.Mode = IngressModeTerminate
+	cond.SNIHost = "web.example.com"
+	cond.CertificateSecretName = "web-cert"
+	cond.Conditions = IngressConditions{
+		PathPrefix: "/api",
+		Headers:    []IngressHeaderCondition{{Name: "x-tenant", Value: "acme"}, {Name: "x-version", Value: "2"}},
+	}
+	cond.StripPathPrefix = true
+	data3, got3 := roundTrip(t, cond)
+	if !got3.Equal(cond) {
+		t.Errorf("round trip = %+v, want %+v", got3, cond)
+	}
+	for _, want := range []string{`"conditions":{"path_prefix":"/api","headers":[{"name":"x-tenant","value":"acme"},{"name":"x-version","value":"2"}]}`, `"strip_path_prefix":true`} {
+		if !strings.Contains(string(data3), want) {
+			t.Errorf("marshaled rule %s does not contain %s", data3, want)
+		}
+	}
+
 	// A rule in the shape before the control plane's rule model decodes
 	// without an error, into a rule with an empty ID.
 	var old IngressRule
@@ -2277,9 +2298,8 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 // TestIngressConfig_DecodesContractBlock decodes the example block of the
 // agent contract's Public ingress section (plexsphere/plexsphere@834500a,
 // docs/reference/api/plexd-agent-contract.md), wrapped in an object as the
-// pull carries it. The rules shop-api and shop-web carry conditions and
-// strip_path_prefix, members IngressRule does not have; the decode ignores
-// them.
+// pull carries it. The rules shop-api and shop-web share their host by their
+// path prefixes, and shop-api strips its prefix.
 func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	const block = `{
 "bridge": {
@@ -2397,8 +2417,8 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5", Slug: "dns", Protocol: IngressProtocolUDP, ListenPort: 53, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 53},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", Slug: "mqtt", Protocol: IngressProtocolTCP, ListenPort: 8883, Mode: IngressModeTerminate, SNIHost: "mqtt.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 1883, CertificateSecretName: "mqtt-cert"},
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6", Slug: "shop-api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeTerminate, SNIHost: "shop.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 8080, CertificateSecretName: "shop-cert"},
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7", Slug: "shop-web", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeTerminate, SNIHost: "shop.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 3000, CertificateSecretName: "shop-cert"},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6", Slug: "shop-api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeTerminate, SNIHost: "shop.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 8080, CertificateSecretName: "shop-cert", Conditions: IngressConditions{PathPrefix: "/api"}, StripPathPrefix: true},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7", Slug: "shop-web", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeTerminate, SNIHost: "shop.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 3000, CertificateSecretName: "shop-cert", Conditions: IngressConditions{PathPrefix: "/"}},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", Slug: "ssh", Protocol: IngressProtocolTCP, ListenPort: 2222, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 22},
 	}
 	requireEqual(t, want, bridge.Ingress.Rules)
@@ -2414,6 +2434,17 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	}
 	if got := bySlug["ssh"]; got.SNIHost != "" {
 		t.Errorf("rule ssh = %+v, want an empty SNIHost", got)
+	}
+	if got := bySlug["shop-api"]; got.Conditions.PathPrefix != "/api" || !got.StripPathPrefix {
+		t.Errorf("rule shop-api = %+v, want the path prefix /api with strip_path_prefix", got)
+	}
+	if got := bySlug["shop-web"]; got.Conditions.PathPrefix != "/" || got.StripPathPrefix {
+		t.Errorf("rule shop-web = %+v, want the path prefix / without strip_path_prefix", got)
+	}
+	for _, r := range bridge.Ingress.Rules {
+		if r.Slug != "shop-api" && r.Slug != "shop-web" && !r.Conditions.IsZero() {
+			t.Errorf("rule %s Conditions = %+v, want none", r.Slug, r.Conditions)
+		}
 	}
 	withSecret := map[string]bool{"mqtt": true, "shop-api": true, "shop-web": true}
 	for _, r := range bridge.Ingress.Rules {
@@ -2459,6 +2490,109 @@ func TestIngressConfig_ACMEAndSecretNamePresence(t *testing.T) {
 		if strings.Contains(string(out), key) {
 			t.Errorf("marshalled block %s carries %s, want no such key", out, key)
 		}
+	}
+}
+
+// TestIngressRule_ConditionsPresence decodes a rule whose conditions are
+// absent, null, empty or an empty headers list into a rule without
+// conditions, and marshals such a rule with neither conditions nor
+// strip_path_prefix.
+func TestIngressRule_ConditionsPresence(t *testing.T) {
+	const head = `{"id":"r1","slug":"web","listen_port":443,"mode":"terminate","sni_host":"web.example.com"`
+	for _, member := range []string{``, `,"conditions":null`, `,"conditions":{}`, `,"conditions":{"headers":[]}`} {
+		var r IngressRule
+		if err := json.Unmarshal([]byte(head+member+`}`), &r); err != nil {
+			t.Fatalf("decode %q: %v", member, err)
+		}
+		if !r.Conditions.IsZero() {
+			t.Errorf("decode %q: Conditions = %+v, want IsZero", member, r.Conditions)
+		}
+		if r.StripPathPrefix {
+			t.Errorf("decode %q: StripPathPrefix = true, want false", member)
+		}
+		out, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal %q: %v", member, err)
+		}
+		for _, key := range []string{`"conditions"`, `"strip_path_prefix"`} {
+			if strings.Contains(string(out), key) {
+				t.Errorf("decode %q, marshal: %s carries %s, want no such key", member, out, key)
+			}
+		}
+	}
+
+	for _, c := range []IngressConditions{{PathPrefix: "/"}, {Headers: []IngressHeaderCondition{{Name: "x-a", Value: "1"}}}} {
+		if c.IsZero() {
+			t.Errorf("%+v.IsZero() = true, want false", c)
+		}
+	}
+}
+
+// TestIngressRule_Equal compares rules that differ in one member each, and a
+// nil against an empty Headers.
+func TestIngressRule_Equal(t *testing.T) {
+	base := IngressRule{
+		ID:                    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6",
+		Slug:                  "shop-api",
+		Protocol:              IngressProtocolTCP,
+		ListenPort:            443,
+		Mode:                  IngressModeTerminate,
+		SNIHost:               "shop.example.com",
+		TargetNodeID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+		TargetAddress:         "10.42.0.8",
+		TargetPort:            8080,
+		CertificateSecretName: "shop-cert",
+		Conditions: IngressConditions{
+			PathPrefix: "/api",
+			Headers:    []IngressHeaderCondition{{Name: "x-a", Value: "1"}, {Name: "x-b", Value: "2"}},
+		},
+		StripPathPrefix: true,
+	}
+	clone := func() IngressRule {
+		r := base
+		r.Conditions.Headers = slices.Clone(base.Conditions.Headers)
+		return r
+	}
+	if !base.Equal(clone()) {
+		t.Fatal("a rule does not equal its copy")
+	}
+
+	edits := map[string]func(*IngressRule){
+		"id":                      func(r *IngressRule) { r.ID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7" },
+		"slug":                    func(r *IngressRule) { r.Slug = "shop-web" },
+		"protocol":                func(r *IngressRule) { r.Protocol = IngressProtocolUDP },
+		"listen_port":             func(r *IngressRule) { r.ListenPort = 8443 },
+		"mode":                    func(r *IngressRule) { r.Mode = IngressModeACME },
+		"sni_host":                func(r *IngressRule) { r.SNIHost = "other.example.com" },
+		"target_node_id":          func(r *IngressRule) { r.TargetNodeID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1" },
+		"target_address":          func(r *IngressRule) { r.TargetAddress = "10.42.0.9" },
+		"target_port":             func(r *IngressRule) { r.TargetPort = 8081 },
+		"certificate_secret_name": func(r *IngressRule) { r.CertificateSecretName = "other-cert" },
+		"path_prefix":             func(r *IngressRule) { r.Conditions.PathPrefix = "/web" },
+		"a header's name":         func(r *IngressRule) { r.Conditions.Headers[0].Name = "x-c" },
+		"a header's value":        func(r *IngressRule) { r.Conditions.Headers[0].Value = "3" },
+		"the order of two headers": func(r *IngressRule) {
+			h := r.Conditions.Headers
+			h[0], h[1] = h[1], h[0]
+		},
+		"one header fewer":  func(r *IngressRule) { r.Conditions.Headers = r.Conditions.Headers[:1] },
+		"strip_path_prefix": func(r *IngressRule) { r.StripPathPrefix = false },
+	}
+	for name, edit := range edits {
+		t.Run(name, func(t *testing.T) {
+			r := clone()
+			edit(&r)
+			if base.Equal(r) || r.Equal(base) {
+				t.Errorf("rules that differ in %s compare equal", name)
+			}
+		})
+	}
+
+	nilHeaders, emptyHeaders := clone(), clone()
+	nilHeaders.Conditions.Headers = nil
+	emptyHeaders.Conditions.Headers = []IngressHeaderCondition{}
+	if !nilHeaders.Equal(emptyHeaders) || !emptyHeaders.Equal(nilHeaders) {
+		t.Error("a nil and an empty Headers compare unequal")
 	}
 }
 

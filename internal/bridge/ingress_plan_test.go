@@ -91,7 +91,7 @@ func TestPlanIngress_ReasonPerCheck(t *testing.T) {
 				t.Fatalf("%d states, want %d", len(plan.states), len(tc.before)+1)
 			}
 			st := plan.states[len(plan.states)-1]
-			if st.Rule != r {
+			if !st.Rule.Equal(r) {
 				t.Errorf("state rule = %+v, want %+v", st.Rule, r)
 			}
 			if st.Reason != tc.reason || st.Detail != tc.detail {
@@ -226,7 +226,7 @@ func TestPlanIngress_Protocol(t *testing.T) {
 			tc.edit(&r)
 			plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
 			st := plan.states[0]
-			if st.Rule != r {
+			if !st.Rule.Equal(r) {
 				t.Errorf("state rule = %+v, want %+v", st.Rule, r)
 			}
 			if st.Reason != tc.reason || st.Detail != tc.detail {
@@ -241,11 +241,11 @@ func TestPlanIngress_Protocol(t *testing.T) {
 	t.Run("a udp passthrough rule is held in plan.udp", func(t *testing.T) {
 		r := udpPlanRule("dns", 53)
 		plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
-		if st := plan.states[0]; !st.held || !st.Served || st.Reason != "" || st.Rule != r {
+		if st := plan.states[0]; !st.held || !st.Served || st.Reason != "" || !st.Rule.Equal(r) {
 			t.Errorf("udp rule = %+v, want held and served as pulled", st)
 		}
 		route := plan.udp[53]
-		if route == nil || route.rule != r || !route.served || route.target != "10.0.0.5:8443" {
+		if route == nil || !route.rule.Equal(r) || !route.served || route.target != "10.0.0.5:8443" {
 			t.Errorf("plan.udp[53] = %+v, want the served route of the rule to 10.0.0.5:8443", route)
 		}
 		if len(plan.udp) != 1 {
@@ -408,7 +408,7 @@ func TestPlanIngress_HostCaseAndIPv6Target(t *testing.T) {
 	if route.target != "[fd00::7]:8443" {
 		t.Errorf("target = %q, want %q", route.target, "[fd00::7]:8443")
 	}
-	if route.rule != r {
+	if !route.rule.Equal(r) {
 		t.Errorf("route rule = %+v, want the rule as pulled", route.rule)
 	}
 }

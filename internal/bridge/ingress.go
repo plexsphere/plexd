@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -56,10 +57,17 @@ type ingressListener struct {
 	done  chan struct{} // closed when the accept loop exits
 }
 
-// notServedKey identifies a "rule not served" line already logged.
+// notServedKey identifies a "rule not served" line already logged. It holds
+// the rule as its JSON, since a rule with header conditions is no map key.
 type notServedKey struct {
-	rule   api.IngressRule
+	rule   string
 	reason string
+}
+
+// newNotServedKey returns the key of a "rule not served" line for r.
+func newNotServedKey(r api.IngressRule, reason string) notServedKey {
+	data, _ := json.Marshal(r)
+	return notServedKey{rule: string(data), reason: reason}
 }
 
 // IngressManager serves public ingress: one TCP listener per listen port of the
@@ -299,7 +307,7 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 	}
 	carried := make(map[*ingressRoute]struct{})
 	carry := func(r *ingressRoute) {
-		if old, ok := current[r.rule.ID]; ok && old.rule == r.rule {
+		if old, ok := current[r.rule.ID]; ok && old.rule.Equal(r.rule) {
 			r.ctx, r.cancel = old.ctx, old.cancel
 			carried[old] = struct{}{}
 			return
@@ -463,14 +471,14 @@ func (m *IngressManager) logRuleChanges(states []IngressRuleState) {
 			order = append(order, r.ID)
 			if old, ok := m.held[r.ID]; !ok {
 				m.logRule("ingress rule added", r)
-			} else if old != r {
+			} else if !old.Equal(r) {
 				m.logRule("ingress rule updated", r)
 			}
 		}
 		if st.Reason == "" {
 			continue
 		}
-		key := notServedKey{rule: r, reason: st.Reason}
+		key := newNotServedKey(r, st.Reason)
 		notServed[key] = struct{}{}
 		if _, ok := m.notServed[key]; ok {
 			continue
