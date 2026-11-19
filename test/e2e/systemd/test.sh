@@ -41,7 +41,11 @@
 #     policy_denied, a udp rule that shares its port number with a tcp rule
 #     and carries datagrams to an echo server and back, a udp rule whose
 #     sends to a mesh target the policy blocks reported as policy_denied with
-#     one Error line, a block whose enabled is false closing every listener,
+#     one Error line, terminate rules with request conditions that share a
+#     host on port 443 and route each request by path prefix and header to
+#     their HTTP targets, with h2 offered, a stripped prefix and the
+#     X-Forwarded headers, and 404, 400, 421 and 502 answered by the bridge,
+#     a block whose enabled is false closing every listener,
 #     and the opt-out with bridge.ingress_enabled: false, which opens no
 #     listener for an enabled block and reports opted_out
 #   - User access through a bridge: a wireguard provider on an interface of
@@ -2268,10 +2272,11 @@ echo "=== Mesh DNS opt-out PASSED ==="
 # The restart below turns this node into a bridge without ingress_enabled, and
 # the mock serves a bridge.ingress block whose rules target a container on the
 # suite's network: three openssl s_server instances with certificates of their
-# own, a plain TCP server that writes a banner first, and a socat server that
-# echoes each UDP datagram to its sender. A terminate rule ends TLS at the
-# bridge with the certificate of a Secret the mock serves, and an acme rule
-# with a certificate the bridge obtains from Pebble, which runs as a
+# own, a plain TCP server that writes a banner first, a socat server that
+# echoes each UDP datagram to its sender, and two socat servers that answer
+# each HTTP request with the request head they read. A terminate rule ends TLS
+# at the bridge with the certificate of a Secret the mock serves, and an acme
+# rule with a certificate the bridge obtains from Pebble, which runs as a
 # container on the same network and validates the bridge over TLS-ALPN-01 on
 # port 443. The probes run from the target container against the systemd
 # container's address on the network, which is outside the mesh. Docker sets
@@ -2306,7 +2311,10 @@ docker exec "${INGRESS_TARGET_CONTAINER}" sh -c '
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
             -subj "/O=${v}/CN=t.ingress.e2e.test" -addext "subjectAltName=DNS:t.ingress.e2e.test" \
             -keyout "/srv/ingress/t-${v}.key" -out "/srv/ingress/t-${v}.pem" 2>/dev/null
-    done' || fail "could not create the target's certificates"
+    done
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+        -subj "/CN=h.ingress.e2e.test" -addext "subjectAltName=DNS:h.ingress.e2e.test,DNS:o.ingress.e2e.test" \
+        -keyout /srv/ingress/http.key -out /srv/ingress/http.pem 2>/dev/null' || fail "could not create the target's certificates"
 for spec in 9441:a 9442:b 9443:wild; do
     docker exec -d "${INGRESS_TARGET_CONTAINER}" openssl s_server -4 -accept "${spec%%:*}" \
         -cert "/srv/ingress/${spec#*:}.pem" -key "/srv/ingress/${spec#*:}.key" -www
@@ -2316,19 +2324,28 @@ docker exec -d "${INGRESS_TARGET_CONTAINER}" sh -c 'while true; do printf "plexd
 # to the sender, so every datagram of every sender is answered. -T 5 ends a
 # child after 5 s without a datagram.
 docker exec -d "${INGRESS_TARGET_CONTAINER}" socat -T 5 UDP4-RECVFROM:9053,fork,reuseaddr EXEC:/bin/cat
+# socat runs http-target.sh for each connection, which answers one request
+# with a body that names the server, api or web, and repeats the request
+# head it read.
+for spec in 9081:api 9082:web; do
+    docker exec -d "${INGRESS_TARGET_CONTAINER}" socat "TCP4-LISTEN:${spec%%:*},fork,reuseaddr" \
+        "EXEC:/usr/local/bin/http-target.sh ${spec#*:}"
+done
 TARGET_START=${SECONDS}
 until TARGET_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -ltn 2>&1) \
     && case "${TARGET_LISTEN}" in *"0.0.0.0:9441 "*) ;; *) false ;; esac \
     && case "${TARGET_LISTEN}" in *"0.0.0.0:9442 "*) ;; *) false ;; esac \
     && case "${TARGET_LISTEN}" in *"0.0.0.0:9443 "*) ;; *) false ;; esac \
-    && case "${TARGET_LISTEN}" in *"0.0.0.0:9022 "*) ;; *) false ;; esac; do
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9022 "*) ;; *) false ;; esac \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9081 "*) ;; *) false ;; esac \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9082 "*) ;; *) false ;; esac; do
     if [ $((SECONDS - TARGET_START)) -ge 10 ]; then
         echo "${TARGET_LISTEN}"
-        fail "the target's servers did not listen on 9441, 9442, 9443 and 9022 within 10s"
+        fail "the target's servers did not listen on 9441, 9442, 9443, 9022, 9081 and 9082 within 10s"
     fi
     sleep 1
 done
-echo "  PASS: the target listens on 9441, 9442, 9443 (TLS) and 9022 (banner)"
+echo "  PASS: the target listens on 9441, 9442, 9443 (TLS), 9022 (banner), 9081 and 9082 (HTTP)"
 TARGET_UDP_START=${SECONDS}
 until TARGET_UDP_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -lun 2>&1) \
     && case "${TARGET_UDP_LISTEN}" in *"0.0.0.0:9053 "*) ;; *) false ;; esac; do
@@ -2454,6 +2471,11 @@ RULE_ID_ACME="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"
 RULE_ID_MESH="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f7"
 RULE_ID_UDP_ECHO="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f8"
 RULE_ID_UDP_MESH="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f9"
+RULE_ID_HTTP_API="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fa"
+RULE_ID_HTTP_BETA="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fb"
+RULE_ID_HTTP_DOWN="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fc"
+RULE_ID_HTTP_ONLY="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fd"
+RULE_ID_HTTP_WEB="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fe"
 RULE_IDS_SIX='["0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f2","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f3","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f4","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f5","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"]'
 
 # wait_ingress_report <tag> <what> <jq-filter> [<jq-option>...] reads the last
@@ -2540,12 +2562,14 @@ is_term_subject() {
     return 1
 }
 
-# configure_term_secret <tag> <version> <value> makes the mock serve the value
-# as the Secret tls-term at that version, the only version it serves.
-configure_term_secret() {
+# configure_named_secret <tag> <name> <version> <value> makes the mock serve
+# the value as the Secret of that name at that version. It replaces the
+# mock's whole set of named Secrets, so the mock serves no other Secret by
+# name after it.
+configure_named_secret() {
     local tag=$1 body status
-    body=$(jq -cn --argjson version "$2" --arg value "$3" \
-        '{secrets: [{name: "tls-term", version: $version, value: $value}]}')
+    body=$(jq -cn --arg name "$2" --argjson version "$3" --arg value "$4" \
+        '{secrets: [{name: $name, version: $version, value: $value}]}')
     status=$(curl -sf -o /dev/null -w "%{http_code}" \
         -X POST -H "Content-Type: application/json" \
         -d "${body}" \
@@ -2553,6 +2577,12 @@ configure_term_secret() {
     if [ "${status}" != "204" ]; then
         fail "[${tag}] configure-secrets returned status ${status}, want 204"
     fi
+}
+
+# configure_term_secret <tag> <version> <value> makes the mock serve the value
+# as the Secret tls-term at that version, the only version it serves.
+configure_term_secret() {
+    configure_named_secret "$1" tls-term "$2" "$3"
 }
 
 # ingress_refused <port> succeeds when a connection to the port of the bridge
@@ -3050,6 +3080,201 @@ until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRES
     sleep 2
 done
 echo "  PASS: plexd[${INGRESS_PID}] applied the fixture's policy again"
+
+# Requests on terminate rules with conditions. The rules of the udp step are
+# served with five terminate rules on 443 that name the Secret tls-http, whose
+# certificate covers h.ingress.e2e.test and o.ingress.e2e.test. On a host
+# whose rules have conditions the bridge ends TLS, reads each request and
+# picks one rule for it. Four rules share h.ingress.e2e.test: http-api for
+# /api, which strips that prefix, http-beta for /api with the header
+# x-beta: 1, http-down for /down, whose target port 9099 nothing listens on,
+# and http-web for every other path. http-only holds o.ingress.e2e.test for
+# /only alone. http-api and http-only target the HTTP server api on 9081,
+# http-beta and http-web the server web on 9082, and each server writes back
+# the request head it read, so a probe reads which server the bridge chose
+# and what the bridge sent it. The live inventory is [] since the unlist
+# step. This step lists tls-http alone, which also replaces tls-term in the
+# mock's set of named Secrets, so tls-term stays not_ready.
+TLS_HTTP_SECRET=$(docker exec "${INGRESS_TARGET_CONTAINER}" cat /srv/ingress/http.pem /srv/ingress/http.key) \
+    || fail "could not read the certificate and key of h.ingress.e2e.test from ${INGRESS_TARGET_CONTAINER}"
+HTTP_RULES=$(printf '%s' "${UDP_RULES}" | jq -c \
+    --argjson api "$(ingress_rule fa http-api 443 terminate h.ingress.e2e.test 9081 tls-http)" \
+    --argjson beta "$(ingress_rule fb http-beta 443 terminate h.ingress.e2e.test 9082 tls-http)" \
+    --argjson down "$(ingress_rule fc http-down 443 terminate h.ingress.e2e.test 9099 tls-http)" \
+    --argjson only "$(ingress_rule fd http-only 443 terminate o.ingress.e2e.test 9081 tls-http)" \
+    --argjson web "$(ingress_rule fe http-web 443 terminate h.ingress.e2e.test 9082 tls-http)" \
+    '. + [$api + {conditions: {path_prefix: "/api"}, strip_path_prefix: true},
+          $beta + {conditions: {path_prefix: "/api", headers: [{name: "x-beta", value: "1"}]}},
+          $down + {conditions: {path_prefix: "/down"}},
+          $only + {conditions: {path_prefix: "/only"}},
+          $web + {conditions: {path_prefix: "/"}}]
+     | sort_by(.slug)')
+configure_named_secret http-secret tls-http 1 "${TLS_HTTP_SECRET}"
+configure_ingress http "${HTTP_RULES}" "${PEBBLE_ACME}" '[{"name": "tls-http", "version": 1}]'
+echo "  the mock serves the Secret tls-http at version 1, lists it, and serves the rules of the udp step with http-api, http-beta, http-down, http-only and http-web"
+
+# ingress_curl <host> <path> [<curl option>...] runs curl in the target
+# container for https://<host><path> on port 443 of the bridge, with the
+# bridge's certificate unchecked, and prints what curl wrote, its errors
+# included.
+ingress_curl() {
+    local host=$1 path=$2
+    shift 2
+    docker exec "${INGRESS_TARGET_CONTAINER}" sh -c \
+        'host=$1 bridge=$2 path=$3; shift 3; timeout 10 curl -sS -k --resolve "${host}:443:${bridge}" "$@" "https://${host}${path}" 2>&1' \
+        _ "${host}" "${BRIDGE_IP}" "${path}" "$@" || true
+}
+
+# target_reply <body> splits a body http-target.sh wrote: REPLY_TARGET is its
+# first line, target=<server>, and REPLY_REQUEST its second, the request line
+# the server read.
+target_reply() {
+    local rest=${1#*$'\n'}
+    REPLY_TARGET=${1%%$'\n'*}
+    REPLY_REQUEST=${rest%%$'\n'*}
+}
+
+# has_line <text> <line> succeeds when one line of text is exactly line.
+has_line() {
+    local text=$1 want=$2 line
+    while IFS= read -r line; do
+        if [ "${line}" = "${want}" ]; then
+            return 0
+        fi
+    done <<< "${text}"
+    return 1
+}
+
+# expect_ingress_status <status> <host> <path> [<curl option>...] fails
+# unless the bridge answers the request with that status.
+expect_ingress_status() {
+    local want=$1 host=$2 path=$3 got
+    shift 3
+    got=$(ingress_curl "${host}" "${path}" -o /dev/null -w '%{http_code}' "$@")
+    if [ "${got}" = "${want}" ]; then
+        echo "  PASS: https://${host}${path}${*:+ with $*} read status ${got}"
+    else
+        fail "https://${host}${path}${*:+ with $*} read '${got}', want status ${want}"
+    fi
+}
+
+# The first request that reaches the server api shows that plexd pulled the
+# block, loaded the certificate of tls-http and routes the host's requests.
+HTTP_START=${SECONDS}
+while :; do
+    HTTP_BODY=$(ingress_curl h.ingress.e2e.test '/api/users?x=1')
+    target_reply "${HTTP_BODY}"
+    if [ "${REPLY_TARGET}" = "target=api" ]; then
+        break
+    fi
+    if [ $((SECONDS - HTTP_START)) -ge 60 ]; then
+        echo "${HTTP_BODY}"
+        fail "https://h.ingress.e2e.test/api/users?x=1 read '${REPLY_TARGET}' at last, want target=api within 60s of the rules http-api, http-beta, http-down, http-only and http-web being served"
+    fi
+    sleep 2
+done
+echo "  PASS: https://h.ingress.e2e.test/api/users?x=1 read target=api"
+
+# http-api strips /api and keeps the query. The bridge writes the request
+# to the target with Go's HTTP/1.1 client, which writes each header name in
+# canonical case. The client is the target container itself, so
+# X-Forwarded-For holds its address.
+if [ "${REPLY_REQUEST}" = "GET /users?x=1 HTTP/1.1" ]; then
+    echo "  PASS: the server api read the request line '${REPLY_REQUEST}'"
+else
+    echo "${HTTP_BODY}"
+    fail "the server api read the request line '${REPLY_REQUEST}', want 'GET /users?x=1 HTTP/1.1'"
+fi
+for want in "X-Forwarded-Prefix: /api" "X-Forwarded-Proto: https" "X-Forwarded-For: ${INGRESS_TARGET_IP}" \
+    "X-Forwarded-Host: h.ingress.e2e.test" "Host: h.ingress.e2e.test"; do
+    if has_line "${HTTP_BODY}" "${want}"; then
+        echo "  PASS: the server api read the header line '${want}'"
+    else
+        echo "${HTTP_BODY}"
+        fail "the server api read no header line '${want}'"
+    fi
+done
+
+# /apix does not match the prefix /api, so http-web takes it, and http-beta
+# wins over http-api for a request with its header, since it has more
+# headers. Neither http-web nor http-beta strips a prefix.
+HTTP_BODY=$(ingress_curl h.ingress.e2e.test /apix)
+target_reply "${HTTP_BODY}"
+case "${REPLY_TARGET}|${REPLY_REQUEST}" in
+    "target=web|GET /apix "*) echo "  PASS: https://h.ingress.e2e.test/apix read ${REPLY_TARGET} with the request line '${REPLY_REQUEST}'" ;;
+    *)
+        echo "${HTTP_BODY}"
+        fail "https://h.ingress.e2e.test/apix read '${REPLY_TARGET}' with the request line '${REPLY_REQUEST}', want target=web with a request line that starts 'GET /apix '"
+        ;;
+esac
+HTTP_BODY=$(ingress_curl h.ingress.e2e.test /api/users -H 'x-beta: 1')
+target_reply "${HTTP_BODY}"
+case "${REPLY_TARGET}|${REPLY_REQUEST}" in
+    "target=web|GET /api/users "*) echo "  PASS: https://h.ingress.e2e.test/api/users with x-beta: 1 read ${REPLY_TARGET} with the request line '${REPLY_REQUEST}'" ;;
+    *)
+        echo "${HTTP_BODY}"
+        fail "https://h.ingress.e2e.test/api/users with x-beta: 1 read '${REPLY_TARGET}' with the request line '${REPLY_REQUEST}', want target=web with a request line that starts 'GET /api/users '"
+        ;;
+esac
+
+# The bridge offers h2 and http/1.1 to a client and speaks HTTP/1.1 to the
+# target. -w writes the version curl spoke on a line of its own after the
+# body.
+HTTP_OUT=$(ingress_curl h.ingress.e2e.test / --http2 -w '\n%{http_version}')
+HTTP_VERSION=${HTTP_OUT##*$'\n'}
+HTTP_BODY=${HTTP_OUT%$'\n'*}
+target_reply "${HTTP_BODY}"
+if [ "${HTTP_VERSION}" = "2" ]; then
+    echo "  PASS: curl --http2 spoke HTTP version ${HTTP_VERSION} with the bridge"
+else
+    echo "${HTTP_OUT}"
+    fail "curl --http2 spoke HTTP version '${HTTP_VERSION}' with the bridge, want 2"
+fi
+case "${REPLY_REQUEST}" in
+    *" HTTP/1.1") echo "  PASS: over HTTP/2, the server ${REPLY_TARGET#target=} read the request line '${REPLY_REQUEST}'" ;;
+    *)
+        echo "${HTTP_BODY}"
+        fail "over HTTP/2, the target read the request line '${REPLY_REQUEST}', want one that ends in HTTP/1.1"
+        ;;
+esac
+HTTP_VERSION=$(ingress_curl h.ingress.e2e.test / --http1.1 -o /dev/null -w '%{http_version}')
+if [ "${HTTP_VERSION}" = "1.1" ]; then
+    echo "  PASS: curl --http1.1 spoke HTTP version ${HTTP_VERSION} with the bridge"
+else
+    fail "curl --http1.1 spoke HTTP version '${HTTP_VERSION}' with the bridge, want 1.1"
+fi
+
+# The bridge answers by itself: 404 when no rule of the host matches, 502
+# when the dial to the target is refused, 400 for a dot segment, and 421 for
+# a Host that the sni_host of the connection's rules does not cover.
+expect_ingress_status 404 o.ingress.e2e.test /other
+expect_ingress_status 502 h.ingress.e2e.test /down
+expect_ingress_status 400 h.ingress.e2e.test /api/../x --path-as-is
+expect_ingress_status 421 h.ingress.e2e.test /api/users -H 'Host: other.ingress.e2e.test'
+
+# Each rule reports its own entry. http-only never dialled, since the 404
+# dials nothing, and http-down's refused dial is its own.
+wait_ingress_report http "the five http rules listening and ready, http-api and http-web dial succeeded, http-only dial none and http-down dial failed with refused" \
+    '. as $r
+     | ([$api, $beta, $down, $only, $web] | map(. as $id | any($r.rules[]?; .id == $id and .listener == "listening" and .certificate == "ready")) | all)
+       and any($r.rules[]?; .id == $api and .dial == "succeeded")
+       and any($r.rules[]?; .id == $web and .dial == "succeeded")
+       and any($r.rules[]?; .id == $only and .dial == "none")
+       and any($r.rules[]?; .id == $down and .dial == "failed" and .dial_reason == "refused")' \
+    --arg api "${RULE_ID_HTTP_API}" --arg beta "${RULE_ID_HTTP_BETA}" --arg down "${RULE_ID_HTTP_DOWN}" \
+    --arg only "${RULE_ID_HTTP_ONLY}" --arg web "${RULE_ID_HTTP_WEB}"
+# The journal holds 'ingress rule not served' lines of other rules from the
+# steps before, so the lines are counted per rule id, over every process.
+ingress_journal
+for spec in "http-api=${RULE_ID_HTTP_API}" "http-beta=${RULE_ID_HTTP_BETA}" "http-down=${RULE_ID_HTTP_DOWN}" \
+    "http-only=${RULE_ID_HTTP_ONLY}" "http-web=${RULE_ID_HTTP_WEB}"; do
+    HTTP_NOT_SERVED=$(journal_count "${INGRESS_JOURNAL}" 'msg="ingress rule not served"' "rule_id=${spec#*=}")
+    if [ "${HTTP_NOT_SERVED}" -eq 0 ]; then
+        echo "  PASS: plexd logged no 'ingress rule not served' for ${spec%%=*}"
+    else
+        fail "plexd logged ${HTTP_NOT_SERVED} 'ingress rule not served' lines with rule_id=${spec#*=} (${spec%%=*}), want 0"
+    fi
+done
 
 # An ingress child of null closes every public listener, of both protocols.
 configure_ingress remove null
