@@ -1286,14 +1286,15 @@ const (
 	// certificate; CertificateReason says why.
 	IngressCertificateNotReady = "not_ready"
 
-	// IngressDialNone marks a rule whose target no client connection has
-	// dialled yet, or, for a udp rule, to which no flow has sent a client's
-	// datagram yet.
+	// IngressDialNone marks a rule for which the bridge has dialled no target
+	// yet, or a target it has not dialled yet. For a udp rule a dial is a
+	// send of a client's datagram.
 	IngressDialNone = "none"
-	// IngressDialSucceeded marks a rule whose last dial reached its target.
+	// IngressDialSucceeded marks a rule whose last unit a target took, or a
+	// target whose last dial succeeded.
 	IngressDialSucceeded = "succeeded"
-	// IngressDialFailed marks a rule whose last dial failed; DialReason says
-	// why.
+	// IngressDialFailed marks a rule whose last unit no target took, or a
+	// target whose last dial failed; DialReason says why.
 	IngressDialFailed = "failed"
 )
 
@@ -1304,6 +1305,10 @@ const MaxIngressStatusRules = 1024
 // MaxIngressStatusDialAgeSeconds is the contract's ceiling on
 // dial_age_seconds, the largest signed 32-bit integer.
 const MaxIngressStatusDialAgeSeconds = 2147483647
+
+// MaxIngressStatusTargets is the contract's ceiling on the target entries of
+// one rule entry, the most targets a rule holds.
+const MaxIngressStatusTargets = 8
 
 // IngressStatusRequest is the body of PUT /v1/nodes/{node_id}/ingress-status:
 // whether the bridge's local configuration serves public ingress, and how
@@ -1349,6 +1354,29 @@ type IngressStatusRule struct {
 	// 0..MaxIngressStatusDialAgeSeconds. It is a pointer because 0 is a valid
 	// age, for a dial less than a second ago.
 	DialAgeSeconds *int64 `json:"dial_age_seconds,omitempty"`
+	// Targets holds at most MaxIngressStatusTargets entries, one per target
+	// of the rule, only beside a Listener of listening; nil omits the member,
+	// which the contract reads as no entries.
+	Targets []IngressStatusTarget `json:"targets,omitempty"`
+}
+
+// IngressStatusTarget is one entry of a rule entry's targets, the control
+// plane's IngressStatusReportRuleTarget: the target as the pull names it and
+// the last dial the bridge made to it. DialReason is sent exactly when Dial
+// is failed, and DialAgeSeconds exactly when Dial is succeeded or failed. No
+// two entries of one rule name the same NodeID and Port.
+type IngressStatusTarget struct {
+	// NodeID is the target's node_id from the pull, a UUID other than the
+	// zero UUID.
+	NodeID string `json:"node_id"`
+	// Port is the target's port from the pull, in 1..65535.
+	Port int `json:"port"`
+	// Dial is one of the IngressDial* constants.
+	Dial       string `json:"dial"`
+	DialReason string `json:"dial_reason,omitempty"`
+	// DialAgeSeconds is the whole seconds between the last dial to the target
+	// and the report, in 0..MaxIngressStatusDialAgeSeconds.
+	DialAgeSeconds *int64 `json:"dial_age_seconds,omitempty"`
 }
 
 // ValidIngressRuleID reports whether s is a UUID in canonical form, groups of
@@ -1375,6 +1403,11 @@ func ValidIngressRuleID(s string) bool {
 	}
 	return !zero
 }
+
+// ValidIngressTargetNodeID reports whether s is a node_id the control plane
+// accepts in a target entry of an ingress status report: a UUID in
+// canonical form other than the zero UUID, as ValidIngressRuleID.
+func ValidIngressTargetNodeID(s string) bool { return ValidIngressRuleID(s) }
 
 // ValidIngressReason reports whether s is a reason token of an ingress status
 // report: a lowercase letter, then up to 62 lowercase letters, digits and
@@ -2033,12 +2066,22 @@ type IngressRule struct {
 	// SNIHost is the server name the rule matches on a shared port, exact or
 	// a wildcard of one left-most label. A rule without it is the only rule on
 	// its port.
-	SNIHost      string `json:"sni_host,omitempty"`
+	SNIHost string `json:"sni_host,omitempty"`
+	// Targets are the rule's targets, one to eight, in round-robin order, as
+	// a control plane since plexsphere/plexsphere#1120 sends them. A rule of
+	// an earlier control plane carries none and marshals without the key; an
+	// absent, null or empty member decodes to an empty Targets.
+	Targets []IngressTarget `json:"targets,omitempty"`
+	// TargetNodeID, TargetAddress and TargetPort name the rule's first
+	// target. They are deprecated: a bridge reads them only when Targets is
+	// empty, as a control plane before plexsphere/plexsphere#1120 sends a
+	// rule.
 	TargetNodeID string `json:"target_node_id"`
 	// TargetAddress is the target node's mesh address, IPv4 or IPv6, without
-	// brackets.
+	// brackets. Deprecated: see TargetNodeID.
 	TargetAddress string `json:"target_address"`
-	TargetPort    int    `json:"target_port"`
+	// TargetPort is the port on the target. Deprecated: see TargetNodeID.
+	TargetPort int `json:"target_port"`
 	// CertificateSecretName names the Secret of the bridge's Project that
 	// holds a terminate rule's certificate chain and key, one PEM document.
 	// It is empty on every other mode.
@@ -2071,6 +2114,15 @@ type IngressHeaderCondition struct {
 	Value string `json:"value"`
 }
 
+// IngressTarget is one target of an ingress rule, the control plane's
+// NodeStateBridgeIngressRuleTarget: a target node, its mesh address, IPv4 or
+// IPv6 without brackets, and a port on it.
+type IngressTarget struct {
+	NodeID  string `json:"node_id"`
+	Address string `json:"address"`
+	Port    int    `json:"port"`
+}
+
 // IsZero reports whether c names no path prefix and no header, which is a
 // rule without conditions. encoding/json's omitzero calls it.
 func (c IngressConditions) IsZero() bool {
@@ -2078,13 +2130,20 @@ func (c IngressConditions) IsZero() bool {
 }
 
 // Equal reports whether two rules carry the same members. A nil and an empty
-// Conditions.Headers are equal; the order of the headers counts.
+// Conditions.Headers are equal, and so are a nil and an empty Targets; the
+// order of the headers and of the targets counts.
 func (r IngressRule) Equal(o IngressRule) bool {
 	if len(r.Conditions.Headers) == 0 {
 		r.Conditions.Headers = nil
 	}
 	if len(o.Conditions.Headers) == 0 {
 		o.Conditions.Headers = nil
+	}
+	if len(r.Targets) == 0 {
+		r.Targets = nil
+	}
+	if len(o.Targets) == 0 {
+		o.Targets = nil
 	}
 	return reflect.DeepEqual(r, o)
 }
