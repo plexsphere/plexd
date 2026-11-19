@@ -10,7 +10,7 @@ The `internal/reconcile` package implements the core convergence loop that keeps
 
 The pull is one-way: plexd does not report drift corrections back to the control plane, except for the policy block, whose outcome (the ruleset plexd applied, the one it rejected and why, and what its default deny dropped) it sends as its [policy status report](../networking/network-policy.md#policy-status-report). `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility for the other blocks will return as node-authored state reports (issue #23).
 
-The envelope carries ten always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, and `signing_key`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
+The envelope carries twelve always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, `signing_key`, `hooks`, and `dns`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
 
 `executions` and `sessions` are the exceptions: both are consumed by the dispatch stage on every successful pull and neither is stored in the local snapshot nor diffed. `executions` is a delivery queue rather than desired state; `sessions` is desired state, but state the tunnel dispatcher converges on itself rather than through the differ.
 

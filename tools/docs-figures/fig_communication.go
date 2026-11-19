@@ -73,7 +73,7 @@ func communicationChannels() *Figure {
 	done = commPhase(f, s, x0, x1, "2", "SSE Event Stream (persistent)")
 	s.msg(call, 0, 1, code("GET /v1/nodes/{id}/events"), body("(SSE, Last-Event-ID)"))
 	s.msg(publish, 1, 0, body("Ed25519-signed event envelopes"))
-	s.note(1, code("node_state_updated, policy_updated,"), code("bridge_config_updated, rotate_keys,"), code("signing_key_rotated, ..."))
+	s.note(1, code("node_state_updated, policy_updated,"), code("action_request, session_setup,"), code("bridge_config_updated, ..."))
 	done()
 
 	done = commPhase(f, s, x0, x1, "3", "Heartbeat (every 30s)")
@@ -83,7 +83,7 @@ func communicationChannels() *Figure {
 
 	done = commPhase(f, s, x0, x1, "4", "Reconciliation (every 60s)")
 	s.msg(call, 0, 1, code("GET /v1/nodes/{id}/state"))
-	s.msg(reply, 1, 0, code("{peers, reachability, policy,"), code("bridge, state, reports}"))
+	s.msg(reply, 1, 0, code("{peers, reachability, policy, bridge,"), code("state, reports, executions, sessions,"), code("secrets, signing_key, hooks, dns}"))
 	s.self(0, body("Diff by presence and apply corrections"))
 	done()
 
