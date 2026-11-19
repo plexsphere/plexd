@@ -58,8 +58,8 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 
 | Endpoint | Validated Fields |
 |----------|-----------------|
-| `register` | `token` (non-empty), `hostname` (non-empty) |
-| `heartbeat` | Valid JSON with `timestamp` field |
+| `register` | `bootstrap_token`, `project_id`, `resource_handle`, `nonce` (each non-empty) |
+| `heartbeat` | Valid JSON with `client_now` (RFC 3339), `binary_checksum` (32-byte base64 digest), `binary_version` (non-empty) and `nat_summary` (a JSON object) |
 | `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), eleven `builtin_actions`; `binary` and `plexd_hooks` absent |
 
 ### 8. Spent token cleanup

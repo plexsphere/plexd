@@ -102,8 +102,8 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 
 | Endpoint | Validated Fields |
 |----------|-----------------|
-| `register` | `token` (non-empty), `hostname` (non-empty), `public_key` (non-empty) |
-| `heartbeat` | Valid JSON with `timestamp` field (node_id is in URL path, not body) |
+| `register` | `bootstrap_token`, `nonce` and `public_key` (non-empty), `project_id` (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0`), `resource_handle` (`e2e-node-1`) |
+| `heartbeat` | Valid JSON with `client_now` (RFC 3339), `binary_checksum` (32-byte base64 digest), `binary_version` (non-empty) and `nat_summary` (a JSON object); node_id is in the URL path, not the body |
 | `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), `builtin_actions` equal to the eleven builtins sorted by name, each with a description, `service.upgrade` declaring `version` then `checksum` as required; `declared_hooks` exactly `e2e-bigout` with the SHA-256 of `test/e2e/docker/hooks/e2e-bigout`, where an absent list fails; `capabilities_count` exactly 1, so these checks read the first manifest and a broken boot order cannot pass through a later send; `plexd_hooks`, `binary`, and `hooks` absent |
 | `metrics` | Array with >= 1 data point |
 
