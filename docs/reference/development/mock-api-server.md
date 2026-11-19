@@ -139,16 +139,20 @@ status report were gated from the start:
   control character. The `200` answer derives the status against the policy
   block the fixture serves, so the agent's report reads `applied` only when
   it echoes that block. See [the route](#put-v1-nodes-id-policy-status).
-- **`PUT /v1/nodes/{id}/ingress-status`** caps the body at 256 KiB
+- **`PUT /v1/nodes/{id}/ingress-status`** caps the body at 2 MiB
   (`413 ingress_status_body_too_large`) and strict-decodes it into a
-  mock-local struct whose `state` is a pointer, then each rule entry on its
-  own. It answers `400 malformed_ingress_status` for a body that is empty or
-  not one JSON object, an unknown member, data after the report, a missing or
-  `null` `state` (`detail` `state is missing`), a `state` outside `enabled`
-  and `opted_out` (`detail` `state is not one of enabled and opted_out`),
-  more than 1,024 entries, and an entry whose member breaks its own rule; and
+  mock-local struct whose `state` is a pointer, then each rule entry and
+  each of its target entries on its own. It answers
+  `400 malformed_ingress_status` for a body that is empty or not one JSON
+  object, an unknown member, data after the report, a missing or `null`
+  `state` (`detail` `state is missing`), a `state` outside `enabled` and
+  `opted_out` (`detail` `state is not one of enabled and opted_out`), more
+  than 1,024 entries, an entry whose member breaks its own rule, more than 8
+  target entries and a target entry whose member breaks its own rule; and
   `400 invalid_ingress_status` for an opted-out report with entries, a
-  repeated `id` and an entry that breaks the presence rules. See
+  repeated `id`, an entry that breaks the presence rules, target entries
+  beside an entry that does not listen, a repeated target `node_id` and
+  `port`, and a target entry that breaks the presence rules of a target. See
   [the route](#put-v1-nodes-id-ingress-status).
 - **`PUT /v1/nodes/{id}/user-access-status`** caps the body at 64 KiB
   (`413 user_access_status_body_too_large`) and strict-decodes it into a
@@ -625,25 +629,28 @@ The report is not stored: the mock keeps only the captured body.
 
 Enforces the ingress status report contract (`PutNodeIngressStatus`, the
 "Ingress status" section of the control plane's
-`docs/reference/api/plexd-agent-contract.md` at plexsphere/plexsphere@16f468b):
-a 256 KiB body cap, strict JSON decoding, the two states, and the rules of
-each rule entry. `handleIngressStatus` captures the body under
-`ingress-status`, so `GET /test/last-request/ingress-status` returns the bytes
-of the last report, and decodes it into a mock-local struct whose `state` is a
-`*string`, so a missing or `null` state is told apart from an empty one. The
-handler does not compare the path `id` with the node, as the policy status
-route does not. `ingress_status_count` increments only when every check
-passes.
+`docs/reference/api/plexd-agent-contract.md` at plexsphere/plexsphere@8c76f19):
+a 2 MiB body cap, strict JSON decoding, the two states, and the rules of
+each rule entry and of each of its target entries. `handleIngressStatus`
+captures the body under `ingress-status` up to the cap, so
+`GET /test/last-request/ingress-status` returns the bytes of the last report
+whole, also above the 1 MiB other routes capture. It decodes the body into a
+mock-local struct whose `state` is a `*string`, so a missing or `null` state
+is told apart from an empty one. The handler does not compare the path `id`
+with the node, as the policy status route does not. `ingress_status_count`
+increments only when every check passes. The mock does not read a rule
+entry's `client_auth_enforced` and `client_refusals` yet, so an entry that
+carries them is refused as an entry with an unknown member.
 
 **Validation order.** The handler returns at the first failure:
 
-1. **Body size** → `413` `ingress_status_body_too_large` if the body exceeds 256 KiB (262,144 bytes), read through `http.MaxBytesReader`.
+1. **Body size** → `413` `ingress_status_body_too_large` if the body exceeds 2 MiB (2,097,152 bytes), read through `http.MaxBytesReader`. A body that reaches 2 MiB is drained, so a body of exactly 2 MiB is told apart from a longer one.
 2. **Body decode** → `400` `malformed_ingress_status` if the body is empty, is not one JSON object, carries an unknown member, or data after the report. The entries of `rules` stay undecoded here.
 3. **State** → `400` `malformed_ingress_status` with the `detail` `state is missing` if `state` is missing or `null`, and with the `detail` `state is not one of enabled and opted_out` for any value but `enabled` and `opted_out`.
-4. **Entries** → `400` `malformed_ingress_status` with the `detail` `rules carries more than 1024 entries`; then, for each entry in order, decoded on its own with unknown members refused into a struct of pointer members: `rules[i] is not a valid rule entry` for an entry that is no object, carries an unknown member or a member of the wrong JSON type, and otherwise `rules[i]` followed by the first broken member rule, in the order `.id is not a rule id` (missing, or failing `api.ValidIngressRuleID`), `.listener is not one of listening and not_listening` (missing or another value), `.listener_reason is not a reason token`, `.certificate is not one of not_required, ready and not_ready`, `.certificate_reason is not a reason token`, `.dial is not one of none, succeeded and failed`, `.dial_reason is not a reason token` and `.dial_age_seconds is outside 0..2147483647`. Reasons are checked with `api.ValidIngressReason`.
-5. **Consistency** → `400` `invalid_ingress_status` with the `detail` `an opted-out bridge reports no rules`; then, for each entry, `rules[i].id repeats rules[j].id` (compared without case), and for the first broken row of the presence rules, in the order `listener_reason`, `certificate`, `certificate_reason`, `dial`, `dial_reason`, `dial_age_seconds`, `rules[i] carries <member> while <facet> is <value>` or `rules[i] misses <member> while <facet> is <value>`.
+4. **Entries** → `400` `malformed_ingress_status` with the `detail` `rules carries more than 1024 entries`; then, for each entry in order, decoded on its own with unknown members refused into a struct of pointer members: `rules[i] is not a valid rule entry` for an entry that is no object, carries an unknown member or a member of the wrong JSON type (a `targets` that is no array included), and otherwise `rules[i]` followed by the first broken member rule, in the order `.id is not a rule id` (missing, or failing `api.ValidIngressRuleID`), `.listener is not one of listening and not_listening` (missing or another value), `.listener_reason is not a reason token`, `.certificate is not one of not_required, ready and not_ready`, `.certificate_reason is not a reason token`, `.dial is not one of none, succeeded and failed`, `.dial_reason is not a reason token` and `.dial_age_seconds is outside 0..2147483647`. Reasons are checked with `api.ValidIngressReason`. The entry's `targets` follow before the next entry: `rules[i].targets carries more than 8 entries`; then, for each target entry in order, decoded on its own in the same way, `rules[i].targets[j] is not a valid target entry` for a target entry that is no object, carries an unknown member or a member of the wrong JSON type, and otherwise `rules[i].targets[j]` followed by the first broken member rule, in the order `.node_id is not a Node id` (missing, or failing `api.ValidIngressTargetNodeID`), `.port is outside 1..65535` (missing or another value), `.dial is not one of none, succeeded and failed` (missing or another value), `.dial_reason is not a reason token` and `.dial_age_seconds is outside 0..2147483647`. A `null` target entry is a target entry without members.
+5. **Consistency** → `400` `invalid_ingress_status` with the `detail` `an opted-out bridge reports no rules`; then, for each entry, `rules[i].id repeats rules[j].id` (compared without case), and for the first broken row of the presence rules, in the order `listener_reason`, `certificate`, `certificate_reason`, `dial`, `dial_reason`, `dial_age_seconds`, `targets`, `rules[i] carries <member> while <facet> is <value>` or `rules[i] misses <member> while <facet> is <value>`. The `targets` row refuses target entries beside a `listener` of `not_listening` only, with `rules[i] carries targets while listener is not_listening`. Then, for each target entry of the entry in order, `rules[i].targets[j] repeats rules[i].targets[k]` for a `node_id` (compared without case) and `port` that an earlier target entry carries, and for the first broken row of the presence rules of a target, `dial_reason` exactly when `dial` is `failed` and `dial_age_seconds` exactly when it is `succeeded` or `failed`, `rules[i].targets[j] carries <member> while dial is <value>` or `rules[i].targets[j] misses <member> while dial is <value>`. These rules of an entry run before those of the next entry.
 
-A `rules` of `null` or `[]` is a report without entries. The details are the control plane's sentences, except the one for an entry that is no valid rule entry, which the control plane splits by cause. The mock accepts canonical ids only, which is narrower than the control plane's parser and wide enough for what plexd sends.
+A `rules` of `null` or `[]` is a report without entries, and an absent `targets`, a `null` and `[]` are a rule entry without target entries, which stands beside either `listener`. The details are the control plane's sentences of `internal/transport/http/v1/ingressstatus/handler.go` at the same commit, except the ones for an entry that is no valid rule entry and a target entry that is no valid target entry, which the control plane splits by cause. The mock accepts canonical ids only, for a rule `id` and a target `node_id` alike, which is narrower than the control plane's parser and wide enough for what plexd sends.
 
 **Request body:**
 
@@ -651,6 +658,12 @@ A `rules` of `null` or `[]` is a report without entries. The details are the con
 {
   "state": "enabled",
   "rules": [
+    { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", "listener": "listening",
+      "certificate": "not_required", "dial": "succeeded", "dial_age_seconds": 2,
+      "targets": [
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 8443, "dial": "succeeded", "dial_age_seconds": 2 },
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "port": 8443, "dial": "failed", "dial_reason": "timeout", "dial_age_seconds": 14 }
+      ] },
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", "listener": "not_listening", "listener_reason": "listen_failed" }
   ]
 }
@@ -912,7 +925,7 @@ therefore hands the node the new key.
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
 | `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, 2 providers in the delivered shape: `field-team` (`...a0e1`), `wireguard` on port 51821 with the pool `10.98.0.0/24`, at most 64 devices and one device `alice-laptop` at `10.98.0.2`; and `tailnet` (`...a0e2`), `tailscale` with the Secret `ts-join`. No suite serves this block to a bridge: the systemd suite's bridge phases replace it |
-| `bridge.ingress` | `enabled: true`, 1 rule, `web`: `protocol` `tcp`, port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The rule carries `protocol`, as the control plane sends it on every rule. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
+| `bridge.ingress` | `enabled: true`, 1 rule, `web`: `protocol` `tcp`, port 443, `passthrough`, `sni_host` `web.e2e.internal`, target peer `...a0b1` at its mesh IP `10.99.0.2` port 8443. The rule carries `protocol` and `targets`, as the control plane sends them on every rule: its one target and the deprecated `target_node_id`, `target_address` and `target_port` name the same target. The Docker and Kubernetes suites run node mode and ignore it; the systemd suite's ingress phase serves a block of its own |
 | `bridge.site_to_site` | `enabled: true`, 2 tunnels in the delivered shape: `branch-berlin` (`...a0e1`), `wireguard` on port 51830 to `vpn.branch.example.com:51820` for `10.20.0.0/16` with the Secret `branch-berlin-psk`; and `dc-east` (`...a0e2`), `ipsec` to `203.0.113.10:500` for `10.30.0.0/16` and `10.31.0.0/16` with the Secret `dc-east-ike`. No suite serves this block to a bridge: the systemd suite sets it to `null` before its node becomes one |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
@@ -1092,6 +1105,13 @@ answers `applied`.
           "listen_port": 443,
           "mode": "passthrough",
           "sni_host": "web.e2e.internal",
+          "targets": [
+            {
+              "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+              "address": "10.99.0.2",
+              "port": 8443
+            }
+          ],
           "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
           "target_address": "10.99.0.2",
           "target_port": 8443
