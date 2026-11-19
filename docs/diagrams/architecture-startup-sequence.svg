@@ -1,122 +1,130 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1178" viewBox="0 0 1200 1178" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Startup sequence of plexd up">
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="1202" viewBox="0 0 1420 1202" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="Startup sequence of plexd up">
 <title>Startup sequence of plexd up</title>
-<rect width="1200" height="1178" fill="#F6F5F1"/>
-<rect x="40" y="40" width="1120" height="92" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<text x="60" y="80.5" font-size="22" font-weight="700" fill="#2B3440">Config and</text>
-<text x="60" y="106.9" font-size="22" font-weight="700" fill="#2B3440">logger</text>
-<rect x="240" y="64" width="177" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="328.5" y="93" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Parse config</text>
-<rect x="461" y="64" width="189" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="555.5" y="93" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Set up logger</text>
-<polyline points="417,86 452,86" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="461,86 448,92 448,80" fill="#3A4452"/>
-<rect x="40" y="188" width="1120" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<text x="60" y="253.7" font-size="22" font-weight="700" fill="#2B3440">Registration</text>
-<rect x="240" y="212" width="198" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="339" y="241" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create control</text>
-<text x="339" y="265" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">plane client</text>
-<rect x="482" y="212" width="194" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="579" y="253" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Register node</text>
-<polyline points="438,246 473,246" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="482,246 469,252 469,240" fill="#3A4452"/>
-<rect x="720" y="212" width="216" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="828" y="241" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create Ed25519</text>
-<text x="828" y="265" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">verifier</text>
-<polyline points="676,246 711,246" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="720,246 707,252 707,240" fill="#3A4452"/>
-<polyline points="555.5,108 555.5,160 339,160 339,203" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="339,212 333,199 345,199" fill="#3A4452"/>
-<rect x="40" y="360" width="1120" height="140" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<text x="60" y="437.7" font-size="22" font-weight="700" fill="#2B3440">Networking</text>
-<rect x="240" y="384" width="157" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="318.5" y="425" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
-<text x="318.5" y="449" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">WireGuard</text>
-<rect x="419.25" y="384" width="165" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="501.75" y="413" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
-<text x="501.75" y="437" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">NAT + Peer</text>
-<text x="501.75" y="461" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Exchange</text>
-<rect x="606.5" y="384" width="206" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="709.5" y="425" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
-<text x="709.5" y="449" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Network Policy</text>
-<rect x="834.75" y="384" width="134" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="901.75" y="425" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
-<text x="901.75" y="449" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Tunnel</text>
-<rect x="991" y="384" width="145" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="1063.5" y="414.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
-<text x="1063.5" y="438.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Bridge</text>
-<text x="1063.5" y="459.95" font-size="17" fill="#55606E" text-anchor="middle">bridge mode</text>
-<polyline points="828,280 828,332 318.5,332 318.5,375" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="318.5,384 312.5,371 324.5,371" fill="#3A4452"/>
-<polyline points="828,280 828,332 501.75,332 501.75,375" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="501.75,384 495.75,371 507.75,371" fill="#3A4452"/>
-<polyline points="828,280 828,332 709.5,332 709.5,375" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="709.5,384 703.5,371 715.5,371" fill="#3A4452"/>
-<polyline points="828,280 828,332 901.75,332 901.75,375" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="901.75,384 895.75,371 907.75,371" fill="#3A4452"/>
-<polyline points="828,280 828,332 1063.5,332 1063.5,375" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="1063.5,384 1057.5,371 1069.5,371" fill="#3A4452"/>
-<rect x="40" y="556" width="1120" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<text x="60" y="621.7" font-size="22" font-weight="700" fill="#2B3440">Core services</text>
-<rect x="240" y="580" width="267" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="373.5" y="621" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create SSE manager</text>
-<rect x="551" y="580" width="230" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="666" y="621" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create reconciler</text>
-<polyline points="507,614 542,614" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="551,614 538,620 538,608" fill="#3A4452"/>
-<rect x="825" y="580" width="230" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="940" y="609" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create heartbeat</text>
-<text x="940" y="633" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">service</text>
-<polyline points="781,614 816,614" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="825,614 812,620 812,608" fill="#3A4452"/>
-<polyline points="318.5,476 318.5,528 373.5,528 373.5,571" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="373.5,580 367.5,567 379.5,567" fill="#3A4452"/>
-<polyline points="501.75,476 501.75,528 373.5,528 373.5,571" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="373.5,580 367.5,567 379.5,567" fill="#3A4452"/>
-<polyline points="709.5,476 709.5,528 373.5,528 373.5,571" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="373.5,580 367.5,567 379.5,567" fill="#3A4452"/>
-<polyline points="901.75,476 901.75,528 373.5,528 373.5,571" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="373.5,580 367.5,567 379.5,567" fill="#3A4452"/>
-<polyline points="1063.5,476 1063.5,528 373.5,528 373.5,571" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="373.5,580 367.5,567 379.5,567" fill="#3A4452"/>
-<rect x="40" y="728" width="1120" height="153.2" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<text x="60" y="799.1" font-size="22" font-weight="700" fill="#2B3440">Actions and</text>
-<text x="60" y="825.5" font-size="22" font-weight="700" fill="#2B3440">Node API</text>
-<rect x="240" y="752" width="216" height="105.2" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="348" y="799.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create integrity</text>
-<text x="348" y="823.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">store + verifier</text>
-<rect x="500" y="752" width="294" height="105.2" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="647" y="781" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create action executor</text>
-<text x="647" y="802.15" font-size="17" fill="#55606E" text-anchor="middle">+ rollout installer</text>
-<text x="647" y="822.55" font-size="17" fill="#55606E" text-anchor="middle">+ capability reporter</text>
-<text x="647" y="842.95" font-size="17" fill="#55606E" text-anchor="middle">+ hook watchers</text>
-<polyline points="456,804.6 491,804.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="500,804.6 487,810.6 487,798.6" fill="#3A4452"/>
-<rect x="838" y="752" width="174" height="105.2" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="925" y="799.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create node</text>
-<text x="925" y="823.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">API server</text>
-<polyline points="794,804.6 829,804.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="838,804.6 825,810.6 825,798.6" fill="#3A4452"/>
-<polyline points="940,648 940,700 348,700 348,743" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="348,752 342,739 354,739" fill="#3A4452"/>
-<rect x="40" y="937.2" width="1120" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<text x="60" y="1002.9" font-size="22" font-weight="700" fill="#2B3440">Observability</text>
-<rect x="240" y="961.2" width="203" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="341.5" y="990.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create metrics</text>
-<text x="341.5" y="1014.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">collectors</text>
-<rect x="487" y="961.2" width="153" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="563.5" y="990.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create log</text>
-<text x="563.5" y="1014.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">forwarder</text>
-<polyline points="443,995.2 478,995.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="487,995.2 474,1001.2 474,989.2" fill="#3A4452"/>
-<rect x="684" y="961.2" width="177" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="772.5" y="990.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create audit</text>
-<text x="772.5" y="1014.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">forwarder</text>
-<polyline points="640,995.2 675,995.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="684,995.2 671,1001.2 671,989.2" fill="#3A4452"/>
-<polyline points="925,857.2 925,909.2 341.5,909.2 341.5,952.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="341.5,961.2 335.5,948.2 347.5,948.2" fill="#3A4452"/>
-<rect x="565.5" y="1093.2" width="414" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
-<text x="772.5" y="1122.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Launch goroutines via WaitGroup</text>
-<polyline points="772.5,1029.2 772.5,1084.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="772.5,1093.2 766.5,1080.2 778.5,1080.2" fill="#3A4452"/>
+<rect width="1420" height="1202" fill="#F6F5F1"/>
+<rect x="40" y="40" width="1340" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="60" y="92.5" font-size="22" font-weight="700" fill="#2B3440">Config and</text>
+<text x="60" y="118.9" font-size="22" font-weight="700" fill="#2B3440">pre-flight</text>
+<rect x="240" y="64" width="177" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="328.5" y="105" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Parse config</text>
+<rect x="461" y="64" width="189" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="555.5" y="105" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Set up logger</text>
+<polyline points="417,98 452,98" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="461,98 448,104 448,92" fill="#3A4452"/>
+<rect x="694" y="64" width="278" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="833" y="93" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Build policy enforcer,</text>
+<text x="833" y="117" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">pre-flight firewall</text>
+<polyline points="650,98 685,98" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="694,98 681,104 681,92" fill="#3A4452"/>
+<rect x="40" y="212" width="1340" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="60" y="277.7" font-size="22" font-weight="700" fill="#2B3440">Registration</text>
+<rect x="240" y="236" width="198" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="339" y="265" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create control</text>
+<text x="339" y="289" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">plane client</text>
+<rect x="482" y="236" width="172" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="568" y="265" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Start health</text>
+<text x="568" y="289" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">listener</text>
+<polyline points="438,270 473,270" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="482,270 469,276 469,264" fill="#3A4452"/>
+<rect x="698" y="236" width="194" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="795" y="277" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Register node</text>
+<polyline points="654,270 689,270" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="698,270 685,276 685,264" fill="#3A4452"/>
+<rect x="936" y="236" width="216" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1044" y="265" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create Ed25519</text>
+<text x="1044" y="289" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">verifier</text>
+<polyline points="892,270 927,270" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="936,270 923,276 923,264" fill="#3A4452"/>
+<polyline points="833,132 833,184 339,184 339,227" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="339,236 333,223 345,223" fill="#3A4452"/>
+<rect x="40" y="384" width="1340" height="140" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="60" y="461.7" font-size="22" font-weight="700" fill="#2B3440">Networking</text>
+<rect x="240" y="408" width="157" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="318.5" y="449" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
+<text x="318.5" y="473" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">WireGuard</text>
+<rect x="441" y="408" width="152" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="517" y="449" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Bind</text>
+<text x="517" y="473" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">mesh DNS</text>
+<polyline points="397,454 432,454" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="441,454 428,460 428,448" fill="#3A4452"/>
+<rect x="637" y="408" width="165" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="719.5" y="437" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
+<text x="719.5" y="461" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">NAT + Peer</text>
+<text x="719.5" y="485" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Exchange</text>
+<polyline points="593,454 628,454" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="637,454 624,460 624,448" fill="#3A4452"/>
+<rect x="846" y="408" width="131" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="911.5" y="437" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Install</text>
+<text x="911.5" y="461" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">firewall</text>
+<text x="911.5" y="485" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">baseline</text>
+<polyline points="802,454 837,454" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="846,454 833,460 833,448" fill="#3A4452"/>
+<rect x="1021" y="408" width="134" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1088" y="449" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
+<text x="1088" y="473" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Tunnel</text>
+<polyline points="977,454 1012,454" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1021,454 1008,460 1008,448" fill="#3A4452"/>
+<rect x="1199" y="408" width="145" height="92" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="1271.5" y="438.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Initialize</text>
+<text x="1271.5" y="462.8" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Bridge</text>
+<text x="1271.5" y="483.95" font-size="17" fill="#55606E" text-anchor="middle">bridge mode</text>
+<polyline points="1155,454 1190,454" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1199,454 1186,460 1186,448" fill="#3A4452"/>
+<polyline points="1044,304 1044,356 318.5,356 318.5,399" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="318.5,408 312.5,395 324.5,395" fill="#3A4452"/>
+<rect x="40" y="580" width="1340" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="60" y="645.7" font-size="22" font-weight="700" fill="#2B3440">Core services</text>
+<rect x="240" y="604" width="267" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="373.5" y="645" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create SSE manager</text>
+<rect x="551" y="604" width="230" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="666" y="645" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create reconciler</text>
+<polyline points="507,638 542,638" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="551,638 538,644 538,632" fill="#3A4452"/>
+<rect x="825" y="604" width="230" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="940" y="633" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create heartbeat</text>
+<text x="940" y="657" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">service</text>
+<polyline points="781,638 816,638" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="825,638 812,644 812,632" fill="#3A4452"/>
+<polyline points="1271.5,500 1271.5,552 373.5,552 373.5,595" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="373.5,604 367.5,591 379.5,591" fill="#3A4452"/>
+<rect x="40" y="752" width="1340" height="153.2" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="60" y="823.1" font-size="22" font-weight="700" fill="#2B3440">Actions and</text>
+<text x="60" y="849.5" font-size="22" font-weight="700" fill="#2B3440">Node API</text>
+<rect x="240" y="776" width="216" height="105.2" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="348" y="823.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create integrity</text>
+<text x="348" y="847.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">store + verifier</text>
+<rect x="500" y="776" width="294" height="105.2" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="647" y="805" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create action executor</text>
+<text x="647" y="826.15" font-size="17" fill="#55606E" text-anchor="middle">+ rollout installer</text>
+<text x="647" y="846.55" font-size="17" fill="#55606E" text-anchor="middle">+ capability reporter</text>
+<text x="647" y="866.95" font-size="17" fill="#55606E" text-anchor="middle">+ hook watchers</text>
+<polyline points="456,828.6 491,828.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="500,828.6 487,834.6 487,822.6" fill="#3A4452"/>
+<rect x="838" y="776" width="174" height="105.2" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="925" y="823.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create node</text>
+<text x="925" y="847.6" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">API server</text>
+<polyline points="794,828.6 829,828.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="838,828.6 825,834.6 825,822.6" fill="#3A4452"/>
+<polyline points="940,672 940,724 348,724 348,767" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="348,776 342,763 354,763" fill="#3A4452"/>
+<rect x="40" y="961.2" width="1340" height="116" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<text x="60" y="1026.9" font-size="22" font-weight="700" fill="#2B3440">Observability</text>
+<rect x="240" y="985.2" width="203" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="341.5" y="1014.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create metrics</text>
+<text x="341.5" y="1038.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">collectors</text>
+<rect x="487" y="985.2" width="153" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="563.5" y="1014.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create log</text>
+<text x="563.5" y="1038.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">forwarder</text>
+<polyline points="443,1019.2 478,1019.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="487,1019.2 474,1025.2 474,1013.2" fill="#3A4452"/>
+<rect x="684" y="985.2" width="177" height="68" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="772.5" y="1014.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Create audit</text>
+<text x="772.5" y="1038.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">forwarder</text>
+<polyline points="640,1019.2 675,1019.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="684,1019.2 671,1025.2 671,1013.2" fill="#3A4452"/>
+<polyline points="925,881.2 925,933.2 341.5,933.2 341.5,976.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="341.5,985.2 335.5,972.2 347.5,972.2" fill="#3A4452"/>
+<rect x="565.5" y="1117.2" width="414" height="44" rx="6" fill="#FDFCF9" stroke="#3A4452" stroke-width="2"/>
+<text x="772.5" y="1146.2" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Launch goroutines via WaitGroup</text>
+<polyline points="772.5,1053.2 772.5,1108.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="772.5,1117.2 766.5,1104.2 778.5,1104.2" fill="#3A4452"/>
 </svg>

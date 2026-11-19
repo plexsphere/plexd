@@ -43,12 +43,17 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 
 1. Parse config, apply CLI flag overrides, apply `PLEXD_*` env overrides
 2. Set up structured logger
+2a. Build the policy enforcer and pre-flight the firewall backend — fatal on failure
 3. Create control plane client
 4. Register (or load existing identity) — fatal on failure
+4a. Start the health listener before the registration call (unless `health.enabled` is `false`)
 5. Create Ed25519 verifier from the control plane's signing public key
 5a. Initialize WireGuard — create interface, configure address, bring up
+5a-1. Build the edge PSK store (unless `wireguard.edge_psk` turns it off)
+5a-2. Build the local endpoint candidate filter
+5a-3. Bind the mesh DNS resolver (unless `dns.enabled` is `false`)
 5b. Initialize NAT traversal and peer exchange
-5c. Initialize network policy engine and enforcer
+5c. Install the deny-by-default firewall baseline — fatal on failure
 5d. Initialize tunnel mesh server with JWT verifier
 5e. Initialize bridge subsystem (bridge mode only — ACME, ingress, user access, site-to-site)
 6. Create SSE manager with handlers for signing keys, WireGuard peers, tunnel, policy, and bridge events

@@ -242,7 +242,7 @@ func architectureAgentLifecycle() *Figure {
 // one band per group of steps, for docs/concepts.md (Startup Sequence).
 func architectureStartupSequence() *Figure {
 	f := &Figure{Name: "architecture-startup-sequence", Title: "Startup sequence of plexd up"}
-	const w, x0, gap, bandGap = 1120.0, 200.0, 44.0, 56.0
+	const w, x0, gap, bandGap = 1340.0, 200.0, 44.0, 56.0
 	y := 0.0
 	// band draws a frame across the figure at y, its title on the left,
 	// and leaves room for a row of steps of height h.
@@ -265,50 +265,33 @@ func architectureStartupSequence() *Figure {
 		f.arrow(flow, vhv(from.bottom(), to.top(), to.y-24-bandGap/2)...)
 	}
 
-	cfg := chain([]string{"Config and", "logger"},
+	cfg := chain([]string{"Config and", "pre-flight"},
 		[]Line{name("Parse config")},
 		[]Line{name("Set up logger")},
+		[]Line{name("Build policy enforcer,"), name("pre-flight firewall")},
 	)
 	reg := chain([]string{"Registration"},
 		[]Line{name("Create control"), name("plane client")},
+		[]Line{name("Start health"), name("listener")},
 		[]Line{name("Register node")},
 		[]Line{name("Create Ed25519"), name("verifier")},
 	)
 	next(cfg[len(cfg)-1], reg[0])
-	verifier := reg[len(reg)-1]
-
-	netLabels := [][]Line{
-		{name("Initialize"), name("WireGuard")},
-		{name("Initialize"), name("NAT + Peer"), name("Exchange")},
-		{name("Initialize"), name("Network Policy")},
-		{name("Initialize"), name("Tunnel")},
-		{name("Initialize"), name("Bridge"), body("bridge mode")},
-	}
-	netBand := band(archStepHeight(netLabels...), "Networking")
-	used := 0.0
-	for _, l := range netLabels {
-		used += archStepWidth(l)
-	}
-	netGap := (w - 24 - x0 - used) / float64(len(netLabels)-1)
-	var nets []*node
-	nx := x0
-	for _, l := range netLabels {
-		n := f.state(stateNormal, spec{x: nx, y: netBand.y + 24, h: archStepHeight(netLabels...), lines: l})
-		nets = append(nets, n)
-		nx += n.w + netGap
-	}
-	for _, n := range nets {
-		f.arrow(flow, vhv(verifier.bottom(), n.top(), netBand.y-bandGap/2)...)
-	}
-
+	nets := chain([]string{"Networking"},
+		[]Line{name("Initialize"), name("WireGuard")},
+		[]Line{name("Bind"), name("mesh DNS")},
+		[]Line{name("Initialize"), name("NAT + Peer"), name("Exchange")},
+		[]Line{name("Install"), name("firewall"), name("baseline")},
+		[]Line{name("Initialize"), name("Tunnel")},
+		[]Line{name("Initialize"), name("Bridge"), body("bridge mode")},
+	)
+	next(reg[len(reg)-1], nets[0])
 	core := chain([]string{"Core services"},
 		[]Line{name("Create SSE manager")},
 		[]Line{name("Create reconciler")},
 		[]Line{name("Create heartbeat"), name("service")},
 	)
-	for _, n := range nets {
-		f.arrow(flow, vhv(n.bottom(), core[0].top(), core[0].y-24-bandGap/2)...)
-	}
+	next(nets[len(nets)-1], core[0])
 	acts := chain([]string{"Actions and", "Node API"},
 		[]Line{name("Create integrity"), name("store + verifier")},
 		[]Line{name("Create action executor"), body("+ rollout installer"), body("+ capability reporter"), body("+ hook watchers")},
