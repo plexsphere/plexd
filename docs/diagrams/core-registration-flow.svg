@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="1451" viewBox="0 0 1160 1451" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How the Registrar registers a node">
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="1482" viewBox="0 0 1160 1482" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How the Registrar registers a node">
 <title>How the Registrar registers a node</title>
-<rect width="1160" height="1451" fill="#F6F5F1"/>
+<rect width="1160" height="1482" fill="#F6F5F1"/>
 <rect x="95.5" y="40" width="129" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="160" y="67.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">Registrar</text>
 <rect x="485" y="40" width="170" height="44" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
@@ -9,87 +9,89 @@
 <text x="830" y="69" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Control Plane</text>
 <rect x="1017.5" y="40" width="85" height="44" rx="8" fill="#FDFCF9" stroke="#0E7D89" stroke-width="2"/>
 <text x="1060" y="69" font-size="20" font-weight="700" fill="#0B5F69" text-anchor="middle">Disk</text>
-<polyline points="160,84 160,1410.6" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
-<polyline points="570,84 570,1410.6" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
-<polyline points="830,84 830,1410.6" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
-<polyline points="1060,84 1060,1410.6" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="160,84 160,1441.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="570,84 570,1441.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="830,84 830,1441.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="1060,84 1060,1441.8" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
 <text x="365" y="123.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">LoadIdentity()</text>
 <polyline points="160,134 1051,134" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="1060,134 1047,140 1047,128" fill="#3A4452"/>
-<rect x="40" y="154" width="1080" height="1238.6" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="40" y="154" width="1080" height="1269.8" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
 <rect x="52" y="166" width="45" height="26" rx="13" fill="#3A4452"/>
 <text x="74.5" y="184.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">alt</text>
 <text x="174" y="184.95" font-size="17" fill="#55606E">[identity exists]</text>
 <text x="365" y="223.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">NodeIdentity</text>
 <polyline points="1060,234 160,234" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
 <polyline points="173,228 160,234 173,240" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<text x="365" y="269.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SetAuthToken(NSK)</text>
-<polyline points="160,280 821,280" fill="none" stroke="#B0387F" stroke-width="2.5"/>
-<polygon points="830,280 817,286 817,274" fill="#B0387F"/>
-<polyline points="160,304 196,304 196,332 160,332" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
-<polyline points="173,326 160,332 173,338" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<text x="206" y="323.95" font-size="17" fill="#55606E">Return (cached)</text>
-<polyline points="40,348 1120,348" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
-<text x="174" y="372.45" font-size="17" fill="#55606E">[not registered]</text>
-<text x="365" y="406.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ErrNotRegistered</text>
-<polyline points="1060,417 160,417" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
-<polyline points="173,411 160,417 173,423" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<text x="365" y="452.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Resolve()</text>
-<text x="365" y="472.55" font-size="17" fill="#55606E" text-anchor="middle">bootstrap token</text>
-<polyline points="160,483 561,483" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="570,483 557,489 557,477" fill="#3A4452"/>
-<text x="365" y="519.45" font-size="17" fill="#55606E" text-anchor="middle">token + source</text>
-<polyline points="570,530 160,530" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
-<polyline points="173,524 160,530 173,536" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polyline points="160,554 196,554 196,582 169,582" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="160,582 173,576 173,588" fill="#3A4452"/>
-<text x="206" y="573.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">GenerateKeypair()</text>
-<text x="365" y="619.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ResolveValue()</text>
-<text x="365" y="638.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">project_id, resource_handle,</text>
-<text x="365" y="657.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">requested_resource_id</text>
-<polyline points="160,668 561,668" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="570,668 557,674 557,662" fill="#3A4452"/>
-<text x="365" y="704.45" font-size="17" fill="#55606E" text-anchor="middle">values (config or IMDS)</text>
-<polyline points="570,715 160,715" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
-<polyline points="173,709 160,715 173,721" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polyline points="160,739 196,739 196,779.8 169,779.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="160,779.8 173,773.8 173,785.8" fill="#3A4452"/>
-<text x="206" y="755.15" font-size="17" fill="#55606E">Fail fast if project_id or</text>
-<text x="206" y="775.55" font-size="17" fill="#55606E">resource_handle missing</text>
-<text x="365" y="817.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SetAuthToken(&quot;&quot;)</text>
-<text x="365" y="837.35" font-size="17" fill="#55606E" text-anchor="middle">register is unauthenticated</text>
-<polyline points="160,847.8 821,847.8" fill="none" stroke="#B0387F" stroke-width="2.5"/>
-<polygon points="830,847.8 817,853.8 817,841.8" fill="#B0387F"/>
-<polyline points="160,871.8 196,871.8 196,912.6 169,912.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="160,912.6 173,906.6 173,918.6" fill="#3A4452"/>
-<text x="206" y="887.95" font-size="17" fill="#55606E">One nonce for the</text>
-<text x="206" y="908.35" font-size="17" fill="#55606E">whole registration</text>
-<rect x="56" y="934.6" width="1048" height="129" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
-<rect x="68" y="946.6" width="59" height="26" rx="13" fill="#3A4452"/>
-<text x="97.5" y="964.85" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">loop</text>
-<text x="174" y="962.85" font-size="17" fill="#55606E">[retry with backoff: max 5m,</text>
-<text x="174" y="983.25" font-size="17" fill="#55606E">rate-limit waits excluded]</text>
-<text x="365" y="1019" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/register</text>
-<text x="365" y="1039.15" font-size="17" fill="#55606E" text-anchor="middle">bootstrap token in body</text>
-<polyline points="160,1049.6 821,1049.6" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="830,1049.6 817,1055.6 817,1043.6" fill="#2457C5"/>
-<text x="365" y="1097" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">node_id, mesh_ip, signing_public_key,</text>
-<text x="365" y="1116.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">signing_key_id, nsk, peer_snapshot,</text>
-<text x="365" y="1135.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">domain_mesh_cidr</text>
-<polyline points="830,1145.6 160,1145.6" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
-<polyline points="173,1139.6 160,1145.6 173,1151.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polyline points="160,1169.6 196,1169.6 196,1197.6 169,1197.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="160,1197.6 173,1191.6 173,1203.6" fill="#3A4452"/>
-<text x="206" y="1189.55" font-size="17" fill="#55606E">Build NodeIdentity</text>
-<text x="365" y="1235" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SaveIdentity()</text>
-<text x="365" y="1255.15" font-size="17" fill="#55606E" text-anchor="middle">atomic write</text>
-<polyline points="160,1265.6 1051,1265.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="1060,1265.6 1047,1271.6 1047,1259.6" fill="#3A4452"/>
-<text x="365" y="1301.85" font-size="17" fill="#55606E" text-anchor="middle">Remove or empty token file</text>
-<text x="365" y="1322.25" font-size="17" fill="#55606E" text-anchor="middle">(if file-based)</text>
-<polyline points="160,1332.6 1051,1332.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="1060,1332.6 1047,1338.6 1047,1326.6" fill="#3A4452"/>
-<text x="365" y="1368.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SetAuthToken(NSK)</text>
-<polyline points="160,1378.6 821,1378.6" fill="none" stroke="#B0387F" stroke-width="2.5"/>
-<polygon points="830,1378.6 817,1384.6 817,1372.6" fill="#B0387F"/>
+<polyline points="160,258 196,258 196,297.6 169,297.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="160,297.6 173,291.6 173,303.6" fill="#3A4452"/>
+<text x="206" y="273.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">BearerToken()</text>
+<text x="206" y="293.35" font-size="17" fill="#55606E">bearer envelope</text>
+<text x="365" y="335.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SetAuthToken(bearer)</text>
+<polyline points="160,345.6 821,345.6" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="830,345.6 817,351.6 817,339.6" fill="#B0387F"/>
+<polyline points="160,369.6 196,369.6 196,397.6 160,397.6" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="173,391.6 160,397.6 173,403.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="206" y="389.55" font-size="17" fill="#55606E">Return (cached)</text>
+<polyline points="40,413.6 1120,413.6" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<text x="174" y="438.05" font-size="17" fill="#55606E">[not registered]</text>
+<text x="365" y="472.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ErrNotRegistered</text>
+<polyline points="1060,482.6 160,482.6" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="173,476.6 160,482.6 173,488.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<text x="365" y="518" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">Resolve()</text>
+<text x="365" y="538.15" font-size="17" fill="#55606E" text-anchor="middle">bootstrap token</text>
+<polyline points="160,548.6 561,548.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="570,548.6 557,554.6 557,542.6" fill="#3A4452"/>
+<text x="365" y="585.05" font-size="17" fill="#55606E" text-anchor="middle">token + source</text>
+<polyline points="570,595.6 160,595.6" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="173,589.6 160,595.6 173,601.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="160,619.6 196,619.6 196,647.6 169,647.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="160,647.6 173,641.6 173,653.6" fill="#3A4452"/>
+<text x="206" y="639.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">GenerateKeypair()</text>
+<text x="365" y="685" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">ResolveValue()</text>
+<text x="365" y="704.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">project_id, resource_handle,</text>
+<text x="365" y="723.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">requested_resource_id</text>
+<polyline points="160,733.6 561,733.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="570,733.6 557,739.6 557,727.6" fill="#3A4452"/>
+<text x="365" y="770.05" font-size="17" fill="#55606E" text-anchor="middle">values (config or IMDS)</text>
+<polyline points="570,780.6 160,780.6" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="173,774.6 160,780.6 173,786.6" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="160,804.6 196,804.6 196,845.4 169,845.4" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="160,845.4 173,839.4 173,851.4" fill="#3A4452"/>
+<text x="206" y="820.75" font-size="17" fill="#55606E">Fail fast if project_id or</text>
+<text x="206" y="841.15" font-size="17" fill="#55606E">resource_handle missing</text>
+<polyline points="160,871.4 196,871.4 196,912.2 169,912.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="160,912.2 173,906.2 173,918.2" fill="#3A4452"/>
+<text x="206" y="887.55" font-size="17" fill="#55606E">One nonce for the</text>
+<text x="206" y="907.95" font-size="17" fill="#55606E">whole registration</text>
+<rect x="56" y="934.2" width="1048" height="149" rx="6" fill="none" stroke="#7D8794" stroke-width="1.5"/>
+<rect x="68" y="946.2" width="59" height="26" rx="13" fill="#3A4452"/>
+<text x="97.5" y="964.45" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">loop</text>
+<text x="174" y="962.45" font-size="17" fill="#55606E">[retry with backoff: max 5m,</text>
+<text x="174" y="982.85" font-size="17" fill="#55606E">rate-limit waits excluded]</text>
+<text x="365" y="1018.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/register</text>
+<text x="365" y="1038.55" font-size="17" fill="#55606E" text-anchor="middle">no Authorization header,</text>
+<text x="365" y="1058.95" font-size="17" fill="#55606E" text-anchor="middle">bootstrap token in body</text>
+<polyline points="160,1069.2 821,1069.2" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="830,1069.2 817,1075.2 817,1063.2" fill="#2457C5"/>
+<text x="365" y="1116.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">node_id, mesh_ip, signing_public_key,</text>
+<text x="365" y="1135.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">signing_key_id, nsk, peer_snapshot,</text>
+<text x="365" y="1155" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">domain_mesh_cidr</text>
+<polyline points="830,1165.2 160,1165.2" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="173,1159.2 160,1165.2 173,1171.2" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="160,1189.2 196,1189.2 196,1228.8 169,1228.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="160,1228.8 173,1222.8 173,1234.8" fill="#3A4452"/>
+<text x="206" y="1205.35" font-size="17" fill="#55606E">Build NodeIdentity,</text>
+<text x="206" y="1224.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">BearerToken()</text>
+<text x="365" y="1266.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SaveIdentity()</text>
+<text x="365" y="1286.35" font-size="17" fill="#55606E" text-anchor="middle">atomic write</text>
+<polyline points="160,1296.8 1051,1296.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1060,1296.8 1047,1302.8 1047,1290.8" fill="#3A4452"/>
+<text x="365" y="1333.05" font-size="17" fill="#55606E" text-anchor="middle">Remove or empty token file</text>
+<text x="365" y="1353.45" font-size="17" fill="#55606E" text-anchor="middle">(if file-based)</text>
+<polyline points="160,1363.8 1051,1363.8" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1060,1363.8 1047,1369.8 1047,1357.8" fill="#3A4452"/>
+<text x="365" y="1399.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">SetAuthToken(bearer)</text>
+<polyline points="160,1409.8 821,1409.8" fill="none" stroke="#B0387F" stroke-width="2.5"/>
+<polygon points="830,1409.8 817,1415.8 817,1403.8" fill="#B0387F"/>
 </svg>

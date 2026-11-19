@@ -27,7 +27,7 @@ plexd uses WireGuard's [Noise_IKpsk2](https://www.wireguard.com/protocol/) hands
 
 During registration the node generates its Curve25519 key pair locally. Only the public key is sent to the control plane. The private key never leaves the node.
 
-![A sequence diagram of registration between the client, plexd, and the control plane. The client generates a Curve25519 key pair and sends POST /v1/register with its token, public key, hostname, metadata and capabilities. The control plane validates the token as a redemption under its BootstrapToken policy, assigns a mesh IP in 10.100.x.x, stores the public key, generates a PSK per peer pair, and generates the Node Secret Key, the NSK. It answers with the node ID, mesh IP, signing public key, node secret key and peers, and the client sets the NSK as its auth token.](../diagrams/security-registration.svg)
+![A sequence diagram of registration between the client, plexd, and the control plane. The client generates a Curve25519 key pair and sends POST /v1/register with project_id, resource_handle, bootstrap_token, nonce, public_key and the optional requested_resource_id. The control plane validates the token as a redemption under its BootstrapToken policy, assigns a mesh IP from the Domain mesh CIDR, stores the public key, and generates the Node Secret Key, the NSK. It answers with node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot and domain_mesh_cidr, and the client builds the bearer envelope from the node ID and the NSK and sets it as its auth token.](../diagrams/security-registration.svg)
 
 ### Phase 2: Tunnel Setup
 
