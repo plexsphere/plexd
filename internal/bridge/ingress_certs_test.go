@@ -611,3 +611,42 @@ func TestIngressCertificates_HostCoverage(t *testing.T) {
 		}
 	})
 }
+
+// TestIngressCertificates_RenewedRouteKeepsItsBalancer renews the route of a
+// terminate rule whose Secret the inventory stops listing, and the fresh
+// route keeps the rule's balancer with its records and hold-outs.
+func TestIngressCertificates_RenewedRouteKeepsItsBalancer(t *testing.T) {
+	fx, _ := newClockedFixture(t)
+	fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+	id := reportID("a1")
+	rule := withID(terminateRule("term", 443, "t.example.com", "tls", 9000), id)
+	rule.Targets = twoTargets()
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	routeOf := func() *ingressRoute {
+		fx.mgr.mu.Lock()
+		defer fx.mgr.mu.Unlock()
+		return fx.mgr.listeners[443].table.Load().exact["t.example.com"].lead()
+	}
+	old := routeOf()
+	fx.mgr.recordDial(old, 0, refusedDial())
+	fx.mgr.recordDial(old, 1, nil)
+
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("other", 1))
+	route := routeOf()
+	if route == old || old.ctx.Err() == nil {
+		t.Fatal("the rule's route was not renewed when its Secret was dropped")
+	}
+	if route.lb != old.lb || balancerFor(t, fx.mgr, id) != old.lb {
+		t.Fatalf("the renewed route has the balancer %p, the manager %p, want the old route's %p", route.lb, balancerFor(t, fx.mgr, id), old.lb)
+	}
+	unit, targets := route.lb.snapshot()
+	if unit.failed || unit.at.IsZero() || !targets[0].failed || targets[1].failed || targets[1].at.IsZero() {
+		t.Errorf("unit %+v and targets %+v, want the unit and the second target succeeded and the first target failed", unit, targets)
+	}
+	if out := outTargets(route.lb, relayStart); !slices.Equal(out, []int{0}) {
+		t.Errorf("out targets = %v, want the first", out)
+	}
+}

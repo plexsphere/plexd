@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -23,6 +24,19 @@ func planRule(slug string, port int, host string) api.IngressRule {
 		TargetAddress: "10.0.0.5",
 		TargetPort:    8443,
 	}
+}
+
+// withOneTarget returns r with the one target the planner gives a rule
+// without targets: its three deprecated members.
+func withOneTarget(r api.IngressRule) api.IngressRule {
+	r.Targets = []api.IngressTarget{{NodeID: r.TargetNodeID, Address: r.TargetAddress, Port: r.TargetPort}}
+	return r
+}
+
+// firstTargetAddr returns the address a balancer of route's planned rule
+// dials first.
+func firstTargetAddr(route *ingressRoute) string {
+	return newIngressBalancer(route.rule.Targets).targets[0].addr
 }
 
 // hostOfLen returns a host name of n bytes made of labels of at most 63 bytes.
@@ -60,12 +74,12 @@ func TestPlanIngress_ReasonPerCheck(t *testing.T) {
 		{name: "sni host of 254 bytes", edit: func(r *api.IngressRule) { r.SNIHost = hostOfLen(254) }, reason: IngressReasonInvalid, detail: "sni_host"},
 		{name: "terminate without a host", edit: func(r *api.IngressRule) { r.Mode = api.IngressModeTerminate; r.SNIHost = "" }, reason: IngressReasonInvalid, detail: "sni_host"},
 		{name: "acme without a host", edit: func(r *api.IngressRule) { r.Mode = api.IngressModeACME; r.SNIHost = "" }, reason: IngressReasonInvalid, detail: "sni_host"},
-		{name: "empty target address", edit: func(r *api.IngressRule) { r.TargetAddress = "" }, reason: IngressReasonInvalid, detail: "target_address"},
-		{name: "target address with a port", edit: func(r *api.IngressRule) { r.TargetAddress = "10.0.0.5:80" }, reason: IngressReasonInvalid, detail: "target_address"},
-		{name: "target address in brackets", edit: func(r *api.IngressRule) { r.TargetAddress = "[fd00::1]" }, reason: IngressReasonInvalid, detail: "target_address"},
-		{name: "target address with a zone", edit: func(r *api.IngressRule) { r.TargetAddress = "fe80::1%eth0" }, reason: IngressReasonInvalid, detail: "target_address"},
-		{name: "target port 0", edit: func(r *api.IngressRule) { r.TargetPort = 0 }, reason: IngressReasonInvalid, detail: "target_port"},
-		{name: "target port 65536", edit: func(r *api.IngressRule) { r.TargetPort = 65536 }, reason: IngressReasonInvalid, detail: "target_port"},
+		{name: "empty target address", edit: func(r *api.IngressRule) { r.TargetAddress = "" }, reason: IngressReasonInvalid, detail: "targets[0].address"},
+		{name: "target address with a port", edit: func(r *api.IngressRule) { r.TargetAddress = "10.0.0.5:80" }, reason: IngressReasonInvalid, detail: "targets[0].address"},
+		{name: "target address in brackets", edit: func(r *api.IngressRule) { r.TargetAddress = "[fd00::1]" }, reason: IngressReasonInvalid, detail: "targets[0].address"},
+		{name: "target address with a zone", edit: func(r *api.IngressRule) { r.TargetAddress = "fe80::1%eth0" }, reason: IngressReasonInvalid, detail: "targets[0].address"},
+		{name: "target port 0", edit: func(r *api.IngressRule) { r.TargetPort = 0 }, reason: IngressReasonInvalid, detail: "targets[0].port"},
+		{name: "target port 65536", edit: func(r *api.IngressRule) { r.TargetPort = 65536 }, reason: IngressReasonInvalid, detail: "targets[0].port"},
 		{name: "listener conflict", before: []api.IngressRule{planRule("holder", 443, "web.example.com")}, edit: func(*api.IngressRule) {}, reason: IngressReasonListenerConflict, detail: "holder"},
 		{name: "max rules", before: []api.IngressRule{planRule("r1", 443, "r1.example.com"), planRule("r2", 443, "r2.example.com")}, edit: func(*api.IngressRule) {}, reason: IngressReasonMaxRules},
 		{name: "terminate without a secret name", edit: terminateNamed(""), reason: IngressReasonInvalid, detail: "certificate_secret_name"},
@@ -98,14 +112,111 @@ func TestPlanIngress_ReasonPerCheck(t *testing.T) {
 				t.Fatalf("%d states, want %d", len(plan.states), len(tc.before)+1)
 			}
 			st := plan.states[len(plan.states)-1]
-			if !st.Rule.Equal(r) {
-				t.Errorf("state rule = %+v, want %+v", st.Rule, r)
+			if want := withOneTarget(r); !st.Rule.Equal(want) {
+				t.Errorf("state rule = %+v, want %+v", st.Rule, want)
 			}
 			if st.Reason != tc.reason || st.Detail != tc.detail {
 				t.Errorf("reason, detail = %q, %q, want %q, %q", st.Reason, st.Detail, tc.reason, tc.detail)
 			}
 			if wantServed := tc.reason == ""; st.Served != wantServed || st.held != wantServed {
 				t.Errorf("Served, held = %v, %v, want %v, %v", st.Served, st.held, wantServed, wantServed)
+			}
+		})
+	}
+}
+
+// planTargets returns n targets, the i-th, counted from 1, on node-i at
+// 10.0.1.i and port 9000+i.
+func planTargets(n int) []api.IngressTarget {
+	targets := make([]api.IngressTarget, n)
+	for i := range targets {
+		targets[i] = api.IngressTarget{NodeID: fmt.Sprintf("node-%d", i+1), Address: fmt.Sprintf("10.0.1.%d", i+1), Port: 9001 + i}
+	}
+	return targets
+}
+
+func TestPlanIngress_Targets(t *testing.T) {
+	t.Run("both pull shapes of one rule plan equal", func(t *testing.T) {
+		legacy := planRule("web", 443, "web.example.com")
+		current := withOneTarget(legacy)
+		fromLegacy := planIngress([]api.IngressRule{legacy}, 20, acmeAvailability{}).states[0]
+		fromCurrent := planIngress([]api.IngressRule{current}, 20, acmeAvailability{}).states[0]
+		if !fromLegacy.held || !fromCurrent.held {
+			t.Fatalf("states = %+v and %+v, want both held", fromLegacy, fromCurrent)
+		}
+		if !fromLegacy.Rule.Equal(fromCurrent.Rule) {
+			t.Errorf("planned rules %+v and %+v, want them equal", fromLegacy.Rule, fromCurrent.Rule)
+		}
+		if !slices.Equal(fromLegacy.Rule.Targets, current.Targets) {
+			t.Errorf("targets of the rule without targets = %+v, want %+v", fromLegacy.Rule.Targets, current.Targets)
+		}
+		if fromLegacy.reportsTargets || !fromCurrent.reportsTargets {
+			t.Errorf("reportsTargets = %v without targets and %v with them, want false and true", fromLegacy.reportsTargets, fromCurrent.reportsTargets)
+		}
+	})
+
+	t.Run("targets win over the deprecated members", func(t *testing.T) {
+		targets := []api.IngressTarget{{NodeID: "node-a", Address: "10.0.0.7", Port: 9001}, {NodeID: "node-b", Address: "fd00::8", Port: 9002}}
+		for name, edit := range map[string]func(*api.IngressRule){
+			"another target":         func(*api.IngressRule) {},
+			"members it cannot dial": func(r *api.IngressRule) { r.TargetNodeID, r.TargetAddress, r.TargetPort = "", "10.0.0.300", 0 },
+		} {
+			r := planRule("web", 443, "web.example.com")
+			edit(&r)
+			r.Targets = targets
+			plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+			want := r
+			want.TargetNodeID, want.TargetAddress, want.TargetPort = "node-a", "10.0.0.7", 9001
+			if st := plan.states[0]; !st.held || !st.Served || !st.Rule.Equal(want) || !st.reportsTargets {
+				t.Errorf("%s: state = %+v, want held and served with %+v", name, st, want)
+			}
+			route := plan.tables[443].exact["web.example.com"].lead()
+			b := newIngressBalancer(route.rule.Targets)
+			if got := []string{b.targets[0].addr, b.targets[1].addr}; !slices.Equal(got, []string{"10.0.0.7:9001", "[fd00::8]:9002"}) {
+				t.Errorf("%s: the route's targets dial %v, want 10.0.0.7:9001 and [fd00::8]:9002", name, got)
+			}
+		}
+	})
+
+	withTargets := func(targets []api.IngressTarget) func(*api.IngressRule) {
+		return func(r *api.IngressRule) { r.Targets = targets }
+	}
+	withSecond := func(address string) func(*api.IngressRule) {
+		return withTargets([]api.IngressTarget{{NodeID: "node-a", Address: "10.0.0.7", Port: 9001}, {NodeID: "node-b", Address: address, Port: 9002}})
+	}
+	withFirstPort := func(port int) func(*api.IngressRule) {
+		return withTargets([]api.IngressTarget{{NodeID: "node-a", Address: "10.0.0.7", Port: port}, {NodeID: "node-b", Address: "10.0.0.8", Port: 9002}})
+	}
+	for _, tc := range []struct {
+		name   string
+		edit   func(*api.IngressRule)
+		detail string // empty when the rule is held
+	}{
+		{name: "nine targets", edit: withTargets(planTargets(9)), detail: "targets"},
+		{name: "a second address 10.0.0.300", edit: withSecond("10.0.0.300"), detail: "targets[1].address"},
+		{name: "a second address [fd00::1]", edit: withSecond("[fd00::1]"), detail: "targets[1].address"},
+		{name: "a second address 10.0.0.1:80", edit: withSecond("10.0.0.1:80"), detail: "targets[1].address"},
+		{name: "a first port 0", edit: withFirstPort(0), detail: "targets[0].port"},
+		{name: "a first port 65536", edit: withFirstPort(65536), detail: "targets[0].port"},
+		{name: "neither targets nor target_address", edit: func(r *api.IngressRule) { r.TargetAddress = "" }, detail: "targets[0].address"},
+		{name: "an address ahead of its own port", edit: withTargets([]api.IngressTarget{{NodeID: "node-a", Address: "", Port: 0}}), detail: "targets[0].address"},
+		{name: "a first port ahead of a second address", edit: withTargets([]api.IngressTarget{{NodeID: "node-a", Address: "10.0.0.7", Port: 0}, {NodeID: "node-b", Address: "", Port: 9002}}), detail: "targets[0].port"},
+		{name: "eight targets", edit: withTargets(planTargets(8))},
+		{name: "one node address with two ports", edit: withTargets([]api.IngressTarget{{NodeID: "node-a", Address: "10.0.0.7", Port: 9001}, {NodeID: "node-a", Address: "10.0.0.7", Port: 9002}})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := planRule("web", 443, "web.example.com")
+			tc.edit(&r)
+			st := planIngress([]api.IngressRule{r}, 20, acmeAvailability{}).states[0]
+			wantReason := ""
+			if tc.detail != "" {
+				wantReason = IngressReasonInvalid
+			}
+			if st.Reason != wantReason || st.Detail != tc.detail {
+				t.Errorf("reason, detail = %q, %q, want %q, %q", st.Reason, st.Detail, wantReason, tc.detail)
+			}
+			if wantHeld := tc.detail == ""; st.held != wantHeld || st.Served != wantHeld {
+				t.Errorf("held, Served = %v, %v, want %v, %v", st.held, st.Served, wantHeld, wantHeld)
 			}
 		})
 	}
@@ -562,8 +673,8 @@ func TestPlanIngress_Protocol(t *testing.T) {
 			tc.edit(&r)
 			plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
 			st := plan.states[0]
-			if !st.Rule.Equal(r) {
-				t.Errorf("state rule = %+v, want %+v", st.Rule, r)
+			if want := withOneTarget(r); !st.Rule.Equal(want) {
+				t.Errorf("state rule = %+v, want %+v", st.Rule, want)
 			}
 			if st.Reason != tc.reason || st.Detail != tc.detail {
 				t.Errorf("reason, detail = %q, %q, want %q, %q", st.Reason, st.Detail, tc.reason, tc.detail)
@@ -577,11 +688,11 @@ func TestPlanIngress_Protocol(t *testing.T) {
 	t.Run("a udp passthrough rule is held in plan.udp", func(t *testing.T) {
 		r := udpPlanRule("dns", 53)
 		plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
-		if st := plan.states[0]; !st.held || !st.Served || st.Reason != "" || !st.Rule.Equal(r) {
+		if st := plan.states[0]; !st.held || !st.Served || st.Reason != "" || !st.Rule.Equal(withOneTarget(r)) {
 			t.Errorf("udp rule = %+v, want held and served as pulled", st)
 		}
 		route := plan.udp[53]
-		if route == nil || !route.rule.Equal(r) || !route.served || route.target != "10.0.0.5:8443" {
+		if route == nil || !route.rule.Equal(withOneTarget(r)) || !route.served || firstTargetAddr(route) != "10.0.0.5:8443" {
 			t.Errorf("plan.udp[53] = %+v, want the served route of the rule to 10.0.0.5:8443", route)
 		}
 		if len(plan.udp) != 1 {
@@ -742,10 +853,10 @@ func TestPlanIngress_HostCaseAndIPv6Target(t *testing.T) {
 		t.Fatalf("no host api.example.com, table = %+v", plan.tables[443])
 	}
 	route := host.lead()
-	if route.target != "[fd00::7]:8443" {
-		t.Errorf("target = %q, want %q", route.target, "[fd00::7]:8443")
+	if got := firstTargetAddr(route); got != "[fd00::7]:8443" {
+		t.Errorf("target = %q, want %q", got, "[fd00::7]:8443")
 	}
-	if !route.rule.Equal(r) {
+	if !route.rule.Equal(withOneTarget(r)) {
 		t.Errorf("route rule = %+v, want the rule as pulled", route.rule)
 	}
 }

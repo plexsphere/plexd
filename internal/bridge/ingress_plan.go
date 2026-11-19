@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -88,6 +89,10 @@ type IngressRuleState struct {
 
 	// held is set for a rule that keeps its listener slot, served or not.
 	held bool
+	// reportsTargets is set when the pull carried the rule's targets. A
+	// control plane that sends targets accepts them in a report, and one
+	// before plexsphere/plexsphere#1120 refuses them as an unknown member.
+	reportsTargets bool
 }
 
 // acmeAvailability says whether the bridge can obtain certificates for the
@@ -173,9 +178,11 @@ func (h *ingressHost) route(path string, hdr http.Header) *ingressRoute {
 
 // ingressRoute is one held rule in a table.
 type ingressRoute struct {
-	rule   api.IngressRule
-	target string // net.JoinHostPort(rule.TargetAddress, strconv.Itoa(rule.TargetPort))
-	served bool   // false for a held acme rule with a reason
+	rule api.IngressRule
+	// lb spreads the rule's units over its targets and holds their dial
+	// records. planIngress leaves it nil, and Apply sets it.
+	lb     *ingressBalancer
+	served bool // false for a held acme rule with a reason
 	ctx    context.Context
 	cancel context.CancelFunc
 	// proxy forwards the requests of a rule with conditions, on target
@@ -260,7 +267,11 @@ func (t *ingressTable) routes() []*ingressRoute {
 // table of each TCP listen port and picks the route of each UDP listen port.
 // It sets an empty protocol to tcp and an empty list of header conditions to
 // nil on its copy of each rule before any check, so every state and route
-// carries tcp or udp. It walks the rules in the order the pull lists them and
+// carries tcp or udp. Before any check it also gives a rule without targets
+// its three deprecated members as its one target, and sets the deprecated
+// members of every rule from its first target, so every state and route
+// carries targets; the state's reportsTargets keeps whether the pull carried
+// them. It walks the rules in the order the pull lists them and
 // gives each the first reason that applies; a rule that passes every check up
 // to the bound is held, and the rules of both protocols count toward the
 // bound. Listener conflicts are per protocol: a tcp rule conflicts only with
@@ -318,8 +329,20 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		if len(r.Conditions.Headers) == 0 {
 			r.Conditions.Headers = nil
 		}
+		// A rule without targets, as a control plane before
+		// plexsphere/plexsphere#1120 sends it, has its three deprecated
+		// members as its one target. The deprecated members of every rule
+		// name its first target, so both shapes of one rule compare equal,
+		// and Apply keeps the rule's route when the control plane starts to
+		// send the member.
+		reportsTargets := len(r.Targets) > 0
+		if !reportsTargets {
+			r.Targets = []api.IngressTarget{{NodeID: r.TargetNodeID, Address: r.TargetAddress, Port: r.TargetPort}}
+		}
+		r.TargetNodeID, r.TargetAddress, r.TargetPort = r.Targets[0].NodeID, r.Targets[0].Address, r.Targets[0].Port
 		udp := r.Protocol == api.IngressProtocolUDP
-		st := IngressRuleState{Rule: r}
+		st := IngressRuleState{Rule: r, reportsTargets: reportsTargets}
+		targetDetail := invalidTargetDetail(r.Targets)
 		host := strings.ToLower(r.SNIHost)
 		_, dup := ids[r.ID]
 		if r.ID != "" {
@@ -345,10 +368,10 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			// A udp rule has no server name to match. An acme rule never
 			// names a wildcard, and autocert refuses a name of one label.
 			st.Reason, st.Detail = IngressReasonInvalid, "sni_host"
-		case !validTargetAddress(r.TargetAddress):
-			st.Reason, st.Detail = IngressReasonInvalid, "target_address"
-		case r.TargetPort < 1 || r.TargetPort > 65535:
-			st.Reason, st.Detail = IngressReasonInvalid, "target_port"
+		case len(r.Targets) > maxIngressTargets:
+			st.Reason, st.Detail = IngressReasonInvalid, "targets"
+		case targetDetail != "":
+			st.Reason, st.Detail = IngressReasonInvalid, targetDetail
 		case r.Mode == api.IngressModeTerminate && !api.ValidSecretName(r.CertificateSecretName):
 			st.Reason, st.Detail = IngressReasonInvalid, "certificate_secret_name"
 		case !r.Conditions.IsZero() && r.Mode == api.IngressModePassthrough:
@@ -391,7 +414,7 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		// The rule is held.
 		held++
 		if udp {
-			plan.udp[r.ListenPort] = &ingressRoute{rule: r, target: ingressTarget(r), served: true}
+			plan.udp[r.ListenPort] = &ingressRoute{rule: r, served: true}
 			st.held, st.Served = true, true
 			plan.states = append(plan.states, st)
 			continue
@@ -407,7 +430,6 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		}
 		route := &ingressRoute{
 			rule:   r,
-			target: ingressTarget(r),
 			served: r.Mode != api.IngressModeACME || acme.Reason == "",
 		}
 		if host == "" {
@@ -642,7 +664,24 @@ func validSNIHost(host string) bool {
 	return true
 }
 
-// validTargetAddress reports whether target_address is an IPv4 or IPv6
+// invalidTargetDetail returns the Detail of the first target, in list order,
+// the bridge cannot dial, or "" when it can dial every one:
+// targets[i].address for an address validTargetAddress refuses and
+// targets[i].port for a port outside 1..65535, i counted from 0 and an
+// entry's address checked before its port.
+func invalidTargetDetail(targets []api.IngressTarget) string {
+	for i, t := range targets {
+		switch {
+		case !validTargetAddress(t.Address):
+			return "targets[" + strconv.Itoa(i) + "].address"
+		case t.Port < 1 || t.Port > 65535:
+			return "targets[" + strconv.Itoa(i) + "].port"
+		}
+	}
+	return ""
+}
+
+// validTargetAddress reports whether a target's address is an IPv4 or IPv6
 // address without brackets, a port or a zone.
 func validTargetAddress(addr string) bool {
 	ip, err := netip.ParseAddr(addr)

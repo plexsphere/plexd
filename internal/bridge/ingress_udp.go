@@ -80,7 +80,7 @@ type udpIngressListener struct {
 type udpFlow struct {
 	client netip.AddrPort
 	route  *ingressRoute
-	target netip.AddrPort // the route's target, unmapped
+	target netip.AddrPort // the rule's first target, unmapped
 	conn   udpFlowConn
 
 	// lastActive is the time of the last datagram in either direction, in
@@ -167,8 +167,9 @@ func (m *IngressManager) serveUDP(l *udpIngressListener) {
 // datagram and leaves the flow open.
 //
 // The flow's first send, and every later send that ends differently from the
-// one before it, is the rule's dial: recordDial records it, and a failed one
-// that changed the record logs "bridge: ingress: dial target failed". Every
+// one before it, is a dial of the rule's first target: recordDial records it,
+// a failed one also fails the rule's unit, and a failed one that changed the
+// target's record logs "bridge: ingress: dial target failed". Every
 // other failed send logs "ingress datagram not forwarded" at Debug, so a
 // client that keeps sending into a blocked rule writes one Error line, not one
 // per datagram. A send that fails with net.ErrClosed is no dial: the flow was
@@ -195,7 +196,11 @@ func (m *IngressManager) forwardUDP(l *udpIngressListener, src netip.AddrPort, b
 	var changed bool
 	if !f.sent || f.failed != (err != nil) {
 		f.sent, f.failed = true, err != nil
-		reason, changed = m.recordDial(f.route, err)
+		if err != nil {
+			reason, changed = m.recordLastDial(f.route, 0, err)
+		} else {
+			reason, changed = m.recordDial(f.route, 0, nil)
+		}
 	}
 	if err != nil {
 		m.logSendFailed(l, f.route, src, err, reason, changed)
@@ -224,12 +229,13 @@ func (l *udpIngressListener) lookup(src netip.AddrPort, now time.Time) (f, stale
 	return f, nil
 }
 
-// openUDPFlow opens the flow of src with the route l holds now, registers its
-// close for when the route is cancelled, and starts its reply loop. At
-// maxUDPFlows it first closes the least recently active flow. It returns nil,
-// and the datagram is dropped, when the route is cancelled, which Apply does
-// before it stores the next one, or when the flow's socket does not open; a
-// socket that does not open is recorded as the rule's failed dial.
+// openUDPFlow opens the flow of src to the first target of the route l holds
+// now, registers its close for when the route is cancelled, and starts its
+// reply loop. At maxUDPFlows it first closes the least recently active flow.
+// It returns nil, and the datagram is dropped, when the route is cancelled,
+// which Apply does before it stores the next one, or when the flow's socket
+// does not open; a socket that does not open is recorded as a failed dial of
+// that target and fails the rule's unit.
 func (m *IngressManager) openUDPFlow(l *udpIngressListener, src netip.AddrPort, now time.Time) *udpFlow {
 	route := l.route.Load()
 	if route.ctx.Err() != nil {
@@ -241,14 +247,14 @@ func (m *IngressManager) openUDPFlow(l *udpIngressListener, src netip.AddrPort, 
 	if open == nil {
 		open = openUDPFlowConn
 	}
-	target, err := netip.ParseAddrPort(route.target)
+	target, err := netip.ParseAddrPort(route.lb.targets[0].addr)
 	var conn udpFlowConn
 	if err == nil {
 		target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 		conn, err = open(target)
 	}
 	if err != nil {
-		reason, changed := m.recordDial(route, err)
+		reason, changed := m.recordLastDial(route, 0, err)
 		m.logSendFailed(l, route, src, err, reason, changed)
 		return nil
 	}
@@ -434,9 +440,9 @@ func (l *udpIngressListener) closeIdle(f *udpFlow, at int64) bool {
 	return idle
 }
 
-// logSendFailed logs err, a send to route's target for the client src that
-// failed or a flow socket that did not open, as recordDial left it: at Error
-// when it changed the rule's dial record, and otherwise at Debug.
+// logSendFailed logs err, a send to route's first target for the client src
+// that failed or a flow socket that did not open, as recordDial left it: at
+// Error when it changed the target's dial record, and otherwise at Debug.
 func (m *IngressManager) logSendFailed(l *udpIngressListener, route *ingressRoute, src netip.AddrPort, err error, reason string, changed bool) {
 	if !changed {
 		m.logDatagramNotForwarded(l, src, err)
@@ -447,7 +453,7 @@ func (m *IngressManager) logSendFailed(l *udpIngressListener, route *ingressRout
 		"rule_id", route.rule.ID,
 		"slug", route.rule.Slug,
 		"protocol", route.rule.Protocol,
-		"target", route.target,
+		"target", route.lb.targets[0].addr,
 		"reason", reason,
 		"error", err,
 	)

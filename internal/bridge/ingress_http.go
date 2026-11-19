@@ -249,23 +249,25 @@ func (m *IngressManager) notForwarded(w http.ResponseWriter, r *http.Request, c 
 }
 
 // newRouteProxy returns the proxy of a route with conditions. It speaks
-// HTTP/1.1 in cleartext to the route's target, on kept-alive connections it
-// pools until the route's context is done, and dials through dialTarget,
-// never through a proxy of the environment. The target receives the
-// request's Host, query and fields, without the client's Forwarded and
+// HTTP/1.1 in cleartext to the rule's first target, on kept-alive connections
+// it pools until the route's context is done, and dials through dialTarget,
+// never through a proxy of the environment. A failed dial also fails the
+// rule's unit (see recordLastDial). The target receives the request's Host,
+// query and fields, without the client's Forwarded and
 // X-Forwarded-* fields, with X-Forwarded-For (the client's address alone),
 // X-Forwarded-Host and X-Forwarded-Proto, and on a rule with
 // strip_path_prefix the path without the prefix and X-Forwarded-Prefix.
 func (m *IngressManager) newRouteProxy(route *ingressRoute) *httputil.ReverseProxy {
 	transport := &http.Transport{
 		Proxy: nil,
-		DialContext: func(context.Context, string, string) (net.Conn, error) {
-			conn, err := m.dialTarget(route)
-			reason, _ := m.recordDial(route, err)
+		DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+			conn, err := m.dialTarget(route, addr)
 			if err != nil {
-				m.logDialFailed(route, reason, err)
+				reason, _ := m.recordLastDial(route, route.lb.index(addr), err)
+				m.logDialFailed(route, addr, reason, err)
 				return nil, &ingressDialError{reason: reason, err: err}
 			}
+			m.recordDial(route, route.lb.index(addr), nil)
 			return conn, nil
 		},
 		DisableCompression:  true,
@@ -277,7 +279,7 @@ func (m *IngressManager) newRouteProxy(route *ingressRoute) *httputil.ReversePro
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "http"
-			pr.Out.URL.Host = route.target
+			pr.Out.URL.Host = route.lb.targets[0].addr
 			pr.Out.URL.User = nil
 			pr.Out.Host = pr.In.Host
 			// ReverseProxy drops query parameters it cannot parse before
