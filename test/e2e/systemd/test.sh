@@ -45,6 +45,10 @@
 #     host on port 443 and route each request by path prefix and header to
 #     their HTTP targets, with h2 offered, a stripped prefix and the
 #     X-Forwarded headers, and 404, 400, 421 and 502 answered by the bridge,
+#     a rule of two targets whose connection fails over from a refused
+#     target to the next and returns to it after the 30 s hold-out, a rule
+#     whose requests alternate between its two targets, each target's last
+#     dial in the report,
 #     a block whose enabled is false closing every listener,
 #     and the opt-out with bridge.ingress_enabled: false, which opens no
 #     listener for an enabled block and reports opted_out
@@ -2319,6 +2323,8 @@ for spec in 9441:a 9442:b 9443:wild; do
     docker exec -d "${INGRESS_TARGET_CONTAINER}" openssl s_server -4 -accept "${spec%%:*}" \
         -cert "/srv/ingress/${spec#*:}.pem" -key "/srv/ingress/${spec#*:}.key" -www
 done
+# Nothing listens on 9023 until the step on several targets starts a second
+# banner server there.
 docker exec -d "${INGRESS_TARGET_CONTAINER}" sh -c 'while true; do printf "plexd-e2e-banner\n" | nc -N -l 9022; done'
 # socat hands each datagram to a child of its own, whose cat writes it back
 # to the sender, so every datagram of every sender is answered. -T 5 ends a
@@ -2390,27 +2396,45 @@ until PEBBLE_DIR=$(docker exec "${SYSTEMD_CONTAINER}" curl -sSf --cacert /etc/pl
 done
 echo "  PASS: https://pebble:14000/dir answers ${SYSTEMD_CONTAINER} under Pebble's test CA"
 
+# The node id of every target of the phase's rules.
+INGRESS_TARGET_NODE_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+
 # ingress_rule <id-suffix> <slug> <listen-port> <mode> <sni-host or ""> <target-port> [secret name or ""] [target address or ""] [protocol]
 # renders one rule of the block, targeting the target container unless a
 # target address is given, with the protocol tcp unless a protocol is given.
 # Every rule carries protocol, as the control plane sends it. A Secret name
-# becomes the rule's certificate_secret_name.
+# becomes the rule's certificate_secret_name. The rule names its one target
+# twice, as the control plane sends a rule: as the one entry of targets and
+# in target_node_id, target_address and target_port. With
+# INGRESS_RULE_LEGACY=1 it names the target in the three members alone, as a
+# control plane that predates targets sends a rule.
 ingress_rule() {
     jq -cn --arg id "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1$1" --arg slug "$2" --argjson port "$3" \
         --arg mode "$4" --arg host "$5" --arg addr "${8:-${INGRESS_TARGET_IP}}" --argjson tport "$6" \
-        --arg secret "${7:-}" --arg proto "${9:-tcp}" \
+        --arg secret "${7:-}" --arg proto "${9:-tcp}" --arg node "${INGRESS_TARGET_NODE_ID}" \
+        --arg legacy "${INGRESS_RULE_LEGACY:-}" \
         '{id: $id, slug: $slug, protocol: $proto, listen_port: $port, mode: $mode}
          + (if $host == "" then {} else {sni_host: $host} end)
-         + {target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", target_address: $addr, target_port: $tport}
+         + (if $legacy == "1" then {} else {targets: [{node_id: $node, address: $addr, port: $tport}]} end)
+         + {target_node_id: $node, target_address: $addr, target_port: $tport}
          + (if $secret == "" then {} else {certificate_secret_name: $secret} end)'
+}
+
+# ingress_targets <port>... renders a targets list with one entry per port,
+# in the order given, each on the target container, for jq to put into a
+# rule that ingress_rule rendered with the first port.
+ingress_targets() {
+    printf '%s\n' "$@" | jq -cs --arg addr "${INGRESS_TARGET_IP}" --arg node "${INGRESS_TARGET_NODE_ID}" \
+        'map({node_id: $node, address: $addr, port: .})'
 }
 
 # ingress_rules <target port of tls-b> renders the phase's six rules, in slug
 # order as the control plane lists them. tls-term and tls-acme end TLS at the
-# bridge and forward the plaintext to the banner server.
+# bridge and forward the plaintext to the banner server. plain carries no
+# targets, so the phase serves a rule of either shape.
 ingress_rules() {
     printf '%s\n' \
-        "$(ingress_rule f1 plain 7022 passthrough "" 9022)" \
+        "$(INGRESS_RULE_LEGACY=1 ingress_rule f1 plain 7022 passthrough "" 9022)" \
         "$(ingress_rule f2 tls-a 443 passthrough a.ingress.e2e.test 9441)" \
         "$(ingress_rule f6 tls-acme 443 acme acme.ingress.e2e.test 9022)" \
         "$(ingress_rule f3 tls-b 443 passthrough b.ingress.e2e.test "$1")" \
@@ -2476,6 +2500,8 @@ RULE_ID_HTTP_BETA="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fb"
 RULE_ID_HTTP_DOWN="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fc"
 RULE_ID_HTTP_ONLY="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fd"
 RULE_ID_HTTP_WEB="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1fe"
+RULE_ID_POOL="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1ff"
+RULE_ID_HTTP_POOL="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1d1"
 RULE_IDS_SIX='["0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f2","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f3","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f4","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f5","0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f6"]'
 
 # wait_ingress_report <tag> <what> <jq-filter> [<jq-option>...] reads the last
@@ -2698,13 +2724,20 @@ fi
 # A bridge without ingress_enabled reports enabled after its start, and an
 # entry per rule once the block is applied: every rule listens, plain needs
 # no certificate and nobody dialled its target yet, and tls-term's
-# certificate is loaded.
-wait_ingress_report listeners "state enabled, all six rules listening, plain not_required with dial none and no dial_age_seconds, and tls-term ready" \
+# certificate is loaded. A rule whose pull entry carries targets reports its
+# one target, which nobody dialled yet either, and plain, whose entry carries
+# none, reports no targets.
+wait_ingress_report listeners "state enabled, all six rules listening, plain not_required with dial none and neither dial_age_seconds nor targets, every other rule its one target with dial none, and tls-term ready" \
     '. as $r | $r.state == "enabled"
      and ([$ids[] | . as $id | any($r.rules[]?; .id == $id and .listener == "listening")] | all)
-     and any($r.rules[]?; .id == $plain and .certificate == "not_required" and .dial == "none" and (has("dial_age_seconds") | not))
+     and any($r.rules[]?; .id == $plain and .certificate == "not_required" and .dial == "none"
+             and (has("dial_age_seconds") | not) and (has("targets") | not))
+     and ([$ids[] | select(. != $plain) | . as $id
+           | any($r.rules[]?; .id == $id and (.targets | length) == 1
+                 and .targets[0].node_id == $node and .targets[0].dial == "none")] | all)
      and any($r.rules[]?; .id == $term and .certificate == "ready")' \
-    --argjson ids "${RULE_IDS_SIX}" --arg plain "${RULE_ID_PLAIN}" --arg term "${RULE_ID_TERM}"
+    --argjson ids "${RULE_IDS_SIX}" --arg plain "${RULE_ID_PLAIN}" --arg term "${RULE_ID_TERM}" \
+    --arg node "${INGRESS_TARGET_NODE_ID}"
 ingress_journal
 if journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress status: reported"' "state=enabled"; then
     echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress status: reported' with state=enabled"
@@ -3276,6 +3309,140 @@ for spec in "http-api=${RULE_ID_HTTP_API}" "http-beta=${RULE_ID_HTTP_BETA}" "htt
     fi
 done
 
+# Several targets. The rules of the request step are served with two rules
+# of two targets each: pool on 7024, a passthrough rule without a host, with
+# 9023 and then 9022 of the target container, and http-pool, a terminate rule
+# for /pool on h.ingress.e2e.test, with api on 9081 and then web on 9082. The
+# bridge forwards each connection of pool and each request of http-pool to
+# one target, by round robin from the rule's first target. Nothing listens
+# on 9023 yet, so the bridge dials 9022 for the same connection when its dial
+# to 9023 is refused. A target whose dial failed is passed over for 30 s,
+# and the next connection or request whose turn it is after that dials it
+# again. No request goes to /pool before the four that check the round robin
+# of http-pool.
+POOL_RULES=$(printf '%s' "${HTTP_RULES}" | jq -c \
+    --argjson pool "$(ingress_rule ff pool 7024 passthrough "" 9023)" \
+    --argjson pool_targets "$(ingress_targets 9023 9022)" \
+    --argjson http "$(ingress_rule d1 http-pool 443 terminate h.ingress.e2e.test 9081 tls-http)" \
+    --argjson http_targets "$(ingress_targets 9081 9082)" \
+    '. + [$pool + {targets: $pool_targets},
+          $http + {targets: $http_targets, conditions: {path_prefix: "/pool"}}]
+     | sort_by(.slug)')
+configure_ingress pool "${POOL_RULES}" "${PEBBLE_ACME}" '[{"name": "tls-http", "version": 1}]'
+echo "  the mock serves the rules of the request step with pool and http-pool, two targets each"
+POOL_START=${SECONDS}
+until ingress_journal && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=7024"; do
+    if [ $((SECONDS - POOL_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] did not open the listener of 7024 within 60s of the rule pool being served"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] opened the listener of 7024 for the rule pool"
+# The report shows both rules served before any client reaches them, which
+# leaves the round robin of each at its first target.
+wait_ingress_report pool-served "pool and http-pool listening, http-pool ready, and each with its two targets in list order and dial none" \
+    '. as $r
+     | any($r.rules[]?; .id == $pool and .listener == "listening" and .dial == "none"
+           and [.targets[]? | [.node_id, .port, .dial]] == [[$node, 9023, "none"], [$node, 9022, "none"]])
+       and any($r.rules[]?; .id == $http and .listener == "listening" and .certificate == "ready" and .dial == "none"
+           and [.targets[]? | [.node_id, .port, .dial]] == [[$node, 9081, "none"], [$node, 9082, "none"]])' \
+    --arg pool "${RULE_ID_POOL}" --arg http "${RULE_ID_HTTP_POOL}" --arg node "${INGRESS_TARGET_NODE_ID}"
+
+# pool_session connects to 7024 of the bridge from the target container as a
+# client that sends nothing and prints what the target wrote.
+pool_session() {
+    docker exec "${INGRESS_TARGET_CONTAINER}" sh -c 'timeout 10 nc -w 5 "$1" 7024 </dev/null' _ "${BRIDGE_IP}" 2>&1 || true
+}
+
+# The first connection's dial to 9023 is refused and its dial to 9022 takes
+# it. The next two pass 9023 over, which is out for 30 s.
+for conn in 1 2 3; do
+    BANNER=$(pool_session)
+    if [ "${BANNER}" = "plexd-e2e-banner" ]; then
+        echo "  PASS: connection ${conn} to port 7024 read plexd-e2e-banner"
+    else
+        fail "connection ${conn} to port 7024 read '${BANNER}', want plexd-e2e-banner"
+    fi
+done
+wait_ingress_report pool-failover "pool's dial succeeded, its target on 9023 failed with refused and its target on 9022 succeeded" \
+    'any(.rules[]?; .id == $pool and .dial == "succeeded"
+         and any(.targets[]?; .node_id == $node and .port == 9023 and .dial == "failed" and .dial_reason == "refused")
+         and any(.targets[]?; .node_id == $node and .port == 9022 and .dial == "succeeded"))' \
+    --arg pool "${RULE_ID_POOL}" --arg node "${INGRESS_TARGET_NODE_ID}"
+# The report shows the failure once the bridge recorded it, and journald
+# may hold the line a moment later, so the step waits for the first line
+# and then counts them.
+POOL_FAILED_NEEDLES=("plexd[${INGRESS_PID}]:" 'msg="bridge: ingress: dial target failed"' "slug=pool")
+POOL_FAILED_START=${SECONDS}
+until ingress_journal && [ "$(journal_count "${INGRESS_JOURNAL}" "${POOL_FAILED_NEEDLES[@]}")" -ge 1 ]; do
+    if [ $((SECONDS - POOL_FAILED_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'bridge: ingress: dial target failed' with slug=pool within 60s of the report showing the failed target"
+    fi
+    sleep 2
+done
+POOL_FAILED=$(journal_count "${INGRESS_JOURNAL}" "${POOL_FAILED_NEEDLES[@]}")
+if [ "${POOL_FAILED}" -eq 1 ]; then
+    echo "  PASS: for three connections, plexd[${INGRESS_PID}] logged one 'bridge: ingress: dial target failed' with slug=pool"
+else
+    fail "for three connections, plexd[${INGRESS_PID}] logged ${POOL_FAILED} 'bridge: ingress: dial target failed' lines with slug=pool, want 1"
+fi
+if journal_has "${INGRESS_JOURNAL}" "${POOL_FAILED_NEEDLES[@]}" "target=${INGRESS_TARGET_IP}:9023" "reason=refused"; then
+    echo "  PASS: that line names target=${INGRESS_TARGET_IP}:9023 and reason=refused"
+else
+    fail "the 'bridge: ingress: dial target failed' line with slug=pool names no target=${INGRESS_TARGET_IP}:9023 with reason=refused"
+fi
+
+# A second banner server comes up on 9023. Until 30 s after the refused dial
+# the bridge passes 9023 over and a connection goes to 9022. The first
+# connection after that dials 9023 again, which follows 9022 in the round
+# robin.
+docker exec -d "${INGRESS_TARGET_CONTAINER}" sh -c 'while true; do printf "plexd-e2e-banner-b\n" | nc -N -l 9023; done'
+POOL_LISTEN_START=${SECONDS}
+until TARGET_LISTEN=$(docker exec "${INGRESS_TARGET_CONTAINER}" ss -ltn 2>&1) \
+    && case "${TARGET_LISTEN}" in *"0.0.0.0:9023 "*) ;; *) false ;; esac; do
+    if [ $((SECONDS - POOL_LISTEN_START)) -ge 10 ]; then
+        echo "${TARGET_LISTEN}"
+        fail "the target's second banner server did not listen on 9023 within 10s"
+    fi
+    sleep 1
+done
+echo "  PASS: the target listens on 9023 (banner b)"
+POOL_RETURN_START=${SECONDS}
+POOL_SESSIONS=0
+while :; do
+    BANNER=$(pool_session)
+    POOL_SESSIONS=$((POOL_SESSIONS + 1))
+    if [ "${BANNER}" = "plexd-e2e-banner-b" ]; then
+        break
+    fi
+    if [ $((SECONDS - POOL_RETURN_START)) -ge 60 ]; then
+        fail "${POOL_SESSIONS} connections to port 7024 in the 60s after 9023 listened read '${BANNER}' at last, want plexd-e2e-banner-b"
+    fi
+    sleep 2
+done
+echo "  PASS: connection ${POOL_SESSIONS} to port 7024 after 9023 listened read plexd-e2e-banner-b"
+wait_ingress_report pool-return "pool's dial and both of its targets succeeded" \
+    'any(.rules[]?; .id == $pool and .dial == "succeeded"
+         and ([.targets[]? | select(.node_id == $node and .dial == "succeeded") | .port] | sort) == [9022, 9023])' \
+    --arg pool "${RULE_ID_POOL}" --arg node "${INGRESS_TARGET_NODE_ID}"
+
+# http-pool's round robin starts at api, and each request takes the target
+# after the one the request before went to.
+for spec in 1:api 2:web 3:api 4:web; do
+    HTTP_BODY=$(ingress_curl h.ingress.e2e.test /pool/x)
+    target_reply "${HTTP_BODY}"
+    if [ "${REPLY_TARGET}" = "target=${spec#*:}" ]; then
+        echo "  PASS: request ${spec%%:*} for https://h.ingress.e2e.test/pool/x read ${REPLY_TARGET}"
+    else
+        echo "${HTTP_BODY}"
+        fail "request ${spec%%:*} for https://h.ingress.e2e.test/pool/x read '${REPLY_TARGET}', want target=${spec#*:}"
+    fi
+done
+wait_ingress_report http-pool "http-pool's dial and both of its targets succeeded" \
+    'any(.rules[]?; .id == $http and .dial == "succeeded"
+         and ([.targets[]? | select(.node_id == $node and .dial == "succeeded") | .port] | sort) == [9081, 9082])' \
+    --arg http "${RULE_ID_HTTP_POOL}" --arg node "${INGRESS_TARGET_NODE_ID}"
+
 # An ingress child of null closes every public listener, of both protocols.
 configure_ingress remove null
 REMOVE_START=${SECONDS}
@@ -3457,6 +3624,17 @@ for msg in "ingress manager started" "ingress listener opened"; do
     fi
     echo "  PASS: plexd[${INGRESS_OPTOUT_PID}] logged no '${msg}'"
 done
+
+# No report the mock refused: every refusal makes plexd log a send failure.
+# The mock stores a report before it checks it, so the reports read from
+# /test/last-request above do not show that the mock accepted them.
+ingress_journal
+for pid in "${INGRESS_PID}" "${INGRESS_OPTOUT_PID}"; do
+    if journal_has "${INGRESS_JOURNAL}" "plexd[${pid}]:" 'msg="ingress status: send failed"'; then
+        fail "plexd[${pid}] logged 'ingress status: send failed', so the mock refused a report"
+    fi
+done
+echo "  PASS: plexd[${INGRESS_PID}] and plexd[${INGRESS_OPTOUT_PID}] logged no 'ingress status: send failed'"
 echo "=== Public ingress on a bridge PASSED ==="
 
 # --- User access through a bridge ---
