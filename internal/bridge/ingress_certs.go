@@ -368,17 +368,24 @@ func (m *IngressManager) overlayCertificatesLocked() []IngressRuleState {
 
 // renewRoutesLocked closes the connections of every route whose rule affected
 // selects: it stores, for each listener that routes such a rule, a copy of
-// its table with a fresh route in place of each selected one, then cancels the
-// old routes. proxy reads a route's context without a lock, so the table is
-// replaced rather than changed. The caller holds mu.
+// its table with a fresh route in place of each selected one, with a fresh
+// proxy for a route with conditions, and a fresh context for a host with
+// conditions that holds such a route, then cancels the old routes and host
+// contexts. A host's rules name one Secret, so its routes are affected
+// together. proxy and serveHTTP read a route's context without a lock, so the
+// table is replaced rather than changed. The caller holds mu.
 func (m *IngressManager) renewRoutesLocked(affected func(api.IngressRule) bool) {
 	var old []*ingressRoute
+	var oldHosts []*ingressHost
 	renew := func(r *ingressRoute) *ingressRoute {
 		if r == nil || !affected(r.rule) {
 			return r
 		}
 		fresh := &ingressRoute{rule: r.rule, target: r.target, served: r.served}
 		fresh.ctx, fresh.cancel = context.WithCancel(m.ctx)
+		if r.proxy != nil {
+			fresh.proxy = m.newRouteProxy(fresh)
+		}
 		old = append(old, r)
 		return fresh
 	}
@@ -390,6 +397,10 @@ func (m *IngressManager) renewRoutesLocked(affected func(api.IngressRule) bool) 
 		fresh := &ingressHost{routes: make([]*ingressRoute, len(h.routes)), http: h.http}
 		for i, r := range h.routes {
 			fresh.routes[i] = renew(r)
+		}
+		if h.http {
+			fresh.ctx, fresh.cancel = context.WithCancel(m.ctx)
+			oldHosts = append(oldHosts, h)
 		}
 		return fresh
 	}
@@ -413,5 +424,8 @@ func (m *IngressManager) renewRoutesLocked(affected func(api.IngressRule) bool) 
 	}
 	for _, r := range old {
 		r.cancel()
+	}
+	for _, h := range oldHosts {
+		h.cancel()
 	}
 }

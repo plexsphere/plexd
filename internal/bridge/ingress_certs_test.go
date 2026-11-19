@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"slices"
 	"testing"
 	"time"
@@ -511,6 +512,35 @@ func TestIngressCertificates_DroppedSecretClosesItsConnections(t *testing.T) {
 	}
 	again := dialTerminated(t, ctrl.addr(443), "a.example.com", roots)
 	requireEcho(t, again, "a again")
+}
+
+// TestIngressCertificates_DroppedSecretClosesHTTPConnections closes the idle
+// client connections of a host whose rules have conditions when the inventory
+// stops listing its Secret, and keeps those of a host of another Secret.
+func TestIngressCertificates_DroppedSecretClosesHTTPConnections(t *testing.T) {
+	apiT := startHTTPTarget(t, "api")
+	fx := newHTTPFixture(t, nil)
+	fx.certs.set("tls-other", 1, fx.doc)
+	other := httpRule("other", "other.example.com", apiT.port(t), "/")
+	other.CertificateSecretName = "tls-other"
+	fx.mgr.SyncSecretInventory(t.Context(), []api.NodeStateSecret{{Name: "tls", Version: 1}, {Name: "tls-other", Version: 1}})
+	fx.apply(t, httpRule("api", "shop.example.com", apiT.port(t), "/api"), httpRule("web", "shop.example.com", apiT.port(t), "/"), other)
+	shop := fx.dialRaw(t, "shop.example.com")
+	kept := fx.dialRaw(t, "other.example.com")
+	for _, conn := range []*rawConn{shop, kept} {
+		if status, _ := conn.roundTrip(t, getHead("/api", conn.ConnectionState().ServerName)); status != http.StatusOK {
+			t.Fatalf("status %d, want 200", status)
+		}
+	}
+
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls-other", 1))
+	requireClosed(t, shop)
+	if status, _ := kept.roundTrip(t, getHead("/", "other.example.com")); status != http.StatusOK {
+		t.Errorf("the host of another Secret answered %d, want 200 on its kept connection", status)
+	}
+	if got := logLines(fx.logs, `msg="ingress certificate dropped"`, "secret=tls ", "reason=certificate_secret_not_listed"); got != 1 {
+		t.Errorf("%d 'ingress certificate dropped' lines, want 1:\n%s", got, fx.logs.String())
+	}
 }
 
 func TestIngressCertificates_SharedSecret(t *testing.T) {

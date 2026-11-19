@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/http"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -55,6 +56,9 @@ type ingressListener struct {
 	ln    net.Listener
 	table atomic.Pointer[ingressTable]
 	done  chan struct{} // closed when the accept loop exits
+	// http is where serveConn hands the handshaken connections of a host
+	// whose rules have conditions: the queue of the manager's HTTP server.
+	http *ingressConnQueue
 }
 
 // notServedKey identifies a "rule not served" line already logged. It holds
@@ -76,7 +80,10 @@ func newNotServedKey(r api.IngressRule, reason string) notServedKey {
 // the datagrams of each client address and port on a flow of their own (see
 // serveUDP). A passthrough rule's connection is forwarded unread; a terminate
 // or acme rule's connection ends TLS at the bridge, and the plaintext goes to
-// the target. IngressManager is concurrent-safe via mu.
+// the target. On a host whose terminate or acme rules have request
+// conditions, one HTTP server reads each request and forwards it to the
+// target of the rule it matches (see serveHTTP). IngressManager is
+// concurrent-safe via mu.
 type IngressManager struct {
 	ctrl             IngressController
 	cfg              Config
@@ -101,6 +108,10 @@ type IngressManager struct {
 	udpAnsweredTimeout   time.Duration
 	// openUDP, nil in production, replaces openUDPFlowConn in tests.
 	openUDP func(target netip.AddrPort) (udpFlowConn, error)
+	// httpReadHeaderTimeout and httpIdleTimeout are the HTTP server's
+	// ReadHeaderTimeout and IdleTimeout; tests shorten them before Setup.
+	httpReadHeaderTimeout time.Duration
+	httpIdleTimeout       time.Duration
 
 	// mu protects the fields below from concurrent access by the reconcile
 	// loop, the connections and status readers.
@@ -123,6 +134,12 @@ type IngressManager struct {
 	certs     map[string]*certEntry    // by the Secret name a held terminate rule names
 	coverage  map[coverageKey]struct{} // the hosts checked against a loaded certificate
 	dials     map[string]dialRecord    // the last dial of each held rule, by rule id
+	// httpSrv reads the requests of every host whose rules have conditions,
+	// from the connections serveConn pushes to httpConns; httpDone is closed
+	// when its Serve returns. All three are set between Setup and Teardown.
+	httpSrv   *http.Server
+	httpConns *ingressConnQueue
+	httpDone  chan struct{}
 
 	// connCount counts the connections from accept to close and the udp flows
 	// from open to close, across all ports.
@@ -156,13 +173,17 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 
 		udpUnansweredTimeout: ingressUDPUnansweredTimeout,
 		udpAnsweredTimeout:   ingressUDPAnsweredTimeout,
+
+		httpReadHeaderTimeout: ingressHTTPReadHeaderTimeout,
+		httpIdleTimeout:       ingressHTTPIdleTimeout,
 	}
 	acme.OnIssuedChange(m.signalReport)
 	return m
 }
 
-// Setup initializes the ingress manager.
-// It is a no-op when the node opts out of public ingress.
+// Setup initializes the ingress manager and starts the HTTP server that
+// reads the requests of a host whose rules have conditions. It is a no-op
+// when the node opts out of public ingress.
 func (m *IngressManager) Setup() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -173,6 +194,13 @@ func (m *IngressManager) Setup() error {
 
 	m.active = true
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.httpConns = newIngressConnQueue()
+	m.httpSrv = m.newHTTPServer()
+	m.httpDone = make(chan struct{})
+	go func(srv *http.Server, conns *ingressConnQueue, done chan<- struct{}) {
+		defer close(done)
+		_ = srv.Serve(conns)
+	}(m.httpSrv, m.httpConns, m.httpDone)
 
 	m.logger.Info("ingress manager started",
 		"component", "bridge",
@@ -184,10 +212,11 @@ func (m *IngressManager) Setup() error {
 	return nil
 }
 
-// Teardown cancels every route, which closes every connection and every udp
-// flow, closes every listener and UDP socket, and forgets the secret inventory
-// and every certificate. It returns once every accept loop, read loop and
-// reply loop has ended. Errors are aggregated; cleanup continues past a failed
+// Teardown cancels every route and host, which closes every connection and
+// every udp flow, closes every listener and UDP socket and the HTTP server,
+// and forgets the secret inventory and every certificate. It returns once
+// every accept loop, read loop and reply loop has ended and the HTTP server's
+// Serve has returned. Errors are aggregated; cleanup continues past a failed
 // close. Idempotent: calling Teardown when inactive returns nil.
 func (m *IngressManager) Teardown() error {
 	m.mu.Lock()
@@ -221,8 +250,15 @@ func (m *IngressManager) Teardown() error {
 	m.certs = make(map[string]*certEntry)
 	m.coverage = nil
 	m.dials = make(map[string]dialRecord)
+	httpSrv, httpDone := m.httpSrv, m.httpDone
+	m.httpSrv, m.httpConns, m.httpDone = nil, nil, nil
 	m.signalReport()
 	m.mu.Unlock()
+
+	// Close closes the queue the server accepts from and every connection it
+	// tracks; an upgraded connection closes with the manager's context.
+	_ = httpSrv.Close()
+	<-httpDone
 
 	// Wait for the accept loops and the read loops outside the lock: a read
 	// loop takes mu to record a dial.
@@ -253,8 +289,13 @@ func (m *IngressManager) Teardown() error {
 // listeners of ports the plan no longer names. It does the same for the UDP
 // socket of each udp port, in ascending order, swapping the port's route in
 // place. A route whose rule is unchanged keeps its context and its connections
-// or flows; every other route of the last Apply is cancelled, which closes its
-// connections and flows. A failed bind marks the rules of that port and
+// or flows, and a route with conditions its proxy and target connections;
+// every other route of the last Apply is cancelled, which closes its
+// connections, flows and requests in flight. A host whose rules have
+// conditions keeps its client connections while the port's table holds the
+// host under the same key with conditions, the same mode and the same
+// certificate_secret_name; every other such host is cancelled, which closes
+// them. A failed bind marks the rules of that port and
 // protocol listen_failed and is retried by the next Apply; the other ports,
 // and the other protocol on the same port number, are served. After the binds
 // it configures the ACME account with the hosts of the acme rules that have
@@ -308,11 +349,14 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 	carried := make(map[*ingressRoute]struct{})
 	carry := func(r *ingressRoute) {
 		if old, ok := current[r.rule.ID]; ok && old.rule.Equal(r.rule) {
-			r.ctx, r.cancel = old.ctx, old.cancel
+			r.ctx, r.cancel, r.proxy = old.ctx, old.cancel, old.proxy
 			carried[old] = struct{}{}
 			return
 		}
 		r.ctx, r.cancel = context.WithCancel(m.ctx)
+		if !r.rule.Conditions.IsZero() {
+			r.proxy = m.newRouteProxy(r)
+		}
 	}
 	for _, t := range plan.tables {
 		for _, r := range t.routes() {
@@ -325,6 +369,40 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 	for _, old := range current {
 		if _, ok := carried[old]; !ok {
 			old.cancel()
+		}
+	}
+
+	// Carry the contexts of the hosts with conditions whose TLS stays the
+	// same, so their client connections stay open, and cancel the others.
+	takenOver := make(map[*ingressHost]struct{})
+	carryHost := func(h, old *ingressHost) {
+		if !h.http {
+			return
+		}
+		if old != nil && old.http && sameTermination(old.lead().rule, h.lead().rule) {
+			h.ctx, h.cancel = old.ctx, old.cancel
+			takenOver[old] = struct{}{}
+			return
+		}
+		h.ctx, h.cancel = context.WithCancel(m.ctx)
+	}
+	for port, t := range plan.tables {
+		cur := newIngressTable()
+		if l, ok := m.listeners[port]; ok {
+			cur = l.table.Load()
+		}
+		for k, h := range t.exact {
+			carryHost(h, cur.exact[k])
+		}
+		for k, h := range t.wildcard {
+			carryHost(h, cur.wildcard[k])
+		}
+	}
+	for _, l := range m.listeners {
+		for _, old := range l.table.Load().hosts() {
+			if _, ok := takenOver[old]; old.http && !ok {
+				old.cancel()
+			}
 		}
 	}
 
@@ -343,11 +421,16 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 			for _, r := range t.routes() {
 				r.cancel()
 			}
+			for _, h := range t.hosts() {
+				if h.http {
+					h.cancel()
+				}
+			}
 			m.logListenFailed(port, api.IngressProtocolTCP, err)
 			errs = append(errs, fmt.Errorf("bridge: ingress: listen on %s: %w", addr, err))
 			continue
 		}
-		l := &ingressListener{port: port, ln: ln, done: make(chan struct{})}
+		l := &ingressListener{port: port, ln: ln, done: make(chan struct{}), http: m.httpConns}
 		l.table.Store(t)
 		m.listeners[port] = l
 		go m.acceptLoop(m.ctx, l)
@@ -504,7 +587,13 @@ func (m *IngressManager) logRuleChanges(states []IngressRuleState) {
 	m.notServed = notServed
 }
 
+// logRule logs a held rule. Of its header conditions it logs the names, never
+// a value: a value can be a routing token.
 func (m *IngressManager) logRule(msg string, r api.IngressRule) {
+	names := make([]string, len(r.Conditions.Headers))
+	for i, h := range r.Conditions.Headers {
+		names[i] = h.Name
+	}
 	m.logger.Info(msg,
 		"component", "bridge",
 		"rule_id", r.ID,
@@ -514,7 +603,16 @@ func (m *IngressManager) logRule(msg string, r api.IngressRule) {
 		"mode", r.Mode,
 		"sni_host", r.SNIHost,
 		"target", net.JoinHostPort(r.TargetAddress, strconv.Itoa(r.TargetPort)),
+		"path_prefix", r.Conditions.PathPrefix,
+		"header_names", strings.Join(names, ","),
+		"strip_path_prefix", r.StripPathPrefix,
 	)
+}
+
+// sameTermination reports whether two rules end TLS alike: the same mode
+// and, on terminate, the same certificate_secret_name.
+func sameTermination(a, b api.IngressRule) bool {
+	return a.Mode == b.Mode && a.CertificateSecretName == b.CertificateSecretName
 }
 
 // logListenFailed logs a failed bind of port for protocol, tcp or udp, with
@@ -583,11 +681,19 @@ func (m *IngressManager) acceptLoop(ctx context.Context, l *ingressListener) {
 // port 443 a TLS-ALPN-01 challenge for the host of a served acme rule is
 // answered in place, unless a rule of another mode routes the host. A
 // passthrough rule's connection is forwarded with its ClientHello; a terminate
-// or acme rule's connection completes a TLS handshake at the bridge, and its
-// plaintext goes to the target.
+// or acme rule's connection completes a TLS handshake at the bridge. Without
+// conditions its plaintext goes to the target, and the handshake offers no
+// ALPN protocol. On a host whose rules have conditions the handshake offers h2
+// and http/1.1, and the connection goes to the HTTP server, which closes it
+// and counts it out of connCount from then on.
 func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn net.Conn) {
-	defer m.connCount.Add(-1)
-	defer conn.Close()
+	owned := true // false once an ingressHTTPConn closes conn
+	defer func() {
+		if owned {
+			_ = conn.Close()
+			m.connCount.Add(-1)
+		}
+	}()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
@@ -598,6 +704,7 @@ func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn
 	}
 
 	hello, peeked, err := peekClientHello(conn, m.peekTimeout)
+	var host *ingressHost
 	var route *ingressRoute
 	var reason string
 	switch {
@@ -608,7 +715,7 @@ func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn
 	default:
 		// A host's rules share their mode, Secret and served state, so its
 		// lead route decides the connection.
-		if host := table.match(hello.ServerName); host != nil {
+		if host = table.match(hello.ServerName); host != nil {
 			route = host.lead()
 		}
 		if l.port == acmeChallengePort && slices.Equal(hello.ALPN, []string{acme.ALPNProto}) &&
@@ -639,14 +746,27 @@ func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn
 			m.logClosed(l, conn, hello.ServerName, connReasonNoCertificate)
 			return
 		}
-		// No NextProtos: the target gets plaintext, and a negotiated h2 would
-		// hand it HTTP/2 frames it did not ask for.
 		cfg = &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}
 	default: // api.IngressModeACME
-		// No NextProtos either, for the same reason.
 		cfg = &tls.Config{GetCertificate: boundedGetCertificate(m.acme.GetCertificate), MinVersion: tls.VersionTLS12}
 	}
-	tlsConn, err := m.handshake(ctx, conn, peeked, cfg)
+	if host.http {
+		cfg.NextProtos = []string{"h2", "http/1.1"}
+		hc := m.newIngressHTTPConn(ctx, host.ctx, l, conn, peeked, hello.ServerName)
+		owned = false
+		// net/http serves HTTP/2 only on the *tls.Conn itself.
+		tlsConn, err := m.handshake(ctx, hc, cfg)
+		if err != nil {
+			m.logClosed(l, conn, hello.ServerName, connReasonTLSHandshakeFailed)
+			_ = hc.Close()
+			return
+		}
+		l.http.push(tlsConn)
+		return
+	}
+	// No NextProtos: the target gets plaintext, and a negotiated h2 would
+	// hand it HTTP/2 frames it did not ask for.
+	tlsConn, err := m.handshake(ctx, newPeekConn(conn, peeked), cfg)
 	if err != nil {
 		m.logClosed(l, conn, hello.ServerName, connReasonTLSHandshakeFailed)
 		return
@@ -660,7 +780,7 @@ func (m *IngressManager) serveConn(ctx context.Context, l *ingressListener, conn
 // of any other client. autocert answers a challenge hello from memory or its
 // cache; the certificate wait is bounded like an acme rule's all the same.
 func (m *IngressManager) answerChallenge(ctx context.Context, conn net.Conn, hello clientHello, peeked []byte) {
-	tlsConn, err := m.handshake(ctx, conn, peeked, &tls.Config{
+	tlsConn, err := m.handshake(ctx, newPeekConn(conn, peeked), &tls.Config{
 		GetCertificate: boundedGetCertificate(m.acme.GetCertificate),
 		NextProtos:     []string{acme.ALPNProto},
 		MinVersion:     tls.VersionTLS12,
@@ -674,15 +794,15 @@ func (m *IngressManager) answerChallenge(ctx context.Context, conn net.Conn, hel
 	_ = tlsConn.Close()
 }
 
-// handshake completes a TLS handshake as the server over conn, replaying the
-// peeked ClientHello, within the handshake timeout. The connection deadline
-// bounds the handshake's reads and writes. The handshake runs under a context
-// that ends at the same timeout, or with ctx: crypto/tls then closes conn and
-// hands the context to GetCertificate as the hello's context, which
-// boundedGetCertificate stops waiting at. A handshake that succeeded clears
-// the deadline.
-func (m *IngressManager) handshake(ctx context.Context, conn net.Conn, peeked []byte, cfg *tls.Config) (*tls.Conn, error) {
-	tlsConn := tls.Server(newPeekConn(conn, peeked), cfg)
+// handshake completes a TLS handshake as the server over conn, the
+// connection tls.Server wraps, which replays the peeked ClientHello, within
+// the handshake timeout. The connection deadline bounds the handshake's reads
+// and writes. The handshake runs under a context that ends at the same
+// timeout, or with ctx: crypto/tls then closes conn and hands the context to
+// GetCertificate as the hello's context, which boundedGetCertificate stops
+// waiting at. A handshake that succeeded clears the deadline.
+func (m *IngressManager) handshake(ctx context.Context, conn net.Conn, cfg *tls.Config) (*tls.Conn, error) {
+	tlsConn := tls.Server(conn, cfg)
 	if err := conn.SetDeadline(time.Now().Add(m.handshakeTimeout)); err != nil {
 		return tlsConn, err
 	}
@@ -741,17 +861,7 @@ func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []by
 	target, err := m.dialTarget(route)
 	reason, _ := m.recordDial(route, err)
 	if err != nil {
-		attrs := []any{
-			"component", "bridge",
-			"rule_id", route.rule.ID,
-			"slug", route.rule.Slug,
-			"protocol", route.rule.Protocol,
-			"target", route.target,
-		}
-		if reason != "" {
-			attrs = append(attrs, "reason", reason)
-		}
-		m.logger.Error("bridge: ingress: dial target failed", append(attrs, "error", err)...)
+		m.logDialFailed(route, reason, err)
 		return
 	}
 
@@ -780,6 +890,22 @@ func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []by
 	_ = client.Close()
 	<-clientToTarget
 	<-targetToClient
+}
+
+// logDialFailed logs a failed dial to route's target, with the reason
+// recordDial gave it when it gave one.
+func (m *IngressManager) logDialFailed(route *ingressRoute, reason string, err error) {
+	attrs := []any{
+		"component", "bridge",
+		"rule_id", route.rule.ID,
+		"slug", route.rule.Slug,
+		"protocol", route.rule.Protocol,
+		"target", route.target,
+	}
+	if reason != "" {
+		attrs = append(attrs, "reason", reason)
+	}
+	m.logger.Error("bridge: ingress: dial target failed", append(attrs, "error", err)...)
 }
 
 // IngressStatus returns ingress status for heartbeat reporting.
