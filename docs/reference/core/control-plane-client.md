@@ -412,7 +412,9 @@ The server replays only sequences strictly greater than the client's `Last-Event
 
 ### State Machine
 
-![The state machine of the SSE connection. It starts in Disconnected and moves to Connecting. From Connecting it moves to Connected; to Backoff on a transient error or a 401; and to PullOnly on a 501 descope. Connected returns to Connecting when the connection drops, Backoff returns when its delay has elapsed, and PullOnly returns on a re-probe every SSEReprobeInterval. When the threshold of 5 minutes is exceeded, Backoff moves to Polling, which returns to Connecting with a periodic SSE retry.](../../diagrams/core-sse-connection-states.svg)
+![The state machine of the SSE connection. It starts in Disconnected and moves to Connecting. From Connecting it moves to Connected; to Backoff on a transient error or a 401; to PullOnly on a 501 descope; and to Stopped on a 403 or 404, which ends the state machine. Connected returns to Connecting when the connection drops, Backoff returns when its delay has elapsed, and PullOnly returns on a re-probe every SSEReprobeInterval. When the threshold of 5 minutes is exceeded, Backoff moves to Polling, which returns to Connecting with a periodic SSE retry.](../../diagrams/core-sse-connection-states.svg)
+
+Stopped is final: `ReconnectEngine.Run` returns the 403 or 404, `SSEManager.Start` returns with it, and nothing reconnects until plexd restarts.
 
 ## SSE Parser
 

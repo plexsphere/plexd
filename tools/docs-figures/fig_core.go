@@ -157,6 +157,11 @@ func coreSSEConnectionStates() *Figure {
 	f.dot(disc.cx(), 0)
 	f.arrow(flow, pt{disc.cx(), 9}, disc.top())
 	f.arrow(flow, disc.bottom(), pt{disc.cx(), connecting.y})
+	stopped := f.state(stateFailed, spec{x: 700, y: 70, w: 180, h: h, lines: []Line{name("Stopped")}})
+	f.arrow(refuse, pt{stopped.cx(), connecting.y}, stopped.bottom())
+	f.labelRight(pt{stopped.cx(), (stopped.y + stopped.h + connecting.y) / 2}, body("403 or 404"))
+	f.final(stopped.cx(), 0)
+	f.arrow(flow, stopped.top(), pt{stopped.cx(), 12})
 
 	rowY := connecting.y + h + 130
 	connected := f.state(stateNormal, spec{x: 10, y: rowY, w: 180, h: h, lines: []Line{name("Connected")}})
