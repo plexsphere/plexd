@@ -2284,6 +2284,20 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 		}
 	}
 
+	// A rule with two targets round-trips with both, in order, beside the
+	// deprecated members that name the first.
+	multi := orig
+	multi.Targets = []IngressTarget{
+		{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.42.0.5", Port: 8443},
+		{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Address: "fd00::6", Port: 8444},
+	}
+	data4, got4 := roundTrip(t, multi)
+	requireEqual(t, multi, got4)
+	const wantTargets = `"targets":[{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","address":"10.42.0.5","port":8443},{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","address":"fd00::6","port":8444}]`
+	if !strings.Contains(string(data4), wantTargets) {
+		t.Errorf("marshaled rule %s does not contain %s", data4, wantTargets)
+	}
+
 	// A rule in the shape before the control plane's rule model decodes
 	// without an error, into a rule with an empty ID.
 	var old IngressRule
@@ -2298,7 +2312,8 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 // TestIngressConfig_DecodesContractBlock decodes the example block of the
 // agent contract's Public ingress section (plexsphere/plexsphere@834500a,
 // docs/reference/api/plexd-agent-contract.md), wrapped in an object as the
-// pull carries it. The rules shop-api and shop-web share their host by their
+// pull carries it, with the api rule's two targets of
+// plexsphere/plexsphere@8c76f19. The rules shop-api and shop-web share their host by their
 // path prefixes, and shop-api strips its prefix.
 func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	const block = `{
@@ -2317,6 +2332,10 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
         "listen_port": 443,
         "mode": "acme",
         "sni_host": "api.example.com",
+        "targets": [
+          { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "address": "10.42.0.7", "port": 8443 },
+          { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "address": "10.42.0.8", "port": 8443 }
+        ],
         "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
         "target_address": "10.42.0.7",
         "target_port": 8443
@@ -2413,7 +2432,10 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 		t.Error("Ingress.Enabled = false, want true")
 	}
 	want := []IngressRule{
-		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
+		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", Targets: []IngressTarget{
+			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.42.0.7", Port: 8443},
+			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Address: "10.42.0.8", Port: 8443},
+		}, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5", Slug: "dns", Protocol: IngressProtocolUDP, ListenPort: 53, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 53},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", Slug: "mqtt", Protocol: IngressProtocolTCP, ListenPort: 8883, Mode: IngressModeTerminate, SNIHost: "mqtt.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 1883, CertificateSecretName: "mqtt-cert"},
@@ -2528,8 +2550,31 @@ func TestIngressRule_ConditionsPresence(t *testing.T) {
 	}
 }
 
+// TestIngressRule_TargetsPresence decodes a rule without targets, with
+// "targets": null and with "targets": [] into a rule without targets, which
+// marshals without the key.
+func TestIngressRule_TargetsPresence(t *testing.T) {
+	const head = `{"id":"r1","slug":"web","listen_port":443,"mode":"passthrough","target_node_id":"n1","target_address":"10.42.0.7","target_port":8443`
+	for _, member := range []string{``, `,"targets":null`, `,"targets":[]`} {
+		var r IngressRule
+		if err := json.Unmarshal([]byte(head+member+`}`), &r); err != nil {
+			t.Fatalf("decode %q: %v", member, err)
+		}
+		if len(r.Targets) != 0 {
+			t.Errorf("decode %q: Targets = %+v, want none", member, r.Targets)
+		}
+		out, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal %q: %v", member, err)
+		}
+		if strings.Contains(string(out), `"targets"`) {
+			t.Errorf("decode %q, marshal: %s carries targets, want no such key", member, out)
+		}
+	}
+}
+
 // TestIngressRule_Equal compares rules that differ in one member each, and a
-// nil against an empty Headers.
+// nil against an empty Headers and Targets.
 func TestIngressRule_Equal(t *testing.T) {
 	base := IngressRule{
 		ID:                    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6",
@@ -2547,10 +2592,15 @@ func TestIngressRule_Equal(t *testing.T) {
 			Headers:    []IngressHeaderCondition{{Name: "x-a", Value: "1"}, {Name: "x-b", Value: "2"}},
 		},
 		StripPathPrefix: true,
+		Targets: []IngressTarget{
+			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Address: "10.42.0.8", Port: 8080},
+			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.42.0.7", Port: 8080},
+		},
 	}
 	clone := func() IngressRule {
 		r := base
 		r.Conditions.Headers = slices.Clone(base.Conditions.Headers)
+		r.Targets = slices.Clone(base.Targets)
 		return r
 	}
 	if !base.Equal(clone()) {
@@ -2575,8 +2625,16 @@ func TestIngressRule_Equal(t *testing.T) {
 			h := r.Conditions.Headers
 			h[0], h[1] = h[1], h[0]
 		},
-		"one header fewer":  func(r *IngressRule) { r.Conditions.Headers = r.Conditions.Headers[:1] },
-		"strip_path_prefix": func(r *IngressRule) { r.StripPathPrefix = false },
+		"one header fewer":   func(r *IngressRule) { r.Conditions.Headers = r.Conditions.Headers[:1] },
+		"strip_path_prefix":  func(r *IngressRule) { r.StripPathPrefix = false },
+		"a target's address": func(r *IngressRule) { r.Targets[1].Address = "10.42.0.9" },
+		"a target's port":    func(r *IngressRule) { r.Targets[1].Port = 8081 },
+		"a target's node id": func(r *IngressRule) { r.Targets[1].NodeID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b3" },
+		"the order of two targets": func(r *IngressRule) {
+			tg := r.Targets
+			tg[0], tg[1] = tg[1], tg[0]
+		},
+		"one target fewer": func(r *IngressRule) { r.Targets = r.Targets[:1] },
 	}
 	for name, edit := range edits {
 		t.Run(name, func(t *testing.T) {
@@ -2593,6 +2651,13 @@ func TestIngressRule_Equal(t *testing.T) {
 	emptyHeaders.Conditions.Headers = []IngressHeaderCondition{}
 	if !nilHeaders.Equal(emptyHeaders) || !emptyHeaders.Equal(nilHeaders) {
 		t.Error("a nil and an empty Headers compare unequal")
+	}
+
+	nilTargets, emptyTargets := clone(), clone()
+	nilTargets.Targets = nil
+	emptyTargets.Targets = []IngressTarget{}
+	if !nilTargets.Equal(emptyTargets) || !emptyTargets.Equal(nilTargets) {
+		t.Error("a nil and an empty Targets compare unequal")
 	}
 }
 
@@ -3824,6 +3889,37 @@ func TestIngressStatusRequest_JSON(t *testing.T) {
 				Certificate: IngressCertificateNotRequired, Dial: IngressDialNone,
 			}}},
 			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"none"}]}`,
+		},
+		{
+			// The api entry of the contract's section "Ingress status"
+			// (plexsphere/plexsphere@8c76f19), without client_auth_enforced
+			// and client_refusals.
+			name: "two targets",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateReady, Dial: IngressDialSucceeded, DialAgeSeconds: age(2),
+				Targets: []IngressStatusTarget{
+					{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Port: 8443, Dial: IngressDialSucceeded, DialAgeSeconds: age(2)},
+					{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Port: 8443, Dial: IngressDialFailed, DialReason: "timeout", DialAgeSeconds: age(14)},
+				},
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"succeeded","dial_age_seconds":2,"targets":[` +
+				`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":8443,"dial":"succeeded","dial_age_seconds":2},` +
+				`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","port":8443,"dial":"failed","dial_reason":"timeout","dial_age_seconds":14}]}]}`,
+		},
+		{
+			name: "a target dialled less than a second ago and one not dialled",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateNotRequired, Dial: IngressDialSucceeded, DialAgeSeconds: age(0),
+				Targets: []IngressStatusTarget{
+					{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Port: 9000, Dial: IngressDialSucceeded, DialAgeSeconds: age(0)},
+					{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Port: 9001, Dial: IngressDialNone},
+				},
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"succeeded","dial_age_seconds":0,"targets":[` +
+				`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":9000,"dial":"succeeded","dial_age_seconds":0},` +
+				`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":9001,"dial":"none"}]}]}`,
 		},
 		{
 			name: "a rule that does not listen",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
 	"slices"
 	"time"
 
@@ -218,12 +219,26 @@ func (r *IngressStatusReporter) build() api.IngressStatusRequest {
 }
 
 // sameAsAccepted reports whether req carries the entries of the last accepted
-// report, the dial age ignored.
+// report, the dial ages of the rules and of their targets ignored.
 func (r *IngressStatusReporter) sameAsAccepted(req api.IngressStatusRequest) bool {
 	return r.reported && slices.EqualFunc(req.Rules, r.accepted, func(a, b api.IngressStatusRule) bool {
 		a.DialAgeSeconds, b.DialAgeSeconds = nil, nil
-		return a == b
+		a.Targets, b.Targets = targetsWithoutAges(a.Targets), targetsWithoutAges(b.Targets)
+		return reflect.DeepEqual(a, b)
 	})
+}
+
+// targetsWithoutAges returns a copy of targets without their dial ages, nil
+// for no entry.
+func targetsWithoutAges(targets []api.IngressStatusTarget) []api.IngressStatusTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	out := slices.Clone(targets)
+	for i := range out {
+		out[i].DialAgeSeconds = nil
+	}
+	return out
 }
 
 // buildIngressStatusRequest turns the state and the rule reports into the
