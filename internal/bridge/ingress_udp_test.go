@@ -130,15 +130,22 @@ func sendUDP(t *testing.T, c *net.UDPConn, msg string) {
 func requireUDPEcho(t *testing.T, c *net.UDPConn, msg string) {
 	t.Helper()
 	sendUDP(t, c, msg)
+	requireUDPReply(t, c, msg)
+}
+
+// requireUDPReply reads one datagram on c within 2 s and fails unless it is
+// msg.
+func requireUDPReply(t *testing.T, c *net.UDPConn, msg string) {
+	t.Helper()
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
 	buf := make([]byte, ingressUDPBufSize)
 	n, err := c.Read(buf)
 	if err != nil {
-		t.Fatalf("read echo of %q: %v", msg, err)
+		t.Fatalf("read reply %q: %v", msg, err)
 	}
 	if got := string(buf[:n]); got != msg {
-		t.Fatalf("echo = %q, want %q", got, msg)
+		t.Fatalf("reply = %q, want %q", got, msg)
 	}
 }
 
@@ -648,10 +655,20 @@ func sendErr(errno error) error {
 // signal of the Apply is drained.
 func newScriptedUDPFixture(t *testing.T, opener *scriptedFlowOpener, policy *fakeDialPolicy) (*ingressFixture, *loopbackIngressController, string) {
 	t.Helper()
+	fx, ctrl, id, _ := newScriptedUDPTargets(t, opener, policy, nil)
+	return fx, ctrl, id
+}
+
+// newScriptedUDPTargets is newScriptedUDPFixture for a rule with targets, or
+// with the rule's one target at 127.0.0.1:9053 when targets is nil, and also
+// returns the manager's clock.
+func newScriptedUDPTargets(t *testing.T, opener *scriptedFlowOpener, policy *fakeDialPolicy, targets []api.IngressTarget) (*ingressFixture, *loopbackIngressController, string, *relayClock) {
+	t.Helper()
 	ctrl := newLoopbackIngressController(t)
 	fx := buildIngressFixture(t, ctrl, ingressTestConfig(true))
 	fx.mgr.openUDP = opener.open
-	fx.mgr.now = (&relayClock{now: relayStart}).Now
+	clock := &relayClock{now: relayStart}
+	fx.mgr.now = clock.Now
 	if policy != nil {
 		fx.mgr.SetDialPolicy(policy)
 	}
@@ -659,11 +676,13 @@ func newScriptedUDPFixture(t *testing.T, opener *scriptedFlowOpener, policy *fak
 		t.Fatalf("Setup: %v", err)
 	}
 	id := reportID("a1")
-	if err := fx.mgr.Apply(t.Context(), rulesBlock(withID(udpIngressRule("dns", 7053, 9053), id))); err != nil {
+	rule := withID(udpIngressRule("dns", 7053, 9053), id)
+	rule.Targets = targets
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	drain(fx.mgr.ReportChanged())
-	return fx, ctrl, id
+	return fx, ctrl, id, clock
 }
 
 // waitForDial waits up to 2 s for the report of id to read dial and returns
@@ -808,4 +827,339 @@ func TestIngressUDP_SendOutcomeIsTheDial(t *testing.T) {
 			t.Errorf("ConnectionCount after the next datagram = %d, want 1", got)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Several targets
+// ---------------------------------------------------------------------------
+
+// The addresses of twoTargets.
+var (
+	udpTarget0 = netip.MustParseAddrPort("127.0.0.1:9000")
+	udpTarget1 = netip.MustParseAddrPort("127.0.0.1:9001")
+)
+
+// waitForUnit waits up to 2 s for done to accept the record of the rule's
+// unit on lb and returns that record and the record of each target.
+func waitForUnit(t *testing.T, lb *ingressBalancer, done func(dialRecord) bool) (dialRecord, []dialRecord) {
+	t.Helper()
+	waitForCondition(t, 2*time.Second, func() bool {
+		unit, _ := lb.snapshot()
+		return done(unit)
+	})
+	return lb.snapshot()
+}
+
+// unitDialled accepts a unit with a dial.
+func unitDialled(unit dialRecord) bool { return !unit.at.IsZero() }
+
+// requireFlowTo fails unless the flows of port are the one flow of client,
+// to the target idx at addr.
+func requireFlowTo(t *testing.T, mgr *IngressManager, client netip.AddrPort, idx int, addr netip.AddrPort) {
+	t.Helper()
+	if flows := udpFlows(mgr, 7053); !slices.Equal(flows, []netip.AddrPort{client}) {
+		t.Errorf("flows = %v, want the one flow of %v", flows, client)
+	}
+	if f := udpFlowOf(mgr, 7053, client); f == nil {
+		t.Errorf("no flow of %v, want one to target %d at %v", client, idx, addr)
+	} else if f.idx != idx || f.target != addr {
+		t.Errorf("flow of %v to target %d at %v, want target %d at %v", client, f.idx, f.target, idx, addr)
+	}
+	if got := connectionCount(t, mgr); got != 1 {
+		t.Errorf("ConnectionCount = %d, want 1", got)
+	}
+}
+
+// requireSent fails unless conn was asked to send the payloads, in order,
+// each to to.
+func requireSent(t *testing.T, name string, conn *scriptedFlowConn, to netip.AddrPort, payloads ...string) {
+	t.Helper()
+	sent := conn.sent()
+	ok := len(sent) == len(payloads)
+	for i := 0; ok && i < len(sent); i++ {
+		ok = string(sent[i].payload) == payloads[i] && sent[i].to == to
+	}
+	if !ok {
+		t.Errorf("%s sent %+v, want %q to %v", name, sent, payloads, to)
+	}
+}
+
+// dialFailedLines counts the "dial target failed" Error lines of the udp
+// rule id that carry every needle.
+func dialFailedLines(logs *relayLog, id string, needles ...string) int {
+	return logLines(logs, append([]string{"level=ERROR", `msg="bridge: ingress: dial target failed"`, "rule_id=" + id, "protocol=udp"}, needles...)...)
+}
+
+func TestIngressUDP_FlowsRoundRobin(t *testing.T) {
+	conns := []*scriptedFlowConn{newScriptedFlowConn(), newScriptedFlowConn(), newScriptedFlowConn()}
+	opener := &scriptedFlowOpener{steps: []openStep{{conn: conns[0]}, {conn: conns[1]}, {conn: conns[2]}}}
+	fx, ctrl, id, _ := newScriptedUDPTargets(t, opener, &fakeDialPolicy{}, twoTargets())
+	names := []string{"a", "b", "c"}
+	clients := make([]*net.UDPConn, len(names))
+	for i := range clients {
+		clients[i] = udpClient(t, ctrl.udpAddr(7053))
+	}
+
+	// Each client's first datagram is forwarded before the next client
+	// sends, so the flows open in the order of the clients.
+	for i, c := range clients {
+		sendUDP(t, c, names[i]+"1")
+		waitForCondition(t, 2*time.Second, func() bool { return len(conns[i].sent()) == 1 })
+	}
+	for i, c := range clients {
+		sendUDP(t, c, names[i]+"2")
+	}
+	for _, conn := range conns {
+		waitForCondition(t, 2*time.Second, func() bool { return len(conn.sent()) == 2 })
+	}
+
+	wantTo := []netip.AddrPort{udpTarget0, udpTarget1, udpTarget0}
+	if got := opener.opened(); !slices.Equal(got, wantTo) {
+		t.Errorf("opened = %v, want %v", got, wantTo)
+	}
+	for i, conn := range conns {
+		requireSent(t, "the flow of "+names[i], conn, wantTo[i], names[i]+"1", names[i]+"2")
+		if f := udpFlowOf(fx.mgr, 7053, clientAddr(clients[i])); f == nil || f.idx != i%2 {
+			t.Errorf("flow of %s is nil or not to target %d", names[i], i%2)
+		}
+	}
+	if got := connectionCount(t, fx.mgr); got != 3 {
+		t.Errorf("ConnectionCount = %d, want 3", got)
+	}
+	unit, targets := balancerFor(t, fx.mgr, id).snapshot()
+	if want := (dialRecord{at: relayStart}); unit != want || !slices.Equal(targets, []dialRecord{want, want}) {
+		t.Errorf("unit %+v, targets %+v, want all succeeded at %v", unit, targets, relayStart)
+	}
+}
+
+func TestIngressUDP_FailoverOnFirstSend(t *testing.T) {
+	first := newScriptedFlowConn(sendErr(syscall.EPERM))
+	second := newScriptedFlowConn()
+	opener := &scriptedFlowOpener{steps: []openStep{{conn: first}, {conn: second}}}
+	policy := &fakeDialPolicy{denied: true}
+	fx, ctrl, id, _ := newScriptedUDPTargets(t, opener, policy, twoTargets())
+	lb := balancerFor(t, fx.mgr, id)
+	client := udpClient(t, ctrl.udpAddr(7053))
+
+	sendUDP(t, client, "query")
+	unit, targets := waitForUnit(t, lb, unitDialled)
+	if want := (dialRecord{at: relayStart}); unit != want {
+		t.Errorf("unit = %+v, want succeeded at %v", unit, relayStart)
+	}
+	if want := []dialRecord{{failed: true, reason: IngressDialReasonPolicyDenied, at: relayStart}, {at: relayStart}}; !slices.Equal(targets, want) {
+		t.Errorf("targets = %+v, want the first failed with policy_denied and the second succeeded", targets)
+	}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got.Dial != api.IngressDialSucceeded || got.DialReason != "" {
+		t.Errorf("report = %+v, want dial succeeded", got)
+	}
+	if got, want := policy.askedWith(), []dialQuestion{{protocol: "udp", target: udpTarget0}}; !slices.Equal(got, want) {
+		t.Errorf("the dial policy was asked %+v, want %+v", got, want)
+	}
+
+	if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{udpTarget0, udpTarget1}) {
+		t.Errorf("opened = %v, want the first target and then the second", got)
+	}
+	requireSent(t, "the first target's socket", first, udpTarget0, "query")
+	requireSent(t, "the second target's socket", second, udpTarget1, "query")
+	if !first.isClosed() || second.isClosed() {
+		t.Errorf("sockets closed: first %v, second %v, want only the first", first.isClosed(), second.isClosed())
+	}
+	requireFlowTo(t, fx.mgr, clientAddr(client), 1, udpTarget1)
+	if got := logLines(fx.logs, `msg="ingress udp flow opened"`); got != 1 {
+		t.Errorf("%d 'ingress udp flow opened' lines, want 1:\n%s", got, fx.logs.String())
+	}
+	if got := dialFailedLines(fx.logs, id, "target=127.0.0.1:9000", "reason=policy_denied"); got != 1 {
+		t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
+	}
+	if got := logLines(fx.logs, `msg="bridge: ingress: dial target failed"`); got != 1 {
+		t.Errorf("%d 'dial target failed' lines in all, want 1:\n%s", got, fx.logs.String())
+	}
+}
+
+func TestIngressUDP_FailoverWhenASocketDoesNotOpen(t *testing.T) {
+	conn := newScriptedFlowConn()
+	opener := &scriptedFlowOpener{steps: []openStep{{err: errors.New("scripted: socket refused")}, {conn: conn}}}
+	fx, ctrl, id, _ := newScriptedUDPTargets(t, opener, &fakeDialPolicy{}, twoTargets())
+	lb := balancerFor(t, fx.mgr, id)
+	client := udpClient(t, ctrl.udpAddr(7053))
+
+	sendUDP(t, client, "query")
+	unit, targets := waitForUnit(t, lb, unitDialled)
+	if want := (dialRecord{at: relayStart}); unit != want {
+		t.Errorf("unit = %+v, want succeeded at %v", unit, relayStart)
+	}
+	if want := []dialRecord{{failed: true, reason: IngressDialReasonOther, at: relayStart}, {at: relayStart}}; !slices.Equal(targets, want) {
+		t.Errorf("targets = %+v, want the first failed with other and the second succeeded", targets)
+	}
+	if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{udpTarget0, udpTarget1}) {
+		t.Errorf("opened = %v, want the first target and then the second", got)
+	}
+	requireSent(t, "the second target's socket", conn, udpTarget1, "query")
+	requireFlowTo(t, fx.mgr, clientAddr(client), 1, udpTarget1)
+	if got := dialFailedLines(fx.logs, id, "target=127.0.0.1:9000", "reason=other", "error="); got != 1 {
+		t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
+	}
+}
+
+func TestIngressUDP_FailedSendMovesTheFlow(t *testing.T) {
+	first := newScriptedFlowConn(nil, sendErr(errNetUnreachable))
+	second := newScriptedFlowConn()
+	opener := &scriptedFlowOpener{steps: []openStep{{conn: first}, {conn: second}}}
+	fx, ctrl, id, _ := newScriptedUDPTargets(t, opener, &fakeDialPolicy{}, twoTargets())
+	lb := balancerFor(t, fx.mgr, id)
+	client := udpClient(t, ctrl.udpAddr(7053))
+
+	// The first target takes the client and answers it.
+	sendUDP(t, client, "one")
+	waitForUnit(t, lb, unitDialled)
+	first.read(t, scriptedRead{payload: []byte("answer 0"), from: udpTarget0})
+	requireUDPReply(t, client, "answer 0")
+
+	sendUDP(t, client, "two")
+	waitForLogLine(t, fx.logs, append(flowClosed(clientAddr(client)), "reason=target_failed")...)
+	waitForCondition(t, 2*time.Second, func() bool { return len(second.sent()) == 1 })
+	sendUDP(t, client, "three")
+	waitForCondition(t, 2*time.Second, func() bool { return len(second.sent()) == 2 })
+	second.read(t, scriptedRead{payload: []byte("answer 1"), from: udpTarget1})
+	requireUDPReply(t, client, "answer 1")
+
+	if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{udpTarget0, udpTarget1}) {
+		t.Errorf("opened = %v, want the first target and then the second", got)
+	}
+	requireSent(t, "the first flow", first, udpTarget0, "one", "two")
+	requireSent(t, "the second flow", second, udpTarget1, "two", "three")
+	if !first.isClosed() {
+		t.Error("the first flow's socket is open after its failed send")
+	}
+	requireFlowTo(t, fx.mgr, clientAddr(client), 1, udpTarget1)
+	unit, targets := lb.snapshot()
+	if want := (dialRecord{at: relayStart}); unit != want {
+		t.Errorf("unit = %+v, want succeeded at %v", unit, relayStart)
+	}
+	if want := []dialRecord{{failed: true, reason: IngressDialReasonUnreachable, at: relayStart}, {at: relayStart}}; !slices.Equal(targets, want) {
+		t.Errorf("targets = %+v, want the first failed with unreachable and the second succeeded", targets)
+	}
+	if got := dialFailedLines(fx.logs, id, "target=127.0.0.1:9000", "reason=unreachable"); got != 1 {
+		t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
+	}
+	if got := logLines(fx.logs, `msg="ingress udp flow closed"`); got != 1 {
+		t.Errorf("%d 'ingress udp flow closed' lines, want only the first flow's:\n%s", got, fx.logs.String())
+	}
+}
+
+func TestIngressUDP_AllTargetsFailKeepsOneFlow(t *testing.T) {
+	unreachable := sendErr(errNetUnreachable)
+	first := newScriptedFlowConn(unreachable)
+	second := newScriptedFlowConn(unreachable, unreachable)
+	third := newScriptedFlowConn()
+	opener := &scriptedFlowOpener{steps: []openStep{{conn: first}, {conn: second}, {conn: third}}}
+	fx, ctrl, id, clock := newScriptedUDPTargets(t, opener, &fakeDialPolicy{}, twoTargets())
+	lb := balancerFor(t, fx.mgr, id)
+	changed := fx.mgr.ReportChanged()
+	client := udpClient(t, ctrl.udpAddr(7053))
+	notForwarded := []string{"level=DEBUG", `msg="ingress datagram not forwarded"`, "remote=" + clientAddr(client).String()}
+
+	// The second target's line is logged after both records and their
+	// signal.
+	sendUDP(t, client, "one")
+	waitForCondition(t, 2*time.Second, func() bool { return dialFailedLines(fx.logs, id) == 2 })
+	requireSignal(t, changed, "a datagram no target took")
+	unit, targets := lb.snapshot()
+	failed := dialRecord{failed: true, reason: IngressDialReasonUnreachable, at: relayStart}
+	if unit != failed || !slices.Equal(targets, []dialRecord{failed, failed}) {
+		t.Errorf("unit %+v, targets %+v, want all failed with unreachable", unit, targets)
+	}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got.Dial != api.IngressDialFailed || got.DialReason != IngressDialReasonUnreachable {
+		t.Errorf("report = %+v, want dial failed with unreachable", got)
+	}
+	if !first.isClosed() || second.isClosed() {
+		t.Errorf("sockets closed: first %v, second %v, want only the first", first.isClosed(), second.isClosed())
+	}
+	requireSent(t, "the first target's socket", first, udpTarget0, "one")
+	requireSent(t, "the second target's socket", second, udpTarget1, "one")
+	requireFlowTo(t, fx.mgr, clientAddr(client), 1, udpTarget1)
+
+	// Within the hold-outs a datagram costs one send on the kept flow and
+	// is no dial.
+	clock.Add(ingressTargetHoldOut - time.Millisecond)
+	sendUDP(t, client, "two")
+	waitForCondition(t, 2*time.Second, func() bool { return logLines(fx.logs, notForwarded...) == 1 })
+	if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{udpTarget0, udpTarget1}) {
+		t.Errorf("opened = %v, want no socket for the second datagram", got)
+	}
+	requireSent(t, "the kept flow", second, udpTarget1, "one", "two")
+	if unit, targets := lb.snapshot(); unit != failed || !slices.Equal(targets, []dialRecord{failed, failed}) {
+		t.Errorf("after the second datagram: unit %+v, targets %+v, want the records of the first", unit, targets)
+	}
+	requireNoSignal(t, changed, "a send that failed as the one before it")
+	if got := dialFailedLines(fx.logs, id); got != 2 {
+		t.Errorf("%d 'dial target failed' lines after the second datagram, want still 2:\n%s", got, fx.logs.String())
+	}
+
+	// Once the first target's hold-out ended, the next datagram moves the
+	// client to it.
+	clock.Add(time.Millisecond)
+	back := relayStart.Add(ingressTargetHoldOut)
+	sendUDP(t, client, "three")
+	unit, targets = waitForUnit(t, lb, func(u dialRecord) bool { return !u.failed })
+	if want := (dialRecord{at: back}); unit != want || targets[0] != want || targets[1] != failed {
+		t.Errorf("unit %+v, targets %+v, want the first target and the unit succeeded at %v", unit, targets, back)
+	}
+	waitForLogLine(t, fx.logs, append(flowClosed(clientAddr(client)), "reason=target_failed")...)
+	if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{udpTarget0, udpTarget1, udpTarget0}) {
+		t.Errorf("opened = %v, want a third socket to the first target", got)
+	}
+	requireSent(t, "the kept flow", second, udpTarget1, "one", "two")
+	requireSent(t, "the new flow", third, udpTarget0, "three")
+	if !second.isClosed() {
+		t.Error("the kept flow's socket is open after the client moved")
+	}
+	requireFlowTo(t, fx.mgr, clientAddr(client), 0, udpTarget0)
+}
+
+func TestIngressUDP_ClosedSocketIsNoDial(t *testing.T) {
+	conn := newScriptedFlowConn(nil, &net.OpError{Op: "write", Net: "udp", Err: net.ErrClosed})
+	opener := &scriptedFlowOpener{steps: []openStep{{conn: conn}}}
+	policy := &fakeDialPolicy{}
+	fx, ctrl, id, clock := newScriptedUDPTargets(t, opener, policy, twoTargets())
+	lb := balancerFor(t, fx.mgr, id)
+	changed := fx.mgr.ReportChanged()
+	client := udpClient(t, ctrl.udpAddr(7053))
+
+	sendUDP(t, client, "one")
+	waitForUnit(t, lb, unitDialled)
+	requireSignal(t, changed, "the first send")
+
+	// A record of a later dial would carry the later time.
+	clock.Add(time.Second)
+	sendUDP(t, client, "two")
+	waitForLogLine(t, fx.logs, "level=DEBUG", `msg="ingress datagram not forwarded"`, "remote="+clientAddr(client).String(), "error=")
+	sendUDP(t, client, "three")
+	waitForCondition(t, 2*time.Second, func() bool { return len(conn.sent()) == 3 })
+
+	unit, targets := lb.snapshot()
+	if want := (dialRecord{at: relayStart}); unit != want || !slices.Equal(targets, []dialRecord{want, {}}) {
+		t.Errorf("unit %+v, targets %+v, want the first target and the unit succeeded at %v and the second without a dial", unit, targets, relayStart)
+	}
+	if out := outTargets(lb, clock.Now()); len(out) != 0 {
+		t.Errorf("out targets = %v, want every target in", out)
+	}
+	requireNoSignal(t, changed, "a send that failed with net.ErrClosed")
+	if got := policy.asked(); len(got) != 0 {
+		t.Errorf("the dial policy was asked about %v, want no question", got)
+	}
+	if got := opener.opened(); !slices.Equal(got, []netip.AddrPort{udpTarget0}) {
+		t.Errorf("opened = %v, want the first flow's socket alone", got)
+	}
+	requireSent(t, "the flow", conn, udpTarget0, "one", "two", "three")
+	if conn.isClosed() {
+		t.Error("the flow's socket was closed")
+	}
+	requireFlowTo(t, fx.mgr, clientAddr(client), 0, udpTarget0)
+	if got := logLines(fx.logs, `msg="ingress udp flow closed"`); got != 0 {
+		t.Errorf("%d 'ingress udp flow closed' lines, want 0:\n%s", got, fx.logs.String())
+	}
+	if got := logLines(fx.logs, `msg="bridge: ingress: dial target failed"`); got != 0 {
+		t.Errorf("%d 'dial target failed' lines, want 0:\n%s", got, fx.logs.String())
+	}
 }
