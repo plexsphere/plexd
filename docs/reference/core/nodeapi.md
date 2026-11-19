@@ -93,12 +93,15 @@ logger := slog.Default()
 
 // Create control plane client (satisfies NodeAPIClient).
 cpClient, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
-cpClient.SetAuthToken(identity.NodeSecretKey)
+
+// Register arms the client with the NSK bearer envelope.
+identity, _ := registration.NewRegistrar(cpClient, regCfg, logger).Register(ctx)
+nsk, _ := identity.SecretKey() // the decoded 32-byte AES-256-GCM key
 
 // Create server.
 srv := nodeapi.NewServer(nodeapi.Config{
     DataDir: "/var/lib/plexd",
-}, cpClient, []byte(identity.NodeSecretKey), logger)
+}, cpClient, nsk, logger)
 
 // Register reconcile handler (feeds the cache from the state pull).
 reconciler.RegisterHandler(srv.ReconcileHandler())
@@ -110,7 +113,7 @@ reconciler.RegisterDispatchHandler(srv.SecretIndexDispatchHandler())
 // Start blocks until context cancelled.
 ctx, cancel := context.WithCancel(context.Background())
 go func() {
-    if err := srv.Start(ctx, nodeID); err != nil && err != context.Canceled {
+    if err := srv.Start(ctx, identity.NodeID); err != nil && err != context.Canceled {
         logger.Error("node API server failed", "error", err)
     }
 }()

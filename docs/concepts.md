@@ -100,8 +100,8 @@ On SIGTERM or SIGINT:
 ## Authentication Flow
 
 1. **Bootstrap** — node registers using a bootstrap token (file, env var, or metadata service)
-2. **Node Secret Key** — registration returns a `NodeSecretKey` used for all subsequent API authentication
-3. **Heartbeat Auth** — each heartbeat uses the node secret key; three heartbeats answered 401 Unauthorized (`unauthorized`, `nsk_invalid` or `nsk_revoked`) with no accepted one between them park the agent, which then stops calling the control plane and probes the credential with the heartbeat (see [Credential Park](reference/core/heartbeat-service.md#credential-park))
+2. **Node Secret Key** — registration returns the NSK. plexd builds the bearer envelope from it and the node ID and presents that envelope, never the NSK itself, on every later API call (see [BearerToken](reference/core/registration.md#bearertoken))
+3. **Heartbeat Auth** — each heartbeat presents the bearer envelope; three heartbeats answered 401 Unauthorized (`unauthorized`, `nsk_invalid` or `nsk_revoked`) with no accepted one between them park the agent, which then stops calling the control plane and probes the credential with the heartbeat (see [Credential Park](reference/core/heartbeat-service.md#credential-park))
 4. **Signing Key** — the Ed25519 verifier checks SSE envelopes and ssh session tokens against the Domain signing key. Every successful state pull installs the key its `signing_key` block carries (`verifier.Install`) and persists it into the identity files, so a restart starts from it. A `null` block keeps the installed key, and a key the verifier refuses changes nothing. A `signing_key_rotated` SSE event installs a new key too (`verifier.Rotate`) and can keep the previous key trusted until the rotation's `transition_expires`; a pulled key that differs from the current one ends that grace window, because a node trusts exactly one key of its Domain. The mesh SSH server's JWT verifier (step 5d) is separate: it keeps the key decoded at start and picks up a pulled key only after a restart
 
 ## SSE Event Types

@@ -4,7 +4,7 @@ title: Control Plane API Endpoints
 
 # Control Plane API Endpoints
 
-plexd requires the following API endpoints on the control plane. All endpoints use the `/v1` prefix and HTTPS. Authentication uses the node's identity token (received during registration) unless noted otherwise. Request and response bodies are JSON (`Content-Type: application/json`) unless noted otherwise.
+plexd requires the following API endpoints on the control plane. All endpoints use the `/v1` prefix and HTTPS. Authentication uses the NSK bearer envelope, which plexd builds from the node ID and the NSK that registration returns (see [BearerToken](registration.md#bearertoken)), unless noted otherwise. Request and response bodies are JSON (`Content-Type: application/json`) unless noted otherwise.
 
 ## Endpoint Summary
 

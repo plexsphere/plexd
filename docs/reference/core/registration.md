@@ -6,7 +6,7 @@ feature: PXD-0002
 
 # Registration
 
-The `internal/registration` package handles node self-registration and bootstrap authentication with the Plexsphere control plane. It resolves a bootstrap token, generates a Curve25519 keypair, registers with the control plane, persists the resulting identity, and manages auth token lifecycle.
+The `internal/registration` package handles node self-registration and bootstrap authentication with the Plexsphere control plane. It resolves a bootstrap token, generates a Curve25519 keypair, registers with the control plane, persists the resulting identity, and arms the shared API client with the NSK bearer envelope.
 
 ## Config
 
@@ -255,7 +255,7 @@ if errors.Is(err, registration.ErrNotRegistered) {
 
 ## Registrar
 
-Orchestrates the complete registration lifecycle: check existing identity, resolve token, generate keypair, register with retries, persist identity, clean up token file, and set auth token.
+Orchestrates the complete registration lifecycle: check existing identity, resolve token, generate keypair, register with retries, persist identity, clean up token file, and arm the client with the bearer envelope.
 
 ### Constructor
 
@@ -279,18 +279,18 @@ Orchestration flow:
 
 ![The registration flow between the Registrar, the TokenResolver, the control plane and the disk. The Registrar calls LoadIdentity() on the disk. If an identity exists, the disk returns the NodeIdentity, the Registrar sets the NSK as the auth token and returns the cached identity. If the node is not registered, the disk returns ErrNotRegistered. The Registrar then resolves the bootstrap token from the TokenResolver, which returns the token and its source; generates a keypair; and resolves project_id, resource_handle and requested_resource_id, which come from the config or IMDS. It fails fast if project_id or resource_handle is missing, sets an empty auth token because register is unauthenticated, and uses one nonce for the whole registration. It posts to /v1/register with the bootstrap token in the body, retrying with backoff for at most 5 minutes, rate-limit waits excluded. The control plane returns node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot and domain_mesh_cidr. The Registrar builds the NodeIdentity, saves it to the disk with an atomic write, removes or empties the token file if the token was file-based, and sets the NSK as the auth token.](../../diagrams/core-registration-flow.svg)
 
-1. **Load existing identity** — if valid, set auth token and return (idempotent)
-2. **Corrupt identity** — log warning, proceed with fresh registration
+1. **Load existing identity** — if it loads and `identity.BearerToken()` succeeds, arm the client with `client.SetAuthToken(bearer)` and return (idempotent, no HTTP call)
+2. **Corrupt or unusable identity** — identity files that fail to load, or an identity whose `node_id` is not a canonical UUID and so cannot form the bearer envelope. Log `corrupt identity files, proceeding with fresh registration` at Warn and proceed with fresh registration. An absent `identity.json` (`ErrNotRegistered`) logs nothing
 3. **Resolve bootstrap token** — via `TokenResolver.Resolve`
 4. **Generate Curve25519 keypair**
 5. **Resolve registration inputs** — `project_id`, `resource_handle`, and `requested_resource_id` via `ResolveValue` (direct config value, else IMDS). Each required input is checked as soon as it resolves, so a missing `project_id` fails before the later metadata lookups run
 6. **Fail fast** — return an error before any HTTP call if `project_id` or `resource_handle` is empty
-7. **Clear the auth token** — `client.SetAuthToken("")`. `POST /v1/register` is unauthenticated (`security: []`); the bootstrap token travels in the request body. Clearing also drops a stale NSK on the re-registration path. The previous token is restored unless registration completes, so a failed re-registration does not leave the shared client unauthenticated.
+7. **Send the register call without a credential** — `POST /v1/register` is unauthenticated (`security: []`); the bootstrap token travels in the request body. `ControlPlane.Register` marks the request with `withoutAuth`, which leaves the `Authorization` header off this one request. The client's token is not changed: whatever it holds is not sent, and a registration that fails leaves the client as it was.
 8. **POST /v1/register with retry** — one UUIDv4 nonce per logical registration, reused across attempts; exponential backoff on transient errors, and a wait without a time limit on `429 token_rate_limited` (see [Rate-limited bootstrap token](#rate-limited-bootstrap-token)). The nonce is replay protection, not an idempotency key: a nonce the control plane has already recorded is answered with `403 nonce_collision`, so retrying a request that may already have been committed is denied rather than granted a second node. The nonce is never persisted — after a restart it could only produce that denial, so a fresh registration starts with a fresh nonce
-9. **Build NodeIdentity** from response + private key — `nsk` must decode from standard-padded base64 to a 32-byte AES-256-GCM key, or registration fails before anything is persisted
+9. **Build NodeIdentity** from response + private key — `nsk` must decode from standard-padded base64 to a 32-byte AES-256-GCM key, or registration fails before anything is persisted. `identity.BearerToken()` assembles the bearer envelope here: a `node_id` that is not a canonical UUID fails registration with `registration: node_id "<id>" is not a canonical UUID`, also before anything is persisted
 10. **Persist identity** atomically to data directory
 11. **Remove token file** if token was file-based. When the unlink fails, the file is truncated to zero bytes and `token file emptied, it could not be removed` is logged at Info; only when that fails too is `failed to delete token file` logged at Warn, with `truncate_error`. A file that is already gone logs nothing, and no outcome is fatal
-12. **Set node_secret_key (nsk) as auth** — `client.SetAuthToken(nsk)`
+12. **Arm the client with the bearer envelope** — `client.SetAuthToken(bearer)`, the envelope from step 9
 
 ### Retry Logic
 
@@ -373,14 +373,14 @@ if err != nil {
 }
 
 log.Printf("registered as %s with mesh IP %s", identity.NodeID, identity.MeshIP)
-// Control plane client now has node_secret_key set as auth token
+// The client now presents the NSK bearer envelope (identity.BearerToken())
 ```
 
 ### Auth Token Lifecycle
 
-| Phase                    | Auth Token Value        |
+| Phase                    | `Authorization` header  |
 |--------------------------|-------------------------|
-| Before registration      | Bootstrap token (resolved, not yet sent)|
-| During POST /v1/register | none (unauthenticated; bootstrap token in body)|
-| After registration       | `NodeSecretKey`         |
-| On restart (cached)      | `NodeSecretKey` from disk|
+| Before registration      | none: a new client holds no token |
+| During POST /v1/register | none: `withoutAuth` leaves the header off this request, whatever the client holds; the bootstrap token is in the body |
+| After registration       | `Bearer nsk_plexd_<...>`, the envelope from `BearerToken()` |
+| On restart (cached)      | the same `nsk_plexd_<...>` envelope, built from the `node_id` in `identity.json` and the `node_secret_key` file |
