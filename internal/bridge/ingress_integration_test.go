@@ -1128,3 +1128,247 @@ func TestIngressIntegration_HeldPortReadsListenFailed(t *testing.T) {
 		t.Errorf("report = %+v, want %+v", got, want)
 	}
 }
+
+// dialLog dials for the manager and records the address of every dial, in
+// order.
+type dialLog struct {
+	mu    sync.Mutex
+	addrs []string
+}
+
+func (d *dialLog) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.mu.Lock()
+	d.addrs = append(d.addrs, addr)
+	d.mu.Unlock()
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, network, addr)
+}
+
+// dialled returns the address of every dial so far, in order.
+func (d *dialLog) dialled() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.addrs)
+}
+
+// newDialLogFixture returns a set-up manager on a settable clock that dials
+// through a dialLog.
+func newDialLogFixture(t *testing.T, ctrl IngressController) (*ingressFixture, *relayClock, *dialLog) {
+	t.Helper()
+	fx := newIngressFixture(t, ctrl)
+	clock := &relayClock{now: relayStart}
+	fx.mgr.now = clock.Now
+	dials := &dialLog{}
+	fx.mgr.dial = dials.dial
+	return fx, clock, dials
+}
+
+// targetOn returns a target on the loopback port port.
+func targetOn(port int) api.IngressTarget {
+	return api.IngressTarget{NodeID: "node-" + strconv.Itoa(port), Address: "127.0.0.1", Port: port}
+}
+
+// addrOf returns the address the bridge dials for target.
+func addrOf(target api.IngressTarget) string {
+	return net.JoinHostPort(target.Address, strconv.Itoa(target.Port))
+}
+
+// bannerOf reads the four-byte banner a backend writes first, within 2 s.
+func bannerOf(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	return string(buf)
+}
+
+// TestIngressIntegration_RoundRobinAcrossTargets sends the connections of a
+// plain rule with two targets to them in turn, the first target first.
+func TestIngressIntegration_RoundRobinAcrossTargets(t *testing.T) {
+	one := startBackend(t, "tcp", "127.0.0.1:0", banner("one\n"))
+	two := startBackend(t, "tcp", "127.0.0.1:0", banner("two\n"))
+	ctrl := newLoopbackIngressController(t)
+	mgr, logs := newActiveIngressManager(t, ctrl)
+	rule := ingressRule("web", 7022, "", one.port(t))
+	rule.Targets = []api.IngressTarget{targetOn(one.port(t)), targetOn(two.port(t))}
+	if err := mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	var got []string
+	for range 4 {
+		got = append(got, bannerOf(t, connect(t, ctrl.addr(7022))))
+	}
+	if want := []string{"one\n", "two\n", "one\n", "two\n"}; !slices.Equal(got, want) {
+		t.Errorf("banners = %q, want %q", got, want)
+	}
+	if a, b := one.accepted.Load(), two.accepted.Load(); a != 2 || b != 2 {
+		t.Errorf("the backends accepted %d and %d connections, want 2 each", a, b)
+	}
+	targets := "targets=" + addrOf(rule.Targets[0]) + "," + addrOf(rule.Targets[1])
+	if got := logLines(logs, `msg="ingress rule added"`, "rule_id=id-web", targets); got != 1 {
+		t.Errorf("%d 'ingress rule added' lines with %s, want 1:\n%s", got, targets, logs.String())
+	}
+	if got := logLines(logs, `msg="ingress rule added"`, " target="); got != 0 {
+		t.Errorf("%d 'ingress rule added' lines with a target key, want 0:\n%s", got, logs.String())
+	}
+}
+
+// TestIngressIntegration_FailoverToTheNextTarget serves a connection whose
+// first target refuses on the second target and passes the first over for
+// the connections after it.
+func TestIngressIntegration_FailoverToTheNextTarget(t *testing.T) {
+	backend := startBackend(t, "tcp", "127.0.0.1:0", banner("two\n"))
+	ctrl := newLoopbackIngressController(t)
+	fx, _, dials := newDialLogFixture(t, ctrl)
+	refusing, serving := targetOn(closedPort(t)), targetOn(backend.port(t))
+	rule := ingressRule("web", 7022, "", refusing.Port)
+	rule.Targets = []api.IngressTarget{refusing, serving}
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for i := range 3 {
+		if got := bannerOf(t, connect(t, ctrl.addr(7022))); got != "two\n" {
+			t.Errorf("connection %d read %q, want the second backend's banner", i+1, got)
+		}
+	}
+	if got, want := dials.dialled(), []string{addrOf(refusing), addrOf(serving), addrOf(serving), addrOf(serving)}; !slices.Equal(got, want) {
+		t.Errorf("dials = %v, want %v", got, want)
+	}
+	if got := logLines(fx.logs, `msg="bridge: ingress: dial target failed"`); got != 1 {
+		t.Errorf("%d 'dial target failed' lines, want 1:\n%s", got, fx.logs.String())
+	}
+	if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "rule_id=id-web", "target="+addrOf(refusing)+" ", "reason=refused"); got != 1 {
+		t.Errorf("%d 'dial target failed' lines for %s with reason=refused, want 1:\n%s", got, addrOf(refusing), fx.logs.String())
+	}
+}
+
+// TestIngressIntegration_AllTargetsFail closes a connection whose two targets
+// refuse, reports the rule and both targets failed, and dials both again for
+// the next connection.
+func TestIngressIntegration_AllTargetsFail(t *testing.T) {
+	ctrl := newLoopbackIngressController(t)
+	fx, _, dials := newDialLogFixture(t, ctrl)
+	first, second := targetOn(closedPort(t)), targetOn(closedPort(t))
+	id := reportID("a1")
+	rule := withID(ingressRule("web", 7022, "", first.Port), id)
+	rule.Targets = []api.IngressTarget{first, second}
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	requireClosed(t, connect(t, ctrl.addr(7022)))
+	want := IngressRuleReport{
+		RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateNotRequired,
+		Dial: api.IngressDialFailed, DialReason: IngressDialReasonRefused, DialAt: relayStart,
+	}
+	if got := reportFor(t, fx.mgr.RuleReports(), id); got != want {
+		t.Errorf("report = %+v, want %+v", got, want)
+	}
+	failed := dialRecord{failed: true, reason: IngressDialReasonRefused, at: relayStart}
+	if _, targets := balancerFor(t, fx.mgr, id).snapshot(); !slices.Equal(targets, []dialRecord{failed, failed}) {
+		t.Errorf("targets = %+v, want both failed with refused", targets)
+	}
+	if got, want := dials.dialled(), []string{addrOf(first), addrOf(second)}; !slices.Equal(got, want) {
+		t.Errorf("dials = %v, want %v", got, want)
+	}
+
+	requireClosed(t, connect(t, ctrl.addr(7022)))
+	if got, want := dials.dialled(), []string{addrOf(first), addrOf(second), addrOf(first), addrOf(second)}; !slices.Equal(got, want) {
+		t.Errorf("dials after the next connection = %v, want %v", got, want)
+	}
+	if got := logLines(fx.logs, "level=ERROR", `msg="bridge: ingress: dial target failed"`, "rule_id="+id, "reason=refused"); got != 4 {
+		t.Errorf("%d 'dial target failed' lines, want one per dial:\n%s", got, fx.logs.String())
+	}
+}
+
+// TestIngressIntegration_TargetReturnsAfterHoldOut dials a target whose dial
+// failed again once the manager's clock passed the hold-out, for the first
+// connection whose turn it is.
+func TestIngressIntegration_TargetReturnsAfterHoldOut(t *testing.T) {
+	two := startBackend(t, "tcp", "127.0.0.1:0", banner("two\n"))
+	ctrl := newLoopbackIngressController(t)
+	fx, clock, dials := newDialLogFixture(t, ctrl)
+	returning, serving := targetOn(closedPort(t)), targetOn(two.port(t))
+	rule := ingressRule("web", 7022, "", returning.Port)
+	rule.Targets = []api.IngressTarget{returning, serving}
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if got := bannerOf(t, connect(t, ctrl.addr(7022))); got != "two\n" {
+		t.Fatalf("the first connection read %q, want the second backend's banner", got)
+	}
+	one := startBackend(t, "tcp", addrOf(returning), banner("one\n"))
+
+	clock.Add(ingressTargetHoldOut - time.Millisecond)
+	if got := bannerOf(t, connect(t, ctrl.addr(7022))); got != "two\n" {
+		t.Errorf("the connection at 29.999 s read %q, want the second backend's banner", got)
+	}
+	clock.Add(time.Millisecond)
+	if got := bannerOf(t, connect(t, ctrl.addr(7022))); got != "one\n" {
+		t.Errorf("the connection at 30 s read %q, want the returned backend's banner", got)
+	}
+	if got, want := dials.dialled(), []string{addrOf(returning), addrOf(serving), addrOf(serving), addrOf(returning)}; !slices.Equal(got, want) {
+		t.Errorf("dials = %v, want %v", got, want)
+	}
+	if got := one.accepted.Load(); got != 1 {
+		t.Errorf("the returned backend accepted %d connections, want 1", got)
+	}
+}
+
+// TestIngressIntegration_TerminateRuleFailsOver fails a terminate rule
+// without conditions and a passthrough rule with sni_host over to their
+// second target, which receives the client's bytes whole.
+func TestIngressIntegration_TerminateRuleFailsOver(t *testing.T) {
+	t.Run("terminate", func(t *testing.T) {
+		backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+		ctrl := newLoopbackIngressController(t)
+		fx := newIngressFixture(t, ctrl)
+		doc := certPEM(t, "t.example.com", "v1")
+		fx.certs.set("tls", 1, doc)
+		fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+		refusing := targetOn(closedPort(t))
+		rule := terminateRule("term", 443, "t.example.com", "tls", refusing.Port)
+		rule.Targets = []api.IngressTarget{refusing, targetOn(backend.port(t))}
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+
+		conn := dialTerminated(t, ctrl.addr(443), "t.example.com", certPool(t, doc))
+		requireEcho(t, conn, "terminated at the bridge")
+		if got := backend.accepted.Load(); got != 1 {
+			t.Errorf("the second target accepted %d connections, want 1", got)
+		}
+		if got := logLines(fx.logs, `msg="bridge: ingress: dial target failed"`, "slug=term", "target="+addrOf(refusing)+" ", "reason=refused"); got != 1 {
+			t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
+		}
+	})
+
+	t.Run("passthrough with sni_host", func(t *testing.T) {
+		backend := startTLSBackend(t, "p.example.com")
+		ctrl := newLoopbackIngressController(t)
+		fx := newIngressFixture(t, ctrl)
+		refusing := targetOn(closedPort(t))
+		rule := ingressRule("pass", 443, "p.example.com", refusing.Port)
+		rule.Targets = []api.IngressTarget{refusing, targetOn(backend.port(t))}
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+
+		conn, cn := dialTLS(t, ctrl.addr(443), "p.example.com")
+		if cn != "p.example.com" {
+			t.Errorf("the far end presented %q, want the second target's p.example.com", cn)
+		}
+		requireEcho(t, conn, "passed through")
+		if got := backend.accepted.Load(); got != 1 {
+			t.Errorf("the second target accepted %d connections, want 1", got)
+		}
+		if got := logLines(fx.logs, `msg="bridge: ingress: dial target failed"`, "slug=pass", "target="+addrOf(refusing)+" ", "reason=refused"); got != 1 {
+			t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
+		}
+	})
+}

@@ -35,9 +35,11 @@ type IngressRuleReport struct {
 // or not_ready with the overlay's reason for terminate; and for acme,
 // not_ready with the plan's reason when it has one, ready once the ACME
 // manager reports the host issued, and acme_not_issued until then. The dial is
-// the last one a client connection caused to the rule's current target, for a
-// udp rule the last send of a client's datagram that counted as one (see
-// forwardUDP), and none without one.
+// how the rule's last unit ended: succeeded when a target took it, failed
+// with the reason of the last target dialled when none did, and none before
+// the first unit and after a pull that changed the rule's targets. For a udp
+// rule the unit is the last send of a client's datagram that counted as a
+// dial (see forwardUDP).
 func (m *IngressManager) RuleReports() []IngressRuleReport {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -98,11 +100,12 @@ func (m *IngressManager) ruleReportLocked(st IngressRuleState) IngressRuleReport
 		}
 	}
 	r.Dial = api.IngressDialNone
-	// A record of another target belongs to the rule before it changed.
-	if rec, ok := m.dials[st.Rule.ID]; ok && rec.target == ingressTarget(st.Rule) {
-		r.Dial, r.DialReason, r.DialAt = api.IngressDialSucceeded, "", rec.at
-		if rec.failed {
-			r.Dial, r.DialReason = api.IngressDialFailed, rec.reason
+	if b := m.balancers[st.Rule.ID]; b != nil {
+		if unit, _ := b.snapshot(); !unit.at.IsZero() {
+			r.Dial, r.DialAt = api.IngressDialSucceeded, unit.at
+			if unit.failed {
+				r.Dial, r.DialReason = api.IngressDialFailed, unit.reason
+			}
 		}
 	}
 	return r

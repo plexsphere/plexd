@@ -75,13 +75,15 @@ func newNotServedKey(r api.IngressRule, reason string) notServedKey {
 }
 
 // IngressManager serves public ingress: one TCP listener per listen port of the
-// tcp rules of the bridge.ingress block, routing each connection to the target
+// tcp rules of the bridge.ingress block, routing each connection to a target
 // of its rule, and one UDP socket per listen port of its udp rules, forwarding
 // the datagrams of each client address and port on a flow of their own (see
-// serveUDP). A passthrough rule's connection is forwarded unread; a terminate
-// or acme rule's connection ends TLS at the bridge, and the plaintext goes to
-// the target. On a host whose terminate or acme rules have request
-// conditions, one HTTP server reads each request and forwards it to the
+// serveUDP). Each held rule has a balancer that takes the rule's targets by
+// round robin and passes a target whose dial failed over for 30 seconds (see
+// ingressBalancer). A passthrough rule's connection is forwarded unread; a
+// terminate or acme rule's connection ends TLS at the bridge, and the
+// plaintext goes to the target. On a host whose terminate or acme rules have
+// request conditions, one HTTP server reads each request and forwards it to a
 // target of the rule it matches (see serveHTTP). IngressManager is
 // concurrent-safe via mu.
 type IngressManager struct {
@@ -131,9 +133,9 @@ type IngressManager struct {
 	// inventory is the last secret inventory, version by Secret name; nil
 	// until the first SyncSecretInventory.
 	inventory map[string]int
-	certs     map[string]*certEntry    // by the Secret name a held terminate rule names
-	coverage  map[coverageKey]struct{} // the hosts checked against a loaded certificate
-	dials     map[string]dialRecord    // the last dial of each held rule, by rule id
+	certs     map[string]*certEntry       // by the Secret name a held terminate rule names
+	coverage  map[coverageKey]struct{}    // the hosts checked against a loaded certificate
+	balancers map[string]*ingressBalancer // the balancer of each held rule, by rule id
 	// httpSrv reads the requests of every host whose rules have conditions,
 	// from the connections serveConn pushes to httpConns; httpDone is closed
 	// when its Serve returns. All three are set between Setup and Teardown.
@@ -168,7 +170,7 @@ func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, 
 		listeners:        make(map[int]*ingressListener),
 		udp:              make(map[int]*udpIngressListener),
 		certs:            make(map[string]*certEntry),
-		dials:            make(map[string]dialRecord),
+		balancers:        make(map[string]*ingressBalancer),
 		changed:          make(chan struct{}, 1),
 
 		udpUnansweredTimeout: ingressUDPUnansweredTimeout,
@@ -214,10 +216,11 @@ func (m *IngressManager) Setup() error {
 
 // Teardown cancels every route and host, which closes every connection and
 // every udp flow, closes every listener and UDP socket and the HTTP server,
-// and forgets the secret inventory and every certificate. It returns once
-// every accept loop, read loop and reply loop has ended and the HTTP server's
-// Serve has returned. Errors are aggregated; cleanup continues past a failed
-// close. Idempotent: calling Teardown when inactive returns nil.
+// and forgets the secret inventory, every certificate and every rule's
+// balancer. It returns once every accept loop, read loop and reply loop has
+// ended and the HTTP server's Serve has returned. Errors are aggregated;
+// cleanup continues past a failed close. Idempotent: calling Teardown when
+// inactive returns nil.
 func (m *IngressManager) Teardown() error {
 	m.mu.Lock()
 
@@ -249,7 +252,7 @@ func (m *IngressManager) Teardown() error {
 	m.inventory = nil
 	m.certs = make(map[string]*certEntry)
 	m.coverage = nil
-	m.dials = make(map[string]dialRecord)
+	m.balancers = make(map[string]*ingressBalancer)
 	httpSrv, httpDone := m.httpSrv, m.httpDone
 	m.httpSrv, m.httpConns, m.httpDone = nil, nil, nil
 	m.signalReport()
@@ -260,8 +263,8 @@ func (m *IngressManager) Teardown() error {
 	_ = httpSrv.Close()
 	<-httpDone
 
-	// Wait for the accept loops and the read loops outside the lock: a read
-	// loop takes mu to record a dial.
+	// Wait for the accept loops and the read loops outside the lock, so the
+	// status readers do not wait for them.
 	for _, l := range closed {
 		<-l.done
 		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port, "protocol", api.IngressProtocolTCP)
@@ -291,11 +294,15 @@ func (m *IngressManager) Teardown() error {
 // place. A route whose rule is unchanged keeps its context and its connections
 // or flows, and a route with conditions its proxy and target connections;
 // every other route of the last Apply is cancelled, which closes its
-// connections, flows and requests in flight. A host whose rules have
-// conditions keeps its client connections while the port's table holds the
-// host under the same key with conditions, the same mode and the same
-// certificate_secret_name; every other such host is cancelled, which closes
-// them. A failed bind marks the rules of that port and
+// connections, flows and requests in flight. A route whose rule names the
+// same targets in the same order as after the last Apply takes over the
+// rule's balancer, also when another member changed or the rule's port did
+// not bind, so the round-robin position, the hold-outs and the dial records
+// stay; every other route gets a new balancer, every target in and every dial
+// none. A host whose rules have conditions keeps its client connections while
+// the port's table holds the host under the same key with conditions, the
+// same mode and the same certificate_secret_name; every other such host is
+// cancelled, which closes them. A failed bind marks the rules of that port and
 // protocol listen_failed and is retried by the next Apply; the other ports,
 // and the other protocol on the same port number, are served. After the binds
 // it configures the ACME account with the hosts of the acme rules that have
@@ -335,7 +342,9 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 	}
 
 	// Carry the routes of unchanged rules over, with their contexts, and give
-	// every other planned route a new one.
+	// every other planned route a new one. The balancer goes by the targets
+	// alone: a rule keeps the balancer of the last Apply whenever they are
+	// unchanged, also when its port did not bind then.
 	current := make(map[string]*ingressRoute)
 	for _, l := range m.listeners {
 		for _, r := range l.table.Load().routes() {
@@ -347,7 +356,14 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 		current[r.rule.ID] = r
 	}
 	carried := make(map[*ingressRoute]struct{})
+	balancers := make(map[string]*ingressBalancer)
 	carry := func(r *ingressRoute) {
+		if lb := m.balancers[r.rule.ID]; lb != nil && lb.balances(r.rule.Targets) {
+			r.lb = lb
+		} else {
+			r.lb = newIngressBalancer(r.rule.Targets)
+		}
+		balancers[r.rule.ID] = r.lb
 		if old, ok := current[r.rule.ID]; ok && old.rule.Equal(r.rule) {
 			r.ctx, r.cancel, r.proxy = old.ctx, old.cancel, old.proxy
 			carried[old] = struct{}{}
@@ -511,19 +527,15 @@ func (m *IngressManager) Apply(ctx context.Context, block api.IngressConfig) err
 
 	m.logRuleChanges(plan.states)
 	m.states = plan.states
-	// Only a held rule has a route that dials, so the records stay within
+	// Only a held rule has a route that dials, so the balancers stay within
 	// bridge.max_ingress_rules.
-	for id := range m.dials {
-		if _, ok := m.held[id]; !ok {
-			delete(m.dials, id)
-		}
-	}
+	m.balancers = balancers
 	m.signalReport()
 	m.mu.Unlock()
 
 	// Wait for the accept loops of closed listeners and the read loops of
-	// closed UDP sockets outside the lock: a read loop takes mu to record a
-	// dial.
+	// closed UDP sockets outside the lock, so the status readers do not wait
+	// for them.
 	for _, l := range closed {
 		<-l.done
 		m.logger.Info("ingress listener closed", "component", "bridge", "listen_port", l.port, "protocol", api.IngressProtocolTCP)
@@ -587,9 +599,14 @@ func (m *IngressManager) logRuleChanges(states []IngressRuleState) {
 	m.notServed = notServed
 }
 
-// logRule logs a held rule. Of its header conditions it logs the names, never
-// a value: a value can be a routing token.
+// logRule logs a held rule, its targets as their addresses joined by commas
+// in list order. Of its header conditions it logs the names, never a value: a
+// value can be a routing token.
 func (m *IngressManager) logRule(msg string, r api.IngressRule) {
+	addrs := make([]string, len(r.Targets))
+	for i, t := range r.Targets {
+		addrs[i] = net.JoinHostPort(t.Address, strconv.Itoa(t.Port))
+	}
 	names := make([]string, len(r.Conditions.Headers))
 	for i, h := range r.Conditions.Headers {
 		names[i] = h.Name
@@ -602,7 +619,7 @@ func (m *IngressManager) logRule(msg string, r api.IngressRule) {
 		"listen_port", r.ListenPort,
 		"mode", r.Mode,
 		"sni_host", r.SNIHost,
-		"target", net.JoinHostPort(r.TargetAddress, strconv.Itoa(r.TargetPort)),
+		"targets", strings.Join(addrs, ","),
 		"path_prefix", r.Conditions.PathPrefix,
 		"header_names", strings.Join(names, ","),
 		"strip_path_prefix", r.StripPathPrefix,
@@ -854,14 +871,12 @@ func (m *IngressManager) logClosed(l *ingressListener, conn net.Conn, serverName
 	)
 }
 
-// proxy dials the route's target, records the dial's outcome, replays the
-// peeked bytes to the target, and copies both ways until one side ends or the
-// route is cancelled.
+// proxy dials a target of the route for the client (see dialUnit), replays
+// the peeked bytes to it, and copies both ways until one side ends or the
+// route is cancelled. When no target takes the client, the caller closes it.
 func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []byte) {
-	target, err := m.dialTarget(route)
-	reason, _ := m.recordDial(route, err)
+	target, err := m.dialUnit(route)
 	if err != nil {
-		m.logDialFailed(route, reason, err)
 		return
 	}
 
@@ -892,15 +907,15 @@ func (m *IngressManager) proxy(route *ingressRoute, client net.Conn, peeked []by
 	<-targetToClient
 }
 
-// logDialFailed logs a failed dial to route's target, with the reason
-// recordDial gave it when it gave one.
-func (m *IngressManager) logDialFailed(route *ingressRoute, reason string, err error) {
+// logDialFailed logs a failed dial to addr, a target of route, with the
+// reason recordDial gave it when it gave one.
+func (m *IngressManager) logDialFailed(route *ingressRoute, addr, reason string, err error) {
 	attrs := []any{
 		"component", "bridge",
 		"rule_id", route.rule.ID,
 		"slug", route.rule.Slug,
 		"protocol", route.rule.Protocol,
-		"target", route.target,
+		"target", addr,
 	}
 	if reason != "" {
 		attrs = append(attrs, "reason", reason)
