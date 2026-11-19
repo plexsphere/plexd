@@ -382,21 +382,32 @@ func (m *IngressManager) renewRoutesLocked(affected func(api.IngressRule) bool) 
 		old = append(old, r)
 		return fresh
 	}
+	isAffected := func(r *ingressRoute) bool { return affected(r.rule) }
+	renewHost := func(h *ingressHost) *ingressHost {
+		if !slices.ContainsFunc(h.routes, isAffected) {
+			return h
+		}
+		fresh := &ingressHost{routes: make([]*ingressRoute, len(h.routes)), http: h.http}
+		for i, r := range h.routes {
+			fresh.routes[i] = renew(r)
+		}
+		return fresh
+	}
 	for _, l := range m.sortedListeners() {
 		t := l.table.Load()
-		if !slices.ContainsFunc(t.routes(), func(r *ingressRoute) bool { return affected(r.rule) }) {
+		if !slices.ContainsFunc(t.routes(), isAffected) {
 			continue
 		}
 		nt := &ingressTable{
 			plain:    renew(t.plain),
-			exact:    make(map[string]*ingressRoute, len(t.exact)),
-			wildcard: make(map[string]*ingressRoute, len(t.wildcard)),
+			exact:    make(map[string]*ingressHost, len(t.exact)),
+			wildcard: make(map[string]*ingressHost, len(t.wildcard)),
 		}
-		for k, r := range t.exact {
-			nt.exact[k] = renew(r)
+		for k, h := range t.exact {
+			nt.exact[k] = renewHost(h)
 		}
-		for k, r := range t.wildcard {
-			nt.wildcard[k] = renew(r)
+		for k, h := range t.wildcard {
+			nt.wildcard[k] = renewHost(h)
 		}
 		l.table.Store(nt)
 	}

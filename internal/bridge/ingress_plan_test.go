@@ -1,6 +1,8 @@
 package bridge
 
 import (
+	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -78,6 +80,11 @@ func TestPlanIngress_ReasonPerCheck(t *testing.T) {
 		{name: "acme is held", edit: func(r *api.IngressRule) { r.Mode = api.IngressModeACME }},
 		{name: "sni host of 253 bytes is served", edit: func(r *api.IngressRule) { r.SNIHost = hostOfLen(253) }},
 		{name: "wildcard host is served", edit: func(r *api.IngressRule) { r.SNIHost = "*.example.com" }},
+		{name: "passthrough with conditions", edit: func(r *api.IngressRule) { r.Conditions.PathPrefix = "/api" }, reason: IngressReasonInvalid, detail: "conditions"},
+		{name: "terminate with a path prefix api", edit: withConditions("api"), reason: IngressReasonInvalid, detail: "conditions.path_prefix"},
+		{name: "terminate with the header name Host", edit: withConditions("/api", "Host", "x"), reason: IngressReasonInvalid, detail: "conditions.headers"},
+		{name: "terminate with strip_path_prefix and no prefix", edit: func(r *api.IngressRule) { withConditions("")(r); r.StripPathPrefix = true }, reason: IngressReasonInvalid, detail: "strip_path_prefix"},
+		{name: "terminate with conditions is held", edit: withConditions("/api", "x-a", "1")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := planRule("web", 443, "web.example.com")
@@ -109,6 +116,335 @@ func terminateNamed(name string) func(*api.IngressRule) {
 	return func(r *api.IngressRule) {
 		r.Mode = api.IngressModeTerminate
 		r.CertificateSecretName = name
+	}
+}
+
+// withConditions makes a rule a terminate rule of the Secret tls with the path
+// prefix and the header conditions, given as name, value pairs.
+func withConditions(prefix string, nameValues ...string) func(*api.IngressRule) {
+	return func(r *api.IngressRule) {
+		terminateNamed("tls")(r)
+		r.Conditions = api.IngressConditions{PathPrefix: prefix}
+		for i := 0; i+1 < len(nameValues); i += 2 {
+			r.Conditions.Headers = append(r.Conditions.Headers, api.IngressHeaderCondition{Name: nameValues[i], Value: nameValues[i+1]})
+		}
+	}
+}
+
+// condRule returns a terminate rule of the Secret tls for host on port 443
+// with the path prefix and the header conditions, given as name, value pairs.
+func condRule(slug, host, prefix string, nameValues ...string) api.IngressRule {
+	r := planRule(slug, 443, host)
+	withConditions(prefix, nameValues...)(&r)
+	return r
+}
+
+// headersOf returns n header conditions x-0: v to x-<n-1>: v.
+func headersOf(n int) []api.IngressHeaderCondition {
+	out := make([]api.IngressHeaderCondition, n)
+	for i := range out {
+		out[i] = api.IngressHeaderCondition{Name: "x-" + string(rune('a'+i)), Value: "v"}
+	}
+	return out
+}
+
+func TestPlanIngress_ConditionsGrammar(t *testing.T) {
+	setHeaders := func(h ...api.IngressHeaderCondition) func(*api.IngressRule) {
+		return func(r *api.IngressRule) { r.Conditions.Headers = h }
+	}
+	header := func(name, value string) api.IngressHeaderCondition {
+		return api.IngressHeaderCondition{Name: name, Value: value}
+	}
+	setPrefix := func(p string) func(*api.IngressRule) {
+		return func(r *api.IngressRule) { r.Conditions.PathPrefix = p }
+	}
+	for _, tc := range []struct {
+		name   string
+		rule   api.IngressRule
+		edit   func(*api.IngressRule)
+		detail string // empty for a rule that is held
+	}{
+		{name: "conditions on a tcp passthrough rule", rule: planRule("web", 443, "web.example.com"), edit: setPrefix("/api"), detail: "conditions"},
+		{name: "a header condition on a tcp passthrough rule", rule: planRule("web", 443, "web.example.com"), edit: setHeaders(header("x-a", "1")), detail: "conditions"},
+		{name: "conditions on a udp rule", rule: udpPlanRule("dns", 53), edit: setPrefix("/api"), detail: "conditions"},
+
+		{name: "prefix api", rule: condRule("web", "web.example.com", ""), edit: setPrefix("api"), detail: "conditions.path_prefix"},
+		{name: "prefix /api/", rule: condRule("web", "web.example.com", ""), edit: setPrefix("/api/"), detail: "conditions.path_prefix"},
+		{name: "prefix //", rule: condRule("web", "web.example.com", ""), edit: setPrefix("//"), detail: "conditions.path_prefix"},
+		{name: "prefix /a/../b", rule: condRule("web", "web.example.com", ""), edit: setPrefix("/a/../b"), detail: "conditions.path_prefix"},
+		{name: "prefix /a b", rule: condRule("web", "web.example.com", ""), edit: setPrefix("/a b"), detail: "conditions.path_prefix"},
+		{name: "prefix /a%20b", rule: condRule("web", "web.example.com", ""), edit: setPrefix("/a%20b"), detail: "conditions.path_prefix"},
+		{name: "prefix /a?b", rule: condRule("web", "web.example.com", ""), edit: setPrefix("/a?b"), detail: "conditions.path_prefix"},
+		{name: "prefix of 1025 bytes", rule: condRule("web", "web.example.com", ""), edit: setPrefix("/" + strings.Repeat("a", 1024)), detail: "conditions.path_prefix"},
+
+		{name: "9 headers", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(headersOf(9)...), detail: "conditions.headers"},
+		{name: "an empty header name", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("", "1")), detail: "conditions.headers"},
+		{name: "the header name X-A", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("X-A", "1")), detail: "conditions.headers"},
+		{name: "the header name host", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("host", "web.example.com")), detail: "conditions.headers"},
+		{name: "the header name a b", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("a b", "1")), detail: "conditions.headers"},
+		{name: "a header name of 65 characters", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header(strings.Repeat("x", 65), "1")), detail: "conditions.headers"},
+		{name: "the header name x-a twice", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", "1"), header("x-a", "2")), detail: "conditions.headers"},
+		{name: "an empty header value", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", "")), detail: "conditions.headers"},
+		{name: "a header value with a leading space", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", " v")), detail: "conditions.headers"},
+		{name: "a header value with a trailing space", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", "v ")), detail: "conditions.headers"},
+		{name: "a header value of 257 bytes", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", strings.Repeat("v", 257))), detail: "conditions.headers"},
+		{name: "a header value with 0x7F", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", "v\x7f")), detail: "conditions.headers"},
+
+		{name: "strip without a prefix", rule: condRule("web", "web.example.com", ""), edit: func(r *api.IngressRule) { r.StripPathPrefix = true }, detail: "strip_path_prefix"},
+		{name: "strip with headers only", rule: condRule("web", "web.example.com", "", "x-a", "1"), edit: func(r *api.IngressRule) { r.StripPathPrefix = true }, detail: "strip_path_prefix"},
+		{name: "strip with the prefix /", rule: condRule("web", "web.example.com", "/"), edit: func(r *api.IngressRule) { r.StripPathPrefix = true }, detail: "strip_path_prefix"},
+
+		{name: "the prefix / is held", rule: condRule("web", "web.example.com", "/"), edit: func(*api.IngressRule) {}},
+		{name: "the prefix /api is held", rule: condRule("web", "web.example.com", "/api"), edit: func(*api.IngressRule) {}},
+		{name: "the prefix /a.b/c~d is held", rule: condRule("web", "web.example.com", "/a.b/c~d"), edit: func(*api.IngressRule) {}},
+		{name: "a prefix of 1024 bytes is held", rule: condRule("web", "web.example.com", "/"+strings.Repeat("a", 1023)), edit: func(*api.IngressRule) {}},
+		{name: "8 headers are held", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(headersOf(8)...)},
+		{name: "headers without a prefix are held", rule: condRule("web", "web.example.com", "", "x-a", "1"), edit: func(*api.IngressRule) {}},
+		{name: "a header name of 64 token characters is held", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("!#$%&'*+-.^_`|~0"+strings.Repeat("z", 48), "1"))},
+		{name: "a header value of 256 printable bytes is held", rule: condRule("web", "web.example.com", "/api"), edit: setHeaders(header("x-a", "!"+strings.Repeat(" ~", 127)+"!"))},
+		{name: "strip with the prefix /api is held", rule: condRule("web", "web.example.com", "/api"), edit: func(r *api.IngressRule) { r.StripPathPrefix = true }},
+		{name: "an empty header list is no condition", rule: planRule("web", 443, "web.example.com"), edit: setHeaders()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.rule
+			tc.edit(&r)
+			plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+			st := plan.states[0]
+			if tc.detail == "" {
+				if !st.held || !st.Served || st.Reason != "" {
+					t.Errorf("state = %+v, want held and served", st)
+				}
+				return
+			}
+			if st.held || st.Reason != IngressReasonInvalid || st.Detail != tc.detail {
+				t.Errorf("reason, detail = %q, %q, want %q, %q", st.Reason, st.Detail, IngressReasonInvalid, tc.detail)
+			}
+		})
+	}
+
+	t.Run("an empty header list reads nil in the state", func(t *testing.T) {
+		r := condRule("web", "web.example.com", "/api")
+		r.Conditions.Headers = []api.IngressHeaderCondition{}
+		plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+		if got := plan.states[0].Rule.Conditions.Headers; got != nil {
+			t.Errorf("state Headers = %#v, want nil", got)
+		}
+	})
+}
+
+// TestPlanIngress_SharedHost holds rules that share a port and host by their
+// conditions and refuses the rules the control plane's terms leave out.
+func TestPlanIngress_SharedHost(t *testing.T) {
+	t.Run("three rules of one Secret on one host", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{
+			condRule("web", "shop.example.com", "/"),
+			condRule("api", "shop.example.com", "/api"),
+			condRule("beta", "shop.example.com", "/api", "x-beta", "1"),
+		}, 20, acmeAvailability{})
+		for _, st := range plan.states {
+			if !st.held || !st.Served || st.Reason != "" {
+				t.Errorf("rule %s = %+v, want held and served", st.Rule.Slug, st)
+			}
+		}
+		host := plan.tables[443].exact["shop.example.com"]
+		if host == nil || !host.http || len(host.routes) != 3 {
+			t.Fatalf("host = %+v, want an http host with three routes", host)
+		}
+		if got := len(plan.tables[443].routes()); got != 3 {
+			t.Errorf("table routes = %d, want 3", got)
+		}
+	})
+
+	t.Run("a rule with conditions alone is an http host", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{condRule("api", "shop.example.com", "/api")}, 20, acmeAvailability{})
+		if host := plan.tables[443].exact["shop.example.com"]; host == nil || !host.http {
+			t.Errorf("host = %+v, want an http host", host)
+		}
+	})
+
+	t.Run("a rule without conditions is no http host", func(t *testing.T) {
+		r := planRule("term", 443, "shop.example.com")
+		terminateNamed("tls")(&r)
+		plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
+		if host := plan.tables[443].exact["shop.example.com"]; host == nil || host.http {
+			t.Errorf("host = %+v, want a host that forwards bytes", host)
+		}
+	})
+
+	t.Run("a wildcard host shared by two rules", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{
+			condRule("a", "*.example.com", "/a"),
+			condRule("b", "*.example.com", "/b"),
+		}, 20, acmeAvailability{})
+		if host := plan.tables[443].wildcard["example.com"]; host == nil || !host.http || len(host.routes) != 2 {
+			t.Errorf("wildcard host = %+v, want an http host with two routes", host)
+		}
+	})
+
+	noConditions := planRule("plainhost", 443, "shop.example.com")
+	terminateNamed("tls")(&noConditions)
+	acmeWith := condRule("acmehost", "shop.example.com", "/acme")
+	acmeWith.Mode, acmeWith.CertificateSecretName = api.IngressModeACME, ""
+	otherSecret := condRule("other", "shop.example.com", "/other")
+	otherSecret.CertificateSecretName = "tls-other"
+	for _, tc := range []struct {
+		name   string
+		rules  []api.IngressRule // the last one is checked
+		detail string
+	}{
+		{name: "a rule without conditions on a host a rule with conditions holds", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), condRule("second", "shop.example.com", "/"), noConditions}, detail: "first"},
+		{name: "a rule with conditions on a host a rule without conditions holds", rules: []api.IngressRule{noConditions, condRule("api", "shop.example.com", "/api")}, detail: "plainhost"},
+		{name: "a passthrough rule on a host rules with conditions hold", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), planRule("pass", 443, "shop.example.com")}, detail: "first"},
+		{name: "a rule of another mode", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), condRule("second", "shop.example.com", "/"), acmeWith}, detail: "first"},
+		{name: "a terminate rule naming another Secret", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), condRule("second", "shop.example.com", "/"), otherSecret}, detail: "first"},
+		{name: "the same conditions", rules: []api.IngressRule{condRule("first", "shop.example.com", "/"), condRule("api", "shop.example.com", "/api", "x-a", "1"), condRule("dup", "shop.example.com", "/api", "x-a", "1")}, detail: "api"},
+		{name: "the same headers in another order", rules: []api.IngressRule{condRule("first", "shop.example.com", "/"), condRule("api", "shop.example.com", "/api", "x-a", "1", "x-b", "2"), condRule("dup", "shop.example.com", "/api", "x-b", "2", "x-a", "1")}, detail: "api"},
+		{name: "the prefix / against an empty prefix", rules: []api.IngressRule{condRule("api", "shop.example.com", "/api"), condRule("root", "shop.example.com", "/", "x-a", "1"), condRule("dup", "shop.example.com", "", "x-a", "1")}, detail: "root"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := planIngress(tc.rules, 20, acmeAvailability{})
+			st := plan.states[len(plan.states)-1]
+			if st.held || st.Reason != IngressReasonListenerConflict || st.Detail != tc.detail {
+				t.Errorf("rule %s = %+v, want %q held by %s", st.Rule.Slug, st, IngressReasonListenerConflict, tc.detail)
+			}
+			for _, earlier := range plan.states[:len(plan.states)-1] {
+				if !earlier.held {
+					t.Errorf("rule %s = %+v, want held", earlier.Rule.Slug, earlier)
+				}
+			}
+		})
+	}
+
+	t.Run("rules sharing a host count toward the bound", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{
+			condRule("a", "shop.example.com", "/a"),
+			condRule("b", "shop.example.com", "/b"),
+			condRule("c", "shop.example.com", "/c"),
+		}, 2, acmeAvailability{})
+		if st := plan.states[2]; st.Reason != IngressReasonMaxRules {
+			t.Errorf("third rule = %+v, want %q", st, IngressReasonMaxRules)
+		}
+		if host := plan.tables[443].exact["shop.example.com"]; host == nil || len(host.routes) != 2 {
+			t.Errorf("host = %+v, want two routes", host)
+		}
+	})
+}
+
+func TestPlanIngress_Precedence(t *testing.T) {
+	rules := []api.IngressRule{
+		condRule("z-root", "shop.example.com", "", "x-z", "1"),
+		condRule("api", "shop.example.com", "/api"),
+		condRule("api-one", "shop.example.com", "/api", "x-a", "1"),
+		condRule("v1", "shop.example.com", "/api/v1"),
+		condRule("a-root", "shop.example.com", "/", "x-y", "1"),
+		condRule("api-two", "shop.example.com", "/api", "x-a", "1", "x-b", "2"),
+	}
+	plan := planIngress(rules, 20, acmeAvailability{})
+	host := plan.tables[443].exact["shop.example.com"]
+	if host == nil {
+		t.Fatal("no host shop.example.com")
+	}
+	var got []string
+	for _, r := range host.routes {
+		got = append(got, r.rule.Slug)
+	}
+	want := []string{"v1", "api-two", "api-one", "api", "a-root", "z-root"}
+	if !slices.Equal(got, want) {
+		t.Errorf("routes = %v, want %v", got, want)
+	}
+	if lead := host.lead().rule.Slug; lead != "v1" {
+		t.Errorf("lead = %s, want v1", lead)
+	}
+
+	// Slugs are unique within a bridge; two equal ones fall back to the id.
+	a, b := condRule("same", "shop.example.com", "/a"), condRule("same", "shop.example.com", "/b")
+	a.ID, b.ID = "id-2", "id-1"
+	ra, rb := &ingressRoute{rule: a}, &ingressRoute{rule: b}
+	if comparePrecedence(rb, ra) >= 0 {
+		t.Error("of two routes with one slug and prefixes of one length, the lower id does not come first")
+	}
+}
+
+func TestIngressHost_Route(t *testing.T) {
+	hostOf := func(rules ...api.IngressRule) *ingressHost {
+		plan := planIngress(rules, 20, acmeAvailability{})
+		return plan.tables[443].exact["shop.example.com"]
+	}
+	slugOf := func(r *ingressRoute) string {
+		if r == nil {
+			return ""
+		}
+		return r.rule.Slug
+	}
+	hdr := func(kv ...string) http.Header {
+		h := http.Header{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			h.Add(kv[i], kv[i+1])
+		}
+		return h
+	}
+
+	prefix := hostOf(condRule("api", "shop.example.com", "/api"))
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{path: "/api", want: "api"},
+		{path: "/api/users", want: "api"},
+		{path: "/api/", want: "api"},
+		{path: "/apix"},
+		{path: "/API"},
+		{path: "/"},
+		{path: "/ap"},
+	} {
+		if got := slugOf(prefix.route(tc.path, http.Header{})); got != tc.want {
+			t.Errorf("prefix /api: route(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+
+	for _, p := range []string{"", "/"} {
+		every := hostOf(condRule("all", "shop.example.com", p, "x-a", "1"))
+		for _, path := range []string{"/", "/api", "/x/y/z", "*"} {
+			if got := slugOf(every.route(path, hdr("X-A", "1"))); got != "all" {
+				t.Errorf("prefix %q: route(%q) = %q, want all", p, path, got)
+			}
+		}
+	}
+
+	headers := hostOf(condRule("tenant", "shop.example.com", "/api", "x-tenant", "acme"))
+	for _, tc := range []struct {
+		name string
+		hdr  http.Header
+		want string
+	}{
+		{name: "the value", hdr: hdr("X-Tenant", "acme"), want: "tenant"},
+		{name: "a second field line of the name", hdr: hdr("X-Tenant", "other", "X-Tenant", "acme"), want: "tenant"},
+		{name: "a name in another case", hdr: http.Header{"X-TENANT": {"acme"}}, want: "tenant"},
+		{name: "another value", hdr: hdr("X-Tenant", "other")},
+		{name: "a value in another case", hdr: hdr("X-Tenant", "ACME")},
+		{name: "a list a, b for a", hdr: hdr("X-Tenant", "acme, other")},
+		{name: "no field", hdr: http.Header{}},
+	} {
+		h := tc.hdr
+		// A server canonicalizes request field names; a test header built by
+		// hand in another case stands for a client that sent that case.
+		for k, v := range h {
+			if c := http.CanonicalHeaderKey(k); c != k {
+				delete(h, k)
+				h[c] = v
+			}
+		}
+		if got := slugOf(headers.route("/api", h)); got != tc.want {
+			t.Errorf("header x-tenant: acme, %s: route = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	none := hostOf(condRule("a", "shop.example.com", "/a"), condRule("b", "shop.example.com", "/b", "x-b", "1"))
+	if got := none.route("/c", hdr("X-B", "1")); got != nil {
+		t.Errorf("a host none of whose routes match: route = %q, want nil", slugOf(got))
+	}
+	if got := slugOf(none.route("/b/x", hdr("X-B", "1"))); got != "b" {
+		t.Errorf("route(/b/x) = %q, want b", got)
 	}
 }
 
@@ -195,9 +531,9 @@ func TestPlanIngress_Protocol(t *testing.T) {
 		if st.Rule.Protocol != api.IngressProtocolTCP {
 			t.Errorf("state Rule.Protocol = %q, want %q", st.Rule.Protocol, api.IngressProtocolTCP)
 		}
-		route := plan.tables[443].exact["web.example.com"]
-		if route == nil || route.rule.Protocol != api.IngressProtocolTCP {
-			t.Errorf("route = %+v, want one under web.example.com whose rule reads %q", route, api.IngressProtocolTCP)
+		host := plan.tables[443].exact["web.example.com"]
+		if host == nil || host.lead().rule.Protocol != api.IngressProtocolTCP {
+			t.Errorf("host = %+v, want one under web.example.com whose rule reads %q", host, api.IngressProtocolTCP)
 		}
 		if len(plan.udp) != 0 {
 			t.Errorf("plan.udp = %+v, want empty", plan.udp)
@@ -390,7 +726,7 @@ func TestPlanIngress_EmptyAndTerminateBlocks(t *testing.T) {
 	if st := plan.states[0]; !st.held || !st.Served || st.Reason != "" {
 		t.Errorf("terminate rule = %+v, want held and served by the plan", st)
 	}
-	if route := plan.tables[8443].exact["term.example.com"]; !route.served {
+	if route := plan.tables[8443].exact["term.example.com"].lead(); !route.served {
 		t.Error("the terminate rule's route is not served")
 	}
 }
@@ -401,10 +737,11 @@ func TestPlanIngress_HostCaseAndIPv6Target(t *testing.T) {
 	r.TargetPort = 8443
 	plan := planIngress([]api.IngressRule{r}, 20, acmeAvailability{})
 
-	route := plan.tables[443].exact["api.example.com"]
-	if route == nil {
-		t.Fatalf("no route under api.example.com, table = %+v", plan.tables[443])
+	host := plan.tables[443].exact["api.example.com"]
+	if host == nil {
+		t.Fatalf("no host api.example.com, table = %+v", plan.tables[443])
 	}
+	route := host.lead()
 	if route.target != "[fd00::7]:8443" {
 		t.Errorf("target = %q, want %q", route.target, "[fd00::7]:8443")
 	}
@@ -417,6 +754,8 @@ func TestIngressTable_Match(t *testing.T) {
 	plan := planIngress([]api.IngressRule{
 		planRule("api", 443, "api.example.com"),
 		planRule("wild", 443, "*.example.com"),
+		condRule("shop-web", "shop.example.com", "/"),
+		condRule("shop-api", "shop.example.com", "/api"),
 	}, 20, acmeAvailability{})
 	tbl := plan.tables[443]
 
@@ -428,18 +767,22 @@ func TestIngressTable_Match(t *testing.T) {
 		{name: "API.example.com", want: "api"},
 		{name: "a.example.com", want: "wild"},
 		{name: "A.EXAMPLE.COM", want: "wild"},
+		{name: "Shop.Example.Com", want: "shop-api"}, // the lead route of the shared host
 		{name: "example.com"},
 		{name: "a.b.example.com"},
 		{name: ".example.com"},
 		{name: ""},
 	} {
 		var got string
-		if r := tbl.match(tc.name); r != nil {
-			got = r.rule.Slug
+		if h := tbl.match(tc.name); h != nil {
+			got = h.lead().rule.Slug
 		}
 		if got != tc.want {
 			t.Errorf("match(%q) = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+	if h := tbl.match("shop.example.com"); h == nil || len(h.routes) != 2 || !h.http {
+		t.Errorf("match(shop.example.com) = %+v, want the http host with both routes", h)
 	}
 }
 
@@ -495,8 +838,8 @@ func TestPlanIngress_ACMERuleWithAReason(t *testing.T) {
 	if st := plan.states[1]; st.Reason != IngressReasonListenerConflict || st.Detail != "acme" {
 		t.Errorf("passthrough rule on the acme rule's host = %+v, want %q held by acme", st, IngressReasonListenerConflict)
 	}
-	if route := plan.tables[8443].exact["acme.example.com"]; route == nil || route.served {
-		t.Errorf("route of the acme rule = %+v, want one that is not served", route)
+	if host := plan.tables[8443].exact["acme.example.com"]; host == nil || host.lead().served {
+		t.Errorf("host of the acme rule = %+v, want one whose route is not served", host)
 	}
 
 	ctrl := newLoopbackIngressController(t)
@@ -574,8 +917,8 @@ func TestPlanIngress_ChallengePort(t *testing.T) {
 			if st.Served || !st.held || st.Reason != IngressReasonACMEChallengePortTaken || st.Detail != tc.holder.Slug {
 				t.Errorf("acme rule = %+v, want held, not served, %q by %s", st, IngressReasonACMEChallengePortTaken, tc.holder.Slug)
 			}
-			if route := plan.tables[8443].exact["acme.example.com"]; route == nil || route.served {
-				t.Errorf("route of the acme rule = %+v, want one that is not served", route)
+			if host := plan.tables[8443].exact["acme.example.com"]; host == nil || host.lead().served {
+				t.Errorf("host of the acme rule = %+v, want one whose route is not served", host)
 			}
 			if !plan.states[1].Served {
 				t.Errorf("rule %s = %+v, want served", tc.holder.Slug, plan.states[1])
@@ -591,6 +934,37 @@ func TestPlanIngress_ChallengePort(t *testing.T) {
 		}
 		if tbl := plan.tables[acmeChallengePort]; tbl == nil || tbl.exact["acme.example.com"] == nil {
 			t.Errorf("table of 443 = %+v, want the acme rule's", tbl)
+		}
+	})
+
+	t.Run("two acme rules with conditions on one host", func(t *testing.T) {
+		withPrefix := func(slug, prefix string) api.IngressRule {
+			r := acmePlanRule(slug, 8443, "acme.example.com")
+			r.Conditions.PathPrefix = prefix
+			return r
+		}
+		rules := []api.IngressRule{withPrefix("acme-api", "/api"), withPrefix("acme-web", "/")}
+		plan := planIngress(rules, 20, acmeAvailability{})
+		for _, st := range plan.states {
+			if !st.held || !st.Served || st.Reason != "" {
+				t.Errorf("rule %s = %+v, want held and served", st.Rule.Slug, st)
+			}
+		}
+		if host := plan.tables[8443].exact["acme.example.com"]; host == nil || !host.http || len(host.routes) != 2 {
+			t.Errorf("host = %+v, want an http host with two routes", host)
+		}
+
+		pass := planRule("pass", 443, "acme.example.com")
+		plan = planIngress(append(rules, pass), 20, acmeAvailability{})
+		for _, st := range plan.states[:2] {
+			if st.Served || !st.held || st.Reason != IngressReasonACMEChallengePortTaken || st.Detail != "pass" {
+				t.Errorf("rule %s = %+v, want held, not served, %q by pass", st.Rule.Slug, st, IngressReasonACMEChallengePortTaken)
+			}
+		}
+		for _, r := range plan.tables[8443].exact["acme.example.com"].routes {
+			if r.served {
+				t.Errorf("route %s is served, want not", r.rule.Slug)
+			}
 		}
 	})
 
