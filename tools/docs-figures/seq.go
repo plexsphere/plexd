@@ -49,12 +49,21 @@ func masked(n *node) *node {
 }
 
 // msg draws a message from participant a to participant b with its
-// label above the arrow.
+// label above the arrow. The label is centred on the arrow, unless the
+// arrow passes over another participant's lifeline: then the label is
+// centred in the gap between the sender's lifeline and the next
+// lifeline toward the receiver, not on the lifeline the arrow passes.
 func (s *seq) msg(k arrowKind, a, b int, lines ...Line) {
 	xa, xb := s.xs[a], s.xs[b]
 	var lbl *node
 	if len(lines) > 0 {
 		cx := (xa + xb) / 2
+		switch {
+		case b > a+1:
+			cx = (xa + s.xs[a+1]) / 2
+		case b < a-1:
+			cx = (xa + s.xs[a-1]) / 2
+		}
 		lbl = masked(s.f.text(cx, s.y, "center", lines...))
 	}
 	y := s.y + 8
