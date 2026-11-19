@@ -131,7 +131,7 @@ The reconciliation loop (`reconcile.interval`, default 60s) ensures that the loc
 
 Each reconciliation cycle:
 
-1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`). A `null` block means "not populated".
+1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, `signing_key`, `hooks`, `dns`). A `null` block means "not populated".
 2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted. The merged `policy` block is applied on this step too, by the [policy dispatch handler](/reference/networking/network-policy#dispatchhandler): plexd rebuilds the firewall rules when the block is not the ruleset it installed, so a block it could not apply is applied again on every pull.
 3. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, and per-block change flags for policy, bridge, and the state/reports buckets. `executions` is a queue rather than desired state, so it is neither stored nor diffed.
 4. **Apply corrections** for any detected drift:

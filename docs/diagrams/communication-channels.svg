@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1166" height="1462" viewBox="0 0 1166 1462" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The channels plexd opens to the control plane">
+<svg xmlns="http://www.w3.org/2000/svg" width="1166" height="1481" viewBox="0 0 1166 1481" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The channels plexd opens to the control plane">
 <title>The channels plexd opens to the control plane</title>
-<rect width="1166" height="1462" fill="#F6F5F1"/>
-<rect x="40" y="1234" width="1086" height="188" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
-<rect x="40" y="993" width="1086" height="215" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<rect width="1166" height="1481" fill="#F6F5F1"/>
+<rect x="40" y="1253" width="1086" height="188" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
+<rect x="40" y="993" width="1086" height="234" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
 <rect x="40" y="747" width="1086" height="220" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
 <rect x="40" y="462" width="1086" height="259" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
 <rect x="40" y="129" width="1086" height="307" rx="12" fill="#EEF0F3" stroke="#7D8794" stroke-width="2"/>
@@ -12,8 +12,8 @@
 <rect x="639" y="40" width="162" height="65" rx="8" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
 <text x="720" y="69.3" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">Plexsphere</text>
 <text x="720" y="90.45" font-size="17" fill="#55606E" text-anchor="middle">Control Plane</text>
-<polyline points="170,105 170,1422" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
-<polyline points="720,105 720,1422" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="170,105 170,1441" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
+<polyline points="720,105 720,1441" fill="none" stroke="#7D8794" stroke-width="1.5" stroke-dasharray="6 4.5"/>
 <text x="463" y="162" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Registration (one-time)</text>
 <ellipse cx="309" cy="155" rx="14" ry="14" fill="#17202B"/>
 <text x="309" y="160.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">1</text>
@@ -44,8 +44,8 @@
 <polygon points="170,609 183,603 183,615" fill="#B38A00"/>
 <rect x="736" y="629" width="370" height="78" rx="8" fill="#FDFCF9" stroke="#7D8794" stroke-width="2"/>
 <text x="750" y="654.2" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">node_state_updated, policy_updated,</text>
-<text x="750" y="673.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">bridge_config_updated, rotate_keys,</text>
-<text x="750" y="692.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">signing_key_rotated, ...</text>
+<text x="750" y="673.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">action_request, session_setup,</text>
+<text x="750" y="692.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E">bridge_config_updated, ...</text>
 <text x="463" y="780" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Heartbeat (every 30s)</text>
 <ellipse cx="317" cy="773" rx="14" ry="14" fill="#17202B"/>
 <text x="317" y="778.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">3</text>
@@ -65,23 +65,24 @@
 <text x="445" y="1062.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">GET /v1/nodes/{id}/state</text>
 <polyline points="170,1073 711,1073" fill="none" stroke="#2457C5" stroke-width="2.5"/>
 <polygon points="720,1073 707,1079 707,1067" fill="#2457C5"/>
-<text x="445" y="1108.5" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{peers, reachability, policy,</text>
-<text x="445" y="1127.7" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">bridge, state, reports}</text>
-<polyline points="720,1138 170,1138" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
-<polyline points="183,1132 170,1138 183,1144" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polyline points="170,1162 206,1162 206,1190 179,1190" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="170,1190 183,1184 183,1196" fill="#3A4452"/>
-<text x="216" y="1181.95" font-size="17" fill="#55606E">Diff by presence and apply corrections</text>
-<text x="463" y="1267" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Observability (periodic)</text>
-<ellipse cx="308" cy="1260" rx="14" ry="14" fill="#17202B"/>
-<text x="308" y="1265.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">5</text>
-<text x="445" y="1303.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/metrics</text>
-<polyline points="170,1314 711,1314" fill="none" stroke="#B38A00" stroke-width="2.5"/>
-<polygon points="720,1314 707,1320 707,1308" fill="#B38A00"/>
-<text x="445" y="1349.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/logs</text>
-<polyline points="170,1360 711,1360" fill="none" stroke="#B38A00" stroke-width="2.5"/>
-<polygon points="720,1360 707,1366 707,1354" fill="#B38A00"/>
-<text x="445" y="1395.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/audit</text>
-<polyline points="170,1406 711,1406" fill="none" stroke="#B38A00" stroke-width="2.5"/>
-<polygon points="720,1406 707,1412 707,1400" fill="#B38A00"/>
+<text x="445" y="1108.4" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">{peers, reachability, policy, bridge,</text>
+<text x="445" y="1127.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">state, reports, executions, sessions,</text>
+<text x="445" y="1146.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">secrets, signing_key, hooks, dns}</text>
+<polyline points="720,1157 170,1157" fill="none" stroke="#3A4452" stroke-width="2.5" stroke-dasharray="7.5 5"/>
+<polyline points="183,1151 170,1157 183,1163" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="170,1181 206,1181 206,1209 179,1209" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="170,1209 183,1203 183,1215" fill="#3A4452"/>
+<text x="216" y="1200.95" font-size="17" fill="#55606E">Diff by presence and apply corrections</text>
+<text x="463" y="1286" font-size="20" font-weight="700" fill="#2B3440" text-anchor="middle">Observability (periodic)</text>
+<ellipse cx="308" cy="1279" rx="14" ry="14" fill="#17202B"/>
+<text x="308" y="1284.25" font-size="15" font-weight="700" fill="#FBFAF7" text-anchor="middle">5</text>
+<text x="445" y="1322.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/metrics</text>
+<polyline points="170,1333 711,1333" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="720,1333 707,1339 707,1327" fill="#B38A00"/>
+<text x="445" y="1368.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/logs</text>
+<polyline points="170,1379 711,1379" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="720,1379 707,1385 707,1373" fill="#B38A00"/>
+<text x="445" y="1414.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">POST /v1/nodes/{id}/audit</text>
+<polyline points="170,1425 711,1425" fill="none" stroke="#B38A00" stroke-width="2.5"/>
+<polygon points="720,1425 707,1431 707,1419" fill="#B38A00"/>
 </svg>
