@@ -51,7 +51,7 @@ The `runUp` function in `cmd/plexd/cmd/up.go` performs initialization before ent
 6. **Create SSE manager** — `api.NewSSEManager()` with handlers for signing key rotation, WireGuard peer events, tunnel events, policy events, and bridge events (bridge mode)
 7. **Create reconciler** — `reconcile.NewReconciler()` with handlers for WireGuard, policy, and bridge reconciliation
 8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment and key-rotation callback; its credential-refused callback is set in step 12, once the node API server exists
-9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()`, for the hook checksums the executor verifies before a run and for the baseline checks of the binary, the hooks directory and the SSH host key that goroutine 10 runs. With integrity enabled and `integrity.binary_path` empty, `integrity.SelfPath()` first sets it to the running executable with symlinks resolved; an error fails `plexd up`
+9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()`, for the hook checksums the executor verifies before a run and for the baseline checks of the binary, the hooks directory and the SSH host key that step 20c runs. With integrity enabled and `integrity.binary_path` empty, `integrity.SelfPath()` first sets it to the running executable with symlinks resolved; an error fails `plexd up`
 10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, build the rollout installer with `actions.NewRolloutInstaller()` (a constructor error logs `rolled-out hooks disabled`, and the agent runs on without rolled-out hooks), register the installer's `Handle`, when it was built, and then `actions.NewDispatcher()` on the reconciler as dispatch handlers, list the `PlexdHook` resources in a pod's namespace, and build `agent.NewCapabilityReporter()`, which sends nothing until it starts. In a pod, `newPlexdHookRunner()` also builds the PlexdHook runner, which runs a dispatched `PlexdHook` as a Kubernetes Job, and `executor.SetPlexdHookRunner()` hands it over before the reconciler starts. An empty ServiceAccount namespace, an unset `MY_NODE_NAME`, or a Job client that cannot be built logs a `plexd hook runs disabled` warning instead, and the node runs no PlexdHook (see [Kubernetes Deployment](reference/deployment/kubernetes-deployment.md#wiring-in-plexd-up))
 11. **Create hook watchers** — `actions.NewHookWatcher()` for `hooks_dir`, with an `onChange` that calls `executor.SetHooks()` and then the reporter's `Notify()`, and, when the installer was built and `actions.rollouts_enabled` is not `false`, `actions.NewRolloutHookWatcher()` for the rollout directory `<data_dir>/hooks`, whose `onChange` calls `executor.SetRolloutHooks()` and `Notify()`. plexd then runs the installer's `Load()`, which restores the rolled-out hooks from `hook_rollouts.json`, pins each to the checksum it was delivered with, and removes every other file of the rollout directory. It then runs one first scan over both directories with `hookDirsReloader.Reload()` and waits for it, for at most 10 seconds, so the executor's hook list is filled before anything reads it and the boot manifest carries the hooks on disk
 12. **Create node API server** — `nodeapi.NewServer()`, wire action provider, hook reloader (the same `hookDirsReloader`, so `POST /v1/hooks/reload` rescans both directories), and reconcile handler
@@ -59,25 +59,36 @@ The `runUp` function in `cmd/plexd/cmd/up.go` performs initialization before ent
 14. **Create log sources + forwarder** — platform log source (journald on Linux, the launchd log file on macOS, the Event Log on Windows), file sources from `file_patterns`, `logfwd.NewForwarder()`
 15. **Create audit sources + forwarder** — process source, `auditfwd.NewForwarder()`
 
-**Goroutines (the same in node and bridge mode):**
+**Goroutines:**
 
-After initialization, goroutines are started via a `sync.WaitGroup`:
+`plexd up` starts these goroutines under one `sync.WaitGroup`. The health listener starts at step 4a, before the registration call; the others start after step 15, in the order of their steps:
 
-1. **SSE Manager** — `sseMgr.Start()` — event stream connection
-2. **Heartbeat** — `heartbeat.Run()` — periodic heartbeats
-3. **Reconciler** — `reconciler.Run()` — periodic state reconciliation
-4. **Node API** — `nodeAPISrv.Start()` — local endpoint (a Unix socket, or a named pipe on Windows) + optional HTTP server
-5. **Hook Watcher** — `hookWatcher.Watch()` — filesystem watching for hook changes in `hooks_dir`
-6. **Rollout Hook Watcher** — `rolloutWatcher.Watch()` — filesystem watching of the rollout directory; started only when that watcher was built
-7. **Rollout Installer** — `rolloutInstaller.Run()` — one pass per `hooks` block the reconciler hands over: fetch, verify, install, and remove rolled-out hooks; started only when the installer was built
-8. **Capability Reporter** — `capabilityReporter.Run()` — sends the boot manifest, reports each hook or `PlexdHook` change and each change to the rollout errors, and retries a failed send
-9. **PlexdHook Inventory** — `plexdHooks.run()` — watches the `PlexdHook` resources in a pod's namespace; returns at once outside a cluster
-10. **Integrity Verifier** — `integrityVerifier.Run()` — checks the binary, `integrity.hooks_dir` and the SSH host key against their baselines once at start and then every `integrity.verify_interval`, reports each change once and then adopts it as the baseline; returns at once when `integrity.enabled` is `false` (see [Integrity Verification](reference/actions/integrity-verification.md#startup-sequence))
-11. **Metrics Manager** — `metricsMgr.Run()` — collect and report metrics
-12. **Log Forwarder** — `logForwarder.Run()` — collect and forward logs
-13. **Audit Forwarder** — `auditForwarder.Run()` — collect and forward audit events
-14. **Peer Exchange** — `exchanger.Run()` — STUN discovery and endpoint exchange loop
-15. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
+| Step | Goroutine | Call | Started when | What it does |
+|------|-----------|------|--------------|--------------|
+| 4a | Health Listener | `healthSrv.Serve()` | `health.enabled` is not `false` | serves `/healthz` and `/readyz`. When it stops while plexd runs, plexd logs `health listener stopped, terminating` and cancels the context, which starts the shutdown |
+| 16 | SSE Manager | `sseMgr.Start()` | always | event stream connection |
+| 17 | Heartbeat | `heartbeat.Run()` | always | periodic heartbeats |
+| 17a | Handshake Reporter | `handshakeReporter.Run()` | WireGuard is up | sends one handshake report per heartbeat interval (see [Handshake Reporter](reference/core/heartbeat-service.md#handshake-reporter)) |
+| 17b | Endpoint Selection | `wgMgr.RunEndpointSelection()` | WireGuard is up | every 5 s (`wireguard.EndpointSelectionInterval`) tries each peer's dial order until a handshake completes, and probes a relay path that fell silent (see [Endpoint selection](reference/networking/wireguard.md#endpoint-selection)) |
+| 17c | Mesh MTU Re-probe | `wgMgr.RunMTUProbe()` | WireGuard is up | measures the uplink again every 10 minutes (`wireguard.MTUProbeInterval`) (see [Probing again](reference/networking/wireguard.md#probing-again)) |
+| 17d | Relay, Ingress, User Access and Site-to-Site Status Reporters (four goroutines) | `relayStatusReporter.Run()`, `ingressStatusReporter.Run()`, `userAccessStatusReporter.Run()`, `siteToSiteStatusReporter.Run()` | bridge mode | the relay status reporter reports the relay's state at the heartbeat interval and sends a last stopped report at shutdown, bounded by 5 s (see [Relay Status Report](reference/bridge/nat-relay.md#relay-status-report)). The ingress, user access and site-to-site status reporters each report whether the bridge opts out of their feature and, unless it does, the state of each ingress rule, provider or tunnel: once at start, on a change at most once per 5 s, and at the heartbeat interval. They send nothing at shutdown (see [Ingress Status Report](reference/bridge/public-ingress.md#ingress-status-report), [User Access Status Report](reference/bridge/user-access-integration.md#user-access-status-report) and [Site-to-Site Status Report](reference/bridge/site-to-site-vpn.md#site-to-site-status-report)) |
+| 17e | Policy Status Reporter | `policyStatusReporter.Run()` | always | reports what the node applied, rejected or enforces on every change, and at the heartbeat interval when the drop counters moved or the last send failed (see [Policy status report](reference/networking/network-policy.md#policy-status-report)) |
+| 18 | Reconciler | `reconciler.Run()` | always | periodic state reconciliation |
+| after 18 | Key Rotation Recovery | `rotator.RecoverPending()` | always | resubmits a staged key the control plane has not confirmed, with a capped backoff, and makes no call while nothing is staged (see [Rotation](reference/core/key-storage.md#rotation)) |
+| 19 | Node API | `nodeAPISrv.Start()` | always | local endpoint (a Unix socket, or a named pipe on Windows) + optional HTTP server |
+| 19a | Status Report Publisher | `statusReports.run()` | always | publishes `status.mesh`, `status.bridge`, `status.user-access`, `status.ingress` and `status.site-to-site` as state reports through the node API, once at start and then at the heartbeat interval, each only when its payload changed |
+| 20 | Hook Watcher, Rollout Hook Watcher, Rollout Installer (three goroutines) | `hookWatcher.Watch()`, `rolloutWatcher.Watch()`, `rolloutInstaller.Run()` | always; the watcher and the installer of rollouts only when built | Hook Watcher: filesystem watching for hook changes in `hooks_dir`. Rollout Hook Watcher: filesystem watching of the rollout directory; started only when that watcher was built. Rollout Installer: one pass per `hooks` block the reconciler hands over: fetch, verify, install, and remove rolled-out hooks; started only when the installer was built |
+| 20a | Capability Reporter | `capabilityReporter.Run()` | always | sends the boot manifest, reports each hook or `PlexdHook` change and each change to the rollout errors, and retries a failed send |
+| 20b | PlexdHook Inventory | `plexdHooks.run()` | always | watches the `PlexdHook` resources in a pod's namespace; returns at once outside a cluster |
+| 20c | Integrity Verifier | `integrityVerifier.Run()` | always | checks the binary, `integrity.hooks_dir` and the SSH host key against their baselines once at start and then every `integrity.verify_interval`, reports each change once and then adopts it as the baseline; returns at once when `integrity.enabled` is `false` (see [Integrity Verification](reference/actions/integrity-verification.md#startup-sequence)) |
+| 21 | Metrics Manager | `metricsMgr.Run()` | always | collect and report metrics |
+| 22 | Log Forwarder | `logForwarder.Run()` | always | collect and forward logs |
+| 22a | Connection Log Summary | `enforcer.ConnLogger().Run()` | always | once a minute logs how many connection lines the rate limit dropped and how many records the firewall's reader lost (see [ConnLogger](reference/networking/network-policy.md#connlogger)) |
+| 23 | Audit Forwarder | `auditForwarder.Run()` | always | collect and forward audit events |
+| 24 | Peer Exchange | `exchanger.Run()` | always | STUN discovery and endpoint exchange loop |
+| 24a | Endpoint Candidate Publisher | `candidatePublisher.Run()` | WireGuard is up and `nat.local_candidates` is not `false` | publishes the node's local interface addresses as endpoint candidates (see [CandidatePublisher](reference/networking/nat-traversal.md#candidatepublisher)) |
+| 25 | Mesh Server | `meshServer.Start()` | always | tunnel SSH server |
+| 25a | Mesh DNS Resolver | `serveMeshDNS()` | step 5a-3 bound the sockets | answers the mesh names on the sockets of step 5a-3. When it stops while plexd runs, plexd logs `mesh dns stopped` and reverts the registration at once (see [Stop, Crash and Opt-Out](reference/networking/mesh-dns.md#stop-crash-and-opt-out)) |
 
 The bridge's NAT relay is not a startup goroutine. In bridge mode with `bridge.relay_enabled` set, the reconciler's `RelayReconcileHandler` starts it on the first cycle whose state pull enables it, and stops it when a pull disables it or the bridge tears down (see [NAT Relay](reference/bridge/nat-relay.md#relayreconcilehandler)).
 
