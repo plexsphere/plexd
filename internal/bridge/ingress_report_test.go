@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -358,7 +359,8 @@ func TestRuleReports_SkipsMalformedAndRepeatedIDs(t *testing.T) {
 }
 
 func TestReportChanged_Signals(t *testing.T) {
-	fx := newIngressFixture(t, newLoopbackIngressController(t))
+	ctrl := newLoopbackIngressController(t)
+	fx := newIngressFixture(t, ctrl)
 	changed := fx.mgr.ReportChanged()
 	requireOne := func(what string) {
 		t.Helper()
@@ -377,6 +379,21 @@ func TestReportChanged_Signals(t *testing.T) {
 		t.Fatal("version 1 of tls did not load")
 	}
 	requireOne("a SyncSecretInventory that loads a certificate")
+
+	// A refused client is recorded on the rule's report without a signal:
+	// its refusal rides the next tick.
+	auth := withID(terminateRule("term", 443, "t.example.com", "tls", 9000), reportID("a1"))
+	withClientAuth(caBundle(newTestCA(t, "client-ca", nil)))(&auth)
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(auth)); err != nil {
+		t.Fatalf("Apply with client_auth: %v", err)
+	}
+	requireOne("an Apply that adds client_auth")
+	repRefuse(t, ctrl.addr(443), "t.example.com", nil)
+	fx.logs.waitFor(t, repRefusedMsg, 1)
+	if got := reportFor(t, fx.mgr.RuleReports(), auth.ID).ClientRefusals; len(got) != 1 || got[0].Reason != IngressRefusalNoCertificate {
+		t.Fatalf("refusals after a client without a certificate = %+v, want one %s", got, IngressRefusalNoCertificate)
+	}
+	requireNoSignal(t, changed, "a refused client")
 
 	results := hookACME(t, fx)
 	if err := fx.mgr.Apply(t.Context(), api.IngressConfig{
@@ -410,11 +427,16 @@ func TestIngressReasons_AreReasonTokens(t *testing.T) {
 		IngressReasonCertificateFetchFailed,
 		IngressReasonCertificateInvalid,
 		IngressReasonACMENotIssued,
+		IngressReasonClientCAInvalid,
 		IngressDialReasonPolicyDenied,
 		IngressDialReasonTimeout,
 		IngressDialReasonRefused,
 		IngressDialReasonUnreachable,
 		IngressDialReasonOther,
+		IngressRefusalNoCertificate,
+		IngressRefusalUnknownAuthority,
+		IngressRefusalCertificateExpired,
+		IngressRefusalCertificateInvalid,
 	} {
 		if !api.ValidIngressReason(reason) {
 			t.Errorf("api.ValidIngressReason(%q) = false, want true", reason)
@@ -671,4 +693,263 @@ func TestRuleReports_SkipsMalformedAndRepeatedTargets(t *testing.T) {
 	if got := reportFor(t, reports, otherID); got.Targets != nil {
 		t.Errorf("a rule whose node ids are no UUIDs: Targets = %#v, want nil", got.Targets)
 	}
+}
+
+// repRefusedMsg is the log message of a refused client.
+const repRefusedMsg = `msg="ingress client refused"`
+
+// repRefuse connects to addr as serverName with cert as the client
+// certificate, or none when cert is nil, and waits up to 2 s for the bridge to
+// close the connection. In TLS 1.3 the client's side of the handshake
+// completes and its first read fails; in TLS 1.2 the dial fails. The caller
+// proves the refusal on the manager's log and report.
+func repRefuse(t *testing.T, addr, serverName string, cert *tls.Certificate) {
+	t.Helper()
+	conn, err := dialTLSClient(t, addr, serverName, cert, nil)
+	if err != nil {
+		return
+	}
+	requireClosed(t, conn)
+}
+
+// TestRuleReports_ClientAuth reports ClientAuthEnforced on a listening rule
+// with client_auth, without refusals before the first, and on no other rule:
+// not on a listening rule without client_auth, and not on a rule with
+// client_auth whose port did not bind, which carries no refusals either while
+// its record keeps them.
+func TestRuleReports_ClientAuth(t *testing.T) {
+	ca := newTestCA(t, "client-ca", nil)
+	ctrl := newLoopbackIngressController(t)
+	ctrl.failListen(8443, syscall.EADDRINUSE)
+	fx, _, _ := newDialLogFixture(t, ctrl)
+	fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+	authID, plainID, downID := reportID("a1"), reportID("b2"), reportID("c3")
+	auth := withID(terminateRule("auth", 443, "t.example.com", "tls", 9000), authID)
+	withClientAuth(caBundle(ca))(&auth)
+	plain := withID(terminateRule("plain", 7443, "t.example.com", "tls", 9000), plainID)
+	down := withID(terminateRule("down", 8443, "t.example.com", "tls", 9000), downID)
+	withClientAuth(caBundle(ca))(&down)
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(auth, plain, down)); !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("Apply = %v, want the bind error of port 8443", err)
+	}
+	listening := func(id string, enforced bool) IngressRuleReport {
+		return IngressRuleReport{
+			RuleID: id, Listener: api.IngressListenerListening, Certificate: api.IngressCertificateReady,
+			Dial: api.IngressDialNone, ClientAuthEnforced: enforced,
+		}
+	}
+	listenFailed := func(id string) IngressRuleReport {
+		return IngressRuleReport{RuleID: id, Listener: api.IngressListenerNotListening, ListenerReason: IngressReasonListenFailed}
+	}
+
+	reports := fx.mgr.RuleReports()
+	for _, want := range []IngressRuleReport{listening(authID, true), listening(plainID, false), listenFailed(downID)} {
+		if got := reportFor(t, reports, want.RuleID); !sameReport(got, want) {
+			t.Errorf("before a refusal: report = %+v, want %+v", got, want)
+		}
+	}
+
+	repRefuse(t, ctrl.addr(443), "t.example.com", nil)
+	fx.logs.waitFor(t, repRefusedMsg, 1)
+	refused := listening(authID, true)
+	refused.ClientRefusals = []IngressClientRefusalReport{{Reason: IngressRefusalNoCertificate, At: relayStart}}
+	if got := reportFor(t, fx.mgr.RuleReports(), authID); !sameReport(got, refused) {
+		t.Fatalf("after a refusal: report = %+v, want %+v", got, refused)
+	}
+
+	// The rule moves to the port that does not bind with the same bundle, so
+	// its record keeps the refusal, and its report carries neither member.
+	moved := auth
+	moved.ListenPort = 8443
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(moved, plain)); !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("Apply = %v, want the bind error of port 8443", err)
+	}
+	if got, want := reportFor(t, fx.mgr.RuleReports(), authID), listenFailed(authID); !sameReport(got, want) {
+		t.Errorf("on the port that did not bind: report = %+v, want %+v", got, want)
+	}
+	// Back on its port, the rule reports the refusal its record kept.
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(auth, plain)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := reportFor(t, fx.mgr.RuleReports(), authID); !sameReport(got, refused) {
+		t.Errorf("back on its port: report = %+v, want %+v", got, refused)
+	}
+}
+
+// TestRuleReports_ClientCAInvalid reports a listening terminate or acme rule
+// whose client CA bundle does not build with the certificate not_ready for
+// client_ca_invalid, ahead of a loaded certificate and of a valid ACME
+// directory, and with ClientAuthEnforced, since the rule serves no client.
+func TestRuleReports_ClientCAInvalid(t *testing.T) {
+	bundles := []struct{ name, bundle string }{
+		{"empty bundle", ""},
+		{"no PEM block", "not a certificate"},
+	}
+	want := func(id string) IngressRuleReport {
+		return IngressRuleReport{
+			RuleID: id, Listener: api.IngressListenerListening,
+			Certificate: api.IngressCertificateNotReady, CertificateReason: IngressReasonClientCAInvalid,
+			Dial: api.IngressDialNone, ClientAuthEnforced: true,
+		}
+	}
+	for _, b := range bundles {
+		t.Run("terminate, "+b.name, func(t *testing.T) {
+			fx := newIngressFixture(t, newLoopbackIngressController(t))
+			fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+			fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+			id := reportID("a1")
+			rule := withID(terminateRule("term", 443, "t.example.com", "tls", 9000), id)
+			withClientAuth(b.bundle)(&rule)
+			if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if servingOrganization(fx.mgr, "tls") != "v1" {
+				t.Fatal("version 1 of tls did not load")
+			}
+			if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want(id)) {
+				t.Errorf("report = %+v, want %+v", got, want(id))
+			}
+		})
+		t.Run("acme, "+b.name, func(t *testing.T) {
+			cfg := ingressTestConfig(true)
+			cfg.ACMEDirectoryURLs = []string{testACME.DirectoryURL}
+			fx := buildIngressFixture(t, newLoopbackIngressController(t), cfg)
+			if err := fx.mgr.Setup(); err != nil {
+				t.Fatalf("Setup: %v", err)
+			}
+			id := reportID("a1")
+			rule := withID(acmeRule("acme", 8443, "acme.example.com", 9000), id)
+			withClientAuth(b.bundle)(&rule)
+			if err := fx.mgr.Apply(t.Context(), api.IngressConfig{Rules: []api.IngressRule{rule}, ACME: testACME}); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if got := reportFor(t, fx.mgr.RuleReports(), id); !sameReport(got, want(id)) {
+				t.Errorf("report = %+v, want %+v", got, want(id))
+			}
+		})
+	}
+}
+
+// TestRuleReports_ClientRefusals reports the last refusal per reason of a rule
+// with client_auth, at the manager's time of the refused handshake, in the
+// order of the reasons, on every rule of a host shared by conditions, and
+// clears them with an Apply that changes the bundle and with Teardown.
+func TestRuleReports_ClientRefusals(t *testing.T) {
+	t.Run("one rule", func(t *testing.T) {
+		ca := newTestCA(t, "client-ca", nil)
+		other := newTestCA(t, "other-ca", nil)
+		stranger := newTestCA(t, "stranger-ca", nil).issue(t, "stranger", nil)
+		ctrl := newLoopbackIngressController(t)
+		fx, clock, dials := newDialLogFixture(t, ctrl)
+		fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+		fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+		id := reportID("a1")
+		rule := withID(terminateRule("auth", 443, "t.example.com", "tls", 9000), id)
+		withClientAuth(caBundle(ca))(&rule)
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		refusals := func() []IngressClientRefusalReport {
+			t.Helper()
+			r := reportFor(t, fx.mgr.RuleReports(), id)
+			if !r.ClientAuthEnforced {
+				t.Errorf("report = %+v, want ClientAuthEnforced", r)
+			}
+			return r.ClientRefusals
+		}
+
+		// A client of another authority, then one without a certificate, and
+		// the other authority's client again: the reasons read in their fixed
+		// order, each at its last refusal.
+		repRefuse(t, ctrl.addr(443), "t.example.com", &stranger)
+		fx.logs.waitFor(t, repRefusedMsg, 1)
+		clock.Add(3 * time.Second)
+		repRefuse(t, ctrl.addr(443), "t.example.com", nil)
+		fx.logs.waitFor(t, repRefusedMsg, 2)
+		clock.Add(2 * time.Second)
+		repRefuse(t, ctrl.addr(443), "t.example.com", &stranger)
+		fx.logs.waitFor(t, repRefusedMsg, 3)
+		want := []IngressClientRefusalReport{
+			{Reason: IngressRefusalNoCertificate, At: relayStart.Add(3 * time.Second)},
+			{Reason: IngressRefusalUnknownAuthority, At: relayStart.Add(5 * time.Second)},
+		}
+		if got := refusals(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("refusals = %+v, want %+v", got, want)
+		}
+		if got := dials.dialled(); len(got) != 0 {
+			t.Errorf("dials = %v, want none for refused clients", got)
+		}
+
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+			t.Fatalf("Apply of the same block: %v", err)
+		}
+		if got := refusals(); !reflect.DeepEqual(got, want) {
+			t.Errorf("after an Apply of the same block: refusals = %+v, want %+v", got, want)
+		}
+
+		changed := rule
+		withClientAuth(caBundle(ca, other))(&changed)
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(changed)); err != nil {
+			t.Fatalf("Apply with another bundle: %v", err)
+		}
+		if got := refusals(); got != nil {
+			t.Errorf("after an Apply with another bundle: refusals = %+v, want nil", got)
+		}
+
+		repRefuse(t, ctrl.addr(443), "t.example.com", nil)
+		fx.logs.waitFor(t, repRefusedMsg, 4)
+		if got := refusals(); len(got) != 1 || got[0].Reason != IngressRefusalNoCertificate {
+			t.Fatalf("refusals under the new bundle = %+v, want one %s", got, IngressRefusalNoCertificate)
+		}
+		if err := fx.mgr.Teardown(); err != nil {
+			t.Fatalf("Teardown: %v", err)
+		}
+		if err := fx.mgr.Setup(); err != nil {
+			t.Fatalf("Setup: %v", err)
+		}
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(changed)); err != nil {
+			t.Fatalf("Apply after Setup: %v", err)
+		}
+		if got := refusals(); got != nil {
+			t.Errorf("after Teardown, Setup and an Apply of the same block: refusals = %+v, want nil", got)
+		}
+	})
+
+	t.Run("a shared host", func(t *testing.T) {
+		ca := newTestCA(t, "client-ca", nil)
+		expired := ca.issue(t, "expired", func(c *x509.Certificate) {
+			c.NotBefore, c.NotAfter = time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)
+		})
+		clock := &relayClock{now: relayStart}
+		fx := newHTTPFixture(t, func(m *IngressManager) { m.now = clock.Now })
+		shop := withID(httpRule("shop", "shop.example.com", 9000, "/shop"), reportID("a1"))
+		cart := withID(httpRule("cart", "shop.example.com", 9001, "/cart"), reportID("a2"))
+		withClientAuth(caBundle(ca))(&shop)
+		withClientAuth(caBundle(ca))(&cart)
+		fx.apply(t, shop, cart)
+		for _, slug := range []string{"shop", "cart"} {
+			if st := stateOf(t, fx.mgr, slug); !st.Served {
+				t.Fatalf("rule %s: state = %+v, want served", slug, st)
+			}
+		}
+
+		repRefuse(t, fx.ctrl.addr(443), "shop.example.com", nil)
+		fx.logs.waitFor(t, repRefusedMsg, 1)
+		clock.Add(2 * time.Second)
+		repRefuse(t, fx.ctrl.addr(443), "shop.example.com", &expired)
+		fx.logs.waitFor(t, repRefusedMsg, 2)
+
+		want := []IngressClientRefusalReport{
+			{Reason: IngressRefusalNoCertificate, At: relayStart},
+			{Reason: IngressRefusalCertificateExpired, At: relayStart.Add(2 * time.Second)},
+		}
+		reports := fx.mgr.RuleReports()
+		for _, id := range []string{shop.ID, cart.ID} {
+			got := reportFor(t, reports, id)
+			if !got.ClientAuthEnforced || !reflect.DeepEqual(got.ClientRefusals, want) {
+				t.Errorf("rule %s: report = %+v, want ClientAuthEnforced and the refusals %+v", id, got, want)
+			}
+		}
+	})
 }
