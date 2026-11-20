@@ -198,6 +198,16 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("plexd up: firewall baseline pre-flight: %s: %w", policyCapabilityHint, err)
 	}
 
+	// 2b. Load the CA files of the local endpoints before anything reaches the
+	// control plane. Their reporters are built after registration, and a file
+	// they cannot load makes a start that can never complete. Registration
+	// spends a redemption of the bootstrap token, as 2a explains, so such a
+	// start has to stop before it. The reporters load the file again when they
+	// are built.
+	if err := preflightLocalEndpointTLS(cfg, logger); err != nil {
+		return err
+	}
+
 	// 3. Create control plane client.
 	client, err := api.NewControlPlane(cfg.API, buildVersion, logger)
 	if err != nil {
@@ -2806,6 +2816,32 @@ func buildMetricsCollectors(tunnelReader metrics.TunnelStatsReader, sysReader me
 	return append(collectors, metrics.NewAgentStatsCollector(startTime, nil, logger))
 }
 
+// preflightLocalEndpointTLS builds the TLS settings of each configured local
+// endpoint, in the order metrics, log_fwd, audit_fwd, and returns the first
+// error prefixed with the section that names the endpoint. The settings are
+// discarded: the check exists only to stop the start before registration. An
+// endpoint without a URL is skipped because runAgent builds no reporter for it,
+// so its CA file is never read.
+func preflightLocalEndpointTLS(cfg *agent.AgentConfig, logger *slog.Logger) error {
+	endpoints := []struct {
+		section  string
+		endpoint *api.LocalEndpointConfig
+	}{
+		{"metrics", &cfg.Metrics.LocalEndpoint},
+		{"log_fwd", &cfg.LogFwd.LocalEndpoint},
+		{"audit_fwd", &cfg.AuditFwd.LocalEndpoint},
+	}
+	for _, e := range endpoints {
+		if e.endpoint.URL == "" {
+			continue
+		}
+		if _, err := e.endpoint.TLSClientConfig(logger); err != nil {
+			return fmt.Errorf("plexd up: %s.local_endpoint: %w", e.section, err)
+		}
+	}
+	return nil
+}
+
 // loadMergedConfig parses the config file at path — an absent one is not fatal
 // — and merges the CLI flag values and then the PLEXD_* environment overrides
 // on top. The returned bool reports whether the file was found. The merged
@@ -2841,6 +2877,7 @@ func loadMergedConfig(path string) (*agent.AgentConfig, bool, error) {
 // Environment variables take precedence over the config file but not CLI flags
 // (CLI flags are applied separately and may have already overridden values).
 func applyEnvOverrides(cfg *agent.AgentConfig) {
+	applyAPIEnvOverrides(&cfg.API)
 	if v := os.Getenv("PLEXD_BOOTSTRAP_TOKEN_FILE"); v != "" {
 		cfg.Registration.TokenFile = v
 	}

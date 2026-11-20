@@ -34,6 +34,7 @@ func runJoin(cmd *cobra.Command, _ []string) error {
 	if apiURL != "" {
 		cfg.API.BaseURL = apiURL
 	}
+	applyAPIEnvOverrides(&cfg.API)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 

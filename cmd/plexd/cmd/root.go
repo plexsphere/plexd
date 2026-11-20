@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/paths"
 )
 
@@ -38,6 +39,18 @@ func envOrDefault(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// applyAPIEnvOverrides applies the environment overrides of the control plane
+// client's settings. plexd up and plexd join both build that client, and both
+// call this before they validate, so the variable outranks the file's key in
+// either command and the rule against combining a CA file with
+// tls_insecure_skip_verify sees the merged value. A non-empty
+// PLEXD_API_TLS_CA_FILE sets TLSCAFile; an empty or unset one leaves it alone.
+func applyAPIEnvOverrides(cfg *api.Config) {
+	if v := os.Getenv("PLEXD_API_TLS_CA_FILE"); v != "" {
+		cfg.TLSCAFile = v
+	}
 }
 
 var (
