@@ -730,18 +730,20 @@ control plane does not serve the report, plexd sends no `stopped` at shutdown.
 Reports whether a bridge's local configuration serves public ingress, so the
 control plane refuses an ingress rule that no listener would serve, and the
 state of each ingress rule: its listener, its certificate, whether a target
-took its last connection, request or client flow, and the last dial to each of
-its targets. While a bridge's report reads `opted_out`, the control plane
-answers a create or an update of an ingress rule on its bridge Resource with
-`409 bridge_ingress_opted_out`. It keeps the rules stored before the opt-out,
-keeps delivering them in the [`bridge.ingress`](#get-v1-nodes-node-id-state)
-block with `enabled: true`, and allows a delete. A bridge that never reported
-reads `not_reported` and accepts rules. See
+took its last connection, request or client flow, the last dial to each of its
+targets, and on a rule with `client_auth` whether the bridge verifies its
+clients and the last client it refused per reason. While a bridge's report
+reads `opted_out`, the control plane answers a create or an update of an
+ingress rule on its bridge Resource with `409 bridge_ingress_opted_out`. It
+keeps the rules stored before the opt-out, keeps delivering them in the
+[`bridge.ingress`](#get-v1-nodes-node-id-state) block with `enabled: true`, and
+allows a delete. A bridge that never reported reads `not_reported` and accepts
+rules. See
 [Ingress Status Report](../bridge/public-ingress.md#ingress-status-report) for
 how plexd derives the state and each entry.
 
 **Request body** (`IngressStatusRequest`, at most 2 MiB), for a rule whose
-second target fails:
+second target fails and whose bridge refused two of its clients:
 
 ```json
 {
@@ -752,6 +754,11 @@ second target fails:
       "targets": [
         { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 8443, "dial": "succeeded", "dial_age_seconds": 2 },
         { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "port": 8443, "dial": "failed", "dial_reason": "timeout", "dial_age_seconds": 14 }
+      ],
+      "client_auth_enforced": true,
+      "client_refusals": [
+        { "reason": "no_certificate", "age_seconds": 40 },
+        { "reason": "unknown_authority", "age_seconds": 310 }
       ] },
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4", "listener": "not_listening", "listener_reason": "listen_failed" }
   ]
@@ -792,6 +799,26 @@ second target fails:
   sends `targets` only for a rule whose pull entry carried `targets`: a
   control plane that predates them refuses them as an unknown member, and its
   pull carries none.
+- `client_auth_enforced`: optional on a rule entry, `true` when the bridge
+  verifies every client of the rule against the rule's `client_auth.ca_bundle`,
+  or serves no client of the rule; absent, `null` and `false` all mean it does
+  not. `true` only on a `listening` entry. plexd sends it on every listening
+  rule whose pull entry carries `client_auth`, a rule with `client_ca_invalid`
+  included, and on no other. The control plane reads a rule that requires a
+  client certificate as `client_auth_not_enforced` while its listening entry
+  does not say `client_auth_enforced: true`.
+- `client_refusals`: optional on a rule entry, at most 8 entries
+  (`IngressStatusClientRefusal`), one per reason, with entries only when
+  `client_auth_enforced` is `true`. An absent `client_refusals`, a `null` and
+  an empty array all mean no refusals. Each entry carries `reason`, a reason
+  token, and `age_seconds`, the seconds between the last refusal for that
+  reason and the report from 0 to 2147483647, both always. No two entries of
+  one rule name the same `reason`. plexd sends at most four, in the order
+  `no_certificate`, `unknown_authority`, `certificate_expired`,
+  `certificate_invalid`. The refusals change neither the rule's status nor its
+  `changed_at`. plexd sends both members only for a rule whose pull entry
+  carries `client_auth`: a control plane that predates them refuses them as
+  unknown members, and its pull carries no `client_auth`.
 
 The control plane decodes the body with unknown members refused, of the report
 and of each entry. A body that is not one JSON object, an unknown member, data
@@ -813,12 +840,32 @@ and `port`. The `detail` names the entry by index, as
 `rules[3] misses certificate while listener is listening` or
 `rules[0].targets[1] repeats rules[0].targets[0]`, and never repeats an `id` or
 a reason of the body; a missing or `null` `state` carries `state is missing`,
-and another value `state is not one of enabled and opted_out`.
+and another value `state is not one of enabled and opted_out`. The control
+plane decodes each refusal entry on its own, as it does each rule entry, and
+answers each defect of the two client authentication members:
+
+| Defect | Answer |
+|---|---|
+| `client_auth_enforced` is not a boolean | `400 malformed_ingress_status`, with the `detail` `rules[i].client_auth_enforced is not a boolean` |
+| `client_refusals` is not an array | `400 malformed_ingress_status`, with the `detail` `rules[i].client_refusals is not an array` |
+| `client_refusals` holds more than 8 entries | `400 malformed_ingress_status`, with the `detail` `rules[i].client_refusals carries more than 8 entries` |
+| a refusal entry is not an object | `400 malformed_ingress_status`, with the `detail` `rules[i].client_refusals[j] is not an object` |
+| a refusal entry carries an unknown member | `400 malformed_ingress_status`, with the `detail` `rules[i].client_refusals[j] carries the unknown member <name>` when the name is a token of the reason grammar, and otherwise `rules[i].client_refusals[j] carries a member IngressStatusReportRuleClientRefusal does not define` |
+| `reason` absent, `null` or not a reason token | `400 malformed_ingress_status`, with the `detail` `rules[i].client_refusals[j].reason is not a reason token` |
+| `age_seconds` absent, `null` or outside 0..2147483647 | `400 malformed_ingress_status`, with the `detail` `rules[i].client_refusals[j].age_seconds is outside 0..2147483647` |
+| `client_auth_enforced` `true` on a rule whose `listener` is `not_listening` | `400 invalid_ingress_status`, with the `detail` `rules[i] carries client_auth_enforced while listener is not_listening` |
+| refusal entries on a rule without `client_auth_enforced` `true` | `400 invalid_ingress_status`, with the `detail` `rules[i] carries client_refusals while client_auth_enforced is not true` |
+| two refusal entries of one rule with the same `reason` | `400 invalid_ingress_status`, with the `detail` `rules[i].client_refusals[j] repeats rules[i].client_refusals[k]` |
+
+A `client_auth_enforced` of `false` or `null` on a `not_listening` entry is
+accepted, and so is an absent, `null` or empty `client_refusals` on any entry.
+
 `ReportIngressStatus` validates nothing, because the reporter builds only the
 shapes the contract admits: it skips a rule whose `id` is no UUID in canonical
 form or repeats an earlier one, and a target whose `node_id` is no such UUID or
 whose `node_id`, compared without case, and `port` repeat an earlier target of
-the rule.
+the rule. It sends `client_auth_enforced` only as `true` and only on a
+listening entry, refusal entries only beside it, and each reason once.
 
 **Response** (`200 OK`, `IngressStatusResponse`):
 
@@ -834,26 +881,30 @@ the rule.
 **Cadence.** plexd reports from a loop of its own, started in bridge mode,
 whether or not the bridge opts out. It sends the report once right after each
 start, without waiting for the first state pull and so without entries; on
-every change of a rule entry or a target entry, at most once per 5 s; and once
-per
+every change of a rule entry or a target entry, a change of a rule's
+`client_auth_enforced` included, at most once per 5 s; and once per
 `heartbeat.interval` (default 30s). The state comes from the local
 configuration, which plexd reads once per start, so the send after each start
 is the report on every change of the setting that the contract asks for: a
 changed `bridge.ingress_enabled` takes effect, and is reported, with the
 restart. A change sends only when the entries differ from those of the last
-accepted report; a moving `dial_age_seconds` alone sends nothing. A failed
-report is not retried within its tick; the next tick, at most one interval
-later, sends the report as it then is. plexd sends nothing at shutdown, and a
-node outside bridge mode sends nothing at all. A bridge sends at most one
-report per 5 s on change and one per interval, each under 250 bytes per rule
-entry and 150 bytes per target entry, so 1,024 rules of eight targets each
-stay under 1.5 MB, within the 2 MiB cap.
+accepted report; a moving `dial_age_seconds` alone sends nothing, and neither
+does a refused client or a moving `age_seconds`: the comparison ignores
+`client_refusals`, so a refusal rides the next report, at the latest one
+interval later. A failed report is not retried within its tick; the next tick,
+at most one interval later, sends the report as it then is. plexd sends nothing
+at shutdown, and a node outside bridge mode sends nothing at all. A bridge
+sends at most one report per 5 s on change and one per interval, each rule
+entry under 300 bytes, each target entry under 150 and each refusal entry under
+60, so 1,024 rules of eight targets and four refusal entries each stay under
+1.8 MB, within the 2 MiB cap.
 
 **Sticky state, aging entries.** The control plane keeps the latest state per
 node and never ages it, unlike the [relay status report](#relay-status), so a
 bridge that reported `opted_out` and went offline stays opted out until it
 reports `enabled`. Each report replaces the rule entries of the one before,
-and a bridge that has not reported for three heartbeat intervals has its rules
+a rule entry's `client_refusals` replace the refusals stored for the rule, and
+a bridge that has not reported for three heartbeat intervals has its rules
 read `stale`. A report that repeats the stored state changes nothing: the stored
 receive time stays that of the report that last changed the state. The report
 never gates serving: a bridge serves as the pull says while a report fails or
@@ -864,8 +915,8 @@ the control plane does not serve the operation.
 | Status | Problem `code` | Meaning | plexd behavior |
 |---|---|---|---|
 | `200 OK` | — | Report accepted; body is an `IngressStatusResponse` | Logged at Debug as `accepted` on every send; also at Info as `reported` for the first accepted send, and once at Info after a not-served phase |
-| `400 Bad Request` | `malformed_ingress_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), names a `state` outside the two (`detail` `state is not one of enabled and opted_out`), carries more than 1,024 entries, an entry whose member breaks its own rule (`detail` such as `rules[0].listener is not one of listening and not_listening`), more than 8 target entries on a rule, or a target entry whose member breaks its own rule (`detail` such as `rules[0].targets[1].port is outside 1..65535`). A control plane that predates `rules` answers it to every `enabled` report with entries | Logged at Warn as `send failed` on every send; the next tick sends the report again. plexd has no fallback for a control plane that predates `rules` |
-| `400 Bad Request` | `invalid_ingress_status` | An `opted_out` report with entries, an `id` that repeats an earlier entry, an entry that breaks the presence rules (`detail` such as `rules[1].id repeats rules[0].id`), target entries on a `not_listening` entry, or a target entry that breaks the presence rules or repeats the `node_id` and `port` of an earlier one (`detail` such as `rules[0].targets[1] repeats rules[0].targets[0]`) | Logged at Warn as `send failed`; the next tick sends the report again |
+| `400 Bad Request` | `malformed_ingress_status` | Body is not one JSON object, carries an unknown member or data after the report, misses `state` or sends it as `null` (`detail` `state is missing`), names a `state` outside the two (`detail` `state is not one of enabled and opted_out`), carries more than 1,024 entries, an entry whose member breaks its own rule (`detail` such as `rules[0].listener is not one of listening and not_listening`), more than 8 target entries on a rule, a target entry whose member breaks its own rule (`detail` such as `rules[0].targets[1].port is outside 1..65535`), or a `client_auth_enforced` or `client_refusals` that breaks its own rule (`detail` such as `rules[0].client_refusals[1].reason is not a reason token`; see the table above). A control plane that predates `rules` answers it to every `enabled` report with entries | Logged at Warn as `send failed` on every send; the next tick sends the report again. plexd has no fallback for a control plane that predates `rules` |
+| `400 Bad Request` | `invalid_ingress_status` | An `opted_out` report with entries, an `id` that repeats an earlier entry, an entry that breaks the presence rules (`detail` such as `rules[1].id repeats rules[0].id`), target entries on a `not_listening` entry, a target entry that breaks the presence rules or repeats the `node_id` and `port` of an earlier one (`detail` such as `rules[0].targets[1] repeats rules[0].targets[0]`), a `client_auth_enforced` of `true` on a `not_listening` entry, refusal entries without it, or a refusal entry that repeats the `reason` of an earlier one (`detail` such as `rules[0].client_refusals[1] repeats rules[0].client_refusals[0]`) | Logged at Warn as `send failed`; the next tick sends the report again |
 | `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends the report again. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
 | `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends the report again |
 | `404 Not Found` | `ingress_status_node_gone` | The node was removed while the request ran | Logged at Warn as `rejected, this node was removed` on every send; plexd keeps reporting every interval |
@@ -1686,7 +1737,16 @@ and `target_port`, which repeat the first entry of `targets`, and a
 Project that holds its certificate chain and key. A `terminate` or `acme` rule
 may carry `conditions`, an optional `path_prefix` and at most 8 `headers` of a
 `name` and a `value`, and, with a path prefix other than `/`,
-`strip_path_prefix`; both members are absent on a rule without them. The
+`strip_path_prefix`; both members are absent on a rule without them. A
+`terminate` or `acme` rule may also carry `client_auth`, whose `ca_bundle`
+holds the rule's client authorities, 1 to 8 CA certificates as PEM
+`CERTIFICATE` blocks, as a control plane since
+[plexsphere/plexsphere#1121](https://github.com/plexsphere/plexsphere/pull/1121)
+sends it; a rule without the requirement carries no member. The bridge then
+completes the TLS handshake only with a client whose certificate chains to one
+of them, and serves no client of a rule whose bundle it cannot build its
+authorities from (see
+[Client Certificates](../bridge/public-ingress.md#client-certificates)). The
 block's `acme` member, present exactly when a rule has mode `acme`, carries the
 `directory_url` and the
 optional `contact_email` of the ACME account the `acme` rules share. The

@@ -387,6 +387,10 @@ them. See [Routing a Request](/reference/bridge/public-ingress#routing-a-request
 A rule names one to eight `Targets`, over which the bridge spreads its
 connections, requests or client flows by round robin. See
 [Several Targets](/reference/bridge/public-ingress#several-targets).
+A `terminate` or `acme` rule may carry `ClientAuth`; the bridge then completes
+the TLS handshake only with a client whose certificate chains to one of the
+rule's client authorities. See
+[Client Certificates](/reference/bridge/public-ingress#client-certificates).
 
 | Field           | Type     | JSON Tag                 | Description                                  |
 |-----------------|----------|--------------------------|----------------------------------------------|
@@ -403,13 +407,25 @@ connections, requests or client flows by round robin. See
 | `CertificateSecretName` | `string` | `"certificate_secret_name,omitempty"` | Secret of the bridge's Project that holds a `terminate` rule's certificate chain and key, one PEM document; empty on every other mode. The bridge fetches it in the version the pull's `secrets` block lists. See [Certificates from the Secret Store](/reference/bridge/public-ingress#certificates-from-the-secret-store) |
 | `Conditions` | `IngressConditions` | `"conditions,omitzero"` | The request conditions of a `terminate` or `acme` rule. A rule without conditions marshals without the key, and an absent, `null` or empty member, or one with an empty `headers` list, decodes to a rule without conditions |
 | `StripPathPrefix` | `bool` | `"strip_path_prefix,omitempty"` | The bridge removes the matched path prefix from the front of the path the target receives. Only a rule whose path prefix is present and not `/` carries it |
+| `ClientAuth` | `*IngressClientAuth` | `"client_auth,omitempty"` | The client certificate requirement of a `terminate` or `acme` rule, as a control plane since [plexsphere/plexsphere#1121](https://github.com/plexsphere/plexsphere/pull/1121) sends it. A pointer, because presence is the requirement: an absent member and `null` decode to nil, which marshals without the key, and `{}` and `{"ca_bundle": ""}` decode to a value with an empty bundle, which the bridge cannot build its authorities from (`client_ca_invalid`) |
 
 The `Conditions.Headers` and `Targets` slices rule out `==` on two rules, so
 the compiler refuses it. `Equal(o IngressRule) bool` compares two rules with
 `reflect.DeepEqual` and treats a nil and an empty `Conditions.Headers` as
 equal, and a nil and an empty `Targets`; the order of the headers and of the
-targets counts. The bridge calls it to tell an unchanged rule from a changed
-one.
+targets counts. `reflect.DeepEqual` follows the `ClientAuth` pointer: a nil and
+a non-nil `ClientAuth` differ, and two bundles compare by their text, so a
+bundle that differs in one byte or in the order of its blocks makes another
+rule. The bridge calls it to tell an unchanged rule from a changed one.
+
+**IngressClientAuth**
+
+The client certificate requirement of an ingress rule, the control plane's
+`BridgeIngressRuleClientAuthBundle`.
+
+| Field      | Type     | JSON Tag      | Description |
+|------------|----------|---------------|-------------|
+| `CABundle` | `string` | `"ca_bundle"` | The rule's client authorities: 1 to 8 CA certificates as PEM `CERTIFICATE` blocks, each without headers, as the control plane stores them. The bridge holds them in memory and logs no byte of them |
 
 **IngressTarget**
 
@@ -1345,8 +1361,10 @@ receive time, so plexd builds a fresh request for every attempt.
 
 Whether a bridge's local configuration serves public ingress, which the control
 plane reads to refuse an ingress rule that no listener would serve, and the
-state of each ingress rule. The control plane keeps the latest state per node
-and never ages it, and each report replaces the rule entries of the one before.
+state of each ingress rule, on a rule with `client_auth` whether the bridge
+verifies its clients and the last client it refused per reason. The control
+plane keeps the latest state per node and never ages it, and each report
+replaces the rule entries of the one before.
 The handler decodes with unknown members refused, of the report and of each
 entry. See [Control Plane API Endpoints](api-endpoints.md#ingress-status) for
 the wire example and error taxonomy, and
@@ -1376,6 +1394,8 @@ send empty:
 | `DialReason`        | `string` | `"dial_reason,omitempty"`       | A reason token; exactly when `Dial` is `failed` |
 | `DialAgeSeconds`    | `*int64` | `"dial_age_seconds,omitempty"`  | Whole seconds from the dial to the report, 0 to `MaxIngressStatusDialAgeSeconds`; exactly when `Dial` is `succeeded` or `failed`. A pointer, because 0 is a valid age |
 | `Targets`           | `[]IngressStatusTarget` | `"targets,omitempty"` | At most `MaxIngressStatusTargets` entries, one per target of the rule, only beside a `Listener` of `listening`; nil omits the member, which reads as no entries |
+| `ClientAuthEnforced` | `bool` | `"client_auth_enforced,omitempty"` | The bridge verifies every client of the rule against its client authorities, or serves no client of the rule. `true` only beside a `Listener` of `listening`, and sent only for a rule whose pull entry carries `client_auth`; `false` omits the member, which the contract reads as `false` |
+| `ClientRefusals` | `[]IngressStatusClientRefusal` | `"client_refusals,omitempty"` | At most `MaxIngressStatusClientRefusals` entries, one per reason, only beside a `ClientAuthEnforced` of `true`; nil omits the member, which reads as no entries. plexd sends at most four, one per refusal reason it knows |
 
 **IngressStatusTarget**, the control plane's `IngressStatusReportRuleTarget`:
 the target as the pull names it and the last dial the bridge made to it.
@@ -1391,20 +1411,37 @@ the same `NodeID` and `Port`:
 | `DialReason`     | `string` | `"dial_reason,omitempty"`      | A reason token; exactly when `Dial` is `failed` |
 | `DialAgeSeconds` | `*int64` | `"dial_age_seconds,omitempty"` | Whole seconds from the last dial to the target to the report, 0 to `MaxIngressStatusDialAgeSeconds`; exactly when `Dial` is `succeeded` or `failed` |
 
-The `Targets` slice makes a rule entry incomparable with `==`, so the reporter
-compares two entries member by member, the dial ages of the rule and of its
-targets ignored.
+**IngressStatusClientRefusal**, the control plane's
+`IngressStatusReportRuleClientRefusal`: the last client the bridge refused for
+one reason. No two entries of one rule name the same `Reason`:
+
+| Field        | Type     | JSON Tag        | Description |
+|--------------|----------|-----------------|-------------|
+| `Reason`     | `string` | `"reason"`      | A reason token: `no_certificate`, `unknown_authority`, `certificate_expired` or `certificate_invalid` |
+| `AgeSeconds` | `int64`  | `"age_seconds"` | Whole seconds from the refusal to the report, 0 to `MaxIngressStatusRefusalAgeSeconds`. The contract requires the member, and 0 is a valid age, so it has no `omitempty` |
+
+The `Targets` and `ClientRefusals` slices make a rule entry incomparable with
+`==`, so the reporter compares two entries member by member, the dial ages of
+the rule and of its targets and the client refusals ignored, so a refusal
+alone sends nothing, while a change of `ClientAuthEnforced` counts.
 
 A missing, `null` or unknown state, an unknown member, data after the report,
 more than `MaxIngressStatusRules` entries, and an entry with a malformed id or
 a value outside its member's rule answer `400 malformed_ingress_status`, and so
 do more than `MaxIngressStatusTargets` target entries and a target entry with a
-malformed `node_id` or a value outside its member's rule. An opted-out report
-with entries, a repeated id, an entry that breaks the presence rules, target
-entries on a rule that is not listening, a target entry that breaks the
-presence rules, and two target entries of one rule with the same `node_id` and
-`port` answer `400 invalid_ingress_status`. `ReportIngressStatus` checks none
-of this and sends the request as passed.
+malformed `node_id` or a value outside its member's rule. A
+`client_auth_enforced` that is not a boolean, a `client_refusals` that is not
+an array or holds more than `MaxIngressStatusClientRefusals` entries, and a
+refusal entry that is not an object, carries an unknown member, or whose
+`reason` is not a reason token or whose `age_seconds` is outside its range
+answer `400 malformed_ingress_status` too. An opted-out report with entries, a
+repeated id, an entry that breaks the presence rules, target entries on a rule
+that is not listening, a target entry that breaks the presence rules, two
+target entries of one rule with the same `node_id` and `port`, a
+`client_auth_enforced` of `true` on a rule that is not listening, refusal
+entries on a rule without a `client_auth_enforced` of `true`, and two refusal
+entries of one rule with the same `reason` answer `400 invalid_ingress_status`.
+`ReportIngressStatus` checks none of this and sends the request as passed.
 
 **IngressStatusResponse** (`200 OK`)
 
@@ -1429,6 +1466,8 @@ of this and sends the request as passed.
 | `MaxIngressStatusRules` | `1024` | The most entries one report carries |
 | `MaxIngressStatusDialAgeSeconds` | `2147483647` | The ceiling of `dial_age_seconds`, the largest signed 32-bit integer |
 | `MaxIngressStatusTargets` | `8` | The most target entries one rule entry carries, the most targets a rule holds |
+| `MaxIngressStatusClientRefusals` | `8` | The contract's ceiling on the refusal entries of one rule entry |
+| `MaxIngressStatusRefusalAgeSeconds` | `2147483647` | The ceiling of a refusal's `age_seconds`, the largest signed 32-bit integer |
 
 **Validators**
 
