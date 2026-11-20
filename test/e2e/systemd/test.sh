@@ -49,6 +49,10 @@
 #     target to the next and returns to it after the 30 s hold-out, a rule
 #     whose requests alternate between its two targets, each target's last
 #     dial in the report,
+#     an acme and a terminate rule that admit only a client certificate of
+#     their CA, report the last refusal per reason, name the admitted client
+#     to an HTTP target in X-Forwarded-Client-Cert and serve no client for a
+#     bundle that holds no certificate,
 #     a block whose enabled is false closing every listener,
 #     and the opt-out with bridge.ingress_enabled: false, which opens no
 #     listener for an enabled block and reports opted_out
@@ -2282,8 +2286,11 @@ echo "=== Mesh DNS opt-out PASSED ==="
 # at the bridge with the certificate of a Secret the mock serves, and an acme
 # rule with a certificate the bridge obtains from Pebble, which runs as a
 # container on the same network and validates the bridge over TLS-ALPN-01 on
-# port 443. The probes run from the target container against the systemd
-# container's address on the network, which is outside the mesh. Docker sets
+# port 443. For one step the acme rule and a terminate rule ask each client
+# for a certificate of a CA the target container creates, and the probes
+# present a certificate of that CA, none, or one of a second CA. The probes
+# run from the target container against the systemd container's address on
+# the network, which is outside the mesh. Docker sets
 # net.ipv4.ip_unprivileged_port_start to 0 in a container, so the phase sets
 # it back to 1024 first: port 443 then binds only through the unit's
 # CAP_NET_BIND_SERVICE. A bridge without the key serves public ingress, and
@@ -2319,6 +2326,24 @@ docker exec "${INGRESS_TARGET_CONTAINER}" sh -c '
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
         -subj "/CN=h.ingress.e2e.test" -addext "subjectAltName=DNS:h.ingress.e2e.test,DNS:o.ingress.e2e.test" \
         -keyout /srv/ingress/http.key -out /srv/ingress/http.pem 2>/dev/null' || fail "could not create the target's certificates"
+# The certificates of the step on client certificates: the CA
+# CN=plexd-e2e-client-ca and the leaf CN=plexd-e2e-client it signs for client
+# authentication, and a second CA, CN=plexd-e2e-stranger-ca, with the leaf
+# CN=plexd-e2e-stranger. openssl req -x509 adds the CA extensions of its
+# config, so each leaf sets its basic constraints to CA:FALSE.
+docker exec "${INGRESS_TARGET_CONTAINER}" sh -c '
+    set -e
+    for name in client stranger; do
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -subj "/CN=plexd-e2e-${name}-ca" \
+            -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" \
+            -keyout "/srv/ingress/${name}-ca.key" -out "/srv/ingress/${name}-ca.pem" 2>/dev/null
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -subj "/CN=plexd-e2e-${name}" -CA "/srv/ingress/${name}-ca.pem" -CAkey "/srv/ingress/${name}-ca.key" \
+            -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=clientAuth" \
+            -keyout "/srv/ingress/${name}.key" -out "/srv/ingress/${name}.pem" 2>/dev/null
+    done' || fail "could not create the client certificates in ${INGRESS_TARGET_CONTAINER}"
 for spec in 9441:a 9442:b 9443:wild; do
     docker exec -d "${INGRESS_TARGET_CONTAINER}" openssl s_server -4 -accept "${spec%%:*}" \
         -cert "/srv/ingress/${spec#*:}.pem" -key "/srv/ingress/${spec#*:}.key" -www
@@ -2561,17 +2586,18 @@ ingress_subject() {
         _ "${BRIDGE_IP}" "$1" || true
 }
 
-# ingress_session <server name> runs one TLS session with port 443 of the
-# bridge under that server name, as a client that sends nothing: -ign_eof
-# keeps it open past the end of stdin until the bridge closes it. It leaves
-# everything s_client printed in SESSION_OUT, the handshake and then the
-# plaintext the target wrote through the session, and the subject and issuer
-# of the certificate the bridge presented in SESSION_SUBJECT and
-# SESSION_ISSUER, both empty when it presented none.
+# ingress_session <server name> [<s_client option>...] runs one TLS session
+# with port 443 of the bridge under that server name, as a client that sends
+# nothing: -ign_eof keeps it open past the end of stdin until the bridge
+# closes it. The options follow the others, such as -cert and -key for a
+# client certificate. It leaves everything s_client printed in SESSION_OUT,
+# the handshake and then the plaintext the target wrote through the session,
+# and the subject and issuer of the certificate the bridge presented in
+# SESSION_SUBJECT and SESSION_ISSUER, both empty when it presented none.
 ingress_session() {
     SESSION_OUT=$(docker exec "${INGRESS_TARGET_CONTAINER}" sh -c \
-        'timeout 10 openssl s_client -connect "$1:443" -servername "$2" -ign_eof </dev/null 2>/dev/null' \
-        _ "${BRIDGE_IP}" "$1" || true)
+        'bridge=$1 name=$2; shift 2; timeout 10 openssl s_client -connect "${bridge}:443" -servername "${name}" -ign_eof "$@" </dev/null 2>/dev/null' \
+        _ "${BRIDGE_IP}" "$@" || true)
     SESSION_SUBJECT=$(printf '%s\n' "${SESSION_OUT}" \
         | docker exec -i "${INGRESS_TARGET_CONTAINER}" openssl x509 -noout -subject 2>/dev/null || true)
     SESSION_ISSUER=$(printf '%s\n' "${SESSION_OUT}" \
@@ -3442,6 +3468,205 @@ wait_ingress_report http-pool "http-pool's dial and both of its targets succeede
     'any(.rules[]?; .id == $http and .dial == "succeeded"
          and ([.targets[]? | select(.node_id == $node and .dial == "succeeded") | .port] | sort) == [9081, 9082])' \
     --arg http "${RULE_ID_HTTP_POOL}" --arg node "${INGRESS_TARGET_NODE_ID}"
+
+# Client certificates. The rules of the step on several targets are served
+# with client_auth on tls-acme and http-only, whose ca_bundle is the text of
+# /srv/ingress/client-ca.pem. The bridge then asks each client of
+# acme.ingress.e2e.test and o.ingress.e2e.test for a certificate in the
+# handshake and admits only one that the CA signed: the leaf
+# CN=plexd-e2e-client, not the leaf CN=plexd-e2e-stranger of the second CA.
+# It refuses a client before it dials a target, and keeps the time of the
+# last refusal per reason on the rule. A refusal sends no report by itself
+# and rides the next repeat, every 30 s. On http-only, whose rule has
+# conditions, the target learns the admitted client from the field
+# X-Forwarded-Client-Cert, which the bridge sets and never takes from the
+# client. A bundle that holds no certificate keeps the rule's listener and
+# serves no client. The step ends with the rules of the step on several
+# targets again, so the later steps start from the rules they expect. Every
+# block keeps port 443, so its listener stays.
+CLIENT_CA_PEM=$(docker exec "${INGRESS_TARGET_CONTAINER}" cat /srv/ingress/client-ca.pem) \
+    || fail "could not read /srv/ingress/client-ca.pem from ${INGRESS_TARGET_CONTAINER}"
+# The hash the bridge must forward: the lowercase hex SHA-256 of the DER of
+# the client's certificate. dgst -r prints the digest first.
+CLIENT_HASH=$(docker exec "${INGRESS_TARGET_CONTAINER}" sh -c \
+    'set -o pipefail; openssl x509 -in /srv/ingress/client.pem -outform DER | openssl dgst -sha256 -r' 2>&1) \
+    || fail "could not compute the SHA-256 of /srv/ingress/client.pem in ${INGRESS_TARGET_CONTAINER}: ${CLIENT_HASH}"
+CLIENT_HASH=${CLIENT_HASH%% *}
+if [ "${#CLIENT_HASH}" -ne 64 ] || [ -n "${CLIENT_HASH//[0-9a-f]/}" ]; then
+    fail "${INGRESS_TARGET_CONTAINER} computed the SHA-256 '${CLIENT_HASH}' of /srv/ingress/client.pem, want 64 lowercase hex digits"
+fi
+CLIENT_XFCC="X-Forwarded-Client-Cert: Hash=${CLIENT_HASH};Subject=\"CN=plexd-e2e-client\""
+CLIENT_CERT_ARGS=(--cert /srv/ingress/client.pem --key /srv/ingress/client.key)
+
+# client_auth_rules <bundles-json> prints the rules of the step on several
+# targets with client_auth on each rule whose slug is a key of the object
+# bundles-json, its ca_bundle the value of that key.
+client_auth_rules() {
+    printf '%s' "${POOL_RULES}" | jq -c --argjson bundles "$1" \
+        'map(.slug as $s | if $bundles | has($s) then . + {client_auth: {ca_bundle: $bundles[$s]}} else . end)'
+}
+
+# prefix_count <text> <prefix> prints how many lines of text start with
+# prefix.
+prefix_count() {
+    local text=$1 prefix=$2 line n=0
+    while IFS= read -r line; do
+        case "${line}" in
+            "${prefix}"*) n=$((n + 1)) ;;
+        esac
+    done <<< "${text}"
+    echo "${n}"
+}
+
+# The ca_bundle is the text of the file, whose last line feed the command
+# substitution dropped.
+CLIENT_AUTH_BUNDLES=$(jq -cn --arg ca "${CLIENT_CA_PEM}"$'\n' '{"tls-acme": $ca, "http-only": $ca}')
+CLIENT_AUTH_RULES=$(client_auth_rules "${CLIENT_AUTH_BUNDLES}") || fail "could not render the rules with client_auth"
+configure_ingress client-auth "${CLIENT_AUTH_RULES}" "${PEBBLE_ACME}" '[{"name": "tls-http", "version": 1}]'
+echo "  the mock serves the rules of the step on several targets with client_auth on tls-acme and http-only, whose ca_bundle is /srv/ingress/client-ca.pem"
+wait_ingress_report client-auth "tls-acme and http-only listening and ready with client_auth_enforced true and no client_refusals, and no other entry with client_auth_enforced" \
+    '. as $r
+     | ([$r.rules[]? | select(has("client_auth_enforced")) | .id] | sort) == ([$acme, $only] | sort)
+       and ([$acme, $only] | map(. as $id | any($r.rules[]?; .id == $id and .listener == "listening" and .certificate == "ready"
+             and .client_auth_enforced == true and (has("client_refusals") | not))) | all)' \
+    --arg acme "${RULE_ID_ACME}" --arg only "${RULE_ID_HTTP_ONLY}"
+
+# A session with the client's certificate reaches the banner server. A
+# session without a certificate and one with the stranger's are refused in
+# the handshake, so neither reads the banner.
+ingress_session acme.ingress.e2e.test -cert /srv/ingress/client.pem -key /srv/ingress/client.key
+case "${SESSION_OUT}" in
+    *plexd-e2e-banner*) echo "  PASS: with the client's certificate, the session with acme.ingress.e2e.test read plexd-e2e-banner" ;;
+    *)
+        echo "${SESSION_OUT}"
+        fail "with the client's certificate, the session with acme.ingress.e2e.test did not read plexd-e2e-banner"
+        ;;
+esac
+# acme_session_refused <what> [<s_client option>...] fails when a session with
+# acme.ingress.e2e.test and those options reads the banner.
+acme_session_refused() {
+    local what=$1
+    shift
+    ingress_session acme.ingress.e2e.test "$@"
+    case "${SESSION_OUT}" in
+        *plexd-e2e-banner*)
+            echo "${SESSION_OUT}"
+            fail "${what}, the session with acme.ingress.e2e.test read plexd-e2e-banner, want no banner"
+            ;;
+    esac
+    echo "  PASS: ${what}, the session with acme.ingress.e2e.test read no banner"
+}
+acme_session_refused "without a certificate"
+acme_session_refused "with the stranger's certificate" -cert /srv/ingress/stranger.pem -key /srv/ingress/stranger.key
+
+# expect_forwarded_client [<curl option>...] fails unless
+# https://o.ingress.e2e.test/only with the client's certificate and those
+# options reads target=api and the header line CLIENT_XFCC as the one
+# X-Forwarded-Client-Cert line.
+expect_forwarded_client() {
+    local body
+    body=$(ingress_curl o.ingress.e2e.test /only "${CLIENT_CERT_ARGS[@]}" "$@")
+    target_reply "${body}"
+    if [ "${REPLY_TARGET}" != "target=api" ]; then
+        echo "${body}"
+        fail "https://o.ingress.e2e.test/only with the client's certificate${*:+ and $*} read '${REPLY_TARGET}', want target=api"
+    fi
+    if [ "$(prefix_count "${body}" "X-Forwarded-Client-Cert:")" -eq 1 ] && has_line "${body}" "${CLIENT_XFCC}"; then
+        echo "  PASS: https://o.ingress.e2e.test/only with the client's certificate${*:+ and $*} read target=api and the one header line '${CLIENT_XFCC}'"
+    else
+        echo "${body}"
+        fail "https://o.ingress.e2e.test/only with the client's certificate${*:+ and $*} read $(prefix_count "${body}" "X-Forwarded-Client-Cert:") X-Forwarded-Client-Cert lines, want the one line '${CLIENT_XFCC}'"
+    fi
+}
+expect_forwarded_client
+expect_forwarded_client -H 'X-Forwarded-Client-Cert: forged'
+HTTP_BODY=$(ingress_curl o.ingress.e2e.test /only)
+if [ "$(prefix_count "${HTTP_BODY}" target=)" -eq 0 ]; then
+    echo "  PASS: https://o.ingress.e2e.test/only without a certificate read no target= line"
+else
+    echo "${HTTP_BODY}"
+    fail "https://o.ingress.e2e.test/only without a certificate read a target= line, want none"
+fi
+
+# Each refusal shows on its rule with the next repeat of the report.
+wait_ingress_report client-refusals "no_certificate and unknown_authority under client_refusals of tls-acme and no_certificate under those of http-only, each with an age_seconds from 0 to 120" \
+    '. as $r
+     | any($r.rules[]?; .id == $acme and .client_auth_enforced == true
+           and [.client_refusals[]? | .reason] == ["no_certificate", "unknown_authority"]
+           and all(.client_refusals[]?; (.age_seconds | type) == "number" and .age_seconds >= 0 and .age_seconds <= 120))
+       and any($r.rules[]?; .id == $only and .client_auth_enforced == true
+           and [.client_refusals[]? | .reason] == ["no_certificate"]
+           and all(.client_refusals[]?; (.age_seconds | type) == "number" and .age_seconds >= 0 and .age_seconds <= 120))' \
+    --arg acme "${RULE_ID_ACME}" --arg only "${RULE_ID_HTTP_ONLY}"
+ingress_journal
+OPENED=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=443")
+if [ "${OPENED}" -eq 1 ]; then
+    echo "  PASS: with client_auth, plexd[${INGRESS_PID}] still logged one 'ingress listener opened' for port 443"
+else
+    fail "plexd[${INGRESS_PID}] logged ${OPENED} 'ingress listener opened' lines for port 443 after client_auth was served, want 1"
+fi
+
+# A bundle that holds no certificate. http-only keeps its listener and reads
+# not_ready with client_ca_invalid, and the bridge closes each of its
+# connections before the handshake. The changed bundle also clears the
+# rule's refusals.
+CLIENT_AUTH_BUNDLES=$(jq -cn --arg ca "${CLIENT_CA_PEM}"$'\n' '{"tls-acme": $ca, "http-only": "not a certificate"}')
+CLIENT_AUTH_RULES=$(client_auth_rules "${CLIENT_AUTH_BUNDLES}") || fail "could not render the rules with client_auth"
+configure_ingress client-ca-invalid "${CLIENT_AUTH_RULES}" "${PEBBLE_ACME}" '[{"name": "tls-http", "version": 1}]'
+echo "  the mock serves http-only with the ca_bundle 'not a certificate'"
+wait_ingress_report client-ca-invalid "http-only listening and not_ready with client_ca_invalid, client_auth_enforced true and no client_refusals" \
+    'any(.rules[]?; .id == $only and .listener == "listening" and .certificate == "not_ready"
+         and .certificate_reason == "client_ca_invalid" and .client_auth_enforced == true
+         and (has("client_refusals") | not))' \
+    --arg only "${RULE_ID_HTTP_ONLY}"
+HTTP_BODY=$(ingress_curl o.ingress.e2e.test /only "${CLIENT_CERT_ARGS[@]}")
+if [ "$(prefix_count "${HTTP_BODY}" target=)" -eq 0 ]; then
+    echo "  PASS: with the bundle 'not a certificate', https://o.ingress.e2e.test/only with the client's certificate read no target= line"
+else
+    echo "${HTTP_BODY}"
+    fail "with the bundle 'not a certificate', https://o.ingress.e2e.test/only with the client's certificate read a target= line, want none"
+fi
+CA_INVALID_START=${SECONDS}
+until ingress_journal && journal_has "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress rule not served"' \
+    "slug=http-only" "reason=client_ca_invalid"; do
+    if [ $((SECONDS - CA_INVALID_START)) -ge 60 ]; then
+        fail "plexd[${INGRESS_PID}] logged no 'ingress rule not served' with slug=http-only and reason=client_ca_invalid within 60s of the report showing client_ca_invalid"
+    fi
+    sleep 2
+done
+echo "  PASS: plexd[${INGRESS_PID}] logged 'ingress rule not served' with slug=http-only and reason=client_ca_invalid"
+
+# The rules of the step on several targets again, without client_auth.
+configure_ingress client-auth-removed "${POOL_RULES}" "${PEBBLE_ACME}" '[{"name": "tls-http", "version": 1}]'
+echo "  the mock serves the rules of the step on several targets again, without client_auth"
+wait_ingress_report client-auth-removed "tls-acme and http-only listening and ready, and no entry with client_auth_enforced or client_refusals" \
+    '. as $r
+     | ([$acme, $only] | map(. as $id | any($r.rules[]?; .id == $id and .listener == "listening" and .certificate == "ready")) | all)
+       and all($r.rules[]?; (has("client_auth_enforced") or has("client_refusals")) | not)' \
+    --arg acme "${RULE_ID_ACME}" --arg only "${RULE_ID_HTTP_ONLY}"
+ingress_session acme.ingress.e2e.test
+case "${SESSION_OUT}" in
+    *plexd-e2e-banner*) echo "  PASS: without client_auth, the session with acme.ingress.e2e.test read plexd-e2e-banner without a certificate again" ;;
+    *)
+        echo "${SESSION_OUT}"
+        fail "without client_auth, the session with acme.ingress.e2e.test did not read plexd-e2e-banner without a certificate"
+        ;;
+esac
+HTTP_BODY=$(ingress_curl o.ingress.e2e.test /only)
+target_reply "${HTTP_BODY}"
+if [ "${REPLY_TARGET}" = "target=api" ] && [ "$(prefix_count "${HTTP_BODY}" "X-Forwarded-Client-Cert:")" -eq 0 ]; then
+    echo "  PASS: without client_auth, https://o.ingress.e2e.test/only without a certificate read target=api and no X-Forwarded-Client-Cert line"
+else
+    echo "${HTTP_BODY}"
+    fail "without client_auth, https://o.ingress.e2e.test/only without a certificate read '${REPLY_TARGET}', want target=api with no X-Forwarded-Client-Cert line"
+fi
+ingress_journal
+OPENED=$(journal_count "${INGRESS_JOURNAL}" "plexd[${INGRESS_PID}]:" 'msg="ingress listener opened"' "listen_port=443")
+if [ "${OPENED}" -eq 1 ]; then
+    echo "  PASS: after the changes of client_auth, plexd[${INGRESS_PID}] still logged one 'ingress listener opened' for port 443"
+else
+    fail "plexd[${INGRESS_PID}] logged ${OPENED} 'ingress listener opened' lines for port 443 after the changes of client_auth, want 1"
+fi
 
 # An ingress child of null closes every public listener, of both protocols.
 configure_ingress remove null
