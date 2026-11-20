@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/tlstest"
 )
 
 // newTestClient creates a ControlPlane client pointed at the given test server.
@@ -417,4 +423,158 @@ func TestClient_EmptyBodyOnStateIsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "decode response") {
 		t.Errorf("FetchState() error = %v, want a decode response error", err)
 	}
+}
+
+// okJSONHandler answers every request with 200 and an empty JSON object.
+func okJSONHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "{}")
+	})
+}
+
+// newCATestClient creates a ControlPlane client for serverURL that trusts the
+// certificates in caFile beside the system roots, or the system roots alone
+// when caFile is empty.
+func newCATestClient(t *testing.T, serverURL, caFile string) *ControlPlane {
+	t.Helper()
+	c, err := NewControlPlane(Config{BaseURL: serverURL, TLSCAFile: caFile}, "1.2.3", slog.Default())
+	if err != nil {
+		t.Fatalf("NewControlPlane: %v", err)
+	}
+	return c
+}
+
+// The server sends only a leaf the test CA signed, as a control plane behind a
+// private CA does, so the handshake completes only through the file.
+func TestClient_TLSCAFileTrustsItsCA(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	srv := ca.Server(t, okJSONHandler())
+	c := newCATestClient(t, srv.URL, ca.File())
+
+	if err := c.GetJSON(context.Background(), "/v1/health", nil); err != nil {
+		t.Fatalf("GetJSON against a server of the file's CA: %v", err)
+	}
+}
+
+func TestClient_TLSCAFileRejectsAnotherCA(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	other := tlstest.NewCA(t)
+	srv := other.Server(t, okJSONHandler())
+	c := newCATestClient(t, srv.URL, ca.File())
+
+	err := c.GetJSON(context.Background(), "/v1/health", nil)
+	if err == nil {
+		t.Fatal("GetJSON against a server of another CA = nil, want a verification error")
+	}
+	var unknown x509.UnknownAuthorityError
+	if !errors.As(err, &unknown) {
+		t.Errorf("errors.As(err, x509.UnknownAuthorityError) = false; err = %v", err)
+	}
+}
+
+// Without the file the test CA is in no trust store the client reads, which
+// proves that the test above trusted it through the file alone. The test
+// asserts the wrapper only: with no file the macOS platform verifier decides,
+// and it reports an untrusted root as a plain x509 error rather than as an
+// x509.UnknownAuthorityError.
+func TestClient_WithoutTLSCAFileRejectsTheCA(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	srv := ca.Server(t, okJSONHandler())
+	c := newCATestClient(t, srv.URL, "")
+
+	err := c.GetJSON(context.Background(), "/v1/health", nil)
+	if err == nil {
+		t.Fatal("GetJSON without the CA file = nil, want a verification error")
+	}
+	var verifyErr *tls.CertificateVerificationError
+	if !errors.As(err, &verifyErr) {
+		t.Errorf("errors.As(err, *tls.CertificateVerificationError) = false; err = %v", err)
+	}
+}
+
+// The file adds to the system roots instead of replacing them, so a control
+// plane that later moves to a publicly trusted certificate keeps working
+// without a configuration change.
+func TestClient_TLSCAFileKeepsSystemRoots(t *testing.T) {
+	caA := tlstest.NewCA(t)
+	caB := tlstest.NewCA(t)
+	block, _ := pem.Decode(readCAFile(t, caA))
+	if block == nil {
+		t.Fatal("CA A's file holds no PEM block")
+	}
+	certA, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse CA A: %v", err)
+	}
+	// x509.SystemCertPool hands out a new copy on each call and LoadRootCAs
+	// appends to the pool it gets, so the stand-in must not share one either.
+	stubSystemCertPool(t, func() (*x509.CertPool, error) {
+		pool := x509.NewCertPool()
+		pool.AddCert(certA)
+		return pool, nil
+	})
+
+	servers := []struct {
+		name string
+		srv  *httptest.Server
+	}{
+		{name: "server of the system root A", srv: caA.Server(t, okJSONHandler())},
+		{name: "server of the file's CA B", srv: caB.Server(t, okJSONHandler())},
+	}
+	for _, s := range servers {
+		c := newCATestClient(t, s.srv.URL, caB.File())
+		if err := c.GetJSON(context.Background(), "/v1/health", nil); err != nil {
+			t.Errorf("GetJSON against the %s: %v", s.name, err)
+		}
+	}
+}
+
+func TestClient_NewControlPlane_MissingTLSCAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-ca.pem")
+
+	c, err := NewControlPlane(Config{BaseURL: "https://example.com", TLSCAFile: path}, "1.0.0", slog.Default())
+	if err == nil {
+		t.Fatal("NewControlPlane with a missing CA file = nil error, want one")
+	}
+	const wantPrefix = "api: config: tls_ca_file: read CA file:"
+	if !strings.HasPrefix(err.Error(), wantPrefix) {
+		t.Errorf("error = %q, want it to start with %q", err, wantPrefix)
+	}
+	if c != nil {
+		t.Error("NewControlPlane returned a client with the error, want nil")
+	}
+}
+
+func TestClient_NewControlPlane_LogsCABundle(t *testing.T) {
+	const msg = "control plane CA bundle loaded"
+
+	t.Run("file set", func(t *testing.T) {
+		ca := tlstest.NewCA(t)
+		logs := &logCapture{}
+		if _, err := NewControlPlane(Config{BaseURL: "https://example.com", TLSCAFile: ca.File()}, "1.0.0", slog.New(logs)); err != nil {
+			t.Fatalf("NewControlPlane: %v", err)
+		}
+		lines := logs.find(msg)
+		if len(lines) != 1 {
+			t.Fatalf("got %d lines %q, want 1", len(lines), msg)
+		}
+		if lines[0].level != slog.LevelInfo {
+			t.Errorf("level = %v, want %v", lines[0].level, slog.LevelInfo)
+		}
+		if got := lines[0].attrs["path"]; got != ca.File() {
+			t.Errorf("path = %q, want %q", got, ca.File())
+		}
+	})
+
+	t.Run("file unset", func(t *testing.T) {
+		logs := &logCapture{}
+		if _, err := NewControlPlane(Config{BaseURL: "https://example.com"}, "1.0.0", slog.New(logs)); err != nil {
+			t.Fatalf("NewControlPlane: %v", err)
+		}
+		if lines := logs.find(msg); len(lines) != 0 {
+			t.Errorf("got %d lines %q without a CA file, want none", len(lines), msg)
+		}
+	})
 }

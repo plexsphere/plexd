@@ -127,3 +127,38 @@ func TestConfig_ValidateSSEReprobeInterval(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_ValidateTLSCAFileExcludesSkipVerify(t *testing.T) {
+	tests := []struct {
+		name       string
+		caFile     string
+		skipVerify bool
+		wantErr    string
+	}{
+		{"both set", "/etc/plexd/control-plane-ca.pem", true, "api: config: tls_ca_file and tls_insecure_skip_verify are mutually exclusive"},
+		{"CA file alone", "/etc/plexd/control-plane-ca.pem", false, ""},
+		{"skip verify alone", "", true, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				BaseURL:               "https://api.example.com",
+				TLSCAFile:             tt.caFile,
+				TLSInsecureSkipVerify: tt.skipVerify,
+			}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() = nil, want %q", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
