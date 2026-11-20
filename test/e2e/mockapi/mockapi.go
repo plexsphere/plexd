@@ -275,6 +275,13 @@ type Server struct {
 	namedSecretsMu sync.RWMutex
 	namedSecrets   map[string]namedSecret
 
+	// tlsCA is the PEM of the CA that signed the TLS listeners' leaf (issue
+	// #231), served by GET /test/tls-ca so a suite can trust the mock through
+	// tls_ca_file instead of skipping verification. Guarded by tlsCAMu: main
+	// sets it once, while a test may set it with the handler already serving.
+	tlsCAMu sync.RWMutex
+	tlsCA   []byte
+
 	mux *http.ServeMux
 }
 
@@ -739,6 +746,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 	s.mux.HandleFunc("GET /test/bearer", s.handleBearer)
+	s.mux.HandleFunc("GET /test/tls-ca", s.handleTLSCA)
 	s.mux.HandleFunc("POST /test/session-token", s.handleSessionToken)
 	s.mux.HandleFunc("POST /test/session-connect", s.handleSessionConnect)
 	s.mux.HandleFunc("POST /test/rotate-signing-key", s.handleRotateSigningKey)
@@ -5790,6 +5798,34 @@ func (s *Server) handleBearer(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+// SetTLSCA sets the CA certificate GET /test/tls-ca serves: the PEM that
+// GenerateCATLSConfig returns beside its configuration. The bytes are copied,
+// so the caller may reuse its slice.
+func (s *Server) SetTLSCA(caPEM []byte) {
+	s.tlsCAMu.Lock()
+	s.tlsCA = bytes.Clone(caPEM)
+	s.tlsCAMu.Unlock()
+}
+
+// handleTLSCA serves GET /test/tls-ca, the CA a client names in tls_ca_file to
+// verify the mock's TLS listeners. Like every /test/ route it needs no
+// credential: a suite fetches the CA before the node it configures has
+// registered.
+func (s *Server) handleTLSCA(w http.ResponseWriter, _ *http.Request) {
+	s.tlsCAMu.RLock()
+	ca := s.tlsCA
+	s.tlsCAMu.RUnlock()
+	if len(ca) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no TLS CA set"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(ca); err != nil {
+		slog.Error("handleTLSCA: write failed", "error", err)
+	}
+}
+
 // validateLocalAuth checks the Authorization header for the expected bearer token.
 // Returns true if valid, false (with 401 written) if invalid.
 func (s *Server) validateLocalAuth(w http.ResponseWriter, r *http.Request) bool {
@@ -5862,47 +5898,73 @@ func (s *Server) TLSHandler() http.Handler {
 	return mux
 }
 
-// GenerateSelfSignedTLSConfig creates a self-signed TLS configuration with an
-// ECDSA key and X.509 certificate valid for "mock-api" and "localhost".
-func GenerateSelfSignedTLSConfig() *tls.Config {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// GenerateCATLSConfig creates an ECDSA P-256 CA and a leaf it signed. It
+// returns a TLS configuration that presents the leaf, and the CA certificate
+// as PEM. The leaf is valid for "mock-api" and "plexd-e2e-mockapi", the names
+// the Docker and systemd suites reach the mock by, and for "localhost". The
+// Kubernetes suite's name for the mock is not among them; that suite skips
+// verification. The
+// configuration sends the leaf only, as a control plane behind a private CA
+// does, so a client accepts it only when it trusts the CA or skips
+// verification.
+func GenerateCATLSConfig() (*tls.Config, []byte) {
+	notBefore := time.Now().Add(-time.Hour)
+	notAfter := time.Now().Add(24 * time.Hour)
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		panic("mockapi: generate ECDSA key: " + err.Error())
+		panic("mockapi: generate CA key: " + err.Error())
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          newCertSerialNumber(),
+		Subject:               pkix.Name{Organization: []string{"plexd-e2e-mock"}, CommonName: "plexd-e2e-mock CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		panic("mockapi: create CA certificate: " + err.Error())
+	}
+	// The leaf is signed by the parsed CA, not by its template, so the leaf's
+	// issuer and authority key id come from the certificate a client trusts.
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		panic("mockapi: parse CA certificate: " + err.Error())
 	}
 
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic("mockapi: generate leaf key: " + err.Error())
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: newCertSerialNumber(),
+		Subject:      pkix.Name{Organization: []string{"plexd-e2e-mock"}, CommonName: "mock-api"},
+		DNSNames:     []string{"mock-api", "localhost", "plexd-e2e-mockapi"},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		panic("mockapi: create leaf certificate: " + err.Error())
+	}
+
+	leaf := tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	return &tls.Config{Certificates: []tls.Certificate{leaf}}, caPEM
+}
+
+// newCertSerialNumber returns a random 128-bit certificate serial number.
+func newCertSerialNumber() *big.Int {
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		panic("mockapi: generate serial number: " + err.Error())
 	}
-
-	template := &x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject:      pkix.Name{Organization: []string{"plexd-e2e-mock"}},
-		DNSNames:     []string{"mock-api", "localhost"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		panic("mockapi: create certificate: " + err.Error())
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		panic("mockapi: marshal ECDSA key: " + err.Error())
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic("mockapi: load X509 key pair: " + err.Error())
-	}
-
-	return &tls.Config{Certificates: []tls.Certificate{cert}}
+	return serialNumber
 }
 
 // NSK returns the server's 32-byte node secret key (for testing).

@@ -10,9 +10,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -11617,6 +11619,104 @@ func TestLocalEndpoint_RejectsWrongToken(t *testing.T) {
 		if after != before {
 			t.Errorf("POST %s with wrong token: counter changed from %d to %d", ep.path, before, after)
 		}
+	}
+}
+
+// TestGenerateCATLSConfig pins that the mock presents a leaf only, and that
+// the leaf chains to the returned CA for every name a suite reaches the mock
+// by, so a client that trusts the CA verifies the mock without skipping
+// verification (issue #231).
+func TestGenerateCATLSConfig(t *testing.T) {
+	cfg, caPEM := mockapi.GenerateCATLSConfig()
+
+	if len(cfg.Certificates) != 1 {
+		t.Fatalf("config holds %d certificates, want 1", len(cfg.Certificates))
+	}
+	chain := cfg.Certificates[0].Certificate
+	if len(chain) != 1 {
+		t.Fatalf("certificate carries %d DER blocks, want the leaf only", len(chain))
+	}
+	leaf, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	if leaf.IsCA {
+		t.Error("presented certificate is a CA, want a leaf")
+	}
+
+	// A leaf placed in the roots verifies against itself, so the PEM must be
+	// shown to be a CA of its own, or a self-signed leaf returned as its own
+	// "CA" would pass the checks below.
+	block, rest := pem.Decode(caPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatalf("CA PEM %q holds no CERTIFICATE block", caPEM)
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		t.Errorf("CA PEM holds data after its certificate: %q", rest)
+	}
+	ca, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse CA: %v", err)
+	}
+	if !ca.IsCA {
+		t.Error("CA PEM certificate is not a CA")
+	}
+	if ca.Equal(leaf) {
+		t.Error("CA PEM is the presented leaf, want the CA that signed it")
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		t.Fatalf("no certificate appended from the CA PEM %q", caPEM)
+	}
+	for _, name := range []string{"mock-api", "localhost", "plexd-e2e-mockapi"} {
+		if _, err := leaf.Verify(x509.VerifyOptions{DNSName: name, Roots: roots}); err != nil {
+			t.Errorf("leaf does not verify for %q against the CA: %v", name, err)
+		}
+	}
+}
+
+// TestTLSCARoute pins GET /test/tls-ca. Sent without an Authorization header,
+// as a suite sends it before its node holds a credential, it answers 404
+// until a CA is set and the exact PEM after.
+func TestTLSCARoute(t *testing.T) {
+	// srv.Handler() directly, not newTestServer: its shim stamps the bearer
+	// on every request, which would hide a route that needs one.
+	srv := mockapi.New()
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	get := func() (*http.Response, []byte) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/test/tls-ca")
+		if err != nil {
+			t.Fatalf("GET /test/tls-ca: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp, body
+	}
+
+	resp, body := get()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("before SetTLSCA: status = %d, want %d (body: %s)", resp.StatusCode, http.StatusNotFound, body)
+	}
+
+	_, caPEM := mockapi.GenerateCATLSConfig()
+	srv.SetTLSCA(caPEM)
+
+	resp, body = get()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("after SetTLSCA: status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-pem-file" {
+		t.Errorf("content-type = %q, want application/x-pem-file", ct)
+	}
+	if !bytes.Equal(body, caPEM) {
+		t.Errorf("body = %q, want the PEM passed to SetTLSCA %q", body, caPEM)
 	}
 }
 
