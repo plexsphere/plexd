@@ -1429,3 +1429,407 @@ func waitConnCount(t *testing.T, m *IngressManager, want int64) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// httpCAPresent returns a GetClientCertificate that presents cert, or no
+// certificate when cert is nil, and counts each certificate request of the
+// bridge in asked when asked is not nil. A client that presents its
+// certificate this way sends it also when its issuer is not among the
+// authorities the bridge's certificate request names (see dialTLSClient).
+func httpCAPresent(cert *tls.Certificate, asked *atomic.Int64) func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		if asked != nil {
+			asked.Add(1)
+		}
+		if cert == nil {
+			return &tls.Certificate{}, nil
+		}
+		return cert, nil
+	}
+}
+
+// httpCAClient returns an HTTP client like fx.client that presents cert as its
+// client certificate, or none when cert is nil, and counts the bridge's
+// certificate requests in asked when asked is not nil.
+func httpCAClient(t *testing.T, fx *httpFixture, cert *tls.Certificate, asked *atomic.Int64, h2 bool) *http.Client {
+	t.Helper()
+	addr := fx.ctrl.addr(443)
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", addr)
+		},
+		TLSClientConfig:   &tls.Config{RootCAs: fx.roots, GetClientCertificate: httpCAPresent(cert, asked)},
+		ForceAttemptHTTP2: h2,
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	return &http.Client{Transport: tr, Timeout: 5 * time.Second}
+}
+
+// httpCADo sends a GET with the fields, given as name, value pairs, and
+// returns the response, whose body it read and closed, and the body, or the
+// error of a request that got no response.
+func httpCADo(t *testing.T, c *http.Client, url string, nameValues ...string) (*http.Response, string, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("request %s: %v", url, err)
+	}
+	for i := 0; i+1 < len(nameValues); i += 2 {
+		req.Header.Add(nameValues[i], nameValues[i+1])
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read the body of %s: %v", url, err)
+	}
+	return resp, string(body), nil
+}
+
+// httpCADialRaw opens an HTTP/1.1 client connection to port 443 of the bridge
+// like fx.dialRaw, which trusts the fixture's certificate and presents cert,
+// or no certificate when cert is nil. edit, when not nil, changes the
+// client's config, to pin a TLS version for example. It returns the
+// handshake's error instead of failing the test: in TLS 1.2 a refused client
+// fails the handshake, and in TLS 1.3 it completes its side and reads the
+// bridge's alert on its first read (see httpCARequireNoResponse).
+func httpCADialRaw(t *testing.T, fx *httpFixture, serverName string, cert *tls.Certificate, edit func(*tls.Config)) (*rawConn, error) {
+	t.Helper()
+	conn, err := dialTLSClient(t, fx.ctrl.addr(443), serverName, cert, func(cfg *tls.Config) {
+		cfg.InsecureSkipVerify = false
+		cfg.RootCAs = fx.roots
+		cfg.NextProtos = []string{"http/1.1"}
+		if edit != nil {
+			edit(cfg)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &rawConn{Conn: conn, br: bufio.NewReader(conn)}, nil
+}
+
+// httpCARequireNoResponse fails unless a client the bridge refused gets no
+// response to head: either its handshake failed, dialErr being the error of
+// httpCADialRaw, or conn closes without a byte after the client wrote head.
+func httpCARequireNoResponse(t *testing.T, conn *rawConn, dialErr error, head string) {
+	t.Helper()
+	if dialErr != nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	// The bridge may have closed the connection already, so the write can
+	// fail; the read decides.
+	_, _ = io.WriteString(conn, head)
+	requireClosed(t, conn)
+}
+
+// httpCARulesWith returns the rules api, for /api to targetPort, and web, for
+// / to webPort, that share shop.example.com, each with client_auth with
+// bundle as its ca_bundle, or without client_auth when bundle is empty.
+func httpCARulesWith(bundle string, targetPort, webPort int) []api.IngressRule {
+	rules := []api.IngressRule{
+		httpRule("api", "shop.example.com", targetPort, "/api"),
+		httpRule("web", "shop.example.com", webPort, "/"),
+	}
+	if bundle != "" {
+		for i := range rules {
+			withClientAuth(bundle)(&rules[i])
+		}
+	}
+	return rules
+}
+
+// TestIngressHTTP_ClientCertificate tells the target of a host with
+// client_auth the client's verified certificate in exactly one
+// X-Forwarded-Client-Cert field, over HTTP/1.1 and HTTP/2, and drops every
+// field of that name the client sent. A client that sends an intermediate
+// gets the field of its leaf.
+func TestIngressHTTP_ClientCertificate(t *testing.T) {
+	ca := newTestCA(t, "client-ca", nil)
+	leaf := ca.issue(t, "client", func(c *x509.Certificate) {
+		c.Subject = pkix.Name{CommonName: "client", Organization: []string{"Acme, Inc."}}
+	})
+	inter := ca.intermediate(t, "client-intermediate", nil)
+	viaInter := inter.issue(t, "client-via-intermediate", nil)
+	viaInter.Certificate = append(viaInter.Certificate, inter.cert.Raw)
+	apiT := startHTTPTarget(t, "api")
+	fx := newHTTPFixture(t, nil)
+	rule := httpRule("api", "shop.example.com", apiT.port(t), "/")
+	withClientAuth(caBundle(ca))(&rule)
+	fx.apply(t, rule)
+
+	const forged = `Hash=0000;Subject="CN=mallory"`
+	requireField := func(t *testing.T, body, want string) {
+		t.Helper()
+		requireLine(t, body, "target=api")
+		requireLine(t, body, "X-Forwarded-Client-Cert: "+want)
+		if n := strings.Count(strings.ToLower(body), "x-forwarded-client-cert:"); n != 1 {
+			t.Errorf("the target read %d X-Forwarded-Client-Cert lines, want 1:\n%s", n, body)
+		}
+		if strings.Contains(body, "mallory") {
+			t.Errorf("the target read the forged field:\n%s", body)
+		}
+	}
+
+	for _, h2 := range []bool{false, true} {
+		t.Run("h2="+strconv.FormatBool(h2), func(t *testing.T) {
+			c := httpCAClient(t, fx, &leaf, nil, h2)
+			for _, sent := range [][]string{
+				nil,
+				{"X-Forwarded-Client-Cert", forged},
+				{"X-Forwarded-Client-Cert", forged, "X-Forwarded-Client-Cert", forged},
+			} {
+				resp, body, err := httpCADo(t, c, "https://shop.example.com/x", sent...)
+				if err != nil {
+					t.Fatalf("GET with the fields %q: %v", sent, err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("GET with the fields %q: status %d, want 200:\n%s", sent, resp.StatusCode, body)
+				}
+				if want := map[bool]int{false: 1, true: 2}[h2]; resp.ProtoMajor != want {
+					t.Errorf("answered over %s, want HTTP/%d", resp.Proto, want)
+				}
+				requireField(t, body, forwardedClientCert(leaf.Leaf))
+			}
+		})
+	}
+
+	t.Run("raw connection", func(t *testing.T) {
+		conn, err := httpCADialRaw(t, fx, "shop.example.com", &leaf, nil)
+		if err != nil {
+			t.Fatalf("dial with the client's certificate: %v", err)
+		}
+		head := "GET /x HTTP/1.1\r\nHost: shop.example.com\r\n" +
+			"x-forwarded-client-cert: " + forged + "\r\n" +
+			"X-FORWARDED-CLIENT-CERT: " + forged + "\r\n\r\n"
+		status, body := conn.roundTrip(t, head)
+		if status != http.StatusOK {
+			t.Fatalf("status %d, want 200:\n%s", status, body)
+		}
+		requireField(t, body, forwardedClientCert(leaf.Leaf))
+		status, body = conn.roundTrip(t, getHead("/y", "shop.example.com"))
+		if status != http.StatusOK {
+			t.Fatalf("the second request: status %d, want 200:\n%s", status, body)
+		}
+		requireField(t, body, forwardedClientCert(leaf.Leaf))
+	})
+
+	t.Run("intermediate", func(t *testing.T) {
+		conn, err := httpCADialRaw(t, fx, "shop.example.com", &viaInter, nil)
+		if err != nil {
+			t.Fatalf("dial with a leaf and its intermediate: %v", err)
+		}
+		status, body := conn.roundTrip(t, getHead("/x", "shop.example.com"))
+		if status != http.StatusOK {
+			t.Fatalf("status %d, want 200:\n%s", status, body)
+		}
+		requireField(t, body, forwardedClientCert(viaInter.Leaf))
+	})
+}
+
+// TestIngressHTTP_NoClientAuthSendsNoField sends no X-Forwarded-Client-Cert to
+// the target of a host without client_auth, also when the client sent one and
+// another host of the port has client_auth, and asks that host's clients for
+// no certificate.
+func TestIngressHTTP_NoClientAuthSendsNoField(t *testing.T) {
+	ca := newTestCA(t, "client-ca", nil)
+	leaf := ca.issue(t, "client", nil)
+	shopT, otherT := startHTTPTarget(t, "shop"), startHTTPTarget(t, "other")
+	fx := newHTTPFixture(t, nil)
+	shop := httpRule("shop", "shop.example.com", shopT.port(t), "/")
+	withClientAuth(caBundle(ca))(&shop)
+	fx.apply(t, shop, httpRule("other", "other.example.com", otherT.port(t), "/"))
+
+	const forged = `Hash=0000;Subject="CN=mallory"`
+	for _, h2 := range []bool{false, true} {
+		t.Run("h2="+strconv.FormatBool(h2), func(t *testing.T) {
+			var asked atomic.Int64
+			c := httpCAClient(t, fx, &leaf, &asked, h2)
+			for _, sent := range [][]string{nil, {"X-Forwarded-Client-Cert", forged}} {
+				resp, body, err := httpCADo(t, c, "https://other.example.com/x", sent...)
+				if err != nil {
+					t.Fatalf("GET with the fields %q: %v", sent, err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("GET with the fields %q: status %d, want 200:\n%s", sent, resp.StatusCode, body)
+				}
+				requireLine(t, body, "target=other")
+				requireNoLinePrefix(t, body, "X-Forwarded-Client-Cert:")
+				if strings.Contains(body, "mallory") {
+					t.Errorf("the target read the forged field:\n%s", body)
+				}
+			}
+			if n := asked.Load(); n != 0 {
+				t.Errorf("the bridge asked a client of other.example.com %d times for a certificate, want never", n)
+			}
+		})
+	}
+
+	// The host with client_auth on the same port still tells its target.
+	var asked atomic.Int64
+	_, body, err := httpCADo(t, httpCAClient(t, fx, &leaf, &asked, false), "https://shop.example.com/x")
+	if err != nil {
+		t.Fatalf("GET on the host with client_auth: %v", err)
+	}
+	requireLine(t, body, "target=shop")
+	requireLine(t, body, "X-Forwarded-Client-Cert: "+forwardedClientCert(leaf.Leaf))
+	if asked.Load() == 0 {
+		t.Error("the bridge asked a client of shop.example.com for no certificate")
+	}
+}
+
+// TestIngressHTTP_ClientWithoutCertificateGetsNoResponse sends no response to
+// a client without a certificate on a host with client_auth, over HTTP/1.1
+// and HTTP/2, and on a raw connection in TLS 1.2 and TLS 1.3. No target reads
+// a request or is dialled, and every rule of the host records no_certificate
+// at the time of the refusal.
+func TestIngressHTTP_ClientWithoutCertificateGetsNoResponse(t *testing.T) {
+	ca := newTestCA(t, "client-ca", nil)
+	apiT, webT := startHTTPTarget(t, "api"), startHTTPTarget(t, "web")
+	fx, dials := newDialLogHTTPFixture(t)
+	fx.apply(t, httpCARulesWith(caBundle(ca), apiT.port(t), webT.port(t))...)
+	const refused = `msg="ingress client refused"`
+
+	attempts := 0
+	for _, h2 := range []bool{false, true} {
+		var asked atomic.Int64
+		c := httpCAClient(t, fx, nil, &asked, h2)
+		for _, path := range []string{"/api/x", "/web"} {
+			if resp, body, err := httpCADo(t, c, "https://shop.example.com"+path); err == nil {
+				t.Errorf("GET %s (h2=%v) without a certificate got %s, want no response:\n%s", path, h2, resp.Status, body)
+			}
+			attempts++
+			fx.logs.waitFor(t, refused, attempts)
+		}
+		if asked.Load() == 0 {
+			t.Errorf("the bridge asked the client (h2=%v) for no certificate", h2)
+		}
+	}
+	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
+		conn, err := httpCADialRaw(t, fx, "shop.example.com", nil, func(cfg *tls.Config) {
+			cfg.MinVersion, cfg.MaxVersion = version, version
+		})
+		httpCARequireNoResponse(t, conn, err, getHead("/api/x", "shop.example.com"))
+		attempts++
+		fx.logs.waitFor(t, refused, attempts)
+	}
+
+	if all, noCert := logLines(fx.logs, refused), logLines(fx.logs, refused, "reason=no_certificate"); all != noCert {
+		t.Errorf("%d of %d 'ingress client refused' lines read reason=no_certificate, want all:\n%s", noCert, all, fx.logs.String())
+	}
+	if a, w := apiT.conns.Load(), webT.conns.Load(); a != 0 || w != 0 {
+		t.Errorf("the targets accepted %d (api) and %d (web) connections, want none", a, w)
+	}
+	if got := dials.dialled(); len(got) != 0 {
+		t.Errorf("dials = %v, want none", got)
+	}
+
+	fx.mgr.mu.Lock()
+	routes := slices.Clone(fx.mgr.listeners[443].table.Load().exact["shop.example.com"].routes)
+	records := make(map[string]*clientRefusals, len(routes))
+	for _, r := range routes {
+		records[r.rule.ID] = fx.mgr.refusals[r.rule.ID]
+	}
+	fx.mgr.mu.Unlock()
+	if len(routes) != 2 {
+		t.Fatalf("the host has %d routes, want 2", len(routes))
+	}
+	for _, r := range routes {
+		if records[r.rule.ID] != r.refusals {
+			t.Errorf("rule %s: the route's refusal record is not the manager's", r.rule.Slug)
+		}
+		got := r.refusals.snapshot()
+		if len(got) != 1 || got[0].Reason != IngressRefusalNoCertificate || !got[0].At.Equal(relayStart) {
+			t.Errorf("rule %s records %+v, want only %s at %v", r.rule.Slug, got, IngressRefusalNoCertificate, relayStart)
+		}
+	}
+}
+
+// TestIngressHTTP_ChangedClientAuthClosesConnections closes a kept-alive client
+// connection of a host whose rules' client_auth changes, a reordered bundle
+// included, and the next handshake follows the new member. An Apply that
+// changes only a rule's targets keeps the connection, and its next request
+// goes to the new target.
+func TestIngressHTTP_ChangedClientAuthClosesConnections(t *testing.T) {
+	one, two, three := newTestCA(t, "client-ca-one", nil), newTestCA(t, "client-ca-two", nil), newTestCA(t, "client-ca-three", nil)
+	leaf := one.issue(t, "client", nil)
+	field := "X-Forwarded-Client-Cert: " + forwardedClientCert(leaf.Leaf)
+	apiT, newT, webT := startHTTPTarget(t, "api"), startHTTPTarget(t, "new"), startHTTPTarget(t, "web")
+
+	// requireServed sends a request for /api/x on conn and fails unless the
+	// target named target answers it, with the client's field when the host
+	// has client_auth and without one otherwise.
+	requireServed := func(t *testing.T, conn *rawConn, target string, withField bool) {
+		t.Helper()
+		status, body := conn.roundTrip(t, getHead("/api/x", "shop.example.com"))
+		if status != http.StatusOK {
+			t.Fatalf("status %d, want 200:\n%s", status, body)
+		}
+		requireLine(t, body, "target="+target)
+		if withField {
+			requireLine(t, body, field)
+		} else {
+			requireNoLinePrefix(t, body, "X-Forwarded-Client-Cert:")
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		from, to string // the bundles before and after; empty is no client_auth
+		admits   bool   // whether the next handshake with the client's leaf is admitted
+	}{
+		{name: "an authority added", from: caBundle(one), to: caBundle(one, two), admits: true},
+		{name: "the bundle reordered", from: caBundle(one, two), to: caBundle(two, one), admits: true},
+		{name: "the authority replaced", from: caBundle(one), to: caBundle(two, three), admits: false},
+		{name: "client_auth removed", from: caBundle(one), admits: true},
+		{name: "client_auth added", to: caBundle(one), admits: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newHTTPFixture(t, nil)
+			fx.apply(t, httpCARulesWith(tc.from, apiT.port(t), webT.port(t))...)
+			kept, err := httpCADialRaw(t, fx, "shop.example.com", &leaf, nil)
+			if err != nil {
+				t.Fatalf("dial with the client's certificate: %v", err)
+			}
+			requireServed(t, kept, "api", tc.from != "")
+
+			fx.apply(t, httpCARulesWith(tc.to, apiT.port(t), webT.port(t))...)
+			requireClosed(t, kept)
+
+			next, err := httpCADialRaw(t, fx, "shop.example.com", &leaf, nil)
+			if tc.admits {
+				if err != nil {
+					t.Fatalf("dial after the Apply: %v", err)
+				}
+				requireServed(t, next, "api", tc.to != "")
+				return
+			}
+			httpCARequireNoResponse(t, next, err, getHead("/api/x", "shop.example.com"))
+			fx.logs.waitFor(t, "reason="+IngressRefusalUnknownAuthority, 1)
+			if n := logLines(fx.logs, `msg="ingress client refused"`, "reason="+IngressRefusalUnknownAuthority); n != 1 {
+				t.Errorf("%d 'ingress client refused' lines with unknown_authority, want 1:\n%s", n, fx.logs.String())
+			}
+		})
+	}
+
+	t.Run("only the targets changed", func(t *testing.T) {
+		fx := newHTTPFixture(t, nil)
+		bundle := caBundle(one, two)
+		fx.apply(t, httpCARulesWith(bundle, apiT.port(t), webT.port(t))...)
+		kept, err := httpCADialRaw(t, fx, "shop.example.com", &leaf, nil)
+		if err != nil {
+			t.Fatalf("dial with the client's certificate: %v", err)
+		}
+		requireServed(t, kept, "api", true)
+
+		fx.apply(t, httpCARulesWith(bundle, newT.port(t), webT.port(t))...)
+		requireServed(t, kept, "new", true)
+		if n := connectionCount(t, fx.mgr); n != 1 {
+			t.Errorf("connection_count = %d, want the one kept client connection", n)
+		}
+	})
+}
