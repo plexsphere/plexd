@@ -37,15 +37,18 @@ import (
 	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/auditfwd"
 	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/kubernetes"
+	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/meshdns"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/registration"
+	"github.com/plexsphere/plexd/internal/tlstest"
 	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
@@ -1327,6 +1330,41 @@ func TestApplyEnvOverrides_DNSEnabled(t *testing.T) {
 	}
 }
 
+// TestLoadMergedConfig_TLSCAFileFromEnv covers the control plane CA bundle
+// from the environment, merged over the path the config file names. The
+// variable outranks the file like every other PLEXD_* override, and an empty
+// one is no setting at all: it must leave the file's path in place rather
+// than clear it and fall back to the system roots alone.
+func TestLoadMergedConfig_TLSCAFileFromEnv(t *testing.T) {
+	const fileCA = "/etc/plexd/file-ca.pem"
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "variable over a different file value", value: "/etc/plexd/env-ca.pem", want: "/etc/plexd/env-ca.pem"},
+		{name: "empty variable keeps the file value", value: "", want: fileCA},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLEXD_API_TLS_CA_FILE", tt.value)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			file := "api:\n  base_url: https://cp.example.com\n  tls_ca_file: " + fileCA + "\n"
+			if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			cfg, _, err := loadMergedConfig(path)
+			if err != nil {
+				t.Fatalf("loadMergedConfig: %v", err)
+			}
+			if got := cfg.API.TLSCAFile; got != tt.want {
+				t.Errorf("API.TLSCAFile with PLEXD_API_TLS_CA_FILE=%q = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 // failingFirewallController fails its pre-flight probe. Every other method
 // panics: a failed pre-flight must abort startup before anything reaches the
 // firewall, and a node running with enforcement disabled must not touch it
@@ -1351,6 +1389,22 @@ func (f *failingFirewallController) DeleteChain(string) error {
 	panic("DeleteChain called without a passing pre-flight probe")
 }
 
+// passingFirewallController clears the pre-flight probe and records that it
+// ran, so a test whose start stops later can show that the firewall check was
+// not what stopped it. Probe is called on runAgent's own goroutine, before
+// anything that could share the controller starts, so the flag needs no lock.
+type passingFirewallController struct{ probed bool }
+
+func (f *passingFirewallController) Probe() error {
+	f.probed = true
+	return nil
+}
+
+func (*passingFirewallController) EnsureChain(string) error                       { return nil }
+func (*passingFirewallController) ApplyRules(string, []policy.FirewallRule) error { return nil }
+func (*passingFirewallController) FlushChain(string) error                        { return nil }
+func (*passingFirewallController) DeleteChain(string) error                       { return nil }
+
 // countingControlPlane starts a control plane that records every request it
 // receives and rejects each one permanently, so a registration attempt fails on
 // its first try instead of retrying into the test's deadline.
@@ -1372,15 +1426,27 @@ func countingControlPlane(t *testing.T) (baseURL string, requests *atomic.Int32)
 // that needs runUp to resume an identity seeds one.
 func writeUpConfig(t *testing.T, apiBase, extraYAML string) string {
 	t.Helper()
+	return writeUpConfigWithAPI(t, apiBase, "", extraYAML)
+}
 
-	// The two blocks this helper pins in the file are also reachable from the
-	// environment, so an ambient PLEXD_POLICY_ENABLED or PLEXD_HEALTH_* would
-	// override what the config says and quietly change what the test exercises.
-	// A caller that wants one of them sets it after this call: t.Setenv cleanup
-	// is LIFO, so the later value wins and both are still restored.
+// writeUpConfigWithAPI is writeUpConfig with apiYAML appended verbatim to the
+// api block, indented by the caller. A test that sets an api key besides
+// base_url needs it, because the file may hold the api key only once and
+// extraYAML cannot carry a second one.
+func writeUpConfigWithAPI(t *testing.T, apiBase, apiYAML, extraYAML string) string {
+	t.Helper()
+
+	// The blocks this helper pins in the file are also reachable from the
+	// environment, so an ambient PLEXD_POLICY_ENABLED, PLEXD_HEALTH_* or
+	// PLEXD_API_TLS_CA_FILE would override what the config says and quietly
+	// change what the test exercises; the last would stop every runUp test at
+	// client creation, before the step it is about. A caller that wants one of
+	// them sets it after this call: t.Setenv cleanup is LIFO, so the later
+	// value wins and both are still restored.
 	t.Setenv("PLEXD_POLICY_ENABLED", "")
 	t.Setenv("PLEXD_HEALTH_ENABLED", "")
 	t.Setenv("PLEXD_HEALTH_LISTEN", "")
+	t.Setenv("PLEXD_API_TLS_CA_FILE", "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -1389,14 +1455,14 @@ data_dir: %s
 log_level: error
 api:
   base_url: %s
-registration:
+%sregistration:
   project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
   resource_handle: preflight-test
   token_value: psb_test_preflight_token
   max_retry_duration: 1s
 health:
   enabled: false
-%s`, dir, apiBase, extraYAML)
+%s`, dir, apiBase, apiYAML, extraYAML)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -1608,6 +1674,171 @@ func TestRunUp_PolicyEnvOverridesFile(t *testing.T) {
 			t.Fatalf("runUp() error = %v, want the environment's true to win and the pre-flight to run", err)
 		}
 	})
+}
+
+// A control plane CA bundle that cannot be read has to stop plexd up before
+// registration, with the key and the path in the error, rather than leave the
+// start retrying a TLS failure that does not say what to configure. The
+// firewall controller passes its probe, so the start gets past that pre-flight
+// and the CA file is what stops it.
+func TestRunUp_MissingAPICAFileStopsBeforeRegistration(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	fw := &passingFirewallController{}
+	useFirewallController(t, fw)
+	caFile := filepath.Join(t.TempDir(), "missing-ca.pem")
+	writeUpConfigWithAPI(t, apiBase, "  tls_ca_file: "+caFile+"\n", "")
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the CA file failure")
+	}
+	for _, want := range []string{"plexd up: create client: api: config: tls_ca_file:", caFile} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("runUp() error = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+	if !fw.probed {
+		t.Error("firewall pre-flight did not run, want the start to stop after it")
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("control plane received %d requests, want 0 (the CA file must stop the start first)", got)
+	}
+}
+
+// PLEXD_API_TLS_CA_FILE is merged before validation, so the rule against a CA
+// file with tls_insecure_skip_verify sees it although the file names no CA.
+// Validated before the merge, this start would register with verification off
+// and the operator's CA silently ignored.
+func TestRunUp_CAFileEnvWithSkipVerifyStopsBeforeRegistration(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	useFirewallController(t, &passingFirewallController{})
+	writeUpConfigWithAPI(t, apiBase, "  tls_insecure_skip_verify: true\n", "")
+	// A readable bundle, so the combination is the only thing wrong.
+	t.Setenv("PLEXD_API_TLS_CA_FILE", tlstest.NewCA(t).File())
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the mutual-exclusion failure")
+	}
+	if want := "api: config: tls_ca_file and tls_insecure_skip_verify are mutually exclusive"; !strings.Contains(err.Error(), want) {
+		t.Errorf("runUp() error = %q, want it to contain %q", err.Error(), want)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("control plane received %d requests, want 0 (validation must stop the start first)", got)
+	}
+}
+
+// The local endpoints' reporters are built after registration, so a CA file
+// one of them cannot load is checked by the pre-flight and stops plexd up
+// before anything reaches the control plane, with the section in the error.
+func TestRunUp_MissingLocalEndpointCAFileStopsBeforeRegistration(t *testing.T) {
+	for _, section := range []string{"metrics", "log_fwd", "audit_fwd"} {
+		t.Run(section, func(t *testing.T) {
+			apiBase, requests := countingControlPlane(t)
+			fw := &passingFirewallController{}
+			useFirewallController(t, fw)
+			caFile := filepath.Join(t.TempDir(), "missing-ca.pem")
+			writeUpConfig(t, apiBase, fmt.Sprintf(`%s:
+  local_endpoint:
+    url: https://127.0.0.1:1/x
+    secret_key: local-secret
+    tls_ca_file: %s
+`, section, caFile))
+
+			err := runUp(upCmd, nil)
+			if err == nil {
+				t.Fatal("runUp() = nil, want the CA file failure")
+			}
+			for _, want := range []string{"plexd up: " + section + ".local_endpoint: tls_ca_file: read CA file:", caFile} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("runUp() error = %q, want it to contain %q", err.Error(), want)
+				}
+			}
+			if !fw.probed {
+				t.Error("firewall pre-flight did not run, want the start to stop after it")
+			}
+			if got := requests.Load(); got != 0 {
+				t.Errorf("control plane received %d requests, want 0 (the pre-flight must stop the start first)", got)
+			}
+		})
+	}
+}
+
+// TestPreflightLocalEndpointTLS pins which endpoints the pre-flight checks and
+// how it names the one that fails. An endpoint without a URL gets no reporter,
+// so a broken CA file on it must not stop the start; one with a URL must, and
+// the error has to say which of the three sections to fix.
+func TestPreflightLocalEndpointTLS(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	validCA := tlstest.NewCA(t).File()
+	endpoint := func(caFile string) api.LocalEndpointConfig {
+		return api.LocalEndpointConfig{URL: "https://127.0.0.1:1/x", SecretKey: "local-secret", TLSCAFile: caFile}
+	}
+	tests := []struct {
+		name string
+		cfg  agent.AgentConfig
+		// wantErr is a substring of the error, or empty for nil.
+		wantErr string
+	}{
+		{
+			name: "endpoints without a URL are skipped",
+			cfg: agent.AgentConfig{
+				Metrics:  metrics.Config{LocalEndpoint: api.LocalEndpointConfig{TLSCAFile: missing}},
+				LogFwd:   logfwd.Config{LocalEndpoint: api.LocalEndpointConfig{TLSCAFile: missing}},
+				AuditFwd: auditfwd.Config{LocalEndpoint: api.LocalEndpointConfig{TLSCAFile: missing}},
+			},
+		},
+		{
+			name: "no TLS option",
+			cfg: agent.AgentConfig{
+				Metrics:  metrics.Config{LocalEndpoint: endpoint("")},
+				LogFwd:   logfwd.Config{LocalEndpoint: endpoint("")},
+				AuditFwd: auditfwd.Config{LocalEndpoint: endpoint("")},
+			},
+		},
+		{
+			name:    "metrics with a missing file",
+			cfg:     agent.AgentConfig{Metrics: metrics.Config{LocalEndpoint: endpoint(missing)}},
+			wantErr: "plexd up: metrics.local_endpoint: tls_ca_file: read CA file:",
+		},
+		{
+			name:    "log_fwd with a missing file",
+			cfg:     agent.AgentConfig{LogFwd: logfwd.Config{LocalEndpoint: endpoint(missing)}},
+			wantErr: "plexd up: log_fwd.local_endpoint: tls_ca_file: read CA file:",
+		},
+		{
+			name:    "audit_fwd with a missing file",
+			cfg:     agent.AgentConfig{AuditFwd: auditfwd.Config{LocalEndpoint: endpoint(missing)}},
+			wantErr: "plexd up: audit_fwd.local_endpoint: tls_ca_file: read CA file:",
+		},
+		{
+			name: "a valid CA file",
+			cfg: agent.AgentConfig{
+				Metrics:  metrics.Config{LocalEndpoint: endpoint(validCA)},
+				LogFwd:   logfwd.Config{LocalEndpoint: endpoint(validCA)},
+				AuditFwd: auditfwd.Config{LocalEndpoint: endpoint(validCA)},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := preflightLocalEndpointTLS(&tt.cfg, discardLogger())
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("preflightLocalEndpointTLS() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("preflightLocalEndpointTLS() = nil, want an error containing %q", tt.wantErr)
+			}
+			for _, want := range []string{tt.wantErr, missing} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("preflightLocalEndpointTLS() = %q, want it to contain %q", err.Error(), want)
+				}
+			}
+		})
+	}
 }
 
 // baselineRefusingFirewallController clears the pre-flight probe and refuses

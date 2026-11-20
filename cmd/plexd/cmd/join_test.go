@@ -62,6 +62,38 @@ func TestJoinCommand_AbsentConfigMissingBaseURL(t *testing.T) {
 	}
 }
 
+// TestJoinCommand_CAFileFromEnvMissing pins that plexd join reads
+// PLEXD_API_TLS_CA_FILE, which it does not get through loadMergedConfig as
+// plexd up does, and that a bundle it cannot read stops the command at client
+// creation with the path in the error, before the registration that would
+// spend the token. There is no config file, so the variable is the only source
+// of the path.
+func TestJoinCommand_CAFileFromEnvMissing(t *testing.T) {
+	oldCfgFile := cfgFile
+	oldAPIURL := apiURL
+	t.Cleanup(func() {
+		cfgFile = oldCfgFile
+		apiURL = oldAPIURL
+	})
+
+	caFile := filepath.Join(t.TempDir(), "missing-ca.pem")
+	t.Setenv("PLEXD_API_TLS_CA_FILE", caFile)
+
+	_, err := executeCmd(t, "join", "--config", "/nonexistent/path/config.yaml", "--api=https://127.0.0.1:1")
+
+	rootCmd.SetOut(nil)
+	rootCmd.SetErr(nil)
+
+	if err == nil {
+		t.Fatal("expected error for a CA file that does not exist")
+	}
+	for _, want := range []string{"plexd join: create client: api: config: tls_ca_file:", caFile} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q, got: %v", want, err)
+		}
+	}
+}
+
 // TestJoinCommand_MalformedConfig pins that an unparsable config file stays a
 // hard error at command level and names the offending path.
 func TestJoinCommand_MalformedConfig(t *testing.T) {
