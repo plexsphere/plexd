@@ -103,14 +103,18 @@ func (ingressQueueAddr) String() string  { return "ingress" }
 // ingressHTTPConn is a client connection of a host whose rules have
 // conditions, the connection tls.Server wraps. It replays the peeked
 // ClientHello and carries the listener and the server name the requests are
-// routed by. It closes when the manager's context or the host's context is
-// done. Close runs once: it closes the socket and counts the connection out
+// routed by, and the key of the client authorities its handshake verified the
+// client against. It closes when the manager's context or the host's context
+// is done. Close runs once: it closes the socket and counts the connection out
 // of connCount. It never takes the manager's mu.
 type ingressHTTPConn struct {
 	net.Conn
 	m          *IngressManager
 	l          *ingressListener
 	serverName string
+	// clientAuthKey is the clientAuthKey of the host's client authorities at
+	// the handshake, "" for a host without client_auth.
+	clientAuthKey string
 
 	mu       sync.Mutex // orders the AfterFunc registration before a close
 	stops    []func() bool
@@ -118,10 +122,11 @@ type ingressHTTPConn struct {
 	closeErr error
 }
 
-// newIngressHTTPConn wraps a client connection whose ClientHello was peeked.
-// It takes over the close of conn and its count in connCount.
-func (m *IngressManager) newIngressHTTPConn(ctx, hostCtx context.Context, l *ingressListener, conn net.Conn, peeked []byte, serverName string) *ingressHTTPConn {
-	c := &ingressHTTPConn{Conn: newPeekConn(conn, peeked), m: m, l: l, serverName: serverName}
+// newIngressHTTPConn wraps a client connection whose ClientHello was peeked
+// and whose handshake verifies the client against the client authorities of
+// clientAuthKey. It takes over the close of conn and its count in connCount.
+func (m *IngressManager) newIngressHTTPConn(ctx, hostCtx context.Context, l *ingressListener, conn net.Conn, peeked []byte, serverName, clientAuthKey string) *ingressHTTPConn {
+	c := &ingressHTTPConn{Conn: newPeekConn(conn, peeked), m: m, l: l, serverName: serverName, clientAuthKey: clientAuthKey}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	closeConn := func() { _ = c.Close() }
@@ -189,7 +194,11 @@ func (m *IngressManager) debugLog() *log.Logger {
 // serveHTTP routes one request of a host whose rules have conditions. It
 // looks the connection's server name up in the listener's current table, so
 // a request follows the rules of the last Apply, and aborts the connection
-// when the name no longer routes to a served host with conditions. It answers
+// when the name no longer routes to a served host with conditions, or to one
+// whose client authorities differ from those the connection's handshake
+// verified the client against: an Apply can give the name an exact host with
+// client_auth beside the wildcard host the handshake ran under, which keeps
+// its client connections. It answers
 // 421 for a Host the host does not cover or that the port routes to another
 // host, 400 for a CONNECT request, a request target that does not start with
 // "/" and a path with a dot segment, and 404 when no rule matches; otherwise
@@ -202,7 +211,7 @@ func (m *IngressManager) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	table := c.l.table.Load()
 	host := table.match(c.serverName)
-	if host == nil || !host.http || !host.lead().served {
+	if host == nil || !host.http || !host.lead().served || clientAuthKey(host.lead().clientAuth) != c.clientAuthKey {
 		panic(http.ErrAbortHandler)
 	}
 	if !hostCovers(host.lead().rule.SNIHost, r.Host) || table.match(authorityName(r.Host)) != host {
