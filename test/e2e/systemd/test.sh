@@ -78,6 +78,10 @@
 #     removed tunnel whose interface, route and key file go, and the opt-out
 #     with bridge.site_to_site_enabled: false, which serves no tunnel, keeps
 #     the keys, reports opted_out and names an ignored local key
+#   - Custom CA for the control plane: plexd join against the mock's TLS
+#     listener, refused without api.tls_ca_file, stopped before any request
+#     by a missing CA file and by the file beside the skip-verify option,
+#     and registered through the file alone
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -271,13 +275,15 @@ docker network create "${NETWORK_NAME}"
 # -dns-addr :53 starts the mock's DNS stub, which the mesh DNS phase forwards
 # to. The image runs as uid 65534, and Docker sets
 # net.ipv4.ip_unprivileged_port_start to 0 in the container, so port 53 binds.
+# -api-tls-addr :8444 serves the control plane API over TLS too, with the leaf
+# the mock's CA signed. Only the custom CA phase joins through it.
 echo "=== Starting mock-api container ==="
 docker run -d \
     --name "${MOCKAPI_CONTAINER}" \
     --network "${NETWORK_NAME}" \
     -p 18080:8080 \
     "${MOCKAPI_IMAGE}" \
-    -addr :8080 -dns-addr :53
+    -addr :8080 -dns-addr :53 -api-tls-addr :8444
 
 # Wait for mock-api to be ready (probe via published port).
 echo "=== Waiting for mock-api readiness ==="
@@ -342,6 +348,18 @@ echo "=== Installing plexd into systemd container ==="
 docker exec "${SYSTEMD_CONTAINER}" bash -c \
     'cp /opt/plexd-binary /usr/local/bin/plexd && chmod +x /usr/local/bin/plexd && cp /opt/plexd.service /opt/plexd-session-helper.socket /opt/plexd-session-helper@.service /etc/systemd/system/'
 
+# The mock's TLS listeners present a leaf its own CA signed, and that CA is in
+# no trust store of the container. plexd trusts it through tls_ca_file: the
+# local endpoints of the config below and the custom CA phase's joins.
+MOCK_CA_PEM=$(curl -sf "http://localhost:18080/test/tls-ca") \
+    || fail "could not fetch the mock's CA from http://localhost:18080/test/tls-ca"
+if [ -z "${MOCK_CA_PEM}" ]; then
+    fail "http://localhost:18080/test/tls-ca answered an empty body, want the mock's CA as PEM"
+fi
+docker exec -i "${SYSTEMD_CONTAINER}" sh -c 'cat > /etc/plexd/mock-ca.pem && chmod 0644 /etc/plexd/mock-ca.pem' <<< "${MOCK_CA_PEM}" \
+    || fail "could not write /etc/plexd/mock-ca.pem in ${SYSTEMD_CONTAINER}"
+echo "  the mock's CA from /test/tls-ca written to /etc/plexd/mock-ca.pem"
+
 # Write plexd config pointing at mock-api.
 docker exec "${SYSTEMD_CONTAINER}" bash -c "cat > /etc/plexd/config.yaml <<EOF
 api:
@@ -365,7 +383,7 @@ metrics:
   local_endpoint:
     url: https://${MOCKAPI_CONTAINER}:8443/local/metrics
     secret_key: local-bearer-token
-    tls_insecure_skip_verify: true
+    tls_ca_file: /etc/plexd/mock-ca.pem
 
 log_fwd:
   enabled: true
@@ -376,7 +394,7 @@ log_fwd:
   local_endpoint:
     url: https://${MOCKAPI_CONTAINER}:8443/local/logs
     secret_key: local-bearer-token
-    tls_insecure_skip_verify: true
+    tls_ca_file: /etc/plexd/mock-ca.pem
 
 audit_fwd:
   enabled: true
@@ -385,12 +403,15 @@ audit_fwd:
   local_endpoint:
     url: https://${MOCKAPI_CONTAINER}:8443/local/audit
     secret_key: local-bearer-token
-    tls_insecure_skip_verify: true
+    tls_ca_file: /etc/plexd/mock-ca.pem
 EOF"
 
 # Write the bootstrap token file before the service starts: the unit can only
 # grant write access to a path that exists when systemd sets up its namespace.
-docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf %s "psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22" > /etc/plexd/bootstrap-token && chmod 600 /etc/plexd/bootstrap-token'
+# The service empties the file once it registered, so the custom CA phase
+# writes its copies of the token from this variable.
+BOOTSTRAP_TOKEN="psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22"
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf %s "$1" > /etc/plexd/bootstrap-token && chmod 600 /etc/plexd/bootstrap-token' bash "${BOOTSTRAP_TOKEN}"
 
 # Create the hooks directory, as plexd install does; this suite copies the
 # units instead of running it, and the unit keeps /etc read-only for plexd.
@@ -4873,6 +4894,141 @@ if journal_has "${S2S_JOURNAL}" 'msg="site-to-site status: send failed"'; then
 fi
 echo "  PASS: plexd logged no 'site-to-site status: send failed'"
 echo "=== Site-to-site through a bridge PASSED ==="
+
+# --- Custom CA for the control plane ---
+# plexd join runs four times as root through docker exec against the mock's
+# TLS listener on 8444, whose leaf the CA in /etc/plexd/mock-ca.pem signed.
+# Each run has a data directory and a token copy of its own, because a join
+# that registers spends the token file it read. Without tls_ca_file the
+# handshake fails, which proves the CA is trusted through the file alone, and
+# max_retry_duration ends that run's retries after 5s. A missing CA file and
+# the file beside the skip-verify option stop join before any request, and
+# the file alone registers. The phase comes last because a successful
+# registration replaces the public key the mock compares key rotations
+# against, which the earlier phases must not see.
+echo "=== Testing a custom CA for the control plane ==="
+CA_JOIN_DIR=/tmp/plexd-ca-join
+CA_JOIN_TMP=$(mktemp -d)
+
+# ca_join_count <case> leaves registration_count from the assertion endpoint
+# in CA_JOIN_COUNT. It sets a variable instead of printing the count, so that
+# its fail ends the suite rather than a command substitution's subshell.
+ca_join_count() {
+    local tag=$1 response
+    response=$(curl -sf "${ASSERT_URL}" 2>/dev/null) || fail "[${tag}] could not read ${ASSERT_URL}"
+    CA_JOIN_COUNT=$(get_counter "${response}" "registration_count")
+    case "${CA_JOIN_COUNT}" in
+        "" | *[!0-9]*) fail "[${tag}] ${ASSERT_URL} reads registration_count '${CA_JOIN_COUNT}', want a number" ;;
+    esac
+}
+
+# ca_join <case> [api line]... writes ${CA_JOIN_DIR}/<case>/config.yaml, whose
+# api section carries the given lines after base_url, and a copy of the
+# suite's token beside it, then runs plexd join on the two. It leaves the exit
+# status in CA_JOIN_RC, stdout and stderr in CA_JOIN_OUT and CA_JOIN_ERR, and
+# registration_count before and after the run in CA_JOIN_BEFORE and
+# CA_JOIN_AFTER. stdout and stderr go to files of their own, so the status is
+# the join's and the two streams stay apart.
+ca_join() {
+    local name=$1 dir="${CA_JOIN_DIR}/$1" api_lines="" line config
+    shift
+    CA_JOIN_CASE=${name}
+    for line in "$@"; do
+        api_lines+="  ${line}"$'\n'
+    done
+    config="data_dir: ${dir}/data
+api:
+  base_url: https://${MOCKAPI_CONTAINER}:8444
+${api_lines}registration:
+  project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
+  resource_handle: e2e-systemd-ca-join
+  max_retry_duration: 5s"
+    docker exec -i "${SYSTEMD_CONTAINER}" sh -c 'mkdir -p "$1" && cat > "$1/config.yaml" && printf %s "$2" > "$1/bootstrap-token" && chmod 600 "$1/bootstrap-token"' \
+        sh "${dir}" "${BOOTSTRAP_TOKEN}" <<< "${config}" \
+        || fail "[${name}] could not write ${dir}/config.yaml and ${dir}/bootstrap-token in ${SYSTEMD_CONTAINER}"
+    ca_join_count "${name}"
+    CA_JOIN_BEFORE=${CA_JOIN_COUNT}
+    CA_JOIN_RC=0
+    docker exec "${SYSTEMD_CONTAINER}" /usr/local/bin/plexd join --config "${dir}/config.yaml" --token-file "${dir}/bootstrap-token" \
+        > "${CA_JOIN_TMP}/${name}.out" 2> "${CA_JOIN_TMP}/${name}.err" || CA_JOIN_RC=$?
+    CA_JOIN_OUT=$(< "${CA_JOIN_TMP}/${name}.out")
+    CA_JOIN_ERR=$(< "${CA_JOIN_TMP}/${name}.err")
+    ca_join_count "${name}"
+    CA_JOIN_AFTER=${CA_JOIN_COUNT}
+}
+
+# ca_join_fail <message> fails the suite with the output of the last join.
+ca_join_fail() {
+    fail "[${CA_JOIN_CASE}] $1
+stdout of plexd join:
+${CA_JOIN_OUT}
+stderr of plexd join:
+${CA_JOIN_ERR}"
+}
+
+# 1. Without tls_ca_file the system roots alone decide, and they do not hold
+# the mock's CA.
+ca_join control
+if [ "${CA_JOIN_RC}" -eq 0 ]; then
+    ca_join_fail "plexd join without tls_ca_file exited 0, want non-zero"
+fi
+echo "  PASS: [control] plexd join without tls_ca_file exited ${CA_JOIN_RC}"
+if ! journal_has "${CA_JOIN_ERR}" "x509: certificate signed by unknown authority"; then
+    ca_join_fail "stderr does not contain 'x509: certificate signed by unknown authority'"
+fi
+echo "  PASS: [control] stderr contains 'x509: certificate signed by unknown authority'"
+if [ "${CA_JOIN_AFTER}" -ne "${CA_JOIN_BEFORE}" ]; then
+    ca_join_fail "registration_count went from ${CA_JOIN_BEFORE} to ${CA_JOIN_AFTER}, want it unchanged"
+fi
+echo "  PASS: [control] registration_count stayed at ${CA_JOIN_BEFORE}"
+
+# 2. A CA file that does not exist stops join when it builds its client.
+ca_join missing-file "tls_ca_file: /etc/plexd/missing-ca.pem"
+if [ "${CA_JOIN_RC}" -eq 0 ]; then
+    ca_join_fail "plexd join with tls_ca_file: /etc/plexd/missing-ca.pem exited 0, want non-zero"
+fi
+echo "  PASS: [missing-file] plexd join with tls_ca_file: /etc/plexd/missing-ca.pem exited ${CA_JOIN_RC}"
+if ! journal_has "${CA_JOIN_ERR}" "plexd join: create client: api: config: tls_ca_file:" "/etc/plexd/missing-ca.pem"; then
+    ca_join_fail "stderr has no line that contains 'plexd join: create client: api: config: tls_ca_file:' and '/etc/plexd/missing-ca.pem'"
+fi
+echo "  PASS: [missing-file] stderr names 'plexd join: create client: api: config: tls_ca_file:' and /etc/plexd/missing-ca.pem"
+if [ "${CA_JOIN_AFTER}" -ne "${CA_JOIN_BEFORE}" ]; then
+    ca_join_fail "registration_count went from ${CA_JOIN_BEFORE} to ${CA_JOIN_AFTER}, want it unchanged"
+fi
+echo "  PASS: [missing-file] registration_count stayed at ${CA_JOIN_BEFORE}"
+
+# 3. The CA file beside the skip-verify option is refused when join
+# validates its config.
+CA_JOIN_EXCLUSIVE="tls_ca_file and tls_insecure_skip_verify are mutually exclusive"
+ca_join both-options "tls_ca_file: /etc/plexd/mock-ca.pem" "tls_insecure_skip_verify: true"
+if [ "${CA_JOIN_RC}" -eq 0 ]; then
+    ca_join_fail "plexd join with tls_ca_file and the skip-verify option exited 0, want non-zero"
+fi
+echo "  PASS: [both-options] plexd join with tls_ca_file and the skip-verify option exited ${CA_JOIN_RC}"
+if ! journal_has "${CA_JOIN_ERR}" "${CA_JOIN_EXCLUSIVE}"; then
+    ca_join_fail "stderr does not contain '${CA_JOIN_EXCLUSIVE}'"
+fi
+echo "  PASS: [both-options] stderr contains '${CA_JOIN_EXCLUSIVE}'"
+
+# 4. The CA file alone registers.
+ca_join ca-file "tls_ca_file: /etc/plexd/mock-ca.pem"
+if [ "${CA_JOIN_RC}" -ne 0 ]; then
+    ca_join_fail "plexd join with tls_ca_file: /etc/plexd/mock-ca.pem exited ${CA_JOIN_RC}, want 0"
+fi
+echo "  PASS: [ca-file] plexd join with tls_ca_file: /etc/plexd/mock-ca.pem exited 0"
+if ! journal_has "${CA_JOIN_OUT}" "node_id:"; then
+    ca_join_fail "stdout does not contain 'node_id:'"
+fi
+echo "  PASS: [ca-file] stdout reads '${CA_JOIN_OUT%%$'\n'*}'"
+if [ "${CA_JOIN_AFTER}" -ne $((CA_JOIN_BEFORE + 1)) ]; then
+    ca_join_fail "registration_count went from ${CA_JOIN_BEFORE} to ${CA_JOIN_AFTER}, want $((CA_JOIN_BEFORE + 1))"
+fi
+echo "  PASS: [ca-file] registration_count grew from ${CA_JOIN_BEFORE} to ${CA_JOIN_AFTER}"
+
+CA_JOIN_RM=$(docker exec "${SYSTEMD_CONTAINER}" rm -rf "${CA_JOIN_DIR}" 2>&1) \
+    || fail "could not remove ${CA_JOIN_DIR} in ${SYSTEMD_CONTAINER}: ${CA_JOIN_RM}"
+rm -rf "${CA_JOIN_TMP}"
+echo "=== Custom CA for the control plane PASSED ==="
 
 # --- Clean shutdown verification ---
 echo "=== Stopping plexd service ==="

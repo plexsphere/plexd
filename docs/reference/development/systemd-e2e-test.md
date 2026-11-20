@@ -6,7 +6,7 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, routes the requests of `terminate` rules with request conditions that share a host by path prefix and header, spreads the connections and requests of a rule over its targets and moves a connection off a target that refuses it, checks the bridge's ingress status report, closes every public listener for a block that does not enable ingress and on a bridge that opts out with `bridge.ingress_enabled: false`, serves a `wireguard` user access provider through which a device reaches a mesh node with the bridge's mesh address, reports each provider's state, keeps the provider's key across a restart and a killed process, and opts out with `bridge.user_access_enabled: false`, serves a `wireguard` site-to-site tunnel through which a host of a remote site reaches a mesh node with the bridge's mesh address and a mesh node reaches the site under the bridge's policy, reports each tunnel's state, keeps the tunnel's key across a restart and a killed process, and opts out with `bridge.site_to_site_enabled: false`, then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), checks that the mesh DNS resolver registers with the container's systemd-resolved, answers through it and forwards to the mock's DNS stub, turns the node into a bridge that serves public ingress rules under the unit's `CAP_NET_BIND_SERVICE`, ends TLS at the bridge with the certificate of a Secret and with one it obtains from Pebble, Let's Encrypt's test CA, routes the requests of `terminate` rules with request conditions that share a host by path prefix and header, spreads the connections and requests of a rule over its targets and moves a connection off a target that refuses it, checks the bridge's ingress status report, closes every public listener for a block that does not enable ingress and on a bridge that opts out with `bridge.ingress_enabled: false`, serves a `wireguard` user access provider through which a device reaches a mesh node with the bridge's mesh address, reports each provider's state, keeps the provider's key across a restart and a killed process, and opts out with `bridge.user_access_enabled: false`, serves a `wireguard` site-to-site tunnel through which a host of a remote site reaches a mesh node with the bridge's mesh address and a mesh node reaches the site under the bridge's policy, reports each tunnel's state, keeps the tunnel's key across a restart and a killed process, and opts out with `bridge.site_to_site_enabled: false`, registers with `plexd join` through `api.tls_ca_file` against the mock's TLS listener for the control plane, then verifies clean shutdown.
 
 ## Container Topology
 
@@ -42,11 +42,11 @@ Builds the mock-api image, the systemd container image, and cross-compiles the p
 
 ### 4. Network and container startup
 
-Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, phase 17 the mesh node and the device, and phase 18 the site. The mock API runs with `-addr :8080 -dns-addr :53`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
+Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, phase 17 the mesh node and the device, and phase 18 the site. The mock API runs with `-addr :8080 -dns-addr :53 -api-tls-addr :8444`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to, and the control plane API over TLS on port 8444, which only phase 19 joins through. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
 
 ### 5. Service installation
 
-Copies the plexd binary, the production `deploy/systemd/plexd.service` unit file and the two session helper units (`plexd-session-helper.socket`, `plexd-session-helper@.service`) into the systemd container. Writes `config.yaml` pointing at the mock-api container and the bootstrap token to `/etc/plexd/bootstrap-token` (mode 0600), before the service starts so the unit can grant write access to it, and creates `/etc/plexd/hooks` as `plexd install` would. Runs `systemctl daemon-reload` and `systemctl enable --now plexd`, then checks that `systemctl is-active plexd-session-helper.socket` prints `active`: `plexd.service` wants the socket and names it in `Also=`.
+Copies the plexd binary, the production `deploy/systemd/plexd.service` unit file and the two session helper units (`plexd-session-helper.socket`, `plexd-session-helper@.service`) into the systemd container. Fetches the mock's CA from `GET http://localhost:18080/test/tls-ca` on the host, fails when the fetch fails or the body is empty, and writes it to `/etc/plexd/mock-ca.pem` (mode 0644) in the container, which the three local endpoints of `config.yaml` name in `tls_ca_file`. Writes `config.yaml` pointing at the mock-api container and the bootstrap token to `/etc/plexd/bootstrap-token` (mode 0600), before the service starts so the unit can grant write access to it, and creates `/etc/plexd/hooks` as `plexd install` would. Runs `systemctl daemon-reload` and `systemctl enable --now plexd`, then checks that `systemctl is-active plexd-session-helper.socket` prints `active`: `plexd.service` wants the socket and names it in `Also=`.
 
 ### 6. Assertion polling
 
@@ -76,7 +76,7 @@ The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entr
 
 ### 11. Local endpoint delivery
 
-Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). Validates that the local endpoint credential chain works with systemd: NSK from registration → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to `plexd-e2e-mockapi:8443`.
+Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). Validates that the local endpoint credential chain works with systemd: NSK from registration → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to `plexd-e2e-mockapi:8443`. plexd verifies the mock's leaf there against `/etc/plexd/mock-ca.pem`, which each `local_endpoint.tls_ca_file` names, so the phase also proves that key.
 
 ### 12. Mediated ssh session
 
@@ -229,11 +229,33 @@ The phase serves site-to-site tunnels on the bridge of phases 16 and 17, which o
 
 The phase ends by requiring that the journal holds no `site-to-site status: send failed` line, so the mock refused no report.
 
-### 19. Shutdown verification
+### 19. Custom CA for the control plane
+
+The phase runs `plexd join` four times as root through `docker exec` in the systemd container, outside the unit, against `https://plexd-e2e-mockapi:8444`, the mock's TLS listener for the control plane API. Its leaf names `mock-api`, `localhost` and `plexd-e2e-mockapi`, the mock's CA signed it, and no trust store of the container holds that CA. Each run works in `/tmp/plexd-ca-join/<case>` with a `config.yaml` of the shape below, whose `api` section each case changes, and its own copy of the bootstrap token of phase 5, because a join that registers removes the token file it read. The phase reads `registration_count` from `GET /test/assertions` before and after each run. It redirects the run's stdout and stderr to two files on the host, with no pipe after the command, so the exit code it records is the one of `plexd join`.
+
+```yaml
+data_dir: /tmp/plexd-ca-join/<case>/data
+api:
+  base_url: https://plexd-e2e-mockapi:8444
+  tls_ca_file: /etc/plexd/mock-ca.pem
+registration:
+  project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
+  resource_handle: e2e-systemd-ca-join
+  max_retry_duration: 5s
+```
+
+1. **Control.** Without `tls_ca_file`, join must exit non-zero, its stderr must contain `x509: certificate signed by unknown authority`, and `registration_count` must not change. The case proves that plexd trusts the mock's CA through the file alone. Registration retries the failed handshake until `max_retry_duration` ends it after 5 seconds.
+2. **A missing file.** With `tls_ca_file: /etc/plexd/missing-ca.pem`, join must exit non-zero, one line of its stderr must contain both `plexd join: create client: api: config: tls_ca_file:` and `/etc/plexd/missing-ca.pem`, and `registration_count` must not change: join stops when it builds its client, before any request.
+3. **Both options.** With the CA file and `tls_insecure_skip_verify: true`, join must exit non-zero and its stderr must contain `tls_ca_file and tls_insecure_skip_verify are mutually exclusive`.
+4. **The CA file.** With the CA file alone, join must exit `0`, its stdout must contain `node_id:`, and `registration_count` must grow by exactly 1.
+
+The phase then removes `/tmp/plexd-ca-join` and the files on the host. It comes last because a successful registration replaces the public key the mock compares key rotations against, which the earlier phases must not see. Every other phase reaches the control plane over plain HTTP on port 8080.
+
+### 20. Shutdown verification
 
 Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. The crash check leaves out the lines `plexd.service: Sent signal SIGKILL to main process <pid> (plexd) on client request.` with which systemd records the deliberate kills of step 6 of phase 17 and step 7 of phase 18, and checks every other line. It runs with the opt-out of phase 15, the bridge mode, environment file and ingress opt-out of phase 16, the user access opt-out of phase 17 and the site-to-site opt-out of phase 18 in place, so it stops a bridge that opts out of public ingress, of user access and of site-to-site tunnels.
 
-### 20. Cleanup
+### 21. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the seven containers and the Docker network.
 
@@ -291,7 +313,7 @@ metrics:
   local_endpoint:
     url: https://plexd-e2e-mockapi:8443/local/metrics
     secret_key: local-bearer-token
-    tls_insecure_skip_verify: true
+    tls_ca_file: /etc/plexd/mock-ca.pem
 log_fwd:
   enabled: true
   collect_interval: 5s
@@ -301,7 +323,7 @@ log_fwd:
   local_endpoint:
     url: https://plexd-e2e-mockapi:8443/local/logs
     secret_key: local-bearer-token
-    tls_insecure_skip_verify: true
+    tls_ca_file: /etc/plexd/mock-ca.pem
 audit_fwd:
   enabled: true
   collect_interval: 5s
@@ -309,10 +331,10 @@ audit_fwd:
   local_endpoint:
     url: https://plexd-e2e-mockapi:8443/local/audit
     secret_key: local-bearer-token
-    tls_insecure_skip_verify: true
+    tls_ca_file: /etc/plexd/mock-ca.pem
 ```
 
-The bootstrap token is written to `/etc/plexd/bootstrap-token` (mode 0600) before the service starts. No environment file exists until phase 16 writes `/etc/plexd/environment` with `SSL_CERT_FILE=/etc/plexd/pebble.minica.pem`, which the unit reads through `EnvironmentFile=-/etc/plexd/environment`.
+The bootstrap token is written to `/etc/plexd/bootstrap-token` (mode 0600) before the service starts, and the mock's CA to `/etc/plexd/mock-ca.pem` (mode 0644) before the config. No environment file exists until phase 16 writes `/etc/plexd/environment` with `SSL_CERT_FILE=/etc/plexd/pebble.minica.pem`, which the unit reads through `EnvironmentFile=-/etc/plexd/environment`.
 
 The config sets no `dns` key, so the mesh DNS resolver runs with its defaults, enabled on port 5354, until phase 15 appends:
 
