@@ -6112,8 +6112,8 @@ func TestIngressStatus_AcceptsNoRules(t *testing.T) {
 
 // ingressStatusContractExample is the four-entry example of the agent
 // contract (plexsphere/plexsphere@8c76f19 docs/reference/api/plexd-agent-contract.md,
-// "Ingress status") without the client_auth_enforced and client_refusals
-// members of its first entry, which the mock does not read yet (#201).
+// "Ingress status") whole: its first entry enforces client certificates and
+// carries two refusal entries.
 const ingressStatusContractExample = `{
   "state": "enabled",
   "rules": [
@@ -6122,6 +6122,11 @@ const ingressStatusContractExample = `{
       "targets": [
         { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 8443, "dial": "succeeded", "dial_age_seconds": 2 },
         { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "port": 8443, "dial": "failed", "dial_reason": "timeout", "dial_age_seconds": 14 }
+      ],
+      "client_auth_enforced": true,
+      "client_refusals": [
+        { "reason": "no_certificate", "age_seconds": 40 },
+        { "reason": "unknown_authority", "age_seconds": 310 }
       ] },
     { "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5", "listener": "listening",
       "certificate": "not_required", "dial": "failed", "dial_reason": "policy_denied", "dial_age_seconds": 3,
@@ -6137,21 +6142,55 @@ const ingressStatusContractExample = `{
   ]
 }`
 
-// TestIngressStatus_AcceptsTheContractExample sends the contract's example,
-// and then reports whose targets are null and [], on a listening and on a
-// not_listening entry: both carry no target entries, so neither breaks the
-// rule that target entries stand only beside a listening entry.
+// TestIngressStatus_AcceptsTheContractExample sends the contract's example
+// whole, and then reports whose targets are null and [], on a listening and
+// on a not_listening entry: both carry no target entries, so neither breaks
+// the rule that target entries stand only beside a listening entry. A
+// client_auth_enforced of false or null says the bridge does not enforce,
+// which stands beside not_listening, and a client_refusals of null or []
+// carries no refusal entries, which stands beside any entry: one that
+// enforces, one that listens without enforcing and one that does not listen.
 func TestIngressStatus_AcceptsTheContractExample(t *testing.T) {
 	const (
 		listening    = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"none","targets":`
 		notListening = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4","listener":"not_listening","listener_reason":"listen_failed","targets":`
+		// The entries the client_auth bodies build on, up to the members
+		// each body adds.
+		enforcing    = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"none","client_auth_enforced":true`
+		notEnforcing = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"none"`
+		notListen    = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f4","listener":"not_listening","listener_reason":"listen_failed"`
 	)
+	refusals := func(value string) string {
+		return `{"state":"enabled","rules":[` + enforcing + `,"client_refusals":` + value + `},` +
+			notEnforcing + `,"client_refusals":` + value + `},` + notListen + `,"client_refusals":` + value + `}]}`
+	}
 	bodies := []struct {
 		name, body string
 	}{
 		{"the contract's example", ingressStatusContractExample},
 		{"targets null", `{"state":"enabled","rules":[` + listening + `null},` + notListening + `null}]}`},
 		{"targets []", `{"state":"enabled","rules":[` + listening + `[]},` + notListening + `[]}]}`},
+		{"client_auth_enforced false beside not_listening", `{"state":"enabled","rules":[` + enforcing + `},` + notListen + `,"client_auth_enforced":false}]}`},
+		{"client_auth_enforced null beside not_listening", `{"state":"enabled","rules":[` + enforcing + `},` + notListen + `,"client_auth_enforced":null}]}`},
+		{"client_auth_enforced false beside listening", `{"state":"enabled","rules":[` + notEnforcing + `,"client_auth_enforced":false}]}`},
+		{"client_refusals null", refusals(`null`)},
+		{"client_refusals []", refusals(`[]`)},
+		{
+			"the range bounds of age_seconds",
+			`{"state":"enabled","rules":[` + enforcing + `,"client_refusals":[{"reason":"no_certificate","age_seconds":0},{"reason":"unknown_authority","age_seconds":2147483647}]}]}`,
+		},
+		{"plexd's encoder", ingressStatusRulesBody(t, api.IngressStateEnabled, []api.IngressStatusRule{
+			{
+				ID: ingressStatusRuleID(0), Listener: api.IngressListenerListening,
+				Certificate: api.IngressCertificateReady, Dial: api.IngressDialNone,
+				ClientAuthEnforced: true,
+				ClientRefusals: []api.IngressStatusClientRefusal{
+					{Reason: "no_certificate", AgeSeconds: 0},
+					{Reason: "certificate_expired", AgeSeconds: 12},
+				},
+			},
+			{ID: ingressStatusRuleID(1), Listener: api.IngressListenerNotListening, ListenerReason: "listen_failed"},
+		})},
 	}
 	for _, tt := range bodies {
 		t.Run(tt.name, func(t *testing.T) {
@@ -6383,6 +6422,304 @@ func TestIngressStatus_InvalidTargetEntries(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			putIngressStatusProblem(t, tt.body, "invalid_ingress_status", tt.detail)
+		})
+	}
+}
+
+// The rule entries the client certificate tests build on: a valid entry that
+// enforces client certificates and carries one refusal entry, a listening
+// entry up to the members a test adds, and a valid refusal entry.
+const (
+	mockCAEnforcingEntry = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"none",` +
+		`"client_auth_enforced":true,"client_refusals":[{"reason":"no_certificate","age_seconds":40}]}`
+	mockCAListeningEntry = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"none"`
+	mockCARefusal        = `{"reason":"unknown_authority","age_seconds":310}`
+)
+
+// mockCAClientAuthBody renders a report whose first rule entry enforces
+// client certificates and whose second listens with members, the members
+// after its dial, so a detail about them names rules[1].
+func mockCAClientAuthBody(members string) string {
+	return `{"state":"enabled","rules":[` + mockCAEnforcingEntry + `,` + mockCAListeningEntry + members + `}]}`
+}
+
+// mockCARefusalsBody renders the report of mockCAClientAuthBody whose second
+// entry enforces client certificates and carries refusals, the given refusal
+// entries.
+func mockCARefusalsBody(refusals ...string) string {
+	return mockCAClientAuthBody(`,"client_auth_enforced":true,"client_refusals":[` + strings.Join(refusals, ",") + `]`)
+}
+
+// mockCARefusalEntries returns n valid refusal entries, each with a reason of
+// its own.
+func mockCARefusalEntries(n int) []string {
+	entries := make([]string, n)
+	for j := range entries {
+		entries[j] = fmt.Sprintf(`{"reason":"refused_%d","age_seconds":%d}`, j, j)
+	}
+	return entries
+}
+
+// mockCAReasonValues returns the reason values body carries: the value of
+// every member named reason or ending in _reason, and every string a
+// client_refusals holds, as its value or as an entry.
+func mockCAReasonValues(t *testing.T, body string) []string {
+	t.Helper()
+	var doc any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("decode body %s: %v", body, err)
+	}
+	var reasons []string
+	var walk func(v any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case map[string]any:
+			for name, member := range v {
+				s, isString := member.(string)
+				switch {
+				case isString && (name == "reason" || strings.HasSuffix(name, "_reason")):
+					reasons = append(reasons, s)
+				case isString && name == "client_refusals":
+					reasons = append(reasons, s)
+				case name == "client_refusals":
+					if entries, isArray := member.([]any); isArray {
+						for _, entry := range entries {
+							if s, isString := entry.(string); isString {
+								reasons = append(reasons, s)
+							}
+						}
+					}
+				}
+				walk(member)
+			}
+		case []any:
+			for _, entry := range v {
+				walk(entry)
+			}
+		}
+	}
+	walk(doc)
+	return reasons
+}
+
+// mockCAPutProblem sends an accepted report and then body to one server, and
+// requires a 400 with code and detail for body, a detail that repeats no
+// reason value of body, and an ingress_status_count that the refusal left at
+// the one accepted report.
+func mockCAPutProblem(t *testing.T, body, code, detail string) {
+	t.Helper()
+	_, ts := newTestServer(t)
+	accepted := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, `{"state":"enabled","rules":[`+mockCAEnforcingEntry+`]}`)
+	decodeIngressStatusReceipt(t, accepted)
+	accepted.Body.Close()
+
+	resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, got)
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != code || problem["detail"] != detail {
+		t.Errorf("problem = %v %q, want %s %q", problem["code"], problem["detail"], code, detail)
+	}
+	got, _ := problem["detail"].(string)
+	reasons := mockCAReasonValues(t, body)
+	if len(reasons) == 0 {
+		t.Fatalf("body %s carries no reason value to look for in the detail", body)
+	}
+	for _, reason := range reasons {
+		// An empty reason is in every string and quotes nothing.
+		if reason != "" && strings.Contains(got, reason) {
+			t.Errorf("detail %q repeats the reason %q of the body", got, reason)
+		}
+	}
+	if a := getAssertions(t, ts.URL); a.IngressStatusCount != 1 {
+		t.Errorf("ingress_status_count = %d after a refusal, want the 1 of the accepted report", a.IngressStatusCount)
+	}
+}
+
+// TestIngressStatus_MalformedClientAuth refuses a rule entry whose
+// client_auth_enforced is no boolean, whose client_refusals is no array or
+// holds more than eight entries, and a refusal entry that is no object,
+// carries a member the contract does not define, or a reason or an
+// age_seconds outside its rule, with malformed_ingress_status and the
+// contract's detail, which names the rule entry and the refusal entry by
+// index and never a reason of the body. These shape rules run after those of
+// the entry's own members and of its target entries, and before a presence
+// breach of an earlier entry.
+func TestIngressStatus_MalformedClientAuth(t *testing.T) {
+	t.Run("eight entries are accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+ingressStatusPath, mockCARefusalsBody(mockCARefusalEntries(8)...))
+		defer resp.Body.Close()
+		decodeIngressStatusReceipt(t, resp)
+	})
+
+	const (
+		notBoolean   = "rules[1].client_auth_enforced is not a boolean"
+		notArray     = "rules[1].client_refusals is not an array"
+		tooMany      = "rules[1].client_refusals carries more than 8 entries"
+		notObject    = "rules[1].client_refusals[1] is not an object"
+		notDefined   = "rules[1].client_refusals[1] carries a member IngressStatusReportRuleClientRefusal does not define"
+		notReason    = "rules[1].client_refusals[1].reason is not a reason token"
+		outsideRange = "rules[1].client_refusals[1].age_seconds is outside 0..2147483647"
+	)
+	tests := []struct {
+		name, body, detail string
+	}{
+		{"client_auth_enforced a string", mockCAClientAuthBody(`,"client_auth_enforced":"true","client_refusals":[` + mockCARefusal + `]`), notBoolean},
+		{"client_auth_enforced a number", mockCAClientAuthBody(`,"client_auth_enforced":1`), notBoolean},
+		{"client_auth_enforced an object", mockCAClientAuthBody(`,"client_auth_enforced":{}`), notBoolean},
+		{"client_auth_enforced an array", mockCAClientAuthBody(`,"client_auth_enforced":[true]`), notBoolean},
+
+		{"client_refusals an object", mockCAClientAuthBody(`,"client_auth_enforced":true,"client_refusals":` + mockCARefusal), notArray},
+		{"client_refusals a string", mockCAClientAuthBody(`,"client_auth_enforced":true,"client_refusals":"unknown_authority"`), notArray},
+		{"client_refusals a number", mockCAClientAuthBody(`,"client_auth_enforced":true,"client_refusals":0`), notArray},
+		{"client_refusals a boolean", mockCAClientAuthBody(`,"client_auth_enforced":true,"client_refusals":true`), notArray},
+
+		{"nine entries", mockCARefusalsBody(mockCARefusalEntries(9)...), tooMany},
+		{"the count before the entries", mockCARefusalsBody(append([]string{`"unknown_authority"`}, mockCARefusalEntries(8)...)...), tooMany},
+
+		{"an entry that is a string", mockCARefusalsBody(mockCARefusal, `"certificate_expired"`), notObject},
+		{"an entry that is a number", mockCARefusalsBody(mockCARefusal, `1`), notObject},
+		{"an entry that is an array", mockCARefusalsBody(mockCARefusal, `[]`), notObject},
+		{"an entry that is a boolean", mockCARefusalsBody(mockCARefusal, `true`), notObject},
+
+		{
+			"an unknown member of the reason grammar",
+			mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":1,"subject":"CN=client"}`),
+			"rules[1].client_refusals[1] carries the unknown member subject",
+		},
+		{
+			"the first unknown member in sorted order",
+			mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":1,"subject":"CN=client","issuer":"CN=ca"}`),
+			"rules[1].client_refusals[1] carries the unknown member issuer",
+		},
+		{"a member name in another case", mockCARefusalsBody(mockCARefusal, `{"Reason":"certificate_expired","age_seconds":1}`), notDefined},
+		{"a member name outside the grammar", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age-seconds":1}`), notDefined},
+		{
+			"a name outside the grammar sorts first",
+			mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":1,"subject":"CN=client","Issuer":"CN=ca"}`),
+			notDefined,
+		},
+		{"an unknown member before the reason", mockCARefusalsBody(mockCARefusal, `{"reason":"Not A Token","age_seconds":1,"subject":"CN=client"}`), "rules[1].client_refusals[1] carries the unknown member subject"},
+
+		{"no reason", mockCARefusalsBody(mockCARefusal, `{"age_seconds":1}`), notReason},
+		{"reason null", mockCARefusalsBody(mockCARefusal, `{"reason":null,"age_seconds":1}`), notReason},
+		{"a reason with spaces", mockCARefusalsBody(mockCARefusal, `{"reason":"Certificate Expired","age_seconds":1}`), notReason},
+		{"an empty reason", mockCARefusalsBody(mockCARefusal, `{"reason":"","age_seconds":1}`), notReason},
+		{"a reason of 64 characters", mockCARefusalsBody(mockCARefusal, `{"reason":"`+strings.Repeat("r", 64)+`","age_seconds":1}`), notReason},
+		{"a reason that is a number", mockCARefusalsBody(mockCARefusal, `{"reason":7,"age_seconds":1}`), notReason},
+		{"a null entry", mockCARefusalsBody(mockCARefusal, `null`), notReason},
+		{"an empty entry", mockCARefusalsBody(mockCARefusal, `{}`), notReason},
+		{"the reason before the age", mockCARefusalsBody(mockCARefusal, `{"reason":"Expired","age_seconds":-1}`), notReason},
+		{"an age of the wrong type before a malformed reason", mockCARefusalsBody(mockCARefusal, `{"reason":"Expired","age_seconds":"1"}`), outsideRange},
+
+		{"no age_seconds", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired"}`), outsideRange},
+		{"age_seconds null", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":null}`), outsideRange},
+		{"a negative age", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":-1}`), outsideRange},
+		{"an age past the range", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":2147483648}`), outsideRange},
+		{"an age past int64", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":9223372036854775808}`), outsideRange},
+		{"an age that is no integer", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":1.5}`), outsideRange},
+		{"an age that is a string", mockCARefusalsBody(mockCARefusal, `{"reason":"certificate_expired","age_seconds":"1"}`), outsideRange},
+
+		{"the refusal entries in body order", mockCARefusalsBody(`{"reason":"Expired","age_seconds":1}`, `"certificate_expired"`), "rules[1].client_refusals[0].reason is not a reason token"},
+		{
+			"client_auth_enforced before client_refusals",
+			mockCAClientAuthBody(`,"client_auth_enforced":"yes","client_refusals":{}`),
+			notBoolean,
+		},
+		{
+			"the rule entry's own members first",
+			`{"state":"enabled","rules":[` + mockCAEnforcingEntry + `,{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","certificate":"ready","dial":"up","client_auth_enforced":"yes"}]}`,
+			"rules[1].dial is not one of none, succeeded and failed",
+		},
+		{"the target entries first", mockCAClientAuthBody(`,"targets":["x"],"client_auth_enforced":"yes"`), "rules[1].targets[0] is not a valid target entry"},
+		{
+			"before a presence breach of an earlier entry",
+			`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"not_listening","listener_reason":"listen_failed",` +
+				`"client_auth_enforced":true,"client_refusals":[{"reason":"no_certificate","age_seconds":40}]},` +
+				mockCAListeningEntry + `,"client_auth_enforced":true,"client_refusals":[` + mockCARefusal + `,"certificate_expired"]}]}`,
+			notObject,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockCAPutProblem(t, tt.body, "malformed_ingress_status", tt.detail)
+		})
+	}
+}
+
+// TestIngressStatus_InvalidClientAuth refuses a client_auth_enforced of true
+// beside a listener of not_listening, refusal entries beside a
+// client_auth_enforced that is not true, and a refusal entry that repeats
+// the reason of an earlier one of its rule, with invalid_ingress_status. The
+// rule entry's presence rows and its target rules run first, then these
+// rules, the repeat last, before the rules of the next entry. A refused
+// report leaves ingress_status_count as it was.
+func TestIngressStatus_InvalidClientAuth(t *testing.T) {
+	const (
+		notListening = `{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"not_listening","listener_reason":"listen_failed"`
+		enforcedNot  = "rules[1] carries client_auth_enforced while listener is not_listening"
+		refusalsNot  = "rules[1] carries client_refusals while client_auth_enforced is not true"
+	)
+	report := func(second string) string {
+		return `{"state":"enabled","rules":[` + mockCAEnforcingEntry + `,` + second + `]}`
+	}
+	tests := []struct {
+		name, body, detail string
+	}{
+		{"client_auth_enforced beside not_listening", report(notListening + `,"client_auth_enforced":true}`), enforcedNot},
+		{
+			"client_auth_enforced before client_refusals",
+			report(notListening + `,"client_auth_enforced":true,"client_refusals":[` + mockCARefusal + `]}`),
+			enforcedNot,
+		},
+		{"client_refusals without client_auth_enforced", mockCAClientAuthBody(`,"client_refusals":[` + mockCARefusal + `]`), refusalsNot},
+		{"client_refusals beside client_auth_enforced null", mockCAClientAuthBody(`,"client_auth_enforced":null,"client_refusals":[` + mockCARefusal + `]`), refusalsNot},
+		{"client_refusals beside client_auth_enforced false", mockCAClientAuthBody(`,"client_auth_enforced":false,"client_refusals":[` + mockCARefusal + `]`), refusalsNot},
+		{"client_refusals beside not_listening", report(notListening + `,"client_auth_enforced":false,"client_refusals":[` + mockCARefusal + `]}`), refusalsNot},
+
+		{
+			"a repeated reason",
+			mockCARefusalsBody(mockCARefusal, `{"reason":"no_certificate","age_seconds":2}`, `{"reason":"unknown_authority","age_seconds":12}`),
+			"rules[1].client_refusals[2] repeats rules[1].client_refusals[0]",
+		},
+		{
+			"a repeat names the first entry with the reason",
+			mockCARefusalsBody(mockCARefusal, mockCARefusal, mockCARefusal),
+			"rules[1].client_refusals[1] repeats rules[1].client_refusals[0]",
+		},
+		{
+			"the presence rows first",
+			report(`{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2","listener":"listening","dial":"none","client_refusals":[` + mockCARefusal + `]}`),
+			"rules[1] misses certificate while listener is listening",
+		},
+		{
+			"the target rules first",
+			mockCAClientAuthBody(`,"targets":[{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":8443,"dial":"none","dial_reason":"refused"}],` +
+				`"client_refusals":[` + mockCARefusal + `]`),
+			"rules[1].targets[0] carries dial_reason while dial is none",
+		},
+		{
+			"the presence rows before a repeat",
+			mockCAClientAuthBody(`,"client_refusals":[` + mockCARefusal + `,` + mockCARefusal + `]`),
+			refusalsNot,
+		},
+		{
+			"an earlier entry's repeat before a later repeated id",
+			`{"state":"enabled","rules":[` + mockCAListeningEntry + `,"client_auth_enforced":true,"client_refusals":[` + mockCARefusal + `,` + mockCARefusal + `]},` +
+				notListening + `}]}`,
+			"rules[0].client_refusals[1] repeats rules[0].client_refusals[0]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockCAPutProblem(t, tt.body, "invalid_ingress_status", tt.detail)
 		})
 	}
 }
@@ -10283,6 +10620,88 @@ func TestConfigureState_IngressRuleConditions(t *testing.T) {
 	raw := stateEnvelope(t, ts.URL)["bridge"]
 	if strings.Count(string(raw), `"strip_path_prefix"`) != 1 {
 		t.Errorf("served bridge %s carries strip_path_prefix %d times, want once (shop-api only)", raw, strings.Count(string(raw), `"strip_path_prefix"`))
+	}
+}
+
+// TestConfigureState_IngressRuleClientAuth posts a bridge block whose rules
+// carry client_auth, as the control plane sends it, and reads it back from
+// the next pull: a bundle byte for byte, a client_auth of {} as a requirement
+// with an empty bundle, and a client_auth of null as no requirement, served
+// without the member. The served block posted back serves the same rules.
+func TestConfigureState_IngressRuleClientAuth(t *testing.T) {
+	_, ts := newTestServer(t)
+	const bundle = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUc2VsZi1zaWduZWQrL3Rlc3Q=\n-----END CERTIFICATE-----\n" +
+		"-----BEGIN CERTIFICATE-----\nMIIBtDCCAVqgAwIBAgIUc2Vjb25kK2F1dGhvcml0eQ==\n-----END CERTIFICATE-----\n"
+	quoted, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatalf("marshal bundle: %v", err)
+	}
+	envelope := stateEnvelope(t, ts.URL)
+	envelope["bridge"] = json.RawMessage(`{"ingress": {"enabled": true, "rules": [
+		{"id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6", "slug": "shop-api", "protocol": "tcp", "listen_port": 443,
+		 "mode": "terminate", "sni_host": "shop.example.com", "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+		 "target_address": "10.42.0.8", "target_port": 8080, "certificate_secret_name": "shop-cert",
+		 "client_auth": {"ca_bundle": ` + string(quoted) + `}},
+		{"id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f7", "slug": "shop-admin", "protocol": "tcp", "listen_port": 443,
+		 "mode": "terminate", "sni_host": "admin.example.com", "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		 "target_address": "10.42.0.7", "target_port": 3000, "certificate_secret_name": "admin-cert",
+		 "client_auth": {}},
+		{"id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f8", "slug": "shop-web", "protocol": "tcp", "listen_port": 443,
+		 "mode": "terminate", "sni_host": "www.example.com", "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		 "target_address": "10.42.0.7", "target_port": 8080, "certificate_secret_name": "www-cert",
+		 "client_auth": null}]}}`)
+	configureStateEnvelope(t, ts.URL, envelope)
+
+	state := getState(t, ts.URL)
+	if state.Bridge == nil || state.Bridge.Ingress == nil || len(state.Bridge.Ingress.Rules) != 3 {
+		t.Fatalf("Bridge after configure-state = %+v, want three ingress rules", state.Bridge)
+	}
+	rules := state.Bridge.Ingress.Rules
+	if ca := rules[0].ClientAuth; ca == nil || ca.CABundle != bundle {
+		t.Errorf("shop-api ClientAuth = %+v, want the bundle as posted", ca)
+	}
+	if ca := rules[1].ClientAuth; ca == nil || ca.CABundle != "" {
+		t.Errorf("shop-admin ClientAuth = %+v, want a requirement with an empty bundle", ca)
+	}
+	if ca := rules[2].ClientAuth; ca != nil {
+		t.Errorf("shop-web ClientAuth = %+v, want nil", ca)
+	}
+
+	// The wire carries the member of the first two rules with ca_bundle alone,
+	// and not the member of the third.
+	var served struct {
+		Ingress struct {
+			Rules []map[string]json.RawMessage `json:"rules"`
+		} `json:"ingress"`
+	}
+	if err := json.Unmarshal(stateEnvelope(t, ts.URL)["bridge"], &served); err != nil {
+		t.Fatalf("decode served bridge: %v", err)
+	}
+	if len(served.Ingress.Rules) != 3 {
+		t.Fatalf("served %d ingress rules, want 3", len(served.Ingress.Rules))
+	}
+	for i, want := range []map[string]string{{"ca_bundle": bundle}, {"ca_bundle": ""}} {
+		var got map[string]string
+		if err := json.Unmarshal(served.Ingress.Rules[i]["client_auth"], &got); err != nil {
+			t.Fatalf("decode served client_auth of rule %d: %v", i, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("served client_auth of rule %d = %q, want %q", i, got, want)
+		}
+	}
+	if ca, sent := served.Ingress.Rules[2]["client_auth"]; sent {
+		t.Errorf("served shop-web carries client_auth %s, want no member", ca)
+	}
+
+	configureStateEnvelope(t, ts.URL, stateEnvelope(t, ts.URL))
+	again := getState(t, ts.URL)
+	if again.Bridge == nil || again.Bridge.Ingress == nil || len(again.Bridge.Ingress.Rules) != len(rules) {
+		t.Fatalf("Bridge after the second round trip = %+v, want three ingress rules", again.Bridge)
+	}
+	for i, rule := range again.Bridge.Ingress.Rules {
+		if !rule.Equal(rules[i]) {
+			t.Errorf("rule %d after the second round trip = %+v, want %+v", i, rule, rules[i])
+		}
 	}
 }
 
