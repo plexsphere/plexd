@@ -1,8 +1,11 @@
 package api
 
 import (
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"reflect"
 	"slices"
@@ -2344,6 +2347,12 @@ type LocalEndpointConfig struct {
 
 	// TLSInsecureSkipVerify disables TLS certificate verification.
 	TLSInsecureSkipVerify bool `yaml:"tls_insecure_skip_verify"`
+
+	// TLSCAFile names a PEM file whose certificates are trusted for the
+	// endpoint in addition to the host's system roots, so an endpoint behind
+	// a private CA needs neither that CA in the host's trust store nor
+	// TLSInsecureSkipVerify. TLSClientConfig reads it on each call.
+	TLSCAFile string `yaml:"tls_ca_file"`
 }
 
 // Validate checks that the local endpoint configuration is well-formed.
@@ -2362,5 +2371,32 @@ func (c *LocalEndpointConfig) Validate(prefix string) error {
 	if c.SecretKey == "" {
 		return fmt.Errorf("%s: config: local_endpoint: SecretKey is required when URL is set", prefix)
 	}
+	// Skipping verification trusts any certificate, so the named CA would be
+	// silently ignored.
+	if c.TLSCAFile != "" && c.TLSInsecureSkipVerify {
+		return fmt.Errorf("%s: config: local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive", prefix)
+	}
 	return nil
+}
+
+// TLSClientConfig returns the TLS settings for a client of the endpoint, or
+// nil when the endpoint sets neither TLS option and the transport's defaults
+// apply.
+func (c *LocalEndpointConfig) TLSClientConfig(logger *slog.Logger) (*tls.Config, error) {
+	switch {
+	case c.TLSCAFile != "" && c.TLSInsecureSkipVerify:
+		// Validate refuses this too, but a caller that skipped it must not get
+		// an unverified client from a configuration that names a CA.
+		return nil, errors.New("tls_ca_file and tls_insecure_skip_verify are mutually exclusive")
+	case c.TLSCAFile != "":
+		pool, err := LoadRootCAs(c.TLSCAFile, logger)
+		if err != nil {
+			return nil, fmt.Errorf("tls_ca_file: %w", err)
+		}
+		return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}, nil
+	case c.TLSInsecureSkipVerify:
+		return &tls.Config{InsecureSkipVerify: true}, nil
+	default:
+		return nil, nil
+	}
 }
