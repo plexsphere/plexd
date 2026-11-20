@@ -34,6 +34,8 @@ USER 65534:65534
 EXPOSE 8080
 # Local endpoint TLS port
 EXPOSE 8443
+# Control plane API TLS port (-api-tls-addr)
+EXPOSE 8444
 
 ENTRYPOINT ["/usr/local/bin/mockapi"]
 CMD ["-addr", ":8080"]

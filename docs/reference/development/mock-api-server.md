@@ -14,6 +14,7 @@ A fixture-based mock of the Central API for end-to-end testing. Returns static r
 |--------|------|---------------------|---------|-------------|
 | Listen address | `-addr` | — | `:0` | TCP address (`host:port`) to listen on |
 | TLS listen address | `-tls-addr` | — | `:8443` | TLS address (`host:port`) for local endpoint handlers |
+| Control plane TLS listen address | `-api-tls-addr` | none | empty | TLS address (`host:port`) that serves the control plane API, the same handler as `-addr`, with the [CA-signed certificate](#tls-listener-local-endpoints). Empty runs no such listener |
 | DNS stub listen address | `-dns-addr` | none | empty | UDP and TCP address (`host:port`) of the [DNS stub](#dns-stub). Empty runs no stub and binds no DNS socket |
 
 The binary prints `MOCKAPI_ADDR=<address>` to stdout on startup, which allows test scripts to discover the dynamically assigned port when using `:0`.
@@ -199,6 +200,16 @@ Returns the envelope an authenticated route admits, so a test script that drives
 ```
 
 Go callers reach the same value through `(*Server).BearerEnvelope()`. In-process tests that mean to exercise handlers rather than the gate serve the mock behind a shim that stamps this header when a request arrives without one.
+
+### `GET /test/tls-ca`
+
+Returns the CA certificate that signed the leaf of the [TLS listeners](#tls-listener-local-endpoints), so a test script can write it to the file a client names in `tls_ca_file` instead of skipping verification. Like every `/test/` route it needs no credential: a script fetches the CA before its node has registered.
+
+**Response:** `200 OK` with `Content-Type: application/x-pem-file` and the CA certificate as one PEM `CERTIFICATE` block.
+
+The binary generates a new CA at every start, so a script fetches it from the running mock rather than keeping a copy. Go callers set the PEM through `(*Server).SetTLSCA(caPEM)`; the binary passes the one `GenerateCATLSConfig()` returned.
+
+**Error:** Returns `404` when no CA was set. The binary always sets one; an in-process server answers `404` until a test calls `SetTLSCA`.
 
 ## Endpoints
 
@@ -2117,9 +2128,11 @@ Returns the raw request body captured from the last call to the specified endpoi
 
 ## TLS Listener (Local Endpoints)
 
-The server runs a second listener on the TLS address (`-tls-addr`, default `:8443`) with a self-signed ECDSA P-256 certificate (DNS names: `mock-api`, `localhost`). This listener serves local endpoint handlers that simulate a secondary on-premises HTTPS endpoint with Bearer token authentication.
+The server runs a second listener on the TLS address (`-tls-addr`, default `:8443`). This listener serves local endpoint handlers that simulate a secondary on-premises HTTPS endpoint with Bearer token authentication.
 
-The TLS certificate is generated at startup by `GenerateSelfSignedTLSConfig()` and is valid for 24 hours. Clients must use `tls_insecure_skip_verify: true` since the certificate is self-signed.
+At startup `GenerateCATLSConfig()` creates an ECDSA P-256 CA and a leaf certificate signed by it for the DNS names `mock-api` (the Docker suite's name for the mock), `plexd-e2e-mockapi` (the systemd suite's) and `localhost`. The Kubernetes suite reaches the mock as `mock-api.plexd-e2e`, which the leaf does not name, and its local endpoints keep `tls_insecure_skip_verify: true`. Both certificates are valid for 24 hours. The listener presents the leaf only, as a control plane behind a private CA does, and the mock serves the CA certificate as PEM at [`GET /test/tls-ca`](#get-test-tls-ca). A client either trusts that CA, by writing the PEM to a file it names in `tls_ca_file`, or skips verification with `tls_insecure_skip_verify: true`. A client that does neither refuses the leaf.
+
+With `-api-tls-addr` set, a third listener serves the control plane API over TLS with the same certificate. It serves the same handler as `-addr`, bearer gate and `/test/` routes included, so only the transport differs. Without the flag no such listener runs, and a suite reaches the control plane over plain HTTP.
 
 The TLS listener serves a separate `http.ServeMux` (`TLSHandler()`) with the following routes:
 
@@ -2322,7 +2335,7 @@ docker buildx build -f test/e2e/mockapi/Dockerfile \
 | Property | Value |
 |----------|-------|
 | User | `65534:65534` (nobody) |
-| Exposed ports | `8080` (HTTP), `8443` (TLS) |
+| Exposed ports | `8080` (HTTP), `8443` (TLS), `8444` (control plane TLS, with `-api-tls-addr :8444`) |
 | Entrypoint | `/usr/local/bin/mockapi` |
 | Default CMD | `["-addr", ":8080"]` |
 
@@ -2358,11 +2371,15 @@ For TLS local endpoint testing:
 
 ```go
 srv := mockapi.New()
-tlsCfg := mockapi.GenerateSelfSignedTLSConfig()
+tlsCfg, caPEM := mockapi.GenerateCATLSConfig()
+srv.SetTLSCA(caPEM) // served by GET /test/tls-ca on srv.Handler()
 ts := httptest.NewUnstartedServer(srv.TLSHandler())
 ts.TLS = tlsCfg
 ts.StartTLS()
 defer ts.Close()
+
+// A client that trusts caPEM verifies the leaf when it dials one of the
+// leaf's names: mock-api, localhost or plexd-e2e-mockapi.
 
 // srv.NSK() returns the raw 32-byte node secret key (the response encodes it as base64)
 // srv.ExpectedBearerToken() returns "e2e-local-bearer-token"

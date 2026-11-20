@@ -19,6 +19,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":0", "listen address (host:port)")
 	tlsAddr := flag.String("tls-addr", ":8443", "TLS listen address for local endpoints (host:port)")
+	apiTLSAddr := flag.String("api-tls-addr", "", "TLS listen address for the control plane API (host:port); empty runs no such listener")
 	check := flag.String("check", "", "healthcheck URL (GET and exit 0/1)")
 	dnsAddr := flag.String("dns-addr", "", "DNS stub listen address for UDP and TCP (host:port); empty runs no stub")
 	flag.Parse()
@@ -53,13 +54,34 @@ func main() {
 		logger.Error("TLS listen failed", "addr", *tlsAddr, "error", err)
 		os.Exit(1)
 	}
-	tlsCfg := mockapi.GenerateSelfSignedTLSConfig()
+	tlsCfg, caPEM := mockapi.GenerateCATLSConfig()
+	srv.SetTLSCA(caPEM)
 	tlsSrv := &http.Server{
 		Handler:   srv.TLSHandler(),
 		TLSConfig: tlsCfg,
 	}
 	tlsLnTLS := tls.NewListener(tlsLn, tlsCfg)
 	logger.Info("TLS server started", "addr", tlsLn.Addr().String())
+
+	// The control plane API over TLS, for a suite that proves a client trusts
+	// the mock's CA from a file. It serves the same handler, bearer gate
+	// included, as the plain listener, and presents the same leaf as the
+	// local endpoint listener, so only the transport differs.
+	var apiTLSSrv *http.Server
+	var apiTLSLnTLS net.Listener
+	if *apiTLSAddr != "" {
+		apiTLSLn, err := net.Listen("tcp", *apiTLSAddr)
+		if err != nil {
+			logger.Error("API TLS listen failed", "addr", *apiTLSAddr, "error", err)
+			os.Exit(1)
+		}
+		apiTLSSrv = &http.Server{
+			Handler:   srv.Handler(),
+			TLSConfig: tlsCfg,
+		}
+		apiTLSLnTLS = tls.NewListener(apiTLSLn, tlsCfg)
+		logger.Info("API TLS server started", "addr", apiTLSLn.Addr().String())
+	}
 
 	dnsStub, err := startDNSStub(*dnsAddr, logger)
 	if err != nil {
@@ -75,6 +97,9 @@ func main() {
 		logger.Info("shutting down")
 		httpSrv.Close()
 		tlsSrv.Close()
+		if apiTLSSrv != nil {
+			apiTLSSrv.Close()
+		}
 	}()
 
 	if dnsStub != nil {
@@ -90,6 +115,14 @@ func main() {
 			logger.Error("TLS serve failed", "error", err)
 		}
 	}()
+
+	if apiTLSSrv != nil {
+		go func() {
+			if err := apiTLSSrv.Serve(apiTLSLnTLS); err != nil && err != http.ErrServerClosed {
+				logger.Error("API TLS serve failed", "error", err)
+			}
+		}()
+	}
 
 	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		logger.Error("serve failed", "error", err)
