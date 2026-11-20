@@ -55,6 +55,14 @@ Those two values are the defaults `upgrade.signing_identity_regexp` and `upgrade
 .\plexd.exe install --token <YOUR_BOOTSTRAP_TOKEN> --api-url https://api.plexsphere.com
 ```
 
+For a control plane behind a private CA, pass the CA bundle as well:
+
+```powershell
+.\plexd.exe install --token <YOUR_BOOTSTRAP_TOKEN> --api-url https://api.example.com --ca-file .\corp-ca.pem
+```
+
+The install copies the bundle's certificates to `%ProgramData%\plexd\control-plane-ca.pem`, which inherits the ACL of the configuration directory, and names that file as `api.tls_ca_file` in a newly generated `config.yaml`. plexd trusts it in addition to the system roots; the Windows certificate store stays as it is. See [CA bundle](../reference/core/configuration.md#ca-bundle).
+
 This creates:
 
 | Path or object                     | Description                                        |
@@ -63,6 +71,7 @@ This creates:
 | `%ProgramData%\plexd\`              | Configuration directory                            |
 | `%ProgramData%\plexd\config.yaml`   | Service configuration                              |
 | `%ProgramData%\plexd\bootstrap-token` | Bootstrap token                                  |
+| `%ProgramData%\plexd\control-plane-ca.pem` | CA bundle, with `--ca-file` only            |
 | `%ProgramData%\plexd\hooks\`          | Hook scripts directory                             |
 | `%ProgramData%\plexd\data\`         | Data directory                                     |
 | `%ProgramData%\plexd\run\`          | Runtime directory                                  |

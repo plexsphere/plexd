@@ -115,6 +115,7 @@ metrics:
     url: https://metrics.local:9090/ingest
     secret_key: local-metrics-token
     tls_insecure_skip_verify: false
+    # tls_ca_file: /etc/plexd/local-ca.pem  # an endpoint behind a private CA
 ```
 
 #### Log Forwarding
@@ -129,6 +130,7 @@ log_fwd:
     url: https://logs.local:3100/loki/api/v1/push
     secret_key: local-logs-token
     tls_insecure_skip_verify: false
+    # tls_ca_file: /etc/plexd/local-ca.pem  # an endpoint behind a private CA
 ```
 
 #### Audit Forwarding
@@ -143,9 +145,18 @@ audit_fwd:
     url: https://audit.local:9200/_bulk
     secret_key: local-audit-token
     tls_insecure_skip_verify: false
+    # tls_ca_file: /etc/plexd/local-ca.pem  # an endpoint behind a private CA
 ```
 
 You can configure one, two, or all three pipelines independently.
+
+An endpoint whose certificate is issued by a private CA needs that CA's
+certificate on the node. Name a PEM file holding it in
+`local_endpoint.tls_ca_file`, which plexd trusts for that endpoint in addition
+to the system roots, and leave `tls_insecure_skip_verify` at `false`: the two
+are mutually exclusive. Each pipeline takes its own file, and no environment
+variable sets it. See [CA bundle](../reference/core/configuration.md#ca-bundle)
+for where the file can live and when plexd reads it.
 
 ### Step 3: Restart plexd
 
@@ -167,9 +178,9 @@ equivalent is `journalctl -u plexd --no-pager`.
 You should see one log line per configured pipeline:
 
 ```
-level=INFO msg="local endpoint enabled" pipeline=metrics url=https://metrics.local:9090/ingest
-level=INFO msg="local endpoint enabled" pipeline=logfwd url=https://logs.local:3100/loki/api/v1/push
-level=INFO msg="local endpoint enabled" pipeline=auditfwd url=https://audit.local:9200/_bulk
+level=INFO msg="local endpoint enabled" pipeline=metrics url=https://metrics.local:9090/ingest tls_ca_file=""
+level=INFO msg="local endpoint enabled" pipeline=logfwd url=https://logs.local:3100/loki/api/v1/push tls_ca_file=""
+level=INFO msg="local endpoint enabled" pipeline=auditfwd url=https://audit.local:9200/_bulk tls_ca_file=""
 ```
 
 If a local endpoint encounters errors, warnings appear in the logs:
@@ -257,7 +268,8 @@ requires a specific ingest format.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| TLS: `certificate signed by unknown authority` | Self-signed or internal CA cert | Install the CA cert on the node, or set `tls_insecure_skip_verify: true` (dev only) |
+| TLS: `certificate signed by unknown authority` | Self-signed or internal CA cert | Set `local_endpoint.tls_ca_file` to a PEM file holding the CA certificate (see [CA bundle](../reference/core/configuration.md#ca-bundle)), or set `tls_insecure_skip_verify: true` (dev only) |
+| `plexd up: <section>.local_endpoint: tls_ca_file: ...` at startup | The file `tls_ca_file` names cannot be read or holds no certificate | Fix the path or the file, then restart plexd; it stops before it registers. See [CA bundle](../reference/core/configuration.md#ca-bundle) for the places the service cannot read |
 | TLS: `certificate is valid for X, not Y` | URL hostname doesn't match cert CN/SAN | Use the hostname matching the certificate, or set `tls_insecure_skip_verify: true` (dev only) |
 | `credential fetch failed` | `secret_key` doesn't match any control plane secret | Verify the secret name matches `secret_key` exactly |
 | `secret decryption failed` | NSK mismatch after key rotation | Re-create the secret or re-register the node |

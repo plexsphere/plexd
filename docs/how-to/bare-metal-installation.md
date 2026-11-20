@@ -34,6 +34,8 @@ This downloads the binary, verifies its checksum, installs plexd as a systemd se
 | `--version VERSION` | Version to install (default: `latest`)  |
 | `--no-start`      | Don't start the service after install      |
 
+The script has no `--ca-file`. For a control plane behind a private CA, install by hand and pass the CA bundle to `plexd install --ca-file`, as in [step 2](#_2-install-as-a-systemd-service) below.
+
 ## Manual installation
 
 ### 1. Download the binary
@@ -54,6 +56,15 @@ chmod +x /tmp/plexd
 sudo /tmp/plexd install --token <YOUR_BOOTSTRAP_TOKEN>
 ```
 
+For a control plane behind a private CA, pass the CA bundle as well:
+
+```sh
+sudo /tmp/plexd install --token <YOUR_BOOTSTRAP_TOKEN> \
+  --api-url https://api.example.com --ca-file ./corp-ca.pem
+```
+
+The install copies the bundle's certificates to `/etc/plexd/control-plane-ca.pem`, where the service can read it, and names that file as `api.tls_ca_file` in a newly generated `config.yaml`. See [CA bundle](../reference/core/configuration.md#ca-bundle).
+
 This creates:
 
 | Path                                 | Description              |
@@ -61,6 +72,7 @@ This creates:
 | `/usr/local/bin/plexd`               | plexd binary             |
 | `/etc/plexd/config.yaml`            | Service configuration    |
 | `/etc/plexd/bootstrap-token`        | Bootstrap token (0600)   |
+| `/etc/plexd/control-plane-ca.pem`   | CA bundle (0644), with `--ca-file` only |
 | `/etc/plexd/hooks/`                  | Hook scripts directory   |
 | `/var/lib/plexd/`                    | Data directory           |
 | `/var/run/plexd/`                    | Runtime directory        |

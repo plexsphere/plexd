@@ -10,12 +10,13 @@ The `internal/api` package provides the Go client for communicating with the Ple
 
 ## Config
 
-`Config` holds connection parameters passed to the client constructor. No file I/O occurs in this package — config loading is the caller's responsibility.
+`Config` holds connection parameters passed to the client constructor. The package reads no configuration file; loading one is the caller's responsibility. The only files it opens are CA bundles, read by `LoadRootCAs`: the one `TLSCAFile` names, and those of the local endpoints (`LocalEndpointConfig.TLSCAFile`).
 
 | Field                   | Type            | Default | Description                                    |
 |-------------------------|-----------------|---------|------------------------------------------------|
 | `BaseURL`               | `string`        | —       | Control plane API base URL (required)          |
-| `TLSInsecureSkipVerify` | `bool`          | `false` | Disable TLS certificate verification           |
+| `TLSInsecureSkipVerify` | `bool`          | `false` | Disable TLS certificate verification. For a private CA, set `TLSCAFile` instead |
+| `TLSCAFile`             | `string`        | —       | PEM file whose certificates the client trusts in addition to the system roots (YAML `tls_ca_file`). Mutually exclusive with `TLSInsecureSkipVerify`; see [CA bundle](configuration.md#ca-bundle) |
 | `ConnectTimeout`        | `time.Duration` | `10s`   | TCP connection timeout. Bounds the ordinary dial and the [dial fallback](#dial-fallback) each |
 | `RequestTimeout`        | `time.Duration` | `30s`   | Full HTTP request/response timeout; bounds only the setup of the SSE stream |
 | `SSEIdleTimeout`        | `time.Duration` | `90s`   | Max idle time before SSE reconnect; the only bound on an open stream. Must not be negative |
@@ -25,12 +26,15 @@ The `internal/api` package provides the Go client for communicating with the Ple
 cfg := api.Config{
     BaseURL:               "https://api.plexsphere.com",
     TLSInsecureSkipVerify: false,
+    TLSCAFile:             "/etc/plexd/control-plane-ca.pem", // optional: a private CA
 }
 cfg.ApplyDefaults() // sets zero-valued timeouts to defaults
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }
 ```
+
+`Validate` refuses `TLSCAFile` together with `TLSInsecureSkipVerify` with `api: config: tls_ca_file and tls_insecure_skip_verify are mutually exclusive`. It does not open the file; the constructor does.
 
 ## ControlPlane
 
@@ -43,8 +47,9 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 ```
 
 - Applies config defaults and validates
+- Loads the CA bundle with `LoadRootCAs(cfg.TLSCAFile, logger)`, which returns the host's system roots plus the certificates in the file. An empty `TLSCAFile` returns a nil pool, which `crypto/tls` reads as the system roots alone. A file that cannot be read or holds no certificate fails the constructor with `api: config: tls_ca_file: read CA file: …` or `api: config: tls_ca_file: no certificate found in CA file <path>`. With a file set it logs `control plane CA bundle loaded` at Info with `path`. A host whose system pool cannot be loaded gets the Warn `system certificate pool unavailable, trusting only the CA file` with `path` and `error`, and the client trusts the file alone. See [CA bundle](configuration.md#ca-bundle)
 - Installs the [dial fallback](#dial-fallback) as the transport's dialer
-- Configures TLS, connect timeout, request timeout (`ConnectSSE` and `OpenSessionConnection` send through a copy without the request timeout, see [SSE Stream](#sse-stream))
+- Configures TLS (TLS 1.2 at least, `InsecureSkipVerify`, and the loaded pool as `RootCAs`), connect timeout, request timeout (`ConnectSSE` and `OpenSessionConnection` send through a copy without the request timeout, see [SSE Stream](#sse-stream))
 - Sets `User-Agent: plexd/{version}` on all requests
 - Gzip-compresses request bodies larger than 1 KiB **on the three observability ingest operations only** — they are the ones whose contract accepts `Content-Encoding: gzip`. Every other handler decodes the body as it arrives, so a compressed one is read as JSON and refused with `400`, naming the gzip magic byte as `invalid character '\x1f'`.
 - Transparently decompresses gzip responses

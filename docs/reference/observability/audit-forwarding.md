@@ -75,7 +75,8 @@ When `Enabled=false`, validation is skipped entirely (including `LocalEndpoint` 
 |--------------------------|----------|------------------------------|----------------------------------------------------|
 | `URL`                    | `string` | `local_endpoint.url`         | HTTPS endpoint URL. Empty means not configured.    |
 | `SecretKey`              | `string` | `local_endpoint.secret_key`  | Auth credential. Required when URL is set. Redacted in config dumps. |
-| `TLSInsecureSkipVerify`  | `bool`   | `local_endpoint.tls_insecure_skip_verify` | Disable TLS certificate verification. |
+| `TLSInsecureSkipVerify`  | `bool`   | `local_endpoint.tls_insecure_skip_verify` | Disable TLS certificate verification. For a private CA, set `TLSCAFile` instead. |
+| `TLSCAFile`              | `string` | `local_endpoint.tls_ca_file` | PEM file whose certificates the client trusts in addition to the system roots. Mutually exclusive with `TLSInsecureSkipVerify`. See [CA bundle](../core/configuration.md#ca-bundle). |
 
 **Validation rules** (applied only when `Enabled=true` and `URL` is non-empty):
 
@@ -84,6 +85,7 @@ When `Enabled=false`, validation is skipped entirely (including `LocalEndpoint` 
 | URL must be parseable      | `auditfwd: config: local_endpoint: invalid URL "<url>"`              |
 | Scheme must be `https`     | `auditfwd: config: local_endpoint: URL must be HTTPS, got "<scheme>"`|
 | SecretKey must be non-empty| `auditfwd: config: local_endpoint: SecretKey is required when URL is set` |
+| Not both TLS options       | `auditfwd: config: local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive` |
 
 A zero-valued `LocalEndpointConfig` (all fields empty/false) is valid and means "not configured".
 
@@ -97,6 +99,7 @@ audit_fwd:
     url: https://audit.local:9090/ingest
     secret_key: local-audit-token
     tls_insecure_skip_verify: false
+    # tls_ca_file: /etc/plexd/local-ca.pem  # an endpoint behind a private CA
 ```
 
 ## AuditSource
@@ -130,7 +133,7 @@ type AuditReporter interface {
 ### Constructor
 
 ```go
-func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter
+func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) (*LocalReporter, error)
 ```
 
 | Parameter | Description |
@@ -140,6 +143,8 @@ func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []
 | `nsk` | Node secret key bytes for AES-256-GCM decryption via `nodeapi.DecryptSecret` |
 | `nodeID` | Node identifier passed to `SecretFetcher.FetchSecret` |
 | `logger` | Structured logger (`log/slog`) |
+
+The constructor builds the client's TLS settings with `cfg.TLSClientConfig(logger)` and returns a nil reporter with an error when that fails: `auditfwd: local endpoint: tls_ca_file: read CA file: …` for a file it cannot read, `auditfwd: local endpoint: tls_ca_file: no certificate found in CA file <path>` for one without a certificate, and `auditfwd: local endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive` when both options are set.
 
 ### SecretFetcher
 
@@ -156,7 +161,7 @@ Defined in the `auditfwd` package. The `api.ControlPlane` client satisfies this 
 | Setting | Value | Notes |
 |---------|-------|-------|
 | Timeout | 10s | Per-request timeout |
-| TLS | Configurable | `TLSInsecureSkipVerify` controls certificate validation for this client only |
+| TLS | Configurable | For this client only: `TLSCAFile` adds a CA bundle to the system roots (TLS 1.2 at least), `TLSInsecureSkipVerify` turns certificate validation off, and neither leaves Go's defaults |
 | Compression | None | Batches are sent as uncompressed JSON |
 
 ### Credential Resolution
@@ -631,9 +636,13 @@ When `LocalEndpoint.URL` is configured, the `Forwarder` receives a `MultiReporte
 ```go
 var auditReporter auditfwd.AuditReporter = auditfwd.NewPlatformReporter(controlPlane, logger)
 if cfg.AuditFwd.LocalEndpoint.URL != "" {
-    localReporter := auditfwd.NewLocalReporter(cfg.AuditFwd.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
+    localReporter, err := auditfwd.NewLocalReporter(cfg.AuditFwd.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
+    if err != nil {
+        return fmt.Errorf("plexd up: %w", err)
+    }
     auditReporter = auditfwd.NewMultiReporter(auditReporter, localReporter, logger)
-    logger.Info("local endpoint enabled", "pipeline", "auditfwd", "url", cfg.AuditFwd.LocalEndpoint.URL)
+    logger.Info("local endpoint enabled", "pipeline", "auditfwd", "url", cfg.AuditFwd.LocalEndpoint.URL,
+        "tls_ca_file", cfg.AuditFwd.LocalEndpoint.TLSCAFile)
 }
 fwd := auditfwd.NewForwarder(cfg.AuditFwd, sources, auditReporter, identity.NodeID, hostname, logger)
 ```

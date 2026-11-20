@@ -24,11 +24,12 @@ These variables are read via `envOrDefault()` in `cmd/plexd/cmd/root.go` and app
 
 ## plexd up Variables
 
-These variables are read by `applyEnvOverrides()` in `cmd/plexd/cmd/up.go` and only apply to the `plexd up` command. They override YAML config values but are themselves overridden by CLI flags.
+These variables are read by `applyEnvOverrides()` in `cmd/plexd/cmd/up.go` and only apply to the `plexd up` command, with one exception: `PLEXD_API_TLS_CA_FILE` is read by `applyAPIEnvOverrides()` in `cmd/plexd/cmd/root.go`, which `applyEnvOverrides()` and `plexd join` both call, so it applies to `plexd join` as well. They override YAML config values but are themselves overridden by CLI flags.
 
 | Variable | Config field | Description |
 |----------|-------------|-------------|
 | `PLEXD_BOOTSTRAP_TOKEN_FILE` | `registration.token_file` | Path to the bootstrap token file |
+| `PLEXD_API_TLS_CA_FILE` | `api.tls_ca_file` | Path to a PEM file whose certificates plexd trusts for the control plane, in addition to the system roots. A non-empty value replaces the file's `api.tls_ca_file`; an empty or unset one leaves it. `plexd join` reads it too. The mutual exclusion with `api.tls_insecure_skip_verify` is checked on the merged value, so setting it while the file sets `tls_insecure_skip_verify: true` stops `plexd up` and `plexd join` at startup. No variable sets `local_endpoint.tls_ca_file`. See [CA bundle](configuration.md#ca-bundle). |
 | `PLEXD_ACTIONS_ENABLED` | `actions.enabled` | Enable/disable action execution. Parsed with Go's `strconv.ParseBool`: `1`, `t`, `T`, `true`, `TRUE`, `True` enable; `0`, `f`, `F`, `false`, `FALSE`, `False` disable. Any other value is ignored with a warning and leaves `actions.enabled` as the file or the default set it. Required to enable it on the file-less path, where `actions.enabled` defaults to `false`. |
 | `PLEXD_ACTIONS_ROLLOUTS_ENABLED` | `actions.rollouts_enabled` | Accept or refuse the hooks the control plane rolls out. Parsed with `strconv.ParseBool`, like `PLEXD_ACTIONS_ENABLED`: `0`, `f`, `F`, `false`, `FALSE` and `False` are the node owner's veto, and plexd removes every rolled-out hook at start and fetches none; `1`, `t`, `T`, `true`, `TRUE` and `True` accept rolled-out hooks. Any other value is ignored with the warning `invalid PLEXD_ACTIONS_ROLLOUTS_ENABLED, leaving actions.rollouts_enabled unchanged` and leaves the setting as the file or the default set it. Unlike `actions.enabled`, it defaults to `true` on the file-less path too. |
 | `PLEXD_HOOKS_ENABLED` | `integrity.watch_enabled` | Enable/disable the integrity verifier's inotify watch of `integrity.hooks_dir`, which re-runs the hooks sweep when a file there changes. Values: `true`, `1` to enable; any other non-empty value disables it, and an unset variable leaves the file's value. It has no effect where neither `integrity.hooks_dir` nor `PLEXD_HOOKS_DIR` names a directory, and it does not touch `HookWatcher`'s watch of `actions.hooks_dir`, which runs regardless. |
@@ -55,7 +56,7 @@ This variable is not processed by `applyEnvOverrides()`. Instead, the registrati
 From highest to lowest priority:
 
 1. **CLI flags** — `--api`, `--mode`, `--log-level` (applied in `runUp` before `applyEnvOverrides`)
-2. **`applyEnvOverrides()`** — `PLEXD_BOOTSTRAP_TOKEN_FILE`, `PLEXD_ACTIONS_ENABLED`, etc.
+2. **`applyEnvOverrides()`** — `PLEXD_BOOTSTRAP_TOKEN_FILE`, `PLEXD_ACTIONS_ENABLED`, etc. It calls `applyAPIEnvOverrides()` for `PLEXD_API_TLS_CA_FILE`, which `plexd join` calls on its own, after its `--api` override and before validation.
 3. **Global env vars** — `PLEXD_CONFIG`, `PLEXD_LOG_LEVEL`, `PLEXD_API`, `PLEXD_MODE` (via `envOrDefault` in flag defaults)
 4. **YAML config file** — values from `/etc/plexd/config.yaml` on Linux (or the `--config` path; see [Platform defaults](configuration.md#platform-defaults))
 5. **`ApplyDefaults()`** — built-in defaults for zero-valued fields
@@ -66,6 +67,12 @@ From highest to lowest priority:
 
 ```bash
 PLEXD_BOOTSTRAP_TOKEN_FILE=/run/secrets/plexd-token plexd up
+```
+
+**Trust a private CA for the control plane during a join:**
+
+```bash
+PLEXD_API_TLS_CA_FILE=/etc/plexd/control-plane-ca.pem plexd join --token-file /etc/plexd/bootstrap-token
 ```
 
 **Disable actions via environment:**
