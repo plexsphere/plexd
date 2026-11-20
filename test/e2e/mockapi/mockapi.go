@@ -3754,11 +3754,14 @@ const maxIngressStatusBody = 2 << 20
 
 // handleIngressStatus handles PUT /v1/nodes/{id}/ingress-status, the bridge's
 // report of whether its local configuration serves public ingress and of the
-// state of each ingress rule and of its targets. It enforces the contract's
-// gates in order: the 2 MiB body cap (413 ingress_status_body_too_large), the
-// strict decode of decodeIngressStatus, which answers 400
-// malformed_ingress_status, and the rules of checkIngressStatus, which answer
-// 400 malformed_ingress_status or invalid_ingress_status. The 200 answer
+// state of each ingress rule, of its targets and of its client certificate
+// requirement: whether the bridge enforces it and the last client it refused
+// per reason. It enforces the contract's gates in order: the 2 MiB body cap
+// (413 ingress_status_body_too_large), the strict decode of
+// decodeIngressStatus, which answers 400 malformed_ingress_status, and the
+// rules of checkIngressStatus over each rule entry, its target entries, its
+// client_auth_enforced and its refusal entries, which answer 400
+// malformed_ingress_status or invalid_ingress_status. The 200 answer
 // carries accepted_at. Every answer of the handler carries Cache-Control:
 // no-store, as the contract asks. The counter increments only on the 200. As
 // for policy-status, the bearer gate is the only check of the node: the path
@@ -3820,8 +3823,9 @@ type ingressStatusBody struct {
 }
 
 // ingressStatusRuleEntry is the mock's reading of one rule entry. Every member
-// is a pointer, so the presence rules can tell an omitted member from a sent
-// one; a member sent as null reads as omitted, as on the control plane.
+// is a pointer or raw JSON, so the presence rules can tell an omitted member
+// from a sent one; a member sent as null reads as omitted, as on the control
+// plane.
 type ingressStatusRuleEntry struct {
 	ID                *string `json:"id"`
 	Listener          *string `json:"listener"`
@@ -3835,9 +3839,43 @@ type ingressStatusRuleEntry struct {
 	// target entry on its own, so a detail names the target entry by its
 	// index. An absent targets, a null and [] carry no entries.
 	Targets *[]json.RawMessage `json:"targets"`
+	// ClientAuthEnforced and ClientRefusals stay undecoded until
+	// decodeIngressStatusClientAuth decodes them, so a value of the wrong
+	// JSON type earns the contract's sentence for its member and not "is not
+	// a valid rule entry". An absent member holds nil and a null the bytes
+	// null; both read as omitted.
+	ClientAuthEnforced json.RawMessage `json:"client_auth_enforced"`
+	ClientRefusals     json.RawMessage `json:"client_refusals"`
 	// targets are the target entries decodeIngressStatusTargets decoded from
 	// Targets, in body order; nil for an entry without target entries.
 	targets []ingressStatusTargetEntry
+	// clientAuthEnforced is true when ClientAuthEnforced is true. Absent,
+	// null and false all read as false, as the contract has it.
+	clientAuthEnforced bool
+	// clientRefusals are the refusal entries decodeIngressStatusClientAuth
+	// decoded from ClientRefusals, in body order; nil for an entry without
+	// refusal entries.
+	clientRefusals []ingressStatusRefusalEntry
+}
+
+// ingressStatusRefusalEntry is the mock's reading of one entry of a rule
+// entry's client_refusals, the contract's
+// IngressStatusReportRuleClientRefusal. Both members are pointers, so a
+// missing or null member reads as missing, which its rule refuses: the
+// contract requires both.
+type ingressStatusRefusalEntry struct {
+	Reason     *string `json:"reason"`
+	AgeSeconds *int64  `json:"age_seconds"`
+}
+
+// ingressStatusRefusalMembers maps each member of a refusal entry onto the
+// sentence that refuses its value, without the indices. A value outside the
+// member's rule and a value of the wrong JSON type, a number that is no
+// integer included, earn the same sentence. A name outside the map is a
+// member the contract does not define.
+var ingressStatusRefusalMembers = map[string]string{
+	"reason":      ".reason is not a reason token",
+	"age_seconds": fmt.Sprintf(".age_seconds is outside 0..%d", api.MaxIngressStatusRefusalAgeSeconds),
 }
 
 // ingressStatusTargetEntry is the mock's reading of one target entry of a
@@ -3871,21 +3909,28 @@ func decodeIngressStatus(data []byte) (*ingressStatusBody, error) {
 
 // checkIngressStatus runs the contract's rules over a decoded report and
 // returns the code and detail of the first breach, or two empty strings when
-// the report is valid. The shape rules, over the state, over every rule entry
-// and over the target entries of each, answer malformed_ingress_status; then
-// the consistency rules, an opted-out report with entries, an id that repeats
-// an earlier entry, an entry that breaks the presence rules, and a target
-// entry that repeats an earlier one of its rule or breaks the presence rules
-// of a target, answer invalid_ingress_status. The details are the control
-// plane's sentences
+// the report is valid. The shape rules, over the state, over every rule entry,
+// over the target entries of each and then over its client_auth_enforced and
+// its refusal entries, answer malformed_ingress_status; then the consistency
+// rules, an opted-out report with entries, an id that repeats an earlier
+// entry, an entry that breaks the presence rules, a target entry that repeats
+// an earlier one of its rule or breaks the presence rules of a target, a
+// client_auth_enforced of true beside a listener of not_listening, refusal
+// entries beside a client_auth_enforced that is not true, and a refusal entry
+// that repeats the reason of an earlier one of its rule, answer
+// invalid_ingress_status. The details are the control plane's sentences
 // (plexsphere/plexsphere@8c76f19 internal/transport/http/v1/ingressstatus/handler.go),
 // except that an entry that is no object, carries an unknown member or a
 // member of the wrong type reads "is not a valid rule entry", and a target
 // entry of that kind "is not a valid target entry". A detail never quotes an
-// id or a reason of the body. The mock accepts canonical ids only
-// (api.ValidIngressRuleID and api.ValidIngressTargetNodeID), which is
-// narrower than the control plane's parser and wide enough for what plexd
-// sends.
+// id or a reason of the body. The control plane judges the JSON type of
+// client_auth_enforced and client_refusals while it decodes the entry, and
+// checks the two members against listener and client_auth_enforced with the
+// presence rows; the mock runs both checks after those of the entry's target
+// entries, so a body that breaks two rules can earn another detail here. The
+// mock accepts canonical ids only (api.ValidIngressRuleID and
+// api.ValidIngressTargetNodeID), which is narrower than the control plane's
+// parser and wide enough for what plexd sends.
 func checkIngressStatus(req *ingressStatusBody) (code, detail string) {
 	const malformed, invalid = "malformed_ingress_status", "invalid_ingress_status"
 	switch {
@@ -3915,6 +3960,11 @@ func checkIngressStatus(req *ingressStatusBody) (code, detail string) {
 			return malformed, fmt.Sprintf("rules[%d]%s", i, detail)
 		}
 		entries[i].targets = targets
+		enforced, refusals, detail := decodeIngressStatusClientAuth(entries[i].ClientAuthEnforced, entries[i].ClientRefusals)
+		if detail != "" {
+			return malformed, fmt.Sprintf("rules[%d]%s", i, detail)
+		}
+		entries[i].clientAuthEnforced, entries[i].clientRefusals = enforced, refusals
 	}
 
 	if *req.State == api.IngressStateOptedOut && len(entries) > 0 {
@@ -3932,6 +3982,9 @@ func checkIngressStatus(req *ingressStatusBody) (code, detail string) {
 			return invalid, fmt.Sprintf("rules[%d] %s", i, detail)
 		}
 		if detail := checkIngressStatusTargets(i, e.targets); detail != "" {
+			return invalid, detail
+		}
+		if detail := checkIngressStatusClientAuth(i, e); detail != "" {
 			return invalid, detail
 		}
 	}
@@ -4015,6 +4068,90 @@ func checkIngressStatusTargetShape(t ingressStatusTargetEntry) string {
 		return fmt.Sprintf(".dial_age_seconds is outside 0..%d", api.MaxIngressStatusDialAgeSeconds)
 	}
 	return ""
+}
+
+// decodeIngressStatusClientAuth decodes the client_auth_enforced and the
+// client_refusals of one rule entry and returns whether the entry says that
+// the bridge enforces the requirement and its refusal entries in body order,
+// or the detail of the first breach without the rule entry's index:
+// a client_auth_enforced other than true, false and null, a client_refusals
+// that is no array or holds more than api.MaxIngressStatusClientRefusals
+// entries, and then a refusal entry decodeIngressStatusRefusal refuses, named
+// by its index. An absent member reads as null. An absent client_refusals, a
+// null and [] return nil: the entry carries no refusal entries.
+func decodeIngressStatusClientAuth(enforcedRaw, refusalsRaw json.RawMessage) (enforced bool, refusals []ingressStatusRefusalEntry, detail string) {
+	var flag *bool
+	if len(enforcedRaw) > 0 {
+		if err := json.Unmarshal(enforcedRaw, &flag); err != nil {
+			return false, nil, ".client_auth_enforced is not a boolean"
+		}
+	}
+	var raw []json.RawMessage
+	if len(refusalsRaw) > 0 {
+		if err := json.Unmarshal(refusalsRaw, &raw); err != nil {
+			return false, nil, ".client_refusals is not an array"
+		}
+	}
+	if len(raw) > api.MaxIngressStatusClientRefusals {
+		return false, nil, fmt.Sprintf(".client_refusals carries more than %d entries", api.MaxIngressStatusClientRefusals)
+	}
+	if len(raw) > 0 {
+		refusals = make([]ingressStatusRefusalEntry, len(raw))
+	}
+	for j, entry := range raw {
+		if refusals[j], detail = decodeIngressStatusRefusal(entry); detail != "" {
+			return false, nil, fmt.Sprintf(".client_refusals[%d]%s", j, detail)
+		}
+	}
+	return flag != nil && *flag, refusals, ""
+}
+
+// decodeIngressStatusRefusal decodes one refusal entry and applies the rules
+// of its members, and returns it, or the detail naming the first breach,
+// without the indices, as the control plane words it: " is not an object"
+// for an entry that is no JSON object and not null; " carries the unknown
+// member <name>" for a member the contract does not define whose name is a
+// token of the reason grammar, and " carries a member
+// IngressStatusReportRuleClientRefusal does not define" for any other
+// unknown member, the first in sorted order of several, as
+// decodeUserAccessStatusEntry does; then the sentence of a member of the wrong
+// JSON type, the first in body order, before any value rule runs, as on the
+// control plane, so {"reason":"Expired","age_seconds":"1"} earns the sentence
+// of age_seconds; then the sentence of reason, for one that is missing, null
+// or no reason token, and of age_seconds, for one that is missing, null or
+// outside its range. Members match by their exact name. A null entry decodes as an entry without members,
+// which the rule of reason refuses, as on the control plane.
+func decodeIngressStatusRefusal(raw json.RawMessage) (ingressStatusRefusalEntry, string) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return ingressStatusRefusalEntry{}, " is not an object"
+	}
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		if _, known := ingressStatusRefusalMembers[name]; known {
+			continue
+		}
+		if api.ValidIngressReason(name) {
+			return ingressStatusRefusalEntry{}, " carries the unknown member " + name
+		}
+		return ingressStatusRefusalEntry{}, " carries a member IngressStatusReportRuleClientRefusal does not define"
+	}
+	var r ingressStatusRefusalEntry
+	if err := json.Unmarshal(raw, &r); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			if detail, known := ingressStatusRefusalMembers[typeErr.Field]; known {
+				return ingressStatusRefusalEntry{}, detail
+			}
+		}
+		return ingressStatusRefusalEntry{}, " is not a valid refusal entry"
+	}
+	switch {
+	case r.Reason == nil || !api.ValidIngressReason(*r.Reason):
+		return ingressStatusRefusalEntry{}, ingressStatusRefusalMembers["reason"]
+	case r.AgeSeconds == nil || *r.AgeSeconds < 0 || *r.AgeSeconds > api.MaxIngressStatusRefusalAgeSeconds:
+		return ingressStatusRefusalEntry{}, ingressStatusRefusalMembers["age_seconds"]
+	}
+	return r, ""
 }
 
 // ingressStatusPresenceRow is one row of a presence table: whether the entry
@@ -4112,6 +4249,35 @@ func checkIngressStatusRulePresence(e ingressStatusRuleEntry) string {
 		{"dial_age_seconds", e.DialAgeSeconds != nil, dial == api.IngressDialSucceeded || dial == api.IngressDialFailed, dialIs},
 		{"targets", hasTargets, hasTargets && listening, listenerIs},
 	})
+}
+
+// checkIngressStatusClientAuth applies the rules that tie the
+// client_auth_enforced and the refusal entries of rule entry i to its
+// listener and to each other: client_auth_enforced is true only beside a
+// listener that is listening, refusal entries stand only beside a
+// client_auth_enforced that is true, and no refusal entry repeats the reason
+// of an earlier one, since a bridge sends the last refusal per reason. A
+// client_auth_enforced of false or null and an entry without refusal entries
+// pass beside either listener. The two presence rows run before the repeat.
+// It returns the detail of the first breach, naming the refusal entries by
+// both indices and never their reason, or "".
+func checkIngressStatusClientAuth(i int, e ingressStatusRuleEntry) string {
+	listening := *e.Listener == api.IngressListenerListening
+	hasRefusals := len(e.clientRefusals) > 0
+	if detail := firstBrokenIngressStatusRow([]ingressStatusPresenceRow{
+		{"client_auth_enforced", e.clientAuthEnforced, e.clientAuthEnforced && listening, "listener is " + *e.Listener},
+		{"client_refusals", hasRefusals, hasRefusals && e.clientAuthEnforced, "client_auth_enforced is not true"},
+	}); detail != "" {
+		return fmt.Sprintf("rules[%d] %s", i, detail)
+	}
+	first := make(map[string]int, len(e.clientRefusals))
+	for j, r := range e.clientRefusals {
+		if k, seen := first[*r.Reason]; seen {
+			return fmt.Sprintf("rules[%d].client_refusals[%d] repeats rules[%d].client_refusals[%d]", i, j, i, k)
+		}
+		first[*r.Reason] = j
+	}
+	return ""
 }
 
 // The contract's numbers for a user access status report, the mock's own
