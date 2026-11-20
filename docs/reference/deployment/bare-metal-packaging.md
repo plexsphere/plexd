@@ -22,6 +22,7 @@ Configuration struct for packaging and installing plexd.
 | `APIBaseURL`   | string | *(empty)*                                | Control plane API URL (optional)             |
 | `TokenValue`   | string | *(empty)*                                | Bootstrap token value (optional)             |
 | `TokenFile`    | string | *(empty)*                                | Path to token file to copy from (optional)   |
+| `CAFile`       | string | *(empty)*                                | Path to a PEM CA bundle to copy to `{ConfigDir}/control-plane-ca.pem`, the name `InstalledCAFileName` holds (optional; `--ca-file`) |
 
 Three of those defaults are resolved per platform:
 
@@ -250,16 +251,19 @@ Recovery actions are the SCM's counterpart to `Restart=always` and `RestartSec=5
 ## GenerateDefaultConfig
 
 ```go
-func GenerateDefaultConfig(apiBaseURL string) string
+func GenerateDefaultConfig(apiBaseURL, tlsCAFile string) string
 ```
 
-Produces a minimal default `config.yaml`. When `apiBaseURL` is empty, writes a commented-out placeholder. The two paths it writes are the platform defaults ([per platform](../core/configuration.md#platform-defaults)); the values below are the Linux ones.
+Produces a minimal default `config.yaml`. When `apiBaseURL` is empty, writes a commented-out placeholder. The two paths it always writes are the platform defaults ([per platform](../core/configuration.md#platform-defaults)); the values below are the Linux ones.
+
+A non-empty `tlsCAFile` adds `tls_ca_file: <tlsCAFile>` to the `api` section. That section is then written uncommented even without a URL, with only `base_url` as the commented placeholder. With `tlsCAFile` empty, the output has no `tls_ca_file` line. The installer passes `{ConfigDir}/control-plane-ca.pem` when `CAFile` is set. The path is a plain YAML scalar, so the space in the macOS path and the backslashes in the Windows path need no quoting.
 
 ### Output fields
 
 | Field                      | Value                                  | Description               |
 |----------------------------|----------------------------------------|---------------------------|
 | `api.base_url`             | Provided URL or `# api: base_url: …`  | Control plane API URL     |
+| `api.tls_ca_file`          | `/etc/plexd/control-plane-ca.pem` (Linux), only when `tlsCAFile` is set | CA bundle added to the system roots |
 | `data_dir`                 | `/var/lib/plexd` (Linux)               | Data directory            |
 | `log_level`                | `info`                                 | Log verbosity             |
 | `registration.token_file`  | `/etc/plexd/bootstrap-token` (Linux)   | Bootstrap token file path |
@@ -270,7 +274,7 @@ Produces a minimal default `config.yaml`. When `apiBaseURL` is empty, writes a c
 func NewInstaller(cfg InstallConfig, mgr ServiceManager, root RootChecker, logger *slog.Logger) *Installer
 ```
 
-The Installer owns the files that are the same on every platform — the binary, the config, the token — and leaves the service definition to the `ServiceManager`.
+The Installer owns the files that are the same on every platform — the binary, the config, the CA bundle, the token — and leaves the service definition to the `ServiceManager`.
 
 ### Install() error
 
@@ -278,11 +282,13 @@ Installs plexd as a host service. Steps:
 
 1. Verify privileges (`RootChecker.IsRoot()`): root on Unix, an elevated token on Windows
 2. Verify the host's service manager is available (`ServiceManager.Available()`)
-3. Create directories: `ConfigDir` (0755), `ConfigDir/hooks` (0755), `DataDir` (0700), `RunDir` (0755), and `LogDir` (0755) where it is set. An existing directory and its contents are left as they are
-4. Copy the running binary to `BinaryPath` (0755)
-5. Write default `config.yaml` if absent (preserves existing)
-6. Write bootstrap token if `TokenValue` or `TokenFile` is set (0600)
-7. Register the service (`ServiceManager.Register()`)
+3. Read the CA bundle if `CAFile` is set, and keep each `CERTIFICATE` block that `x509.ParseCertificate` accepts, re-encoded without PEM headers; every other block, a private key included, is dropped. A read failure returns `packaging: read CA file "<path>": …` and a file without a certificate `packaging: no certificate found in CA file "<path>"`, both before anything on the host changes
+4. Create directories: `ConfigDir` (0755), `ConfigDir/hooks` (0755), `DataDir` (0700), `RunDir` (0755), and `LogDir` (0755) where it is set. An existing directory and its contents are left as they are
+5. Copy the running binary to `BinaryPath` (0755)
+6. Write default `config.yaml` if absent (preserves existing). A preserved file is not edited: with `CAFile` set, the installer logs `existing config preserved, api.tls_ca_file not written` at Warn with `path` and `tls_ca_file`
+7. If `CAFile` is set, write the certificates read in step 3 to `{ConfigDir}/control-plane-ca.pem` (0644) and log `CA bundle installed` with `src` and `dst`; a failure returns `packaging: write CA file: …`. Because step 3 read the bytes first, `CAFile` may name the installed file itself
+8. Write bootstrap token if `TokenValue` or `TokenFile` is set (0600)
+9. Register the service (`ServiceManager.Register()`)
 
 The service is registered, never started. `--api-url` is optional, so an install can legitimately precede a usable configuration; the start command per platform is in the [CLI reference](../core/cli.md#plexd-install).
 
@@ -295,6 +301,8 @@ Removes the plexd host service. Steps:
 3. Stop the service and remove its definition (`ServiceManager.Unregister()`)
 4. Remove binary
 5. If `purge` is true, remove `DataDir` and `ConfigDir` recursively
+
+The CA bundle lives in `ConfigDir`, so only `purge` removes it; a plain uninstall keeps it beside the `config.yaml` that names it.
 
 On Windows the binary is a running image whenever `plexd uninstall` runs from the installed path, and Windows refuses to delete one. The file is renamed to `plexd.exe.old` and handed to the boot-time delete queue instead, so it disappears at the next reboot.
 
@@ -374,6 +382,7 @@ Linux:
 | `/etc/plexd/hooks/`                       | 0755       | Install    | Hook scripts; read-only to plexd under its unit |
 | `/etc/plexd/config.yaml`                  | 0644       | Install    | Service configuration    |
 | `/etc/plexd/bootstrap-token`              | 0600       | Install    | Bootstrap token; emptied rather than removed after registration under the unit |
+| `/etc/plexd/control-plane-ca.pem`         | 0644       | Install    | CA bundle from `--ca-file`, certificates only |
 | `/etc/plexd/environment`                  | *(user)*   | Operator   | Optional env vars        |
 | `/var/lib/plexd/`                         | 0700       | Install    | Data directory           |
 | `/var/run/plexd/`                         | 0755       | Install    | Runtime directory        |
@@ -443,6 +452,8 @@ curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- [OPTIONS]
 | `--api-url URL`   | Control plane API URL                      | *(none)*   |
 | `--version VERSION` | Version to install                       | `latest`   |
 | `--no-start`      | Don't start the service after install      | *(start)*  |
+
+The script passes no CA bundle to `plexd install`: it has no `--ca-file`, and an unknown option is fatal. A host whose control plane is behind a private CA runs `plexd install --ca-file` itself.
 
 ### Behavior
 

@@ -78,13 +78,53 @@ Control plane HTTP client configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.com`. Required in the merged configuration — the value may come from the file, `--api`, or `PLEXD_API`. |
-| `tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification. **WARNING:** Only for development/testing. |
+| `tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification. **WARNING:** Only for development/testing. For a control plane behind a private CA, set `tls_ca_file` instead. |
+| `tls_ca_file` | string | — | Path to a PEM file whose certificates plexd trusts for the control plane, in addition to the system roots. Only its certificates are used; other blocks are skipped. A relative path resolves against the working directory. `PLEXD_API_TLS_CA_FILE` overrides it. Mutually exclusive with `tls_insecure_skip_verify`. See [CA bundle](#ca-bundle). |
 | `connect_timeout` | duration | `10s` | Maximum time to wait for a TCP connection |
 | `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle. On the SSE event stream it bounds only the setup: the wait for the response headers, and the problem body of a non-2xx answer. It does not cut an open stream. |
 | `sse_idle_timeout` | duration | `90s` | Maximum idle time on the SSE stream before reconnecting. It is the only bound on an open stream: any byte resets it, the control plane's keep-alive comments included. Must not be negative. |
 | `sse_reprobe_interval` | duration | `10m` | How often pull-only delivery re-probes the SSE endpoint after the control plane descoped it. Must be at least `1s` when set. |
 
-Source: `internal/api/config.go`
+### CA bundle
+
+`api.tls_ca_file` names a PEM file whose certificates plexd trusts when it talks to the control plane. `local_endpoint.tls_ca_file` in `metrics`, `log_fwd` and `audit_fwd` does the same for that section's local endpoint. Nothing outside plexd changes on the host. Three facts hold for each of these keys:
+
+- **The file is added to the system roots; it does not replace them.** A certificate that chains to a CA in the host's trust store still verifies with the key set, so a public CA keeps working, and a control plane that later moves to a public certificate needs no configuration change.
+- **plexd reads the file at startup and not again while it runs.** A changed or replaced file takes effect at the next restart. `plexd up` reads a `local_endpoint.tls_ca_file` twice while it starts: once to check it before it registers, and again when it builds that endpoint's reporter.
+- **Under the shipped systemd unit, a file under `/home`, `/root` or `/run/user` is unreadable.** `plexd install` writes the unit with `ProtectSystem=full` and `ProtectHome=true`, which make those directories inaccessible to plexd. This is why `plexd install --ca-file` copies the bundle into the config directory: to `/etc/plexd/control-plane-ca.pem` on Linux, `/Library/Application Support/plexd/control-plane-ca.pem` on macOS and `%ProgramData%\plexd\control-plane-ca.pem` on Windows.
+
+```yaml
+api:
+  base_url: https://api.example.com
+  tls_ca_file: /etc/plexd/control-plane-ca.pem
+```
+
+plexd uses only the certificates in the file and skips every other PEM block, such as a private key in a combined file. A file without a certificate is refused. A relative path resolves against the working directory of the process, so a service should be given an absolute path.
+
+`tls_ca_file` and `tls_insecure_skip_verify: true` are mutually exclusive in `api` and in each `local_endpoint`. Validation checks a local endpoint only when its section is enabled and its `url` is set, and refuses a configuration that sets both:
+
+| Section | Error |
+|---------|-------|
+| `api` | `api: config: tls_ca_file and tls_insecure_skip_verify are mutually exclusive` |
+| `metrics.local_endpoint` | `metrics: config: local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive` |
+| `log_fwd.local_endpoint` | `logfwd: config: local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive` |
+| `audit_fwd.local_endpoint` | `auditfwd: config: local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive` |
+
+`plexd up` builds a reporter for every local endpoint that sets a `url`, whether its section is enabled or not, so it also refuses the combination for such an endpoint before it registers, for example with `plexd up: metrics.local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive`.
+
+A file that cannot be read, or that holds no certificate, stops plexd at startup with an error that names the file: `api.tls_ca_file` stops `plexd up` and `plexd join`, and a `local_endpoint.tls_ca_file` stops `plexd up`. Both commands build the control plane client before they register, and `plexd up` checks the local endpoints before that, so a bad file never spends a redemption of the bootstrap token:
+
+```text
+plexd up: create client: api: config: tls_ca_file: read CA file: open /etc/plexd/control-plane-ca.pem: no such file or directory
+plexd join: create client: api: config: tls_ca_file: no certificate found in CA file /etc/plexd/control-plane-ca.pem
+plexd up: metrics.local_endpoint: tls_ca_file: read CA file: open /etc/plexd/metrics-ca.pem: no such file or directory
+```
+
+`PLEXD_API_TLS_CA_FILE` overrides `api.tls_ca_file` in `plexd up` and in `plexd join` (see [Environment Variables](environment-variables.md#plexd-up-variables)), and the mutual exclusion is checked on the merged value. No flag of `plexd up` or `plexd join` sets either key, and no environment variable sets `local_endpoint.tls_ca_file`.
+
+`plexd install --ca-file <path>` checks the file before it changes anything on the host: a file that cannot be read or holds no certificate fails the install and leaves the host as it was. It copies only the certificates, never a private key, with mode 0644. It writes `api.tls_ca_file` into `config.yaml` only when it generates a new one. An existing `config.yaml` is preserved: the bundle is still copied, the install warns `existing config preserved, api.tls_ca_file not written`, and the key has to be added by hand. `plexd uninstall --purge` removes the copy with the config directory, and a plain `plexd uninstall` keeps it. See [`plexd install`](cli.md#plexd-install).
+
+Source: `internal/api/config.go`, `internal/api/rootcas.go`
 
 ---
 
@@ -274,7 +314,8 @@ System metrics collection and reporting.
 | `batch_size` | int | `100` | Maximum number of metric points per report batch. Minimum: `1`. |
 | `local_endpoint.url` | string | — | HTTPS URL for a local metrics endpoint. Must use `https://` scheme. Empty means not configured. |
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
-| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
+| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. For an endpoint behind a private CA, set `local_endpoint.tls_ca_file` instead. |
+| `local_endpoint.tls_ca_file` | string | — | Path to a PEM file whose certificates plexd trusts for the local endpoint, in addition to the system roots. Mutually exclusive with `local_endpoint.tls_insecure_skip_verify`. Ignored while `url` is empty. No environment variable sets it. See [CA bundle](#ca-bundle). |
 
 > For a step-by-step guide to configuring local endpoints, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
 
@@ -298,7 +339,8 @@ Log collection and forwarding.
 | `filter.exclude_units` | []string | — | Drop entries matching any of these unit names. Takes precedence over `include_units`. The unit name is the systemd unit on Linux (`plexd.service` for the daemon) and `plexd` on macOS and Windows. |
 | `local_endpoint.url` | string | — | HTTPS URL for a local log forwarding endpoint. Must use `https://` scheme. Empty means not configured. |
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
-| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
+| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. For an endpoint behind a private CA, set `local_endpoint.tls_ca_file` instead. |
+| `local_endpoint.tls_ca_file` | string | — | Path to a PEM file whose certificates plexd trusts for the local endpoint, in addition to the system roots. Mutually exclusive with `local_endpoint.tls_insecure_skip_verify`. Ignored while `url` is empty. No environment variable sets it. See [CA bundle](#ca-bundle). |
 
 > For a step-by-step guide to configuring local endpoints, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
 
@@ -318,7 +360,8 @@ Audit event collection and forwarding.
 | `batch_size` | int | `500` | Maximum number of audit entries per report batch. Minimum: `1`. |
 | `local_endpoint.url` | string | — | HTTPS URL for a local audit forwarding endpoint. Must use `https://` scheme. Empty means not configured. |
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
-| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
+| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. For an endpoint behind a private CA, set `local_endpoint.tls_ca_file` instead. |
+| `local_endpoint.tls_ca_file` | string | — | Path to a PEM file whose certificates plexd trusts for the local endpoint, in addition to the system roots. Mutually exclusive with `local_endpoint.tls_insecure_skip_verify`. Ignored while `url` is empty. No environment variable sets it. See [CA bundle](#ca-bundle). |
 
 > For a step-by-step guide to configuring local endpoints, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
 
@@ -605,6 +648,7 @@ data_dir: /var/lib/plexd  # persistent data directory (default: /var/lib/plexd)
 api:
   base_url: https://api.plexsphere.com  # required
   tls_insecure_skip_verify: false
+  # tls_ca_file: ""          # PEM bundle added to the system roots; empty = system roots only
   connect_timeout: 10s
   request_timeout: 30s
   sse_idle_timeout: 90s
@@ -670,6 +714,7 @@ metrics:
   #   url: https://metrics.local:9090/ingest
   #   secret_key: local-metrics-token
   #   tls_insecure_skip_verify: false
+  #   tls_ca_file: ""        # PEM bundle added to the system roots for this endpoint
 
 log_fwd:
   enabled: true
@@ -689,6 +734,7 @@ log_fwd:
   #   url: https://logs.local:9090/ingest
   #   secret_key: local-logs-token
   #   tls_insecure_skip_verify: false
+  #   tls_ca_file: ""        # PEM bundle added to the system roots for this endpoint
 
 audit_fwd:
   enabled: true
@@ -699,6 +745,7 @@ audit_fwd:
   #   url: https://audit.local:9090/ingest
   #   secret_key: local-audit-token
   #   tls_insecure_skip_verify: false
+  #   tls_ca_file: ""        # PEM bundle added to the system roots for this endpoint
 
 wireguard:
   interface_name: plexd0

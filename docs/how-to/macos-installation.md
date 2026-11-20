@@ -33,6 +33,8 @@ This downloads `plexd-darwin-<arch>`, verifies its checksum, runs `plexd install
 | `--version VERSION` | Version to install (default: `latest`)   |
 | `--no-start`      | Don't start the daemon after install       |
 
+The script has no `--ca-file`. For a control plane behind a private CA, install by hand and pass the CA bundle to `plexd install --ca-file`, as in [step 2](#_2-install-as-a-launchd-daemon) below.
+
 The script does not create the `plexd` and `plexd-secrets` groups on macOS, which has no `groupadd`. It warns and carries on; see [Verification](#verification).
 
 ## Manual installation
@@ -82,6 +84,15 @@ A binary fetched with `curl` carries no `com.apple.quarantine` attribute and run
 sudo /tmp/plexd install --token <YOUR_BOOTSTRAP_TOKEN> --api-url https://api.plexsphere.com
 ```
 
+For a control plane behind a private CA, pass the CA bundle as well:
+
+```sh
+sudo /tmp/plexd install --token <YOUR_BOOTSTRAP_TOKEN> \
+  --api-url https://api.example.com --ca-file ./corp-ca.pem
+```
+
+The install copies the bundle's certificates to `/Library/Application Support/plexd/control-plane-ca.pem` and names that file as `api.tls_ca_file` in a newly generated `config.yaml`. plexd trusts it in addition to the system roots; the System keychain stays as it is. See [CA bundle](../reference/core/configuration.md#ca-bundle).
+
 This creates:
 
 | Path                                                | Description                           |
@@ -90,6 +101,7 @@ This creates:
 | `/Library/Application Support/plexd/`               | Configuration directory               |
 | `/Library/Application Support/plexd/config.yaml`    | Service configuration                 |
 | `/Library/Application Support/plexd/bootstrap-token`| Bootstrap token (0600)                |
+| `/Library/Application Support/plexd/control-plane-ca.pem` | CA bundle (0644), with `--ca-file` only |
 | `/Library/Application Support/plexd/hooks/`         | Hook scripts directory                |
 | `/Library/Application Support/plexd/data/`          | Data directory (0700)                 |
 | `/var/run/plexd/`                                   | Runtime directory                     |

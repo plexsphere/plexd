@@ -44,6 +44,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 1. Parse config, apply CLI flag overrides, apply `PLEXD_*` env overrides
 2. Set up structured logger
 2a. Build the policy enforcer and pre-flight the firewall backend — fatal on failure
+2b. Load the `tls_ca_file` of every local endpoint that sets a `url`, fatal on failure (see [CA bundle](configuration.md#ca-bundle))
 3. Create control plane client
 4. Register (or load existing identity) — fatal on failure
 4a. Start the health listener before the registration call (unless `health.enabled` is `false`)
@@ -96,7 +97,7 @@ plexd join [--token-file /path/to/token]
 Register plexd with the host's service manager. Requires root privileges on Unix and an elevated shell on Windows.
 
 ```
-plexd install [--api-url https://api.example.com] [--token TOKEN] [--token-file /path]
+plexd install [--api-url https://api.example.com] [--token TOKEN] [--token-file /path] [--ca-file /path/ca.pem]
 ```
 
 | Flag           | Default | Description                      |
@@ -104,6 +105,9 @@ plexd install [--api-url https://api.example.com] [--token TOKEN] [--token-file 
 | `--api-url`    | —       | Control plane API URL            |
 | `--token`      | —       | Bootstrap token value            |
 | `--token-file` | —       | Path to bootstrap token file     |
+| `--ca-file`    | —       | Path to a PEM CA bundle plexd trusts for the control plane |
+
+`--ca-file` copies the certificates of the bundle, and no private key, to `control-plane-ca.pem` in the config directory (`/etc/plexd/control-plane-ca.pem` on Linux, `/Library/Application Support/plexd/control-plane-ca.pem` on macOS, `%ProgramData%\plexd\control-plane-ca.pem` on Windows) and sets `api.tls_ca_file` to that path in the `config.yaml` it generates. The file is checked before anything is written, so a bundle that cannot be read or holds no certificate fails the install and leaves the host unchanged. An existing `config.yaml` is preserved: the bundle is still copied, and the install warns `existing config preserved, api.tls_ca_file not written`, so add the key by hand. See [CA bundle](configuration.md#ca-bundle).
 
 What is registered, and what "registered" means, differs per platform:
 
@@ -134,6 +138,8 @@ plexd uninstall [--purge]
 | Flag      | Default | Description                               |
 |-----------|---------|-------------------------------------------|
 | `--purge` | `false` | Also remove data and config directories   |
+
+`--purge` removes the CA bundle that `plexd install --ca-file` copied along with the config directory, and a plain `plexd uninstall` keeps it beside the `config.yaml` that names it.
 
 On Windows the binary is a running image whenever `plexd uninstall` runs from the installed path, and Windows refuses to delete one. It is renamed to `plexd.exe.old` and removed at the next reboot.
 

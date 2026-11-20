@@ -103,6 +103,15 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.plexsphere.plexd.plis
 sc.exe start plexd
 ```
 
+A control plane behind a private CA needs that CA's certificate. Pass it to the install, which copies it into the config directory and names it as `api.tls_ca_file` in the `config.yaml` it generates. plexd then trusts it in addition to the system roots, and nothing outside plexd changes on the host:
+
+```bash
+sudo plexd install --api-url https://api.example.com --ca-file ./corp-ca.pem
+sudo systemctl enable --now plexd
+```
+
+An existing `config.yaml` is kept as it is, so on a host that already has one, add `api.tls_ca_file` by hand. See [CA bundle](../reference/core/configuration.md#ca-bundle).
+
 The [macOS](../how-to/macos-installation.md) and [Windows](../how-to/windows-installation.md) guides carry the full walkthrough, including verification and uninstall.
 
 ### Kubernetes (DaemonSet)
