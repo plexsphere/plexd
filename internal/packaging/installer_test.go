@@ -1,17 +1,29 @@
 package packaging
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // --- Mock SystemdController ---
@@ -962,5 +974,486 @@ func TestUninstall_UnregisterFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(binPath); statErr != nil {
 		t.Errorf("Stat(binary) = %v, want the binary kept after a failed Unregister", statErr)
+	}
+}
+
+// --- CA bundle ---
+
+// newTestCA generates a self-signed ECDSA P-256 CA and returns its
+// certificate in DER together with its key.
+func newTestCA(t *testing.T) ([]byte, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey() = %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "plexd packaging test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate() = %v", err)
+	}
+	return der, key
+}
+
+// certPEM encodes a DER certificate as one PEM block.
+func certPEM(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// writeCAFixture writes data to a file outside the installer's tree, so a
+// test that expects Install to write nothing can check that tree is empty.
+func writeCAFixture(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) = %v", path, err)
+	}
+	return path
+}
+
+// pemBlocks decodes every PEM block in the file at path. It fails the test on
+// bytes that are not PEM, which a bundle the installer wrote must not hold.
+func pemBlocks(t *testing.T, path string) []*pem.Block {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", path, err)
+	}
+	var blocks []*pem.Block
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		blocks = append(blocks, block)
+	}
+	if len(bytes.TrimSpace(data)) != 0 {
+		t.Fatalf("%s holds %d bytes that are not PEM: %q", path, len(data), data)
+	}
+	return blocks
+}
+
+// assertOneCertificate checks that the file at path holds exactly the
+// certificate der and nothing else.
+func assertOneCertificate(t *testing.T, path string, der []byte) {
+	t.Helper()
+	blocks := pemBlocks(t, path)
+	if len(blocks) != 1 {
+		t.Fatalf("%s holds %d PEM blocks, want 1", path, len(blocks))
+	}
+	if blocks[0].Type != "CERTIFICATE" {
+		t.Errorf("%s block type = %q, want CERTIFICATE", path, blocks[0].Type)
+	}
+	if !bytes.Equal(blocks[0].Bytes, der) {
+		t.Errorf("%s holds a certificate other than the source's", path)
+	}
+	if _, err := x509.ParseCertificate(blocks[0].Bytes); err != nil {
+		t.Errorf("x509.ParseCertificate(%s) = %v", path, err)
+	}
+}
+
+// capturedLog is one line a logCapture recorded.
+type capturedLog struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string
+}
+
+// logCapture is a slog.Handler that records every line with its attributes
+// as strings.
+type logCapture struct {
+	mu      sync.Mutex
+	entries []capturedLog
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]string, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Resolve().String()
+		return true
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = append(c.entries, capturedLog{level: r.Level, msg: r.Message, attrs: attrs})
+	return nil
+}
+
+// WithAttrs returns c unchanged: the installer adds only its component
+// through With, which no test asserts on.
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+// WithGroup returns c unchanged: the installer logs no groups.
+func (c *logCapture) WithGroup(string) slog.Handler { return c }
+
+// find returns the lines that say msg, at any level.
+func (c *logCapture) find(msg string) []capturedLog {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []capturedLog
+	for _, e := range c.entries {
+		if e.msg == msg {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestInstall_CAFileCopiedAndConfigured(t *testing.T) {
+	der, _ := newTestCA(t)
+	src := writeCAFixture(t, certPEM(der))
+	systemd := &mockSystemdController{available: true}
+	root := &mockRootChecker{isRoot: true}
+	ins, tmpDir := newTestInstaller(t, InstallConfig{CAFile: src}, systemd, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	dst := filepath.Join(tmpDir, "etc", "plexd", InstalledCAFileName)
+	assertOneCertificate(t, dst, der)
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("Stat(%q) = %v", dst, err)
+	}
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o644 {
+			t.Errorf("%s perm = %04o, want 0644", dst, got)
+		}
+	}
+
+	configPath := filepath.Join(tmpDir, "etc", "plexd", "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", configPath, err)
+	}
+	var parsed struct {
+		API struct {
+			TLSCAFile string `yaml:"tls_ca_file"`
+		} `yaml:"api"`
+	}
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("yaml.Unmarshal(%s) = %v, got:\n%s", configPath, err, data)
+	}
+	if parsed.API.TLSCAFile != dst {
+		t.Errorf("api.tls_ca_file = %q, want %q", parsed.API.TLSCAFile, dst)
+	}
+}
+
+// An unusable --ca-file is refused before the first directory is created, so
+// the host is left as it was and no service is registered.
+func TestInstall_UnusableCAFileChangesNothing(t *testing.T) {
+	keyOnly := func(t *testing.T) string {
+		t.Helper()
+		_, key := newTestCA(t)
+		keyDER, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			t.Fatalf("x509.MarshalECPrivateKey() = %v", err)
+		}
+		return writeCAFixture(t, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	}
+	tests := []struct {
+		name    string
+		path    func(t *testing.T) string
+		wantErr func(path string) string
+		// notExist marks the read failure, whose message ends in the
+		// operating system's text, so only its prefix is compared.
+		notExist bool
+	}{
+		{
+			name:     "missing file",
+			path:     func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing-ca.pem") },
+			wantErr:  func(path string) string { return fmt.Sprintf("packaging: read CA file %q: ", path) },
+			notExist: true,
+		},
+		{
+			name:    "key without certificate",
+			path:    keyOnly,
+			wantErr: func(path string) string { return fmt.Sprintf("packaging: no certificate found in CA file %q", path) },
+		},
+		{
+			name: "certificate block that does not parse",
+			path: func(t *testing.T) string {
+				return writeCAFixture(t, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")}))
+			},
+			wantErr: func(path string) string { return fmt.Sprintf("packaging: no certificate found in CA file %q", path) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := tt.path(t)
+			root := &mockRootChecker{isRoot: true}
+			mgr := &mockServiceManager{available: true}
+			ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{CAFile: path}, mgr, root)
+
+			err := ins.Install()
+			if err == nil {
+				t.Fatal("Install() = nil, want an error for an unusable CA file")
+			}
+			want := tt.wantErr(path)
+			if tt.notExist {
+				if !strings.HasPrefix(err.Error(), want) {
+					t.Errorf("Install() error = %q, want prefix %q", err, want)
+				}
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("Install() error = %v, want os.ErrNotExist", err)
+				}
+			} else if err.Error() != want {
+				t.Errorf("Install() error = %q, want %q", err, want)
+			}
+
+			configDir := filepath.Join(tmpDir, "etc", "plexd")
+			if _, err := os.Stat(configDir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("Stat(%q) = %v, want os.ErrNotExist", configDir, err)
+			}
+			entries, readErr := os.ReadDir(tmpDir)
+			if readErr != nil {
+				t.Fatalf("ReadDir(%q) failed: %v", tmpDir, readErr)
+			}
+			if len(entries) != 0 {
+				t.Errorf("expected nothing created, found %d entries in %s", len(entries), tmpDir)
+			}
+			if len(mgr.registerCalls) != 0 {
+				t.Errorf("Register called %d times, want 0", len(mgr.registerCalls))
+			}
+		})
+	}
+}
+
+// The copy is world-readable, so a combined PEM must not carry its private
+// key into it. The key comes first to prove the walk goes on past a block it
+// skips.
+func TestInstall_CAFileDropsPrivateKey(t *testing.T) {
+	der, key := newTestCA(t)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("x509.MarshalECPrivateKey() = %v", err)
+	}
+	combined := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	combined = append(combined, certPEM(der)...)
+	src := writeCAFixture(t, combined)
+
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{CAFile: src}, mgr, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	dst := filepath.Join(tmpDir, "etc", "plexd", InstalledCAFileName)
+	assertOneCertificate(t, dst, der)
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", dst, err)
+	}
+	if bytes.Contains(data, []byte("PRIVATE KEY")) {
+		t.Errorf("%s contains a private key:\n%s", dst, data)
+	}
+}
+
+// TestInstall_CAFileStripsPEMHeaders installs a certificate whose PEM block
+// carries a header. plexd reads the copy with AppendCertsFromPEM, which skips
+// a block with headers, so a copy that kept the header would hold a
+// certificate install accepted and plexd never trusts.
+func TestInstall_CAFileStripsPEMHeaders(t *testing.T) {
+	der, _ := newTestCA(t)
+	headered := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Headers: map[string]string{"Comment": "lab"}, Bytes: der})
+	src := writeCAFixture(t, headered)
+
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{CAFile: src}, mgr, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	dst := filepath.Join(tmpDir, "etc", "plexd", InstalledCAFileName)
+	assertOneCertificate(t, dst, der)
+	if blocks := pemBlocks(t, dst); len(blocks[0].Headers) != 0 {
+		t.Errorf("%s keeps the PEM headers %v", dst, blocks[0].Headers)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", dst, err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(data) {
+		t.Errorf("AppendCertsFromPEM(%s) = false, want the certificate plexd trusts:\n%s", dst, data)
+	}
+}
+
+func TestInstall_CAFileWriteFails(t *testing.T) {
+	der, _ := newTestCA(t)
+	src := writeCAFixture(t, certPEM(der))
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{CAFile: src}, mgr, root)
+
+	dst := filepath.Join(tmpDir, "etc", "plexd", InstalledCAFileName)
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v", dst, err)
+	}
+
+	err := ins.Install()
+	if err == nil {
+		t.Fatal("Install() = nil, want an error for a CA destination that is a directory")
+	}
+	if want := "packaging: write CA file:"; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("Install() error = %q, want prefix %q", err, want)
+	}
+}
+
+func TestInstall_WithoutCAFile(t *testing.T) {
+	systemd := &mockSystemdController{available: true}
+	root := &mockRootChecker{isRoot: true}
+	ins, tmpDir := newTestInstaller(t, InstallConfig{}, systemd, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	dst := filepath.Join(tmpDir, "etc", "plexd", InstalledCAFileName)
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(%q) = %v, want os.ErrNotExist", dst, err)
+	}
+	configPath := filepath.Join(tmpDir, "etc", "plexd", "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", configPath, err)
+	}
+	if bytes.Contains(data, []byte("tls_ca_file")) {
+		t.Errorf("config names tls_ca_file without a CA file, got:\n%s", data)
+	}
+}
+
+// The installer never edits an operator's config.yaml. It still installs the
+// bundle and warns that the config does not name it.
+func TestInstall_CAFileOverExistingConfig(t *testing.T) {
+	der, _ := newTestCA(t)
+	src := writeCAFixture(t, certPEM(der))
+	logs := &logCapture{}
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	tmpDir := t.TempDir()
+	cfg := remapUnderTemp(InstallConfig{CAFile: src}, tmpDir)
+	ins := NewInstaller(cfg, mgr, root, slog.New(logs))
+
+	configDir := filepath.Join(tmpDir, "etc", "plexd")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v", configDir, err)
+	}
+	configPath := filepath.Join(configDir, "config.yaml")
+	existingContent := "# my custom config\napi:\n  base_url: https://custom.example.com\n"
+	if err := os.WriteFile(configPath, []byte(existingContent), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) = %v", configPath, err)
+	}
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", configPath, err)
+	}
+	if string(data) != existingContent {
+		t.Errorf("config was changed, got:\n%s\nwant:\n%s", data, existingContent)
+	}
+	dst := filepath.Join(configDir, InstalledCAFileName)
+	assertOneCertificate(t, dst, der)
+
+	if got := logs.find("existing config preserved"); len(got) != 1 {
+		t.Errorf("logged %d \"existing config preserved\" lines, want 1", len(got))
+	}
+	warns := logs.find("existing config preserved, api.tls_ca_file not written")
+	if len(warns) != 1 {
+		t.Fatalf("logged %d \"existing config preserved, api.tls_ca_file not written\" lines, want 1", len(warns))
+	}
+	if warns[0].level != slog.LevelWarn {
+		t.Errorf("level = %v, want %v", warns[0].level, slog.LevelWarn)
+	}
+	if got := warns[0].attrs["path"]; got != configPath {
+		t.Errorf("path = %q, want %q", got, configPath)
+	}
+	if got := warns[0].attrs["tls_ca_file"]; got != dst {
+		t.Errorf("tls_ca_file = %q, want %q", got, dst)
+	}
+}
+
+// Passing the installed copy as --ca-file on a re-run must not truncate it:
+// the bytes are read before anything is written.
+func TestInstall_CAFileSameSourceAndDestination(t *testing.T) {
+	der, _ := newTestCA(t)
+	src := writeCAFixture(t, certPEM(der))
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{CAFile: src}, mgr, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("first Install() = %v", err)
+	}
+	dst := filepath.Join(tmpDir, "etc", "plexd", InstalledCAFileName)
+	before, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", dst, err)
+	}
+
+	cfg := ins.cfg
+	cfg.CAFile = dst
+	if err := NewInstaller(cfg, mgr, root, testLogger()).Install(); err != nil {
+		t.Fatalf("second Install() = %v", err)
+	}
+
+	after, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", dst, err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Errorf("%s changed on re-install, got:\n%s\nwant:\n%s", dst, after, before)
+	}
+}
+
+// A plain uninstall keeps config.yaml, which names the bundle, so the bundle
+// stays too; --purge takes it with the config directory.
+func TestUninstall_CAFileKeptUntilPurge(t *testing.T) {
+	der, _ := newTestCA(t)
+	src := writeCAFixture(t, certPEM(der))
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true, registered: true}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{CAFile: src}, mgr, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+	configDir := filepath.Join(tmpDir, "etc", "plexd")
+	dst := filepath.Join(configDir, InstalledCAFileName)
+
+	if err := ins.Uninstall(false); err != nil {
+		t.Fatalf("Uninstall(false) = %v", err)
+	}
+	if _, err := os.Stat(dst); err != nil {
+		t.Errorf("Stat(%q) = %v, want the CA file kept after a plain uninstall", dst, err)
+	}
+
+	if err := ins.Uninstall(true); err != nil {
+		t.Fatalf("Uninstall(true) = %v", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(%q) = %v, want os.ErrNotExist after purge", dst, err)
+	}
+	if _, err := os.Stat(configDir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(%q) = %v, want os.ErrNotExist after purge", configDir, err)
 	}
 }

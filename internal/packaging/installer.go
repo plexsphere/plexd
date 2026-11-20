@@ -1,6 +1,8 @@
 package packaging
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -51,7 +53,14 @@ func (ins *Installer) Install() error {
 		return fmt.Errorf("packaging: %s is not available", ins.mgr.Name())
 	}
 
-	// 3. Create directories. LogDir is empty wherever the service manager
+	// 3. Read the CA bundle before anything is written, so an unusable
+	// --ca-file leaves the host as it was.
+	caPEM, err := ins.readCAFile()
+	if err != nil {
+		return err
+	}
+
+	// 4. Create directories. LogDir is empty wherever the service manager
 	// keeps the logs itself, and then there is nothing to create. The hooks
 	// directory is created here because plexd cannot create it under its
 	// systemd unit, which keeps /etc read-only; the hook watcher only needs
@@ -72,31 +81,45 @@ func (ins *Installer) Install() error {
 		ins.logger.Info("directory created", "path", d.path, "perm", fmt.Sprintf("%04o", d.perm))
 	}
 
-	// 4. Copy binary
+	// 5. Copy binary
 	if err := ins.copyBinary(); err != nil {
 		return err
 	}
 
-	// 5. Write default config if absent
+	// 6. Write default config if absent. An existing one is the operator's
+	// and is never edited, so a CA bundle given now is installed but not
+	// named in it.
 	configPath := filepath.Join(ins.cfg.ConfigDir, "config.yaml")
+	var caDst string
+	if caPEM != nil {
+		caDst = filepath.Join(ins.cfg.ConfigDir, InstalledCAFileName)
+	}
 	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
-		content := GenerateDefaultConfig(ins.cfg.APIBaseURL)
+		content := GenerateDefaultConfig(ins.cfg.APIBaseURL, caDst)
 		if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("packaging: write config: %w", err)
 		}
 		ins.logger.Info("default config written", "path", configPath)
 	} else if err == nil {
 		ins.logger.Info("existing config preserved", "path", configPath)
+		if caDst != "" {
+			ins.logger.Warn("existing config preserved, api.tls_ca_file not written", "path", configPath, "tls_ca_file", caDst)
+		}
 	} else {
 		return fmt.Errorf("packaging: stat config: %w", err)
 	}
 
-	// 6. Write bootstrap token if provided
+	// 7. Install the CA bundle if provided
+	if err := ins.writeCAFile(caPEM); err != nil {
+		return err
+	}
+
+	// 8. Write bootstrap token if provided
 	if err := ins.writeToken(); err != nil {
 		return err
 	}
 
-	// 7. Register the service. The manager never starts it: --api-url is
+	// 9. Register the service. The manager never starts it: --api-url is
 	// optional, so an install can legitimately precede a usable configuration.
 	// Every manager already prefixes its errors with "packaging:".
 	return ins.mgr.Register(ins.cfg)
@@ -184,6 +207,59 @@ func (ins *Installer) copyBinary() error {
 	}
 
 	ins.logger.Info("binary installed", "src", srcPath, "dst", dstPath)
+	return nil
+}
+
+// readCAFile reads the bundle named by CAFile and returns only its
+// certificates, each re-encoded as PEM. The copy is world-readable, so a
+// combined PEM that also holds a private key must not carry the key into it.
+// A certificate is re-encoded without the PEM headers its block may carry:
+// plexd reads the copy with x509.CertPool.AppendCertsFromPEM, which skips a
+// block that has headers, so an accepted certificate would otherwise be one
+// plexd never trusts. An empty CAFile returns nil and no error.
+func (ins *Installer) readCAFile() ([]byte, error) {
+	path := ins.cfg.CAFile
+	if path == "" {
+		return nil, nil
+	}
+	rest, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("packaging: read CA file %q: %w", path, err)
+	}
+
+	var certs []byte
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			continue
+		}
+		certs = append(certs, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes})...)
+	}
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("packaging: no certificate found in CA file %q", path)
+	}
+	return certs, nil
+}
+
+// writeCAFile writes the bundle readCAFile returned into the config directory.
+// It needs no check for a CAFile that already names the destination: the
+// bytes were read before anything was written. A nil pem writes nothing.
+func (ins *Installer) writeCAFile(pem []byte) error {
+	if pem == nil {
+		return nil
+	}
+	dst := filepath.Join(ins.cfg.ConfigDir, InstalledCAFileName)
+	if err := os.WriteFile(dst, pem, 0o644); err != nil {
+		return fmt.Errorf("packaging: write CA file: %w", err)
+	}
+	ins.logger.Info("CA bundle installed", "src", ins.cfg.CAFile, "dst", dst)
 	return nil
 }
 

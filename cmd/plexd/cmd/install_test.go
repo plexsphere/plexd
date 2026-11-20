@@ -25,6 +25,7 @@ func TestInstallCommand_Flags(t *testing.T) {
 		{"api-url", "control plane API URL"},
 		{"token", "bootstrap token value"},
 		{"token-file", "path to bootstrap token file"},
+		{"ca-file", "path to a PEM CA bundle plexd trusts for the control plane"},
 	}
 	for _, tt := range tests {
 		f := installCmd.Flags().Lookup(tt.flag)
