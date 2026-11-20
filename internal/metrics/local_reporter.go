@@ -3,7 +3,6 @@ package metrics
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -50,13 +49,19 @@ type LocalReporter struct {
 	fetchedAt   time.Time
 }
 
-// NewLocalReporter creates a LocalReporter from the given configuration.
-func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter {
+// NewLocalReporter creates a LocalReporter from the given configuration. A
+// tls_ca_file is read here, once, so a changed file takes effect only with a
+// new reporter. TLS options that cannot be used, such as a missing or
+// certificate-less CA file, return an error instead of a reporter that would
+// fail every send.
+func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) (*LocalReporter, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if cfg.TLSInsecureSkipVerify {
-		transport.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true, //nolint:gosec // user-configured opt-in
-		}
+	tlsCfg, err := cfg.TLSClientConfig(logger)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: local endpoint: %w", err)
+	}
+	if tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
 	}
 
 	return &LocalReporter{
@@ -71,7 +76,7 @@ func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []
 		nodeID:    nodeID,
 		logger:    logger,
 		cacheTTL:  defaultCacheTTL,
-	}
+	}, nil
 }
 
 // ReportMetrics posts the metric batch as JSON to the configured local

@@ -1307,9 +1307,13 @@ func runAgent(ctx context.Context) error {
 
 	var metricsReporter metrics.MetricsReporter = metrics.NewPlatformReporter(client, logger)
 	if cfg.Metrics.LocalEndpoint.URL != "" {
-		localMetrics := metrics.NewLocalReporter(cfg.Metrics.LocalEndpoint, client, nsk, identity.NodeID, logger)
+		localMetrics, err := metrics.NewLocalReporter(cfg.Metrics.LocalEndpoint, client, nsk, identity.NodeID, logger)
+		if err != nil {
+			return fmt.Errorf("plexd up: %w", err)
+		}
 		metricsReporter = metrics.NewMultiReporter(metricsReporter, localMetrics, logger)
-		logger.Info("local endpoint enabled", "pipeline", "metrics", "url", cfg.Metrics.LocalEndpoint.URL)
+		logger.Info("local endpoint enabled", "pipeline", "metrics", "url", cfg.Metrics.LocalEndpoint.URL,
+			"tls_ca_file", cfg.Metrics.LocalEndpoint.TLSCAFile)
 	}
 	metricsMgr := metrics.NewManager(cfg.Metrics, metricsCollectors, metricsReporter, identity.NodeID, logger)
 
@@ -1331,9 +1335,13 @@ func runAgent(ctx context.Context) error {
 	}
 	var logReporter logfwd.LogReporter = logfwd.NewPlatformReporter(client, logger)
 	if cfg.LogFwd.LocalEndpoint.URL != "" {
-		localLogs := logfwd.NewLocalReporter(cfg.LogFwd.LocalEndpoint, client, nsk, identity.NodeID, logger)
+		localLogs, err := logfwd.NewLocalReporter(cfg.LogFwd.LocalEndpoint, client, nsk, identity.NodeID, logger)
+		if err != nil {
+			return fmt.Errorf("plexd up: %w", err)
+		}
 		logReporter = logfwd.NewMultiReporter(logReporter, localLogs, logger)
-		logger.Info("local endpoint enabled", "pipeline", "logfwd", "url", cfg.LogFwd.LocalEndpoint.URL)
+		logger.Info("local endpoint enabled", "pipeline", "logfwd", "url", cfg.LogFwd.LocalEndpoint.URL,
+			"tls_ca_file", cfg.LogFwd.LocalEndpoint.TLSCAFile)
 	}
 	logForwarder := logfwd.NewForwarder(cfg.LogFwd, logSources, logReporter, identity.NodeID, hostname, logger)
 	logForwarder.SetRingBuffer(logRingBuffer)
@@ -1343,9 +1351,13 @@ func runAgent(ctx context.Context) error {
 	auditSources = append(auditSources, auditfwd.NewProcessSource(hostname))
 	var auditReporter auditfwd.AuditReporter = auditfwd.NewPlatformReporter(client, logger)
 	if cfg.AuditFwd.LocalEndpoint.URL != "" {
-		localAudit := auditfwd.NewLocalReporter(cfg.AuditFwd.LocalEndpoint, client, nsk, identity.NodeID, logger)
+		localAudit, err := auditfwd.NewLocalReporter(cfg.AuditFwd.LocalEndpoint, client, nsk, identity.NodeID, logger)
+		if err != nil {
+			return fmt.Errorf("plexd up: %w", err)
+		}
 		auditReporter = auditfwd.NewMultiReporter(auditReporter, localAudit, logger)
-		logger.Info("local endpoint enabled", "pipeline", "auditfwd", "url", cfg.AuditFwd.LocalEndpoint.URL)
+		logger.Info("local endpoint enabled", "pipeline", "auditfwd", "url", cfg.AuditFwd.LocalEndpoint.URL,
+			"tls_ca_file", cfg.AuditFwd.LocalEndpoint.TLSCAFile)
 	}
 	auditForwarder := auditfwd.NewForwarder(cfg.AuditFwd, auditSources, auditReporter, identity.NodeID, hostname, logger)
 

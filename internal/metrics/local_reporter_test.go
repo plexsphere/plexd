@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/tlstest"
 )
 
 // ---------------------------------------------------------------------------
@@ -89,7 +92,7 @@ func newTestReporter(t *testing.T, handler http.Handler, fetcher SecretFetcher) 
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	r := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	r := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	// Use the TLS test server's client so certificates are trusted.
 	r.httpClient = srv.Client()
 	return srv, r
@@ -559,7 +562,7 @@ func TestLocalReporter_TLSInsecureSkipVerify(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	rInsecure := NewLocalReporter(cfgInsecure, fetcher, nsk, "node-1", discardLogger())
+	rInsecure := mustNewLocalReporter(t, cfgInsecure, fetcher, nsk, "node-1", discardLogger())
 	if err := rInsecure.ReportMetrics(context.Background(), "node-1", batch); err != nil {
 		t.Fatalf("InsecureSkipVerify=true failed: %v", err)
 	}
@@ -571,7 +574,7 @@ func TestLocalReporter_TLSInsecureSkipVerify(t *testing.T) {
 		TLSInsecureSkipVerify: false,
 	}
 	fetcher2 := newTestFetcher("tls-tok")
-	rSecure := NewLocalReporter(cfgSecure, fetcher2, nsk, "node-1", discardLogger())
+	rSecure := mustNewLocalReporter(t, cfgSecure, fetcher2, nsk, "node-1", discardLogger())
 	err := rSecure.ReportMetrics(context.Background(), "node-1", batch)
 	if err == nil {
 		t.Fatal("expected TLS error with InsecureSkipVerify=false against self-signed cert")
@@ -609,7 +612,7 @@ func TestLocalReporter_RequestTimeout(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	reporter.httpClient.Timeout = 50 * time.Millisecond
 
 	batch := api.MetricBatch{
@@ -883,7 +886,7 @@ func TestLocalReporter_ServerClosesConnectionMidResponse(t *testing.T) {
 		URL:       "http://" + ln.Addr().String(),
 		SecretKey: "metrics-token",
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 
 	batch := api.MetricBatch{
 		{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)},
@@ -1150,5 +1153,82 @@ func TestLocalReporter_KeepsCachedCredentialOnNonRevocationFetchError(t *testing
 				t.Errorf("%q records = %d, want 0", "dropping revoked credential", n)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Trusted CA file
+// ---------------------------------------------------------------------------
+
+// The server sends only a leaf the test CA signed, so the batch arrives only
+// when the reporter's own client trusts that CA through tls_ca_file. The test
+// keeps that client: srv.Client() would trust the leaf directly.
+func TestLocalReporter_TrustsCAFile(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	var posts atomic.Int32
+	srv := ca.Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "metrics-token", TLSCAFile: ca.File()}
+	reporter := mustNewLocalReporter(t, cfg, newTestFetcher("ca-tok"), testNSK(), "node-1", discardLogger())
+
+	batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+	if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+		t.Fatalf("ReportMetrics() against a server of the file's CA: %v", err)
+	}
+	if n := posts.Load(); n != 1 {
+		t.Errorf("POSTs = %d, want 1", n)
+	}
+}
+
+// The file adds one CA to the trusted roots; it does not make the reporter
+// accept any certificate, so a server of another CA fails the handshake before
+// a request reaches it.
+func TestLocalReporter_CAFileRejectsOtherCA(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	other := tlstest.NewCA(t)
+	var requests atomic.Int32
+	srv := other.Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "metrics-token", TLSCAFile: ca.File()}
+	reporter := mustNewLocalReporter(t, cfg, newTestFetcher("ca-tok"), testNSK(), "node-1", discardLogger())
+
+	batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+	err := reporter.ReportMetrics(context.Background(), "node-1", batch)
+	if err == nil {
+		t.Fatal("ReportMetrics() against a server of another CA = nil, want a verification error")
+	}
+	var unknown x509.UnknownAuthorityError
+	if !errors.As(err, &unknown) {
+		t.Errorf("errors.As(err, x509.UnknownAuthorityError) = false; err = %v", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+}
+
+// A missing file fails the constructor rather than every later send, with an
+// error that names the key and the file.
+func TestNewLocalReporter_MissingCAFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	cfg := api.LocalEndpointConfig{URL: "https://127.0.0.1:1", SecretKey: "metrics-token", TLSCAFile: missing}
+
+	reporter, err := NewLocalReporter(cfg, newTestFetcher("ca-tok"), testNSK(), "node-1", discardLogger())
+	if reporter != nil {
+		t.Errorf("NewLocalReporter() reporter = %p, want nil", reporter)
+	}
+	const prefix = "metrics: local endpoint: tls_ca_file:"
+	if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("NewLocalReporter() error = %v, want prefix %q", err, prefix)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("NewLocalReporter() error = %q, want the path %q", err, missing)
 	}
 }

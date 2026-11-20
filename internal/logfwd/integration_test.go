@@ -118,7 +118,7 @@ func TestIntegration_DualDelivery_BothReceiveSameLogBatch(t *testing.T) {
 		SecretKey:             "logs-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 
 	multi := NewMultiReporter(platform, local, discardLogger())
@@ -191,7 +191,7 @@ func TestIntegration_DualDelivery_CredentialResolution(t *testing.T) {
 		SecretKey:             "logs-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 
 	multi := NewMultiReporter(platform, local, discardLogger())
@@ -236,7 +236,7 @@ func TestIntegration_LocalDown_PlatformReceivesLogs(t *testing.T) {
 		SecretKey:             "logs-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 	multi := NewMultiReporter(platform, local, discardLogger())
 
@@ -265,7 +265,7 @@ func TestIntegration_CredentialFailure_LogFwd(t *testing.T) {
 		SecretKey:             "logs-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	multi := NewMultiReporter(platform, local, discardLogger())
 
 	batch := makeLogEntries(2)
@@ -299,7 +299,7 @@ func TestIntegration_TLSSkipVerify_LogFwd(t *testing.T) {
 		SecretKey:             "logs-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 
 	batch := makeLogEntries(1)
 	err := local.ReportLogs(context.Background(), "node-1", batch)
@@ -329,7 +329,7 @@ func TestIntegration_TLSStrictVerify_LogFwd(t *testing.T) {
 		SecretKey:             "logs-token",
 		TLSInsecureSkipVerify: false,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	multi := NewMultiReporter(platform, local, discardLogger())
 
 	batch := makeLogEntries(1)

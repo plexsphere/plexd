@@ -101,7 +101,7 @@ func TestIntegration_DualDelivery_BothReceiveSameBatch(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 
 	// Wrap in MultiReporter.
@@ -180,7 +180,7 @@ func TestIntegration_DualDelivery_CredentialResolution(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 
 	multi := NewMultiReporter(platform, local, discardLogger())
@@ -274,7 +274,7 @@ func TestIntegration_ConditionalWiring_Pattern(t *testing.T) {
 	}
 	var reporter1 MetricsReporter = platform
 	if cfgWithURL.URL != "" {
-		localMetrics := NewLocalReporter(cfgWithURL, newTestFetcher("tok"), nsk, "node-1", discardLogger())
+		localMetrics := mustNewLocalReporter(t, cfgWithURL, newTestFetcher("tok"), nsk, "node-1", discardLogger())
 		localMetrics.httpClient = localSrv.Client()
 		reporter1 = NewMultiReporter(platform, localMetrics, discardLogger())
 	}
@@ -316,7 +316,7 @@ func TestIntegration_LocalDown_PlatformUnaffected(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 
 	multi := NewMultiReporter(platform, local, discardLogger())
@@ -354,7 +354,7 @@ func TestIntegration_LocalHTTP500_PlatformUnaffected(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	local.httpClient = localSrv.Client()
 	multi := NewMultiReporter(platform, local, discardLogger())
 
@@ -401,7 +401,7 @@ func TestIntegration_CredentialFailure_PlatformStillReceives(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 
 	multi := NewMultiReporter(platform, local, discardLogger())
 
@@ -436,7 +436,7 @@ func TestIntegration_TLSSkipVerify_SelfSignedSucceeds(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: true,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 
 	batch := testPoints(GroupSystem, 1)
 	err := local.ReportMetrics(context.Background(), "node-1", batch)
@@ -466,7 +466,7 @@ func TestIntegration_TLSStrictVerify_SelfSignedFails(t *testing.T) {
 		SecretKey:             "metrics-token",
 		TLSInsecureSkipVerify: false,
 	}
-	local := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	local := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 
 	multi := NewMultiReporter(platform, local, discardLogger())
 
