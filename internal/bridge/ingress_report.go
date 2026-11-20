@@ -22,6 +22,15 @@ type IngressRuleReport struct {
 	// Targets holds the target entries of a rule that listens, in the order
 	// of the rule's targets (see RuleReports); nil when the rule has none.
 	Targets []IngressTargetReport
+	// ClientAuthEnforced is set for a rule that listens and whose pull entry
+	// carries client_auth: the bridge verifies every client of the rule, or
+	// serves none of them (client_ca_invalid).
+	ClientAuthEnforced bool
+	// ClientRefusals holds the last refusal per reason of such a rule, in the
+	// order no_certificate, unknown_authority, certificate_expired,
+	// certificate_invalid; nil before the first refusal and for every other
+	// rule.
+	ClientRefusals []IngressClientRefusalReport
 }
 
 // IngressClientRefusalReport is the last client the bridge refused for one
@@ -73,6 +82,14 @@ type IngressTargetReport struct {
 // does not listen has no target entries, and neither has a rule whose pull
 // entry carried no targets, as a control plane before
 // plexsphere/plexsphere#1120 sends it: that control plane refuses the member.
+//
+// A rule that listens and whose pull entry carries client_auth reads
+// ClientAuthEnforced, also with client_ca_invalid, since it then serves no
+// client, and its refusals: the last client the bridge refused per reason
+// since the last Apply that changed the rule's ca_bundle text, or since
+// Setup. A rule that does not listen and a rule without client_auth carry
+// neither, so a control plane that predates the two members, whose pull
+// carries no client_auth, never receives them.
 func (m *IngressManager) RuleReports() []IngressRuleReport {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -113,6 +130,10 @@ func (m *IngressManager) ruleReportLocked(st IngressRuleState) IngressRuleReport
 	}
 
 	r.Listener = api.IngressListenerListening
+	if st.Rule.ClientAuth != nil {
+		r.ClientAuthEnforced = true
+		r.ClientRefusals = m.refusals[st.Rule.ID].snapshot()
+	}
 	switch st.Rule.Mode {
 	case api.IngressModePassthrough:
 		r.Certificate = api.IngressCertificateNotRequired
@@ -192,9 +213,11 @@ func dialFacet(rec dialRecord) (dial, reason string, at time.Time) {
 // when what RuleReports returns may have changed: at the end of every Apply,
 // every certificate load and Teardown, when the ACME manager reports a change
 // of its issued hosts, and when the record of a rule's last unit or of the
-// last dial to one of its targets changes its outcome or reason. Several
-// signals before the reader wakes collapse into one. The signals are liberal;
-// the reader compares before it acts.
+// last dial to one of its targets changes its outcome or reason. A change of
+// a rule's ClientAuthEnforced comes with an Apply. A refused client signals
+// nothing: its refusal rides the next tick. Several signals before the reader
+// wakes collapse into one. The signals are liberal; the reader compares before
+// it acts.
 func (m *IngressManager) ReportChanged() <-chan struct{} {
 	return m.changed
 }

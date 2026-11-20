@@ -30,11 +30,13 @@ const ingressStatusChangeGap = 5 * time.Second
 // the bridge's local configuration serves public ingress, enabled or
 // opted_out when bridge.ingress_enabled is false, and on an enabled bridge
 // one entry per ingress rule as the ingress manager reports it: its listener,
-// its certificate, how its last unit ended and the last dial to each of its
-// targets. It sends once when it starts, again when the entries change, and
-// once per interval. The control plane keeps the latest state per node and
-// refuses ingress rule creates and updates on a bridge whose report reads
-// opted_out; each report replaces the rule entries of the one before.
+// its certificate, how its last unit ended, the last dial to each of its
+// targets and, on a rule with client_auth, that the bridge verifies its
+// clients and the last client it refused per reason. It sends once when it
+// starts, again when the entries change, and once per interval. The control
+// plane keeps the latest state per node and refuses ingress rule creates and
+// updates on a bridge whose report reads opted_out; each report replaces the
+// rule entries of the one before.
 //
 // DECISION: the reporter sends at once when it starts, without waiting for a
 // pull. The state comes from the local configuration and is known before the
@@ -46,13 +48,15 @@ const ingressStatusChangeGap = 5 * time.Second
 //
 // DECISION: a change sends only when its entries differ from those of the
 // last accepted report, the dial ages of the rule entries and of their target
-// entries ignored, and at most once per ingressStatusChangeGap; a change
-// inside the gap is sent when the gap ends, with the entries as they are
-// then. Dial outcomes follow public connections, so without the bound a
-// target that alternates between failing and answering would cost one
-// request per flip. An on-change send restarts the interval, as the relay
-// status reporter's does. A moving dial age alone, of a rule or of a target,
-// sends nothing; the tick carries it.
+// entries and the client refusals ignored, and at most once per
+// ingressStatusChangeGap; a change inside the gap is sent when the gap ends,
+// with the entries as they are then. Dial outcomes follow public connections,
+// so without the bound a target that alternates between failing and
+// answering would cost one request per flip. An on-change send restarts the
+// interval, as the relay status reporter's does. A moving dial age alone, of
+// a rule or of a target, sends nothing, and neither does a refused client or
+// the age of a refusal, as the contract requires, since a public port draws
+// scanners; the tick carries them. A change of client_auth_enforced sends.
 //
 // DECISION: a failed send is never retried within its tick. The last
 // accepted report stays what it was, so the next tick, or the next change,
@@ -220,10 +224,13 @@ func (r *IngressStatusReporter) build() api.IngressStatusRequest {
 }
 
 // sameAsAccepted reports whether req carries the entries of the last accepted
-// report, the dial ages of the rules and of their targets ignored.
+// report, the dial ages of the rules and of their targets and the client
+// refusals ignored, so a refusal alone rides the next tick, while a change of
+// client_auth_enforced counts.
 func (r *IngressStatusReporter) sameAsAccepted(req api.IngressStatusRequest) bool {
 	return r.reported && slices.EqualFunc(req.Rules, r.accepted, func(a, b api.IngressStatusRule) bool {
 		a.DialAgeSeconds, b.DialAgeSeconds = nil, nil
+		a.ClientRefusals, b.ClientRefusals = nil, nil
 		a.Targets, b.Targets = targetsWithoutAges(a.Targets), targetsWithoutAges(b.Targets)
 		return reflect.DeepEqual(a, b)
 	})
@@ -245,8 +252,10 @@ func targetsWithoutAges(targets []api.IngressStatusTarget) []api.IngressStatusTa
 // buildIngressStatusRequest turns the state and the rule reports into the
 // report body at now. It returns the state alone for opted_out and for no
 // reports, and otherwise maps the first api.MaxIngressStatusRules reports in
-// order, each with its target entries in order. The DialAgeSeconds of a rule
-// entry and of a target entry is set by one rule (see dialAgeSeconds).
+// order, each with its target entries and its client refusals in order. The
+// DialAgeSeconds of a rule entry and of a target entry is set by one rule
+// (see dialAgeSeconds), and the AgeSeconds of a refusal by the same clock
+// (see ageSeconds).
 func buildIngressStatusRequest(state string, reports []IngressRuleReport, now time.Time) api.IngressStatusRequest {
 	req := api.IngressStatusRequest{State: state}
 	if state == api.IngressStateOptedOut || len(reports) == 0 {
@@ -264,6 +273,8 @@ func buildIngressStatusRequest(state string, reports []IngressRuleReport, now ti
 			Dial:              rep.Dial,
 			DialReason:        rep.DialReason,
 			DialAgeSeconds:    dialAgeSeconds(rep.Dial, rep.DialAt, now),
+
+			ClientAuthEnforced: rep.ClientAuthEnforced,
 		}
 		if len(rep.Targets) > 0 {
 			entry.Targets = make([]api.IngressStatusTarget, len(rep.Targets))
@@ -277,6 +288,12 @@ func buildIngressStatusRequest(state string, reports []IngressRuleReport, now ti
 				}
 			}
 		}
+		if len(rep.ClientRefusals) > 0 {
+			entry.ClientRefusals = make([]api.IngressStatusClientRefusal, len(rep.ClientRefusals))
+			for j, c := range rep.ClientRefusals {
+				entry.ClientRefusals[j] = api.IngressStatusClientRefusal{Reason: c.Reason, AgeSeconds: ageSeconds(c.At, now)}
+			}
+		}
 		req.Rules[i] = entry
 	}
 	return req
@@ -284,17 +301,24 @@ func buildIngressStatusRequest(state string, reports []IngressRuleReport, now ti
 
 // dialAgeSeconds returns the dial_age_seconds of a dial whose outcome is dial
 // and whose time is at, in a report sent at now. It is nil unless dial is
-// succeeded or failed, and otherwise now minus at in whole seconds, floored,
-// clamped to 0 when at postdates now and to
-// api.MaxIngressStatusDialAgeSeconds above it.
+// succeeded or failed, and otherwise ageSeconds of at.
 func dialAgeSeconds(dial string, at, now time.Time) *int64 {
 	if dial != api.IngressDialSucceeded && dial != api.IngressDialFailed {
 		return nil
 	}
+	secs := ageSeconds(at, now)
+	return &secs
+}
+
+// ageSeconds returns the age of an event at at in a report sent at now: now
+// minus at in whole seconds, floored, clamped to 0 when at postdates now and
+// to the largest signed 32-bit integer above it, the ceiling of
+// api.MaxIngressStatusDialAgeSeconds and of
+// api.MaxIngressStatusRefusalAgeSeconds alike.
+func ageSeconds(at, now time.Time) int64 {
 	// Integer division floors here because the clamped age is not negative.
 	secs := int64(max(now.Sub(at), 0) / time.Second)
-	secs = min(secs, api.MaxIngressStatusDialAgeSeconds)
-	return &secs
+	return min(secs, api.MaxIngressStatusDialAgeSeconds, api.MaxIngressStatusRefusalAgeSeconds)
 }
 
 // reportOnce sends the report as it is now once.

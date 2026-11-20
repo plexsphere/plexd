@@ -22,11 +22,11 @@ const testIngressStatusNSK = "test-nsk"
 // PUT /v1/nodes/{node_id}/ingress-status with the gates the contract,
 // plexsphere/plexsphere docs/reference/api/plexd-agent-contract.md, puts on
 // it: the NSK bearer, the node, a 2 MiB body cap, a strict decode that
-// refuses unknown members of the report, of each rule entry and of each
-// target entry, a member of the wrong type, and data after the report, and a
-// state that is present and one of the two the contract names. It answers
-// 200 with its own receive time as accepted_at and records the body, and
-// counts every 400 it answers.
+// refuses unknown members of the report, of each rule entry, of each target
+// entry and of each refusal entry, a member of the wrong type, and data after
+// the report, and a state that is present and one of the two the contract
+// names. It answers 200 with its own receive time as accepted_at and records
+// the body, and counts every 400 it answers.
 type ingressStatusControlPlane struct {
 	srv      *httptest.Server
 	client   *api.ControlPlane
@@ -44,17 +44,20 @@ type ingressStatusWire struct {
 }
 
 // ingressStatusWireRule is one rule entry as the control plane decodes it. A
-// dial_age_seconds that is not an integer fails the decode.
+// dial_age_seconds that is not an integer, and a client_auth_enforced that is
+// not a boolean, fail the decode.
 type ingressStatusWireRule struct {
-	ID                *string                    `json:"id"`
-	Listener          *string                    `json:"listener"`
-	ListenerReason    *string                    `json:"listener_reason"`
-	Certificate       *string                    `json:"certificate"`
-	CertificateReason *string                    `json:"certificate_reason"`
-	Dial              *string                    `json:"dial"`
-	DialReason        *string                    `json:"dial_reason"`
-	DialAgeSeconds    *int64                     `json:"dial_age_seconds"`
-	Targets           *[]ingressStatusWireTarget `json:"targets"`
+	ID                 *string                        `json:"id"`
+	Listener           *string                        `json:"listener"`
+	ListenerReason     *string                        `json:"listener_reason"`
+	Certificate        *string                        `json:"certificate"`
+	CertificateReason  *string                        `json:"certificate_reason"`
+	Dial               *string                        `json:"dial"`
+	DialReason         *string                        `json:"dial_reason"`
+	DialAgeSeconds     *int64                         `json:"dial_age_seconds"`
+	Targets            *[]ingressStatusWireTarget     `json:"targets"`
+	ClientAuthEnforced *bool                          `json:"client_auth_enforced"`
+	ClientRefusals     *[]repIngressStatusWireRefusal `json:"client_refusals"`
 }
 
 // ingressStatusWireTarget is one target entry of a rule entry as the control
@@ -66,6 +69,14 @@ type ingressStatusWireTarget struct {
 	Dial           *string `json:"dial"`
 	DialReason     *string `json:"dial_reason"`
 	DialAgeSeconds *int64  `json:"dial_age_seconds"`
+}
+
+// repIngressStatusWireRefusal is one refusal entry of a rule entry's
+// client_refusals as the control plane decodes it, every member a pointer as
+// in a rule entry. An age_seconds that is not an integer fails the decode.
+type repIngressStatusWireRefusal struct {
+	Reason     *string `json:"reason"`
+	AgeSeconds *int64  `json:"age_seconds"`
 }
 
 // maxIngressStatusWireBody is the contract's cap on a report body, 2 MiB.
@@ -126,9 +137,10 @@ func (cp *ingressStatusControlPlane) serve(w http.ResponseWriter, r *http.Reques
 
 // ingressStatusMalformed returns why the contract answers 400
 // malformed_ingress_status for body, or "" when it does not: a body that is not
-// one JSON object, an unknown member of the report, of a rule entry or of a
-// target entry, a member of the wrong type, data after the report, a missing
-// or null state, or a state that is neither enabled nor opted_out.
+// one JSON object, an unknown member of the report, of a rule entry, of a
+// target entry or of a refusal entry, a member of the wrong type, data after
+// the report, a missing or null state, or a state that is neither enabled nor
+// opted_out.
 func ingressStatusMalformed(body []byte) string {
 	report, err := decodeIngressStatusWire(body)
 	if err != nil {
@@ -226,6 +238,10 @@ func TestIngressStatusIntegration_ReportsBothStatesOverTheWire(t *testing.T) {
 			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","dial_age_seconds":1.5}]}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","targets":[{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":9000,"dial":"none","up":true}]}]}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","targets":[{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":9000,"dial":"succeeded","dial_age_seconds":1.5}]}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","client_auth_enforced":"yes"}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","client_auth_enforced":true,"client_refusals":{"reason":"no_certificate","age_seconds":1}}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","client_auth_enforced":true,"client_refusals":[{"reason":"no_certificate","age_seconds":1,"subject":"CN=client"}]}]}`, http.StatusBadRequest, "malformed_ingress_status"},
+			{`{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1a1","listener":"listening","dial":"none","client_auth_enforced":true,"client_refusals":[{"reason":"no_certificate","age_seconds":1.5}]}]}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled"}{}`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`["enabled"]`, http.StatusBadRequest, "malformed_ingress_status"},
 			{`{"state":"enabled"}` + strings.Repeat(" ", maxIngressStatusWireBody+1-len(`{"state":"enabled"}`)), http.StatusRequestEntityTooLarge, "ingress_status_body_too_large"},
@@ -387,5 +403,84 @@ func TestIngressStatusIntegration_ReportsTargetEntriesOverTheWire(t *testing.T) 
 	}
 	if got := str(rules[1].Dial); got != api.IngressDialNone {
 		t.Errorf("dial of the rule from a pull without targets = %s, want none", got)
+	}
+}
+
+// TestIngressStatusIntegration_ReportsClientAuthOverTheWire sends a manager's
+// report through the real client after two refused handshakes: the control
+// plane decodes client_auth_enforced and both refusals of the rule with
+// client_auth strictly, and receives neither member for a rule without it.
+func TestIngressStatusIntegration_ReportsClientAuthOverTheWire(t *testing.T) {
+	ca := newTestCA(t, "client-ca", nil)
+	stranger := newTestCA(t, "stranger-ca", nil).issue(t, "stranger", nil)
+	ctrl := newLoopbackIngressController(t)
+	fx, clock, dials := newDialLogFixture(t, ctrl)
+	fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+	authID, plainID := reportID("a1"), reportID("b2")
+	auth := withID(terminateRule("auth", 443, "t.example.com", "tls", 9000), authID)
+	withClientAuth(caBundle(ca))(&auth)
+	plain := withID(terminateRule("plain", 7443, "t.example.com", "tls", 9000), plainID)
+	if err := fx.mgr.Apply(t.Context(), rulesBlock(auth, plain)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// A client without a certificate at the start, one of another authority
+	// 2 s later.
+	repRefuse(t, ctrl.addr(443), "t.example.com", nil)
+	fx.logs.waitFor(t, repRefusedMsg, 1)
+	clock.Add(2 * time.Second)
+	repRefuse(t, ctrl.addr(443), "t.example.com", &stranger)
+	fx.logs.waitFor(t, repRefusedMsg, 2)
+	if got := dials.dialled(); len(got) != 0 {
+		t.Errorf("dials = %v, want none for refused clients", got)
+	}
+	drain(fx.mgr.ReportChanged())
+
+	cp := newIngressStatusControlPlane(t)
+	reporter := NewIngressStatusReporter(time.Hour, testIngressNodeID, cp.client, false, fx.mgr, discardLogger())
+	// The manager dates its refusals on the fixture's clock.
+	reporter.now = func() time.Time { return relayStart.Add(12500 * time.Millisecond) }
+	stop := startIngressStatusReporter(t, reporter)
+	var body string
+	select {
+	case body = <-cp.accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no report accepted within 2s")
+	}
+	stop()
+	cp.wantNoMore(t)
+
+	report, err := decodeIngressStatusWire([]byte(body))
+	if err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	if report.Rules == nil || len(*report.Rules) != 2 {
+		t.Fatalf("rules of %s, want two entries", body)
+	}
+	rules := *report.Rules
+	if e := rules[0].ClientAuthEnforced; e == nil || !*e {
+		t.Errorf("client_auth_enforced of the rule with client_auth in %s, want true", body)
+	}
+	if rules[0].ClientRefusals == nil || len(*rules[0].ClientRefusals) != 2 {
+		t.Fatalf("client_refusals of the rule with client_auth in %s, want two entries", body)
+	}
+	type refusal struct {
+		reason string
+		age    int64
+	}
+	want := []refusal{{IngressRefusalNoCertificate, 12}, {IngressRefusalUnknownAuthority, 10}}
+	for j, e := range *rules[0].ClientRefusals {
+		if e.Reason == nil || e.AgeSeconds == nil {
+			t.Errorf("refusal entry %d of %s misses its reason or its age_seconds", j, body)
+			continue
+		}
+		if got := (refusal{*e.Reason, *e.AgeSeconds}); got != want[j] {
+			t.Errorf("refusal entry %d = %+v, want %+v", j, got, want[j])
+		}
+	}
+	if rules[1].ClientAuthEnforced != nil || rules[1].ClientRefusals != nil ||
+		strings.Count(body, `"client_auth_enforced"`) != 1 || strings.Count(body, `"client_refusals"`) != 1 {
+		t.Errorf("the entry of the rule without client_auth carries client_auth_enforced or client_refusals: %s", body)
 	}
 }

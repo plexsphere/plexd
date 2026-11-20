@@ -2,8 +2,10 @@ package bridge
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -890,5 +892,301 @@ func TestIngressStatusReporter_CancelWhileTheGapTimerIsArmed(t *testing.T) {
 		if got := client.calls(); got != 2 {
 			t.Errorf("reports after the cancel = %d, want still 2", got)
 		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Client authentication
+// ---------------------------------------------------------------------------
+
+// repEnforcedReport returns the report of a terminate rule with client_auth
+// that listens, whose certificate is ready and whose target nobody dialled,
+// with the refusals.
+func repEnforcedReport(id string, refusals ...IngressClientRefusalReport) IngressRuleReport {
+	r := listeningReport(id)
+	r.Certificate = api.IngressCertificateReady
+	r.ClientAuthEnforced = true
+	r.ClientRefusals = refusals
+	return r
+}
+
+// TestBuildIngressStatusRequest_ClientRefusals maps client_auth_enforced and
+// each refusal in order, its age_seconds floored, 0 for a refusal at or after
+// now and clamped to 2147483647 above that, and gives an entry without
+// refusals no client_refusals member and an entry without client_auth
+// neither member.
+func TestBuildIngressStatusRequest_ClientRefusals(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	id := reportID("a1")
+	const ceiling = api.MaxIngressStatusRefusalAgeSeconds
+	for _, tt := range []struct {
+		name string
+		at   time.Time
+		want int64
+	}{
+		{"1.9 s ago", now.Add(-1900 * time.Millisecond), 1},
+		{"0.9 s ago", now.Add(-900 * time.Millisecond), 0},
+		{"at now", now, 0},
+		{"1.5 s after now", now.Add(1500 * time.Millisecond), 0},
+		{"a nanosecond short of the ceiling", now.Add(-(ceiling*time.Second - 1)), ceiling - 1},
+		{"at the ceiling", now.Add(-ceiling * time.Second), ceiling},
+		{"a second above the ceiling", now.Add(-(ceiling + 1) * time.Second), ceiling},
+		{"100 years ago", now.AddDate(-100, 0, 0), ceiling},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			report := repEnforcedReport(id, IngressClientRefusalReport{Reason: IngressRefusalNoCertificate, At: tt.at})
+			req := buildIngressStatusRequest(api.IngressStateEnabled, []IngressRuleReport{report}, now)
+			if len(req.Rules) != 1 {
+				t.Fatalf("rules = %+v, want one entry", req.Rules)
+			}
+			want := []api.IngressStatusClientRefusal{{Reason: IngressRefusalNoCertificate, AgeSeconds: tt.want}}
+			if got := req.Rules[0].ClientRefusals; !slices.Equal(got, want) {
+				t.Errorf("ClientRefusals = %+v, want %+v", got, want)
+			}
+			// An age of 0 is a valid age, so the member is always written.
+			wantJSON := fmt.Sprintf(`"client_refusals":[{"reason":"no_certificate","age_seconds":%d}]`, tt.want)
+			if body := mustJSON(t, req.Rules[0]); !strings.Contains(body, wantJSON) {
+				t.Errorf("entry = %s, want it to contain %s", body, wantJSON)
+			}
+		})
+	}
+
+	all := repEnforcedReport(reportID("a1"),
+		IngressClientRefusalReport{Reason: IngressRefusalNoCertificate, At: now.Add(-1900 * time.Millisecond)},
+		IngressClientRefusalReport{Reason: IngressRefusalUnknownAuthority, At: now.Add(time.Second)},
+		IngressClientRefusalReport{Reason: IngressRefusalCertificateExpired, At: now.AddDate(-100, 0, 0)},
+		IngressClientRefusalReport{Reason: IngressRefusalCertificateInvalid, At: now.Add(-12900 * time.Millisecond)},
+	)
+	none := repEnforcedReport(reportID("b2"))
+	empty := repEnforcedReport(reportID("c3"))
+	empty.ClientRefusals = []IngressClientRefusalReport{}
+	plain := listeningReport(reportID("d4"))
+	req := buildIngressStatusRequest(api.IngressStateEnabled, []IngressRuleReport{all, none, empty, plain}, now)
+	if len(req.Rules) != 4 {
+		t.Fatalf("rules = %+v, want four entries", req.Rules)
+	}
+	for i, want := range []string{
+		`{"id":"` + all.RuleID + `","listener":"listening","certificate":"ready","dial":"none","client_auth_enforced":true,"client_refusals":[` +
+			`{"reason":"no_certificate","age_seconds":1},` +
+			`{"reason":"unknown_authority","age_seconds":0},` +
+			`{"reason":"certificate_expired","age_seconds":2147483647},` +
+			`{"reason":"certificate_invalid","age_seconds":12}]}`,
+		`{"id":"` + none.RuleID + `","listener":"listening","certificate":"ready","dial":"none","client_auth_enforced":true}`,
+		`{"id":"` + empty.RuleID + `","listener":"listening","certificate":"ready","dial":"none","client_auth_enforced":true}`,
+		`{"id":"` + plain.RuleID + `","listener":"listening","certificate":"not_required","dial":"none"}`,
+	} {
+		if got := mustJSON(t, req.Rules[i]); got != want {
+			t.Errorf("entry %d = %s, want %s", i, got, want)
+		}
+	}
+	for i, want := range []bool{true, true, true, false} {
+		if got := req.Rules[i].ClientAuthEnforced; got != want {
+			t.Errorf("entry %d: ClientAuthEnforced = %t, want %t", i, got, want)
+		}
+	}
+	if req.Rules[1].ClientRefusals != nil || req.Rules[2].ClientRefusals != nil || req.Rules[3].ClientRefusals != nil {
+		t.Errorf("entries without refusals carry ClientRefusals: %s", mustJSON(t, req.Rules[1:]))
+	}
+}
+
+// TestIngressStatusReporter_RefusalAloneSendsNothing sends nothing before the
+// tick for a new refusal, a moving refusal age and a later refusal for a
+// reason, also after a tick whose send failed with a 500, and has every tick
+// carry the refusals with their ages at the tick.
+func TestIngressStatusReporter_RefusalAloneSendsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		start := time.Now()
+		// until sleeps until offset after the start and waits for the
+		// reporter to block again.
+		until := func(offset time.Duration) {
+			time.Sleep(time.Until(start.Add(offset)))
+			synctest.Wait()
+		}
+		id := reportID("a1")
+		refusal := func(reason string, offset time.Duration) IngressClientRefusalReport {
+			return IngressClientRefusalReport{Reason: reason, At: start.Add(offset)}
+		}
+		source := newFakeRuleSource(repEnforcedReport(id))
+		failed := &api.APIError{StatusCode: 500, Code: "internal"}
+		client := &fakeIngressStatusClient{errs: []error{nil, nil, failed}}
+		logger, logs := newRelayLogger()
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, source, logger)
+		requireCalls := func(want int, step string) {
+			t.Helper()
+			if got := client.calls(); got != want {
+				t.Errorf("%s: reports = %d, want %d", step, got, want)
+			}
+		}
+		requireRefusals := func(k int, want string) {
+			t.Helper()
+			_, reqs := client.recorded()
+			if len(reqs) <= k {
+				t.Fatalf("reports = %d, want report %d", len(reqs), k)
+			}
+			if len(reqs[k].Rules) != 1 {
+				t.Fatalf("report %d rules = %s, want one entry", k, mustJSON(t, reqs[k].Rules))
+			}
+			if got := mustJSON(t, reqs[k].Rules[0].ClientRefusals); got != want {
+				t.Errorf("report %d client_refusals = %s, want %s", k, got, want)
+			}
+		}
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		requireCalls(1, "at the start")
+
+		until(10 * time.Second)
+		source.set(repEnforcedReport(id, refusal(IngressRefusalNoCertificate, 10*time.Second)))
+		synctest.Wait()
+		requireCalls(1, "after a new refusal")
+		until(interval - time.Millisecond)
+		requireCalls(1, "just before the first tick")
+		until(interval + time.Millisecond)
+		requireCalls(2, "just after the first tick")
+		requireRefusals(1, `[{"reason":"no_certificate","age_seconds":50}]`)
+
+		// The same refusal at a later age, then a later refusal for its
+		// reason beside a new one.
+		until(70 * time.Second)
+		source.set(repEnforcedReport(id, refusal(IngressRefusalNoCertificate, 10*time.Second)))
+		synctest.Wait()
+		requireCalls(2, "after the refusal age moved")
+		until(80 * time.Second)
+		source.set(repEnforcedReport(id,
+			refusal(IngressRefusalNoCertificate, 80*time.Second),
+			refusal(IngressRefusalUnknownAuthority, 80*time.Second),
+		))
+		synctest.Wait()
+		requireCalls(2, "after a later refusal and a new reason")
+		until(2*interval - time.Millisecond)
+		requireCalls(2, "just before the second tick")
+
+		// The second tick's send fails; it carried the refusals.
+		until(2*interval + time.Millisecond)
+		requireCalls(3, "just after the second tick")
+		requireRefusals(2, `[{"reason":"no_certificate","age_seconds":40},{"reason":"unknown_authority","age_seconds":40}]`)
+		if n := logs.count(`level=WARN msg="ingress status: send failed"`); n != 1 {
+			t.Errorf("%d Warns 'ingress status: send failed' after the refused tick, want 1:\n%s", n, logs.String())
+		}
+
+		until(130 * time.Second)
+		source.set(repEnforcedReport(id,
+			refusal(IngressRefusalNoCertificate, 80*time.Second),
+			refusal(IngressRefusalUnknownAuthority, 80*time.Second),
+			refusal(IngressRefusalCertificateExpired, 130*time.Second),
+		))
+		synctest.Wait()
+		requireCalls(3, "after a new refusal behind the failed send")
+		until(140 * time.Second)
+		source.set(repEnforcedReport(id,
+			refusal(IngressRefusalNoCertificate, 80*time.Second),
+			refusal(IngressRefusalUnknownAuthority, 80*time.Second),
+			refusal(IngressRefusalCertificateExpired, 130*time.Second),
+		))
+		synctest.Wait()
+		requireCalls(3, "after the refusal ages moved behind the failed send")
+		until(3*interval - time.Millisecond)
+		requireCalls(3, "just before the third tick")
+		until(3*interval + time.Millisecond)
+		requireCalls(4, "just after the third tick")
+		requireRefusals(3, `[{"reason":"no_certificate","age_seconds":100},{"reason":"unknown_authority","age_seconds":100},{"reason":"certificate_expired","age_seconds":50}]`)
+	})
+}
+
+// repIdleListener is a net.Listener that accepts no connection: Accept blocks
+// on a channel until Close, so a manager inside a synctest bubble listens
+// without a socket.
+type repIdleListener struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newRepIdleListener() *repIdleListener { return &repIdleListener{closed: make(chan struct{})} }
+
+func (l *repIdleListener) Accept() (net.Conn, error) {
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *repIdleListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *repIdleListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// TestIngressStatusReporter_ClientAuthEnforcedChangeSends sends on change when
+// a pull adds client_auth to a listening rule and when one removes it, each
+// past the change gap, and sends a change inside the gap when the gap ends.
+func TestIngressStatusReporter_ClientAuthEnforcedChangeSends(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = time.Minute
+		ctrl := &mockIngressController{listenFn: func(string, *tls.Config) (net.Listener, error) {
+			return newRepIdleListener(), nil
+		}}
+		fx := buildIngressFixture(t, ctrl, ingressTestConfig(true))
+		if err := fx.mgr.Setup(); err != nil {
+			t.Fatalf("Setup: %v", err)
+		}
+		id := reportID("a1")
+		plain := withID(terminateRule("term", 443, "t.example.com", "tls", 9000), id)
+		auth := plain
+		withClientAuth(caBundle(newTestCA(t, "client-ca", nil)))(&auth)
+		apply := func(r api.IngressRule) {
+			t.Helper()
+			if err := fx.mgr.Apply(t.Context(), rulesBlock(r)); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+		}
+		apply(plain)
+		drain(fx.mgr.ReportChanged())
+		if got := reportFor(t, fx.mgr.RuleReports(), id); got.Listener != api.IngressListenerListening {
+			t.Fatalf("report = %+v, want the rule listening", got)
+		}
+
+		client := &fakeIngressStatusClient{}
+		r := NewIngressStatusReporter(interval, testIngressNodeID, client, false, fx.mgr, discardLogger())
+		// requireEnforced fails unless the reporter sent n reports and the
+		// last carries enforced and the matching member.
+		requireEnforced := func(n int, enforced bool, step string) {
+			t.Helper()
+			_, reqs := client.recorded()
+			if len(reqs) != n {
+				t.Fatalf("%s: reports = %d, want %d", step, len(reqs), n)
+			}
+			last := reqs[n-1]
+			if len(last.Rules) != 1 || last.Rules[0].ClientAuthEnforced != enforced {
+				t.Fatalf("%s: rules = %s, want one entry with client_auth_enforced %t", step, mustJSON(t, last.Rules), enforced)
+			}
+			if body := mustJSON(t, last); strings.Contains(body, `"client_auth_enforced":true`) != enforced || strings.Contains(body, "client_refusals") {
+				t.Errorf("%s: body = %s, want client_auth_enforced only when it is true and no client_refusals", step, body)
+			}
+		}
+
+		startIngressStatusReporter(t, r)
+		synctest.Wait()
+		requireEnforced(1, false, "at the start")
+
+		time.Sleep(10 * time.Second)
+		apply(auth)
+		synctest.Wait()
+		requireEnforced(2, true, "a pull that adds client_auth")
+
+		time.Sleep(10 * time.Second)
+		apply(plain)
+		synctest.Wait()
+		requireEnforced(3, false, "a pull that removes client_auth")
+
+		// A second change inside the gap is sent when the gap ends.
+		time.Sleep(time.Second)
+		apply(auth)
+		synctest.Wait()
+		time.Sleep(4*time.Second - time.Millisecond)
+		synctest.Wait()
+		requireEnforced(3, false, "a pull that adds client_auth inside the gap, just before its end")
+		time.Sleep(2 * time.Millisecond)
+		synctest.Wait()
+		requireEnforced(4, true, "a pull that adds client_auth inside the gap, just after its end")
 	})
 }
