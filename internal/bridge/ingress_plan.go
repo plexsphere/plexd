@@ -24,9 +24,11 @@ const (
 	// IngressReasonListenerConflict: a held rule of the same protocol has the
 	// same listen port and host, or one of the two has no host; Detail is the
 	// holder's slug. Rules with request conditions share a port and host when
-	// they all name the same mode and certificate_secret_name and no two have
-	// the same conditions; a rule that breaks this conflicts with the host's
-	// first held rule, or with the held rule whose conditions equal its own.
+	// they all name the same mode, certificate_secret_name and client
+	// authorities, the last compared by certificate fingerprints, and no two
+	// have the same conditions; a rule that breaks this conflicts with the
+	// host's first held rule, or with the held rule whose conditions equal its
+	// own.
 	// A udp rule has no host, so it conflicts with every held udp rule on its
 	// port, and a tcp and a udp rule never conflict.
 	IngressReasonListenerConflict = "listener_conflict"
@@ -60,6 +62,11 @@ const (
 	// rule's Secret holds no certificate chain with a matching key; Detail is
 	// the Secret name.
 	IngressReasonCertificateInvalid = "certificate_invalid"
+	// IngressReasonClientCAInvalid: the bridge cannot build the client
+	// authorities of a held terminate or acme rule from the ca_bundle of its
+	// client_auth; Detail names the check the bundle fails. The rule keeps
+	// its listener slot and serves no client.
+	IngressReasonClientCAInvalid = "client_ca_invalid"
 )
 
 // acmeChallengePort is the port the CA connects to for the TLS-ALPN-01
@@ -85,7 +92,7 @@ type IngressRuleState struct {
 	Rule   api.IngressRule
 	Served bool
 	Reason string // empty when served
-	Detail string // the field of an invalid rule, the slug of the held rule it conflicts with, a directory URL or a Secret name
+	Detail string // the field of an invalid rule, the slug of the held rule it conflicts with, a directory URL, a Secret name or the defect of a client CA bundle
 
 	// held is set for a rule that keeps its listener slot, served or not.
 	held bool
@@ -181,10 +188,19 @@ type ingressRoute struct {
 	rule api.IngressRule
 	// lb spreads the rule's units over its targets and holds their dial
 	// records. planIngress leaves it nil, and Apply sets it.
-	lb     *ingressBalancer
-	served bool // false for a held acme rule with a reason
-	ctx    context.Context
-	cancel context.CancelFunc
+	lb *ingressBalancer
+	// served is false for a held acme rule with a reason and for a held rule
+	// whose client CA bundle does not build (client_ca_invalid).
+	served bool
+	// clientAuth holds the client authorities of a rule with client_auth,
+	// which every handshake of the rule verifies the client against; nil for
+	// a rule without one. The rules of a host share their authorities.
+	clientAuth *clientAuthorities
+	// refusals records the clients the bridge refused for a rule with
+	// client_auth. planIngress leaves it nil, and Apply sets it.
+	refusals *clientRefusals
+	ctx      context.Context
+	cancel   context.CancelFunc
 	// proxy forwards the requests of a rule with conditions, on target
 	// connections it keeps until ctx is done; nil for a rule without
 	// conditions.
@@ -289,7 +305,12 @@ func (t *ingressTable) routes() []*ingressRoute {
 // mode on TCP port 443 would take the CA's challenge connection for its host;
 // when one is served and TCP port 443 holds no rule, the plan adds an empty
 // table for 443, so the port opens for challenges. A udp rule on 443 neither
-// takes the challenge connection nor holds the port for it.
+// takes the challenge connection nor holds the port for it. A held terminate
+// or acme rule with client_auth gets its client authorities on its route; when
+// its bundle does not build, the rule keeps its listener slot, is not served
+// and reads client_ca_invalid with the defect as Detail, ahead of an acme
+// rule's reason, and the rules of its host, which name the same authorities,
+// are not served with it.
 func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) ingressPlan {
 	plan := ingressPlan{
 		tables: make(map[int]*ingressTable),
@@ -384,8 +405,14 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			st.Reason, st.Detail = IngressReasonInvalid, "conditions.headers"
 		case r.StripPathPrefix && (r.Conditions.PathPrefix == "" || r.Conditions.PathPrefix == "/"):
 			st.Reason, st.Detail = IngressReasonInvalid, "strip_path_prefix"
+		case r.ClientAuth != nil && r.Mode == api.IngressModePassthrough:
+			// The bridge ends no TLS of a passthrough rule, which every udp
+			// rule is, so it cannot ask for a client certificate.
+			st.Reason, st.Detail = IngressReasonInvalid, "client_auth"
 		}
+		var ca *clientAuthorities
 		if st.Reason == "" {
+			ca = newClientAuthorities(r.ClientAuth)
 			if udp {
 				if holder := plan.udp[r.ListenPort]; holder != nil {
 					st.Reason, st.Detail = IngressReasonListenerConflict, holder.rule.Slug
@@ -397,7 +424,7 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 				case host == "":
 					st.Reason, st.Detail = IngressReasonListenerConflict, h.first
 				case h.hosts[host] != nil:
-					if holder := hostConflict(h.hosts[host], r); holder != "" {
+					if holder := hostConflict(h.hosts[host], r, ca); holder != "" {
 						st.Reason, st.Detail = IngressReasonListenerConflict, holder
 					}
 				}
@@ -428,9 +455,11 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 			}
 			ports[r.ListenPort] = h
 		}
+		clientCAInvalid := ca != nil && ca.defect != ""
 		route := &ingressRoute{
-			rule:   r,
-			served: r.Mode != api.IngressModeACME || acme.Reason == "",
+			rule:       r,
+			served:     (r.Mode != api.IngressModeACME || acme.Reason == "") && !clientCAInvalid,
+			clientAuth: ca,
 		}
 		if host == "" {
 			h.plain = r.Slug
@@ -450,7 +479,10 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 		}
 		st.held = true
 		st.Served = route.served
-		if !route.served {
+		switch {
+		case clientCAInvalid:
+			st.Reason, st.Detail = IngressReasonClientCAInvalid, ca.defect
+		case !route.served:
 			st.Reason, st.Detail = acme.Reason, acme.Detail
 		}
 		if r.Mode == api.IngressModeACME {
@@ -499,16 +531,19 @@ func planIngress(rules []api.IngressRule, maxRules int, acme acmeAvailability) i
 
 // hostConflict returns the slug of the held rule a rule for the held host
 // conflicts with, or "" when the rule may join the host: the host's first
-// held rule when the rule or the host's rules have no conditions, or the
-// rule's mode or, on terminate, its certificate_secret_name differs; the held
-// rule whose conditions equal the rule's otherwise. The caller walks the rules
-// in block order, so routes[0] is the host's first held rule.
-func hostConflict(h *ingressHost, r api.IngressRule) string {
+// held rule when the rule or the host's rules have no conditions, the rule's
+// mode or, on terminate, its certificate_secret_name differs, or ca, the
+// rule's client authorities, names another set of authorities than the first
+// rule's; the held rule whose conditions equal the rule's otherwise. The
+// caller walks the rules in block order, so routes[0] is the host's first
+// held rule.
+func hostConflict(h *ingressHost, r api.IngressRule, ca *clientAuthorities) string {
 	first := h.routes[0].rule
 	switch {
 	case r.Conditions.IsZero() || !h.http,
 		r.Mode != first.Mode,
-		r.Mode == api.IngressModeTerminate && r.CertificateSecretName != first.CertificateSecretName:
+		r.Mode == api.IngressModeTerminate && r.CertificateSecretName != first.CertificateSecretName,
+		clientAuthKey(ca) != clientAuthKey(h.routes[0].clientAuth):
 		return first.Slug
 	}
 	key := conditionsKey(r.Conditions)

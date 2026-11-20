@@ -212,12 +212,17 @@ func TestIngressManager_Apply_Idempotent(t *testing.T) {
 	}
 
 	// Rules that share a host by their conditions, applied twice, keep their
-	// routes, contexts and proxies and log nothing the second time.
+	// routes, contexts and proxies and log nothing the second time. They
+	// carry client_auth, and the second time the same bundle text sits
+	// behind new pointers.
+	bundle := newTestCA(t, "integ-idempotent-ca", nil).pem
 	api1 := terminateRule("shop-api", 8443, "shop.example.com", "tls-shop", 9081)
 	api1.Conditions = api.IngressConditions{PathPrefix: "/api", Headers: []api.IngressHeaderCondition{{Name: "x-tenant", Value: "tenant-7f3a"}, {Name: "x-version", Value: "v-91c2"}}}
 	api1.StripPathPrefix = true
+	api1.ClientAuth = &api.IngressClientAuth{CABundle: bundle}
 	web := terminateRule("shop-web", 8443, "shop.example.com", "tls-shop", 9082)
 	web.Conditions.PathPrefix = "/"
+	web.ClientAuth = &api.IngressClientAuth{CABundle: bundle}
 	shared := append(slices.Clone(rules), api1, web)
 	if err := mgr.Apply(t.Context(), rulesBlock(shared...)); err != nil {
 		t.Fatalf("Apply with the shared host: %v", err)
@@ -227,7 +232,13 @@ func TestIngressManager_Apply_Idempotent(t *testing.T) {
 		t.Fatalf("host = %+v, want an http host with two routes", host)
 	}
 	lines := strings.Count(logs.String(), "\n")
-	if err := mgr.Apply(t.Context(), rulesBlock(shared...)); err != nil {
+	same := slices.Clone(shared)
+	for i := range same {
+		if same[i].ClientAuth != nil {
+			same[i].ClientAuth = &api.IngressClientAuth{CABundle: same[i].ClientAuth.CABundle}
+		}
+	}
+	if err := mgr.Apply(t.Context(), rulesBlock(same...)); err != nil {
 		t.Fatalf("second Apply with the shared host: %v", err)
 	}
 	if got := strings.Count(logs.String(), "\n"); got != lines {
@@ -242,15 +253,20 @@ func TestIngressManager_Apply_Idempotent(t *testing.T) {
 			t.Errorf("route %s: the second Apply gave it a new context or proxy, want the carried ones", r.rule.Slug)
 		}
 	}
-	if got := logLines(logs, `msg="ingress rule added"`, "slug=shop-api", "path_prefix=/api", "header_names=x-tenant,x-version", "strip_path_prefix=true"); got != 1 {
-		t.Errorf("%d 'ingress rule added' lines for shop-api with the condition keys, want 1:\n%s", got, logs.String())
+	if got := logLines(logs, `msg="ingress rule added"`, "slug=shop-api", "path_prefix=/api", "header_names=x-tenant,x-version", "strip_path_prefix=true", "client_auth=true"); got != 1 {
+		t.Errorf("%d 'ingress rule added' lines for shop-api with the condition keys and client_auth=true, want 1:\n%s", got, logs.String())
 	}
-	if got := logLines(logs, `msg="ingress rule added"`, "slug=a ", `path_prefix=""`, `header_names=""`, "strip_path_prefix=false"); got != 1 {
-		t.Errorf("%d 'ingress rule added' lines for a with empty condition keys, want 1:\n%s", got, logs.String())
+	if got := logLines(logs, `msg="ingress rule added"`, "slug=a ", `path_prefix=""`, `header_names=""`, "strip_path_prefix=false", "client_auth=false"); got != 1 {
+		t.Errorf("%d 'ingress rule added' lines for a with empty condition keys and client_auth=false, want 1:\n%s", got, logs.String())
 	}
 	for _, value := range []string{"tenant-7f3a", "v-91c2"} {
 		if strings.Contains(logs.String(), value) {
 			t.Errorf("the log carries the header value %s:\n%s", value, logs.String())
+		}
+	}
+	for _, line := range strings.Split(strings.TrimSpace(bundle), "\n") {
+		if !strings.HasPrefix(line, "-----") && strings.Contains(logs.String(), line) {
+			t.Errorf("the log carries the bundle's line %q:\n%s", line, logs.String())
 		}
 	}
 }

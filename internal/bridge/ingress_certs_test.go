@@ -613,15 +613,23 @@ func TestIngressCertificates_HostCoverage(t *testing.T) {
 }
 
 // TestIngressCertificates_RenewedRouteKeepsItsBalancer renews the route of a
-// terminate rule whose Secret the inventory stops listing, and the fresh
-// route keeps the rule's balancer with its records and hold-outs.
+// terminate rule with client_auth whose Secret the inventory stops listing,
+// and the fresh route keeps the rule's balancer with its records and
+// hold-outs, its client authorities and its refusal record. Listed again, the
+// Secret serves the fresh route, which still refuses a client without a
+// certificate and records it on the same record.
 func TestIngressCertificates_RenewedRouteKeepsItsBalancer(t *testing.T) {
-	fx, _ := newClockedFixture(t)
+	ctrl := newLoopbackIngressController(t)
+	fx := newIngressFixture(t, ctrl)
+	clock := &relayClock{now: relayStart}
+	fx.mgr.now = clock.Now
 	fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+	fx.certs.set("tls", 2, certPEM(t, "t.example.com", "v2"))
 	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
 	id := reportID("a1")
 	rule := withID(terminateRule("term", 443, "t.example.com", "tls", 9000), id)
 	rule.Targets = twoTargets()
+	withClientAuth(newTestCA(t, "integ-client-ca", nil).pem)(&rule)
 	if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -631,8 +639,14 @@ func TestIngressCertificates_RenewedRouteKeepsItsBalancer(t *testing.T) {
 		return fx.mgr.listeners[443].table.Load().exact["t.example.com"].lead()
 	}
 	old := routeOf()
+	if old.clientAuth == nil || old.refusals == nil {
+		t.Fatalf("route = %+v, want client authorities and a refusal record", old)
+	}
 	fx.mgr.recordDial(old, 0, refusedDial())
 	fx.mgr.recordDial(old, 1, nil)
+	stranger := newTestCA(t, "integ-stranger-ca", nil).issue(t, "integ-stranger-leaf", nil)
+	integRequireRefused(t, ctrl.addr(443), "t.example.com", &stranger, tls.VersionTLS13)
+	fx.logs.waitFor(t, `msg="ingress client refused"`, 1)
 
 	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("other", 1))
 	route := routeOf()
@@ -648,5 +662,38 @@ func TestIngressCertificates_RenewedRouteKeepsItsBalancer(t *testing.T) {
 	}
 	if out := outTargets(route.lb, relayStart); !slices.Equal(out, []int{0}) {
 		t.Errorf("out targets = %v, want the first", out)
+	}
+	if route.clientAuth != old.clientAuth {
+		t.Errorf("the renewed route has the client authorities %p, want the old route's %p", route.clientAuth, old.clientAuth)
+	}
+	if record := integRefusalsOf(fx.mgr, id); route.refusals != old.refusals || record != old.refusals {
+		t.Fatalf("the renewed route has the refusal record %p, the manager %p, want the old route's %p", route.refusals, record, old.refusals)
+	}
+	before := []IngressClientRefusalReport{{Reason: IngressRefusalUnknownAuthority, At: relayStart}}
+	if got := route.refusals.snapshot(); !integSameRefusals(got, before) {
+		t.Errorf("refusals after the renewal = %+v, want %+v", got, before)
+	}
+
+	// Listed again, the Secret serves the renewed route, whose handshake
+	// still asks for a client certificate.
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 2))
+	if st := stateOf(t, fx.mgr, "term"); !st.Served {
+		t.Fatalf("rule term after its Secret is listed again = %+v, want served", st)
+	}
+	clock.Add(5 * time.Second)
+	integRequireRefused(t, ctrl.addr(443), "t.example.com", nil, tls.VersionTLS13)
+	fx.logs.waitFor(t, `msg="ingress client refused"`, 2)
+	if got := logLines(fx.logs, `msg="ingress client refused"`, "reason="+IngressRefusalNoCertificate); got != 1 {
+		t.Errorf("%d 'ingress client refused' lines with reason=%s, want 1:\n%s", got, IngressRefusalNoCertificate, fx.logs.String())
+	}
+	if got := logLines(fx.logs, `msg="ingress connection closed"`); got != 0 {
+		t.Errorf("%d 'ingress connection closed' lines, want the client refused by its certificate alone:\n%s", got, fx.logs.String())
+	}
+	after := []IngressClientRefusalReport{
+		{Reason: IngressRefusalNoCertificate, At: relayStart.Add(5 * time.Second)},
+		{Reason: IngressRefusalUnknownAuthority, At: relayStart},
+	}
+	if got := old.refusals.snapshot(); !integSameRefusals(got, after) {
+		t.Errorf("refusals after the listed Secret = %+v, want %+v", got, after)
 	}
 }

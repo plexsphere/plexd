@@ -1262,6 +1262,57 @@ func TestIngressHTTP_HostChangeClosesConnections(t *testing.T) {
 	}
 }
 
+// TestIngressHTTP_ConnectionKeepsItsClientAuthorities sends a request on a
+// kept-alive connection whose server name an Apply moved to another host: an
+// exact host with client_auth that joins the wildcard host the connection's
+// handshake ran under. The wildcard host is unchanged and keeps its client
+// connections, but the handshake verified no client against the exact host's
+// authorities, so the request reaches no target.
+func TestIngressHTTP_ConnectionKeepsItsClientAuthorities(t *testing.T) {
+	ca, other := newTestCA(t, "keep-ca", nil), newTestCA(t, "keep-other-ca", nil)
+	for _, tc := range []struct {
+		name     string
+		wildAuth string // the ca_bundle of the wildcard host, "" for none
+		cert     func(t *testing.T) *tls.Certificate
+	}{
+		{name: "a handshake that asked for no certificate", cert: func(*testing.T) *tls.Certificate { return nil }},
+		{name: "a handshake that verified another authority", wildAuth: other.pem, cert: func(t *testing.T) *tls.Certificate {
+			leaf := other.issue(t, "keep-other-client", nil)
+			return &leaf
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wildT, exactT := startHTTPTarget(t, "wild"), startHTTPTarget(t, "exact")
+			fx := newHTTPFixture(t, nil)
+			wild := httpRule("wild", "*.apps.example.com", wildT.port(t), "/")
+			if tc.wildAuth != "" {
+				withClientAuth(tc.wildAuth)(&wild)
+			}
+			fx.apply(t, wild)
+			conn, err := dialTLSClient(t, fx.ctrl.addr(443), "exact.apps.example.com", tc.cert(t), func(c *tls.Config) {
+				c.NextProtos = []string{"http/1.1"}
+			})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			raw := &rawConn{Conn: conn, br: bufio.NewReader(conn)}
+			if status, body := raw.roundTrip(t, getHead("/x", "exact.apps.example.com")); status != http.StatusOK || !strings.HasPrefix(body, "target=wild\n") {
+				t.Fatalf("first request = %d %q, want 200 from the wildcard host's target", status, body)
+			}
+
+			exact := httpRule("exact", "exact.apps.example.com", exactT.port(t), "/")
+			withClientAuth(ca.pem)(&exact)
+			fx.apply(t, wild, exact)
+			_ = raw.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, _ = io.WriteString(raw, getHead("/x", "exact.apps.example.com"))
+			requireClosed(t, raw.Conn)
+			if n := exactT.conns.Load(); n != 0 {
+				t.Errorf("the exact host's target accepted %d connections, want none", n)
+			}
+		})
+	}
+}
+
 // TestIngressHTTP_Limits closes a slow header and an idle client connection,
 // and answers an oversized header with 431.
 func TestIngressHTTP_Limits(t *testing.T) {

@@ -369,12 +369,12 @@ func (m *IngressManager) overlayCertificatesLocked() []IngressRuleState {
 // renewRoutesLocked closes the connections of every route whose rule affected
 // selects: it stores, for each listener that routes such a rule, a copy of
 // its table with a fresh route in place of each selected one, which keeps the
-// route's balancer, with a fresh proxy for a route with conditions, and a
-// fresh context for a host with conditions that holds such a route, then
-// cancels the old routes and host contexts. A host's rules name one Secret,
-// so its routes are affected together. proxy and serveHTTP read a route's
-// context without a lock, so the table is replaced rather than changed. The
-// caller holds mu.
+// route's balancer, client authorities and refusal record, with a fresh proxy
+// for a route with conditions, and a fresh context for a host with conditions
+// that holds such a route, then cancels the old routes and host contexts. A
+// host's rules name one Secret, so its routes are affected together. proxy
+// and serveHTTP read a route's context without a lock, so the table is
+// replaced rather than changed. The caller holds mu.
 func (m *IngressManager) renewRoutesLocked(affected func(api.IngressRule) bool) {
 	var old []*ingressRoute
 	var oldHosts []*ingressHost
@@ -382,7 +382,7 @@ func (m *IngressManager) renewRoutesLocked(affected func(api.IngressRule) bool) 
 		if r == nil || !affected(r.rule) {
 			return r
 		}
-		fresh := &ingressRoute{rule: r.rule, lb: r.lb, served: r.served}
+		fresh := &ingressRoute{rule: r.rule, lb: r.lb, served: r.served, clientAuth: r.clientAuth, refusals: r.refusals}
 		fresh.ctx, fresh.cancel = context.WithCancel(m.ctx)
 		if r.proxy != nil {
 			fresh.proxy = m.newRouteProxy(fresh)

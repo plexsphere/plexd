@@ -6,9 +6,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"io"
 	"math/big"
@@ -125,6 +128,157 @@ func selfSignedCert(t *testing.T, cn string) tls.Certificate {
 		t.Fatalf("create certificate: %v", err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// testCA is a certificate authority a test signs client certificates and
+// intermediates with, at run time.
+type testCA struct {
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+	// pem is the CA certificate as one PEM CERTIFICATE block, as a ca_bundle
+	// holds it.
+	pem string
+}
+
+// testSerial returns a random certificate serial number.
+func testSerial(t *testing.T) *big.Int {
+	t.Helper()
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	return serial
+}
+
+// signTestCertificate signs template with parent's key, or self-signs it when
+// parent is nil, and returns the certificate and its key.
+func signTestCertificate(t *testing.T, template *x509.Certificate, parent *testCA) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	issuer, signer := template, key
+	if parent != nil {
+		issuer, signer = parent.cert, parent.key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, issuer, &key.PublicKey, signer)
+	if err != nil {
+		t.Fatalf("create certificate %q: %v", template.Subject.CommonName, err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate %q: %v", template.Subject.CommonName, err)
+	}
+	return cert, key
+}
+
+// caTemplate returns the template of a CA certificate named cn, valid from an
+// hour ago for a day.
+func caTemplate(t *testing.T, cn string) *x509.Certificate {
+	t.Helper()
+	return &x509.Certificate{
+		SerialNumber:          testSerial(t),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+}
+
+// newTestCA returns a self-signed CA named cn, valid from an hour ago for a
+// day. edit, when not nil, changes the template before it is signed, to
+// expire the CA for example.
+func newTestCA(t *testing.T, cn string, edit func(*x509.Certificate)) *testCA {
+	t.Helper()
+	template := caTemplate(t, cn)
+	if edit != nil {
+		edit(template)
+	}
+	cert, key := signTestCertificate(t, template, nil)
+	return &testCA{cert: cert, key: key, pem: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}))}
+}
+
+// intermediate returns a CA named cn that ca signs, valid from an hour ago
+// for a day. edit, when not nil, changes the template before it is signed.
+func (ca *testCA) intermediate(t *testing.T, cn string, edit func(*x509.Certificate)) *testCA {
+	t.Helper()
+	template := caTemplate(t, cn)
+	if edit != nil {
+		edit(template)
+	}
+	cert, key := signTestCertificate(t, template, ca)
+	return &testCA{cert: cert, key: key, pem: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}))}
+}
+
+// issue returns a client certificate for cn that ca signs, with the extended
+// key usage clientAuth, valid from a minute ago for an hour. Its chain holds
+// the leaf alone; a test that sends intermediates appends their Raw bytes.
+// edit, when not nil, changes the template before it is signed, to expire the
+// leaf or drop its usage for example.
+func (ca *testCA) issue(t *testing.T, cn string, edit func(*x509.Certificate)) tls.Certificate {
+	t.Helper()
+	template := &x509.Certificate{
+		SerialNumber: testSerial(t),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	if edit != nil {
+		edit(template)
+	}
+	leaf, key := signTestCertificate(t, template, ca)
+	return tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: key, Leaf: leaf}
+}
+
+// caBundle joins the certificates of cas, in order, into one ca_bundle.
+func caBundle(cas ...*testCA) string {
+	var b strings.Builder
+	for _, ca := range cas {
+		b.WriteString(ca.pem)
+	}
+	return b.String()
+}
+
+// withClientAuth returns an edit that gives a rule client_auth with bundle as
+// its ca_bundle.
+func withClientAuth(bundle string) func(*api.IngressRule) {
+	return func(r *api.IngressRule) {
+		r.ClientAuth = &api.IngressClientAuth{CABundle: bundle}
+	}
+}
+
+// dialTLSClient connects to addr with serverName, presenting cert as the
+// client certificate, or none when cert is nil, without verifying the
+// bridge's certificate. It presents cert through GetClientCertificate, so the
+// client sends it also when its issuer is not among the authorities the
+// bridge's certificate request names, which crypto/tls would otherwise
+// answer with no certificate. edit, when not nil, changes the client's
+// config, to pin a TLS version for example. It returns the connection once
+// the client's side of the handshake completed, or the handshake's error. In
+// TLS 1.3 a refused client completes its own side and reads the bridge's
+// alert on its first read, so a test asserts on that read (requireClosed),
+// never on the dial's error alone.
+func dialTLSClient(t *testing.T, addr, serverName string, cert *tls.Certificate, edit func(*tls.Config)) (*tls.Conn, error) {
+	t.Helper()
+	cfg := &tls.Config{ServerName: serverName, InsecureSkipVerify: true}
+	if cert != nil {
+		cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return cert, nil }
+	}
+	if edit != nil {
+		edit(cfg)
+	}
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, cfg)
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn, nil
 }
 
 // startTLSBackend serves TLS with a certificate for cn and echoes.
@@ -1377,4 +1531,652 @@ func TestIngressIntegration_TerminateRuleFailsOver(t *testing.T) {
 			t.Errorf("%d 'dial target failed' lines for the first target, want 1:\n%s", got, fx.logs.String())
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Client certificates
+// ---------------------------------------------------------------------------
+
+// integTLSVersions are the versions the client certificate tests pin a
+// client to. In TLS 1.2 the bridge refuses a client within the client's
+// handshake; in TLS 1.3 the client completes its side first.
+var integTLSVersions = []struct {
+	name    string
+	version uint16
+}{
+	{name: "TLS 1.2", version: tls.VersionTLS12},
+	{name: "TLS 1.3", version: tls.VersionTLS13},
+}
+
+// integPinVersion returns a client config edit that pins version.
+func integPinVersion(version uint16) func(*tls.Config) {
+	return func(cfg *tls.Config) { cfg.MinVersion, cfg.MaxVersion = version, version }
+}
+
+// integRequireRefused connects to addr as serverName at version, presenting
+// cert, or no certificate when cert is nil, and fails unless the bridge
+// closes the client without a byte of the session: in TLS 1.2 the client's
+// handshake fails, in TLS 1.3 the client completes its side and its first
+// read fails.
+func integRequireRefused(t *testing.T, addr, serverName string, cert *tls.Certificate, version uint16) {
+	t.Helper()
+	conn, err := dialTLSClient(t, addr, serverName, cert, integPinVersion(version))
+	if version < tls.VersionTLS13 {
+		if err == nil {
+			t.Fatal("the TLS 1.2 handshake completed, want the bridge to refuse the client")
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("the client's side of the TLS 1.3 handshake: %v, want it complete", err)
+	}
+	requireClosed(t, conn)
+}
+
+// integRequireAdmitted connects to addr as serverName with cert, or no
+// certificate when cert is nil, and fails unless the session echoes msg.
+func integRequireAdmitted(t *testing.T, addr, serverName string, cert *tls.Certificate, msg string) *tls.Conn {
+	t.Helper()
+	conn, err := dialTLSClient(t, addr, serverName, cert, nil)
+	if err != nil {
+		t.Fatalf("tls dial %s as %q: %v", addr, serverName, err)
+	}
+	requireEcho(t, conn, msg)
+	return conn
+}
+
+// integFingerprint returns the lowercase hex SHA-256 of the leaf of cert.
+func integFingerprint(cert *tls.Certificate) string {
+	sum := sha256.Sum256(cert.Certificate[0])
+	return hex.EncodeToString(sum[:])
+}
+
+// integRefusalsOf returns the refusal record the manager holds for the rule
+// id, nil when it holds none.
+func integRefusalsOf(mgr *IngressManager, id string) *clientRefusals {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.refusals[id]
+}
+
+// integSameRefusals reports whether two refusal lists name the same reasons
+// at the same times, in the same order.
+func integSameRefusals(a, b []IngressClientRefusalReport) bool {
+	return slices.EqualFunc(a, b, func(x, y IngressClientRefusalReport) bool {
+		return x.Reason == y.Reason && x.At.Equal(y.At)
+	})
+}
+
+// integRequireAdmitsAndRefuses checks the clients of the rule slug for
+// serverName on addr, whose client_auth names ca, at version. A client with a
+// leaf of ca reads the banner of the target, "tgt\n". A client without a
+// certificate, with a leaf of another authority, with an expired leaf and
+// with a leaf for server authentication only each fail their first read,
+// cause no dial and leave one Debug line "ingress client refused" with their
+// reason. The line names the issuer, the expiry and the fingerprint of a leaf
+// whose chain failed, and never a leaf's subject. The fixture's clock reads
+// relayStart.
+func integRequireAdmitsAndRefuses(t *testing.T, fx *ingressFixture, dials *dialLog, addr, serverName, slug string, ca *testCA, version uint16) {
+	t.Helper()
+	good := ca.issue(t, "integ-good-leaf", nil)
+	stranger := newTestCA(t, "integ-stranger-ca", nil)
+	strangerLeaf := stranger.issue(t, "integ-stranger-leaf", nil)
+	expired := ca.issue(t, "integ-expired-leaf", func(c *x509.Certificate) {
+		c.NotBefore, c.NotAfter = time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)
+	})
+	serverOnly := ca.issue(t, "integ-server-leaf", func(c *x509.Certificate) {
+		c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	})
+
+	conn, err := dialTLSClient(t, addr, serverName, &good, integPinVersion(version))
+	if err != nil {
+		t.Fatalf("the client with a leaf of the rule's authority: %v", err)
+	}
+	if got := bannerOf(t, conn); got != "tgt\n" {
+		t.Fatalf("the admitted client read %q, want the target's banner", got)
+	}
+	if got := len(dials.dialled()); got != 1 {
+		t.Fatalf("%d dials for the admitted client, want 1", got)
+	}
+
+	for i, tc := range []struct {
+		name   string
+		cert   *tls.Certificate
+		reason string
+		issuer *testCA // nil: the line names no certificate
+	}{
+		{name: "no certificate", reason: IngressRefusalNoCertificate},
+		{name: "a leaf of another authority", cert: &strangerLeaf, reason: IngressRefusalUnknownAuthority, issuer: stranger},
+		{name: "an expired leaf", cert: &expired, reason: IngressRefusalCertificateExpired, issuer: ca},
+		{name: "a leaf for server authentication only", cert: &serverOnly, reason: IngressRefusalCertificateInvalid, issuer: ca},
+	} {
+		integRequireRefused(t, addr, serverName, tc.cert, version)
+		fx.logs.waitFor(t, `msg="ingress client refused"`, i+1)
+		needles := []string{
+			"level=DEBUG", `msg="ingress client refused"`, "component=bridge", "listen_port=", "remote=",
+			"server_name=" + serverName, "rule_id=id-" + slug, "slug=" + slug, "reason=" + tc.reason,
+		}
+		if tc.issuer != nil {
+			needles = append(needles, "issuer=", tc.issuer.cert.Subject.String(), "not_after=", "fingerprint_sha256="+integFingerprint(tc.cert))
+		}
+		if got := logLines(fx.logs, needles...); got != 1 {
+			t.Errorf("%s: %d 'ingress client refused' lines with %q, want 1:\n%s", tc.name, got, needles, fx.logs.String())
+		}
+		if got := logLines(fx.logs, `msg="ingress client refused"`, "reason="+tc.reason); got != 1 {
+			t.Errorf("%s: %d 'ingress client refused' lines with reason=%s, want 1:\n%s", tc.name, got, tc.reason, fx.logs.String())
+		}
+		if got := len(dials.dialled()); got != 1 {
+			t.Errorf("%s: %d dials, want only the admitted client's", tc.name, got)
+		}
+	}
+
+	if got := logLines(fx.logs, `msg="ingress client refused"`, " subject="); got != 0 {
+		t.Errorf("%d 'ingress client refused' lines with a subject key, want none:\n%s", got, fx.logs.String())
+	}
+	for _, cn := range []string{"integ-good-leaf", "integ-stranger-leaf", "integ-expired-leaf", "integ-server-leaf"} {
+		if strings.Contains(fx.logs.String(), cn) {
+			t.Errorf("the log names the subject %s:\n%s", cn, fx.logs.String())
+		}
+	}
+	if got := logLines(fx.logs, `msg="ingress connection closed"`); got != 0 {
+		t.Errorf("%d 'ingress connection closed' lines, want every refusal on a line of its own:\n%s", got, fx.logs.String())
+	}
+	want := []IngressClientRefusalReport{
+		{Reason: IngressRefusalNoCertificate, At: relayStart},
+		{Reason: IngressRefusalUnknownAuthority, At: relayStart},
+		{Reason: IngressRefusalCertificateExpired, At: relayStart},
+		{Reason: IngressRefusalCertificateInvalid, At: relayStart},
+	}
+	if got := integRefusalsOf(fx.mgr, "id-"+slug).snapshot(); !integSameRefusals(got, want) {
+		t.Errorf("refusals = %+v, want %+v", got, want)
+	}
+}
+
+// TestIngressIntegration_ClientCertificateAdmitsAndRefuses serves a terminate
+// rule with client_auth to a client with a leaf of the rule's authority and
+// refuses a client without a certificate, with a leaf of another authority,
+// with an expired leaf and with a leaf for server authentication only, in TLS
+// 1.2 and TLS 1.3.
+func TestIngressIntegration_ClientCertificateAdmitsAndRefuses(t *testing.T) {
+	for _, v := range integTLSVersions {
+		t.Run(v.name, func(t *testing.T) {
+			backend := startBackend(t, "tcp", "127.0.0.1:0", banner("tgt\n"))
+			ctrl := newLoopbackIngressController(t)
+			fx, _, dials := newDialLogFixture(t, ctrl)
+			fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+			fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+			ca := newTestCA(t, "integ-client-ca", nil)
+			rule := terminateRule("term", 443, "t.example.com", "tls", backend.port(t))
+			withClientAuth(ca.pem)(&rule)
+			if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			integRequireAdmitsAndRefuses(t, fx, dials, ctrl.addr(443), "t.example.com", "term", ca, v.version)
+		})
+	}
+}
+
+// TestIngressIntegration_ClientCertificateOnACMERule does the same for an
+// acme rule with client_auth, whose certificate the ACME account supplies.
+func TestIngressIntegration_ClientCertificateOnACMERule(t *testing.T) {
+	for _, v := range integTLSVersions {
+		t.Run(v.name, func(t *testing.T) {
+			backend := startBackend(t, "tcp", "127.0.0.1:0", banner("tgt\n"))
+			ctrl := newLoopbackIngressController(t)
+			fx, _, dials := newDialLogFixture(t, ctrl)
+			hookCertificate(t, fx.acme, "acme.example.com")
+			ca := newTestCA(t, "integ-client-ca", nil)
+			rule := acmeRule("acme", 8443, "acme.example.com", backend.port(t))
+			withClientAuth(ca.pem)(&rule)
+			if err := fx.mgr.Apply(t.Context(), api.IngressConfig{Rules: []api.IngressRule{rule}, ACME: testACME}); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if st := stateOf(t, fx.mgr, "acme"); !st.Served {
+				t.Fatalf("rule acme = %+v, want served", st)
+			}
+
+			integRequireAdmitsAndRefuses(t, fx, dials, ctrl.addr(8443), "acme.example.com", "acme", ca, v.version)
+		})
+	}
+}
+
+// TestIngressIntegration_ACMEChallengeAsksForNoClientCertificate answers a
+// TLS-ALPN-01 challenge for the host of an acme rule with client_auth on port
+// 443 without asking the client for a certificate, while an ordinary client
+// of the same host is asked for one.
+func TestIngressIntegration_ACMEChallengeAsksForNoClientCertificate(t *testing.T) {
+	for _, v := range integTLSVersions {
+		t.Run(v.name, func(t *testing.T) {
+			backend := startBackend(t, "tcp", "127.0.0.1:0", banner("tgt\n"))
+			ctrl := newLoopbackIngressController(t)
+			fx, _, dials := newDialLogFixture(t, ctrl)
+			hookCertificate(t, fx.acme, "acme.example.com")
+			ca := newTestCA(t, "integ-client-ca", nil)
+			rule := acmeRule("acme", acmeChallengePort, "acme.example.com", backend.port(t))
+			withClientAuth(ca.pem)(&rule)
+			if err := fx.mgr.Apply(t.Context(), api.IngressConfig{Rules: []api.IngressRule{rule}, ACME: testACME}); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if st := stateOf(t, fx.mgr, "acme"); !st.Served {
+				t.Fatalf("rule acme = %+v, want served", st)
+			}
+			leaf := ca.issue(t, "integ-good-leaf", nil)
+			var asked atomic.Int32
+			client := func(protos ...string) func(*tls.Config) {
+				return func(cfg *tls.Config) {
+					integPinVersion(v.version)(cfg)
+					cfg.NextProtos = protos
+					cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+						asked.Add(1)
+						return &leaf, nil
+					}
+				}
+			}
+
+			conn, err := dialTLSClient(t, ctrl.addr(acmeChallengePort), "acme.example.com", nil, client("acme-tls/1"))
+			if err != nil {
+				t.Fatalf("challenge handshake: %v", err)
+			}
+			if p := conn.ConnectionState().NegotiatedProtocol; p != "acme-tls/1" {
+				t.Errorf("the challenge negotiated protocol %q, want acme-tls/1", p)
+			}
+			fx.logs.waitFor(t, `msg="ingress acme challenge answered" component=bridge server_name=acme.example.com`, 1)
+			if n := asked.Load(); n != 0 {
+				t.Errorf("the challenge handshake asked the client for a certificate %d times, want never", n)
+			}
+			if got := dials.dialled(); len(got) != 0 {
+				t.Errorf("dials = %v after the challenge, want none", got)
+			}
+
+			// The same host without acme-tls/1 is a client of the rule, which
+			// asks for a certificate.
+			ordinary, err := dialTLSClient(t, ctrl.addr(acmeChallengePort), "acme.example.com", nil, client())
+			if err != nil {
+				t.Fatalf("ordinary handshake: %v", err)
+			}
+			if got := bannerOf(t, ordinary); got != "tgt\n" {
+				t.Errorf("the ordinary client read %q, want the target's banner", got)
+			}
+			if n := asked.Load(); n != 1 {
+				t.Errorf("the ordinary handshake asked the client for a certificate %d times, want once", n)
+			}
+		})
+	}
+}
+
+// TestIngressIntegration_ClientWithoutItsKeyIsRefused refuses a client that
+// presents a chain of the rule's authority but signs with another key.
+func TestIngressIntegration_ClientWithoutItsKeyIsRefused(t *testing.T) {
+	for _, v := range integTLSVersions {
+		t.Run(v.name, func(t *testing.T) {
+			backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+			ctrl := newLoopbackIngressController(t)
+			fx, _, dials := newDialLogFixture(t, ctrl)
+			fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+			fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+			ca := newTestCA(t, "integ-client-ca", nil)
+			rule := terminateRule("term", 443, "t.example.com", "tls", backend.port(t))
+			withClientAuth(ca.pem)(&rule)
+			if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			good := ca.issue(t, "integ-good-leaf", nil)
+			otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatalf("generate key: %v", err)
+			}
+			thief := tls.Certificate{Certificate: good.Certificate, PrivateKey: otherKey, Leaf: good.Leaf}
+
+			integRequireRefused(t, ctrl.addr(443), "t.example.com", &thief, v.version)
+			fx.logs.waitFor(t, `msg="ingress client refused"`, 1)
+			if got := logLines(fx.logs, "level=DEBUG", `msg="ingress client refused"`, "slug=term", "reason="+IngressRefusalCertificateInvalid); got != 1 {
+				t.Errorf("%d 'ingress client refused' lines with reason=%s, want 1:\n%s", got, IngressRefusalCertificateInvalid, fx.logs.String())
+			}
+			if got := dials.dialled(); len(got) != 0 {
+				t.Errorf("dials = %v, want none", got)
+			}
+			want := []IngressClientRefusalReport{{Reason: IngressRefusalCertificateInvalid, At: relayStart}}
+			if got := integRefusalsOf(fx.mgr, rule.ID).snapshot(); !integSameRefusals(got, want) {
+				t.Errorf("refusals = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// integClientHello returns the ClientHello a Go client sends for serverName
+// that offers version as its highest.
+func integClientHello(t *testing.T, serverName string, version uint16) []byte {
+	t.Helper()
+	conn, _, stop := startTLSClient(t, &tls.Config{ServerName: serverName, MaxVersion: version}, 0)
+	_, peeked, err := peekClientHello(conn, 2*time.Second)
+	stop()
+	if err != nil {
+		t.Fatalf("peek the client hello: %v", err)
+	}
+	return peeked
+}
+
+// TestIngressIntegration_ClientThatStallsIsNotRefused closes a client of a
+// rule with client_auth that sends its ClientHello and nothing more after the
+// handshake timeout, as a failed handshake, and records no refusal.
+func TestIngressIntegration_ClientThatStallsIsNotRefused(t *testing.T) {
+	for _, v := range integTLSVersions {
+		t.Run(v.name, func(t *testing.T) {
+			backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+			ctrl := newLoopbackIngressController(t)
+			fx, _, dials := newDialLogFixture(t, ctrl)
+			const handshakeTimeout = 300 * time.Millisecond
+			fx.mgr.handshakeTimeout = handshakeTimeout
+			fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+			fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+			rule := terminateRule("term", 443, "t.example.com", "tls", backend.port(t))
+			withClientAuth(newTestCA(t, "integ-client-ca", nil).pem)(&rule)
+			if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			hello := integClientHello(t, "t.example.com", v.version)
+
+			raw, err := net.DialTimeout("tcp", ctrl.addr(443), 2*time.Second)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer raw.Close()
+			start := time.Now()
+			if _, err := raw.Write(hello); err != nil {
+				t.Fatalf("write the client hello: %v", err)
+			}
+			_ = raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := io.Copy(io.Discard, raw); err != nil {
+				t.Fatalf("read until the bridge closes: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed < handshakeTimeout {
+				t.Errorf("closed after %v, want the %v handshake timeout", elapsed, handshakeTimeout)
+			}
+			fx.logs.waitFor(t, "reason=tls_handshake_failed", 1)
+			if got := logLines(fx.logs, "level=DEBUG", `msg="ingress connection closed"`, "server_name=t.example.com", "reason=tls_handshake_failed"); got != 1 {
+				t.Errorf("%d 'ingress connection closed' lines with reason=tls_handshake_failed, want 1:\n%s", got, fx.logs.String())
+			}
+			if got := logLines(fx.logs, `msg="ingress client refused"`); got != 0 {
+				t.Errorf("%d 'ingress client refused' lines, want none:\n%s", got, fx.logs.String())
+			}
+			if got := integRefusalsOf(fx.mgr, rule.ID).snapshot(); got != nil {
+				t.Errorf("refusals = %+v, want none", got)
+			}
+			if got := dials.dialled(); len(got) != 0 {
+				t.Errorf("dials = %v, want none", got)
+			}
+		})
+	}
+}
+
+// TestIngressIntegration_ClientCAInvalidServesNobody binds the port of a rule
+// whose client_auth bundle does not build, closes every client of its host
+// before a handshake, and logs the defect once without a byte of the bundle.
+// A one-byte bundle cannot be searched for in the log, so a second rule holds
+// a bundle whose second block is truncated, whose lines the log must not hold.
+func TestIngressIntegration_ClientCAInvalidServesNobody(t *testing.T) {
+	backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+	ctrl := newLoopbackIngressController(t)
+	fx, _, dials := newDialLogFixture(t, ctrl)
+	fx.certs.set("tls", 1, certPEM(t, "*.example.com", "v1"))
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+	ca := newTestCA(t, "integ-client-ca", nil)
+	caLines := strings.Split(strings.TrimSpace(ca.pem), "\n")
+	truncated := ca.pem + strings.Join(caLines[:3], "\n") + "\n"
+	one := terminateRule("one", 443, "one.example.com", "tls", backend.port(t))
+	withClientAuth("x")(&one)
+	cut := terminateRule("cut", 443, "cut.example.com", "tls", backend.port(t))
+	withClientAuth(truncated)(&cut)
+	for range 2 {
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(one, cut)); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+	}
+
+	if got := ctrl.listenAddrs(); !slices.Equal(got, []string{":443"}) {
+		t.Fatalf("Listen addresses = %v, want [:443]", got)
+	}
+	for _, tc := range []struct{ slug, host, detail string }{
+		{slug: "one", host: "one.example.com", detail: "no PEM block"},
+		{slug: "cut", host: "cut.example.com", detail: "a PEM block does not decode"},
+	} {
+		if st := stateOf(t, fx.mgr, tc.slug); st.Served || st.Reason != IngressReasonClientCAInvalid || st.Detail != tc.detail {
+			t.Errorf("rule %s = %+v, want not served with %s and the detail %q", tc.slug, st, IngressReasonClientCAInvalid, tc.detail)
+		}
+		var asked atomic.Int32
+		leaf := ca.issue(t, "integ-good-leaf", nil)
+		conn, err := dialTLSClient(t, ctrl.addr(443), tc.host, nil, func(cfg *tls.Config) {
+			cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				asked.Add(1)
+				return &leaf, nil
+			}
+		})
+		if err == nil {
+			requireClosed(t, conn)
+			t.Errorf("rule %s: the handshake completed, want the bridge to close the connection before it", tc.slug)
+		}
+		fx.logs.waitFor(t, "server_name="+tc.host+" reason=rule_not_served", 1)
+		if n := asked.Load(); n != 0 {
+			t.Errorf("rule %s: the client was asked for a certificate %d times, want never", tc.slug, n)
+		}
+		if got := logLines(fx.logs, "level=WARN", `msg="ingress rule not served"`, "slug="+tc.slug, "reason="+IngressReasonClientCAInvalid, `detail="`+tc.detail+`"`); got != 1 {
+			t.Errorf("%d 'ingress rule not served' lines for %s with reason=%s, want 1:\n%s", got, tc.slug, IngressReasonClientCAInvalid, fx.logs.String())
+		}
+	}
+	if got := logLines(fx.logs, `msg="ingress rule not served"`); got != 2 {
+		t.Errorf("%d 'ingress rule not served' lines, want one per rule:\n%s", got, fx.logs.String())
+	}
+	logged := fx.logs.String()
+	for _, line := range caLines[1 : len(caLines)-1] {
+		if strings.Contains(logged, line) {
+			t.Errorf("the log holds the bundle's line %q:\n%s", line, logged)
+		}
+	}
+	if strings.Contains(logged, "ca_bundle") {
+		t.Errorf("the log holds a ca_bundle key:\n%s", logged)
+	}
+	if got := logLines(fx.logs, `msg="ingress client refused"`); got != 0 {
+		t.Errorf("%d 'ingress client refused' lines, want none:\n%s", got, logged)
+	}
+	if got := dials.dialled(); len(got) != 0 {
+		t.Errorf("dials = %v, want none", got)
+	}
+}
+
+// TestIngressIntegration_ChangedClientAuthClosesConnections closes the
+// established connection of a terminate rule when an Apply adds a second
+// authority, reorders the bundle, removes client_auth and adds it back,
+// keeps the listener, and verifies the next handshake by the new member.
+func TestIngressIntegration_ChangedClientAuthClosesConnections(t *testing.T) {
+	backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+	ctrl := newLoopbackIngressController(t)
+	fx := newIngressFixture(t, ctrl)
+	fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+	caA, caB := newTestCA(t, "integ-ca-a", nil), newTestCA(t, "integ-ca-b", nil)
+	leafA, leafB := caA.issue(t, "integ-leaf-a", nil), caB.issue(t, "integ-leaf-b", nil)
+	rule := terminateRule("term", 443, "t.example.com", "tls", backend.port(t))
+	apply := func(clientAuth *api.IngressClientAuth) {
+		t.Helper()
+		r := rule
+		r.ClientAuth = clientAuth
+		if err := fx.mgr.Apply(t.Context(), rulesBlock(r)); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+	}
+	apply(&api.IngressClientAuth{CABundle: caA.pem})
+	addr := ctrl.addr(443)
+	conn := integRequireAdmitted(t, addr, "t.example.com", &leafA, "leaf a under a")
+	integRequireRefused(t, addr, "t.example.com", &leafB, tls.VersionTLS13)
+
+	for _, step := range []struct {
+		name       string
+		clientAuth *api.IngressClientAuth
+		admitted   []*tls.Certificate // nil: a client without a certificate
+		refused    []*tls.Certificate
+	}{
+		{name: "adds a second authority", clientAuth: &api.IngressClientAuth{CABundle: caBundle(caA, caB)}, admitted: []*tls.Certificate{&leafB, &leafA}},
+		{name: "reorders the bundle", clientAuth: &api.IngressClientAuth{CABundle: caBundle(caB, caA)}, admitted: []*tls.Certificate{&leafB, &leafA}},
+		{name: "removes client_auth", admitted: []*tls.Certificate{nil}},
+		{name: "adds client_auth back", clientAuth: &api.IngressClientAuth{CABundle: caA.pem}, admitted: []*tls.Certificate{&leafA}, refused: []*tls.Certificate{nil, &leafB}},
+	} {
+		apply(step.clientAuth)
+		requireClosed(t, conn)
+		if got := len(ctrl.ingressCallsFor("Listen")); got != 1 {
+			t.Errorf("%s: Listen calls = %d, want still 1", step.name, got)
+		}
+		for _, cert := range step.refused {
+			integRequireRefused(t, addr, "t.example.com", cert, tls.VersionTLS13)
+		}
+		for i, cert := range step.admitted {
+			conn = integRequireAdmitted(t, addr, "t.example.com", cert, step.name+" "+strconv.Itoa(i))
+		}
+	}
+	if got := len(ctrl.ingressCallsFor("Close")); got != 0 {
+		t.Errorf("Close calls = %d, want 0", got)
+	}
+	if got := logLines(fx.logs, `msg="ingress rule updated"`, "slug=term"); got != 4 {
+		t.Errorf("%d 'ingress rule updated' lines, want one per change:\n%s", got, fx.logs.String())
+	}
+	fx.logs.waitFor(t, `msg="ingress client refused"`, 3)
+	for _, reason := range []string{IngressRefusalUnknownAuthority, IngressRefusalNoCertificate} {
+		if got := logLines(fx.logs, `msg="ingress client refused"`, "reason="+reason); got == 0 {
+			t.Errorf("no 'ingress client refused' line with reason=%s:\n%s", reason, fx.logs.String())
+		}
+	}
+}
+
+// TestIngressIntegration_SameClientAuthKeepsConnectionsAndRefusals applies the
+// same block twice, the bundle text behind a new pointer: the established
+// connections and the refusal record stay, and "ingress rule added" names
+// client_auth for the rule with it and the rule without it.
+func TestIngressIntegration_SameClientAuthKeepsConnectionsAndRefusals(t *testing.T) {
+	backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+	ctrl := newLoopbackIngressController(t)
+	fx, _, _ := newDialLogFixture(t, ctrl)
+	fx.certs.set("tls", 1, certPEM(t, "*.example.com", "v1"))
+	fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+	ca := newTestCA(t, "integ-client-ca", nil)
+	block := func() api.IngressConfig {
+		auth := terminateRule("auth", 443, "auth.example.com", "tls", backend.port(t))
+		withClientAuth(ca.pem)(&auth)
+		open := terminateRule("open", 443, "open.example.com", "tls", backend.port(t))
+		return rulesBlock(auth, open)
+	}
+	if err := fx.mgr.Apply(t.Context(), block()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	addr := ctrl.addr(443)
+	leaf := ca.issue(t, "integ-good-leaf", nil)
+	authConn := integRequireAdmitted(t, addr, "auth.example.com", &leaf, "auth before")
+	openConn := integRequireAdmitted(t, addr, "open.example.com", nil, "open before")
+	integRequireRefused(t, addr, "auth.example.com", nil, tls.VersionTLS13)
+	fx.logs.waitFor(t, `msg="ingress client refused"`, 1)
+	record := integRefusalsOf(fx.mgr, "id-auth")
+	want := []IngressClientRefusalReport{{Reason: IngressRefusalNoCertificate, At: relayStart}}
+	if got := record.snapshot(); !integSameRefusals(got, want) {
+		t.Fatalf("refusals before the second Apply = %+v, want %+v", got, want)
+	}
+
+	if err := fx.mgr.Apply(t.Context(), block()); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	requireEcho(t, authConn, "auth after")
+	requireEcho(t, openConn, "open after")
+	if got := integRefusalsOf(fx.mgr, "id-auth"); got != record {
+		t.Errorf("the second Apply gave the rule the refusal record %p, want the kept %p", got, record)
+	}
+	if got := record.snapshot(); !integSameRefusals(got, want) {
+		t.Errorf("refusals after the second Apply = %+v, want %+v", got, want)
+	}
+	if got := integRefusalsOf(fx.mgr, "id-open"); got != nil {
+		t.Errorf("the rule without client_auth has the refusal record %p, want none", got)
+	}
+	if got := len(ctrl.ingressCallsFor("Listen")); got != 1 {
+		t.Errorf("Listen calls = %d, want 1", got)
+	}
+	if got := logLines(fx.logs, `msg="ingress rule added"`, "slug=auth", "client_auth=true"); got != 1 {
+		t.Errorf("%d 'ingress rule added' lines for auth with client_auth=true, want 1:\n%s", got, fx.logs.String())
+	}
+	if got := logLines(fx.logs, `msg="ingress rule added"`, "slug=open", "client_auth=false"); got != 1 {
+		t.Errorf("%d 'ingress rule added' lines for open with client_auth=false, want 1:\n%s", got, fx.logs.String())
+	}
+	if got := logLines(fx.logs, `msg="ingress rule updated"`); got != 0 {
+		t.Errorf("%d 'ingress rule updated' lines, want none:\n%s", got, fx.logs.String())
+	}
+}
+
+// integSessionCache is a client session cache that counts the sessions it was
+// handed and the lookups it answered with one.
+type integSessionCache struct {
+	tls.ClientSessionCache
+	puts atomic.Int32
+	hits atomic.Int32
+}
+
+func (c *integSessionCache) Get(key string) (*tls.ClientSessionState, bool) {
+	session, ok := c.ClientSessionCache.Get(key)
+	if ok {
+		c.hits.Add(1)
+	}
+	return session, ok
+}
+
+func (c *integSessionCache) Put(key string, session *tls.ClientSessionState) {
+	if session != nil {
+		c.puts.Add(1)
+	}
+	c.ClientSessionCache.Put(key, session)
+}
+
+// TestIngressIntegration_ClientSessionIsNotResumed offers the session of a
+// client's first connection to a rule with client_auth on its second, which
+// completes a full handshake.
+func TestIngressIntegration_ClientSessionIsNotResumed(t *testing.T) {
+	for _, v := range integTLSVersions {
+		t.Run(v.name, func(t *testing.T) {
+			backend := startBackend(t, "tcp", "127.0.0.1:0", echo)
+			ctrl := newLoopbackIngressController(t)
+			fx := newIngressFixture(t, ctrl)
+			fx.certs.set("tls", 1, certPEM(t, "t.example.com", "v1"))
+			fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("tls", 1))
+			ca := newTestCA(t, "integ-client-ca", nil)
+			rule := terminateRule("term", 443, "t.example.com", "tls", backend.port(t))
+			withClientAuth(ca.pem)(&rule)
+			if err := fx.mgr.Apply(t.Context(), rulesBlock(rule)); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			leaf := ca.issue(t, "integ-good-leaf", nil)
+			cache := &integSessionCache{ClientSessionCache: tls.NewLRUClientSessionCache(4)}
+			client := func(cfg *tls.Config) {
+				integPinVersion(v.version)(cfg)
+				cfg.ClientSessionCache = cache
+			}
+
+			first, err := dialTLSClient(t, ctrl.addr(443), "t.example.com", &leaf, client)
+			if err != nil {
+				t.Fatalf("first handshake: %v", err)
+			}
+			// A TLS 1.3 client reads its session ticket with the first bytes
+			// after the handshake.
+			requireEcho(t, first, "first")
+			_ = first.Close()
+			if n := cache.puts.Load(); n == 0 {
+				t.Fatal("the client holds no session after its first connection, want one to offer")
+			}
+
+			second, err := dialTLSClient(t, ctrl.addr(443), "t.example.com", &leaf, client)
+			if err != nil {
+				t.Fatalf("second handshake: %v", err)
+			}
+			if n := cache.hits.Load(); n != 1 {
+				t.Errorf("the second handshake found %d sessions to offer, want 1", n)
+			}
+			if second.ConnectionState().DidResume {
+				t.Error("the second connection resumed the first's session, want a full handshake")
+			}
+			requireEcho(t, second, "second")
+		})
+	}
 }

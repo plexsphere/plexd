@@ -55,13 +55,15 @@ func TestPlanIngress_ReasonPerCheck(t *testing.T) {
 		t.Fatalf("hostOfLen(254) is %d bytes", got)
 	}
 
-	for _, tc := range []struct {
+	bundle := caBundle(newTestCA(t, "client-ca", nil))
+	type check struct {
 		name   string
 		before []api.IngressRule // rules ahead of the one checked
 		edit   func(*api.IngressRule)
 		reason string
 		detail string
-	}{
+	}
+	checks := []check{
 		{name: "empty id", edit: func(r *api.IngressRule) { r.ID = "" }, reason: IngressReasonInvalid, detail: "id"},
 		{name: "duplicate id", before: []api.IngressRule{planRule("first", 443, "first.example.com")}, edit: func(r *api.IngressRule) { r.ID = "id-first" }, reason: IngressReasonDuplicateID},
 		{name: "mode tcp", edit: func(r *api.IngressRule) { r.Mode = "tcp" }, reason: IngressReasonInvalid, detail: "mode"},
@@ -99,7 +101,49 @@ func TestPlanIngress_ReasonPerCheck(t *testing.T) {
 		{name: "terminate with the header name Host", edit: withConditions("/api", "Host", "x"), reason: IngressReasonInvalid, detail: "conditions.headers"},
 		{name: "terminate with strip_path_prefix and no prefix", edit: func(r *api.IngressRule) { withConditions("")(r); r.StripPathPrefix = true }, reason: IngressReasonInvalid, detail: "strip_path_prefix"},
 		{name: "terminate with conditions is held", edit: withConditions("/api", "x-a", "1")},
-	} {
+		{name: "client_auth on a tcp passthrough rule", edit: withClientAuth(bundle), reason: IngressReasonInvalid, detail: "client_auth"},
+		{name: "an empty client_auth on a tcp passthrough rule", edit: withClientAuth(""), reason: IngressReasonInvalid, detail: "client_auth"},
+		{name: "client_auth on a udp rule", edit: func(r *api.IngressRule) {
+			r.Protocol, r.SNIHost = api.IngressProtocolUDP, ""
+			withClientAuth(bundle)(r)
+		}, reason: IngressReasonInvalid, detail: "client_auth"},
+		{name: "client_auth on a passthrough rule a held rule's host conflicts with", before: []api.IngressRule{planRule("holder", 443, "web.example.com")}, edit: withClientAuth(bundle), reason: IngressReasonInvalid, detail: "client_auth"},
+		{name: "client_auth on a udp rule of mode terminate", edit: func(r *api.IngressRule) {
+			r.Protocol, r.SNIHost = api.IngressProtocolUDP, ""
+			terminateNamed("tls")(r)
+			withClientAuth(bundle)(r)
+		}, reason: IngressReasonInvalid, detail: "mode"},
+		{name: "client_auth on a passthrough rule with conditions", edit: func(r *api.IngressRule) {
+			r.Conditions.PathPrefix = "/api"
+			withClientAuth(bundle)(r)
+		}, reason: IngressReasonInvalid, detail: "conditions"},
+		{name: "client_auth on a passthrough rule with strip_path_prefix and no prefix", edit: func(r *api.IngressRule) {
+			r.StripPathPrefix = true
+			withClientAuth(bundle)(r)
+		}, reason: IngressReasonInvalid, detail: "strip_path_prefix"},
+		{name: "terminate with client_auth is held", edit: func(r *api.IngressRule) { terminateNamed("tls")(r); withClientAuth(bundle)(r) }},
+		{name: "acme with client_auth is held", edit: func(r *api.IngressRule) { r.Mode = api.IngressModeACME; withClientAuth(bundle)(r) }},
+		{name: "terminate with conditions and client_auth is held", edit: func(r *api.IngressRule) { withConditions("/api")(r); withClientAuth(bundle)(r) }},
+	}
+	// client_auth is the last check of the switch: every rule that fails an
+	// earlier check reads that check's reason also with an empty client_auth,
+	// which a passthrough rule would read as client_auth and a terminate or
+	// acme rule as client_ca_invalid.
+	for _, tc := range slices.Clone(checks) {
+		probe := planRule("web", 443, "web.example.com")
+		tc.edit(&probe)
+		if (tc.reason != IngressReasonInvalid && tc.reason != IngressReasonDuplicateID) || probe.ClientAuth != nil {
+			continue
+		}
+		edit := tc.edit
+		tc.name += " and an empty client_auth"
+		tc.edit = func(r *api.IngressRule) {
+			edit(r)
+			withClientAuth("")(r)
+		}
+		checks = append(checks, tc)
+	}
+	for _, tc := range checks {
 		t.Run(tc.name, func(t *testing.T) {
 			r := planRule("web", 443, "web.example.com")
 			tc.edit(&r)
@@ -398,11 +442,46 @@ func TestPlanIngress_SharedHost(t *testing.T) {
 	acmeWith.Mode, acmeWith.CertificateSecretName = api.IngressModeACME, ""
 	otherSecret := condRule("other", "shop.example.com", "/other")
 	otherSecret.CertificateSecretName = "tls-other"
+
+	ca1, ca2, ca3 := newTestCA(t, "client-ca-1", nil), newTestCA(t, "client-ca-2", nil), newTestCA(t, "client-ca-3", nil)
+	authed := func(slug, prefix, bundle string) api.IngressRule {
+		r := condRule(slug, "shop.example.com", prefix)
+		withClientAuth(bundle)(&r)
+		return r
+	}
+	t.Run("two rules whose bundles hold the same certificates in another order", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{
+			authed("first", "/api", caBundle(ca1, ca2)),
+			authed("second", "/", caBundle(ca2, ca1)),
+		}, 20, acmeAvailability{})
+		for _, st := range plan.states {
+			if !st.held || !st.Served || st.Reason != "" {
+				t.Errorf("rule %s = %+v, want held and served", st.Rule.Slug, st)
+			}
+		}
+		host := plan.tables[443].exact["shop.example.com"]
+		if host == nil || !host.http || len(host.routes) != 2 {
+			t.Fatalf("host = %+v, want an http host with two routes", host)
+		}
+		for _, r := range host.routes {
+			if r.clientAuth == nil || r.clientAuth.key != authKeyOf(ca1, ca2) {
+				t.Errorf("route %s authorities = %+v, want the key of both CAs", r.rule.Slug, r.clientAuth)
+			}
+		}
+	})
+
 	for _, tc := range []struct {
 		name   string
 		rules  []api.IngressRule // the last one is checked
 		detail string
 	}{
+		{name: "a rule with another client authority", rules: []api.IngressRule{authed("first", "/api", caBundle(ca1, ca2)), authed("second", "/", caBundle(ca2, ca1)), authed("third", "/third", caBundle(ca3))}, detail: "first"},
+		{name: "a rule with one more client authority", rules: []api.IngressRule{authed("first", "/api", caBundle(ca1, ca2)), authed("second", "/", caBundle(ca1, ca2, ca3))}, detail: "first"},
+		{name: "a rule with fewer client authorities", rules: []api.IngressRule{authed("first", "/api", caBundle(ca1, ca2)), authed("second", "/", caBundle(ca1))}, detail: "first"},
+		{name: "a rule without client_auth on a host whose rules have it", rules: []api.IngressRule{authed("first", "/api", caBundle(ca1, ca2)), authed("second", "/", caBundle(ca2, ca1)), condRule("third", "shop.example.com", "/third")}, detail: "first"},
+		{name: "a rule with client_auth on a host whose rules have none", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), condRule("second", "shop.example.com", "/"), authed("third", "/third", caBundle(ca1))}, detail: "first"},
+		{name: "a rule whose bundle does not build on a host whose bundle builds", rules: []api.IngressRule{authed("first", "/api", caBundle(ca1)), authed("second", "/", "x")}, detail: "first"},
+		{name: "two bundles that do not build in other bytes", rules: []api.IngressRule{authed("first", "/api", "x"), authed("second", "/", "y")}, detail: "first"},
 		{name: "a rule without conditions on a host a rule with conditions holds", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), condRule("second", "shop.example.com", "/"), noConditions}, detail: "first"},
 		{name: "a rule with conditions on a host a rule without conditions holds", rules: []api.IngressRule{noConditions, condRule("api", "shop.example.com", "/api")}, detail: "plainhost"},
 		{name: "a passthrough rule on a host rules with conditions hold", rules: []api.IngressRule{condRule("first", "shop.example.com", "/api"), planRule("pass", 443, "shop.example.com")}, detail: "first"},
@@ -931,6 +1010,141 @@ func acmePlanRule(slug string, port int, host string) api.IngressRule {
 	r := planRule(slug, port, host)
 	r.Mode = api.IngressModeACME
 	return r
+}
+
+// authPlanRoute returns the route of the rule for host on port, the host's
+// lead route.
+func authPlanRoute(t *testing.T, plan ingressPlan, port int, host string) *ingressRoute {
+	t.Helper()
+	tbl := plan.tables[port]
+	if tbl == nil || tbl.exact[host] == nil || len(tbl.exact[host].routes) == 0 {
+		t.Fatalf("no route for %s on port %d", host, port)
+	}
+	return tbl.exact[host].lead()
+}
+
+// TestPlanIngress_ClientAuth gives a held terminate or acme rule with
+// client_auth its client authorities, and holds a rule whose bundle does not
+// build without serving it.
+func TestPlanIngress_ClientAuth(t *testing.T) {
+	ca := newTestCA(t, "client-ca", nil)
+	bundle := caBundle(ca)
+	term := planRule("term", 443, "term.example.com")
+	terminateNamed("tls")(&term)
+	acme := acmePlanRule("acme", 443, "acme.example.com")
+	with := func(r api.IngressRule, bundle string) api.IngressRule {
+		withClientAuth(bundle)(&r)
+		return r
+	}
+
+	t.Run("a bundle that builds", func(t *testing.T) {
+		plain := planRule("plain", 443, "plain.example.com")
+		terminateNamed("tls")(&plain)
+		plan := planIngress([]api.IngressRule{with(term, bundle), with(acme, bundle), plain}, 20, acmeAvailability{})
+		for _, st := range plan.states {
+			if !st.held || !st.Served || st.Reason != "" || st.Detail != "" {
+				t.Errorf("rule %s = %+v, want held and served", st.Rule.Slug, st)
+			}
+		}
+		leaf := ca.issue(t, "client", nil).Leaf
+		for _, host := range []string{"term.example.com", "acme.example.com"} {
+			route := authPlanRoute(t, plan, 443, host)
+			if !route.served {
+				t.Errorf("route of %s is not served", host)
+			}
+			if route.clientAuth == nil {
+				t.Fatalf("route of %s has no client authorities", host)
+			}
+			if route.clientAuth.defect != "" || route.clientAuth.key != authKeyOf(ca) {
+				t.Errorf("route of %s authorities = %+v, want the CA's key and no defect", host, route.clientAuth)
+			}
+			if err := authVerify(route.clientAuth.pool, leaf); err != nil {
+				t.Errorf("a leaf of the CA does not verify against the route of %s: %v", host, err)
+			}
+			if route.refusals != nil {
+				t.Errorf("route of %s has refusals, want none from the planner", host)
+			}
+		}
+		if route := authPlanRoute(t, plan, 443, "plain.example.com"); route.clientAuth != nil || route.refusals != nil {
+			t.Errorf("route of a rule without client_auth = %+v, want no authorities", route)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		acme  acmeAvailability
+		rules []api.IngressRule
+	}{
+		{name: "an empty client_auth", rules: []api.IngressRule{with(term, ""), with(acme, "")}},
+		{name: "an empty client_auth under an invalid directory", acme: acmeAvailability{Reason: IngressReasonACMEDirectoryInvalid}, rules: []api.IngressRule{with(term, ""), with(acme, "")}},
+		{name: "an empty client_auth on an acme rule whose challenge port another rule takes", rules: []api.IngressRule{
+			with(acmePlanRule("acme", 8443, "acme.example.com"), ""),
+			planRule("pass", 443, "acme.example.com"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := planIngress(tc.rules, 20, tc.acme)
+			for _, st := range plan.states {
+				if st.Rule.ClientAuth == nil {
+					continue
+				}
+				if !st.held || st.Served || st.Reason != IngressReasonClientCAInvalid || st.Detail != "empty" {
+					t.Errorf("rule %s = %+v, want held, not served, %q with the detail empty", st.Rule.Slug, st, IngressReasonClientCAInvalid)
+				}
+				route := authPlanRoute(t, plan, st.Rule.ListenPort, st.Rule.SNIHost)
+				if route.served || route.clientAuth == nil || route.clientAuth.defect != "empty" {
+					t.Errorf("route of %s = %+v, want one that is not served with the defect empty", st.Rule.Slug, route)
+				}
+			}
+		})
+	}
+
+	t.Run("a bundle that builds under an invalid directory", func(t *testing.T) {
+		plan := planIngress([]api.IngressRule{with(acme, bundle)}, 20, acmeAvailability{Reason: IngressReasonACMEDirectoryInvalid})
+		if st := plan.states[0]; !st.held || st.Served || st.Reason != IngressReasonACMEDirectoryInvalid {
+			t.Errorf("acme rule = %+v, want held, not served, %q", st, IngressReasonACMEDirectoryInvalid)
+		}
+	})
+
+	t.Run("an acme rule with client_ca_invalid opens no challenge port", func(t *testing.T) {
+		on8443 := acmePlanRule("acme", 8443, "acme.example.com")
+		plan := planIngress([]api.IngressRule{with(on8443, "x")}, 20, acmeAvailability{})
+		if st := plan.states[0]; st.Reason != IngressReasonClientCAInvalid || st.Detail != "no PEM block" {
+			t.Errorf("acme rule = %+v, want %q with the detail no PEM block", st, IngressReasonClientCAInvalid)
+		}
+		if _, ok := plan.tables[acmeChallengePort]; ok {
+			t.Error("port 443 has a table, want none: no acme rule is served")
+		}
+		if plan.tables[8443] == nil {
+			t.Error("no table for the held acme rule's port 8443")
+		}
+		plan = planIngress([]api.IngressRule{with(on8443, bundle)}, 20, acmeAvailability{})
+		if plan.tables[acmeChallengePort] == nil {
+			t.Error("port 443 has no table, want one for the served acme rule's challenges")
+		}
+	})
+
+	t.Run("the rules of a host whose bundle does not build", func(t *testing.T) {
+		rules := []api.IngressRule{
+			with(condRule("api", "shop.example.com", "/api"), "x"),
+			with(condRule("web", "shop.example.com", "/"), "x"),
+		}
+		plan := planIngress(rules, 20, acmeAvailability{})
+		for _, st := range plan.states {
+			if !st.held || st.Served || st.Reason != IngressReasonClientCAInvalid || st.Detail != "no PEM block" {
+				t.Errorf("rule %s = %+v, want held, not served, %q", st.Rule.Slug, st, IngressReasonClientCAInvalid)
+			}
+		}
+		host := plan.tables[443].exact["shop.example.com"]
+		if host == nil || len(host.routes) != 2 {
+			t.Fatalf("host = %+v, want two routes", host)
+		}
+		for _, r := range host.routes {
+			if r.served {
+				t.Errorf("route %s is served, want not", r.rule.Slug)
+			}
+		}
+	})
 }
 
 // TestPlanIngress_ACMERuleWithAReason holds an acme rule the availability

@@ -24,6 +24,13 @@ type IngressRuleReport struct {
 	Targets []IngressTargetReport
 }
 
+// IngressClientRefusalReport is the last client the bridge refused for one
+// reason on a rule with client_auth.
+type IngressClientRefusalReport struct {
+	Reason string    // one of the IngressRefusal* constants
+	At     time.Time // when the bridge refused that client
+}
+
 // IngressTargetReport is what the bridge says about one target of a rule: the
 // target as the pull names it and how the last dial to it ended.
 type IngressTargetReport struct {
