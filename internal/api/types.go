@@ -1310,6 +1310,14 @@ const MaxIngressStatusDialAgeSeconds = 2147483647
 // one rule entry, the most targets a rule holds.
 const MaxIngressStatusTargets = 8
 
+// MaxIngressStatusClientRefusals is the contract's ceiling on the refusal
+// entries of one rule entry.
+const MaxIngressStatusClientRefusals = 8
+
+// MaxIngressStatusRefusalAgeSeconds is the contract's ceiling on a refusal's
+// age_seconds, the largest signed 32-bit integer.
+const MaxIngressStatusRefusalAgeSeconds = 2147483647
+
 // IngressStatusRequest is the body of PUT /v1/nodes/{node_id}/ingress-status:
 // whether the bridge's local configuration serves public ingress, and how
 // each ingress rule of its pull fares. The control plane keeps the latest
@@ -1320,8 +1328,9 @@ const MaxIngressStatusTargets = 8
 // A missing, null or unknown state, an unknown member, data after the report,
 // more than MaxIngressStatusRules entries, and an entry with a malformed id or
 // a value outside its member's rule answer 400 malformed_ingress_status. An
-// opted-out report with entries, an id that repeats an earlier entry, and an
-// entry that breaks the presence rules of IngressStatusRule answer 400
+// opted-out report with entries, an id that repeats an earlier entry, an
+// entry that breaks the presence rules of IngressStatusRule, and a refusal
+// whose reason an earlier refusal of its entry carries answer 400
 // invalid_ingress_status.
 type IngressStatusRequest struct {
 	// State is one of the IngressState* constants.
@@ -1336,8 +1345,10 @@ type IngressStatusRequest struct {
 // facet before it calls for it: ListenerReason when Listener is not_listening;
 // Certificate and Dial when it is listening; CertificateReason when
 // Certificate is not_ready; DialReason when Dial is failed; DialAgeSeconds
-// when Dial is succeeded or failed. omitempty drops an empty member, so a
-// caller leaves every member it must not send empty.
+// when Dial is succeeded or failed. ClientAuthEnforced is true only beside a
+// Listener of listening, and ClientRefusals carries entries only beside a
+// ClientAuthEnforced of true. omitempty drops an empty member, so a caller
+// leaves every member it must not send empty.
 type IngressStatusRule struct {
 	// ID is the rule's id from the pull, a UUID other than the zero UUID.
 	ID string `json:"id"`
@@ -1358,6 +1369,29 @@ type IngressStatusRule struct {
 	// of the rule, only beside a Listener of listening; nil omits the member,
 	// which the contract reads as no entries.
 	Targets []IngressStatusTarget `json:"targets,omitempty"`
+	// ClientAuthEnforced says that the bridge verifies every client of the
+	// rule against its client authorities, or serves no client of the rule.
+	// It is sent only for a listening rule whose pull entry carries
+	// client_auth; false omits the member, which the contract reads as false.
+	ClientAuthEnforced bool `json:"client_auth_enforced,omitempty"`
+	// ClientRefusals holds at most MaxIngressStatusClientRefusals entries,
+	// one per reason, only beside a ClientAuthEnforced of true; nil omits the
+	// member, which the contract reads as no entries.
+	ClientRefusals []IngressStatusClientRefusal `json:"client_refusals,omitempty"`
+}
+
+// IngressStatusClientRefusal is one entry of a rule entry's client_refusals,
+// the control plane's IngressStatusReportRuleClientRefusal: the last client
+// the bridge refused for Reason. No two entries of one rule name the same
+// Reason.
+type IngressStatusClientRefusal struct {
+	// Reason is a reason token: no_certificate, unknown_authority,
+	// certificate_expired or certificate_invalid.
+	Reason string `json:"reason"`
+	// AgeSeconds is the whole seconds between the refusal and the report, in
+	// 0..MaxIngressStatusRefusalAgeSeconds. The contract requires the member,
+	// and 0 is a valid age, so it has no omitempty.
+	AgeSeconds int64 `json:"age_seconds"`
 }
 
 // IngressStatusTarget is one entry of a rule entry's targets, the control
@@ -2096,6 +2130,21 @@ type IngressRule struct {
 	// path the target receives. Only a rule whose path prefix is present
 	// and not "/" carries it.
 	StripPathPrefix bool `json:"strip_path_prefix,omitempty"`
+	// ClientAuth requires a client certificate that chains to one of the
+	// rule's client authorities; only a terminate or acme rule carries it.
+	// It is a pointer because presence is the requirement: an absent member
+	// and null decode to nil, which marshals without the key, and {} and
+	// {"ca_bundle": ""} decode to a value with an empty bundle, which the
+	// bridge cannot build its authorities from.
+	ClientAuth *IngressClientAuth `json:"client_auth,omitempty"`
+}
+
+// IngressClientAuth is the client certificate requirement of an ingress rule,
+// the control plane's BridgeIngressRuleClientAuthBundle: CABundle holds the
+// rule's client authorities, 1 to 8 CA certificates as PEM CERTIFICATE
+// blocks.
+type IngressClientAuth struct {
+	CABundle string `json:"ca_bundle"`
 }
 
 // IngressConditions are the request conditions of an ingress rule, the
@@ -2131,7 +2180,10 @@ func (c IngressConditions) IsZero() bool {
 
 // Equal reports whether two rules carry the same members. A nil and an empty
 // Conditions.Headers are equal, and so are a nil and an empty Targets; the
-// order of the headers and of the targets counts.
+// order of the headers and of the targets counts. reflect.DeepEqual follows
+// the ClientAuth pointer: a nil and a non-nil ClientAuth differ, and two
+// bundles compare by their text, so a bundle that differs in one byte or in
+// the order of its blocks makes another rule.
 func (r IngressRule) Equal(o IngressRule) bool {
 	if len(r.Conditions.Headers) == 0 {
 		r.Conditions.Headers = nil
