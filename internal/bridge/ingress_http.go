@@ -319,8 +319,12 @@ func (ingressRetryBody) Close() error { return nil }
 // and a failed one is logged. The target receives the request's Host, query
 // and fields, without the client's Forwarded and X-Forwarded-* fields, with
 // X-Forwarded-For (the client's address alone), X-Forwarded-Host and
-// X-Forwarded-Proto, and on a rule with strip_path_prefix the path without
-// the prefix and X-Forwarded-Prefix.
+// X-Forwarded-Proto, on a host with client_auth X-Forwarded-Client-Cert with
+// the fingerprint and subject of the client's verified certificate (see
+// forwardedClientCert), and on a rule with strip_path_prefix the path without
+// the prefix and X-Forwarded-Prefix. The bridge asks for a client
+// certificate only on a host with client_auth, so a request of any other host
+// carries no peer certificate and gets no X-Forwarded-Client-Cert.
 func (m *IngressManager) newRouteProxy(route *ingressRoute) *httputil.ReverseProxy {
 	transport := &http.Transport{
 		Proxy: nil,
@@ -356,6 +360,11 @@ func (m *IngressManager) newRouteProxy(route *ingressRoute) *httputil.ReversePro
 				}
 			}
 			pr.SetXForwarded()
+			// The HTTP server reads the *tls.Conn itself, so net/http sets
+			// the request's TLS for HTTP/1.1 and HTTP/2 alike.
+			if pr.In.TLS != nil && len(pr.In.TLS.PeerCertificates) > 0 {
+				pr.Out.Header.Set("X-Forwarded-Client-Cert", forwardedClientCert(pr.In.TLS.PeerCertificates[0]))
+			}
 			if route.rule.StripPathPrefix {
 				prefix := route.rule.Conditions.PathPrefix
 				rest := strings.TrimPrefix(pr.In.URL.EscapedPath(), prefix)
