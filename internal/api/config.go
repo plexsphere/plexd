@@ -6,7 +6,9 @@ import (
 )
 
 // Config holds the configuration for the ControlPlane client.
-// Config is passed as a constructor argument — no file I/O in this package.
+// Config is passed as a constructor argument: this package reads no
+// configuration file, and the only files it opens are the CA bundles that
+// LoadRootCAs reads.
 type Config struct {
 	// BaseURL is the control plane API base URL (required).
 	// Example: "https://api.plexsphere.com"
@@ -15,6 +17,13 @@ type Config struct {
 	// TLSInsecureSkipVerify disables TLS certificate verification.
 	// WARNING: Only use for development/testing.
 	TLSInsecureSkipVerify bool `yaml:"tls_insecure_skip_verify"`
+
+	// TLSCAFile names a PEM file whose certificates the client trusts for the
+	// control plane in addition to the host's system roots, so a control plane
+	// behind a private CA needs neither that CA in the host's trust store nor
+	// disabled verification. NewControlPlane reads it once. Empty means the
+	// system roots alone.
+	TLSCAFile string `yaml:"tls_ca_file"`
 
 	// ConnectTimeout is the maximum time to wait for a TCP connection.
 	// Default: 10s
@@ -80,6 +89,11 @@ func (c *Config) Validate() error {
 	}
 	if c.SSEReprobeInterval != 0 && c.SSEReprobeInterval < time.Second {
 		return errors.New("api: config: SSEReprobeInterval must be at least 1s")
+	}
+	// Naming a CA says which certificates to trust; skipping verification
+	// trusts any, so the CA would be silently ignored.
+	if c.TLSCAFile != "" && c.TLSInsecureSkipVerify {
+		return errors.New("api: config: tls_ca_file and tls_insecure_skip_verify are mutually exclusive")
 	}
 	return nil
 }

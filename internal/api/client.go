@@ -54,6 +54,10 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	pool, err := LoadRootCAs(cfg.TLSCAFile, logger)
+	if err != nil {
+		return nil, fmt.Errorf("api: config: tls_ca_file: %w", err)
+	}
 
 	dialer := newFallbackDialer((&net.Dialer{
 		Timeout: cfg.ConnectTimeout,
@@ -62,6 +66,7 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
+			RootCAs:            pool,
 		},
 		DialContext:        dialer.DialContext,
 		DisableCompression: true,
@@ -74,6 +79,9 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 
 	if cfg.TLSInsecureSkipVerify {
 		logger.Warn("TLS certificate verification disabled")
+	}
+	if cfg.TLSCAFile != "" {
+		logger.Info("control plane CA bundle loaded", "path", cfg.TLSCAFile)
 	}
 
 	return &ControlPlane{
