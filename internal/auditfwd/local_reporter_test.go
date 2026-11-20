@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,12 +13,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/tlstest"
 )
 
 // ---------------------------------------------------------------------------
@@ -743,5 +747,89 @@ func TestLocalReporter_KeepsCachedCredentialOnNonRevocationFetchError(t *testing
 				t.Errorf("unexpected %q record at %v", rec.Message, rec.Level)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Trusted CA file
+// ---------------------------------------------------------------------------
+
+// The server sends only a leaf the test CA signed, so the batch arrives only
+// when the reporter's own client trusts that CA through tls_ca_file. The test
+// keeps that client: srv.Client() would trust the leaf directly.
+func TestLocalReporter_TrustsCAFile(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	var posts atomic.Int32
+	srv := ca.Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	fetcher := &mockSecretFetcher{resp: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "ca-tok"), Version: 1}}
+	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "audit-secret", TLSCAFile: ca.File()}
+	reporter := mustNewLocalReporter(t, cfg, fetcher, testNSK(), "node-1", discardLogger())
+
+	batch := api.AuditBatch{
+		{Timestamp: time.Now(), Source: "test", EventType: "TEST", Action: "a", Result: "ok", Hostname: "h"},
+	}
+	if err := reporter.ReportAudit(context.Background(), "node-1", batch); err != nil {
+		t.Fatalf("ReportAudit() against a server of the file's CA: %v", err)
+	}
+	if n := posts.Load(); n != 1 {
+		t.Errorf("POSTs = %d, want 1", n)
+	}
+}
+
+// The file adds one CA to the trusted roots; it does not make the reporter
+// accept any certificate, so a server of another CA fails the handshake before
+// a request reaches it.
+func TestLocalReporter_CAFileRejectsOtherCA(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	other := tlstest.NewCA(t)
+	var requests atomic.Int32
+	srv := other.Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	fetcher := &mockSecretFetcher{resp: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "ca-tok"), Version: 1}}
+	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "audit-secret", TLSCAFile: ca.File()}
+	reporter := mustNewLocalReporter(t, cfg, fetcher, testNSK(), "node-1", discardLogger())
+
+	batch := api.AuditBatch{
+		{Timestamp: time.Now(), Source: "test", EventType: "TEST", Action: "a", Result: "ok", Hostname: "h"},
+	}
+	err := reporter.ReportAudit(context.Background(), "node-1", batch)
+	if err == nil {
+		t.Fatal("ReportAudit() against a server of another CA = nil, want a verification error")
+	}
+	var unknown x509.UnknownAuthorityError
+	if !errors.As(err, &unknown) {
+		t.Errorf("errors.As(err, x509.UnknownAuthorityError) = false; err = %v", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+}
+
+// A missing file fails the constructor rather than every later send, with an
+// error that names the key and the file.
+func TestNewLocalReporter_MissingCAFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	fetcher := &mockSecretFetcher{resp: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "ca-tok"), Version: 1}}
+	cfg := api.LocalEndpointConfig{URL: "https://127.0.0.1:1", SecretKey: "audit-secret", TLSCAFile: missing}
+
+	reporter, err := NewLocalReporter(cfg, fetcher, testNSK(), "node-1", discardLogger())
+	if reporter != nil {
+		t.Errorf("NewLocalReporter() reporter = %p, want nil", reporter)
+	}
+	const prefix = "auditfwd: local endpoint: tls_ca_file:"
+	if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("NewLocalReporter() error = %v, want prefix %q", err, prefix)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("NewLocalReporter() error = %q, want the path %q", err, missing)
 	}
 }

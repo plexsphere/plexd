@@ -3,7 +3,6 @@ package logfwd
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,11 +46,19 @@ type LocalReporter struct {
 	cacheTTL    time.Duration
 }
 
-// NewLocalReporter creates a LocalReporter from the given configuration.
-func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter {
+// NewLocalReporter creates a LocalReporter from the given configuration. A
+// tls_ca_file is read here, once, so a changed file takes effect only with a
+// new reporter. TLS options that cannot be used, such as a missing or
+// certificate-less CA file, return an error instead of a reporter that would
+// fail every send.
+func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) (*LocalReporter, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if cfg.TLSInsecureSkipVerify {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // user-configured
+	tlsCfg, err := cfg.TLSClientConfig(logger)
+	if err != nil {
+		return nil, fmt.Errorf("logfwd: local endpoint: %w", err)
+	}
+	if tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
 	}
 	return &LocalReporter{
 		httpClient: &http.Client{Timeout: defaultHTTPTimeout, Transport: transport},
@@ -62,7 +69,7 @@ func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []
 		nodeID:     nodeID,
 		logger:     logger,
 		cacheTTL:   defaultCacheTTL,
-	}
+	}, nil
 }
 
 // ReportLogs sends a log batch to the local endpoint with bearer token authentication.

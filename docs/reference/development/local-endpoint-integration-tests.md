@@ -82,6 +82,9 @@ These construct a `mockSecretFetcher` with a pre-sealed `api.SecretEnvelope` tha
 | Credential failure, platform unaffected | `TestIntegration_CredentialFailure_PlatformStillReceives` | `TestIntegration_CredentialFailure_LogFwd` | `TestIntegration_CredentialFailure_AuditFwd` |
 | TLS skip-verify succeeds (self-signed) | `TestIntegration_TLSSkipVerify_SelfSignedSucceeds` | `TestIntegration_TLSSkipVerify_LogFwd` | `TestIntegration_TLSSkipVerify_AuditFwd` |
 | TLS strict verify rejects self-signed | `TestIntegration_TLSStrictVerify_SelfSignedFails` | `TestIntegration_TLSStrictVerify_LogFwd` | `TestIntegration_TLSStrictVerify_AuditFwd` |
+| TLS CA file trusts its CA (`tls_ca_file`) | `TestLocalReporter_TrustsCAFile` | `TestLocalReporter_TrustsCAFile` | `TestLocalReporter_TrustsCAFile` |
+| TLS CA file rejects a server of another CA | `TestLocalReporter_CAFileRejectsOtherCA` | `TestLocalReporter_CAFileRejectsOtherCA` | `TestLocalReporter_CAFileRejectsOtherCA` |
+| Missing TLS CA file fails the constructor | `TestNewLocalReporter_MissingCAFile` | `TestNewLocalReporter_MissingCAFile` | `TestNewLocalReporter_MissingCAFile` |
 
 The metrics pipeline carries extra coverage for platform-only wiring and the conditional wiring pattern from `up.go` since the pattern is identical across all three pipelines.
 
@@ -117,6 +120,8 @@ Tests that exercise real TLS behavior using `httptest.NewTLSServer` (self-signed
 - **`skip_verify=true`**: `LocalReporter` creates its own `http.Client` with `InsecureSkipVerify=true` → POST succeeds
 - **`skip_verify=false`**: Default `http.Client` rejects the self-signed cert → TLS handshake fails, local capture count is 0, platform is unaffected
 
+The `tls_ca_file` tests live in each package's `local_reporter_test.go` and start their servers from `internal/tlstest`, which presents only a leaf signed by a test CA. The reporter trusts the CA file in addition to the system roots and delivers the batch, a server of another CA fails with an `x509.UnknownAuthorityError` before any request reaches it, and a missing file makes `NewLocalReporter` return an error instead of a reporter.
+
 ### Conditional Wiring Pattern
 
 Validates the exact wiring logic from `up.go`:
@@ -124,7 +129,10 @@ Validates the exact wiring logic from `up.go`:
 ```go
 var reporter MetricsReporter = platform
 if cfg.LocalEndpoint.URL != "" {
-    local := NewLocalReporter(cfg.LocalEndpoint, fetcher, nsk, nodeID, logger)
+    local, err := NewLocalReporter(cfg.LocalEndpoint, fetcher, nsk, nodeID, logger)
+    if err != nil {
+        return err
+    }
     reporter = NewMultiReporter(platform, local, logger)
 }
 ```

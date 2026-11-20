@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,12 +13,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/tlstest"
 )
 
 // ---------------------------------------------------------------------------
@@ -100,7 +104,7 @@ func TestLocalReporter_PostsLogBatchWithBearerAuth(t *testing.T) {
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	reporter.httpClient = srv.Client()
 
 	batch := api.LogBatch{
@@ -157,7 +161,7 @@ func TestLocalReporter_CachesAndRefreshesCredential(t *testing.T) {
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	reporter.httpClient = srv.Client()
 	reporter.cacheTTL = 50 * time.Millisecond
 
@@ -219,7 +223,7 @@ func TestLocalReporter_UsesStaleCacheOnFetchError(t *testing.T) {
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", logger)
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", logger)
 	reporter.httpClient = srv.Client()
 	reporter.cacheTTL = 50 * time.Millisecond
 
@@ -283,7 +287,7 @@ func TestLocalReporter_LogsRefusedCredentialFallbackAtDebug(t *testing.T) {
 				SecretKey:             "local-logs",
 				TLSInsecureSkipVerify: true,
 			}
-			reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", slog.New(ch))
+			reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", slog.New(ch))
 			reporter.httpClient = srv.Client()
 			// A zero TTL makes every call fetch again, so the second call
 			// takes the fetch-error branch with the token the first cached.
@@ -335,7 +339,7 @@ func TestLocalReporter_ReturnsErrorWhenNoCacheAndFetchFails(t *testing.T) {
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	reporter.httpClient = srv.Client()
 
 	batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -370,7 +374,7 @@ func TestLocalReporter_NonSuccessStatusReturnsError(t *testing.T) {
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	reporter.httpClient = srv.Client()
 
 	batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -404,7 +408,7 @@ func TestLocalReporter_PreservesLogEntryFields(t *testing.T) {
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 	reporter.httpClient = srv.Client()
 
 	ts := time.Date(2025, 6, 15, 12, 30, 0, 0, time.UTC)
@@ -470,7 +474,7 @@ func TestLocalReporter_RateLimitedFetchError(t *testing.T) {
 		ch := &capturingHandler{}
 
 		cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "local-logs", TLSInsecureSkipVerify: true}
-		reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", slog.New(ch))
+		reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", slog.New(ch))
 		reporter.httpClient = srv.Client()
 		reporter.cacheTTL = 50 * time.Millisecond
 
@@ -501,7 +505,7 @@ func TestLocalReporter_RateLimitedFetchError(t *testing.T) {
 
 		fetcher := &mockSecretFetcher{err: rateLimitErr}
 		cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "local-logs", TLSInsecureSkipVerify: true}
-		reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", discardLogger())
+		reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", discardLogger())
 		reporter.httpClient = srv.Client()
 
 		batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -528,7 +532,7 @@ func TestLocalReporter_DecryptFailureWarnCarriesKIDAndVersion(t *testing.T) {
 
 	var buf bytes.Buffer
 	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "local-logs", TLSInsecureSkipVerify: true}
-	reporter := NewLocalReporter(cfg, fetcher, nsk, "node-1", slog.New(slog.NewTextHandler(&buf, nil)))
+	reporter := mustNewLocalReporter(t, cfg, fetcher, nsk, "node-1", slog.New(slog.NewTextHandler(&buf, nil)))
 	reporter.httpClient = srv.Client()
 
 	reporter.mu.Lock()
@@ -576,14 +580,15 @@ func (p *postRecorder) got() []string {
 
 // newRecordingReporter returns a LocalReporter that posts to endpoint over TLS,
 // logs to ch, and fetches on every call. The caller must close the server.
-func newRecordingReporter(endpoint http.Handler, fetcher SecretFetcher, ch *capturingHandler) (*httptest.Server, *LocalReporter) {
+func newRecordingReporter(t testing.TB, endpoint http.Handler, fetcher SecretFetcher, ch *capturingHandler) (*httptest.Server, *LocalReporter) {
+	t.Helper()
 	srv := httptest.NewTLSServer(endpoint)
 	cfg := api.LocalEndpointConfig{
 		URL:                   srv.URL,
 		SecretKey:             "local-logs",
 		TLSInsecureSkipVerify: true,
 	}
-	reporter := NewLocalReporter(cfg, fetcher, testNSK(), "node-1", slog.New(ch))
+	reporter := mustNewLocalReporter(t, cfg, fetcher, testNSK(), "node-1", slog.New(ch))
 	reporter.httpClient = srv.Client()
 	// A zero TTL makes every call fetch again, so a call after the first
 	// takes the fetch-error branch with the token the first cached.
@@ -616,7 +621,7 @@ func TestLocalReporter_DropsCachedCredentialOnRevocation(t *testing.T) {
 				response: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "cached-tok"), Version: 1},
 			}
 			ch := &capturingHandler{}
-			srv, reporter := newRecordingReporter(endpoint, fetcher, ch)
+			srv, reporter := newRecordingReporter(t, endpoint, fetcher, ch)
 			defer srv.Close()
 
 			batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -691,7 +696,7 @@ func TestLocalReporter_ResumesAfterRevocationOnSuccessfulFetch(t *testing.T) {
 	fetcher := &mockSecretFetcher{
 		response: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "cached-tok"), Version: 1},
 	}
-	srv, reporter := newRecordingReporter(endpoint, fetcher, &capturingHandler{})
+	srv, reporter := newRecordingReporter(t, endpoint, fetcher, &capturingHandler{})
 	defer srv.Close()
 
 	batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -724,7 +729,7 @@ func TestLocalReporter_RevocationWithoutCacheReturnsError(t *testing.T) {
 	endpoint := &postRecorder{}
 	fetcher := &mockSecretFetcher{err: &api.APIError{StatusCode: 403, Code: "permission_denied"}}
 	ch := &capturingHandler{}
-	srv, reporter := newRecordingReporter(endpoint, fetcher, ch)
+	srv, reporter := newRecordingReporter(t, endpoint, fetcher, ch)
 	defer srv.Close()
 
 	batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -772,7 +777,7 @@ func TestLocalReporter_KeepsCachedCredentialOnNonRevocationFetchError(t *testing
 				response: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "cached-tok"), Version: 1},
 			}
 			ch := &capturingHandler{}
-			srv, reporter := newRecordingReporter(endpoint, fetcher, ch)
+			srv, reporter := newRecordingReporter(t, endpoint, fetcher, ch)
 			defer srv.Close()
 
 			batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
@@ -795,5 +800,85 @@ func TestLocalReporter_KeepsCachedCredentialOnNonRevocationFetchError(t *testing
 				t.Errorf("unexpected %q record at %v", rec.Message, rec.Level)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Trusted CA file
+// ---------------------------------------------------------------------------
+
+// The server sends only a leaf the test CA signed, so the batch arrives only
+// when the reporter's own client trusts that CA through tls_ca_file. The test
+// keeps that client: srv.Client() would trust the leaf directly.
+func TestLocalReporter_TrustsCAFile(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	var posts atomic.Int32
+	srv := ca.Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	fetcher := &mockSecretFetcher{response: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "ca-tok"), Version: 1}}
+	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "local-logs", TLSCAFile: ca.File()}
+	reporter := mustNewLocalReporter(t, cfg, fetcher, testNSK(), "node-1", discardLogger())
+
+	batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
+	if err := reporter.ReportLogs(context.Background(), "node-1", batch); err != nil {
+		t.Fatalf("ReportLogs() against a server of the file's CA: %v", err)
+	}
+	if n := posts.Load(); n != 1 {
+		t.Errorf("POSTs = %d, want 1", n)
+	}
+}
+
+// The file adds one CA to the trusted roots; it does not make the reporter
+// accept any certificate, so a server of another CA fails the handshake before
+// a request reaches it.
+func TestLocalReporter_CAFileRejectsOtherCA(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	other := tlstest.NewCA(t)
+	var requests atomic.Int32
+	srv := other.Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	fetcher := &mockSecretFetcher{response: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "ca-tok"), Version: 1}}
+	cfg := api.LocalEndpointConfig{URL: srv.URL, SecretKey: "local-logs", TLSCAFile: ca.File()}
+	reporter := mustNewLocalReporter(t, cfg, fetcher, testNSK(), "node-1", discardLogger())
+
+	batch := api.LogBatch{{Timestamp: time.Now(), Source: "test", Message: "m1", Severity: "info", Hostname: "h"}}
+	err := reporter.ReportLogs(context.Background(), "node-1", batch)
+	if err == nil {
+		t.Fatal("ReportLogs() against a server of another CA = nil, want a verification error")
+	}
+	var unknown x509.UnknownAuthorityError
+	if !errors.As(err, &unknown) {
+		t.Errorf("errors.As(err, x509.UnknownAuthorityError) = false; err = %v", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+}
+
+// A missing file fails the constructor rather than every later send, with an
+// error that names the key and the file.
+func TestNewLocalReporter_MissingCAFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	fetcher := &mockSecretFetcher{response: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "ca-tok"), Version: 1}}
+	cfg := api.LocalEndpointConfig{URL: "https://127.0.0.1:1", SecretKey: "local-logs", TLSCAFile: missing}
+
+	reporter, err := NewLocalReporter(cfg, fetcher, testNSK(), "node-1", discardLogger())
+	if reporter != nil {
+		t.Errorf("NewLocalReporter() reporter = %p, want nil", reporter)
+	}
+	const prefix = "logfwd: local endpoint: tls_ca_file:"
+	if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("NewLocalReporter() error = %v, want prefix %q", err, prefix)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("NewLocalReporter() error = %q, want the path %q", err, missing)
 	}
 }
