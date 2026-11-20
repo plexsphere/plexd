@@ -116,6 +116,12 @@ func copyIngress(src *api.IngressConfig) *api.IngressConfig {
 	}
 	cp := *src
 	cp.Rules = slices.Clone(src.Rules)
+	for i, r := range cp.Rules {
+		if r.ClientAuth != nil {
+			ca := *r.ClientAuth
+			cp.Rules[i].ClientAuth = &ca
+		}
+	}
 	if src.ACME != nil {
 		acme := *src.ACME
 		cp.ACME = &acme

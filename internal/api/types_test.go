@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -2298,6 +2299,24 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 		t.Errorf("marshaled rule %s does not contain %s", data4, wantTargets)
 	}
 
+	// A rule with client_auth round-trips with its bundle's text.
+	withCA := orig
+	withCA.Mode = IngressModeTerminate
+	withCA.SNIHost = "web.example.com"
+	withCA.CertificateSecretName = "web-cert"
+	withCA.ClientAuth = &IngressClientAuth{CABundle: "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU…\n-----END CERTIFICATE-----\n"}
+	data5, got5 := roundTrip(t, withCA)
+	if !got5.Equal(withCA) {
+		t.Errorf("round trip = %+v, want %+v", got5, withCA)
+	}
+	if got5.ClientAuth == nil || got5.ClientAuth.CABundle != withCA.ClientAuth.CABundle {
+		t.Errorf("round trip ClientAuth = %+v, want %+v", got5.ClientAuth, withCA.ClientAuth)
+	}
+	const wantClientAuth = `"client_auth":{"ca_bundle":"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU…\n-----END CERTIFICATE-----\n"}`
+	if !strings.Contains(string(data5), wantClientAuth) {
+		t.Errorf("marshaled rule %s does not contain %s", data5, wantClientAuth)
+	}
+
 	// A rule in the shape before the control plane's rule model decodes
 	// without an error, into a rule with an empty ID.
 	var old IngressRule
@@ -2312,9 +2331,9 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 // TestIngressConfig_DecodesContractBlock decodes the example block of the
 // agent contract's Public ingress section (plexsphere/plexsphere@834500a,
 // docs/reference/api/plexd-agent-contract.md), wrapped in an object as the
-// pull carries it, with the api rule's two targets of
-// plexsphere/plexsphere@8c76f19. The rules shop-api and shop-web share their host by their
-// path prefixes, and shop-api strips its prefix.
+// pull carries it, with the api rule's two targets and its client_auth member
+// of plexsphere/plexsphere@8c76f19. The rules shop-api and shop-web share
+// their host by their path prefixes, and shop-api strips its prefix.
 func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	const block = `{
 "bridge": {
@@ -2338,7 +2357,10 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
         ],
         "target_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
         "target_address": "10.42.0.7",
-        "target_port": 8443
+        "target_port": 8443,
+        "client_auth": {
+          "ca_bundle": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU…\n-----END CERTIFICATE-----\n"
+        }
       },
       {
         "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2",
@@ -2431,11 +2453,15 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	if !bridge.Ingress.Enabled {
 		t.Error("Ingress.Enabled = false, want true")
 	}
+	// contractCABundle is the api rule's ca_bundle once JSON decodes its
+	// escapes; … stands for the rest of the certificate.
+	const contractCABundle = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU…\n-----END CERTIFICATE-----\n"
 	want := []IngressRule{
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Slug: "api", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModeACME, SNIHost: "api.example.com", Targets: []IngressTarget{
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.42.0.7", Port: 8443},
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Address: "10.42.0.8", Port: 8443},
-		}, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443},
+		}, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 8443,
+			ClientAuth: &IngressClientAuth{CABundle: contractCABundle}},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2", Slug: "apps", Protocol: IngressProtocolTCP, ListenPort: 443, Mode: IngressModePassthrough, SNIHost: "*.apps.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", TargetAddress: "10.42.0.8", TargetPort: 443},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f5", Slug: "dns", Protocol: IngressProtocolUDP, ListenPort: 53, Mode: IngressModePassthrough, TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 53},
 		{ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3", Slug: "mqtt", Protocol: IngressProtocolTCP, ListenPort: 8883, Mode: IngressModeTerminate, SNIHost: "mqtt.example.com", TargetNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", TargetAddress: "10.42.0.7", TargetPort: 1883, CertificateSecretName: "mqtt-cert"},
@@ -2472,6 +2498,14 @@ func TestIngressConfig_DecodesContractBlock(t *testing.T) {
 	for _, r := range bridge.Ingress.Rules {
 		if !withSecret[r.Slug] && r.CertificateSecretName != "" {
 			t.Errorf("rule %s CertificateSecretName = %q, want empty", r.Slug, r.CertificateSecretName)
+		}
+	}
+	if got := bySlug["api"]; got.ClientAuth == nil || got.ClientAuth.CABundle != contractCABundle {
+		t.Errorf("rule api ClientAuth = %+v, want the ca_bundle %q", got.ClientAuth, contractCABundle)
+	}
+	for _, r := range bridge.Ingress.Rules {
+		if r.Slug != "api" && r.ClientAuth != nil {
+			t.Errorf("rule %s ClientAuth = %+v, want nil", r.Slug, r.ClientAuth)
 		}
 	}
 	requireEqual(t, &IngressACME{
@@ -2573,9 +2607,63 @@ func TestIngressRule_TargetsPresence(t *testing.T) {
 	}
 }
 
-// TestIngressRule_Equal compares rules that differ in one member each, and a
-// nil against an empty Headers and Targets.
+// TestIngressRule_ClientAuthPresence decodes a rule whose client_auth is
+// absent or null into a nil ClientAuth, which marshals without the key, and a
+// rule whose client_auth is {} or carries an empty ca_bundle into a non-nil
+// ClientAuth with an empty bundle: presence is the requirement, and an empty
+// bundle is a requirement no client meets.
+func TestIngressRule_ClientAuthPresence(t *testing.T) {
+	const head = `{"id":"r1","slug":"web","listen_port":443,"mode":"terminate","sni_host":"web.example.com","certificate_secret_name":"web-cert"`
+	for _, member := range []string{``, `,"client_auth":null`} {
+		var r IngressRule
+		if err := json.Unmarshal([]byte(head+member+`}`), &r); err != nil {
+			t.Fatalf("decode %q: %v", member, err)
+		}
+		if r.ClientAuth != nil {
+			t.Errorf("decode %q: ClientAuth = %+v, want nil", member, r.ClientAuth)
+		}
+		out, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal %q: %v", member, err)
+		}
+		if strings.Contains(string(out), `"client_auth"`) {
+			t.Errorf("decode %q, marshal: %s carries client_auth, want no such key", member, out)
+		}
+	}
+
+	for _, member := range []string{`,"client_auth":{}`, `,"client_auth":{"ca_bundle": ""}`} {
+		var r IngressRule
+		if err := json.Unmarshal([]byte(head+member+`}`), &r); err != nil {
+			t.Fatalf("decode %q: %v", member, err)
+		}
+		if r.ClientAuth == nil {
+			t.Errorf("decode %q: ClientAuth = nil, want a requirement with an empty bundle", member)
+			continue
+		}
+		if r.ClientAuth.CABundle != "" {
+			t.Errorf("decode %q: CABundle = %q, want empty", member, r.ClientAuth.CABundle)
+		}
+		out, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal %q: %v", member, err)
+		}
+		if want := `"client_auth":{"ca_bundle":""}`; !strings.Contains(string(out), want) {
+			t.Errorf("decode %q, marshal: %s does not contain %s", member, out, want)
+		}
+	}
+}
+
+// TestIngressRule_Equal compares rules that differ in one member each, a nil
+// against an empty Headers and Targets, and two bundles of equal text behind
+// different ClientAuth pointers.
 func TestIngressRule_Equal(t *testing.T) {
+	// blockA and blockB stand for two CA certificates, and blockB2 differs
+	// from blockB in one byte. Equal compares the text and parses nothing.
+	const (
+		blockA  = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUa\n-----END CERTIFICATE-----\n"
+		blockB  = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUb\n-----END CERTIFICATE-----\n"
+		blockB2 = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUc\n-----END CERTIFICATE-----\n"
+	)
 	base := IngressRule{
 		ID:                    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f6",
 		Slug:                  "shop-api",
@@ -2596,15 +2684,29 @@ func TestIngressRule_Equal(t *testing.T) {
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Address: "10.42.0.8", Port: 8080},
 			{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Address: "10.42.0.7", Port: 8080},
 		},
+		ClientAuth: &IngressClientAuth{CABundle: blockA + blockB},
 	}
 	clone := func() IngressRule {
 		r := base
 		r.Conditions.Headers = slices.Clone(base.Conditions.Headers)
 		r.Targets = slices.Clone(base.Targets)
+		ca := *base.ClientAuth
+		r.ClientAuth = &ca
 		return r
 	}
 	if !base.Equal(clone()) {
 		t.Fatal("a rule does not equal its copy")
+	}
+
+	// Equal texts behind different pointers compare equal: DeepEqual follows
+	// the pointer. The edits below change a copy's bundle in place, so the
+	// copy must not share the pointer of base.
+	other := clone()
+	if other.ClientAuth == base.ClientAuth {
+		t.Fatal("the copy shares the ClientAuth pointer of base")
+	}
+	if !base.Equal(other) || !other.Equal(base) {
+		t.Error("two rules with equal bundle texts behind different pointers compare unequal")
 	}
 
 	edits := map[string]func(*IngressRule){
@@ -2635,6 +2737,14 @@ func TestIngressRule_Equal(t *testing.T) {
 			tg[0], tg[1] = tg[1], tg[0]
 		},
 		"one target fewer": func(r *IngressRule) { r.Targets = r.Targets[:1] },
+
+		// A nil against a non-nil ClientAuth, and bundles whose texts differ.
+		"client_auth":             func(r *IngressRule) { r.ClientAuth = nil },
+		"an empty ca_bundle":      func(r *IngressRule) { r.ClientAuth.CABundle = "" },
+		"a byte of the ca_bundle": func(r *IngressRule) { r.ClientAuth.CABundle = blockA + blockB2 },
+		"the order of the ca_bundle's blocks": func(r *IngressRule) {
+			r.ClientAuth.CABundle = blockB + blockA
+		},
 	}
 	for name, edit := range edits {
 		t.Run(name, func(t *testing.T) {
@@ -2658,6 +2768,12 @@ func TestIngressRule_Equal(t *testing.T) {
 	emptyTargets.Targets = []IngressTarget{}
 	if !nilTargets.Equal(emptyTargets) || !emptyTargets.Equal(nilTargets) {
 		t.Error("a nil and an empty Targets compare unequal")
+	}
+
+	noCA1, noCA2 := clone(), clone()
+	noCA1.ClientAuth, noCA2.ClientAuth = nil, nil
+	if !noCA1.Equal(noCA2) {
+		t.Error("two rules without ClientAuth compare unequal")
 	}
 }
 
@@ -3864,6 +3980,24 @@ func TestHookVersionPayload_OmitsUndeclaredFields(t *testing.T) {
 
 func TestIngressStatusRequest_JSON(t *testing.T) {
 	age := func(s int64) *int64 { return &s }
+	// The api entry of the contract's section "Ingress status"
+	// (plexsphere/plexsphere@8c76f19), as the contract writes it.
+	const contractAPIEntryText = `{ "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", "listener": "listening",
+      "certificate": "ready", "dial": "succeeded", "dial_age_seconds": 2,
+      "targets": [
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "port": 8443, "dial": "succeeded", "dial_age_seconds": 2 },
+        { "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "port": 8443, "dial": "failed", "dial_reason": "timeout", "dial_age_seconds": 14 }
+      ],
+      "client_auth_enforced": true,
+      "client_refusals": [
+        { "reason": "no_certificate", "age_seconds": 40 },
+        { "reason": "unknown_authority", "age_seconds": 310 }
+      ] }`
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(contractAPIEntryText)); err != nil {
+		t.Fatalf("compact the contract's api entry: %v", err)
+	}
+	contractAPIEntry := compact.String()
 	tests := []struct {
 		name string
 		req  IngressStatusRequest
@@ -3891,9 +4025,6 @@ func TestIngressStatusRequest_JSON(t *testing.T) {
 			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"none"}]}`,
 		},
 		{
-			// The api entry of the contract's section "Ingress status"
-			// (plexsphere/plexsphere@8c76f19), without client_auth_enforced
-			// and client_refusals.
 			name: "two targets",
 			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
 				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1", Listener: IngressListenerListening,
@@ -3902,10 +4033,42 @@ func TestIngressStatusRequest_JSON(t *testing.T) {
 					{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", Port: 8443, Dial: IngressDialSucceeded, DialAgeSeconds: age(2)},
 					{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", Port: 8443, Dial: IngressDialFailed, DialReason: "timeout", DialAgeSeconds: age(14)},
 				},
+				ClientAuthEnforced: true,
+				ClientRefusals: []IngressStatusClientRefusal{
+					{Reason: "no_certificate", AgeSeconds: 40},
+					{Reason: "unknown_authority", AgeSeconds: 310},
+				},
 			}}},
-			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","listener":"listening","certificate":"ready","dial":"succeeded","dial_age_seconds":2,"targets":[` +
-				`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","port":8443,"dial":"succeeded","dial_age_seconds":2},` +
-				`{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","port":8443,"dial":"failed","dial_reason":"timeout","dial_age_seconds":14}]}]}`,
+			want: `{"state":"enabled","rules":[` + contractAPIEntry + `]}`,
+		},
+		{
+			name: "a client refused less than a second ago",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateNotRequired, Dial: IngressDialNone,
+				ClientAuthEnforced: true,
+				ClientRefusals:     []IngressStatusClientRefusal{{Reason: "certificate_expired", AgeSeconds: 0}},
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"none",` +
+				`"client_auth_enforced":true,"client_refusals":[{"reason":"certificate_expired","age_seconds":0}]}]}`,
+		},
+		{
+			name: "client auth enforced without refusals",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateNotRequired, Dial: IngressDialNone,
+				ClientAuthEnforced: true,
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"none","client_auth_enforced":true}]}`,
+		},
+		{
+			name: "client auth not enforced",
+			req: IngressStatusRequest{State: IngressStateEnabled, Rules: []IngressStatusRule{{
+				ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1", Listener: IngressListenerListening,
+				Certificate: IngressCertificateNotRequired, Dial: IngressDialNone,
+				ClientAuthEnforced: false, ClientRefusals: nil,
+			}}},
+			want: `{"state":"enabled","rules":[{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a1f1","listener":"listening","certificate":"not_required","dial":"none"}]}`,
 		},
 		{
 			name: "a target dialled less than a second ago and one not dialled",

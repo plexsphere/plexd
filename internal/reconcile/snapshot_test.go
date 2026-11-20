@@ -252,6 +252,54 @@ func TestStateSnapshot_CopiesIngressACME(t *testing.T) {
 	}
 }
 
+// TestStateSnapshot_CopiesIngressClientAuth proves copyIngress clones each
+// rule's client_auth member on both Update and Get, so a stored rule never
+// shares its ClientAuth pointer with the rule it was copied from, and keeps a
+// rule without the member without it.
+func TestStateSnapshot_CopiesIngressClientAuth(t *testing.T) {
+	const bundle = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU…\n-----END CERTIFICATE-----\n"
+	snap := NewStateSnapshot()
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{ID: "r1", Slug: "api", ListenPort: 443, Mode: api.IngressModeACME, SNIHost: "api.example.com", ClientAuth: &api.IngressClientAuth{CABundle: bundle}},
+					{ID: "r2", Slug: "web", ListenPort: 443, Mode: api.IngressModeTerminate, SNIHost: "web.example.com", CertificateSecretName: "web-cert"},
+				},
+			},
+		},
+	}
+	snap.Update(desired)
+
+	got := snap.Get()
+	if diff := ComputeDiff(desired, &got); diff.BridgeChanged {
+		t.Fatalf("stored ingress = %+v, want %+v", got.Bridge.Ingress, desired.Bridge.Ingress)
+	}
+	if got.Bridge.Ingress.Rules[0].ClientAuth == desired.Bridge.Ingress.Rules[0].ClientAuth {
+		t.Error("the stored rule shares its ClientAuth pointer with the pulled rule")
+	}
+	if got.Bridge.Ingress.Rules[1].ClientAuth != nil {
+		t.Errorf("rule web ClientAuth = %+v, want nil", got.Bridge.Ingress.Rules[1].ClientAuth)
+	}
+
+	// A change of the source after Update leaves the snapshot as it was.
+	desired.Bridge.Ingress.Rules[0].ClientAuth.CABundle = "mutated"
+	if got2 := snap.Get(); got2.Bridge.Ingress.Rules[0].ClientAuth.CABundle != bundle {
+		t.Error("the ingress rule's client_auth member was not copied on Update")
+	}
+
+	// A change of a value Get returned leaves the snapshot as it was.
+	got.Bridge.Ingress.Rules[0].ClientAuth.CABundle = "mutated"
+	got2 := snap.Get()
+	if got2.Bridge.Ingress.Rules[0].ClientAuth.CABundle != bundle {
+		t.Error("Get did not return a copy of the ingress rule's client_auth member")
+	}
+	if got2.Bridge.Ingress.Rules[0].ClientAuth == got.Bridge.Ingress.Rules[0].ClientAuth {
+		t.Error("two results of Get share a rule's ClientAuth pointer")
+	}
+}
+
 // TestStateSnapshot_CopiesRelayAssignments proves copyRelay clones the relay
 // assignments on both Update and Get, and keeps an empty list empty: a nil
 // copy of the [] a pull decodes would make ComputeDiff report bridge drift on
