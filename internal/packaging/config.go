@@ -50,7 +50,20 @@ type InstallConfig struct {
 
 	// TokenFile is the path to the token file to copy from (optional).
 	TokenFile string
+
+	// CAFile is the path to a PEM CA bundle to copy into ConfigDir as
+	// InstalledCAFileName (optional).
+	CAFile string
 }
+
+// InstalledCAFileName is the name the CA bundle from InstallConfig.CAFile is
+// copied to, under ConfigDir: /etc/plexd/control-plane-ca.pem on Linux,
+// /Library/Application Support/plexd/control-plane-ca.pem on macOS and
+// %ProgramData%\plexd\control-plane-ca.pem on Windows. The bundle is copied
+// rather than referenced because the shipped systemd unit cannot read a file
+// under /home, /root or /run/user, while it can always read the config
+// directory.
+const InstalledCAFileName = "control-plane-ca.pem"
 
 // The install paths are resolved per platform, which is why they are vars
 // rather than consts. Only the service name is the same everywhere.

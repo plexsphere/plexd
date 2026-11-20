@@ -14,6 +14,7 @@ var (
 	installAPIURL    string
 	installToken     string
 	installTokenFile string
+	installCAFile    string
 )
 
 var installCmd = &cobra.Command{
@@ -34,6 +35,7 @@ func init() {
 	installCmd.Flags().StringVar(&installAPIURL, "api-url", "", "control plane API URL")
 	installCmd.Flags().StringVar(&installToken, "token", "", "bootstrap token value")
 	installCmd.Flags().StringVar(&installTokenFile, "token-file", "", "path to bootstrap token file")
+	installCmd.Flags().StringVar(&installCAFile, "ca-file", "", "path to a PEM CA bundle plexd trusts for the control plane")
 	rootCmd.AddCommand(installCmd)
 }
 
@@ -44,6 +46,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		APIBaseURL: installAPIURL,
 		TokenValue: installToken,
 		TokenFile:  installTokenFile,
+		CAFile:     installCAFile,
 	}
 
 	installer := packaging.NewInstaller(cfg, packaging.NewServiceManager(logger), packaging.NewRootChecker(), logger)
