@@ -3,14 +3,20 @@ package api
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"maps"
+	"net/http"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/tlstest"
 )
 
 // roundTrip marshals v to JSON, then unmarshals back into a new value of the
@@ -3292,6 +3298,24 @@ func TestLocalEndpointConfig_Validate(t *testing.T) {
 			name: "secret key without URL is harmless no-op",
 			cfg:  LocalEndpointConfig{SecretKey: "orphaned-secret"},
 		},
+		{
+			name: "rejects both TLS options",
+			cfg: LocalEndpointConfig{
+				URL:                   "https://metrics.local:9090/ingest",
+				SecretKey:             "my-secret-token",
+				TLSCAFile:             "/etc/plexd/local-ca.pem",
+				TLSInsecureSkipVerify: true,
+			},
+			wantErr:    true,
+			errContain: "tls_ca_file and tls_insecure_skip_verify are mutually exclusive",
+		},
+		{
+			name: "both TLS options without URL stay unvalidated",
+			cfg: LocalEndpointConfig{
+				TLSCAFile:             "/etc/plexd/local-ca.pem",
+				TLSInsecureSkipVerify: true,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -3308,6 +3332,121 @@ func TestLocalEndpointConfig_Validate(t *testing.T) {
 			}
 			if err != nil {
 				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// Each pipeline's Config.Validate passes its own name as the prefix, as
+// metrics does here, so the text an operator reads names the pipeline whose
+// endpoint sets both options.
+func TestLocalEndpointConfig_ValidateTLSOptionsText(t *testing.T) {
+	cfg := LocalEndpointConfig{
+		URL:                   "https://metrics.local:9090/ingest",
+		SecretKey:             "my-secret-token",
+		TLSCAFile:             "/etc/plexd/local-ca.pem",
+		TLSInsecureSkipVerify: true,
+	}
+	const want = "metrics: config: local_endpoint: tls_ca_file and tls_insecure_skip_verify are mutually exclusive"
+
+	err := cfg.Validate("metrics")
+	if err == nil {
+		t.Fatalf("Validate(%q) = nil, want %q", "metrics", want)
+	}
+	if err.Error() != want {
+		t.Errorf("Validate(%q) error = %q, want %q", "metrics", err.Error(), want)
+	}
+}
+
+func TestLocalEndpointConfig_TLSClientConfig(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	srv := ca.Server(t, http.NotFoundHandler())
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	empty := writeCAFixture(t, "empty-ca.pem", nil)
+
+	tests := []struct {
+		name string
+		cfg  LocalEndpointConfig
+		// wantErr is the exact error text, or its start when wantPrefix is set.
+		wantErr    string
+		wantPrefix bool
+		// check inspects the config of a case that wants no error.
+		check func(t *testing.T, got *tls.Config)
+	}{
+		{
+			name: "neither option",
+			cfg:  LocalEndpointConfig{},
+			check: func(t *testing.T, got *tls.Config) {
+				if got != nil {
+					t.Error("TLSClientConfig() returned a config, want nil so the transport's defaults apply")
+				}
+			},
+		},
+		{
+			name: "skip verify alone",
+			cfg:  LocalEndpointConfig{TLSInsecureSkipVerify: true},
+			check: func(t *testing.T, got *tls.Config) {
+				if got == nil || !got.InsecureSkipVerify {
+					t.Error("TLSClientConfig() returned no config with InsecureSkipVerify set")
+				}
+			},
+		},
+		{
+			name: "CA file",
+			cfg:  LocalEndpointConfig{TLSCAFile: ca.File()},
+			check: func(t *testing.T, got *tls.Config) {
+				if got == nil || got.RootCAs == nil {
+					t.Fatal("TLSClientConfig() returned no config with RootCAs set")
+				}
+				if got.MinVersion != tls.VersionTLS12 {
+					t.Errorf("MinVersion = %#x, want %#x", got.MinVersion, tls.VersionTLS12)
+				}
+				if got.InsecureSkipVerify {
+					t.Error("InsecureSkipVerify = true, want false")
+				}
+				requireVerifies(t, got.RootCAs, srv)
+			},
+		},
+		{
+			name:    "both options",
+			cfg:     LocalEndpointConfig{TLSCAFile: ca.File(), TLSInsecureSkipVerify: true},
+			wantErr: "tls_ca_file and tls_insecure_skip_verify are mutually exclusive",
+		},
+		{
+			name:       "missing CA file",
+			cfg:        LocalEndpointConfig{TLSCAFile: missing},
+			wantErr:    "tls_ca_file: read CA file:",
+			wantPrefix: true,
+		},
+		{
+			name:    "empty CA file",
+			cfg:     LocalEndpointConfig{TLSCAFile: empty},
+			wantErr: "tls_ca_file: no certificate found in CA file " + empty,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.cfg.TLSClientConfig(slog.Default())
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("TLSClientConfig() error = %v, want nil", err)
+				}
+				tt.check(t, got)
+				return
+			}
+			if err == nil {
+				t.Fatalf("TLSClientConfig() error = nil, want %q", tt.wantErr)
+			}
+			if tt.wantPrefix {
+				if !strings.HasPrefix(err.Error(), tt.wantErr) {
+					t.Errorf("TLSClientConfig() error = %q, want it to start with %q", err, tt.wantErr)
+				}
+			} else if err.Error() != tt.wantErr {
+				t.Errorf("TLSClientConfig() error = %q, want %q", err, tt.wantErr)
+			}
+			if got != nil {
+				t.Error("TLSClientConfig() returned a config beside the error, want nil")
 			}
 		})
 	}
