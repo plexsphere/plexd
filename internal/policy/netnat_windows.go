@@ -13,11 +13,14 @@ import (
 )
 
 const (
-	// netNatName is the name plexd's NetNat object carries, so an operator
-	// recognises it in Get-NetNat. Client editions of Windows hold one NetNat
-	// object at a time, which is why plexd keeps exactly this one and rebuilds
-	// it instead of adding a second. Every cmdlet below is built from it, so
-	// the name plexd creates and the name plexd reports cannot drift apart.
+	// netNatName is the name plexd's NetNat object for the mesh prefix
+	// carries, so an operator recognises it in Get-NetNat. Microsoft documents
+	// one NAT network per host, while Windows Server 2025 was measured to hold
+	// three at once. plexd still keeps exactly one object for the mesh prefix
+	// and rebuilds it instead of adding a second, so a host that takes only
+	// one keeps its bridge NAT; a tunnel's exemption is an object of its own,
+	// see netNatExemptPrefix. Every cmdlet below is built from it, so the name
+	// plexd creates and the name plexd reports cannot drift apart.
 	netNatName        = "plexd"
 	powershellTimeout = 30 * time.Second // PowerShell takes seconds to start on a cold host
 
@@ -96,7 +99,7 @@ func (c *WFPController) powershell(op, script string) ([]byte, error) {
 //
 // Idempotent: an object that already translates the mesh prefix is left
 // alone. One that translates another prefix is rebuilt, because the mesh
-// moved and the host has no room for a second object.
+// moved and plexd keeps one object for the mesh prefix (see netNatName).
 func (c *WFPController) AddNATMasquerade(iface string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
