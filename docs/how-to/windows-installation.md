@@ -99,6 +99,15 @@ New-NetFirewallRule -DisplayName 'plexd WireGuard' -Direction Inbound `
 
 A node behind NAT that only ever initiates handshakes reaches its peers without the rule. A node other peers must reach directly needs it.
 
+A bridge needs the same rule for the `listen_port` of each `wireguard` user access provider and each `wireguard` site-to-site tunnel its state pull delivers: a device starts its handshake to the provider's port, and a remote site that starts one does so to the tunnel's port. `-LocalPort` takes a list:
+
+```powershell
+New-NetFirewallRule -DisplayName 'plexd bridge WireGuard' -Direction Inbound `
+  -Protocol UDP -LocalPort 51821,51830 -Action Allow
+```
+
+51821 and 51830 stand for the ports the state pull delivers; each provider's and each tunnel's entry in the node API's [`status.user-access`](../reference/core/nodeapi.md#status-user-access) and [`status.site-to-site`](../reference/core/nodeapi.md#status-site-to-site) reports carries its `listen_port`. See [User Access Integration](../reference/bridge/user-access-integration.md#windows) and [Site-to-Site VPN](../reference/bridge/site-to-site-vpn.md#routes-and-policy).
+
 ## Automated installation
 
 Pre-provision the token before installing, then leave `--token` off:

@@ -8,7 +8,7 @@ feature: PXD-0028
 
 An `ipsec` or `openvpn` site-to-site tunnel runs a daemon on the bridge: an `ipsec` tunnel is an IKEv2 connection of the host's strongSwan bound to an xfrm interface, an `openvpn` tunnel an OpenVPN process on a tun device. A `TunnelProvider` runs the daemon's side of one tunnel on the link the site-to-site manager created before; the manager owns the link, the routes, the forwarding and the source rewrite for every kind. This page covers the two providers, the files plexd writes, the commands it runs, what the host provides and what the remote site sets. The `bridge.site_to_site` block, the checks, the reasons, the retry and the status report are on [Site-to-Site VPN](site-to-site-vpn.md).
 
-A Linux bridge serves both kinds. On macOS `plexd up` builds no provider, since the xfrm interface and the persistent tun device are Linux kernel features, and on Windows no provider runs, since the platform has no mesh source rewrite. On both a tunnel of either kind that passes its own [checks](site-to-site-vpn.md#checks) reads `kind_not_served`, on macOS with the error `no <kind> provider is built in`, and one that fails them reads `invalid_tunnel`. Both providers are tested against the command stand-in only: no test suite runs strongSwan or OpenVPN (see [Testing](#testing)).
+A Linux bridge serves both kinds. On macOS and Windows `plexd up` builds no provider, since the xfrm interface and the persistent tun device are Linux kernel features. On both a tunnel of either kind that passes its own [checks](site-to-site-vpn.md#checks) reads `kind_not_served` with the error `no <kind> provider is built in`, and one that fails them reads `invalid_tunnel`. Both providers are tested against the command stand-in only: no test suite runs strongSwan or OpenVPN (see [Testing](#testing)).
 
 ## Data Flow
 
@@ -70,7 +70,7 @@ Every command a provider runs gets the caller's context, and an error of the exe
 
 ### How the Manager Runs a Provider
 
-`SiteToSiteDeps.Providers` holds one provider per kind; a kind without one reads `kind_not_served`. `plexd up` builds `NewIPsecProvider` over the resolved `bridge.swanctl_conf_dir` and `NewOpenVPNProvider` over `DefaultTunnelConfigDir`, `/run/plexd/tunnels`, each over its own `NewStdCommandExecutor()`, on every platform.
+`SiteToSiteDeps.Providers` holds one provider per kind; a kind without one reads `kind_not_served`. `plexd up` builds `NewIPsecProvider` over the resolved `bridge.swanctl_conf_dir` and `NewOpenVPNProvider` over `DefaultTunnelConfigDir`, `/run/plexd/tunnels`, each over its own `NewStdCommandExecutor()`, on every platform but macOS and Windows, where `newTunnelProviders` returns none.
 
 | Call | When | Context |
 |---|---|---|
