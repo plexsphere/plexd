@@ -15,7 +15,7 @@ The Linux implementation is [`NftablesController`](./nftables-firewall.md).
 
 On all three platforms the rules govern everything that arrives on the mesh interface, whether the packet is delivered to the node itself or forwarded through it, and everything the node's own sockets send over it. A rule matches by its addresses. The control plane compiles every rule for both ends: the destination node's copy names the peer as the source, and the source node's copy names the node itself, so each copy matches one direction. A node rejects unsolicited mesh traffic to its own addresses until a rule allows it, and drops what it sends to a mesh address until a rule allows that too, because the ruleset ends in a default deny. Replies to a connection the policy let in leave without a policy rule of their own on Linux and Windows, and on macOS for tcp, udp and icmp; see below.
 
-What the node forwards into the mesh is not filtered on its way out, on any platform. On Linux such a packet takes the forward hook, whose chain matches the interface it arrived on. On macOS the default deny's `block out` line names the interface's own addresses as the source, which a forwarded packet does not carry. On Windows forwarded traffic never reaches `ALE_AUTH_CONNECT`.
+What the node forwards into the mesh is not filtered on its way out, on any platform. On Linux such a packet takes the forward hook, whose chain matches the interface it arrived on. On macOS the default deny's `block out` line names the interface's own addresses as the source, which a forwarded packet does not carry. A packet a [mesh source rewrite](#mesh-source-rewrite) translates does carry the mesh interface's address, and the rewrite's `nat` line carries `pass`, which makes pf skip the filter rules for it, so a bridge's device and site traffic is not filtered on its way out either. On Windows forwarded traffic never reaches `ALE_AUTH_CONNECT`.
 
 On every platform the node can send UDP to port 9, `RelayProbePort`, over the mesh interface without a rule, ahead of the policy rules. That is plexd's [relay liveness probe](./wireguard.md#relay-liveness-probe). Any local process can use the exemption, to any address the mesh routes, and the receiving node's inbound rules still apply.
 
@@ -120,7 +120,7 @@ A deny renders a `block in` line and a `block out` line. The `block out` line na
 | `label "plexd-default-deny"` | Makes pf keep the packets and bytes the `block` lines drop under one label, which `pfctl -sl` prints and `DropCounts` sums |
 | `any` | An empty address field, `0.0.0.0/0` or `::/0`. Under `0.0.0.0/0` or `::/0` the family keyword stays, so the rule still matches only its own family |
 
-Chains are rendered in name order, so the same desired state always yields the same text. A `nat` rule, when one is configured, is rendered ahead of the chains, because pf requires translation rules before filter rules in a file.
+Chains are rendered in name order, so the same desired state always yields the same text. The `nat` rules, the bridge NAT's and one per mesh interface the [mesh source rewrites](#mesh-source-rewrite) name, are rendered ahead of the chains, because pf requires translation rules before filter rules in a file. The two filter lines of each rewrite follow the last chain.
 
 ### Logged rules
 
@@ -143,7 +143,7 @@ pass out quick on utun4 inet proto icmp from 10.1.0.5 to 10.0.0.0/24 icmp-type {
 
 Without the tag the same rule renders the last four lines, none of them with `log`. The `Enforcer` puts the logged rules first (see [Log tags and rule order](./network-policy.md#log-tags-and-rule-order)), so their lines follow the relay probe line.
 
-pf reports a logged packet with the number of the line that matched it, so `render` also returns a map from line number to tag, for every line that starts `pass in log ` or `pass out log `. pf numbers the rules of an anchor from 0 in the order they load. The header, the `# chain` comments and the `nat` line load none, and every other line loads one rule, except a line with a brace list, which loads one rule per item: an IPv4 ICMP reply mirror loads four and an IPv6 one five. `render` counts the rules that way, and `TestPFController_RealConnLog` proves the numbering on the macOS runner. `ApplyRules` keeps the map of the anchor loaded last as the current one, and the one before as the previous one, and swaps them only after `pfctl -f` succeeds. See [pflog](#pflog) for how the records are read.
+pf reports a logged packet with the number of the line that matched it, so `render` also returns a map from line number to tag, for every line that starts `pass in log ` or `pass out log `. pf numbers the rules of an anchor from 0 in the order they load. The header, the `# chain` comments and the `nat` lines load none, the filter lines of the mesh source rewrites follow every chain, so they move no logged line's number, and every other line loads one rule, except a line with a brace list, which loads one rule per item: an IPv4 ICMP reply mirror loads four and an IPv6 one five. `render` counts the rules that way, and `TestPFController_RealConnLog` proves the numbering on the macOS runner. `ApplyRules` keeps the map of the anchor loaded last as the current one, and the one before as the previous one, and swaps them only after `pfctl -f` succeeds. See [pflog](#pflog) for how the records are read.
 
 ### pfctl invocations
 
@@ -153,7 +153,7 @@ pf reports a logged packet with the number of the line that matched it, so `rend
 | `pfctl -s nat` | `Probe` | Prints the main translation rules, checked for the `nat-anchor "com.apple/*"` line |
 | `pfctl -a com.apple/plexd -f -` | Every change | Loads the rendered anchor from stdin, replacing what it held |
 | `pfctl -E` | After the first load | Enables pf and prints a reference token |
-| `pfctl -a com.apple/plexd -F all` | Last chain gone, no NAT | Flushes the anchor |
+| `pfctl -a com.apple/plexd -F all` | Last chain gone, no NAT and no mesh source rewrite; `ResetMeshSourceRewrite` with nothing else held | Flushes the anchor |
 | `pfctl -X <token>` | After that flush | Gives plexd's reference back |
 | `pfctl -a com.apple/plexd -sl` | `DropCounts`, once per send or tick of the policy status report | Prints the anchor's labels with their counters, and changes nothing |
 
@@ -168,7 +168,7 @@ pf enabled
 Token : 13971906727590307623
 ```
 
-The token is one reference. pf stays enabled while any reference is held, and `pfctl -X <token>` releases the one it names. plexd takes exactly one, on the first successful load, and gives it back when its last chain is deleted and no NAT rule is left, so plexd does not keep pf switched on for a host that had it off. On a host where another holder keeps pf enabled, pf stays enabled. `pfctl -s References` lists the holders.
+The token is one reference. pf stays enabled while any reference is held, and `pfctl -X <token>` releases the one it names. plexd takes exactly one, on the first successful load, and gives it back when its last chain is deleted and neither a NAT rule nor a mesh source rewrite is left, so plexd does not keep pf switched on for a host that had it off. A user access provider or a site-to-site tunnel that comes up on a bridge takes the reference too, so pf is switched on for a host that had it off, as a policy chain or the bridge NAT does. On a host where another holder keeps pf enabled, pf stays enabled. `pfctl -s References` lists the holders.
 
 The controller forgets the token even when `-X` failed. A leaked reference only means pf stays enabled, and a retry with the same token could not release it either.
 
@@ -183,7 +183,7 @@ policy: pf: probe: the main ruleset does not reference anchor "com.apple/*"; res
 policy: pf: probe: the main ruleset does not reference nat-anchor "com.apple/*"; restore /etc/pf.conf and run pfctl -f /etc/pf.conf
 ```
 
-`Enforcer.Preflight` calls `Probe` before `plexd up` registers, so a node that cannot enforce exits before it spends a redemption of its bootstrap token. `AddNATMasquerade` calls it too, on its first use. `Preflight` returns early with `policy.enabled: false` — the configuration an operator picks who wants bridge routing without enforcement — and without that second call a missing `nat-anchor` line would leave the bridge loading a `nat` rule the kernel never evaluates, with every `pfctl` invocation reporting success and mesh traffic still leaving the Mac untranslated.
+`Enforcer.Preflight` calls `Probe` before `plexd up` registers, so a node that cannot enforce exits before it spends a redemption of its bootstrap token. `AddNATMasquerade` calls it too, on its first use, and so does the first `AddMeshSourceRewrite` on a controller that holds neither a rewrite nor the bridge NAT. `Preflight` returns early with `policy.enabled: false` — the configuration an operator picks who wants bridge routing without enforcement — and without that second call a missing `nat-anchor` line would leave the bridge loading a `nat` rule the kernel never evaluates, with every `pfctl` invocation reporting success and mesh traffic still leaving the Mac untranslated.
 
 ### Interface names
 
@@ -390,9 +390,38 @@ Inspect the object with:
 Get-NetNat -Name plexd
 ```
 
+### Mesh source rewrite
+
+On macOS `PFController` implements `bridge.MeshSourceRewriter` in the same anchor. The [user access](../bridge/user-access-integration.md) and [site-to-site](../bridge/site-to-site-vpn.md) managers call it for each provider's interface and each tunnel's link, with the kernel's `utunN` names. A rewrite from `utun7` onto the mesh interface `utun4`, beside a chain that holds the default deny alone, renders:
+
+```text
+# plexd policy anchor. Managed by plexd; edits are overwritten.
+nat pass on utun4 inet from any to any tagged plexd-mesh-rewrite -> (utun4)
+# chain plexd-mesh
+pass out quick on utun4 proto udp from (utun4) to any port 9 no state
+block in quick on utun4 from any to any label "plexd-default-deny"
+block out quick on utun4 from (utun4) to any label "plexd-default-deny"
+pass out on utun7 inet all keep state
+pass in on utun7 inet all keep state tag plexd-mesh-rewrite
+```
+
+| Line | Why |
+|---|---|
+| `nat pass on <mesh> ... tagged plexd-mesh-rewrite -> (<mesh>)` | One per mesh interface the rewrites name, after the bridge NAT line, in name order. It translates the source of what leaves the mesh interface carrying the tag to that interface's address, the bridge's mesh address, which is the only source a mesh node accepts from the bridge. `pass` makes pf skip the filter rules for the translated packet, which carries the mesh interface's own address and would otherwise meet the default deny's `block out ... from (<mesh>)` line, so the bridge would filter device and site traffic that Linux lets through. The destination node filters it under its rules for the bridge's mesh address |
+| `pass in on <from> inet all keep state tag plexd-mesh-rewrite` | pf has no way to match the interface a packet arrived on in a `nat` rule, so this line tags what arrives on the source interface, and the `nat` line matches the tag on the way out of the mesh interface. The tag is the constant `pfMeshRewriteTag` |
+| `pass out on <from> inet all keep state` | What a mesh node sends to a device or a site leaves through the source interface and creates its state here. The reply returns on that state, is never tagged, and keeps its own source, as Linux's connection tracking masquerades new connections only. The mesh node's packet was filtered by the chain when it arrived on the mesh interface |
+
+Both filter lines follow the last chain, so the numbers of the [logged lines](#logged-rules) do not move, and neither is `quick`, so a host's own rules for the interface still decide. Only IPv4 is rewritten, as on Linux.
+
+`AddMeshSourceRewrite` refuses a name that does not match `^[A-Za-z0-9_.-]{1,15}$`, in either argument, before anything is rendered: a vendor client reports the name of its interface, and the name becomes pf rule text. A rewrite that exists for the source interface is left alone and runs no `pfctl`, whatever mesh interface the call names. The first rewrite on a controller that holds neither a rewrite nor the bridge NAT runs [Probe](#probe) first, since nothing else on the bridge path checks that the kernel evaluates the anchor. `RemoveMeshSourceRewrite` reloads the anchor without the lines, or flushes it and releases the [enable reference](#the-enable-reference) when nothing else is left, and runs no `pfctl` for an interface it holds no rewrite for. A failed probe or load leaves the controller's rewrites as they were.
+
+`ResetMeshSourceRewrite` forgets every rewrite and writes the anchor once, whatever the controller holds: it loads the rendered text while a chain or the bridge NAT is left, and otherwise runs `pfctl -a com.apple/plexd -F all`, also when it holds no enable reference, and releases the reference when it holds one. `plexd up` resets once at start, through `bridge.CleanupUserAccess`, on every macOS bridge, also with `policy.enabled: false` and `bridge.enable_nat: false`. The reset flushes unconditionally because a pf anchor outlives the process that loaded it and a utun does not: the kernel hands a freed `utunN` to the next device that asks, so the lines a killed process left would tag another interface's traffic.
+
+Every change reloads the anchor, which restarts the [drop counters](#drop-counters), as a NAT change does. The states a removed rewrite created stay until they expire; the interface they name is gone with its provider or tunnel. `TestPFController_RealMeshSourceRewrite` proves the lines with packets on the macOS runner (see [Tests](#tests)).
+
 ## Error prefixes
 
-Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<op>` one of `probe`, `ensure chain`, `apply rules`, `flush chain` and `delete chain`, and on macOS also `drop counts`. NAT failures carry the bridge prefixes instead, so a log line reads the same as the Linux one and the route controller's.
+Every policy failure reads `policy: pf: <op>:` or `policy: wfp: <op>:`, with `<op>` one of `probe`, `ensure chain`, `apply rules`, `flush chain` and `delete chain`, and on macOS also `drop counts`. NAT and mesh source rewrite failures carry the bridge prefixes instead, so a log line reads the same as the Linux one and the route controller's. They wrap the `pfctl` failure, whose `<op>` names the method, such as `add NAT masquerade` or `add mesh source rewrite`.
 
 | Failure | Prefix |
 |---|---|
@@ -429,6 +458,8 @@ Inside these, a failed call of the filter engine reads `<procedure>: <error>`, s
 |---|---|
 | Any leg of the macOS masquerade | `bridge: add NAT masquerade on "<iface>":`, `bridge: remove NAT masquerade on "<iface>":` |
 | An empty interface name on macOS | `bridge: add NAT masquerade on "": interface name is empty` |
+| Any leg of a mesh source rewrite on macOS, its probe included | `bridge: add mesh source rewrite from "<from>" to "<mesh>":`, `bridge: remove mesh source rewrite from "<from>":`, `bridge: reset mesh source rewrite:` |
+| A name the rewrite's check refuses | `bridge: add mesh source rewrite: invalid interface name "<name>"` |
 | Resolving the mesh prefix on Windows | `bridge: add NAT masquerade on "<iface>": resolve mesh prefix for "<mesh iface>":` |
 | Any PowerShell command | `bridge: <op>: powershell -Command "<script>":` followed by the error and PowerShell's output |
 
@@ -442,7 +473,7 @@ The two failures `plexd up` aborts on, the pre-flight probe and the deny-by-defa
 
 ## Logging
 
-All entries carry `component=policy` for the filter operations and `component=bridge` for the NAT ones. All are at `Debug` except the lines the table marks with another level.
+All entries carry `component=policy` for the filter operations and `component=bridge` for the NAT and mesh source rewrite ones. All are at `Debug` except the lines the table marks with another level.
 
 | Message (`component=policy`) | Keys |
 |---|---|
@@ -478,6 +509,9 @@ All entries carry `component=policy` for the filter operations and `component=br
 | `NAT masquerade already configured` (Windows) | `interface`, `prefix` |
 | `NAT masquerade removed` | `interface` |
 | `NAT masquerade not configured, idempotent success` (macOS) | `interface` |
+| `mesh source rewrite added`, `mesh source rewrite removed` (macOS) | `from_iface`, `mesh_iface`, `anchor` |
+| `mesh source rewrite already present, idempotent success`, `mesh source rewrite not found, idempotent success` (macOS) | `from_iface`, `mesh_iface`, `anchor` |
+| `mesh source rewrites reset` (macOS) | `anchor` |
 
 `count` is the number of rules the chain was given, `filters` the number of WFP filters they became, which is larger: every rule yields an inbound and an outbound filter per family, some a forward filter too, and every interface two relay probe permits. Three of the lines above `Debug` concern the forward path and the rollback. `wfp forward path cannot enforce a protocol or port, allow rules narrowed away` names, per apply, how many `allow` rules the node does not enforce on the forward path because they name a protocol or a port. `wfp forward path cannot enforce a protocol or port, deny rules widened to every protocol and port` names how many `deny` rules went onto the forward path without their protocol and port; the engine's only deny names neither, so it does not appear with the rules plexd builds today. Each `count` is a subset of the chain's rules, not of its filters. `wfp rollback delete failed` reports an apply whose `AddRule` failed: it deletes the filters it already installed, and a deletion that fails there leaves a filter behind that only the session's close drops.
 
@@ -487,7 +521,9 @@ The other six concern [connection logging](./network-policy.md#connection-loggin
 
 Both controllers reach the operating system through seams, so every rendered rule and every idempotent case runs on an ordinary unprivileged runner. macOS wires the package's recording runner in place of `pfctl`, which captures each invocation's arguments and its stdin, so a test pins the whole anchor text a change renders. Windows wires a `wfpEngine` fake in place of the session, which records the sublayer, the filters in the order they were added and the deletions, and can be armed to fail a chosen `AddRule`; PowerShell goes through the same recording runner. The fake refuses a filter whose condition names a field its layer does not have, as the engine does, from a per-layer list of the fields plexd uses: a protocol or a port at a forward layer fails a unit test rather than the real one.
 
-`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, `block out quick on <if> from (<if>) to any label "plexd-default-deny"`, and the logged forms `pass in log ... flags S/SA no state`, `pass out log ... keep state` and `pass in log ... no state`.
+`TestPFController_RenderParses` runs the real `pfctl -n -q -a com.apple/plexd -f -` over the rendered text. `-n` parses without loading, which needs no access to `/dev/pf`, so the test proves the rendered syntax is pf's without root. The anchor it parses holds every line form: the relay probe line, `keep state` and `no state` outbound lines, a `flags A/A` mirror with a port range, both ICMP type lists, `block out quick on <if> from (<if>) to any label "plexd-default-deny"`, the logged forms `pass in log ... flags S/SA no state`, `pass out log ... keep state` and `pass in log ... no state`, and the three lines of a mesh source rewrite.
+
+The mesh source rewrite has unit tests on macOS too. They pin the anchor a rewrite beside a chain loads, one `nat pass` line for two rewrites onto one mesh interface, the probe before the first rewrite and none beside the bridge NAT, the repeat that runs no `pfctl`, the refused names (empty, 16 characters, one with a newline, in either argument), the error prefixes of a failed probe and a failed load with no line left for the interface afterwards, the removal that flushes and releases, the reset that loads, flushes without a reference, and restores the rewrites on a failure, and in `TestPFController_RenderLogTags` that a rewrite leaves the map of logged lines as it was.
 
 The drop counters have unit tests on macOS too. `TestPFController_RenderRuleLines` checks that both `block` lines end in `label "plexd-default-deny"` and that no `pass` line carries a label. `TestPFController_DropCounts` feeds the recording runner `pfctl -sl` output: it sums fields 3 and 4 of two label lines, ignores a line of another label, and returns an error containing `policy: pf: drop counts` for a label line with three fields, a non-numeric count, an output without a label line, a `pfctl` exit status 1, and a chain the controller does not hold.
 
@@ -498,13 +534,14 @@ The connection logging code has unit tests of its own. On macOS they pin the lin
 - `TestWFPController_EnableAllowEvents` checks that the first enable writes the record before it sets anything and then sets only what is off, that a second call writes, sets and logs nothing and does not subscribe again, and that a record already there is kept byte for byte. `TestWFPController_RestoreAllowEvents` checks that the restore clears the keyword only when the record holds it clear, turns collection off only when the record holds it off, leaves the bits others set, deletes the record and closes the session, and that it reads a record that is not valid JSON as collection on and the keyword clear. `TestWFPController_SetStateDir_RestoresCrashRecord` checks that `SetStateDir` on a new controller restores from a crash record, and that a directory without a record opens no session.
 - `TestNetEventLayouts` pins the sizes and offsets of plexd's own layouts on a 64-bit build, among them `fwpmFilter0` at 200 bytes with `FilterID` at 176 and `fwpmNetEvent5` at 152 bytes with `Type` at 136 and `ClassifyAllow` at 144. `TestParseNetEvent` reads an IPv4 and an IPv6 event and refuses an event of another type, one without its classify-allow part and one of neither family. `TestOnNetEvent_DispatchesByKey` checks that the callback finds the handler by the context the subscription named and returns 0 each time. `TestWFPController_AllowEventConversion` checks the `ConnEvent` an event under an inbound or an outbound filter becomes, and that a reauthorization, a loopback event and an event under a filter that is not a logged one of plexd's are dropped.
 
-Seven tests drive the real host and are gated:
+Eight tests drive the real host and are gated:
 
 | Test | Gate | Locally |
 |---|---|---|
 | `TestPFController_Real` (`pf_darwin_test.go`) | `PLEXD_TEST_REAL_PF=1` and `os.Geteuid() == 0` | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_Real$' ./internal/policy/` |
 | `TestPFController_RealTraffic` (`tuntraffic_darwin_test.go`) | The same | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_RealTraffic$' ./internal/policy/` |
 | `TestPFController_RealConnLog` (`tuntraffic_darwin_test.go`) | The same | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_RealConnLog$' ./internal/policy/` |
+| `TestPFController_RealMeshSourceRewrite` (`meshrewrite_darwin_test.go`) | The same | `sudo PLEXD_TEST_REAL_PF=1 go test -run '^TestPFController_RealMeshSourceRewrite$' ./internal/policy/` |
 | `TestWFPController_Real` (`wfp_windows_test.go`) | `PLEXD_TEST_REAL_WFP=1` and an elevated token | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run '^TestWFPController_Real$' ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealNAT` (`netnat_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealNAT ./internal/policy/` from an elevated shell |
 | `TestWFPController_RealTraffic` (`tuntraffic_windows_test.go`) | The same | `$env:PLEXD_TEST_REAL_WFP='1'; go test -run TestWFPController_RealTraffic ./internal/policy/` from an elevated shell, with every Windows Firewall profile off |
@@ -559,6 +596,25 @@ and checks that:
 
 The checks end with `DeleteChain("plexd-logtest")`, and the cleanup deletes the chain only when a check failed before that. `TestPFController_RealConnLog` also finds `pflog0` after the first tagged apply, and its events prove the line numbers of [Logged rules](#logged-rules).
 
+`TestPFController_RealMeshSourceRewrite` proves the [mesh source rewrite](#mesh-source-rewrite) with packets. It is the only measurement of the two kernel facts its lines rest on: that a tag a filter line sets on the way in is still on the packet when pf evaluates the `nat` rules on its way out of another interface, and that `nat pass` skips the filter rules. It creates three utuns with `tun.CreateTUN` and addresses and routes them the way the controllers do, `ifconfig <utun> inet <cidr> <address> alias`, `route -n add -inet <network> -interface <utun>` and `ifconfig <utun> up`:
+
+| Device | Address | Route | Far end the test plays |
+|---|---|---|---|
+| M, the mesh interface | `10.255.245.1/24` | `10.255.245.0/24` | mesh node N, `10.255.245.2` |
+| P, a provider's interface | `10.255.246.1/24` | `10.255.246.0/24` | device D, `10.255.246.2` |
+| T, a tunnel's link | `10.255.245.1/32`, the mesh address, as plexd up's tunnel controller assigns it | `10.255.244.0/24` | site host S, `10.255.244.2` |
+
+No other test uses these prefixes. The test reads `net.inet.ip.forwarding`, sets it to 1 and restores it in a cleanup, applies chain `plexd-test` on M with the default deny alone, and runs the checks once with P and D and once with T and S. A packet enters a device when the test writes it into the device and leaves when the test reads it from the device, and every check uses ports of its own, so none meets a state an earlier check left. With the rewrite from the source device onto M, it checks that:
+
+- a UDP datagram from the far end to N:7001 enters the source device and leaves M with the source `10.255.245.1`;
+- N's reply to the address and port the datagram left with enters M and leaves the source device to the far end's address and port, from N;
+- a datagram from a host socket bound to `10.255.245.1` to N does not leave M within 2 s, and `DropCounts` grows;
+- a datagram from N to the far end entering M does not leave the source device while the chain holds only the default deny;
+- after an allow rule for udp and tcp from `10.255.245.2` to the far end, the same datagram leaves the source device from `10.255.245.2`, and the far end's reply leaves M with the far end's address as its source, not `10.255.245.1`;
+- the same holds for a TCP SYN from N and the far end's SYN-ACK;
+- after `RemoveMeshSourceRewrite`, a datagram of a new flow from the far end leaves M with its own source;
+- after the rewrite is added again and found in `pfctl -a com.apple/plexd -s nat`, `ResetMeshSourceRewrite` on a second `PFController` that holds nothing leaves no line containing `plexd-mesh-rewrite` in `-s nat` and `-s rules`.
+
 On Windows `tunUDPLogsEveryPacket` is false, because the engine authorizes a UDP flow once, and the events `TestWFPController_RealConnLog` checks prove the filter ids of [Logged rules on Windows](#logged-rules-on-windows). The engine options it turns on belong to the whole host and outlive the process. Before the checks the test reads both through a session of its own and stops when the keyword is already set, and a cleanup puts both back to those starting values whatever the test's result. The test hands the controller `t.TempDir()` through `SetStateDir` and wraps it in `wfpLoggedApplyHook`, which embeds the `*WFPController` and, after each successful `ApplyRules` with a tagged rule, checks that the keyword bit is set, that `collect_net_events` is not 0, and that `wfp-allow-events.json` holds the starting values. After the checks' `DeleteChain` it finds both options at their starting values and no record. It then sets the keyword and writes the record as a crashed run would, and checks that `SetStateDir` with the same directory on a new controller puts the starting values back and deletes the record.
 
-CI runs all seven; see [CI Workflow](../development/ci-workflow.md).
+CI runs all eight; see [CI Workflow](../development/ci-workflow.md).

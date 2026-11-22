@@ -1,12 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1160" height="522" viewBox="0 0 1160 522" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The macOS and Windows route controllers and what they program">
 <title>The macOS and Windows route controllers and what they program</title>
 <rect width="1160" height="522" fill="#F6F5F1"/>
-<rect x="190" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="340" y="88.6" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Manager</text>
-<text x="340" y="109.75" font-size="17" fill="#55606E" text-anchor="middle">access routes,</text>
-<text x="340" y="130.15" font-size="17" fill="#55606E" text-anchor="middle">forwarding, NAT</text>
-<rect x="351" y="40" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
-<text x="414.5" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+<rect x="40" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="190" y="88.6" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Manager</text>
+<text x="190" y="109.75" font-size="17" fill="#55606E" text-anchor="middle">access routes,</text>
+<text x="190" y="130.15" font-size="17" fill="#55606E" text-anchor="middle">forwarding, NAT</text>
+<rect x="201" y="40" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="264.5" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+<rect x="370" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="520" y="87.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">UserAccessManager</text>
+<text x="520" y="107.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteManager</text>
+<text x="520" y="128.35" font-size="17" fill="#55606E" text-anchor="middle">forwarding, routes, rewrite</text>
+<rect x="461" y="40" width="197" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="559.5" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode, macOS</text>
 <rect x="775" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="925" y="87.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">wireguard.Manager</text>
 <text x="925" y="107.95" font-size="17" fill="#55606E" text-anchor="middle">peer routes on every node,</text>
@@ -25,9 +31,9 @@
 <text x="340" y="295.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">DarwinRouteController</text>
 <rect x="775" y="258" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
 <text x="925" y="295.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WindowsRouteController</text>
-<polyline points="340,152 340,205 340,205 340,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="190,152 190,205 340,205 340,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="340,258 334,245 346,245" fill="#3A4452"/>
-<polyline points="340,152 340,205 925,205 925,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polyline points="190,152 190,205 925,205 925,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="925,258 919,245 931,245" fill="#3A4452"/>
 <polyline points="925,152 925,205 340,205 340,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="340,258 334,245 346,245" fill="#3A4452"/>
@@ -43,4 +49,8 @@
 <polygon points="820,418 814,405 826,405" fill="#2457C5"/>
 <polyline points="1030,322 1030,409" fill="none" stroke="#3A4452" stroke-width="2.5"/>
 <polygon points="1030,418 1024,405 1036,405" fill="#3A4452"/>
+<polyline points="460,152 460,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="460,258 454,245 466,245" fill="#3A4452"/>
+<polyline points="600,152 600,409" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="600,418 594,405 606,405" fill="#3A4452"/>
 </svg>

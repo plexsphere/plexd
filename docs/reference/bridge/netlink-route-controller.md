@@ -115,7 +115,7 @@ The tables are deliberately separated to avoid conflicts between the policy fire
 
 ## Mesh Source Rewrite
 
-`NetlinkRouteController` implements `MeshSourceRewriter`, which the user access manager calls for each provider's interface and the site-to-site manager for each tunnel's link (see [User Access Integration](user-access-integration.md#policy-and-device-traffic) and [Site-to-Site VPN](site-to-site-vpn.md#routes-and-policy)). Both managers share the table:
+`NetlinkRouteController` implements `MeshSourceRewriter`, which the user access manager calls for each provider's interface and the site-to-site manager for each tunnel's link (see [User Access Integration](user-access-integration.md#policy-and-device-traffic) and [Site-to-Site VPN](site-to-site-vpn.md#routes-and-policy)). On macOS `PFController` implements it in the pf anchor instead (see [Mesh source rewrite](../networking/pf-wfp-firewall.md#mesh-source-rewrite)). Both managers share the table:
 
 | Method                    | Mechanism | Linux Subsystem                                      |
 |---------------------------|-----------|------------------------------------------------------|
