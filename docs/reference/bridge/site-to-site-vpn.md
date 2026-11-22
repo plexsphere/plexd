@@ -8,7 +8,7 @@ feature: PXD-0015
 
 A site-to-site tunnel joins a network outside the mesh, such as a branch office or a data center, to the nodes of a bridge's Domain. Each tunnel is an entry of the `bridge.site_to_site` block of the bridge's state pull, which an operator authors on the bridge Resource in the control plane. A `wireguard` tunnel is a WireGuard interface on the bridge with the remote site as its one peer. An `ipsec` tunnel is an IKEv2 connection of the host's strongSwan, bound to an xfrm interface on the bridge, and an `openvpn` tunnel is an OpenVPN process on a tun device on the bridge (see [Tunnel Providers](tunnel-providers.md)). For every kind the bridge routes the tunnel's `allowed_subnets` into the tunnel's link, forwards between the link and the mesh interface, and rewrites the source of what the link forwards into the mesh to the bridge's own mesh address. Every node of the Project routes the networks behind a bridge's tunnels through that bridge.
 
-A Linux bridge serves the tunnels. On macOS and Windows no tunnel is served, because neither platform has the mesh source rewrite: a tunnel that passes its own [checks](#checks) reads `kind_not_served`, and one that fails them reads `invalid_tunnel` there as on Linux. No issue carries tunnels to either platform yet. The peer routes are programmed on Linux, macOS and Windows alike (see [Routed subnets](../networking/wireguard.md#routed-subnets)). Every bridge reports whether it serves site-to-site tunnels, and the state of each tunnel, with `PUT /v1/nodes/{node_id}/site-to-site-status` (see [Site-to-Site Status Report](#site-to-site-status-report)).
+A Linux bridge serves the tunnels of all three kinds. A macOS bridge serves `wireguard` tunnels, with the source rewrite in pf; an `ipsec` or `openvpn` tunnel that passes its own [checks](#checks) reads `kind_not_served` there, because an xfrm interface and a persistent tun device are Linux kernel features and `plexd up` builds no provider of either kind on macOS. On Windows no tunnel is served, because the platform has no mesh source rewrite: a tunnel that passes its own checks reads `kind_not_served`. On every platform a tunnel that fails its checks reads `invalid_tunnel`. No issue carries tunnels to Windows yet. The peer routes are programmed on Linux, macOS and Windows alike (see [Routed subnets](../networking/wireguard.md#routed-subnets)). Every bridge reports whether it serves site-to-site tunnels, and the state of each tunnel, with `PUT /v1/nodes/{node_id}/site-to-site-status` (see [Site-to-Site Status Report](#site-to-site-status-report)).
 
 ## Data Flow
 
@@ -23,16 +23,25 @@ A tunnel carries traffic both ways only when both ends of the mesh know where th
 - **On the bridge**, the manager adds a route for each of the tunnel's `allowed_subnets` into the tunnel's link (`RouteController.AddRoute(subnet, link)`), so what the bridge receives on the mesh interface for the site leaves through the tunnel.
 - **On every node**, the WireGuard manager routes the `routed_subnets` of a peer through the mesh interface and accepts them as allowed IPs of that peer. The control plane lists the networks behind a bridge's tunnels in the `routed_subnets` of the bridge's peer entry, so a node sends traffic for the site to the bridge, and its WireGuard accepts the site's addresses from the bridge. A node skips a routed subnet that is malformed, overlaps the mesh prefix, or lies inside a network of one of its own interfaces; see [Routed subnets](../networking/wireguard.md#routed-subnets).
 
-The bridge masquerades what a tunnel's link forwards out through the mesh interface, so a packet the site sends into the mesh leaves the bridge with the bridge's mesh address as its source. The source rewrite is the same rule user access uses, `iifname <link> oifname plexd0 masquerade`, in the nftables table `plexd-mesh-nat` (see [Mesh Source Rewrite](netlink-route-controller.md#mesh-source-rewrite)). A packet a mesh node sends to the site keeps its source.
+The bridge masquerades what a tunnel's link forwards out through the mesh interface, so a packet the site sends into the mesh leaves the bridge with the bridge's mesh address as its source. On Linux the source rewrite is the same rule user access uses, `iifname <link> oifname plexd0 masquerade`, in the nftables table `plexd-mesh-nat` (see [Mesh Source Rewrite](netlink-route-controller.md#mesh-source-rewrite)). On macOS it is three lines of the pf anchor `com.apple/plexd`, the same ones user access uses: `nat pass on <mesh> inet from any to any tagged plexd-mesh-rewrite -> (<mesh>)`, `pass out on <link> inet all keep state` and `pass in on <link> inet all keep state tag plexd-mesh-rewrite` (see [Mesh source rewrite](../networking/pf-wfp-firewall.md#mesh-source-rewrite)). A packet a mesh node sends to the site keeps its source.
 
-The policy applies differently in each direction:
+On macOS the kernel names a tunnel's WireGuard device `utunN`. The configured name, `wg-s2s-a0a0a0e1`, stays the name of the WireGuard device, of the tunnel's entry in `status.site-to-site` and of the log lines. Forwarding, the routes of the tunnel's `allowed_subnets` and the source rewrite take the kernel's name, and so does the mesh interface: `plexd up` hands the manager `wgMgr.OSInterfaceName()`, the mesh device's `utunN`. The Info line `utun device created` (`component=wireguard`) maps the two names with `interface` and `utun`.
+
+On Linux the policy applies differently in each direction:
 
 | Direction | Source seen at the far end | Where the policy applies |
 |---|---|---|
 | Mesh node to the site | The node's mesh address | The sending node's output chain filters what it sends under its compiled rules; the control plane compiles a rule to a network behind a bridge with that network as `destination_cidr`. The bridge's forward chain filters the packet too, because its policy chain matches what arrives on the mesh interface. The site's reply passes the bridge as a reply to a tracked connection and reaches the node with the site's address, which the node's WireGuard accepts from the bridge as a routed subnet |
 | Site to a mesh node | The bridge's mesh address | The bridge does not filter it: the packet arrives on the tunnel's link, and the policy chain of the forward hook matches only what arrives on the mesh interface. The destination node filters it under its rules for the bridge's mesh address, as it does for every packet a node forwards into the mesh (see [Connection Tracking](../networking/nftables-firewall.md#connection-tracking)) |
 
-A rule that lets a mesh node reach the site therefore names the site's network as its destination, and a Policy that allows the bridge's mesh address to a destination allows every host of every site behind the bridge to reach it. Phase 18 of the systemd suite proves both directions with packets (see [Systemd E2E Test](../development/systemd-e2e-test.md#_18-site-to-site-through-a-bridge)).
+On macOS pf gives each direction the same outcome through its own lines:
+
+| Direction | Source seen at the far end | Where the policy applies |
+|---|---|---|
+| Mesh node to the site | The node's mesh address | The sending node filters what it sends under its compiled rules. The bridge's policy chain filters the packet when it arrives on the mesh interface, so its default deny drops what no rule allows. The link's `pass out` line keeps state, so the site's reply returns on the state the first packet created, is never tagged, and reaches the node with the site's address, which the node's WireGuard accepts from the bridge as a routed subnet |
+| Site to a mesh node | The bridge's mesh address | The bridge does not filter it: the link's `pass in` line tags it, and the `nat pass` line translates it on its way out of the mesh interface and skips the filter rules. The destination node filters it under its rules for the bridge's mesh address |
+
+A rule that lets a mesh node reach the site therefore names the site's network as its destination, and a Policy that allows the bridge's mesh address to a destination allows every host of every site behind the bridge to reach it. Phase 18 of the systemd suite proves both directions with packets on Linux (see [Systemd E2E Test](../development/systemd-e2e-test.md#_18-site-to-site-through-a-bridge)). On macOS `TestPFController_RealMeshSourceRewrite` checks both directions with packets through utuns of its own, a tunnel's link that carries the mesh address among them, in the privileged macOS step of CI (see [Mesh source rewrite](../networking/pf-wfp-firewall.md#mesh-source-rewrite)).
 
 ## The bridge.site_to_site Block
 
@@ -94,7 +103,7 @@ A bridge serves the pulled tunnels when three conditions hold:
 2. Its local configuration does not opt out: `bridge.site_to_site_enabled` is absent or `true`.
 3. The block carries `enabled: true`.
 
-A bridge that never set `bridge.site_to_site_enabled` starts serving the tunnels the control plane delivers after an upgrade: before, `site_to_site_enabled` was an opt-in that defaulted to `false`. A host that must stay closed sets `bridge.site_to_site_enabled: false` before it upgrades.
+A bridge that never set `bridge.site_to_site_enabled` starts serving the tunnels the control plane delivers after an upgrade: before, `site_to_site_enabled` was an opt-in that defaulted to `false`. A macOS bridge read `kind_not_served` for every tunnel before the pf source rewrite; one that never set the key serves its `wireguard` tunnels once it runs a plexd that has the rewrite. A host that must stay closed sets `bridge.site_to_site_enabled: false` before it upgrades.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -187,17 +196,19 @@ A tunnel whose id fails one of the first two checks gets no state: the control p
 The first step that fails sets the tunnel's reason:
 
 1. The checks above: `invalid_tunnel`.
-2. Without a `MeshSourceRewriter`, on macOS and Windows: `kind_not_served`. A `kind` this plexd does not know, and an `ipsec` or `openvpn` tunnel without a provider of its kind, read `kind_not_served` too.
+2. Without a `MeshSourceRewriter`, on Windows: `kind_not_served`. A `kind` this plexd does not know, and an `ipsec` or `openvpn` tunnel without a provider of its kind, as on macOS, read `kind_not_served` too.
 3. The secret inventory does not list the Secret the tunnel names: `auth_secret_not_listed`. An `ipsec` tunnel on a bridge without a Domain mesh CIDR: `setup_failed`, since it has no local traffic selector.
 4. A `remote_host` that is no IP address is resolved, with a timeout of 5 s: `remote_host_unresolved` when the lookup fails or returns no address. A `wireguard` tunnel takes the first IPv4 address among those returned, or the first address when none is IPv4, and `<address>:<remote_port>` as its peer's endpoint. An IP address is taken as it is, without a lookup.
 5. The fetch of the Secret the tunnel names, in the version the inventory lists: `auth_secret_unreadable`. The value is trimmed of surrounding white space. For a `wireguard` tunnel a value that is not 44 characters of standard base64 decoding to 32 bytes: `setup_failed`. A `wireguard` tunnel without `auth_secret_name` fetches nothing and gets no preshared key.
 6. The link. `wireguard`: `InterfaceKeyStore.LoadOrCreate(id)`, `key_unavailable` when it fails; `VPNController.CreateTunnelInterface(name, key, listen_port)`, `bind_failed` when the error wraps `ErrListenPortInUse` and `setup_failed` for any other error; then `ConfigureTunnelPeer(name, remote_public_key, allowed_subnets, endpoint, psk)`. `ipsec`: `CreateXfrmInterface(name, <interface id>)`. `openvpn`: `CreateTunInterface(name)`. An error of these three calls: `setup_failed`. After a failed create or peer the manager removes a link of that name.
-7. `RouteController.EnableForwarding(plexd0, name)`, `MeshSourceRewriter.AddMeshSourceRewrite(name, plexd0)` and `RouteController.AddRoute(subnet, name)` for each allowed subnet: `setup_failed`.
+7. `RouteController.EnableForwarding(<mesh>, <os link>)`, `MeshSourceRewriter.AddMeshSourceRewrite(<os link>, <mesh>)` and `RouteController.AddRoute(subnet, <os link>)` for each allowed subnet: `setup_failed`. `<mesh>` and `<os link>` are the names the operating system knows the mesh interface and the link by: `plexd0` and `name` on Linux, the two devices' `utunN` names on macOS.
 8. `ipsec` and `openvpn`: the provider's `CreateTunnel` with the link, the remote host and port, the allowed subnets as the remote subnets, the Domain mesh CIDR as the local subnet, and the Secret's value as the key: `client_missing` when the error wraps `exec.ErrNotFound`, `setup_failed` for any other error. The commands of an `ipsec` tunnel run under a timeout of 30 s. An `openvpn` process runs under the manager's context, which `Teardown` cancels, since a process ends with the context it was started under.
 
-The tunnel is then up, and `site-to-site tunnel up` is logged. Steps 4 and 5 run outside the manager's mutex, so `Teardown` and the status readers do not wait for a lookup or a Secret fetch; an attempt that finds the manager torn down or the tunnel no longer held after them sets nothing up. Steps 6 to 8 run under the mutex. A failure in steps 6 to 8 undoes what the attempt added, in reverse: the routes, the rewrite, the link. A new tunnel, and one rebuilt for a new Secret version, has no entry in the local status or the report until its attempt ends; a tunnel that `Retry` brings up again keeps its `down` entry while its attempt runs.
+The tunnel is then up, and `site-to-site tunnel up` is logged. Steps 4 and 5 run outside the manager's mutex, so `Teardown` and the status readers do not wait for a lookup or a Secret fetch; an attempt that finds the manager torn down or the tunnel no longer held after them sets nothing up. Steps 6 to 8 run under the mutex. A failure in steps 6 to 8 undoes what the attempt added, in reverse: the routes, the rewrite, on macOS the forwarding claim, the link. A new tunnel, and one rebuilt for a new Secret version, has no entry in the local status or the report until its attempt ends; a tunnel that `Retry` brings up again keeps its `down` entry while its attempt runs.
 
-Tearing a tunnel down runs the provider's `RemoveTunnel` under a timeout of 30 s, `RouteController.RemoveRoute` for each allowed subnet, `MeshSourceRewriter.RemoveMeshSourceRewrite` and `VPNController.RemoveTunnelInterface`. Every step runs; their errors are joined.
+Tearing a tunnel down runs the provider's `RemoveTunnel` under a timeout of 30 s, `RouteController.RemoveRoute` for each allowed subnet, `MeshSourceRewriter.RemoveMeshSourceRewrite`, on macOS `RouteController.DisableForwarding`, and `VPNController.RemoveTunnelInterface`. The route, rewrite and forwarding calls take the kernel name the tunnel was brought up with. Every step runs; their errors are joined.
+
+macOS has one IPv4 forwarding sysctl for the whole host, `net.inet.ip.forwarding`, which the route controller restores once the last pair that claimed it lets go (see [Forwarding](route-controllers-macos-windows.md#forwarding)). There `plexd up` builds the manager with `ReleaseForwarding`, and the manager gives back the pair it claimed for a tunnel: when a tunnel that is up is torn down, `Teardown` included, and in the undo of a bring-up that fails after its forwarding was switched on. A failed release joins the teardown's errors; after a failed bring-up it is logged at Error, and the tunnel keeps `setup_failed`. The bridge manager stops after the site-to-site manager and lets go of its own pair last, so a stopped plexd leaves the sysctl as it found it. On Linux the manager never switches forwarding off: there `DisableForwarding` would switch off the mesh interface's own knob, which belongs to the bridge manager.
 
 ## Retry
 
@@ -258,7 +269,7 @@ A reason is a token of the grammar `^[a-z][a-z0-9_]{0,62}$`, and the control pla
 | Token | Kinds | Meaning |
 |---|---|---|
 | `invalid_tunnel` | every kind | A member of the entry is missing or malformed, or the entry clashes with an earlier one of the block (see [Checks](#checks)). Not retried until the entry changes |
-| `kind_not_served` | every kind | This plexd serves no tunnel of the kind: the platform has no mesh source rewrite (macOS, Windows), the kind is unknown to it, or no provider of the kind is built in. Not retried until the entry changes |
+| `kind_not_served` | every kind | This plexd serves no tunnel of the kind: the platform has no mesh source rewrite (Windows), the kind is unknown to it, or no provider of the kind is built in (`ipsec` and `openvpn` on macOS). Not retried until the entry changes |
 | `key_unavailable` | `wireguard` | The interface's key file could not be read, decoded or created |
 | `bind_failed` | `wireguard` | The interface cannot listen on its `listen_port`, which another socket holds, such as the mesh interface or another tunnel's interface |
 | `setup_failed` | every kind | The link, the remote peer, the forwarding, the source rewrite, a route or the daemon's side could not be set up; the Secret of a `wireguard` tunnel holds no preshared key; or an `ipsec` tunnel has no Domain mesh CIDR as its local traffic selector |
@@ -461,7 +472,7 @@ type VPNController interface {
 
 `NetlinkVPNController` (`vpn_controller_linux.go`) implements it on Linux through netlink and `wgctrl`. `CreateTunnelInterface` works as the user access controller's create does, without an address: the key is parsed before the link is added, and `EADDRINUSE` from `ConfigureDevice` or from `LinkSetUp` is wrapped with `ErrListenPortInUse`, which is what makes the manager report `bind_failed`. `CreateXfrmInterface` adds what `ip link add <name> type xfrm dev lo if_id <id>` adds, with the loopback link as its parent, so the interface depends on no uplink. `CreateTunInterface` adds what `ip tuntap add <name> mode tun` adds; the kernel attaches to a tun device that already carries the name and that no process holds open, so such a device is taken over, and a link of another kind under the name fails. `RemoveTunnelInterfaces` removes only links of type `wireguard`, `xfrm` or `tuntap`, so a link of another type is kept whatever its name starts with; it lists the links again while the kernel reports the dump as interrupted, up to three times. `TestNetlinkVPNController_RealLinks` proves the three kinds of link, the port sentinel and the sweep against the kernel in a network namespace of its own, gated by `PLEXD_TEST_REAL_LINKS` and root; CI runs it in its privileged Linux step.
 
-`WGVPNController` (`vpn_controller_wg.go`) implements it on macOS and Windows over the platform `WGController`, a utun device or a Wintun adapter on the [userspace backend](../networking/wireguard.md#userspace-backend). It passes the key through, returns an error wrapping `errors.ErrUnsupported` from `CreateXfrmInterface` and `CreateTunInterface`, since both links are Linux kernel features, returns nil from `RemoveTunnelInterfaces`, since a userspace device ends with its process, and reads handshakes through `wireguard.PeerStatsReader`. On macOS `plexd up` builds it with the node's mesh IP as a `/32`, because `route(8)` refuses a route over a utun without an IPv4 address. Both controllers stay compiled and tested, and `plexd up` builds them, but no tunnel reaches them: one that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_tunnel`.
+`WGVPNController` (`vpn_controller_wg.go`) implements it on macOS and Windows over the platform `WGController`, a utun device or a Wintun adapter on the [userspace backend](../networking/wireguard.md#userspace-backend). It passes the key through, returns an error wrapping `errors.ErrUnsupported` from `CreateXfrmInterface` and `CreateTunInterface`, since both links are Linux kernel features, returns nil from `RemoveTunnelInterfaces`, since a userspace device ends with its process, and reads handshakes through `wireguard.PeerStatsReader`. On macOS `plexd up` builds it with the node's mesh IP as a `/32`, because `route(8)` refuses a route over a utun without an IPv4 address. There a `wireguard` tunnel reaches it: its `OSInterfaceName` reports the utun's kernel name, which the manager hands to forwarding, the routes and the source rewrite, and a listen port another socket holds fails `CreateTunnelInterface` with an error wrapping `ErrListenPortInUse` and the bind's `EADDRINUSE`, since wireguard-go binds the port as it brings the device up, so the tunnel reads `bind_failed`. No `ipsec` or `openvpn` tunnel reaches its unsupported create, since `plexd up` builds no provider of either kind on macOS. On Windows the controller stays compiled and tested, and `plexd up` builds it, but no tunnel reaches it: one that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_tunnel`. Windows reports a taken port as `WSAEADDRINUSE`, which Go does not equate with `EADDRINUSE`, so the controller does not wrap `ErrListenPortInUse` there.
 
 ## Wiring in plexd up
 
@@ -473,27 +484,25 @@ if swanctlDir == "" {
     swanctlDir = filepath.Join(paths.RunDir(), "swanctl")
 }
 vpnCtrl := newVPNController(logger, identity.MeshIP)
-tunnelProviders := map[string]bridge.TunnelProvider{
-    api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
-    api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
-}
+tunnelProviders := newTunnelProviders(swanctlDir, logger)
 s2sMgr = bridge.NewSiteToSiteManager(bridge.SiteToSiteDeps{
-    VPN:           vpnCtrl,
-    Routes:        routeCtrl,
-    Rewriter:      newMeshSourceRewriter(routeCtrl),
-    Keys:          bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "site-to-site")),
-    Secrets:       secrets, // nodeSecretFetcher
-    Providers:     tunnelProviders,
-    MeshInterface: cfg.WireGuard.InterfaceName,
-    MeshCIDR:      userAccessMeshCIDR(wgMgr.MeshPrefix()),
-    Logger:        logger,
+    VPN:               vpnCtrl,
+    Routes:            routeCtrl,
+    Rewriter:          newMeshSourceRewriter(routeCtrl, fwCtrl),
+    Keys:              bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "site-to-site")),
+    Secrets:           secrets, // nodeSecretFetcher
+    Providers:         tunnelProviders,
+    MeshInterface:     wgMgr.OSInterfaceName(),
+    MeshCIDR:          userAccessMeshCIDR(wgMgr.MeshPrefix()),
+    ReleaseForwarding: forwardingKnobIsShared,
+    Logger:            logger,
 })
 if err := s2sMgr.Setup(); err != nil {
     return fmt.Errorf("plexd up: site-to-site setup: %w", err)
 }
 ```
 
-`routeCtrl` is the route controller `plexd up` builds once for every node, the instance the WireGuard manager adds the peer routes with. `secrets` is built when ingress, user access or site-to-site tunnels are not opted out, so a bridge that opts out of all three reads no node secret key. `userAccessMeshCIDR` returns the Domain mesh prefix, masked to its network, and an empty string for a prefix that is not valid or covers a single address. A bridge that opts out builds the same controller and providers and runs `bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders)` once instead (see [Activation](#activation)). The shutdown sequence calls `Teardown` after the user access manager's and logs a failure as `site-to-site teardown error`.
+`routeCtrl` is the route controller `plexd up` builds once for every node, the instance the WireGuard manager adds the peer routes with, and `fwCtrl` the firewall controller. The platform files decide three things. `newMeshSourceRewriter` returns the `NetlinkRouteController` on Linux, the `PFController` `fwCtrl` holds on macOS, and nil on Windows. `newTunnelProviders` returns the `ipsec` and the `openvpn` provider on Linux and Windows and none on macOS. `forwardingKnobIsShared` is true on macOS alone. `wgMgr.OSInterfaceName()` is the mesh interface's kernel name, `utunN` on macOS and `cfg.WireGuard.InterfaceName` everywhere else, also on a Mac whose WireGuard setup failed. `secrets` is built when ingress, user access or site-to-site tunnels are not opted out, so a bridge that opts out of all three reads no node secret key. `userAccessMeshCIDR` returns the Domain mesh prefix, masked to its network, and an empty string for a prefix that is not valid or covers a single address. A bridge that opts out builds the same controller and providers and runs `bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders)` once instead (see [Activation](#activation)). The shutdown sequence calls `Teardown` after the user access manager's and logs a failure as `site-to-site teardown error`.
 
 ## API Types
 
@@ -543,6 +552,7 @@ The report's types, `SiteToSiteStatusRequest`, `SiteToSiteStatusTunnel` and `Sit
 | `SiteToSiteManager.Teardown` (provider) | `bridge: site-to-site: remove the <kind> side of <id>: ` |
 | `SiteToSiteManager.Teardown` (route) | `bridge: site-to-site: remove route <subnet> via <link>: ` |
 | `SiteToSiteManager.Teardown` (rewrite) | `bridge: site-to-site: remove mesh source rewrite <link>: ` |
+| `SiteToSiteManager.Teardown` (forwarding, macOS) | `bridge: site-to-site: release forwarding <link>: ` |
 | `SiteToSiteManager.Teardown` (link) | `bridge: site-to-site: remove interface <link>: ` |
 | The `error` of a tunnel down for its link | `create interface <link>: `, `configure the remote peer on <link>: `, `create xfrm interface <link>: `, `create tun device <link>: ` |
 | The `error` of a tunnel down for its forwarding, rewrite or route | `enable forwarding: `, `add mesh source rewrite: `, `add route <subnet>: ` |
@@ -574,7 +584,7 @@ The `error` of a tunnel down for one of the checks is the text the [Checks](#che
 | Peer programming | `bridge: vpn: configure peer:` |
 | Peer removal | `bridge: vpn: remove peer:` |
 
-The `configure device` and `set interface up` errors of a taken port read `bridge: vpn: <step>: listen port in use: <cause>`. The address assignment is a step of the macOS controller alone; the device configuration, the xfrm and tun creates, the removal after a failed create, the removal by prefix and the opening of wgctrl are steps of the Linux controller alone. On macOS and Windows the text after a prefix is the `wireguard:` controller's own message.
+The route, rewrite and forwarding prefixes name the link by its kernel name, `utunN` on macOS. The `configure device` and `set interface up` errors of a taken port read `bridge: vpn: <step>: listen port in use: <cause>`. On macOS a taken port fails the interface creation, `bridge: vpn: create interface <name>: listen port in use: <cause>`, whose cause wraps `EADDRINUSE`. The address assignment is a step of the macOS controller alone; the device configuration, the xfrm and tun creates, the removal after a failed create, the removal by prefix and the opening of wgctrl are steps of the Linux controller alone. On macOS and Windows the text after a prefix is the `wireguard:` controller's own message.
 
 ## Logging
 
@@ -601,6 +611,7 @@ All site-to-site log entries use `component=bridge`, the reporter's included, ex
 | `Debug` | `site-to-site status: send failed` | `error`; logged instead of the Warn while the client holds a refused credential (`api.ErrCredentialRefused`) |
 | `Error` | `bridge: site-to-site: clean up failed` | `error`; logged by step 5e of `plexd up` on a bridge that opts out |
 | `Error` | `bridge: site-to-site: tear down tunnel failed` | `tunnel_id`, `interface`, `error` |
+| `Error` | `bridge: site-to-site: release forwarding failed` | `tunnel_id`, `interface`, `error`; on macOS, when the undo of a failed bring-up cannot give the forwarding claim back |
 | `Error` | `bridge: site-to-site: prune keys failed` | `error` |
 | `Error` | `site-to-site teardown error` | `error`; logged by the shutdown of `plexd up` |
 | `Info` | `tunnel interface created` | `interface`, and `listen_port` for a WireGuard interface or `if_id` for an xfrm interface |
@@ -609,4 +620,4 @@ All site-to-site log entries use `component=bridge`, the reporter's included, ex
 | `Debug` | `tunnel peer configured` | `interface` |
 | `Debug` | `tunnel peer removed` | `interface` |
 
-A failed read of `established` is logged at Debug. The providers' own lines are listed in [Tunnel Providers](tunnel-providers.md#logging), the peer routes' in [Routed subnets](../networking/wireguard.md#routed-subnets), and the source rewrite's in [Netlink Route Controller](netlink-route-controller.md#mesh-source-rewrite).
+A failed read of `established` is logged at Debug. The providers' own lines are listed in [Tunnel Providers](tunnel-providers.md#logging), the peer routes' in [Routed subnets](../networking/wireguard.md#routed-subnets), and the source rewrite's in [Netlink Route Controller](netlink-route-controller.md#mesh-source-rewrite) for Linux and in [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#mesh-source-rewrite) for macOS.

@@ -8,13 +8,13 @@ feature: PXD-0028
 
 A `tailscale` or `netbird` user access provider joins the bridge to that vendor's network with the vendor's client, so the users of that network reach the nodes of the bridge's Domain through the bridge. This page covers the two clients, the key they join with and how plexd runs them. The `bridge.user_access` block, the checks, the reasons, the retry and the status report are on [User Access Integration](user-access-integration.md).
 
-A Linux bridge serves both kinds. On macOS and Windows no client starts: a provider that passes its own [checks](user-access-integration.md#checks) reads `kind_not_served`, and one that fails them reads `invalid_provider`. Serving there is [#213](https://github.com/plexsphere/plexd/issues/213) and [#214](https://github.com/plexsphere/plexd/issues/214).
+A Linux bridge and a macOS bridge serve both kinds. On Windows no client starts: a provider that passes its own [checks](user-access-integration.md#checks) reads `kind_not_served`, and one that fails them reads `invalid_provider`. Serving there is [#214](https://github.com/plexsphere/plexd/issues/214). No real client of either kind has run on any platform, macOS included (see [Testing](#testing)).
 
 ## Data Flow
 
 ![Users of a tailnet or a NetBird network reach the bridge node over the vendor's overlay network and arrive on the client's interface, such as tailscale0 or wt0. Forwarding with a source rewrite carries their traffic to the mesh WireGuard interface plexd0, which exchanges it with the mesh peers in 10.42.0.0/16. The UserAccessClient for Tailscale or NetBird creates the client's interface; a line joins it to the CommandExecutor, which runs the tailscale and netbird commands. The UserAccessManager calls Start and Stop on the UserAccessClient. The nodeSecretFetcher fetches the Secret's value from the control plane and hands the join key to the UserAccessManager.](../../diagrams/bridge-vpn-providers-data-flow.svg)
 
-The vendor's users reach the bridge through the vendor's network and arrive on the client's interface: `tailscale0` for Tailscale, and for NetBird the interface `netbird status --json` names, such as `wt0`. The bridge forwards between that interface and `plexd0` and rewrites the source of what it forwards into the mesh to its own mesh address, as for every kind (see [Policy and Device Traffic](user-access-integration.md#policy-and-device-traffic)). `UserAccessManager` fetches the key from the Secret the provider names and starts the client with it. The client runs its commands through a `CommandExecutor`.
+The vendor's users reach the bridge through the vendor's network and arrive on the client's interface: for Tailscale the interface that carries the client's address, `tailscale0` on Linux and a `utunN` on macOS, and for NetBird the interface `netbird status --json` names, such as `wt0`. The bridge forwards between that interface and `plexd0` and rewrites the source of what it forwards into the mesh to its own mesh address, as for every kind (see [Policy and Device Traffic](user-access-integration.md#policy-and-device-traffic)). `UserAccessManager` fetches the key from the Secret the provider names and starts the client with it. The client runs its commands through a `CommandExecutor`.
 
 ## The Join Key
 
@@ -85,7 +85,7 @@ The provider is then up, and its report entry carries `id` and `health` alone: t
 
 - **File**: `internal/bridge/tailscale.go`
 - **Name**: `"tailscale"`
-- **Interface name**: `"tailscale0"`, set by plexd, not read from the client
+- **Interface name**: the first interface of the host that carries the client's address, read with `net.Interfaces`, and `"tailscale0"` when none carries it or the client lists no address. `tailscaled` names its interface `tailscale0` on Linux and runs on a `utunN` on macOS, and the client reports neither
 - **Concurrency**: `sync.Mutex` protects `running`, `ip`, `ifaceName`, `daemonHandle`
 
 ```go
@@ -98,7 +98,7 @@ func NewTailscaleProvider(exec CommandExecutor, logger *slog.Logger) *TailscaleP
 2. Start `tailscaled --state=mem:` with `CommandExecutor.Start` under `ctx`, the manager's context. The daemon runs until `Stop` or until the context ends.
 3. Run `tailscale up --authkey=<key> --accept-routes --advertise-routes=<mesh CIDR>` with `CommandExecutor.Run`.
 4. Run `tailscale status --json`.
-5. Take the first entry of `TailscaleIPs` from the JSON as the client's IP, set the interface name to `tailscale0`, and mark the client running.
+5. Take the first entry of `TailscaleIPs` from the JSON as the client's IP. Take as the interface name that of the first interface that carries the IP, or `tailscale0` when none carries it or `TailscaleIPs` is empty, and mark the client running.
 
 Steps 3 and 4 share one timeout of 60 s derived from `ctx`. A failure rolls back what the earlier steps started:
 
@@ -185,9 +185,11 @@ type CommandHandle interface {
 
 The host must carry the vendor's client: `tailscaled` and `tailscale` for a `tailscale` provider, `netbird` for a `netbird` provider, each on the `PATH` of the plexd process. Whether a vendor client runs inside the sandbox of `deploy/systemd/plexd.service` is unproven, as no suite runs one.
 
+On macOS launchd starts the daemon with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so a client installed in any other directory is not found and its provider reads `client_missing`.
+
 ## Testing
 
-No test suite runs a real Tailscale or NetBird client; the proof is the command stand-in. `tailscale_test.go` and `netbird_test.go` run each client over a mock `CommandExecutor` and check the exact commands and arguments, the 60 s deadline of the join commands, the refused empty key, the rollback, a missing executable, and that no log line carries the key. `provider_integration_test.go` runs the user access manager with both clients over the stand-in, up to the forwarding and the source rewrite of the client's interface, and covers `client_missing` and a client that reports no interface. The systemd suite's user access phase serves a `tailscale` provider on a host without a Tailscale client: it proves the Secret fetch, through the change from `auth_secret_not_listed` to `client_missing`, and nothing of a join (see [Systemd E2E Test](../development/systemd-e2e-test.md#_17-user-access-through-a-bridge)). A real client would need a coordination server in the suite.
+No test suite runs a real Tailscale or NetBird client; the proof is the command stand-in. `tailscale_test.go` and `netbird_test.go` run each client over a mock `CommandExecutor` and check the exact commands and arguments, the 60 s deadline of the join commands, the refused empty key, the rollback, a missing executable, and that no log line carries the key. `tailscale_test.go` also checks the interface found by the client's address through a seam, since no interface carries the stand-in's address. `provider_integration_test.go` runs the user access manager with both clients over the stand-in, up to the forwarding and the source rewrite of the client's interface, and covers `client_missing` and a client that reports no interface. The systemd suite's user access phase serves a `tailscale` provider on a host without a Tailscale client: it proves the Secret fetch, through the change from `auth_secret_not_listed` to `client_missing`, and nothing of a join (see [Systemd E2E Test](../development/systemd-e2e-test.md#_17-user-access-through-a-bridge)). A real client would need a coordination server in the suite. No real client has run on macOS either, so whether a vendor client's traffic reaches the mesh through a macOS bridge is unproven.
 
 ## Error Prefixes
 

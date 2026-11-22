@@ -8,7 +8,7 @@ feature: PXD-0013
 
 User access lets devices outside the mesh, such as an operator's laptop, reach the nodes of a bridge's Domain. Each way in is a user access provider of the `bridge.user_access` block of the bridge's state pull, which an operator authors on the bridge Resource in the control plane. A `wireguard` provider is a WireGuard interface on the bridge that admits the devices the operator registers by their public keys. A `tailscale` or `netbird` provider joins the bridge to that vendor's network with the vendor's client (see [VPN Providers](vpn-providers.md)). For every kind the bridge forwards the traffic of the provider's interface into the mesh and rewrites its source to the bridge's own mesh address.
 
-A Linux bridge serves the providers. On macOS and Windows no provider is served, because neither platform has the source rewrite yet: a provider that passes its own [checks](#checks) reads `kind_not_served`, and one that fails them reads `invalid_provider` there as on Linux. Serving there is [#213](https://github.com/plexsphere/plexd/issues/213) and [#214](https://github.com/plexsphere/plexd/issues/214). Every bridge reports whether it serves user access, and the state of each provider, with `PUT /v1/nodes/{node_id}/user-access-status` (see [User Access Status Report](#user-access-status-report)).
+A Linux bridge and a macOS bridge serve the providers (see [macOS](#macos) for what differs there). On Windows no provider is served, because it has no source rewrite yet: a provider that passes its own [checks](#checks) reads `kind_not_served`, and one that fails them reads `invalid_provider` there as on Linux. Serving there is [#214](https://github.com/plexsphere/plexd/issues/214). Every bridge reports whether it serves user access, and the state of each provider, with `PUT /v1/nodes/{node_id}/user-access-status` (see [User Access Status Report](#user-access-status-report)).
 
 ## Data Flow
 
@@ -23,6 +23,18 @@ A device is no peer of the mesh. The bridge masquerades what a provider's interf
 The bridge does not filter a device's packet on its way into the mesh. The destination node filters device traffic under its rules for the bridge's mesh address, as it does for every packet a node forwards into the mesh: on Linux such a packet takes the forward hook, whose policy chain matches only what arrives on the mesh interface, so the bridge's policy does not filter it on its way out (see [Connection Tracking](../networking/nftables-firewall.md#connection-tracking)). The replies pass the bridge's forward chain as replies to a tracked connection. A Policy that allows the bridge's mesh address to a destination therefore allows every device behind the bridge to reach it.
 
 This deviates from the control plane's agent contract, whose section "User access" says that the bridge's compiled policy applies to device traffic as to the bridge's own traffic. plexd keeps the decision recorded in `internal/policy/nftables_linux.go`, under which the output chain filters only what the node itself sends.
+
+## macOS
+
+A macOS bridge serves all three kinds. A `wireguard` provider's interface is a utun device, which the kernel names `utunN`. The manager keeps the configured name, such as `wg-ua-a0a0a0e1`, for the WireGuard device, for the `interface` of `status.user-access` and for its log lines, and hands the `utunN` name the access controller reports to forwarding and to the source rewrite. The mesh interface they take is the kernel's name of `plexd0`, a `utunN` too. The Info line `utun device created` (`component=wireguard`) maps the two names with its keys `interface` and `utun`. A `tailscale` or `netbird` provider takes the interface its client reports; for Tailscale that is the interface that carries the client's address (see [VPN Providers](vpn-providers.md#tailscaleprovider)).
+
+The source rewrite lives in pf, in the anchor `com.apple/plexd` that holds the policy chains and the bridge NAT (see [Mesh Source Rewrite](../networking/pf-wfp-firewall.md#mesh-source-rewrite)). The policy applies in the same places as on Linux. What a provider's interface forwards into the mesh is not filtered on the bridge: the rewrite's `nat` line carries `pass`, so pf skips the filter rules for the translated packet, and the destination node filters it under its rules for the bridge's mesh address. What a mesh node sends to a device is filtered by the bridge's policy chain when it arrives on the mesh interface.
+
+macOS has one IPv4 forwarding knob for the whole host, `net.inet.ip.forwarding`. The manager claims one pair per provider with `EnableForwarding` and gives it back with `DisableForwarding` when the provider goes down: when it is removed or rebuilt, when its bring-up fails after its forwarding was switched on, and at `Teardown` (`UserAccessDeps.ReleaseForwarding`). The route controller restores the value it found once the last pair lets go, which is the bridge manager's, since `plexd up` stops that manager after the user access manager (see [Forwarding](route-controllers-macos-windows.md#forwarding)).
+
+A listen port another socket holds reads `bind_failed`, as on Linux: wireguard-go binds the port as it brings the utun up, and the controller wraps the bind's `EADDRINUSE` with `ErrListenPortInUse`. Windows reports the port as `WSAEADDRINUSE`, which Go does not equate with `EADDRINUSE`, so a taken port reads `setup_failed` there.
+
+A macOS bridge that never set `bridge.user_access_enabled` serves what its pull enables from the upgrade on, and `false` opts it out (see [Activation](#activation)). Every macOS bridge writes its pf anchor once at start, through `CleanupUserAccess`, also with `policy.enabled: false` and `bridge.enable_nat: false`. The first provider that comes up takes a pf enable reference, so pf is switched on for a host that had it off, as a policy chain or the bridge NAT does.
 
 ## The bridge.user_access Block
 
@@ -108,7 +120,7 @@ The control plane sends `enabled: true` on every block, so the bridge host's con
 
 `Validate` refuses only an explicit `true` while `bridge.enabled` is `false`, with `bridge: config: user access requires bridge mode to be enabled`. An absent key and an explicit `false` are valid without `bridge.enabled`, so a node outside bridge mode loads either. `Validate` does not read `mode`: `mode: node` with `bridge.enabled: true` and `bridge.user_access_enabled: true` loads, and serves no provider, because `plexd up` builds the bridge subsystem only when both conditions of step 1 hold.
 
-A bridge with `bridge.user_access_enabled: false` opts out. Step 5e of `plexd up` builds no user access manager, so no code path creates a provider's interface or starts a vendor client, whatever the pull says. It runs `CleanupUserAccess` once instead, which on Linux removes every interface whose name starts with `wg-ua-` and the nftables table `plexd-mesh-nat` that an earlier process left behind, so no interface of that process keeps a port open. A failed cleanup is logged at Error as `bridge: user access: clean up failed` and does not stop the start. The step then logs `user access: opted out by bridge.user_access_enabled, no provider is served`, and `bridge subsystem initialized` reads `user_access=false`. The opt-out keeps the key files. The reconcile handler logs a Warn when the pull enables user access with providers (see [UserAccessReconcileHandler](#useraccessreconcilehandler)), and the bridge reports `opted_out`. plexd reads its configuration once per start, so a changed `bridge.user_access_enabled` takes effect, and is reported, with the next restart.
+A bridge with `bridge.user_access_enabled: false` opts out. Step 5e of `plexd up` builds no user access manager, so no code path creates a provider's interface or starts a vendor client, whatever the pull says. It runs `CleanupUserAccess` once instead, which on Linux removes every interface whose name starts with `wg-ua-` and the nftables table `plexd-mesh-nat` that an earlier process left behind, so no interface of that process keeps a port open, and on macOS writes the pf anchor without any rewrite line. A failed cleanup is logged at Error as `bridge: user access: clean up failed` and does not stop the start. The step then logs `user access: opted out by bridge.user_access_enabled, no provider is served`, and `bridge subsystem initialized` reads `user_access=false`. The opt-out keeps the key files. The reconcile handler logs a Warn when the pull enables user access with providers (see [UserAccessReconcileHandler](#useraccessreconcilehandler)), and the bridge reports `opted_out`. plexd reads its configuration once per start, so a changed `bridge.user_access_enabled` takes effect, and is reported, with the next restart.
 
 ### The Replaced Keys
 
@@ -152,7 +164,7 @@ The key file lives as long as the pull lists the provider:
 4. A held provider whose entry is unchanged is kept. Unchanged means the same `kind` and the same verdict of the [checks](#checks), compared by its error text, and for a `wireguard` provider the same `listen_port` and `address_pool`, for a `tailscale` or `netbird` provider the same `auth_secret_name`; `slug`, `max_devices`, `devices` and the case of the id change in place. The verdict depends on the providers before it in the block, so a provider whose own members stay the same is rebuilt when an earlier provider of the block comes to take its interface name or its vendor kind: it is torn down, an up one included, and reads `invalid_provider`. The devices of a kept `wireguard` provider that is up are brought in line with the block by public key: a device the block no longer lists is removed with `RemovePeer`, and a new device, or one with another address, is configured with `ConfigurePeer`.
 5. Any other provider is brought up, in block order. A held provider whose entry changed is torn down and brought up again; a `wireguard` provider keeps its key, because its id names the key file.
 
-The manager never switches forwarding off: the provider's interface is deleted with the provider, and the forwarding of the mesh interface belongs to the bridge manager.
+On Linux and Windows the manager never switches forwarding off: the provider's interface is deleted with the provider, and the forwarding of the mesh interface belongs to the bridge manager. On macOS, where one knob serves the whole host, it gives back the forwarding pair of every provider it tears down (see [macOS](#macos)).
 
 ### Checks
 
@@ -175,10 +187,10 @@ A provider whose id fails one of the first two checks gets no state: the control
 The first step that fails sets the provider's reason:
 
 1. The checks above: `invalid_provider`.
-2. Without a `MeshSourceRewriter`, on macOS and Windows: `kind_not_served`.
+2. Without a `MeshSourceRewriter`, on Windows: `kind_not_served`.
 3. `InterfaceKeyStore.LoadOrCreate(id)` reads or creates the key file: `key_unavailable`.
 4. `AccessController.CreateInterface(name, key, listen_port, address)`: `bind_failed` when the error wraps `ErrListenPortInUse`, `setup_failed` for any other error. The manager removes an interface of that name afterwards.
-5. `RouteController.EnableForwarding(plexd0, name)`, then `MeshSourceRewriter.AddMeshSourceRewrite(name, plexd0)`: `setup_failed`. The manager removes the interface.
+5. `RouteController.EnableForwarding(plexd0, name)`, then `MeshSourceRewriter.AddMeshSourceRewrite(name, plexd0)`, each with the name the operating system knows the interface by, a `utunN` on macOS: `setup_failed`. On macOS a failed rewrite gives the forwarding pair back. The manager removes the interface.
 6. Each device becomes a peer. A device the bridge cannot serve is skipped, and the provider stays up.
 
 The provider is then up, and `user access provider up` is logged. A device is skipped with the Warn `user access device not served` and one of these reasons, the first that applies:
@@ -200,13 +212,13 @@ Each skip is logged once while it lasts.
 The first step that fails sets the provider's reason (see [VPN Providers](vpn-providers.md) for the clients):
 
 1. The checks above: `invalid_provider`.
-2. Without a `MeshSourceRewriter`, on macOS and Windows, or without a client of the kind: `kind_not_served`.
+2. Without a `MeshSourceRewriter`, on Windows, or without a client of the kind: `kind_not_served`.
 3. A `tailscale` provider without a Domain mesh CIDR to advertise: `setup_failed`, before the inventory is read.
 4. The secret inventory does not list `auth_secret_name`: `auth_secret_not_listed`.
 5. The fetch of the Secret, in the version the inventory lists: `auth_secret_unreadable`.
 6. `UserAccessClient.Start`: `client_missing` when the error wraps `exec.ErrNotFound`, `join_failed` for any other error.
 7. The client reports no interface: the manager stops the client, `join_failed`.
-8. `EnableForwarding` and `AddMeshSourceRewrite` for the client's interface: the manager stops the client, `setup_failed`.
+8. `EnableForwarding` and `AddMeshSourceRewrite` for the client's interface: the manager stops the client, `setup_failed`. On macOS a failed rewrite gives the forwarding pair back.
 
 Steps 5 to 7 run outside the manager's mutex, so `Teardown` and the status readers do not wait for the Secret fetch or the client's start. Step 8 runs under the mutex, and a join that finds the manager torn down by then stops the client it started. A provider whose first join still runs has no report entry until the join ends.
 
@@ -257,7 +269,7 @@ A reason is a token of the grammar `^[a-z][a-z0-9_]{0,62}$`, and the control pla
 | Token | Kinds | Meaning |
 |---|---|---|
 | `invalid_provider` | every kind | A member of the entry is malformed, or the entry clashes with an earlier one of the block (see [Checks](#checks)). Not retried until the entry changes |
-| `kind_not_served` | every kind | This plexd serves no provider of the kind: the platform has no mesh source rewrite (macOS, Windows), the kind is unknown to it, or no client of the kind is built in. Not retried until the entry changes |
+| `kind_not_served` | every kind | This plexd serves no provider of the kind: the platform has no mesh source rewrite (Windows), the kind is unknown to it, or no client of the kind is built in. Not retried until the entry changes |
 | `key_unavailable` | `wireguard` | The interface's key file could not be read, decoded or created |
 | `bind_failed` | `wireguard` | The interface cannot listen on its `listen_port`, which another socket holds |
 | `setup_failed` | `wireguard`, `tailscale`, `netbird` | The interface, its forwarding or its source rewrite could not be set up, or a `tailscale` provider has no Domain mesh CIDR to advertise |
@@ -332,15 +344,16 @@ Each report replaces the provider entries of the one before. A bridge that has n
 
 ```go
 type UserAccessDeps struct {
-    Access        AccessController
-    Routes        RouteController
-    Rewriter      MeshSourceRewriter          // nil: this platform serves no provider
-    Keys          *InterfaceKeyStore          // must not be nil
-    Secrets       SecretValueFetcher          // must not be nil while Clients holds a client
-    Clients       map[string]UserAccessClient // the vendor client of each vendor kind, by kind
-    MeshInterface string
-    MeshCIDR      string                      // the Domain mesh CIDR; empty when the node has none
-    Logger        *slog.Logger
+    Access            AccessController
+    Routes            RouteController
+    ReleaseForwarding bool                        // give back each forwarding pair the manager claims (macOS)
+    Rewriter          MeshSourceRewriter          // nil, on Windows: this platform serves no provider
+    Keys              *InterfaceKeyStore          // must not be nil
+    Secrets           SecretValueFetcher          // must not be nil while Clients holds a client
+    Clients           map[string]UserAccessClient // the vendor client of each vendor kind, by kind
+    MeshInterface     string
+    MeshCIDR          string                      // the Domain mesh CIDR; empty when the node has none
+    Logger            *slog.Logger
 }
 
 func NewUserAccessManager(deps UserAccessDeps) *UserAccessManager
@@ -354,12 +367,12 @@ The manager is concurrent-safe through a mutex. `Apply`, `SyncSecretInventory` a
 | `Apply` | `(ctx context.Context, block api.UserAccessConfig)` | Serves the block whole (see [Applying the Block](#applying-the-block)); a no-op while inactive |
 | `SyncSecretInventory` | `(ctx context.Context, inventory []api.NodeStateSecret)` | Replaces the secret inventory the vendor providers read, then calls `Retry`; a no-op while inactive |
 | `Retry` | `(ctx context.Context)` | Brings up again each provider that is down for a retried reason and whose next attempt is due (see [Retry](#retry)); a no-op while inactive |
-| `Teardown` | `() error` | Stops every vendor client, removes every source rewrite and every interface, cancels the clients' context and keeps the key files. Idempotent; joins its errors |
+| `Teardown` | `() error` | Stops every vendor client, removes every source rewrite and every interface, gives back each forwarding pair with `ReleaseForwarding`, cancels the clients' context and keeps the key files. Idempotent; joins its errors |
 | `ProviderReports` | `() []UserAccessProviderReport` | One report per provider with a valid, unrepeated id, in block order; nil while inactive |
 | `ReportChanged` | `() <-chan struct{}` | Signalled, without blocking, when what `ProviderReports` returns may have changed; capacity 1 |
 | `UserAccessStatus` | `() *api.UserAccessInfo` | The `status.user-access` payload; nil while inactive |
 
-`Setup` exists because a killed process leaves its kernel interfaces behind, and the next `CreateInterface` for the same provider would fail on the name. The process the unit starts next removes them and brings each provider up again with its kept key, so a device connects again unchanged. `CleanupUserAccess` removes the nftables table `plexd-mesh-nat` for the same reason.
+`Setup` exists because a killed process leaves its kernel interfaces behind, and the next `CreateInterface` for the same provider would fail on the name. The process the unit starts next removes them and brings each provider up again with its kept key, so a device connects again unchanged. `CleanupUserAccess` removes the nftables table `plexd-mesh-nat` for the same reason, and on macOS the rewrite lines of the pf anchor, which would otherwise tag the traffic of whichever device gets a freed `utunN` next.
 
 The inventory is a map from Secret name to version, filtered as the node API's [secret index](../core/nodeapi.md#secretindexdispatchhandler) filters it: the first entry of a name counts, and a name outside the grammar or a version below 1 counts as not listed. The manager holds no inventory until the first `SyncSecretInventory`.
 
@@ -430,7 +443,7 @@ type AccessController interface {
 
 `NetlinkAccessController` (`access_controller_linux.go`) implements it on Linux through netlink and `wgctrl`. The kernel binds a WireGuard device's listen port when the device comes up, and again when the port changes on a device that is up, so a port another socket holds surfaces as `EADDRINUSE` from `LinkSetUp` or from `ConfigureDevice`. The controller wraps such an error with `ErrListenPortInUse`, which is what makes the manager report `bind_failed`; step 7 of the systemd suite's user access phase checks that a provider on the port `plexd0` holds reads `bind_failed` (see [Systemd E2E Test](../development/systemd-e2e-test.md#_17-user-access-through-a-bridge)). `RemoveInterfaces` refuses an empty prefix, which would match the mesh interface. It lists the links again while the kernel reports the dump as interrupted, up to three times.
 
-`WGAccessController` (`access_controller_wg.go`) implements it on macOS and Windows over the platform `WGController`, a utun device or a Wintun adapter on the [userspace backend](../networking/wireguard.md#userspace-backend). It passes the key and the address through, reads handshakes through `wireguard.PeerStatsReader`, and returns nil from `RemoveInterfaces`, since a userspace device ends with its process. `plexd up` builds it on both platforms, and no provider reaches it there: one that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_provider`.
+`WGAccessController` (`access_controller_wg.go`) implements it on macOS and Windows over the platform `WGController`, a utun device or a Wintun adapter on the [userspace backend](../networking/wireguard.md#userspace-backend). It passes the key and the address through, reads handshakes through `wireguard.PeerStatsReader`, and returns nil from `RemoveInterfaces`, since a userspace device ends with its process. It also implements `wireguard.OSInterfaceNamer`: `OSInterfaceName` reports the kernel's name of an interface, a `utunN` on macOS and the configured name on Windows. wireguard-go binds the listen port when it brings the device up, and the controller wraps the bind's `EADDRINUSE` with `ErrListenPortInUse`. `plexd up` builds it on both platforms. The providers of a macOS bridge are served through it; on Windows no provider reaches it: one that passes its checks reads `kind_not_served`, and one that fails them reads `invalid_provider`.
 
 ## MeshSourceRewriter
 
@@ -452,7 +465,9 @@ func CleanupUserAccess(access AccessController, rewriter MeshSourceRewriter) err
 
 `NetlinkRouteController` implements the rewriter on Linux in an IPv4 nftables table of its own, `plexd-mesh-nat`, with one chain `postrouting` (type nat, hook postrouting, priority srcnat). `AddMeshSourceRewrite` adds one rule per provider interface, `iifname <fromIface> oifname <meshIface> counter masquerade`, tagged with the interface's name; masquerade gives the packet the address of the mesh interface, the bridge's mesh address. See [Netlink Route Controller](netlink-route-controller.md#mesh-source-rewrite).
 
-The rewriter is a dependency of its own, not a method of `NATController`, so the pf and WinNAT backends do not implement it. `cmd/plexd/cmd/up_linux.go` builds it with `newMeshSourceRewriter(routeCtrl)`, which returns the `NetlinkRouteController`; the macOS, Windows and other builds return nil, which makes every provider that passes its checks read `kind_not_served`.
+`policy.PFController` implements it on macOS in its pf anchor `com.apple/plexd`: a `nat pass` line per mesh interface that matches the tag `plexd-mesh-rewrite`, and per provider interface two filter lines, one of which sets the tag on what arrives there. See [Mesh Source Rewrite](../networking/pf-wfp-firewall.md#mesh-source-rewrite).
+
+The rewriter is a dependency of its own, not a method of `NATController`, so a NAT backend need not implement it; the WinNAT backend does not. `plexd up` builds it with `newMeshSourceRewriter(routeCtrl, fwCtrl)`, which returns the `NetlinkRouteController` on Linux and the `PFController` on macOS; the Windows and other builds return nil, which makes every provider that passes its checks read `kind_not_served`.
 
 ## InterfaceKeyStore
 
@@ -472,23 +487,24 @@ Step 5e of `plexd up` builds the manager on a bridge that does not opt out:
 userAccessMgr = bridge.NewUserAccessManager(bridge.UserAccessDeps{
     Access:   newAccessController(logger),
     Routes:   routeCtrl,
-    Rewriter: newMeshSourceRewriter(routeCtrl),
+    Rewriter: newMeshSourceRewriter(routeCtrl, fwCtrl),
     Keys:     bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "user-access")),
     Secrets:  secrets, // nodeSecretFetcher
     Clients: map[string]bridge.UserAccessClient{
         api.UserAccessKindTailscale: bridge.NewTailscaleProvider(bridge.NewStdCommandExecutor(), logger),
         api.UserAccessKindNetbird:   bridge.NewNetbirdProvider(bridge.NewStdCommandExecutor(), logger),
     },
-    MeshInterface: cfg.WireGuard.InterfaceName,
-    MeshCIDR:      userAccessMeshCIDR(wgMgr.MeshPrefix()),
-    Logger:        logger,
+    MeshInterface:     wgMgr.OSInterfaceName(),
+    MeshCIDR:          userAccessMeshCIDR(wgMgr.MeshPrefix()),
+    ReleaseForwarding: forwardingKnobIsShared,
+    Logger:            logger,
 })
 if err := userAccessMgr.Setup(); err != nil {
     return fmt.Errorf("plexd up: user access setup: %w", err)
 }
 ```
 
-`userAccessMeshCIDR` returns the Domain mesh prefix, masked to its network, and an empty string for a prefix that is not valid or covers a single address: the WireGuard manager falls back to the mesh IP's `/32` when the identity carries no usable `domain_mesh_cidr`, and a route to the bridge alone would reach no other node. The shutdown sequence calls `Teardown` after the ingress manager's and logs a failure as `user access teardown error`.
+`wgMgr.OSInterfaceName()` is the name the operating system knows the mesh interface by: the configured name on Linux and Windows, its `utunN` on macOS. `forwardingKnobIsShared` is `true` on macOS alone. `userAccessMeshCIDR` returns the Domain mesh prefix, masked to its network, and an empty string for a prefix that is not valid or covers a single address: the WireGuard manager falls back to the mesh IP's `/32` when the identity carries no usable `domain_mesh_cidr`, and a route to the bridge alone would reach no other node. The shutdown sequence calls `Teardown` after the ingress manager's and logs a failure as `user access teardown error`.
 
 ## API Types
 
@@ -543,11 +559,12 @@ The report's types, `UserAccessStatusRequest`, `UserAccessStatusProvider` and `U
 | `UserAccessManager.Teardown` (client) | `bridge: user access: stop <kind> client: ` |
 | `UserAccessManager.Teardown` (interface) | `bridge: user access: remove interface <iface>: ` |
 | `UserAccessManager.Teardown` (rewrite) | `bridge: user access: remove mesh source rewrite <iface>: ` |
+| `UserAccessManager.Teardown` (forwarding, with `ReleaseForwarding`) | `bridge: user access: release forwarding <iface>: ` |
 | The `error` of a provider down for its forwarding | `enable forwarding: ` |
 | The `error` of a provider down for its source rewrite | `add mesh source rewrite: ` |
 | `InterfaceKeyStore` | `bridge: key store: ` |
 
-The `error` of a provider down for one of the checks is the text the [Checks](#checks) table lists; the others are `this platform has no mesh source rewrite`, `kind "<kind>" is not known`, `no <kind> client is built in`, `the node has no mesh CIDR to advertise`, `the secret inventory does not list "<name>"` and `the client reports no interface`. The controller carries prefixes of its own:
+In the rewrite and forwarding prefixes `<iface>` is the name the operating system knows the interface by, a `utunN` on macOS. The `error` of a provider down for one of the checks is the text the [Checks](#checks) table lists; the others are `this platform has no mesh source rewrite` (Windows), `kind "<kind>" is not known`, `no <kind> client is built in`, `the node has no mesh CIDR to advertise`, `the secret inventory does not list "<name>"` and `the client reports no interface`. The controller carries prefixes of its own:
 
 | Step | Prefix |
 |---|---|
@@ -570,7 +587,7 @@ The `error` of a provider down for one of the checks is the text the [Checks](#c
 | Peer programming | `bridge: access: configure peer:` |
 | Peer removal | `bridge: access: remove peer:` |
 
-The `configure device` and `set interface up` errors of a taken port read `bridge: access: <step>: listen port in use: <cause>`. The address parse, the device configuration, the removal after a failed create, the removal by prefix and the opening of wgctrl are steps of the Linux controller alone. On macOS and Windows the text after a prefix is the `wireguard:` controller's own message.
+On Linux the `configure device` and `set interface up` errors of a taken port read `bridge: access: <step>: listen port in use: <cause>`. On macOS a taken port reads `bridge: access: create interface <name>: listen port in use: <cause>`, because wireguard-go binds the port inside the create. The address parse, the device configuration, the removal after a failed create, the removal by prefix and the opening of wgctrl are steps of the Linux controller alone. On macOS and Windows the text after a prefix is the `wireguard:` controller's own message.
 
 ## Logging
 
@@ -602,6 +619,7 @@ All user access log entries use `component=bridge`, the reporter's included, exc
 | `Error` | `bridge: user access: prune keys failed` | `error` |
 | `Error` | `bridge: user access: remove device failed` | `provider_id`, `device_id`, `error` |
 | `Error` | `bridge: user access: stop client failed` | `provider_id`, `kind`, `error` |
+| `Error` | `bridge: user access: release forwarding failed` | `provider_id`, `interface`, `error`; logged when a failed bring-up cannot give its forwarding pair back (macOS); the provider keeps `setup_failed` |
 | `Error` | `user access teardown error` | `error`; logged by the shutdown of `plexd up` |
 | `Info` | `access interface created` | `interface`, `listen_port` |
 | `Info` | `access interface removed` | `interface` |
@@ -609,4 +627,4 @@ All user access log entries use `component=bridge`, the reporter's included, exc
 | `Debug` | `access peer configured` | `interface` |
 | `Debug` | `access peer removed` | `interface` |
 
-No log line and no error carries a key or a Secret's value. The vendor clients' own lines are listed in [VPN Providers](vpn-providers.md#logging), and the source rewrite's in [Netlink Route Controller](netlink-route-controller.md#mesh-source-rewrite).
+No log line and no error carries a key or a Secret's value. The vendor clients' own lines are listed in [VPN Providers](vpn-providers.md#logging), and the source rewrite's in [Netlink Route Controller](netlink-route-controller.md#mesh-source-rewrite) for Linux and in [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#mesh-source-rewrite) for macOS.

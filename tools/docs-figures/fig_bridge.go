@@ -137,16 +137,22 @@ func bridgeNetlinkRouteController() *Figure {
 // to, for docs/reference/bridge/route-controllers-macos-windows.md.
 // The bridge manager runs in bridge mode only; the WireGuard manager
 // adds the peer routes on every node. The user access and site-to-site
-// managers are not among them: they serve no provider and no tunnel on
-// either platform, so they never call the route controller there.
+// managers serve providers and tunnels on macOS alone: they call
+// DarwinRouteController for forwarding and routes and PFController for
+// the mesh source rewrite, and never reach the Windows controller,
+// since Windows has no mesh source rewrite.
 func bridgeRouteControllersMacOSWindows() *Figure {
 	f := &Figure{Name: "bridge-route-controllers-macos-windows", Title: "The macOS and Windows route controllers and what they program"}
 	const ctrlY = brgCallerH + 106
 	const leafY, leafW, leafGap = ctrlY + 160, 180.0, 30.0
-	bridgeMgr := f.box(roleAgent, spec{x: 150, y: 0, w: 300, h: brgCallerH, lines: []Line{
+	bridgeMgr := f.box(roleAgent, spec{x: 0, y: 0, w: 300, h: brgCallerH, lines: []Line{
 		name("Bridge Manager"), body("access routes,"), body("forwarding, NAT"),
 	}})
 	f.chipOn(bridgeMgr, "bridge mode", colorGrey)
+	served := f.box(roleAgent, spec{x: 330, y: 0, w: 300, h: brgCallerH, lines: []Line{
+		codeName("UserAccessManager"), codeName("SiteToSiteManager"), body("forwarding, routes, rewrite"),
+	}})
+	f.chipOn(served, "bridge mode, macOS", colorGrey)
 	mgrs := []*node{
 		bridgeMgr,
 		f.box(roleAgent, spec{x: 735, y: 0, w: 300, h: brgCallerH, lines: []Line{
@@ -185,6 +191,11 @@ func bridgeRouteControllersMacOSWindows() *Figure {
 	f.arrow(flow, vhv(darwin.bottomAt(darwin.x+darwin.w-50), pf.top(), leafBus)...)
 	f.arrow(call, windows.bottomAt(ipcfg.cx()), ipcfg.top())
 	f.arrow(flow, windows.bottomAt(wfp.cx()), wfp.top())
+	// The two managers reach DarwinRouteController above its delegation
+	// to PFController, and PFController itself through the gap between
+	// the two route controllers, apart from that delegation's stem.
+	f.arrow(flow, served.bottomAt(darwin.x+darwin.w-30), darwin.topAt(darwin.x+darwin.w-30))
+	f.arrow(flow, served.bottomAt(pf.x+pf.w-40), pf.topAt(pf.x+pf.w-40))
 	return f
 }
 

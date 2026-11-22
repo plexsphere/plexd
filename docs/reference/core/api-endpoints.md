@@ -1807,8 +1807,10 @@ its static key; the bridge hands either to the host's strongSwan or to an
 `openvpn` process it starts. The bridge fetches a Secret in the version the
 `secrets` block lists. For every kind the bridge routes `allowed_subnets` into
 the tunnel and forwards what arrives from the tunnel into the mesh with the
-source rewritten to its mesh address. Only a Linux bridge serves tunnels; on
-macOS and Windows every tunnel that passes its checks reads `kind_not_served`.
+source rewritten to its mesh address. A Linux bridge serves all three kinds
+and a macOS bridge `wireguard` tunnels alone, where an `ipsec` or `openvpn`
+tunnel that passes its checks reads `kind_not_served`; on Windows every tunnel
+that passes its checks reads `kind_not_served`.
 The block is whole, so a tunnel missing from a later pull is torn down, and a
 `null` block serves no tunnel. The control plane delivers the block in this
 shape since
