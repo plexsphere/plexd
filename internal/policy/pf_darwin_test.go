@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"slices"
@@ -31,6 +32,16 @@ type natController interface {
 }
 
 var _ natController = (*PFController)(nil)
+
+// meshSourceRewriter mirrors bridge.MeshSourceRewriter, checked against a
+// local copy for the reason natController is.
+type meshSourceRewriter interface {
+	AddMeshSourceRewrite(fromIface, meshIface string) error
+	RemoveMeshSourceRewrite(fromIface, meshIface string) error
+	ResetMeshSourceRewrite() error
+}
+
+var _ meshSourceRewriter = (*PFController)(nil)
 
 // newTestPFController returns a controller whose pfctl invocations are
 // recorded instead of run.
@@ -928,6 +939,28 @@ func TestPFController_RenderLogTags(t *testing.T) {
 			t.Errorf("render() tags = %v, want an empty map", tags)
 		}
 	})
+
+	// The filter lines of a mesh source rewrite follow every chain, so the
+	// logged lines keep their numbers.
+	t.Run("with a mesh source rewrite", func(t *testing.T) {
+		ctrl := NewPFController(testLogger())
+		ctrl.chains["plexd-mesh"] = []FirewallRule{
+			{Interface: "utun4", SrcIP: "10.0.0.0/24", DstIP: "10.1.0.6", Port: 8443, Protocol: "tcp", Action: "allow", LogTag: "1/1"},
+			{Interface: "utun4", Action: "allow", LogTag: "1/2"},
+			{Interface: "utun4", Action: "deny"},
+		}
+		_, without := ctrl.render()
+
+		ctrl.rewrites["utun7"] = "utun4"
+		text, with := ctrl.render()
+
+		if !strings.Contains(string(text), utun7FilterText) {
+			t.Fatalf("render() carries no rewrite lines:\n%s", text)
+		}
+		if len(without) == 0 || !maps.Equal(with, without) {
+			t.Errorf("render() tags with a rewrite = %v, want %v as without", with, without)
+		}
+	})
 }
 
 // tcp443Rules is a logged tcp rule and the default deny, the ruleset the
@@ -1237,12 +1270,19 @@ func TestPFController_RenderParses(t *testing.T) {
 		{Interface: "utun6", Action: "deny"},
 	}
 
+	// A mesh source rewrite adds a nat pass line with tagged and the two
+	// filter lines that keep state, one of them with tag.
+	ctrl.rewrites["utun7"] = "utun4"
+
 	text, _ := ctrl.render()
 
 	// The anchor has to hold every line form, or pfctl would pass without
 	// having seen one.
 	lines := strings.Split(string(text), "\n")
 	for _, form := range []string{
+		"nat pass on utun4 inet from any to any tagged plexd-mesh-rewrite -> (utun4)",
+		"pass out on utun7 inet all keep state",
+		"pass in on utun7 inet all keep state tag plexd-mesh-rewrite",
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state",
 		"pass out quick on utun5 proto udp from (utun5) to any port 9 no state",
 		"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state",
@@ -1642,6 +1682,371 @@ func TestPFController_RemoveNATMasquerade_LoadFails(t *testing.T) {
 	if ctrl.natIface != "en1" {
 		t.Errorf("natIface = %q, want %q", ctrl.natIface, "en1")
 	}
+}
+
+// The lines a mesh source rewrite from utun7 onto utun4 adds to the anchor:
+// the nat line ahead of every chain, the two filter lines behind them.
+const (
+	utun7NATLine    = "nat pass on utun4 inet from any to any tagged plexd-mesh-rewrite -> (utun4)\n"
+	utun7FilterText = "pass out on utun7 inet all keep state\n" +
+		"pass in on utun7 inet all keep state tag plexd-mesh-rewrite\n"
+)
+
+func TestPFController_AddMeshSourceRewrite(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	seedProbe(runner)
+
+	if err := ctrl.EnsureChain("plexd-mesh"); err != nil {
+		t.Fatalf("EnsureChain() error = %v, want nil", err)
+	}
+	if err := ctrl.ApplyRules("plexd-mesh", sixRules); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+	if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+		t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+	}
+
+	checkCalls(t, runner,
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + "# chain plexd-mesh\n"},
+		runnerCall{Args: []string{"-E"}},
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: sixRulesText},
+		probeCalls[0], probeCalls[1],
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + utun7NATLine + sixRulesText[len(pfHeader):] + utun7FilterText},
+	)
+}
+
+// Rewrites onto one mesh interface share its nat line. The nat lines follow
+// the mesh interfaces' names, the filter lines the source interfaces'.
+func TestPFController_AddMeshSourceRewrite_OneNATLinePerMeshInterface(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	seedProbe(runner)
+
+	for _, r := range [][2]string{{"utun9", "utun4"}, {"utun7", "utun4"}, {"utun8", "utun3"}} {
+		if err := ctrl.AddMeshSourceRewrite(r[0], r[1]); err != nil {
+			t.Fatalf("AddMeshSourceRewrite(%q, %q) error = %v, want nil", r[0], r[1], err)
+		}
+	}
+
+	calls := runner.callsFor(pfctlPath)
+	want := pfHeader +
+		"nat pass on utun3 inet from any to any tagged plexd-mesh-rewrite -> (utun3)\n" +
+		utun7NATLine +
+		utun7FilterText +
+		"pass out on utun8 inet all keep state\n" +
+		"pass in on utun8 inet all keep state tag plexd-mesh-rewrite\n" +
+		"pass out on utun9 inet all keep state\n" +
+		"pass in on utun9 inet all keep state tag plexd-mesh-rewrite\n"
+	if got := calls[len(calls)-1]; !slices.Equal(got.Args, []string{"-a", pfAnchor, "-f", "-"}) || got.Stdin != want {
+		t.Errorf("last call = %v with stdin\n%q\nwant a load of\n%q", got.Args, got.Stdin, want)
+	}
+}
+
+// The first rewrite probes the main ruleset unless the bridge NAT already
+// did, because nothing else on the bridge path checks that the kernel still
+// evaluates the anchor.
+func TestPFController_AddMeshSourceRewrite_Probe(t *testing.T) {
+	t.Run("without NAT", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+		}
+
+		checkCalls(t, runner,
+			probeCalls[0], probeCalls[1],
+			runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + utun7NATLine + utun7FilterText},
+			runnerCall{Args: []string{"-E"}},
+		)
+	})
+
+	t.Run("with NAT", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.AddNATMasquerade("en1"); err != nil {
+			t.Fatalf("AddNATMasquerade() error = %v, want nil", err)
+		}
+		if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+		}
+
+		natLine := "nat on en1 inet from any to any -> (en1)\n"
+		checkCalls(t, runner,
+			probeCalls[0], probeCalls[1],
+			runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + natLine},
+			runnerCall{Args: []string{"-E"}},
+			runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + natLine + utun7NATLine + utun7FilterText},
+		)
+	})
+}
+
+func TestPFController_AddMeshSourceRewrite_Repeat(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	seedProbe(runner)
+
+	if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+		t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+	}
+	// The second call names another mesh interface: the rewrite that exists
+	// for utun7 is left alone, as on Linux.
+	if err := ctrl.AddMeshSourceRewrite("utun7", "utun5"); err != nil {
+		t.Fatalf("AddMeshSourceRewrite() repeat error = %v, want nil", err)
+	}
+
+	checkCalls(t, runner,
+		probeCalls[0], probeCalls[1],
+		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + utun7NATLine + utun7FilterText},
+		runnerCall{Args: []string{"-E"}},
+	)
+}
+
+// A vendor client reports the name of its interface, and the name becomes pf
+// rule text, so a name that is no kernel interface name is refused before
+// anything reaches pfctl.
+func TestPFController_AddMeshSourceRewrite_InvalidName(t *testing.T) {
+	for _, name := range []string{"", "utun012345678901", "utun7\npass all"} {
+		for _, args := range [][2]string{{name, "utun4"}, {"utun7", name}} {
+			ctrl, runner := newTestPFController(t)
+
+			err := ctrl.AddMeshSourceRewrite(args[0], args[1])
+			want := fmt.Sprintf("bridge: add mesh source rewrite: invalid interface name %q", name)
+			if err == nil || err.Error() != want {
+				t.Errorf("AddMeshSourceRewrite(%q, %q) error = %v, want %q", args[0], args[1], err, want)
+			}
+			if calls := runner.callsFor(pfctlPath); len(calls) != 0 {
+				t.Errorf("AddMeshSourceRewrite(%q, %q) ran pfctl: %+v", args[0], args[1], calls)
+			}
+			if len(ctrl.rewrites) != 0 {
+				t.Errorf("rewrites = %v, want none", ctrl.rewrites)
+			}
+		}
+	}
+
+	// 15 characters, the kernel's limit, pass the check.
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	seedProbe(runner)
+	if err := ctrl.AddMeshSourceRewrite("wg-s2s-a0a0a0e1", "utun4"); err != nil {
+		t.Errorf("AddMeshSourceRewrite() of a 15-character name error = %v, want nil", err)
+	}
+}
+
+func TestPFController_AddMeshSourceRewrite_ProbeFails(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	runner.outputs[pfKey("-s", "rules")] = []byte(okRules)
+	runner.outputs[pfKey("-s", "nat")] = []byte("rdr-anchor \"com.apple/*\" all\n")
+
+	err := ctrl.AddMeshSourceRewrite("utun7", "utun4")
+	want := `bridge: add mesh source rewrite from "utun7" to "utun4": policy: pf: probe: the main ruleset does not reference nat-anchor "com.apple/*"`
+	if err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("AddMeshSourceRewrite() error = %v, want prefix %q", err, want)
+	}
+	checkCalls(t, runner, probeCalls[0], probeCalls[1])
+
+	seedProbe(runner)
+	if err := ctrl.AddMeshSourceRewrite("utun8", "utun4"); err != nil {
+		t.Fatalf("AddMeshSourceRewrite() after the probe passes error = %v, want nil", err)
+	}
+	if text := lastLoad(t, runner); strings.Contains(text, "utun7") {
+		t.Errorf("the next load carries a line for utun7:\n%s", text)
+	}
+}
+
+func TestPFController_AddMeshSourceRewrite_LoadFails(t *testing.T) {
+	ctrl, runner := newTestPFController(t)
+	runner.outputs[enableKey] = []byte(tokenOut)
+	seedProbe(runner)
+	loadErr := errors.New("exit status 1")
+	runner.errs[loadKey] = loadErr
+
+	err := ctrl.AddMeshSourceRewrite("utun7", "utun4")
+	want := `bridge: add mesh source rewrite from "utun7" to "utun4": policy: pf: add mesh source rewrite: /sbin/pfctl -a com.apple/plexd -f -:`
+	if err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("AddMeshSourceRewrite() error = %v, want prefix %q", err, want)
+	}
+	if !errors.Is(err, loadErr) {
+		t.Errorf("errors.Is(err, the runner's error) = false, want true: %v", err)
+	}
+	if len(ctrl.rewrites) != 0 {
+		t.Errorf("rewrites = %v, want none", ctrl.rewrites)
+	}
+
+	delete(runner.errs, loadKey)
+	if err := ctrl.EnsureChain("plexd-mesh"); err != nil {
+		t.Fatalf("EnsureChain() error = %v, want nil", err)
+	}
+	if text := lastLoad(t, runner); strings.Contains(text, "utun7") {
+		t.Errorf("the next load carries a line for utun7:\n%s", text)
+	}
+}
+
+// lastLoad returns the stdin of the last pfctl load and fails the test when
+// pfctl loaded nothing.
+func lastLoad(t *testing.T, runner *recordingRunner) string {
+	t.Helper()
+
+	calls := runner.callsFor(pfctlPath)
+	for _, c := range slices.Backward(calls) {
+		if slices.Equal(c.Args, []string{"-a", pfAnchor, "-f", "-"}) {
+			return c.Stdin
+		}
+	}
+	t.Fatalf("pfctl loaded nothing: %+v", calls)
+	return ""
+}
+
+func TestPFController_RemoveMeshSourceRewrite(t *testing.T) {
+	t.Run("the last one flushes and releases", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+		}
+		if err := ctrl.RemoveMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("RemoveMeshSourceRewrite() error = %v, want nil", err)
+		}
+
+		checkCalls(t, runner,
+			probeCalls[0], probeCalls[1],
+			runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + utun7NATLine + utun7FilterText},
+			runnerCall{Args: []string{"-E"}},
+			runnerCall{Args: []string{"-a", pfAnchor, "-F", "all"}},
+			runnerCall{Args: []string{"-X", "13971906727590307623"}},
+		)
+	})
+
+	t.Run("an unknown interface", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+
+		if err := ctrl.RemoveMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("RemoveMeshSourceRewrite() error = %v, want nil", err)
+		}
+		checkCalls(t, runner)
+	})
+
+	t.Run("the load fails", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.EnsureChain("plexd-mesh"); err != nil {
+			t.Fatalf("EnsureChain() error = %v, want nil", err)
+		}
+		if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+		}
+		loadErr := errors.New("exit status 1")
+		runner.errs[loadKey] = loadErr
+
+		err := ctrl.RemoveMeshSourceRewrite("utun7", "utun4")
+		want := `bridge: remove mesh source rewrite from "utun7":`
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("RemoveMeshSourceRewrite() error = %v, want prefix %q", err, want)
+		}
+		if !errors.Is(err, loadErr) {
+			t.Errorf("errors.Is(err, the runner's error) = false, want true: %v", err)
+		}
+
+		delete(runner.errs, loadKey)
+		if err := ctrl.EnsureChain("plexd-other"); err != nil {
+			t.Fatalf("EnsureChain() error = %v, want nil", err)
+		}
+		if text := lastLoad(t, runner); !strings.Contains(text, utun7NATLine) || !strings.Contains(text, utun7FilterText) {
+			t.Errorf("the next load lost the rewrite of utun7:\n%s", text)
+		}
+	})
+}
+
+func TestPFController_ResetMeshSourceRewrite(t *testing.T) {
+	t.Run("with a chain and two rewrites", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.ApplyRules("plexd-mesh", sixRules); err != nil {
+			t.Fatalf("ApplyRules() error = %v, want nil", err)
+		}
+		for _, from := range []string{"utun7", "utun8"} {
+			if err := ctrl.AddMeshSourceRewrite(from, "utun4"); err != nil {
+				t.Fatalf("AddMeshSourceRewrite(%q) error = %v, want nil", from, err)
+			}
+		}
+		if err := ctrl.ResetMeshSourceRewrite(); err != nil {
+			t.Fatalf("ResetMeshSourceRewrite() error = %v, want nil", err)
+		}
+
+		if text := lastLoad(t, runner); text != sixRulesText {
+			t.Errorf("the reset loaded\n%q\nwant the chain alone\n%q", text, sixRulesText)
+		}
+		if len(ctrl.rewrites) != 0 {
+			t.Errorf("rewrites = %v, want none", ctrl.rewrites)
+		}
+	})
+
+	// A start resets before it holds anything, and the lines a killed
+	// process left sit in an anchor this process never loaded.
+	t.Run("on a new controller", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+
+		if err := ctrl.ResetMeshSourceRewrite(); err != nil {
+			t.Fatalf("ResetMeshSourceRewrite() error = %v, want nil", err)
+		}
+		checkCalls(t, runner, runnerCall{Args: []string{"-a", pfAnchor, "-F", "all"}})
+	})
+
+	t.Run("with rewrites alone", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+		}
+		if err := ctrl.ResetMeshSourceRewrite(); err != nil {
+			t.Fatalf("ResetMeshSourceRewrite() error = %v, want nil", err)
+		}
+
+		checkCalls(t, runner,
+			probeCalls[0], probeCalls[1],
+			runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: pfHeader + utun7NATLine + utun7FilterText},
+			runnerCall{Args: []string{"-E"}},
+			runnerCall{Args: []string{"-a", pfAnchor, "-F", "all"}},
+			runnerCall{Args: []string{"-X", "13971906727590307623"}},
+		)
+	})
+
+	t.Run("pfctl fails", func(t *testing.T) {
+		ctrl, runner := newTestPFController(t)
+		runner.outputs[enableKey] = []byte(tokenOut)
+		seedProbe(runner)
+
+		if err := ctrl.AddMeshSourceRewrite("utun7", "utun4"); err != nil {
+			t.Fatalf("AddMeshSourceRewrite() error = %v, want nil", err)
+		}
+		flushErr := errors.New("exit status 1")
+		runner.errs[flushKey] = flushErr
+
+		err := ctrl.ResetMeshSourceRewrite()
+		want := "bridge: reset mesh source rewrite: policy: pf: reset mesh source rewrite: /sbin/pfctl -a com.apple/plexd -F all:"
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("ResetMeshSourceRewrite() error = %v, want prefix %q", err, want)
+		}
+		if !errors.Is(err, flushErr) {
+			t.Errorf("errors.Is(err, the runner's error) = false, want true: %v", err)
+		}
+		if got := ctrl.rewrites["utun7"]; got != "utun4" {
+			t.Errorf("rewrites = %v, want the rewrite of utun7 restored", ctrl.rewrites)
+		}
+	})
 }
 
 // labelsKey is the answer-map key of the pfctl call DropCounts runs.
