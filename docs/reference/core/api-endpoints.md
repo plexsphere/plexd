@@ -1673,15 +1673,25 @@ first does not move it back. A pull never moves a peer connected over a direct
 path WireGuard roamed to; plexd tells that path from the device's endpoint,
 which it can compare only with a relay that is an address. Any other peer that
 is not connected starts its walk over when a pull changes it, even when the
-pull only changes a standby. A relayed peer tries its direct entries again only
-when the pull drops every relay or the peer, its key rotates, plexd restarts,
-or WireGuard roamed it to a direct path that then failed. A plexd that predates
-`fallback_endpoints` dials only `fallback_endpoint`, and dials it again when it
-fails, so a pair with one such side fails over only when the control plane
-names a new first relay.
+pull only changes a standby. A relayed peer tries its direct entries again in a
+direct retry when a pull adds a direct entry that the peer's order did not hold
+and that did not leave it or fail a retry in the last 10 min, or when a change
+of the node's own local networks makes one of them on-link. A pull that adds
+such an entry and takes the relay away runs the retry first and ends it on the
+pull's first relay. The retry tries each direct entry for 10 s on a fresh
+WireGuard session, which cuts the relayed one, and a handshake over a direct
+entry leaves the relay. A retry that fails costs the pair 10 to 15 s per entry,
+about 1 min with four entries and up to 2 min 15 s with nine, and about 5 s
+more for the handshake back over the relay. A relayed peer also walks its
+direct entries again when the pull drops every relay or the peer, its key
+rotates, plexd restarts, or WireGuard roamed it to a direct path that then
+failed. A plexd that predates `fallback_endpoints` dials only
+`fallback_endpoint`, and dials it again when it fails, so a pair with one such
+side fails over only when the control plane names a new first relay.
 See [Dial order](../networking/wireguard.md#dial-order),
-[Endpoint selection](../networking/wireguard.md#endpoint-selection) and
-[Relay liveness probe](../networking/wireguard.md#relay-liveness-probe).
+[Endpoint selection](../networking/wireguard.md#endpoint-selection),
+[Relay liveness probe](../networking/wireguard.md#relay-liveness-probe) and
+[Direct retry](../networking/wireguard.md#direct-retry).
 
 `bridge.relay` asks a bridge to relay WireGuard for the pairs that hold it
 among their relays. A bridge listens only when both its local
