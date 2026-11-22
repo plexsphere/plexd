@@ -6965,6 +6965,15 @@ func TestMeshDNSRevertAtStart_PerPlatform(t *testing.T) {
 	}
 }
 
+// macOS alone has one forwarding knob for the whole host, so only there do
+// the user access and site-to-site managers give back the forwarding pairs
+// they claim.
+func TestForwardingKnobIsShared_PerPlatform(t *testing.T) {
+	if want := runtime.GOOS == "darwin"; forwardingKnobIsShared != want {
+		t.Errorf("forwardingKnobIsShared = %t on %s, want %t", forwardingKnobIsShared, runtime.GOOS, want)
+	}
+}
+
 // The bind failure names the way out. On Windows the port is fixed at 53,
 // because the Name Resolution Policy Table sends nowhere else, so the hint
 // says to free it or turn the resolver off; every other platform takes any

@@ -30,9 +30,10 @@ const (
 	// not retried until the entry changes.
 	SiteToSiteReasonInvalidTunnel = "invalid_tunnel"
 	// SiteToSiteReasonKindNotServed: this plexd serves no tunnel of the kind,
-	// because the platform has no mesh source rewrite, the kind is unknown,
-	// or no provider of the kind is built in. It is not retried until the
-	// entry changes.
+	// because the platform has no mesh source rewrite, as Windows has none,
+	// the kind is unknown, or no provider of the kind is built in, as macOS
+	// builds none for ipsec and openvpn. It is not retried until the entry
+	// changes.
 	SiteToSiteReasonKindNotServed = "kind_not_served"
 	// SiteToSiteReasonKeyUnavailable: the key of a wireguard tunnel's
 	// interface could not be read or created.
@@ -96,9 +97,9 @@ type SiteToSiteDeps struct {
 	// whose route controller restores the knob once its last pair lets go.
 	ReleaseForwarding bool
 	// Rewriter rewrites the source of what a tunnel forwards into the mesh to
-	// the bridge's mesh address. nil: this platform serves no tunnel; one
-	// that passes its checks reads kind_not_served, one that fails them
-	// invalid_tunnel.
+	// the bridge's mesh address: nftables on Linux, pf on macOS. nil, on
+	// Windows: this platform serves no tunnel; one that passes its checks
+	// reads kind_not_served, one that fails them invalid_tunnel.
 	Rewriter MeshSourceRewriter
 	// Keys keeps the private key of each wireguard tunnel's interface. It
 	// must not be nil.
@@ -267,7 +268,8 @@ func NewSiteToSiteManager(deps SiteToSiteDeps) *SiteToSiteManager {
 // the errors are joined.
 //
 // The source rewrites of a killed process are gone before it runs: plexd up
-// runs CleanupUserAccess first, which resets the table both managers share.
+// runs CleanupUserAccess first, which resets the rewrites both managers
+// share, an nftables table on Linux and lines of the pf anchor on macOS.
 // Without it a tunnel's next create fails on the name the killed process
 // left, and a link of a bridge that opted out since keeps its port open.
 func CleanupSiteToSite(vpn VPNController, providers map[string]TunnelProvider) error {

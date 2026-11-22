@@ -59,9 +59,10 @@ const UserAccessInterfacePrefix = "wg-ua-"
 // the bridge's mesh address. A mesh node accepts from the bridge only that
 // address, so a packet that kept a device's address would be dropped by the
 // first peer it meets.
-// It is a dependency of its own rather than a method of NATController, so the
-// pf and WinNAT backends that implement NATController on macOS and Windows do
-// not implement it. NetlinkRouteController implements it through nftables.
+// It is a dependency of its own rather than a method of NATController, so a
+// NAT backend need not implement it. NetlinkRouteController implements it
+// through nftables, and policy.PFController through pf on macOS, beside the
+// NAT rule it holds. The WinNAT backend on Windows does not implement it.
 // All methods must be idempotent.
 type MeshSourceRewriter interface {
 	// AddMeshSourceRewrite rewrites the source of packets that arrive on
