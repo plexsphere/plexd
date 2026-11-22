@@ -509,7 +509,7 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 //     the update no longer lists and could still send from it.
 //   - A peer whose programmed entry is one of its Fallbacks, and that is
 //     relayed or not connected, moves to the update's first relay at once, on
-//     a fresh device peer (see redialRelay), when the update takes its relay
+//     a fresh device peer (see redial), when the update takes its relay
 //     away (see relayMoved), and logs the move. A connected peer that is not
 //     relayed runs on a path it roamed to (see relayedOver), which the move
 //     would cut.
@@ -551,10 +551,10 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 	case st.onFallback() && (st.relayed || !st.connected) && relayMoved(st, peer):
 		from, to := st.endpoint(), peer.Fallbacks[0]
 		// Read before the write: the new device peer can complete a
-		// handshake before redialRelay returns, and that handshake must
+		// handshake before redial returns, and that handshake must
 		// count as the new session's.
 		now := m.now()
-		if err := m.redialRelay(peer, to); err != nil {
+		if err := m.redial(peer, to); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
 		moved := &dialState{peer: peer, relayed: st.relayed}
@@ -721,9 +721,9 @@ func (m *Manager) programFirst(peer api.Peer) error {
 	return nil
 }
 
-// redialRelay writes peer anew with relay, one of its Fallbacks, as the
-// endpoint: it removes the device peer and adds it again. A write that only set the
-// endpoint would keep the peer's WireGuard session, and a relay drops every
+// redial writes peer anew with endpoint as the endpoint: it removes the
+// device peer and adds it again. A write that only set the endpoint would
+// keep the peer's WireGuard session, and a relay drops every
 // packet of a session whose handshake it did not forward, while WireGuard
 // starts a new handshake on its own only after 15 s of unanswered data, or
 // once the session is 120 to 180 s old. The new device peer has no session.
@@ -735,8 +735,8 @@ func (m *Manager) programFirst(peer api.Peer) error {
 // remove then names a key the device does not hold. The userspace backend
 // accepts that (see UserspaceBackend.RemovePeer), and the Linux module is
 // assumed to as well.
-func (m *Manager) redialRelay(peer api.Peer, relay string) error {
-	peerCfg, err := m.peerConfig(peer, relay)
+func (m *Manager) redial(peer api.Peer, endpoint string) error {
+	peerCfg, err := m.peerConfig(peer, endpoint)
 	if err != nil {
 		return err
 	}
