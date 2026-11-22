@@ -42,10 +42,10 @@ const (
 	// listen on its port, which another socket holds.
 	SiteToSiteReasonBindFailed = "bind_failed"
 	// SiteToSiteReasonSetupFailed: the tunnel's link, its peer, its
-	// forwarding, its source rewrite, its routes or the daemon's side of it
-	// could not be set up, the Secret of a wireguard tunnel holds no
-	// preshared key, or an ipsec tunnel has no mesh CIDR as its local
-	// traffic selector.
+	// exemption from the host's NAT, its forwarding, its source rewrite, its
+	// routes or the daemon's side of it could not be set up, the Secret of a
+	// wireguard tunnel holds no preshared key, or an ipsec tunnel has no mesh
+	// CIDR as its local traffic selector.
 	SiteToSiteReasonSetupFailed = "setup_failed"
 	// SiteToSiteReasonAuthSecretNotListed: the secret inventory does not list
 	// the Secret the tunnel names.
@@ -101,6 +101,10 @@ type SiteToSiteDeps struct {
 	// Windows: this platform serves no tunnel; one that passes its checks
 	// reads kind_not_served, one that fails them invalid_tunnel.
 	Rewriter MeshSourceRewriter
+	// NATExempter exempts each tunnel's link from the host's NAT. nil on
+	// every platform but Windows, where it keeps the bridge NAT off what is
+	// forwarded between the mesh and a tunnel's link.
+	NATExempter NATExempter
 	// Keys keeps the private key of each wireguard tunnel's interface. It
 	// must not be nil.
 	Keys *InterfaceKeyStore
@@ -143,6 +147,7 @@ type SiteToSiteManager struct {
 	vpn       VPNController
 	routes    RouteController
 	rewriter  MeshSourceRewriter
+	exempter  NATExempter
 	keys      *InterfaceKeyStore
 	secrets   SecretValueFetcher
 	providers map[string]TunnelProvider
@@ -213,10 +218,10 @@ type siteToSiteTunnel struct {
 	iface     string
 	publicKey string
 	version   int
-	// osIface is the name the operating system knows iface by, which
-	// forwarding, the source rewrite and the routes take: the utunN behind a
-	// wireguard tunnel's interface on macOS, and iface itself everywhere
-	// else.
+	// osIface is the name the operating system knows iface by, which the
+	// NAT exemption, forwarding, the source rewrite and the routes take: the
+	// utunN behind a wireguard tunnel's interface on macOS, and iface itself
+	// everywhere else.
 	osIface string
 }
 
@@ -247,6 +252,7 @@ func NewSiteToSiteManager(deps SiteToSiteDeps) *SiteToSiteManager {
 		vpn:       deps.VPN,
 		routes:    deps.Routes,
 		rewriter:  deps.Rewriter,
+		exempter:  deps.NATExempter,
 		keys:      deps.Keys,
 		secrets:   deps.Secrets,
 		providers: deps.Providers,
@@ -263,16 +269,18 @@ func NewSiteToSiteManager(deps SiteToSiteDeps) *SiteToSiteManager {
 
 // CleanupSiteToSite removes what a process that was killed left behind: every
 // link whose name starts with one of SiteToSiteInterfacePrefixes, through
-// vpn.RemoveTunnelInterfaces, and the files of every provider, through its
-// Reset, all under a timeout of 30 s. A nil vpn is skipped. Every step runs;
-// the errors are joined.
+// vpn.RemoveTunnelInterfaces, the files of every provider, through its Reset
+// under a timeout of 30 s, and with an exempter every exemption of a link
+// from the host's NAT, through exempter.ResetNATExemptions. A nil vpn or
+// exempter is skipped. Every step runs; the errors are joined.
 //
 // The source rewrites of a killed process are gone before it runs: plexd up
 // runs CleanupUserAccess first, which resets the rewrites both managers
 // share, an nftables table on Linux and lines of the pf anchor on macOS.
 // Without it a tunnel's next create fails on the name the killed process
-// left, and a link of a bridge that opted out since keeps its port open.
-func CleanupSiteToSite(vpn VPNController, providers map[string]TunnelProvider) error {
+// left, a link of a bridge that opted out since keeps its port open, and on
+// Windows the NetNat object that exempted a link stays on the host.
+func CleanupSiteToSite(vpn VPNController, providers map[string]TunnelProvider, exempter NATExempter) error {
 	ctx, cancel := context.WithTimeout(context.Background(), siteToSiteProviderTimeout)
 	defer cancel()
 
@@ -291,6 +299,11 @@ func CleanupSiteToSite(vpn VPNController, providers map[string]TunnelProvider) e
 			errs = append(errs, fmt.Errorf("reset the %s provider: %w", kind, err))
 		}
 	}
+	if exempter != nil {
+		if err := exempter.ResetNATExemptions(); err != nil {
+			errs = append(errs, fmt.Errorf("reset the NAT exemptions: %w", err))
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -306,7 +319,7 @@ func (m *SiteToSiteManager) Setup() error {
 	if m.active {
 		return nil
 	}
-	if err := CleanupSiteToSite(m.vpn, m.providers); err != nil {
+	if err := CleanupSiteToSite(m.vpn, m.providers, m.exempter); err != nil {
 		return fmt.Errorf("bridge: site-to-site: clean up: %w", err)
 	}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
@@ -317,11 +330,12 @@ func (m *SiteToSiteManager) Setup() error {
 }
 
 // Teardown removes every tunnel: the provider's side of it, its routes, its
-// source rewrite and its link. It cancels the context the openvpn processes
-// run under and marks the manager inactive. It keeps the key files, so a
-// wireguard tunnel comes back with its key after a restart. Errors are
-// joined; the cleanup continues past a failure. Idempotent: calling Teardown
-// when inactive returns nil. It signals ReportChanged when it returns.
+// source rewrite, its NAT exemption and its link. It cancels the context the
+// openvpn processes run under and marks the manager inactive. It keeps the
+// key files, so a wireguard tunnel comes back with its key after a restart.
+// Errors are joined; the cleanup continues past a failure. Idempotent:
+// calling Teardown when inactive returns nil. It signals ReportChanged when
+// it returns.
 func (m *SiteToSiteManager) Teardown() error {
 	defer m.signalReport()
 	m.mu.Lock()
@@ -1007,10 +1021,10 @@ func (m *SiteToSiteManager) attemptFailed(a *siteToSiteAttempt, reason string, e
 
 // bringUpLocked sets up the tunnel of a, whose remote host is addr and whose
 // Secret holds secret, empty without one: the link of its kind, a wireguard
-// tunnel's peer, forwarding into the mesh, the source rewrite, a route for
-// each allowed subnet, and the provider's side of an ipsec or openvpn
-// tunnel. A failure undoes what the attempt added, in reverse. The caller
-// holds mu.
+// tunnel's peer, with a NATExempter the link's exemption from the host's NAT,
+// forwarding into the mesh, the source rewrite, a route for each allowed
+// subnet, and the provider's side of an ipsec or openvpn tunnel. A failure
+// undoes what the attempt added, in reverse. The caller holds mu.
 func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAttempt, addr netip.Addr, secret string) {
 	t, e := a.t, a.entry
 	name := siteToSiteInterfaceName(e.Kind, a.key)
@@ -1058,7 +1072,7 @@ func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAtte
 
 	osIface := osInterfaceName(m.vpn, name)
 	var routed []string
-	forwarded, rewritten := false, false
+	exempted, forwarded, rewritten := false, false, false
 	undo := func() {
 		for _, s := range slices.Backward(routed) {
 			_ = m.routes.RemoveRoute(s, osIface)
@@ -1076,7 +1090,20 @@ func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAtte
 				)
 			}
 		}
+		if exempted {
+			_ = m.exempter.UnexemptFromNAT(osIface)
+		}
 		_ = m.vpn.RemoveTunnelInterface(name)
+	}
+	// The exemption comes before forwarding, so the address it adds to the
+	// link on Windows is there when the rewrite reads the link's prefixes.
+	if m.exempter != nil {
+		if err := m.exempter.ExemptFromNAT(osIface); err != nil {
+			undo()
+			m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("exempt from NAT: %w", err))
+			return
+		}
+		exempted = true
 	}
 	if err := m.routes.EnableForwarding(m.meshIface, osIface); err != nil {
 		undo()
@@ -1151,8 +1178,9 @@ func (m *SiteToSiteManager) createProviderTunnel(ctx context.Context, a *siteToS
 
 // stopTunnel tears down what t serves on: the provider's side of an ipsec or
 // openvpn tunnel, a route for each allowed subnet, the source rewrite, with
-// ReleaseForwarding the forwarding claim, and the link. A tunnel that is down
-// holds nothing. t reads down afterwards.
+// ReleaseForwarding the forwarding claim, with a NATExempter the link's
+// exemption from the host's NAT, and the link. A tunnel that is down holds
+// nothing. t reads down afterwards.
 func (m *SiteToSiteManager) stopTunnel(t *siteToSiteTunnel) error {
 	if !t.up {
 		return nil
@@ -1177,6 +1205,11 @@ func (m *SiteToSiteManager) stopTunnel(t *siteToSiteTunnel) error {
 	}
 	if err := m.disableForwarding(t.osIface); err != nil {
 		errs = append(errs, err)
+	}
+	if m.exempter != nil {
+		if err := m.exempter.UnexemptFromNAT(t.osIface); err != nil {
+			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove NAT exemption %s: %w", t.osIface, err))
+		}
 	}
 	if err := m.vpn.RemoveTunnelInterface(t.iface); err != nil {
 		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove interface %s: %w", t.iface, err))

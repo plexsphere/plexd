@@ -202,6 +202,83 @@ func (r *fakeResolver) resolved() []string {
 	return hosts
 }
 
+// callSequence keeps, in the order they were made, the calls of the doubles
+// sequencedRoutes and sequencedRewriter wrap. Each double records its own
+// calls alone, so only a sequence they share shows the order across them.
+type callSequence struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+// add appends call to the sequence.
+func (s *callSequence) add(call string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, call)
+}
+
+// list returns the calls in the order they were made.
+func (s *callSequence) list() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.calls)
+}
+
+// reset clears the sequence.
+func (s *callSequence) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = nil
+}
+
+// sequencedRoutes adds each call the manager makes for a tunnel to seq,
+// prefixed with "routes.", and passes it on to the RouteController it wraps.
+// The NAT methods, which the manager does not call, go to that controller
+// alone.
+type sequencedRoutes struct {
+	RouteController
+	seq *callSequence
+}
+
+func (r sequencedRoutes) EnableForwarding(meshIface, accessIface string) error {
+	r.seq.add("routes.EnableForwarding")
+	return r.RouteController.EnableForwarding(meshIface, accessIface)
+}
+
+func (r sequencedRoutes) DisableForwarding(meshIface, accessIface string) error {
+	r.seq.add("routes.DisableForwarding")
+	return r.RouteController.DisableForwarding(meshIface, accessIface)
+}
+
+func (r sequencedRoutes) AddRoute(subnet, iface string) error {
+	r.seq.add("routes.AddRoute")
+	return r.RouteController.AddRoute(subnet, iface)
+}
+
+func (r sequencedRoutes) RemoveRoute(subnet, iface string) error {
+	r.seq.add("routes.RemoveRoute")
+	return r.RouteController.RemoveRoute(subnet, iface)
+}
+
+// sequencedRewriter adds each call the manager makes for a tunnel to seq,
+// prefixed with "rewriter.", and passes it on to the MeshSourceRewriter it
+// wraps. ResetMeshSourceRewrite, which the manager does not call, goes to
+// that rewriter alone.
+type sequencedRewriter struct {
+	MeshSourceRewriter
+	seq *callSequence
+}
+
+func (r sequencedRewriter) AddMeshSourceRewrite(fromIface, meshIface string) error {
+	r.seq.add("rewriter.AddMeshSourceRewrite")
+	return r.MeshSourceRewriter.AddMeshSourceRewrite(fromIface, meshIface)
+}
+
+func (r sequencedRewriter) RemoveMeshSourceRewrite(fromIface, meshIface string) error {
+	r.seq.add("rewriter.RemoveMeshSourceRewrite")
+	return r.MeshSourceRewriter.RemoveMeshSourceRewrite(fromIface, meshIface)
+}
+
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -295,7 +372,14 @@ type s2sFixture struct {
 	resolver *fakeResolver
 	clock    *relayClock
 	logs     *relayLog
+	// exempter is the recording NATExempter exemptNAT handed the manager;
+	// nil without one, as on Linux and macOS.
+	exempter *mockNATExempter
 }
+
+// exemptNAT hands the manager a recording NATExempter, as plexd up does on
+// Windows. buildS2SFixture keeps it as the fixture's exempter.
+func exemptNAT(d *SiteToSiteDeps) { d.NATExempter = &mockNATExempter{} }
 
 // buildS2SFixture builds the fixture without setting the manager up; adjust
 // changes the dependencies first. The fixture's Secrets hold a value for each
@@ -340,6 +424,10 @@ func buildS2SFixture(t *testing.T, adjust func(*SiteToSiteDeps)) *s2sFixture {
 	if adjust != nil {
 		adjust(&deps)
 	}
+	if e, ok := deps.NATExempter.(*mockNATExempter); ok {
+		fx.exempter = e
+		e.snapshot = fx.controllerCalls
+	}
 	fx.mgr = NewSiteToSiteManager(deps)
 	fx.mgr.now = fx.clock.Now
 	t.Cleanup(func() {
@@ -374,25 +462,38 @@ func (fx *s2sFixture) reset() {
 	fx.rewriter.reset()
 	fx.ipsec.reset()
 	fx.openvpn.reset()
+	if fx.exempter != nil {
+		fx.exempter.reset()
+	}
 }
 
 // calls returns the methods every controller and provider double recorded,
 // prefixed with the double's name, so a test can want none at all.
 func (fx *s2sFixture) calls() []string {
-	var out []string
-	for _, d := range []struct {
-		name    string
-		methods []string
-	}{
-		{"vpn", fx.vpn.vpnMethods()},
-		{"routes", fx.routes.methods()},
-		{"rewriter", fx.rewriter.methods()},
-		{"ipsec", fx.ipsec.calls()},
-		{"openvpn", fx.openvpn.calls()},
-	} {
-		for _, m := range d.methods {
-			out = append(out, d.name+"."+m)
-		}
+	out := fx.controllerCalls()
+	out = append(out, prefixedMethods("ipsec", fx.ipsec.calls())...)
+	out = append(out, prefixedMethods("openvpn", fx.openvpn.calls())...)
+	if fx.exempter != nil {
+		out = append(out, prefixedMethods("exempter", fx.exempter.methods())...)
+	}
+	return out
+}
+
+// controllerCalls returns the methods the vpn, routes and rewriter doubles
+// recorded, prefixed with the double's name. Each double records its own
+// calls alone, so the recording NATExempter keeps this at each of its calls:
+// it is what places an exemption call among the calls of the others.
+func (fx *s2sFixture) controllerCalls() []string {
+	out := prefixedMethods("vpn", fx.vpn.vpnMethods())
+	out = append(out, prefixedMethods("routes", fx.routes.methods())...)
+	return append(out, prefixedMethods("rewriter", fx.rewriter.methods())...)
+}
+
+// prefixedMethods returns methods, each prefixed with name and a dot.
+func prefixedMethods(name string, methods []string) []string {
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		out = append(out, name+"."+m)
 	}
 	return out
 }
@@ -531,7 +632,7 @@ func TestCleanupSiteToSite(t *testing.T) {
 		vpn := &mockVPNController{}
 		ipsec, openvpn := &mockTunnelProvider{name: "ipsec"}, &mockTunnelProvider{name: "openvpn"}
 		providers := map[string]TunnelProvider{"ipsec": ipsec, "openvpn": openvpn}
-		if err := CleanupSiteToSite(vpn, providers); err != nil {
+		if err := CleanupSiteToSite(vpn, providers, nil); err != nil {
 			t.Fatalf("CleanupSiteToSite: %v", err)
 		}
 		c := vpn.vpnCallsFor("RemoveTunnelInterfaces")
@@ -554,7 +655,7 @@ func TestCleanupSiteToSite(t *testing.T) {
 
 	t.Run("nil controller", func(t *testing.T) {
 		ipsec := &mockTunnelProvider{name: "ipsec"}
-		if err := CleanupSiteToSite(nil, map[string]TunnelProvider{"ipsec": ipsec}); err != nil {
+		if err := CleanupSiteToSite(nil, map[string]TunnelProvider{"ipsec": ipsec}, nil); err != nil {
 			t.Fatalf("CleanupSiteToSite: %v", err)
 		}
 		if got := ipsec.calls(); !slices.Equal(got, []string{"Reset"}) {
@@ -566,12 +667,45 @@ func TestCleanupSiteToSite(t *testing.T) {
 		errRemove, errReset := errors.New("remove failed"), errors.New("reset failed")
 		vpn := &mockVPNController{removeAllErr: errRemove}
 		ipsec, openvpn := &mockTunnelProvider{name: "ipsec", resetErr: errReset}, &mockTunnelProvider{name: "openvpn"}
-		err := CleanupSiteToSite(vpn, map[string]TunnelProvider{"ipsec": ipsec, "openvpn": openvpn})
+		err := CleanupSiteToSite(vpn, map[string]TunnelProvider{"ipsec": ipsec, "openvpn": openvpn}, nil)
 		if !errors.Is(err, errRemove) || !errors.Is(err, errReset) {
 			t.Errorf("CleanupSiteToSite = %v, want both errors", err)
 		}
 		if len(ipsec.calls()) != 1 || len(openvpn.calls()) != 1 {
 			t.Error("a failed step skipped a later one")
+		}
+	})
+
+	t.Run("exempter", func(t *testing.T) {
+		vpn, exempter := &mockVPNController{}, &mockNATExempter{}
+		ipsec := &mockTunnelProvider{name: "ipsec"}
+		if err := CleanupSiteToSite(vpn, map[string]TunnelProvider{"ipsec": ipsec}, exempter); err != nil {
+			t.Fatalf("CleanupSiteToSite: %v", err)
+		}
+		if got := exempter.methods(); !slices.Equal(got, []string{"ResetNATExemptions"}) {
+			t.Errorf("exempter calls = %q, want ResetNATExemptions alone", got)
+		}
+		if got := vpn.vpnMethods(); !slices.Equal(got, []string{"RemoveTunnelInterfaces"}) {
+			t.Errorf("controller calls = %q, want RemoveTunnelInterfaces alone", got)
+		}
+		if got := ipsec.calls(); !slices.Equal(got, []string{"Reset"}) {
+			t.Errorf("ipsec calls = %q, want Reset alone", got)
+		}
+	})
+
+	t.Run("an exempter's error is joined", func(t *testing.T) {
+		errRemove, errExempt := errors.New("remove failed"), errors.New("Remove-NetNat failed")
+		vpn := &mockVPNController{removeAllErr: errRemove}
+		exempter := &mockNATExempter{resetNATExemptionsErr: errExempt}
+		err := CleanupSiteToSite(vpn, nil, exempter)
+		if !errors.Is(err, errRemove) || !errors.Is(err, errExempt) {
+			t.Errorf("CleanupSiteToSite = %v, want both errors", err)
+		}
+		if err != nil && !strings.Contains(err.Error(), "reset the NAT exemptions: Remove-NetNat failed") {
+			t.Errorf("CleanupSiteToSite = %q, want the reset's error as %q", err, "reset the NAT exemptions: Remove-NetNat failed")
+		}
+		if got := exempter.methods(); !slices.Equal(got, []string{"ResetNATExemptions"}) {
+			t.Errorf("exempter calls = %q, want ResetNATExemptions after the failed removal", got)
 		}
 	})
 }
@@ -634,6 +768,46 @@ func TestSiteToSiteManager_SetupReturnsTheCleanupError(t *testing.T) {
 			fx.requireNoCalls(t, "Apply after a failed Setup")
 		})
 	}
+}
+
+// TestSiteToSiteManager_SetupResetsTheNATExemptions checks that Setup with a
+// NATExempter resets the exemptions a killed process left behind, once, and
+// that a failed reset fails Setup and leaves the manager inactive.
+func TestSiteToSiteManager_SetupResetsTheNATExemptions(t *testing.T) {
+	t.Run("reset", func(t *testing.T) {
+		fx := buildS2SFixture(t, exemptNAT)
+		if err := fx.mgr.Setup(); err != nil {
+			t.Fatalf("Setup: %v", err)
+		}
+		if got := fx.exempter.methods(); !slices.Equal(got, []string{"ResetNATExemptions"}) {
+			t.Errorf("exempter calls = %q, want ResetNATExemptions once", got)
+		}
+		// A second Setup changes nothing.
+		fx.reset()
+		if err := fx.mgr.Setup(); err != nil {
+			t.Fatalf("second Setup: %v", err)
+		}
+		fx.requireNoCalls(t, "a second Setup")
+	})
+
+	t.Run("reset fails", func(t *testing.T) {
+		fx := buildS2SFixture(t, exemptNAT)
+		errReset := errors.New("Remove-NetNat failed")
+		fx.exempter.resetNATExemptionsErr = errReset
+		err := fx.mgr.Setup()
+		if !errors.Is(err, errReset) {
+			t.Fatalf("Setup = %v, want the reset's error", err)
+		}
+		if want := "bridge: site-to-site: clean up: reset the NAT exemptions: "; !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("Setup = %q, want the prefix %q", err, want)
+		}
+		if got := fx.exempter.methods(); !slices.Equal(got, []string{"ResetNATExemptions"}) {
+			t.Errorf("exempter calls = %q, want ResetNATExemptions once", got)
+		}
+		if fx.mgr.SiteToSiteStatus() != nil {
+			t.Error("SiteToSiteStatus() after a failed Setup is not nil")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +1029,180 @@ func TestSiteToSiteManager_ReleaseForwarding(t *testing.T) {
 		err := fx.mgr.Teardown()
 		if !errors.Is(err, errRefused) || !strings.Contains(err.Error(), "bridge: site-to-site: release forwarding "+s2sWGIface+": ") {
 			t.Errorf("Teardown() error = %v, want the release error of %s", err, s2sWGIface)
+		}
+	})
+}
+
+// TestSiteToSiteManager_NATExemption checks the exemption of a tunnel's link
+// from the host's NAT, which a NATExempter adds on Windows: where it sits
+// among the calls that bring a tunnel up and remove it, what a failure of the
+// exemption and a failure after it undo, and the error Teardown returns for a
+// failed removal. The recording exempter keeps the calls the vpn, routes and
+// rewriter doubles had recorded at each of its own calls, since each double
+// records its own calls alone. That places each exemption call among the
+// others but not those among themselves, so the order test also wraps the
+// routes and rewriter doubles in a sequence they share.
+func TestSiteToSiteManager_NATExemption(t *testing.T) {
+	t.Run("order", func(t *testing.T) {
+		seq := &callSequence{}
+		fx := newS2SFixture(t, func(d *SiteToSiteDeps) {
+			exemptNAT(d)
+			d.Routes = sequencedRoutes{RouteController: d.Routes, seq: seq}
+			d.Rewriter = sequencedRewriter{MeshSourceRewriter: d.Rewriter, seq: seq}
+		})
+		seq.reset()
+		fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
+
+		if c := fx.exempter.callsFor("ExemptFromNAT"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+			t.Fatalf("ExemptFromNAT calls = %+v, want one for %s", c, s2sWGIface)
+		}
+		before := []string{"vpn.CreateTunnelInterface", "vpn.ConfigureTunnelPeer"}
+		if got := fx.exempter.snapshots("ExemptFromNAT")[0]; !slices.Equal(got, before) {
+			t.Errorf("calls before ExemptFromNAT = %q, want %q: the link and its peer first, forwarding, the rewrite and the routes after", got, before)
+		}
+		after := []string{"routes.EnableForwarding", "rewriter.AddMeshSourceRewrite", "routes.AddRoute", "routes.AddRoute"}
+		if got := seq.list(); !slices.Equal(got, after) {
+			t.Errorf("route and rewrite calls in order = %q, want %q: forwarding, then the rewrite, then the routes", got, after)
+		}
+		want := []string{
+			"vpn.CreateTunnelInterface", "vpn.ConfigureTunnelPeer",
+			"routes.EnableForwarding", "routes.AddRoute", "routes.AddRoute",
+			"rewriter.AddMeshSourceRewrite",
+			"exempter.ExemptFromNAT",
+		}
+		if got := fx.calls(); !slices.Equal(got, want) {
+			t.Errorf("calls = %q, want %q", got, want)
+		}
+		requireTunnelUp(t, fx.mgr, s2sID1)
+
+		fx.reset()
+		seq.reset()
+		fx.mgr.Apply(t.Context(), s2sBlock())
+
+		if c := fx.exempter.callsFor("UnexemptFromNAT"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+			t.Fatalf("UnexemptFromNAT calls = %+v, want one for %s", c, s2sWGIface)
+		}
+		before = []string{"routes.RemoveRoute", "routes.RemoveRoute", "rewriter.RemoveMeshSourceRewrite"}
+		if got := fx.exempter.snapshots("UnexemptFromNAT")[0]; !slices.Equal(got, before) {
+			t.Errorf("calls before UnexemptFromNAT = %q, want %q: the routes and the rewrite first, the link after", got, before)
+		}
+		if got := seq.list(); !slices.Equal(got, before) {
+			t.Errorf("route and rewrite calls in order = %q, want %q: the routes, then the rewrite", got, before)
+		}
+		want = []string{
+			"vpn.RemoveTunnelInterface",
+			"routes.RemoveRoute", "routes.RemoveRoute",
+			"rewriter.RemoveMeshSourceRewrite",
+			"exempter.UnexemptFromNAT",
+		}
+		if got := fx.calls(); !slices.Equal(got, want) {
+			t.Errorf("calls = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("an exemption that fails", func(t *testing.T) {
+		fx := newS2SFixture(t, exemptNAT)
+		fx.exempter.set(func(m *mockNATExempter) { m.exemptFromNATErr = errors.New("New-NetNat failed") })
+		fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
+
+		requireTunnelDown(t, fx.mgr, s2sID1, SiteToSiteReasonSetupFailed)
+		if got := logLines(fx.logs, "level=WARN", `msg="site-to-site tunnel down"`, "tunnel_id="+s2sID1,
+			"reason=setup_failed", `error="exempt from NAT: New-NetNat failed"`); got != 1 {
+			t.Errorf("%d 'site-to-site tunnel down' lines with the exemption's error, want 1:\n%s", got, fx.logs.String())
+		}
+		// The link is removed, and neither forwarding nor a removal of the
+		// exemption that never was follows.
+		want := []string{
+			"vpn.CreateTunnelInterface", "vpn.ConfigureTunnelPeer", "vpn.RemoveTunnelInterface",
+			"exempter.ExemptFromNAT",
+		}
+		if got := fx.calls(); !slices.Equal(got, want) {
+			t.Errorf("calls = %q, want %q", got, want)
+		}
+		if c := fx.vpn.vpnCallsFor("RemoveTunnelInterface"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+			t.Errorf("RemoveTunnelInterface calls = %+v, want the attempt's link %s removed", c, s2sWGIface)
+		}
+
+		// Retry tries again after 5 s, and once the exemption succeeds the
+		// tunnel comes up.
+		fx.clock.Add(4 * time.Second)
+		fx.mgr.Retry(t.Context())
+		if got := len(fx.exempter.callsFor("ExemptFromNAT")); got != 1 {
+			t.Fatalf("4 s after the failure: %d ExemptFromNAT calls, want 1", got)
+		}
+		fx.clock.Add(time.Second)
+		fx.mgr.Retry(t.Context())
+		if got := len(fx.exempter.callsFor("ExemptFromNAT")); got != 2 {
+			t.Fatalf("5 s after the failure: %d ExemptFromNAT calls, want 2", got)
+		}
+		requireTunnelDown(t, fx.mgr, s2sID1, SiteToSiteReasonSetupFailed)
+		fx.exempter.set(func(m *mockNATExempter) { m.exemptFromNATErr = nil })
+		fx.clock.Add(10 * time.Second)
+		fx.mgr.Retry(t.Context())
+		requireTunnelUp(t, fx.mgr, s2sID1)
+	})
+
+	for name, inject := range map[string]func(*s2sFixture){
+		"forwarding that fails after the exemption": func(fx *s2sFixture) { fx.routes.enableForwardingErr = errors.New("boom") },
+		"a rewrite that fails after the exemption":  func(fx *s2sFixture) { fx.rewriter.addMeshSourceRewriteErr = errors.New("boom") },
+		"a route that fails after the exemption":    func(fx *s2sFixture) { fx.routes.addRouteErr = errors.New("boom") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newS2SFixture(t, exemptNAT)
+			inject(fx)
+			fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
+
+			requireTunnelDown(t, fx.mgr, s2sID1, SiteToSiteReasonSetupFailed)
+			if got := fx.exempter.methods(); !slices.Equal(got, []string{"ExemptFromNAT", "UnexemptFromNAT"}) {
+				t.Errorf("exempter calls = %q, want the exemption and its removal once", got)
+			}
+			if c := fx.exempter.callsFor("UnexemptFromNAT"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+				t.Fatalf("UnexemptFromNAT calls = %+v, want one for %s", c, s2sWGIface)
+			}
+			// The exemption goes before the link does.
+			if got := fx.exempter.snapshots("UnexemptFromNAT")[0]; slices.Contains(got, "vpn.RemoveTunnelInterface") {
+				t.Errorf("calls before UnexemptFromNAT = %q, want the link removed after it", got)
+			}
+			if c := fx.vpn.vpnCallsFor("RemoveTunnelInterface"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+				t.Errorf("RemoveTunnelInterface calls = %+v, want the attempt's link %s removed", c, s2sWGIface)
+			}
+		})
+	}
+
+	t.Run("teardown", func(t *testing.T) {
+		fx := newS2SFixture(t, exemptNAT)
+		fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin, dcEast, office))
+		fx.reset()
+
+		if err := fx.mgr.Teardown(); err != nil {
+			t.Fatalf("Teardown() error = %v, want nil", err)
+		}
+		var unexempted []string
+		for _, c := range fx.exempter.callsFor("UnexemptFromNAT") {
+			unexempted = append(unexempted, c.Args[0].(string))
+		}
+		if want := []string{s2sWGIface, s2sXfrmIface, s2sTunIface}; !slices.Equal(unexempted, want) {
+			t.Errorf("UnexemptFromNAT calls = %q, want one per tunnel %q", unexempted, want)
+		}
+	})
+
+	t.Run("teardown returns the removal's error", func(t *testing.T) {
+		fx := newS2SFixture(t, exemptNAT)
+		fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
+		requireTunnelUp(t, fx.mgr, s2sID1)
+		errUnexempt := errors.New("Remove-NetNat failed")
+		fx.exempter.set(func(m *mockNATExempter) { m.unexemptFromNATErr = errUnexempt })
+		fx.reset()
+
+		err := fx.mgr.Teardown()
+		if !errors.Is(err, errUnexempt) {
+			t.Fatalf("Teardown() error = %v, want the removal's error", err)
+		}
+		if want := "bridge: site-to-site: remove NAT exemption " + s2sWGIface + ": "; !strings.Contains(err.Error(), want) {
+			t.Errorf("Teardown() error = %q, want it to hold %q", err, want)
+		}
+		if c := fx.vpn.vpnCallsFor("RemoveTunnelInterface"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+			t.Errorf("RemoveTunnelInterface calls = %+v, want the link removed after the failure", c)
 		}
 	})
 }
