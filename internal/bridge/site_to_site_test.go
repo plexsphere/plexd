@@ -710,6 +710,54 @@ func TestSiteToSiteManager_ApplyBringsUpAWireGuardTunnel(t *testing.T) {
 	}
 }
 
+// TestSiteToSiteManager_KernelNames checks that forwarding, the source
+// rewrite and the routes of a wireguard tunnel take the name the operating
+// system knows its interface by, utunN on macOS, while its peer and its
+// status keep the configured name, and that its removal uses the kernel name
+// it was brought up with, although the controller no longer maps the
+// configured one.
+func TestSiteToSiteManager_KernelNames(t *testing.T) {
+	var namer *namerVPNController
+	fx := newS2SFixture(t, func(d *SiteToSiteDeps) {
+		namer = &namerVPNController{
+			mockVPNController: d.VPN.(*mockVPNController),
+			names:             map[string]string{s2sWGIface: "utun8"},
+		}
+		d.VPN = namer
+	})
+	fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
+
+	if got := routeCalls(fx.routes, "EnableForwarding"); !slices.Equal(got, []string{s2sMesh + " utun8"}) {
+		t.Errorf("EnableForwarding calls = %q, want (%s, utun8)", got, s2sMesh)
+	}
+	if c := fx.rewriter.callsFor("AddMeshSourceRewrite"); len(c) != 1 || c[0].Args[0] != "utun8" || c[0].Args[1] != s2sMesh {
+		t.Errorf("AddMeshSourceRewrite calls = %+v, want one (utun8, %s)", c, s2sMesh)
+	}
+	if got := routeCalls(fx.routes, "AddRoute"); !slices.Equal(got, []string{"10.20.0.0/16 utun8", "10.21.0.0/16 utun8"}) {
+		t.Errorf("AddRoute calls = %q, want one per subnet on utun8", got)
+	}
+	if peer := fx.vpn.vpnCallsFor("ConfigureTunnelPeer"); len(peer) != 1 || peer[0].Args[0] != s2sWGIface {
+		t.Errorf("ConfigureTunnelPeer calls = %+v, want one on the configured %s", peer, s2sWGIface)
+	}
+	if ti := requireTunnelUp(t, fx.mgr, s2sID1); ti.Interface != s2sWGIface {
+		t.Errorf("status interface = %q, want the configured %s", ti.Interface, s2sWGIface)
+	}
+
+	namer.unmap(s2sWGIface)
+	fx.reset()
+	fx.mgr.Apply(t.Context(), s2sBlock())
+
+	if got := routeCalls(fx.routes, "RemoveRoute"); !slices.Equal(got, []string{"10.20.0.0/16 utun8", "10.21.0.0/16 utun8"}) {
+		t.Errorf("RemoveRoute calls = %q, want one per subnet on utun8", got)
+	}
+	if c := fx.rewriter.callsFor("RemoveMeshSourceRewrite"); len(c) != 1 || c[0].Args[0] != "utun8" || c[0].Args[1] != s2sMesh {
+		t.Errorf("RemoveMeshSourceRewrite calls = %+v, want one (utun8, %s)", c, s2sMesh)
+	}
+	if c := fx.vpn.vpnCallsFor("RemoveTunnelInterface"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+		t.Errorf("RemoveTunnelInterface calls = %+v, want one for the configured %s", c, s2sWGIface)
+	}
+}
+
 // TestSiteToSiteManager_ApplyBringsUpIPsecAndOpenVPNTunnels checks the link
 // of each other kind, the provider's call with the mesh CIDR as its local
 // subnet, and the contexts the providers run under.

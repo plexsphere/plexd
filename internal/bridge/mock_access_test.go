@@ -4,6 +4,8 @@ import (
 	"maps"
 	"sync"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // mockAccessCall records a single method invocation on mockAccessController.
@@ -124,3 +126,29 @@ func (m *mockAccessController) resetAccess() {
 
 // Verify mockAccessController satisfies AccessController at compile time.
 var _ AccessController = (*mockAccessController)(nil)
+
+// namerAccessController is a mockAccessController that maps configured names
+// to kernel names, as WGAccessController does over the utun controller on
+// macOS.
+type namerAccessController struct {
+	*mockAccessController
+
+	names map[string]string // guarded by mockAccessController.mu
+}
+
+var _ wireguard.OSInterfaceNamer = (*namerAccessController)(nil)
+
+func (m *namerAccessController) OSInterfaceName(name string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	osName, ok := m.names[name]
+	return osName, ok
+}
+
+// unmap drops the mapping of name, as the utun controller does once the
+// interface is gone.
+func (m *namerAccessController) unmap(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.names, name)
+}

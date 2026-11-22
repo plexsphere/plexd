@@ -197,10 +197,16 @@ type siteToSiteTunnel struct {
 
 	// While the tunnel is up: its link, the public key of a wireguard
 	// tunnel's interface, and the version of the Secret it was built with,
-	// 0 for a tunnel without one.
+	// 0 for a tunnel without one. iface is the name the VPN controller, the
+	// provider, the status report and the log lines take.
 	iface     string
 	publicKey string
 	version   int
+	// osIface is the name the operating system knows iface by, which
+	// forwarding, the source rewrite and the routes take: the utunN behind a
+	// wireguard tunnel's interface on macOS, and iface itself everywhere
+	// else.
+	osIface string
 }
 
 // siteToSiteAttempt is one attempt to bring a tunnel up past the checks that
@@ -1036,30 +1042,31 @@ func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAtte
 		}
 	}
 
+	osIface := osInterfaceName(m.vpn, name)
 	var routed []string
 	rewritten := false
 	undo := func() {
 		for _, s := range slices.Backward(routed) {
-			_ = m.routes.RemoveRoute(s, name)
+			_ = m.routes.RemoveRoute(s, osIface)
 		}
 		if rewritten {
-			_ = m.rewriter.RemoveMeshSourceRewrite(name, m.meshIface)
+			_ = m.rewriter.RemoveMeshSourceRewrite(osIface, m.meshIface)
 		}
 		_ = m.vpn.RemoveTunnelInterface(name)
 	}
-	if err := m.routes.EnableForwarding(m.meshIface, name); err != nil {
+	if err := m.routes.EnableForwarding(m.meshIface, osIface); err != nil {
 		undo()
 		m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("enable forwarding: %w", err))
 		return
 	}
-	if err := m.rewriter.AddMeshSourceRewrite(name, m.meshIface); err != nil {
+	if err := m.rewriter.AddMeshSourceRewrite(osIface, m.meshIface); err != nil {
 		undo()
 		m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("add mesh source rewrite: %w", err))
 		return
 	}
 	rewritten = true
 	for _, s := range e.AllowedSubnets {
-		if err := m.routes.AddRoute(s, name); err != nil {
+		if err := m.routes.AddRoute(s, osIface); err != nil {
 			undo()
 			m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("add route %s: %w", s, err))
 			return
@@ -1079,7 +1086,7 @@ func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAtte
 		}
 	}
 
-	t.iface = name
+	t.iface, t.osIface = name, osIface
 	t.publicKey = publicKey
 	t.version = a.version
 	m.upLocked(t)
@@ -1135,18 +1142,18 @@ func (m *SiteToSiteManager) stopTunnel(t *siteToSiteTunnel) error {
 		}
 	}
 	for _, s := range e.AllowedSubnets {
-		if err := m.routes.RemoveRoute(s, t.iface); err != nil {
-			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove route %s via %s: %w", s, t.iface, err))
+		if err := m.routes.RemoveRoute(s, t.osIface); err != nil {
+			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove route %s via %s: %w", s, t.osIface, err))
 		}
 	}
-	if err := m.rewriter.RemoveMeshSourceRewrite(t.iface, m.meshIface); err != nil {
-		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove mesh source rewrite %s: %w", t.iface, err))
+	if err := m.rewriter.RemoveMeshSourceRewrite(t.osIface, m.meshIface); err != nil {
+		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove mesh source rewrite %s: %w", t.osIface, err))
 	}
 	if err := m.vpn.RemoveTunnelInterface(t.iface); err != nil {
 		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove interface %s: %w", t.iface, err))
 	}
 	t.up = false
-	t.iface, t.publicKey, t.version = "", "", 0
+	t.iface, t.osIface, t.publicKey, t.version = "", "", "", 0
 	return errors.Join(errs...)
 }
 

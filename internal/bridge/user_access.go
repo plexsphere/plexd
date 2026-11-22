@@ -179,8 +179,13 @@ type userAccessProvider struct {
 	nextAttempt time.Time
 
 	// iface is the interface the provider serves on while it is up: its
-	// WireGuard interface, or the one its vendor client reports.
+	// WireGuard interface, or the one its vendor client reports. It is the
+	// name the access controller, the status report and the log lines take.
 	iface string
+	// osIface is the name the operating system knows iface by, which
+	// forwarding and the source rewrite take: the utunN behind a wireguard
+	// provider's interface on macOS, and iface itself everywhere else.
+	osIface string
 
 	// A wireguard provider while it is up: the public key of its interface,
 	// its pool and the interface's address in it, the devices configured on
@@ -742,13 +747,14 @@ func (m *UserAccessManager) bringUpWireGuardLocked(p *userAccessProvider) {
 		m.downLocked(p, reason, err)
 		return
 	}
-	if err := m.forwardIntoMesh(name); err != nil {
+	osIface := osInterfaceName(m.access, name)
+	if err := m.forwardIntoMesh(osIface); err != nil {
 		_ = m.access.RemoveInterface(name)
 		m.downLocked(p, UserAccessReasonSetupFailed, err)
 		return
 	}
 
-	p.iface = name
+	p.iface, p.osIface = name, osIface
 	p.publicKey = key.PublicKey().String()
 	p.pool, p.ifaceAddr = pool, addr
 	p.devices = make(map[string]userAccessDevice)
@@ -757,13 +763,14 @@ func (m *UserAccessManager) bringUpWireGuardLocked(p *userAccessProvider) {
 	m.upLocked(p)
 }
 
-// forwardIntoMesh switches forwarding on between iface and the mesh interface
-// and rewrites the source of what iface forwards into the mesh.
-func (m *UserAccessManager) forwardIntoMesh(iface string) error {
-	if err := m.routes.EnableForwarding(m.meshIface, iface); err != nil {
+// forwardIntoMesh switches forwarding on between osIface, a provider's
+// interface by the operating system's name, and the mesh interface, and
+// rewrites the source of what osIface forwards into the mesh.
+func (m *UserAccessManager) forwardIntoMesh(osIface string) error {
+	if err := m.routes.EnableForwarding(m.meshIface, osIface); err != nil {
 		return fmt.Errorf("enable forwarding: %w", err)
 	}
-	if err := m.rewriter.AddMeshSourceRewrite(iface, m.meshIface); err != nil {
+	if err := m.rewriter.AddMeshSourceRewrite(osIface, m.meshIface); err != nil {
 		return fmt.Errorf("add mesh source rewrite: %w", err)
 	}
 	return nil
@@ -937,7 +944,9 @@ func (m *UserAccessManager) join(ctx context.Context, j *userAccessJoin) {
 		m.joinFailed(j, UserAccessReasonSetupFailed, err)
 		return
 	}
-	j.p.iface = iface
+	// A vendor client reports the name the operating system knows its
+	// interface by.
+	j.p.iface, j.p.osIface = iface, iface
 	j.p.client = j.client
 	m.upLocked(j.p)
 	m.mu.Unlock()
@@ -980,11 +989,11 @@ func (m *UserAccessManager) stopProvider(p *userAccessProvider) error {
 	} else if err := m.access.RemoveInterface(p.iface); err != nil {
 		errs = append(errs, fmt.Errorf("bridge: user access: remove interface %s: %w", p.iface, err))
 	}
-	if err := m.rewriter.RemoveMeshSourceRewrite(p.iface, m.meshIface); err != nil {
-		errs = append(errs, fmt.Errorf("bridge: user access: remove mesh source rewrite %s: %w", p.iface, err))
+	if err := m.rewriter.RemoveMeshSourceRewrite(p.osIface, m.meshIface); err != nil {
+		errs = append(errs, fmt.Errorf("bridge: user access: remove mesh source rewrite %s: %w", p.osIface, err))
 	}
 	p.up = false
-	p.iface, p.publicKey, p.client = "", "", nil
+	p.iface, p.osIface, p.publicKey, p.client = "", "", "", nil
 	p.devices, p.skipped = nil, nil
 	return errors.Join(errs...)
 }
