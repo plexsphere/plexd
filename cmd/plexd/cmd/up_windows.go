@@ -104,50 +104,128 @@ func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridg
 	return bridge.NewWindowsRouteController(logger, nat)
 }
 
+// The in-process rewriter stands in for the kernel rewrites of Linux and
+// macOS, and the WFP controller exempts a tunnel's adapter from the bridge
+// NAT. internal/wireguard and internal/policy do not import internal/bridge,
+// so the compiler checks both interfaces here, beside the wiring.
+var (
+	_ bridge.MeshSourceRewriter = (*wireguard.MeshRewriter)(nil)
+	_ bridge.NATExempter        = (*policy.WFPController)(nil)
+
+	// up.go hands the rewriter to the mesh controller through an assertion
+	// to this interface, which turns false without an error when the
+	// signature of SetMeshRewriter drifts. The mesh device would then run
+	// unwrapped, and every wireguard provider and tunnel would fail its
+	// rewrite with "the mesh interface is no device of this process", so the
+	// compiler checks the controller against it here.
+	_ interface{ SetMeshRewriter(*wireguard.MeshRewriter) } = (*wireguard.WindowsController)(nil)
+)
+
+// newMeshRewriter returns the rewriter of a Windows bridge that serves user
+// access or site-to-site, and nil when serves is false. It rewrites, inside
+// the process, the source of what a wireguard provider's or a wireguard
+// tunnel's far end sends into the mesh to the bridge's mesh address, between
+// plexd's own wireguard-go devices: Windows has no kernel mechanism that fits,
+// since WinNAT translates nothing into the mesh beside the bridge NAT's object
+// for the mesh prefix, and what it translates passes no WFP forward filter.
+// Every device the rewriter knows runs over its wrapper, which copies each
+// packet, so no other Windows node is given one.
+func newMeshRewriter(serves bool, logger *slog.Logger) *wireguard.MeshRewriter {
+	if !serves {
+		return nil
+	}
+	return wireguard.NewMeshRewriter(logger)
+}
+
+// newRewritingWindowsController returns a WindowsController of its own whose
+// adapters run over rewriter's wrapper, so the rewriter knows them, or plain
+// adapters when rewriter is nil.
+func newRewritingWindowsController(logger *slog.Logger, rewriter *wireguard.MeshRewriter) *wireguard.WindowsController {
+	ctrl := wireguard.NewWindowsController(logger)
+	if rewriter != nil {
+		ctrl.SetMeshRewriter(rewriter)
+	}
+	return ctrl
+}
+
 // newAccessController creates the Wintun-backed controller for bridge user
 // access on Windows. It needs Administrator: creating an adapter is
 // privileged, which the LocalSystem service satisfies. The WindowsController
 // is its own, so the mesh, the access and the tunnel adapters live in three
-// backends, each keyed by the names it created.
+// backends, each keyed by the names it created, and with a rewriter it wraps
+// every adapter it creates, as the mesh controller does.
 //
-// The adapter stays unnumbered, as on Linux. Nothing routes over the access
-// adapter, and the IP Helper route controller addresses an interface by its
-// LUID rather than by an address on it.
-func newAccessController(logger *slog.Logger) bridge.AccessController {
-	return bridge.NewWGAccessController(wireguard.NewWindowsController(logger), logger)
+// A wireguard provider's adapter carries the first address of its pool,
+// which the user access manager passes, and Windows installs the on-link
+// route for the pool, which the replies to its devices take. The rewriter
+// reads that prefix: what a device sends to an address in it is for the host,
+// and what it sends into the mesh is translated and handed to the mesh
+// device in the process. The IP Helper route controller addresses the
+// adapter by its LUID rather than by an address on it.
+func newAccessController(logger *slog.Logger, rewriter *wireguard.MeshRewriter) bridge.AccessController {
+	return bridge.NewWGAccessController(newRewritingWindowsController(logger, rewriter), logger)
 }
 
-// newMeshSourceRewriter returns nil: Windows has no mesh source rewrite yet,
-// so every user access provider (plexd#214) and every site-to-site tunnel
-// reads kind_not_served.
-func newMeshSourceRewriter(_ bridge.RouteController, _ policy.FirewallController) bridge.MeshSourceRewriter {
+// newMeshSourceRewriter returns the in-process rewriter newMeshRewriter
+// built: it serves the three user access kinds and wireguard tunnels on a
+// Windows bridge. A wireguard provider and a wireguard tunnel are translated
+// between their device and the mesh device. A tailscale or netbird provider
+// gets no rewrite, because its vendor client's adapter is no device of this
+// process, and both vendors document that what their Windows client forwards
+// leaves with the host's address. A nil rewriter yields an untyped nil, never
+// a typed nil in the interface, which serves no provider and no tunnel.
+func newMeshSourceRewriter(_ bridge.RouteController, _ policy.FirewallController, rewriter *wireguard.MeshRewriter) bridge.MeshSourceRewriter {
+	if rewriter == nil {
+		return nil
+	}
+	return rewriter
+}
+
+// newNATExempter returns the firewall controller as the exempter of each
+// site-to-site tunnel's adapter from the bridge NAT: while the NetNat object
+// of the bridge NAT covers the mesh prefix, WFPController gives the adapter a
+// 169.254 /30 and a NetNat object of its own, so what a mesh node sends to
+// the site keeps its source and stays under the bridge's policy. A fw that
+// implements no NATExempter, nil or a test's fake, yields an untyped nil.
+func newNATExempter(fw policy.FirewallController) bridge.NATExempter {
+	if e, ok := fw.(bridge.NATExempter); ok {
+		return e
+	}
 	return nil
 }
 
-// newTunnelProviders returns the providers of the site-to-site kinds other
-// than wireguard: strongSwan for ipsec, with its connection files in
-// swanctlDir, and an openvpn process for openvpn.
-func newTunnelProviders(swanctlDir string, logger *slog.Logger) map[string]bridge.TunnelProvider {
-	return map[string]bridge.TunnelProvider{
-		api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
-		api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
-	}
+// newTunnelProviders builds no ipsec and no openvpn provider on Windows, as
+// on macOS: the xfrm interface of an ipsec tunnel and the persistent tun
+// device of an openvpn tunnel are Linux kernel features, so such a tunnel
+// reads kind_not_served rather than failing its link create. A wireguard
+// tunnel needs no provider.
+func newTunnelProviders(_ string, _ *slog.Logger) map[string]bridge.TunnelProvider {
+	return nil
 }
 
-// forwardingKnobIsShared is false on Windows: neither the user access nor the
-// site-to-site manager serves there, so the bridge manager is the only
-// claimant of the mesh adapter's forwarding flag.
+// forwardingKnobIsShared is false on Windows: the user access and
+// site-to-site managers claim the forwarding flags of the mesh adapter and of
+// each provider's and tunnel's adapter, and give none back. A provider's or
+// a tunnel's adapter goes with the provider or the tunnel and the mesh
+// adapter with the process, and a release after the adapter is gone would
+// fail on its LUID. A vendor client's adapter keeps the flag plexd set, as
+// tailscale0 does on Linux.
 const forwardingKnobIsShared = false
 
 // newVPNController creates the Wintun-backed controller for bridge
 // site-to-site tunnels on Windows. It needs Administrator for the same
-// reason, and it holds its own WindowsController.
+// reason, and it holds its own WindowsController, which with a rewriter wraps
+// every adapter it creates, so a wireguard tunnel's far end is translated
+// into the mesh in the process.
 //
-// The tunnel adapter stays unnumbered, as on Linux: the route to the remote
-// subnet is installed by adapter LUID, so it does not depend on the adapter
-// carrying an address. The mesh IP is therefore unused here.
-func newVPNController(logger *slog.Logger, _ string) bridge.VPNController {
-	return bridge.NewWGVPNController(wireguard.NewWindowsController(logger), "", logger)
+// The controller leaves the tunnel adapter unnumbered, as on Linux: the route
+// to the remote subnet is installed by adapter LUID, so it does not depend on
+// the adapter carrying an address. The mesh IP is therefore unused here.
+// While the bridge NAT's NetNat object covers the mesh prefix, the
+// site-to-site manager's NAT exempter gives the adapter a 169.254 /30 of its
+// own before forwarding is switched on.
+func newVPNController(logger *slog.Logger, _ string, rewriter *wireguard.MeshRewriter) bridge.VPNController {
+	return bridge.NewWGVPNController(newRewritingWindowsController(logger, rewriter), "", logger)
 }
 
 // newSessionLauncher returns nil: mediated ssh sessions are served on Linux

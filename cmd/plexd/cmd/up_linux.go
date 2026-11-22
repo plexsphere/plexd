@@ -79,8 +79,16 @@ func newRouteController(logger *slog.Logger, _ policy.FirewallController) bridge
 	return bridge.NewNetlinkRouteController(logger)
 }
 
-// newAccessController creates a NetlinkAccessController for user access on Linux.
-func newAccessController(logger *slog.Logger) bridge.AccessController {
+// newMeshRewriter returns nil on Linux: the NetlinkRouteController rewrites
+// the source of user access and site-to-site traffic in the kernel, so no
+// device of this process needs the in-process rewriter.
+func newMeshRewriter(_ bool, _ *slog.Logger) *wireguard.MeshRewriter {
+	return nil
+}
+
+// newAccessController creates a NetlinkAccessController for user access on
+// Linux. The rewriter is unused: a kernel interface does not run through it.
+func newAccessController(logger *slog.Logger, _ *wireguard.MeshRewriter) bridge.AccessController {
 	return bridge.NewNetlinkAccessController(logger)
 }
 
@@ -88,8 +96,9 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 // NetlinkRouteController rewrites the source of user access and site-to-site
 // traffic into the mesh in its nftables table plexd-mesh-nat. It returns nil
 // for any other route controller, which serves no user access provider and
-// no site-to-site tunnel. The firewall controller plays no part here.
-func newMeshSourceRewriter(routes bridge.RouteController, _ policy.FirewallController) bridge.MeshSourceRewriter {
+// no site-to-site tunnel. The firewall controller and the in-process
+// rewriter play no part here.
+func newMeshSourceRewriter(routes bridge.RouteController, _ policy.FirewallController, _ *wireguard.MeshRewriter) bridge.MeshSourceRewriter {
 	if r, ok := routes.(*bridge.NetlinkRouteController); ok && r != nil {
 		return r
 	}
@@ -106,6 +115,13 @@ func newTunnelProviders(swanctlDir string, logger *slog.Logger) map[string]bridg
 	}
 }
 
+// newNATExempter returns nil on Linux: the bridge NAT masquerades only what
+// leaves through bridge.access_interface, so it never translates what is
+// forwarded between the mesh and a tunnel's link.
+func newNATExempter(_ policy.FirewallController) bridge.NATExempter {
+	return nil
+}
+
 // forwardingKnobIsShared is false on Linux: each interface has a forwarding
 // knob of its own, and DisableForwarding would switch off the mesh
 // interface's, which belongs to the bridge manager, so the user access and
@@ -114,8 +130,9 @@ const forwardingKnobIsShared = false
 
 // newVPNController creates a NetlinkVPNController for site-to-site tunnels on
 // Linux. The mesh IP is unused: the tunnel link stays unnumbered, because a
-// netlink route names the link itself.
-func newVPNController(logger *slog.Logger, _ string) bridge.VPNController {
+// netlink route names the link itself. The rewriter is unused too: a kernel
+// link does not run through it.
+func newVPNController(logger *slog.Logger, _ string, _ *wireguard.MeshRewriter) bridge.VPNController {
 	return bridge.NewNetlinkVPNController(logger)
 }
 
