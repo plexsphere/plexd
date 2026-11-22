@@ -188,6 +188,10 @@ jobs:
       # Administrator. The runner has it, so the gate is this variable for the
       # same reason as above: without one the tests would install real filters
       # inside the ordinary step. The NAT test uses a prefix no adapter carries.
+      # The NAT exemption test TestWFPController_RealNATExemption creates two
+      # Wintun adapters of its own, checks the exemption object of one beside
+      # the object AddNATMasquerade makes for the other's prefix, and removes
+      # every object it made.
       # The traffic test TestWFPController_RealTraffic and the connection-log
       # test TestWFPController_RealConnLog each create a Wintun adapter and
       # inject unsolicited packets into it, which the Windows Firewall would
@@ -197,10 +201,12 @@ jobs:
       # engine's classify-allow net events, a setting of the whole host that
       # outlives the process, and checks that the controller puts the host's
       # setting back, also after a simulated crash. The traffic test is the
-      # only proof of what plexd's filters let out and back in on Windows, and
-      # the connection-log test the only proof that the engine reports what
-      # plexd's logged filters permit, so the step fails unless both PASS
-      # lines are in the output: a skip would pass otherwise.
+      # only proof of what plexd's filters let out and back in on Windows, the
+      # connection-log test the only proof that the engine reports what
+      # plexd's logged filters permit, and the NAT exemption test checks every
+      # object an exemption leaves in the host's WinNAT, so the step fails
+      # unless all three PASS lines are in the output: a skip would pass
+      # otherwise.
       - name: Run real WFP tests
         if: runner.os == 'Windows'
         env:
@@ -208,7 +214,7 @@ jobs:
         run: |
           Set-NetFirewallProfile -All -Enabled False
           $out = Join-Path $env:RUNNER_TEMP 'real-wfp.txt'
-          go test -race -count=1 -v -run '^TestWFPController_Real(NAT|Traffic|ConnLog)?$' ./internal/policy/ | Tee-Object -FilePath $out
+          go test -race -count=1 -v -run '^TestWFPController_Real(NAT|NATExemption|Traffic|ConnLog)?$' ./internal/policy/ | Tee-Object -FilePath $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWFPController_RealTraffic ')) {
             Write-Error 'TestWFPController_RealTraffic did not pass'
@@ -216,6 +222,42 @@ jobs:
           }
           if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWFPController_RealConnLog ')) {
             Write-Error 'TestWFPController_RealConnLog did not pass'
+            exit 1
+          }
+          if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWFPController_RealNATExemption ')) {
+            Write-Error 'TestWFPController_RealNATExemption did not pass'
+            exit 1
+          }
+
+      # The mesh source rewrite test creates three Wintun adapters through the
+      # bridge's own controllers, the mesh adapter, a user access provider's
+      # and a site-to-site tunnel's, and drives WireGuard traffic between them
+      # and three wireguard-go devices of its own. It also adds a route to the
+      # tunnel's adapter, switches the adapters' forwarding flags on, applies a
+      # WFP chain on the mesh adapter and creates the bridge NAT's NetNat
+      # object and the tunnel's exemption object, so it needs all three
+      # variables of the steps above. Its echo socket on the provider's address
+      # takes unsolicited inbound UDP, which the Windows Firewall would block
+      # on its own, so the step turns every firewall profile off itself rather
+      # than rely on the WFP step before it. Its NetNat objects carry the names
+      # the WFP step's NAT tests use, and the test refuses to start beside an
+      # object of those names, so the two stay in steps of their own. The test
+      # is the only proof of the in-process mesh source rewrite and of the
+      # tunnel's NAT exemption on Windows, so the step fails unless its PASS
+      # line is in the output: a skip would pass otherwise.
+      - name: Run real mesh source rewrite tests
+        if: runner.os == 'Windows'
+        env:
+          PLEXD_TEST_REAL_WINTUN: '1'
+          PLEXD_TEST_REAL_ROUTES: '1'
+          PLEXD_TEST_REAL_WFP: '1'
+        run: |
+          Set-NetFirewallProfile -All -Enabled False
+          $out = Join-Path $env:RUNNER_TEMP 'real-meshrewrite.txt'
+          go test -race -count=1 -v -run '^TestMeshSourceRewrite_RealWintun$' ./internal/bridge/ | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestMeshSourceRewrite_RealWintun ')) {
+            Write-Error 'TestMeshSourceRewrite_RealWintun did not pass'
             exit 1
           }
 
