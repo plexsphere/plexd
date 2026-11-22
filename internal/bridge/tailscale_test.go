@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os/exec"
 	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +51,14 @@ func newTailscaleRunner() (*mockCommandExecutor, *mockCommandHandle) {
 	return runner, handle
 }
 
+// noHostInterface is the ifaceByAddr seam of a test that wants tailscale0: it
+// finds no interface, whatever the host carries. The production lookup reads
+// the host's interface table, and a test of another package that runs at the
+// same time can hold the client's address there: the windows-latest runner
+// had a plexd0 with 100.64.0.7, one of the two mesh addresses the daemon
+// tests of cmd/plexd/cmd run under.
+func noHostInterface(string) string { return "" }
+
 func TestTailscaleProvider_Start_Success(t *testing.T) {
 	// The variable Start read before is set to another key, which must
 	// appear in no command.
@@ -56,6 +66,7 @@ func TestTailscaleProvider_Start_Success(t *testing.T) {
 
 	runner, handle := newTailscaleRunner()
 	p := NewTailscaleProvider(runner, discardLogger())
+	p.ifaceByAddr = noHostInterface
 	if err := p.Start(context.Background(), "k", testMeshCIDR); err != nil {
 		t.Fatalf("Start() unexpected error: %v", err)
 	}
@@ -90,6 +101,67 @@ func TestTailscaleProvider_Start_Success(t *testing.T) {
 	}
 	if n := handle.stopCalls(); n != 0 {
 		t.Errorf("tailscaled stopped %d times after a successful join, want 0", n)
+	}
+}
+
+// TestTailscaleProvider_Start_InterfaceByAddress checks that Start reports
+// the interface that carries the client's address, which is a utunN on
+// macOS, and tailscale0 when no interface carries it or the client lists no
+// address.
+func TestTailscaleProvider_Start_InterfaceByAddress(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    string // tailscale status --json; empty keeps the runner's
+		found     string // what the seam returns for 100.64.0.1
+		wantIface string
+		wantAsked []string
+	}{
+		{name: "an interface carries the address", found: "utun9", wantIface: "utun9", wantAsked: []string{"100.64.0.1"}},
+		{name: "no interface carries the address", found: "", wantIface: "tailscale0", wantAsked: []string{"100.64.0.1"}},
+		{name: "the client lists no address", status: `{"TailscaleIPs":[]}`, found: "utun9", wantIface: "tailscale0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, _ := newTailscaleRunner()
+			if tc.status != "" {
+				runner.runOutputs[commandKey("tailscale", "status", "--json")] = []byte(tc.status)
+			}
+			p := NewTailscaleProvider(runner, discardLogger())
+			var asked []string
+			p.ifaceByAddr = func(ip string) string {
+				asked = append(asked, ip)
+				if ip == "100.64.0.1" {
+					return tc.found
+				}
+				return ""
+			}
+
+			if err := p.Start(context.Background(), "k", testMeshCIDR); err != nil {
+				t.Fatalf("Start() unexpected error: %v", err)
+			}
+			if got := p.Status().InterfaceName; got != tc.wantIface {
+				t.Errorf("Status().InterfaceName = %q, want %q", got, tc.wantIface)
+			}
+			if !slices.Equal(asked, tc.wantAsked) {
+				t.Errorf("the seam was asked for %q, want %q", asked, tc.wantAsked)
+			}
+		})
+	}
+}
+
+// TestInterfaceByAddr checks the lookup the production seam runs: no
+// interface for something that is no address or an address no interface
+// carries, and on Linux and macOS the loopback for 127.0.0.1. The Windows
+// loopback's name depends on the host's language, so it is not pinned.
+func TestInterfaceByAddr(t *testing.T) {
+	for _, ip := range []string{"", "not-an-ip", "192.0.2.123"} {
+		if got := interfaceByAddr(ip); got != "" {
+			t.Errorf("interfaceByAddr(%q) = %q, want none", ip, got)
+		}
+	}
+	if want := map[string]string{"linux": "lo", "darwin": "lo0"}[runtime.GOOS]; want != "" {
+		if got := interfaceByAddr("127.0.0.1"); got != want {
+			t.Errorf("interfaceByAddr(\"127.0.0.1\") = %q, want %q", got, want)
+		}
 	}
 }
 
@@ -389,6 +461,7 @@ func TestTailscaleProvider_Stop_Idempotent(t *testing.T) {
 func TestTailscaleProvider_Status_Running(t *testing.T) {
 	runner, _ := newTailscaleRunner()
 	p := NewTailscaleProvider(runner, discardLogger())
+	p.ifaceByAddr = noHostInterface
 	if err := p.Start(context.Background(), "tskey-auth-test123", testMeshCIDR); err != nil {
 		t.Fatalf("Start() unexpected error: %v", err)
 	}

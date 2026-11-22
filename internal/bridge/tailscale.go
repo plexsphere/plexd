@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"sync"
 )
 
@@ -21,6 +23,11 @@ type TailscaleProvider struct {
 	exec   CommandExecutor
 	logger *slog.Logger
 
+	// ifaceByAddr returns the name of the interface that carries an
+	// address, "" for none. It is a seam: interfaceByAddr in production, a
+	// fake in tests.
+	ifaceByAddr func(ip string) string
+
 	// mu protects running, ip, ifaceName, daemonHandle.
 	mu           sync.Mutex
 	running      bool
@@ -32,8 +39,9 @@ type TailscaleProvider struct {
 // NewTailscaleProvider creates a new TailscaleProvider.
 func NewTailscaleProvider(exec CommandExecutor, logger *slog.Logger) *TailscaleProvider {
 	return &TailscaleProvider{
-		exec:   exec,
-		logger: logger,
+		exec:        exec,
+		logger:      logger,
+		ifaceByAddr: interfaceByAddr,
 	}
 }
 
@@ -98,7 +106,15 @@ func (p *TailscaleProvider) Start(ctx context.Context, key string, meshCIDR stri
 	if len(status.TailscaleIPs) > 0 {
 		p.ip = status.TailscaleIPs[0]
 	}
+	// tailscaled names its interface tailscale0 on Linux and runs on a utunN
+	// on macOS, and the client reports neither, so the interface is the one
+	// that carries the client's address.
 	p.ifaceName = "tailscale0"
+	if p.ip != "" {
+		if name := p.ifaceByAddr(p.ip); name != "" {
+			p.ifaceName = name
+		}
+	}
 	p.running = true
 
 	p.logger.Info("tailscale provider started",
@@ -160,4 +176,34 @@ func (p *TailscaleProvider) Status() ProviderStatus {
 		InterfaceName: p.ifaceName,
 		IP:            p.ip,
 	}
+}
+
+// interfaceByAddr returns the name of the first interface of the host that
+// carries ip, and "" when none does, ip is no address, or the interfaces
+// cannot be read. An interface whose addresses cannot be read is skipped.
+func interfaceByAddr(ip string) string {
+	want, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			n, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if got, ok := netip.AddrFromSlice(n.IP); ok && got.Unmap() == want.Unmap() {
+				return ifc.Name
+			}
+		}
+	}
+	return ""
 }
