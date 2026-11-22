@@ -395,7 +395,9 @@ func (s *Server) Assertions() AssertionCounters {
 // (the contract splits them for forward compatibility). The dns block names the
 // node at the mesh IP register assigns it and each peer at the mesh IP of its
 // peers entry, so every name a suite resolves points at an address of the
-// agent's mesh.
+// agent's mesh. The failure_detection block carries 15 s, what the control
+// plane serves for a Domain that never set it, so the e2e suites run the
+// timing production runs.
 func newStateFixture() api.NodeStateSnapshot {
 	rules := []api.PolicyRule{
 		{Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"},
@@ -589,6 +591,7 @@ func newStateFixture() api.NodeStateSnapshot {
 				CatchAll:     []string{},
 			},
 		},
+		FailureDetection: json.RawMessage(`{"detect_after_seconds":15}`),
 	}
 }
 
@@ -4899,15 +4902,17 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 
 // GetState returns the current state fixture with the peers, executions,
 // sessions, and secrets slices normalized to non-nil so they always serialize
-// as [] rather than null. The twelve envelope blocks carry no omitempty, so all
-// keys are emitted (null for unpopulated blocks). The hooks block is left as
+// as [] rather than null. The thirteen envelope blocks carry no omitempty, so
+// all keys are emitted (null for unpopulated blocks). The hooks block is left as
 // configured: a fixture without one serves null, which keeps every hook a
 // rollout installed. The dns block is left as configured too: a fixture
-// without one serves null, which keeps the names the node holds.
+// without one serves null, which keeps the names the node holds. So is the
+// failure_detection block: a fixture without one serves null, which keeps the
+// failure-detection time the node holds.
 //
 // The result is a SHALLOW copy: the policy, bridge, state, reports, and dns
 // pointers and the peers, executions, sessions, and secrets backing arrays
-// alias the live fixture.
+// alias the live fixture, and so do the failure_detection bytes.
 // Reading is safe — SetState replaces the whole struct under the mutex, so no
 // caller observes a half-written fixture — but callers must NOT mutate through
 // the returned pointers or slices, which would race the state handler serving a

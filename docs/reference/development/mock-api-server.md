@@ -931,6 +931,7 @@ rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions`,
 `sessions`, and `secrets` blocks.
 It also carries a `dns` block that names the node and both peers, holds eight records, and carries a `forwarding` member with two empty lists.
+Its `failure_detection` block carries the Domain's default failure-detection time, 15 s.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
 The `signing_key` block is not read from the fixture: every response sets it to
 the mock's current signing key, the key `POST /v1/register` hands out, whatever
@@ -955,6 +956,7 @@ therefore hands the node the new key.
 | `hooks` | `null`, which keeps every hook a rollout installed and lets the [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serve nothing; phases configure entries explicitly |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
 | `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa`; `forwarding` with `forward_zones` `[]` and `catch_all` `[]` |
+| `failure_detection` | `{"detect_after_seconds": 15}`, what the control plane serves for a Domain that never set the value, so every suite runs the timing production runs: the node probes its relayed peers on every pass, 1 s apart, and dials the next relay of a silent peer's set 14 to 15 s after its last packet. See [Failure detection time](../networking/wireguard.md#failure-detection-time) |
 
 The `dns` block names the node at the mesh IP `POST /v1/register` assigns it and
 each peer at the mesh IP of its `peers` entry, so every name a suite resolves
@@ -1212,7 +1214,8 @@ answers `applied`.
     ],
     "reverse_zones": ["0.99.10.in-addr.arpa"],
     "forwarding": {"forward_zones": [], "catch_all": []}
-  }
+  },
+  "failure_detection": {"detect_after_seconds": 15}
 }
 ```
 
@@ -1753,7 +1756,8 @@ Replaces the active `NodeStateSnapshot` fixture at runtime. Subsequent calls to 
       "target": {"tcp": {"host": "127.0.0.1", "port": 8080}},
       "expires_at": "2099-01-01T00:00:00Z"
     }
-  ]
+  ],
+  "failure_detection": null
 }
 ```
 
@@ -1776,6 +1780,15 @@ the block is the full set, so the node drops the records it held. A configured
 `api.NodeStateDNS.Forwarding` is `nil` and `omitempty` drops it. That is the
 contract's signal that the node keeps the forwarding it holds. A block whose
 `forwarding` holds two empty lists ends the forwarding.
+
+The `failure_detection` block is served as configured too. A body without a
+`failure_detection` key stores a nil block, which the state endpoint serves as
+`"failure_detection": null`, the contract's signal that the node keeps the
+failure-detection time it holds. Splicing `"failure_detection": null` does the
+same. The Docker suite's
+[phase `12f`](docker-e2e-test.md#phase-8-cont-failure-detection-time-from-the-state-pull)
+splices values into the live snapshot with `splice_state` and reads plexd's log
+after each.
 
 **Response:** `204 No Content`
 

@@ -1497,6 +1497,50 @@ func TestState_CarriesTheDNSBlock(t *testing.T) {
 	}
 }
 
+// TestState_CarriesTheFailureDetectionBlock pins the failure_detection block a
+// fresh mock serves, the 15 s the control plane serves for a Domain that never
+// set it, that a configured block is served back byte for byte, and that a
+// state configured without the key is served with null, the "keep the value
+// held" signal of the contract.
+func TestState_CarriesTheFailureDetectionBlock(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	raw, ok := stateEnvelope(t, ts.URL)["failure_detection"]
+	if !ok {
+		t.Fatal("envelope missing key \"failure_detection\"")
+	}
+	if want := `{"detect_after_seconds":15}`; string(raw) != want {
+		t.Errorf("failure_detection = %s, want %s", raw, want)
+	}
+
+	// Configure the served state with another value and read the raw block
+	// back: the mock serves it as configured.
+	configured := stateEnvelope(t, ts.URL)
+	want := `{"detect_after_seconds":20}`
+	configured["failure_detection"] = json.RawMessage(want)
+	configureStateEnvelope(t, ts.URL, configured)
+	raw, ok = stateEnvelope(t, ts.URL)["failure_detection"]
+	if !ok {
+		t.Fatal("envelope after configure-state missing key \"failure_detection\"")
+	}
+	if string(raw) != want {
+		t.Errorf("failure_detection after configure-state = %s, want %s", raw, want)
+	}
+
+	// Configure the served state with its failure_detection key removed, the
+	// way a suite splices a state together, and read the raw answer back.
+	withoutBlock := stateEnvelope(t, ts.URL)
+	delete(withoutBlock, "failure_detection")
+	configureStateEnvelope(t, ts.URL, withoutBlock)
+	raw, ok = stateEnvelope(t, ts.URL)["failure_detection"]
+	if !ok {
+		t.Fatal("envelope after configure-state missing key \"failure_detection\", want it present as null")
+	}
+	if string(raw) != "null" {
+		t.Errorf("failure_detection after configure-state without the key = %s, want null", raw)
+	}
+}
+
 // configureStateEnvelope posts envelope, a served state with members changed
 // by key, to /test/configure-state, failing the test on a non-204 answer.
 func configureStateEnvelope(t *testing.T, baseURL string, envelope map[string]json.RawMessage) {
