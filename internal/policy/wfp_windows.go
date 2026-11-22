@@ -65,9 +65,11 @@ var plexdSublayerID = wf.SublayerID(windows.GUID{
 })
 
 // WFPController implements FirewallController on Windows through the Windows
-// Filtering Platform and bridge.NATController through WinNAT. Filters live in
-// a dynamic session, so they vanish with the process; the Wintun adapter
-// vanishes with it too, so nothing arrives that they could have filtered.
+// Filtering Platform, and bridge.NATController and bridge.NATExempter through
+// WinNAT: the bridge NAT's object for the mesh prefix, and one object for the
+// 169.254 /30 of each exempted tunnel adapter. Filters live in a dynamic
+// session, so they vanish with the process; the Wintun adapter vanishes with
+// it too, so nothing arrives that they could have filtered.
 //
 // It implements ConnReporter through the engine's classify-allow net events,
 // see enableAllowEvents.
@@ -82,6 +84,14 @@ type WFPController struct {
 	lookupIface   func(name string) (ifaceIDs, error)
 	meshPrefix    func(name string) (netip.Prefix, error)
 	run           commandRunner
+
+	// The IP Helper calls of a tunnel's NAT exemption, see ExemptFromNAT.
+	// Each prefix is an address with its on-link prefix length: the one
+	// addAddress and removeAddress put on or take off an adapter, and those
+	// of every IPv4 address of the host that hostPrefixes returns.
+	addAddress    func(luid uint64, prefix netip.Prefix) error
+	removeAddress func(luid uint64, prefix netip.Prefix) error
+	hostPrefixes  func() ([]netip.Prefix, error)
 
 	mu     sync.Mutex
 	engine wfpEngine              // nil while no chain exists
@@ -128,6 +138,9 @@ func NewWFPController(logger *slog.Logger, meshIface string) *WFPController {
 		lookupIface:   lookupWinIface,
 		meshPrefix:    meshPrefixOf,
 		run:           execCommand,
+		addAddress:    addLUIDAddress,
+		removeAddress: deleteLUIDAddress,
+		hostPrefixes:  hostUnicastPrefixes,
 		chains:        make(map[string][]wf.RuleID),
 		connLogs:      make(map[string]*wfpChainLog),
 	}
