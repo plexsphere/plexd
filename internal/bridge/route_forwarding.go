@@ -13,9 +13,12 @@ type forwardingPair [2]string
 // single global forwarding sysctl, and on Windows the mesh adapter's
 // forwarding flag is claimed by every pair that names the mesh adapter, so
 // releasing one pair would otherwise switch forwarding off under another.
-// The bridge manager is the only claimant there: the user access and
-// site-to-site managers claim no knob, since neither serves a provider or a
-// tunnel on either platform.
+// On macOS the user access and site-to-site managers claim the knob as well,
+// one pair per provider or tunnel, and give each pair back
+// (UserAccessDeps.ReleaseForwarding, SiteToSiteDeps.ReleaseForwarding), so
+// the knob is restored once the bridge manager, the last to stop, lets go of
+// its own. On Windows the bridge manager is the only claimant: neither of the
+// other two serves a provider or a tunnel there.
 //
 // V is the saved state; each platform picks its own. The ledger carries no
 // lock: every caller already holds its controller's mutex.

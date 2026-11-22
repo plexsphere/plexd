@@ -223,7 +223,14 @@ func buildUAFixture(t *testing.T, adjust func(*UserAccessDeps)) *uaFixture {
 	}
 	fx.mgr = NewUserAccessManager(deps)
 	fx.mgr.now = fx.clock.Now
-	t.Cleanup(func() { _ = fx.mgr.Teardown() })
+	t.Cleanup(func() {
+		_ = fx.mgr.Teardown()
+		// Without ReleaseForwarding, as on Linux, the manager never switches
+		// forwarding off: the knob there is the mesh interface's own.
+		if got := fx.routes.callsFor("DisableForwarding"); !deps.ReleaseForwarding && len(got) != 0 {
+			t.Errorf("DisableForwarding calls = %+v without ReleaseForwarding, want none", got)
+		}
+	})
 	return fx
 }
 
@@ -611,6 +618,93 @@ func TestUserAccessManager_KernelNames(t *testing.T) {
 	if c := fx.access.accessCallsFor("RemoveInterface"); len(c) != 1 || c[0].Args[0] != uaIface1 {
 		t.Errorf("RemoveInterface calls = %+v, want one for the configured %s", c, uaIface1)
 	}
+}
+
+// TestUserAccessManager_ReleaseForwarding checks that with ReleaseForwarding,
+// as on macOS, where one forwarding knob serves the whole host, the manager
+// gives back each forwarding pair it claimed: when a provider that is up is
+// removed, once per provider Teardown stops, and when a bring-up fails after
+// its forwarding was switched on.
+func TestUserAccessManager_ReleaseForwarding(t *testing.T) {
+	release := func(d *UserAccessDeps) { d.ReleaseForwarding = true }
+
+	t.Run("a removed provider", func(t *testing.T) {
+		fx := newUAFixture(t, release)
+		fx.mgr.Apply(t.Context(), uaBlock(fieldTeam))
+		requireUp(t, fx.mgr, uaID1)
+		if got := routeCalls(fx.routes, "DisableForwarding"); len(got) != 0 {
+			t.Fatalf("DisableForwarding calls = %q while the provider is up, want none", got)
+		}
+
+		fx.mgr.Apply(t.Context(), uaBlock())
+		if got := routeCalls(fx.routes, "DisableForwarding"); !slices.Equal(got, []string{uaMesh + " " + uaIface1}) {
+			t.Errorf("DisableForwarding calls = %q, want (%s, %s)", got, uaMesh, uaIface1)
+		}
+	})
+
+	t.Run("teardown", func(t *testing.T) {
+		fx := newUAFixture(t, release)
+		fx.secrets.set("nb-setup", 1, "join-key")
+		fx.mgr.SyncSecretInventory(t.Context(), inventoryOf("nb-setup", 1))
+		fx.mgr.Apply(t.Context(), uaBlock(
+			fieldTeam,
+			wgProvider(uaID2, "ops", 51822, "10.98.0.0/24"),
+			vendorProvider(uaID3, "vendor", api.UserAccessKindNetbird, "nb-setup"),
+		))
+		for _, id := range []string{uaID1, uaID2, uaID3} {
+			requireUp(t, fx.mgr, id)
+		}
+
+		if err := fx.mgr.Teardown(); err != nil {
+			t.Fatalf("Teardown() error = %v, want nil", err)
+		}
+		got := routeCalls(fx.routes, "DisableForwarding")
+		slices.Sort(got)
+		want := []string{uaMesh + " " + uaIface1, uaMesh + " " + uaIface2, uaMesh + " wt0"}
+		if !slices.Equal(got, want) {
+			t.Errorf("DisableForwarding calls = %q, want one per provider %q", got, want)
+		}
+	})
+
+	t.Run("a rewrite that fails after forwarding", func(t *testing.T) {
+		fx := newUAFixture(t, release)
+		fx.rewriter.addMeshSourceRewriteErr = errors.New("boom")
+		fx.mgr.Apply(t.Context(), uaBlock(fieldTeam))
+
+		requireDown(t, fx.mgr, uaID1, UserAccessReasonSetupFailed)
+		if got := routeCalls(fx.routes, "EnableForwarding"); !slices.Equal(got, []string{uaMesh + " " + uaIface1}) {
+			t.Errorf("EnableForwarding calls = %q, want (%s, %s)", got, uaMesh, uaIface1)
+		}
+		if got := routeCalls(fx.routes, "DisableForwarding"); !slices.Equal(got, []string{uaMesh + " " + uaIface1}) {
+			t.Errorf("DisableForwarding calls = %q, want (%s, %s)", got, uaMesh, uaIface1)
+		}
+	})
+
+	t.Run("a release that fails after a failed bring-up", func(t *testing.T) {
+		fx := newUAFixture(t, release)
+		fx.rewriter.addMeshSourceRewriteErr = errors.New("boom")
+		fx.routes.disableForwardingErr = errors.New("sysctl refused")
+		fx.mgr.Apply(t.Context(), uaBlock(fieldTeam))
+
+		requireDown(t, fx.mgr, uaID1, UserAccessReasonSetupFailed)
+		if got := logLines(fx.logs, "level=ERROR", `msg="bridge: user access: release forwarding failed"`, "component=bridge",
+			"provider_id="+uaID1, "interface="+uaIface1, "release forwarding "+uaIface1+": sysctl refused"); got != 1 {
+			t.Errorf("%d 'release forwarding failed' lines, want 1:\n%s", got, fx.logs.String())
+		}
+	})
+
+	t.Run("teardown returns the release error", func(t *testing.T) {
+		fx := newUAFixture(t, release)
+		fx.mgr.Apply(t.Context(), uaBlock(fieldTeam))
+		requireUp(t, fx.mgr, uaID1)
+		errRefused := errors.New("sysctl refused")
+		fx.routes.disableForwardingErr = errRefused
+
+		err := fx.mgr.Teardown()
+		if !errors.Is(err, errRefused) || !strings.Contains(err.Error(), "bridge: user access: release forwarding "+uaIface1+": ") {
+			t.Errorf("Teardown() error = %v, want the release error of %s", err, uaIface1)
+		}
+	})
 }
 
 // TestUserAccessManager_ApplyDiffsDevicesAndRebuilds checks that an unchanged
