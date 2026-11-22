@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/plexsphere/plexd/internal/winpipe"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/ipc/namedpipe"
 )
@@ -42,12 +43,16 @@ const pipeSecurityDescriptor = `D:P(A;;GA;;;SY)(A;;GA;;;BA)`
 // ListenLocal opens the local node API listener: the named pipe called path.
 // The logger is unused on Windows, where the pipe's access control is fixed by
 // pipeSecurityDescriptor at creation rather than applied afterwards.
+//
+// The listener comes from winpipe, whose Close returns in every order of
+// events: http.Server.Shutdown waits on that Close whatever its context says,
+// so a Close that blocks keeps the daemon from stopping.
 func ListenLocal(path string, _ *slog.Logger) (net.Listener, error) {
 	sd, err := windows.SecurityDescriptorFromString(pipeSecurityDescriptor)
 	if err != nil {
 		return nil, fmt.Errorf("nodeapi: pipe security descriptor: %w", err)
 	}
-	ln, err := (&namedpipe.ListenConfig{SecurityDescriptor: sd}).Listen(path)
+	ln, err := winpipe.Listen(path, sd)
 	if err != nil {
 		return nil, fmt.Errorf("nodeapi: listen pipe %s: %w", path, err)
 	}

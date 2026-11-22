@@ -5,8 +5,8 @@ package wireguard
 import (
 	"net"
 
+	"github.com/plexsphere/plexd/internal/winpipe"
 	"golang.org/x/sys/windows"
-	"golang.zx2c4.com/wireguard/ipc/namedpipe"
 )
 
 // uapiPipePrefix is where wg(8) and any wgctrl reader look for a userspace
@@ -31,11 +31,13 @@ const uapiPipePrefix = `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\`
 const uapiSecurityDescriptor = `D:P(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NWNRNX;;;HI)`
 
 // uapiListen serves the WireGuard UAPI for the named device on its named pipe,
-// so wg(8) and any wgctrl reader can query the in-process device.
+// so wg(8) and any wgctrl reader can query the in-process device. The listener
+// comes from winpipe, whose Close returns in every order of events: DeleteDevice
+// closes it before the device and would otherwise never get to the device.
 func uapiListen(name string) (net.Listener, error) {
 	sd, err := windows.SecurityDescriptorFromString(uapiSecurityDescriptor)
 	if err != nil {
 		return nil, err
 	}
-	return (&namedpipe.ListenConfig{SecurityDescriptor: sd}).Listen(uapiPipePrefix + name)
+	return winpipe.Listen(uapiPipePrefix+name, sd)
 }
