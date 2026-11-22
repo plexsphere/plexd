@@ -3,6 +3,8 @@ package bridge
 import (
 	"sync"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // mockVPNCall records a single method invocation on mockVPNController.
@@ -147,3 +149,28 @@ func (m *mockVPNController) resetVPN() {
 
 // Verify mockVPNController satisfies VPNController at compile time.
 var _ VPNController = (*mockVPNController)(nil)
+
+// namerVPNController is a mockVPNController that maps configured names to
+// kernel names, as WGVPNController does over the utun controller on macOS.
+type namerVPNController struct {
+	*mockVPNController
+
+	names map[string]string // guarded by mockVPNController.mu
+}
+
+var _ wireguard.OSInterfaceNamer = (*namerVPNController)(nil)
+
+func (m *namerVPNController) OSInterfaceName(name string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	osName, ok := m.names[name]
+	return osName, ok
+}
+
+// unmap drops the mapping of name, as the utun controller does once the
+// interface is gone.
+func (m *namerVPNController) unmap(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.names, name)
+}

@@ -567,6 +567,52 @@ func TestUserAccessManager_ApplyBringsUpAWireGuardProvider(t *testing.T) {
 	}
 }
 
+// TestUserAccessManager_KernelNames checks that forwarding and the source
+// rewrite of a wireguard provider take the name the operating system knows
+// its interface by, utunN on macOS, while its devices and its status keep the
+// configured name, and that its removal uses the kernel name it was brought
+// up with, although the controller no longer maps the configured one.
+func TestUserAccessManager_KernelNames(t *testing.T) {
+	var namer *namerAccessController
+	fx := newUAFixture(t, func(d *UserAccessDeps) {
+		namer = &namerAccessController{
+			mockAccessController: d.Access.(*mockAccessController),
+			names:                map[string]string{uaIface1: "utun7"},
+		}
+		d.Access = namer
+		d.MeshInterface = "utun4"
+	})
+	fx.mgr.Apply(t.Context(), uaBlock(fieldTeam))
+
+	if c := fx.routes.callsFor("EnableForwarding"); len(c) != 1 || c[0].Args[0] != "utun4" || c[0].Args[1] != "utun7" {
+		t.Errorf("EnableForwarding calls = %+v, want one (utun4, utun7)", c)
+	}
+	if c := fx.rewriter.callsFor("AddMeshSourceRewrite"); len(c) != 1 || c[0].Args[0] != "utun7" || c[0].Args[1] != "utun4" {
+		t.Errorf("AddMeshSourceRewrite calls = %+v, want one (utun7, utun4)", c)
+	}
+	want := []string{
+		fmt.Sprintf("%s %s [10.99.0.2/32] %q", uaIface1, alice.PublicKey, ""),
+		fmt.Sprintf("%s %s [10.99.0.3/32] %q", uaIface1, bob.PublicKey, ""),
+	}
+	if got := configuredPeers(fx.access); !slices.Equal(got, want) {
+		t.Errorf("ConfigurePeer calls =\n  %q\nwant\n  %q", got, want)
+	}
+	if p := requireUp(t, fx.mgr, uaID1); p.Interface != uaIface1 {
+		t.Errorf("status interface = %q, want the configured %s", p.Interface, uaIface1)
+	}
+
+	namer.unmap(uaIface1)
+	fx.reset()
+	fx.mgr.Apply(t.Context(), uaBlock())
+
+	if c := fx.rewriter.callsFor("RemoveMeshSourceRewrite"); len(c) != 1 || c[0].Args[0] != "utun7" || c[0].Args[1] != "utun4" {
+		t.Errorf("RemoveMeshSourceRewrite calls = %+v, want one (utun7, utun4)", c)
+	}
+	if c := fx.access.accessCallsFor("RemoveInterface"); len(c) != 1 || c[0].Args[0] != uaIface1 {
+		t.Errorf("RemoveInterface calls = %+v, want one for the configured %s", c, uaIface1)
+	}
+}
+
 // TestUserAccessManager_ApplyDiffsDevicesAndRebuilds checks that an unchanged
 // block calls nothing, that devices are diffed by public key on the running
 // interface, and that a changed listen_port or address_pool rebuilds the
