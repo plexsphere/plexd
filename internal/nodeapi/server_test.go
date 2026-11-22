@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -266,6 +269,142 @@ func TestServer_GracefulShutdown(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down in time")
 	}
+}
+
+// TestListenLocal_CloseReturnsWithAcceptInFlight closes the local listener
+// right after its one client connected and went away, while the accept loop
+// is on its way into the next Accept, and requires Close to return and Accept
+// to report net.ErrClosed. That is the order a shutdown right after a local
+// request takes, and http.Server's Shutdown waits on that Close whatever its
+// context says.
+//
+// On Windows this is the proof against the real pipe that the listener of
+// internal/winpipe closes: the bare listener of wireguard's ipc/namedpipe
+// hung here in about 1 close of 550 on windows-latest (plexsphere/plexd#236),
+// which over these 3,200 closes is a failure in more than 99 runs of 100. The
+// delay between the client's close and the listener's close sweeps the window
+// across iterations. The workers run side by side because a dial that finds
+// every pipe instance busy sleeps 10 ms, which is most of an iteration.
+func TestListenLocal_CloseReturnsWithAcceptInFlight(t *testing.T) {
+	const (
+		workers      = 8
+		iterations   = 400 // per worker
+		closeTimeout = 3 * time.Second
+		maxHangs     = 3
+	)
+
+	dir := ""
+	if runtime.GOOS != "windows" {
+		var err error
+		if dir, err = os.MkdirTemp("", "plexd-sock-"); err != nil {
+			t.Fatalf("MkdirTemp: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	}
+	stamp := time.Now().UnixNano()
+
+	var (
+		hangs    atomic.Int32
+		dumpOnce sync.Once
+		wg       sync.WaitGroup
+		// On Unix ListenLocal swaps the process umask around its bind, so
+		// two calls must not overlap: the second would save the first's
+		// umask as the one to put back.
+		listenMu sync.Mutex
+	)
+	closeOnce := func(w, i int) {
+		path := filepath.Join(dir, fmt.Sprintf("s%d-%d.sock", w, i))
+		if runtime.GOOS == "windows" {
+			path = fmt.Sprintf(`\\.\pipe\plexd-test-%d-%d-close-%d-%d`, os.Getpid(), stamp, w, i)
+		}
+		listenMu.Lock()
+		ln, err := ListenLocal(path, discardLogger())
+		listenMu.Unlock()
+		if err != nil {
+			t.Errorf("worker %d iteration %d: ListenLocal: %v", w, i, err)
+			return
+		}
+
+		// The accept loop of http.Server.Serve: hand each connection to a
+		// goroutine that reads it to its end and closes it, and go straight
+		// back into Accept.
+		acceptErr := make(chan error, 1)
+		var conns sync.WaitGroup
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					acceptErr <- err
+					return
+				}
+				conns.Add(1)
+				go func() {
+					defer conns.Done()
+					_, _ = io.Copy(io.Discard, c)
+					_ = c.Close()
+				}()
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		c, err := DialLocal(ctx, path)
+		cancel()
+		if err != nil {
+			t.Errorf("worker %d iteration %d: DialLocal: %v", w, i, err)
+		} else {
+			_ = c.Close()
+		}
+
+		// 0 to 300 microseconds in steps of 20, spun rather than slept: a
+		// sleep rounds up to the timer resolution and would skip the window.
+		delay := time.Duration(i%16) * 20 * time.Microsecond
+		for until := time.Now().Add(delay); time.Now().Before(until); {
+		}
+
+		closed := make(chan struct{})
+		go func() {
+			_ = ln.Close()
+			close(closed)
+		}()
+
+		select {
+		case <-closed:
+			select {
+			case err := <-acceptErr:
+				if !errors.Is(err, net.ErrClosed) {
+					t.Errorf("worker %d iteration %d: Accept after Close = %T %v, want net.ErrClosed", w, i, err, err)
+				}
+			case <-time.After(closeTimeout):
+				t.Errorf("worker %d iteration %d: Close returned, Accept did not within %v", w, i, closeTimeout)
+			}
+			conns.Wait()
+		case <-time.After(closeTimeout):
+			hangs.Add(1)
+			got := "nothing, it is still blocked"
+			select {
+			case err := <-acceptErr:
+				got = fmt.Sprintf("%T %v", err, err)
+			default:
+			}
+			t.Errorf("worker %d iteration %d (delay %v): Close did not return within %v; Accept returned %s",
+				w, i, delay, closeTimeout, got)
+			dumpOnce.Do(func() {
+				buf := make([]byte, 1<<20)
+				t.Logf("goroutines at the first hang:\n%s", buf[:runtime.Stack(buf, true)])
+			})
+		}
+	}
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations && hangs.Load() < maxHangs && !t.Failed(); i++ {
+				closeOnce(w, i)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestServer_NoGoroutineLeaks(t *testing.T) {
