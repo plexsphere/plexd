@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"net"
+	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -151,10 +155,30 @@ func TestWGAccessController_CreateInterfaceErrors(t *testing.T) {
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
 		}
+		if errors.Is(err, ErrListenPortInUse) {
+			t.Errorf("errors.Is(err, ErrListenPortInUse) = true for %v, want false", err)
+		}
 		for _, method := range []string{"ConfigureAddress", "SetInterfaceUp", "DeleteInterface"} {
 			if calls := fake.wgCallsFor(method); len(calls) != 0 {
 				t.Errorf("%s calls = %d, want 0", method, len(calls))
 			}
+		}
+	})
+
+	// wireguard-go binds the listen port when the wrapped controller brings
+	// the device up, and a port another socket holds surfaces as the bind's
+	// EADDRINUSE, wrapped.
+	t.Run("create fails on a taken port", func(t *testing.T) {
+		fake := &fakeWGController{createInterfaceErr: takenPortErr()}
+		c := NewWGAccessController(fake, discardLogger())
+
+		err := c.CreateInterface(testAccessIface, testPrivateKey(t), testAccessPort, testAccessAddress)
+		wantWGErrPrefix(t, err, "bridge: access: create interface wg-access: listen port in use:")
+		if !errors.Is(err, ErrListenPortInUse) {
+			t.Errorf("errors.Is(err, ErrListenPortInUse) = false for %v, want true", err)
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Errorf("errors.Is(err, syscall.EADDRINUSE) = false for %v, want true", err)
 		}
 	})
 
@@ -196,6 +220,65 @@ func TestWGAccessController_CreateInterfaceErrors(t *testing.T) {
 			t.Errorf("DeleteInterface interface = %v, want %q", got, testAccessIface)
 		}
 	})
+}
+
+// takenPortErr is what UserspaceBackend returns when wireguard-go cannot bind
+// a port another socket holds: its prefix around the bind's net.OpError.
+func takenPortErr() error {
+	bind := &net.OpError{Op: "listen", Net: "udp4", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+	return fmt.Errorf("wireguard: create interface: up: %w", bind)
+}
+
+func TestWGAccessController_OSInterfaceName(t *testing.T) {
+	t.Run("controller names devices", func(t *testing.T) {
+		namer := &namerWGController{
+			fakeWGController: &fakeWGController{},
+			names:            map[string]string{testAccessIface: "utun7"},
+		}
+		c := NewWGAccessController(namer, discardLogger())
+
+		if got, ok := c.OSInterfaceName(testAccessIface); got != "utun7" || !ok {
+			t.Errorf("OSInterfaceName(%q) = (%q, %v), want (\"utun7\", true)", testAccessIface, got, ok)
+		}
+		if got, ok := c.OSInterfaceName("other"); got != "" || ok {
+			t.Errorf("OSInterfaceName(\"other\") = (%q, %v), want (\"\", false)", got, ok)
+		}
+	})
+
+	t.Run("controller keeps the configured name", func(t *testing.T) {
+		c := NewWGAccessController(&fakeWGController{}, discardLogger())
+
+		if got, ok := c.OSInterfaceName(testAccessIface); got != testAccessIface || !ok {
+			t.Errorf("OSInterfaceName(%q) = (%q, %v), want (%q, true)", testAccessIface, got, ok, testAccessIface)
+		}
+	})
+}
+
+// osInterfaceName falls back to the configured name whenever no namer finds
+// the interface, so a manager always has a name to hand to the host.
+func TestOSInterfaceName(t *testing.T) {
+	namer := &namerWGController{
+		fakeWGController: &fakeWGController{},
+		names:            map[string]string{testAccessIface: "utun7"},
+	}
+
+	tests := []struct {
+		name string
+		ctrl any
+		want string
+	}{
+		{name: "a namer that finds the interface", ctrl: namer, want: "utun7"},
+		{name: "a nil controller", ctrl: nil, want: testAccessIface},
+		{name: "a controller without a namer", ctrl: &mockAccessController{}, want: testAccessIface},
+		{name: "a namer that reports false", ctrl: &namerWGController{fakeWGController: &fakeWGController{}}, want: testAccessIface},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := osInterfaceName(tt.ctrl, testAccessIface); got != tt.want {
+				t.Errorf("osInterfaceName(%T, %q) = %q, want %q", tt.ctrl, testAccessIface, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestWGAccessController_RemoveInterface(t *testing.T) {

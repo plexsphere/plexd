@@ -17,11 +17,17 @@ import (
 // A repeated CreateInterface for the same name fails with an error wrapping
 // os.ErrExist, which is what EEXIST is for the Linux netlink controller.
 // RemoveInterface, RemoveInterfaces and RemovePeer are idempotent.
+// OSInterfaceName reports the kernel's name for an interface, utunN on macOS,
+// which the user access manager hands to forwarding, the mesh source rewrite
+// and the routes.
 type WGAccessController struct {
 	wgOps
 }
 
-var _ AccessController = (*WGAccessController)(nil)
+var (
+	_ AccessController           = (*WGAccessController)(nil)
+	_ wireguard.OSInterfaceNamer = (*WGAccessController)(nil)
+)
 
 // NewWGAccessController returns a WGAccessController over wg.
 func NewWGAccessController(wg wireguard.WGController, logger *slog.Logger) *WGAccessController {
@@ -62,6 +68,13 @@ func (c *WGAccessController) ConfigurePeer(iface, publicKey string, allowedIPs [
 // It is idempotent: removing an unknown peer returns nil.
 func (c *WGAccessController) RemovePeer(iface, publicKey string) error {
 	return c.removePeer(iface, publicKey)
+}
+
+// OSInterfaceName returns the kernel's name for the access interface created
+// under name, and false when there is no such interface. A platform that
+// keeps the configured name, as Windows does, reports that name.
+func (c *WGAccessController) OSInterfaceName(name string) (string, bool) {
+	return c.osName(name)
 }
 
 // PeerHandshakes reads the access interface through the wrapped controller's
