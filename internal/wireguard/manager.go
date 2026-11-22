@@ -65,6 +65,12 @@ type Manager struct {
 	// goes out then.
 	sendProbe func(meshIP netip.Addr) error
 
+	// detectAfter is the failure-detection time the last pull that carried
+	// one delivered (see SetFailureDetection), guarded by mu. It is zero while
+	// no pull carried a value, and endpoint selection then keeps the relay
+	// liveness probe's fixed windows and its own pass interval.
+	detectAfter time.Duration
+
 	// probe measures the uplink: it returns the largest IPv4 packet size, in
 	// bytes, that reached a STUN server. It is nil until SetPathMTUProbe sets
 	// it, and the interface then keeps DefaultMTU unless Config.MTU pins one.

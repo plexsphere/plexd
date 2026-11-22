@@ -39,6 +39,31 @@ const endpointTrialMargin = 5 * time.Second
 // send; its RekeyTimeout, 5 s, on top leaves the answer time to arrive.
 const relayProbeTimeout = 15 * time.Second
 
+// MinFailureDetection and MaxFailureDetection bound the failure-detection
+// time SetFailureDetection holds: a positive value outside them is clamped to
+// the nearer one. The floor is the control plane's. The ceiling is
+// connectedHandshakeAge: past that age the stale-handshake branch re-dials a
+// relayed peer whatever the value says.
+const (
+	MinFailureDetection = 5 * time.Second
+	MaxFailureDetection = connectedHandshakeAge
+)
+
+// detectPass returns the pass and probe interval under the failure-detection
+// time d: d/15 truncated to whole seconds, at least 1 s and at most
+// EndpointSelectionInterval.
+func detectPass(d time.Duration) time.Duration {
+	return min(max((d/15).Truncate(time.Second), time.Second), EndpointSelectionInterval)
+}
+
+// detectSilence returns how long a relayed peer may stay silent under the
+// failure-detection time d before watchRelay dials the next relay: d less one
+// pass, because a pass starts the silence window up to one pass after the
+// packet it counts arrived.
+func detectSilence(d time.Duration) time.Duration {
+	return d - detectPass(d)
+}
+
 // relayProbePort is the UDP port SendRelayProbe sends to, the discard port.
 // Nothing has to listen there: the peer's WireGuard answers the data packet
 // that carries the datagram, whatever the host behind it does with it. The
@@ -86,7 +111,8 @@ const localNetworksInterval = 30 * time.Second
 // re-dial needs no reset of it: the peer is then not connected, and turning
 // connected sets it.
 // restoredFor limits a session to one move back (see restoreRelay). The
-// probe fields are the relay liveness probe's state (see checkRelay).
+// probe fields are the relay liveness probe's state (see checkRelay, and
+// watchRelay while a failure-detection time is held).
 //
 // The last three fields are the direct retry's state. retry holds the direct
 // entries a running retry tries after the one programmed, in order, and
@@ -107,7 +133,7 @@ type dialState struct {
 	restoredFor  time.Time // the LastHandshake of the session a move back was last written for
 	rxBytes      uint64    // the device's RxBytes for the peer at the last pass
 	rxAt         time.Time // when the silence window started: rxBytes changed, the peer turned connected or came back on the relay, or a probe send failed
-	probedAt     time.Time // when the outstanding probe went out, zero when none is
+	probedAt     time.Time // when the outstanding probe went out, zero when none is; while a failure-detection time is held, when the last probe was sent
 	probeFailing bool      // the last probe send failed
 
 	retry      []string
@@ -509,14 +535,16 @@ func (m *Manager) localNetworksChanged(now time.Time) (old, cur []netip.Prefix, 
 // entry it programs.
 //
 // A relayed peer (see dialState) moves to a direct entry only in a direct
-// retry. While it is connected, checkRelay probes it once it falls silent.
-// When its handshake goes stale, or the probe goes unanswered, the next relay
-// of its set is dialed on a fresh device peer, and the next one again each
-// time a relay's trial passes without a handshake. A connected relayed peer
-// the device reports at another relay of its set follows that relay when a
-// new handshake came with the roam. Without one it is moved back to the entry
-// programmed, once per session, and a second roam in the session is followed
-// (see restoreRelay).
+// retry. While it is connected, checkRelay probes it once it falls silent, or,
+// while a failure-detection time is held (see SetFailureDetection), watchRelay
+// probes it on every pass. When its handshake goes stale, or the probe goes
+// unanswered, or under a failure-detection time the peer stays silent past
+// it, the next relay of its set is dialed on a fresh device peer, and the
+// next one again each time a relay's trial passes without a handshake. A
+// connected relayed peer the device reports at another relay of its set
+// follows that relay when a new handshake came with the roam. Without one it
+// is moved back to the entry programmed, once per session, and a second roam
+// in the session is followed (see restoreRelay).
 //
 // A direct retry (see Manager.retryDirect), which UpdatePeer starts when a
 // pull adds a direct entry to a relayed peer, holds each of its entries for
@@ -643,7 +671,13 @@ func (m *Manager) selectEndpoints() error {
 			}
 			st.relayed = relayed
 			if relayed {
-				if err := m.checkRelay(nodeID, st, stat, now, timeout); err != nil {
+				var err error
+				if m.detectAfter > 0 {
+					err = m.watchRelay(nodeID, st, stat, now)
+				} else {
+					err = m.checkRelay(nodeID, st, stat, now, timeout)
+				}
+				if err != nil {
 					errs = append(errs, err)
 				}
 			}
@@ -860,13 +894,14 @@ func (m *Manager) stepRetry(nodeID string, st *dialState, now time.Time) error {
 }
 
 // checkRelay runs the relay liveness probe for a relayed peer whose handshake
-// is fresh. A fresh handshake does not prove the relay still forwards: the
-// session stays valid for up to 180 s after the relay stopped. Nor does a
-// device counter that stands still prove it stopped, because a received
-// keepalive restarts WireGuard's own keepalive timer, so on an idle tunnel one
-// side can receive nothing until the next rekey. A data packet is different:
-// WireGuard answers one with a keepalive within 10 s when it has nothing else
-// to send.
+// is fresh, on a node that holds no failure-detection time (see watchRelay
+// for one that does). A fresh handshake does not prove the relay still
+// forwards: the session stays valid for up to 180 s after the relay stopped.
+// Nor does a device counter that stands still prove it stopped, because a
+// received keepalive restarts WireGuard's own keepalive timer, so on an idle
+// tunnel one side can receive nothing until the next rekey. A data packet is
+// different: WireGuard answers one with a keepalive within 10 s when it has
+// nothing else to send.
 //
 // So once the peer's RxBytes has not moved for one trial, the probe sends a
 // datagram through the tunnel to the peer's mesh IP, and a counter that has
@@ -910,17 +945,7 @@ func (m *Manager) checkRelay(nodeID string, st *dialState, stat MeshPeerStat, no
 		return nil
 	}
 	if err := m.sendProbe(ip); err != nil {
-		level := slog.LevelWarn
-		if st.probeFailing {
-			level = slog.LevelDebug
-		}
-		m.logger.Log(context.Background(), level, "wireguard: relay probe send failed",
-			"component", "wireguard",
-			"peer_id", nodeID,
-			"mesh_ip", ip.String(),
-			"error", err,
-		)
-		st.probeFailing = true
+		m.probeSendFailed(nodeID, st, ip, err)
 		st.rxAt = now
 		return nil
 	}
@@ -933,6 +958,89 @@ func (m *Manager) checkRelay(nodeID string, st *dialState, stat MeshPeerStat, no
 	st.probeFailing = false
 	st.probedAt = now
 	return nil
+}
+
+// watchRelay watches a relayed peer whose handshake is fresh against the
+// failure-detection time m holds (see SetFailureDetection), in place of
+// checkRelay. It applies these rules in order:
+//
+//   - RxBytes moved: it records the counter and restarts the silence window,
+//     and goes on to the rules below.
+//   - No sender, or a mesh IP that does not parse or lies outside the mesh
+//     prefix: it returns nil. Without a probe there is no verdict, and the
+//     peer counts as failed once its handshake goes stale, as under
+//     checkRelay.
+//   - Silent for detectSilence of the time or longer: it dials the next relay
+//     of the peer's set, which is the same relay for a set of one.
+//   - No probe sent yet, or the last one sent half a pass or more ago: it
+//     sends the probe.
+//
+// The probe goes out whether or not the peer is silent. Two nodes that both
+// watch the pair this way then count each other's probes on every pass,
+// where a probe sent only into silence would leave one side waiting for its
+// partner's WireGuard to answer within its 10 s KeepaliveTimeout. A peer that
+// sends nothing on its own answers a probe per pass at most 10 s plus one
+// pass apart, which stays inside the silence window from 15 s up. The half
+// pass keeps a pass that runs a few milliseconds early from skipping its
+// probe, and holds a caller that ticks faster than detectPass to two probes
+// per pass. A sent probe logs nothing. A failed send logs as under
+// checkRelay and restarts the silence window, so no verdict follows a probe
+// that never left. Callers hold m.mu; the probe is sent under it for the
+// reason checkRelay gives.
+func (m *Manager) watchRelay(nodeID string, st *dialState, stat MeshPeerStat, now time.Time) error {
+	d := m.detectAfter
+	if stat.RxBytes != st.rxBytes {
+		st.rxBytes = stat.RxBytes
+		st.rxAt = now
+	}
+	if m.sendProbe == nil {
+		return nil
+	}
+	ip, err := netip.ParseAddr(st.peer.MeshIP)
+	if err != nil || !m.meshPrefix.Contains(ip) {
+		return nil
+	}
+	if silent := now.Sub(st.rxAt); silent >= detectSilence(d) {
+		next := st.nextRelay()
+		m.logger.Info("wireguard: relayed peer silent past the failure detection time, dialing the relay again",
+			"component", "wireguard",
+			"peer_id", nodeID,
+			"from", st.endpoint(),
+			"endpoint", next,
+			"silent_for", silent,
+			"detect_after", d,
+		)
+		return m.redialInPass(nodeID, st, next, now)
+	}
+	if !st.probedAt.IsZero() && now.Sub(st.probedAt) < detectPass(d)/2 {
+		return nil
+	}
+	if err := m.sendProbe(ip); err != nil {
+		m.probeSendFailed(nodeID, st, ip, err)
+		st.rxAt = now
+		st.probedAt = now
+		return nil
+	}
+	st.probeFailing = false
+	st.probedAt = now
+	return nil
+}
+
+// probeSendFailed logs a relay probe to ip that the sender refused with err,
+// at Warn the first time and at Debug while the sends keep failing, and
+// records that the last send failed.
+func (m *Manager) probeSendFailed(nodeID string, st *dialState, ip netip.Addr, err error) {
+	level := slog.LevelWarn
+	if st.probeFailing {
+		level = slog.LevelDebug
+	}
+	m.logger.Log(context.Background(), level, "wireguard: relay probe send failed",
+		"component", "wireguard",
+		"peer_id", nodeID,
+		"mesh_ip", ip.String(),
+		"error", err,
+	)
+	st.probeFailing = true
 }
 
 // redialInPass dials relay, one of st's relays, on a fresh device peer during
@@ -962,11 +1070,75 @@ func (m *Manager) redialInPass(nodeID string, st *dialState, relay string, now t
 }
 
 // SetRelayProbe sets the function endpoint selection sends the relay liveness
-// probe with (see checkRelay); plexd up passes SendRelayProbe. Call it before
-// RunEndpointSelection, like SetLocalPrefixes. Without it no probe goes out,
-// and a relayed peer counts as failed only once its handshake goes stale.
+// probe with (see checkRelay, and watchRelay under a failure-detection time);
+// plexd up passes SendRelayProbe. Call it before RunEndpointSelection, like
+// SetLocalPrefixes. Without it no probe goes out, and a relayed peer counts as
+// failed only once its handshake goes stale, whatever failure-detection time
+// is held.
 func (m *Manager) SetRelayProbe(send func(meshIP netip.Addr) error) {
 	m.sendProbe = send
+}
+
+// SetFailureDetection sets the failure-detection time, how long a relayed
+// peer may stay silent before endpoint selection dials the next relay of its
+// set (see watchRelay), and returns the value in force and whether it changed.
+// A value of zero or less is ignored, and any other is clamped to
+// MinFailureDetection and MaxFailureDetection. While a value is held, each
+// pass watches relayed peers with watchRelay instead of checkRelay, and
+// RunEndpointSelection runs a pass every detectPass of the value, or at its
+// own interval when that is shorter (see passInterval).
+//
+// A change restarts the silence window of every relayed peer, so no peer is
+// judged against a window it did not start under, and logs wireguard: failure
+// detection time set with the new value, the previous one (0s when none was
+// held) and the pass interval it gives. The value is not persisted: the first
+// pull after a start delivers it again.
+func (m *Manager) SetFailureDetection(detectAfter time.Duration) (time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if detectAfter <= 0 {
+		return m.detectAfter, false
+	}
+	detectAfter = min(max(detectAfter, MinFailureDetection), MaxFailureDetection)
+	if detectAfter == m.detectAfter {
+		return detectAfter, false
+	}
+	previous := m.detectAfter
+	m.detectAfter = detectAfter
+	now := m.now()
+	for _, st := range m.dial {
+		if st.relayed {
+			st.rxAt = now
+			st.probedAt = time.Time{}
+			st.probeFailing = false
+		}
+	}
+	m.logger.Info("wireguard: failure detection time set",
+		"component", "wireguard",
+		"detect_after", detectAfter,
+		"previous", previous,
+		"pass", detectPass(detectAfter),
+	)
+	return detectAfter, true
+}
+
+// FailureDetection returns the failure-detection time m holds, and false while
+// it holds none.
+func (m *Manager) FailureDetection() (time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.detectAfter, m.detectAfter > 0
+}
+
+// passInterval returns the interval RunEndpointSelection, started with
+// interval, runs its passes at: interval while no failure-detection time is
+// held, and the shorter of interval and detectPass of the time otherwise.
+func (m *Manager) passInterval(interval time.Duration) time.Duration {
+	d, held := m.FailureDetection()
+	if !held {
+		return interval
+	}
+	return min(interval, detectPass(d))
 }
 
 // SendRelayProbe sends the relay liveness probe: one datagram of one zero
@@ -990,7 +1162,10 @@ func SendRelayProbe(meshIP netip.Addr) error {
 }
 
 // RunEndpointSelection runs selectEndpoints every interval until ctx is done,
-// then returns nil.
+// then returns nil. While a failure-detection time is held, a pass runs every
+// passInterval instead. The loop reads it after every pass and resets its
+// ticker when it changed, so a new value takes effect at most one pass of the
+// old interval late.
 //
 // It returns nil at once when the keepalive is off: WireGuard starts a
 // handshake only when it sends something, so without the keepalive an idle
@@ -1013,7 +1188,8 @@ func (m *Manager) RunEndpointSelection(ctx context.Context, interval time.Durati
 		"relay_probe", m.sendProbe != nil,
 	)
 
-	ticker := time.NewTicker(interval)
+	pass := m.passInterval(interval)
+	ticker := time.NewTicker(pass)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1034,6 +1210,10 @@ func (m *Manager) RunEndpointSelection(ctx context.Context, interval time.Durati
 				"component", "wireguard",
 				"error", err,
 			)
+		}
+		if next := m.passInterval(interval); next != pass {
+			pass = next
+			ticker.Reset(pass)
 		}
 	}
 }
