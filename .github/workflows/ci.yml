@@ -95,7 +95,7 @@ jobs:
           grep -q -- '--- PASS: TestNetlinkRouteController_RealRoutes ' "$RUNNER_TEMP/real-links.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
-      # and the forwarding sysctl, so the seven macOS tests against the real
+      # and the forwarding sysctl, so the eight macOS tests against the real
       # kernel skip in the unprivileged run above. The bridge controller test
       # creates its utuns through the bridge controllers and routes over them.
       # The peer route test TestPeerRoutes_RealUTUN sets a WireGuard manager up
@@ -104,11 +104,15 @@ jobs:
       # peer routes, so the step also fails unless its PASS line is in the
       # output.
       # Loading a pf anchor and taking a pf enable reference need root as well;
-      # the three pf tests also ask for PLEXD_TEST_REAL_PF, so sudo go test
+      # the four pf tests also ask for PLEXD_TEST_REAL_PF, so sudo go test
       # ./... on a developer's Mac leaves the host's pf alone. The pf traffic
       # test TestPFController_RealTraffic and the connection-log test
       # TestPFController_RealConnLog each create a utun of their own and send
-      # traffic through it, under rules that name that utun alone. The
+      # traffic through it, under rules that name that utun alone. The mesh
+      # source rewrite test TestPFController_RealMeshSourceRewrite creates a
+      # mesh utun and a provider's and a tunnel's utun beside it, switches
+      # net.inet.ip.forwarding on and restores it, and forwards packets
+      # between them through the rewrite's pf lines. The
       # connection-log test creates pflog0 when the host has none and reads it
       # through a BPF device, which needs root too. The absolute go path is
       # resolved before sudo resets PATH, and the two cache variables let root
@@ -122,10 +126,12 @@ jobs:
       # host's resolver configuration while it runs; it also asks for
       # PLEXD_TEST_REAL_RESOLVER, so sudo go test ./... on a developer's Mac
       # leaves their resolver alone. The pf traffic test is the only proof of
-      # what a Mac's pf lines let out and back in, and the connection-log test
-      # the only proof of how pf numbers and logs plexd's logged lines, so the
-      # step also fails unless both PASS lines are in the output: a skip would
-      # pass otherwise.
+      # what a Mac's pf lines let out and back in, the connection-log test the
+      # only proof of how pf numbers and logs plexd's logged lines, and the
+      # mesh source rewrite test the only proof that a tag set on the way in
+      # reaches the nat line on the way out and that nat pass skips the
+      # filter rules, so the step also fails unless all three PASS lines are
+      # in the output: a skip would pass otherwise.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
@@ -133,11 +139,12 @@ jobs:
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
             PLEXD_TEST_REAL_PF=1 PLEXD_TEST_REAL_RESOLVER=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestPFController_RealConnLog|TestWGControllers_RealUTUN|TestPeerRoutes_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestPFController_RealConnLog|TestPFController_RealMeshSourceRewrite|TestWGControllers_RealUTUN|TestPeerRoutes_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
             ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/ ./internal/meshdns/ \
             | tee "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealTraffic ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealConnLog ' "$RUNNER_TEMP/real-darwin.txt"
+          grep -q -- '--- PASS: TestPFController_RealMeshSourceRewrite ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPeerRoutes_RealUTUN ' "$RUNNER_TEMP/real-darwin.txt"
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
