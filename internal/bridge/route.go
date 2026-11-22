@@ -80,6 +80,15 @@ type MeshSourceRewriter interface {
 	ResetMeshSourceRewrite() error
 }
 
+// NATExempter keeps the host's NAT from translating what is forwarded between
+// the mesh interface and a tunnel's link. Windows needs it while a NetNat
+// object covers the mesh prefix. All methods must be idempotent.
+type NATExempter interface {
+	ExemptFromNAT(iface string) error
+	UnexemptFromNAT(iface string) error
+	ResetNATExemptions() error
+}
+
 // CleanupUserAccess removes what a process that was killed left behind: every
 // interface whose name starts with UserAccessInterfacePrefix, through
 // access.RemoveInterfaces, and with a rewriter every mesh source rewrite,

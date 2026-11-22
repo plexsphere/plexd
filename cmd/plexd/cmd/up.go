@@ -762,7 +762,7 @@ func runAgent(ctx context.Context) error {
 				return fmt.Errorf("plexd up: site-to-site setup: %w", err)
 			}
 		} else {
-			if err := bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders); err != nil {
+			if err := bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders, nil); err != nil {
 				logger.Error("bridge: site-to-site: clean up failed",
 					"component", "bridge",
 					"error", err,
