@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -970,4 +971,165 @@ func TestReconcileHandler_NewCandidateStartsADirectRetry(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFailureDetectionDispatchHandler(t *testing.T) {
+	const (
+		setMsg       = "wireguard: failure detection time set"
+		rangeMsg     = "wireguard: failure detection time out of range"
+		malformedMsg = "wireguard: failure detection block malformed"
+	)
+	// newHandler returns a handler on a fresh manager that logs into logs.
+	newHandler := func(logs *bytes.Buffer) (*Manager, reconcile.DispatchHandler) {
+		mgr, _, _ := newSelectionManager(Config{}, logs)
+		return mgr, FailureDetectionDispatchHandler(mgr)
+	}
+	pull := func(h reconcile.DispatchHandler, block string) {
+		snap := &api.NodeStateSnapshot{}
+		if block != "" {
+			snap.FailureDetection = json.RawMessage(block)
+		}
+		h(context.Background(), snap)
+	}
+	requireHeld := func(t *testing.T, mgr *Manager, want time.Duration) {
+		t.Helper()
+		if d, held := mgr.FailureDetection(); d != want || held != (want > 0) {
+			t.Errorf("FailureDetection() = %v, %v, want %v, %v", d, held, want, want > 0)
+		}
+	}
+	// holding15 returns a handler whose manager holds 15 s from a first pull,
+	// with the log of that pull dropped.
+	holding15 := func(t *testing.T, logs *bytes.Buffer) (*Manager, reconcile.DispatchHandler) {
+		t.Helper()
+		mgr, h := newHandler(logs)
+		pull(h, `{"detect_after_seconds":15}`)
+		requireHeld(t, mgr, 15*time.Second)
+		logs.Reset()
+		return mgr, h
+	}
+
+	t.Run("a value in range", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, h := newHandler(&logs)
+		pull(h, `{"detect_after_seconds":15}`)
+		requireHeld(t, mgr, 15*time.Second)
+		requireLogLine(t, logs.String(), setMsg, "level=INFO", "component=wireguard", "detect_after=15s", "previous=0s", "pass=1s")
+		pull(h, `{"detect_after_seconds":15}`)
+		if n := len(logLines(logs.String(), setMsg)); n != 1 {
+			t.Errorf("%d set lines after a pull that repeats the value, want 1:\n%s", n, logs.String())
+		}
+		if lines := strings.Count(logs.String(), "\n"); lines != 1 {
+			t.Errorf("%d lines for two pulls of one value, want 1:\n%s", lines, logs.String())
+		}
+	})
+
+	t.Run("absent and null", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, h := holding15(t, &logs)
+		pull(h, "")
+		pull(h, "null")
+		h(context.Background(), nil)
+		requireHeld(t, mgr, 15*time.Second)
+		if logs.Len() != 0 {
+			t.Errorf("an absent block, a null and no snapshot logged:\n%s", logs.String())
+		}
+	})
+
+	for _, tt := range []struct{ block, raw string }{
+		{`{}`, "0"},
+		{`{"detect_after_seconds":0}`, "0"},
+		{`{"detect_after_seconds":-5}`, "-5"},
+	} {
+		t.Run("zero or less "+tt.block, func(t *testing.T) {
+			var logs bytes.Buffer
+			mgr, h := holding15(t, &logs)
+			pull(h, tt.block)
+			requireHeld(t, mgr, 15*time.Second)
+			requireLogLine(t, logs.String(), rangeMsg, "level=WARN", "component=wireguard", "detect_after_seconds="+tt.raw)
+			if strings.Contains(logs.String(), "applied=") || len(logLines(logs.String(), setMsg)) != 0 {
+				t.Errorf("a value of %s applied something:\n%s", tt.raw, logs.String())
+			}
+		})
+	}
+
+	t.Run("clamped", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, h := newHandler(&logs)
+		for _, tt := range []struct {
+			raw     string
+			applied time.Duration
+		}{
+			{"4", 5 * time.Second},
+			{"181", 180 * time.Second},
+			{"9000000000000", 180 * time.Second},
+		} {
+			pull(h, `{"detect_after_seconds":`+tt.raw+`}`)
+			requireHeld(t, mgr, tt.applied)
+			lines := 0
+			for _, line := range logLines(logs.String(), rangeMsg) {
+				if slices.Contains(strings.Fields(line), "detect_after_seconds="+tt.raw) {
+					lines++
+				}
+			}
+			if lines != 1 {
+				t.Errorf("%d out of range lines for %s, want 1:\n%s", lines, tt.raw, logs.String())
+			}
+			requireLogLine(t, logs.String(), rangeMsg, "level=WARN", "detect_after_seconds="+tt.raw, "applied="+tt.applied.String())
+		}
+	})
+
+	t.Run("malformed", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, h := holding15(t, &logs)
+		for _, block := range []string{`"soon"`, `{"detect_after_seconds":15.5}`, `{"detect_after_seconds":"15"}`} {
+			pull(h, block)
+		}
+		requireHeld(t, mgr, 15*time.Second)
+		if n := len(logLines(logs.String(), malformedMsg)); n != 1 {
+			t.Fatalf("%d malformed lines across three malformed pulls, want 1:\n%s", n, logs.String())
+		}
+		requireLogLine(t, logs.String(), malformedMsg, "level=WARN", "component=wireguard")
+		if !strings.Contains(logs.String(), "error=") {
+			t.Errorf("the malformed line does not name its error:\n%s", logs.String())
+		}
+
+		pull(h, `{"detect_after_seconds":15}`)
+		pull(h, `"soon"`)
+		if n := len(logLines(logs.String(), malformedMsg)); n != 2 {
+			t.Errorf("%d malformed lines after a valid block and another malformed one, want 2:\n%s", n, logs.String())
+		}
+	})
+
+	t.Run("a run of the same raw value", func(t *testing.T) {
+		count := func(logs *bytes.Buffer) int { return len(logLines(logs.String(), rangeMsg)) }
+
+		var same bytes.Buffer
+		_, h := newHandler(&same)
+		for range 3 {
+			pull(h, `{"detect_after_seconds":2}`)
+		}
+		if n := count(&same); n != 1 {
+			t.Errorf("%d out of range lines for 2, 2, 2, want 1:\n%s", n, same.String())
+		}
+
+		var broken bytes.Buffer
+		mgr, h := newHandler(&broken)
+		for _, raw := range []string{"2", "15", "2"} {
+			pull(h, `{"detect_after_seconds":`+raw+`}`)
+		}
+		if n := count(&broken); n != 2 {
+			t.Errorf("%d out of range lines for 2, 15, 2, want 2:\n%s", n, broken.String())
+		}
+		requireHeld(t, mgr, 5*time.Second)
+	})
+
+	t.Run("no value and no block", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, h := newHandler(&logs)
+		pull(h, "")
+		requireHeld(t, mgr, 0)
+		if logs.Len() != 0 {
+			t.Errorf("a pull without the block logged:\n%s", logs.String())
+		}
+	})
 }
