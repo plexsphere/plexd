@@ -507,6 +507,16 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 //     the old key is removed first: WireGuard moves to the new key only the
 //     allowed IPs its write names, so the old key would keep a routed subnet
 //     the update no longer lists and could still send from it.
+//   - A relayed peer, or one in a direct retry, whose update names relays
+//     tries its direct entries again (see retryDirect) when the update adds
+//     a direct entry that is neither among its direct entries nor remembered
+//     (see dialState.remembered): it tries every direct entry of the update
+//     that is not remembered, in the update's order, and ends on the relay
+//     relayAfter names. A running retry the update adds nothing to goes on
+//     with the entries it had left that the update still lists, from the
+//     first of them, or dials that relay at once when none is left. A direct
+//     entry the update drops is remembered (see triedAfter), here and in the
+//     two rules after this one.
 //   - A peer whose programmed entry is one of its Fallbacks, and that is
 //     relayed or not connected, moves to the update's first relay at once, on
 //     a fresh device peer (see redial), when the update takes its relay
@@ -522,7 +532,8 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 //     resumes from the new order's position of the entry last programmed. A
 //     relayed peer gets here only when the update has no Fallbacks, and it
 //     stops being relayed.
-//   - Any other peer starts over from the first entry of its new order.
+//   - Any other peer starts over from the first entry of its new order,
+//     including a peer in a direct retry whose update names no relays.
 //
 // A failed write leaves the state as it was.
 func (m *Manager) UpdatePeer(peer api.Peer) error {
@@ -538,6 +549,31 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 	}
 
 	st, ok := m.dial[peer.ID]
+
+	// The direct retry's rule: the memory the update leaves, and the entries
+	// to try. Read now before any write, for the reason the relay move gives.
+	var (
+		now     time.Time
+		tried   map[string]time.Time
+		entries []string
+		retry   bool
+	)
+	if ok && st.peer.PublicKey == peer.PublicKey && (st.relayed || st.retrying()) {
+		now = m.now()
+		tried = triedAfter(st, peer, now)
+		next := &dialState{peer: peer, tried: tried}
+		added := func(e string) bool { return !slices.Contains(st.direct(), e) && !next.remembered(e, now) }
+		switch {
+		case slices.ContainsFunc(next.direct(), added):
+			entries = next.untried(now)
+		case st.retrying():
+			entries = slices.DeleteFunc(slices.Clone(next.direct()), func(e string) bool {
+				return e != st.endpoint() && !slices.Contains(st.retry, e)
+			})
+		}
+		retry = len(peer.Fallbacks) > 0 && (len(entries) > 0 || st.retrying())
+	}
+
 	switch {
 	case !ok || st.peer.PublicKey != peer.PublicKey:
 		if ok {
@@ -548,6 +584,34 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 		if err := m.programFirst(peer); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
+	case retry && len(entries) > 0:
+		relay := relayAfter(st, peer)
+		next, err := m.retryDirect(peer, entries, relay, tried, now)
+		if err != nil {
+			return fmt.Errorf("wireguard: update peer: %w", err)
+		}
+		m.dial[peer.ID] = next
+		m.logger.Info("wireguard: trying the direct endpoints again",
+			"component", "wireguard",
+			"peer_id", peer.ID,
+			"reason", "pull",
+			"endpoint", entries[0],
+			"entries", len(entries),
+			"relay", relay,
+		)
+	case retry:
+		relay := relayAfter(st, peer)
+		if err := m.redial(peer, relay); err != nil {
+			return fmt.Errorf("wireguard: update peer: %w", err)
+		}
+		back := &dialState{peer: peer, relayed: true, tried: tried}
+		back.onRelay(now, relay)
+		m.dial[peer.ID] = back
+		m.logger.Info("wireguard: no direct endpoint answered, dialing the relay again",
+			"component", "wireguard",
+			"peer_id", peer.ID,
+			"endpoint", relay,
+		)
 	case st.onFallback() && (st.relayed || !st.connected) && relayMoved(st, peer):
 		from, to := st.endpoint(), peer.Fallbacks[0]
 		// Read before the write: the new device peer can complete a
@@ -557,7 +621,7 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 		if err := m.redial(peer, to); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
-		moved := &dialState{peer: peer, relayed: st.relayed}
+		moved := &dialState{peer: peer, relayed: st.relayed, tried: tried}
 		moved.onRelay(now, to)
 		m.dial[peer.ID] = moved
 		m.logger.Info("wireguard: relay fallback changed, moving to the new relay",
@@ -573,6 +637,7 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 		}
 		st.peer = peer
 		st.idx = max(slices.Index(st.order(), relay), 0)
+		st.tried = tried
 	case st.connected:
 		if err := keepEndpoint(); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
@@ -721,6 +786,30 @@ func (m *Manager) programFirst(peer api.Peer) error {
 	return nil
 }
 
+// retryDirect starts a direct retry for peer, which is relayed or already in
+// a retry: it writes peer anew with entries[0] as the endpoint on a fresh
+// device peer (see redial) and returns the state that tries entries in order,
+// each for directRetryTimeout, and dials relay when none answers (see
+// stepRetry). tried is the state's memory. The write replaces the device peer
+// and so cuts the relayed session. Writing only the endpoint would keep it,
+// but WireGuard moves a peer's endpoint to the source of every authenticated
+// packet it receives, so the partner's next packet through the relay would
+// put the device back on the relay before the entry was judged. The fresh
+// session accepts nothing the partner still sends in the old one.
+//
+// A failed write returns redial's error unchanged. retryDirect stores
+// nothing: the caller does. Callers hold m.mu, pass at least one entry, and
+// read now before the call, because the new device peer can complete a
+// handshake before redial returns.
+func (m *Manager) retryDirect(peer api.Peer, entries []string, relay string, tried map[string]time.Time, now time.Time) (*dialState, error) {
+	if err := m.redial(peer, entries[0]); err != nil {
+		return nil, err
+	}
+	st := &dialState{peer: peer, programmedAt: now, recreatedAt: now, retry: entries[1:], retryRelay: relay, tried: tried}
+	st.idx = max(slices.Index(st.order(), entries[0]), 0)
+	return st, nil
+}
+
 // redial writes peer anew with endpoint as the endpoint: it removes the
 // device peer and adds it again. A write that only set the endpoint would
 // keep the peer's WireGuard session, and a relay drops every
@@ -735,6 +824,9 @@ func (m *Manager) programFirst(peer api.Peer) error {
 // remove then names a key the device does not hold. The userspace backend
 // accepts that (see UserspaceBackend.RemovePeer), and the Linux module is
 // assumed to as well.
+//
+// A direct retry writes its entries the same way, for the reason retryDirect
+// gives.
 func (m *Manager) redial(peer api.Peer, endpoint string) error {
 	peerCfg, err := m.peerConfig(peer, endpoint)
 	if err != nil {

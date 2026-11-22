@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -901,5 +902,72 @@ func TestReconcileHandler_NoPeerRouter(t *testing.T) {
 	}
 	if got := routeCalls(ctrl); len(got) != 0 {
 		t.Errorf("route calls = %v, want none", got)
+	}
+}
+
+// TestReconcileHandler_NewCandidateStartsADirectRetry runs the direct retry
+// through the handler. A pull that adds an endpoint candidate to a peer
+// connected over its relay writes the candidate on a fresh device peer, and a
+// pull that withdraws it again during the retry dials the relay at once,
+// whether its endpoint_candidates is nil or empty.
+func TestReconcileHandler_NewCandidateStartsADirectRetry(t *testing.T) {
+	const relay, candidate = "203.0.113.1:51820", "192.0.2.44:51820"
+	key, b64 := testKey(0x0a)
+	ctx := context.Background()
+	update := func(t *testing.T, handler reconcile.ReconcileHandler, peer api.SnapshotPeer) {
+		t.Helper()
+		if err := handler(ctx, nil, reconcile.StateDiff{PeersToUpdate: []api.SnapshotPeer{peer}}); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+	}
+	start := func(t *testing.T) (*Manager, *statsController, reconcile.ReconcileHandler, api.SnapshotPeer) {
+		t.Helper()
+		var logs bytes.Buffer
+		mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+		handler := ReconcileHandler(mgr, nil)
+		peer := snapshotPeer("peer-1", "10.99.0.2", relay)
+		peer.PublicKey = b64
+		if err := handler(ctx, nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		ctrl.stats = []PeerStat{{
+			PublicKey:     key,
+			Endpoint:      netip.MustParseAddrPort(relay),
+			LastHandshake: selectionStart.Add(5 * time.Second),
+		}}
+		passAt(t, mgr, clock, 5*time.Second)
+		if st := mgr.dial["peer-1"]; !st.connected || !st.relayed {
+			t.Fatalf("after the handshake over the relay connected = %v, relayed = %v, want both", st.connected, st.relayed)
+		}
+
+		peer.EndpointCandidates = []string{candidate}
+		before := len(deviceWrites(ctrl))
+		clock.Set(selectionStart.Add(10 * time.Second))
+		update(t, handler, peer)
+		if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + candidate}; !slices.Equal(got, want) {
+			t.Fatalf("device writes for the new candidate = %v, want %v", got, want)
+		}
+		return mgr, ctrl, handler, peer
+	}
+
+	for _, tc := range []struct {
+		name       string
+		candidates []string
+	}{
+		{"nil", nil},
+		{"empty", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, ctrl, handler, peer := start(t)
+			peer.EndpointCandidates = tc.candidates
+			before := len(deviceWrites(ctrl))
+			update(t, handler, peer)
+			if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + relay}; !slices.Equal(got, want) {
+				t.Errorf("device writes after the candidate was withdrawn = %v, want %v", got, want)
+			}
+			if st := mgr.dial["peer-1"]; !st.relayed {
+				t.Error("relayed = false after the candidate was withdrawn, want true")
+			}
+		})
 	}
 }
