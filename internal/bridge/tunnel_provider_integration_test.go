@@ -129,12 +129,17 @@ func TestTunnelProviderIntegration_Lifecycle(t *testing.T) {
 		t.Errorf("openvpn stops = %d, want office left running", pf.handle.stopCalls())
 	}
 
-	// office leaves the pull: its process stops and its files are gone.
+	// office leaves the pull: its process stops and its files are gone. The
+	// provider removes the files after it stopped the process, so the wait is
+	// for the manager, which drops the tunnel once the provider returned.
 	fetcher.setState(siteToSiteState(s2sInventory()))
 	rec.TriggerReconcile()
 	waitForCondition(t, 2*time.Second, func() bool {
-		return pf.handle.stopCalls() == 1
+		return len(tunnelIDs(pf.mgr)) == 0
 	})
+	if pf.handle.stopCalls() != 1 {
+		t.Errorf("openvpn stops = %d, want 1", pf.handle.stopCalls())
+	}
 	if got := dirNames(t, pf.tunnels); len(got) != 0 {
 		t.Errorf("tunnel directory holds %q, want nothing", got)
 	}
