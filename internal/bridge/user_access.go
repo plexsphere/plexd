@@ -78,10 +78,17 @@ type UserAccessDeps struct {
 	// Access creates and removes the interfaces of wireguard providers.
 	Access AccessController
 	// Routes switches forwarding on between a provider's interface and the
-	// mesh interface. The manager never switches it off: a provider's
-	// interface is deleted with the provider, and the mesh interface's
-	// forwarding belongs to the bridge manager.
+	// mesh interface. Without ReleaseForwarding the manager never switches
+	// it off: a provider's interface is deleted with the provider, and on
+	// Linux the knob DisableForwarding would turn is the mesh interface's
+	// own, which belongs to the bridge manager.
 	Routes RouteController
+	// ReleaseForwarding gives back every forwarding pair the manager claimed
+	// with Routes.DisableForwarding: when a provider that is up is torn down,
+	// and when a bring-up fails after its forwarding was switched on. It is
+	// for a platform with one forwarding knob for the whole host, macOS,
+	// whose route controller restores the knob once its last pair lets go.
+	ReleaseForwarding bool
 	// Rewriter rewrites the source of device traffic to the bridge's mesh
 	// address. nil: this platform serves no provider; one that passes its
 	// checks reads kind_not_served, one that fails them invalid_provider.
@@ -125,6 +132,9 @@ type UserAccessManager struct {
 	meshCIDR  string
 	logger    *slog.Logger
 	now       func() time.Time
+
+	// releaseForwarding is UserAccessDeps.ReleaseForwarding.
+	releaseForwarding bool
 
 	// mu protects the fields below from concurrent access by the reconcile
 	// loop, Teardown and the status readers.
@@ -239,6 +249,8 @@ func NewUserAccessManager(deps UserAccessDeps) *UserAccessManager {
 		logger:    deps.Logger,
 		now:       time.Now,
 		changed:   make(chan struct{}, 1),
+
+		releaseForwarding: deps.ReleaseForwarding,
 	}
 }
 
@@ -748,7 +760,7 @@ func (m *UserAccessManager) bringUpWireGuardLocked(p *userAccessProvider) {
 		return
 	}
 	osIface := osInterfaceName(m.access, name)
-	if err := m.forwardIntoMesh(osIface); err != nil {
+	if err := m.forwardIntoMesh(p, name, osIface); err != nil {
 		_ = m.access.RemoveInterface(name)
 		m.downLocked(p, UserAccessReasonSetupFailed, err)
 		return
@@ -763,15 +775,37 @@ func (m *UserAccessManager) bringUpWireGuardLocked(p *userAccessProvider) {
 	m.upLocked(p)
 }
 
-// forwardIntoMesh switches forwarding on between osIface, a provider's
-// interface by the operating system's name, and the mesh interface, and
-// rewrites the source of what osIface forwards into the mesh.
-func (m *UserAccessManager) forwardIntoMesh(osIface string) error {
+// forwardIntoMesh switches forwarding on between osIface, the interface iface
+// of p by the operating system's name, and the mesh interface, and rewrites
+// the source of what osIface forwards into the mesh. A failed rewrite gives
+// the forwarding claim back; a failure to do so is logged, and the rewrite's
+// error is returned.
+func (m *UserAccessManager) forwardIntoMesh(p *userAccessProvider, iface, osIface string) error {
 	if err := m.routes.EnableForwarding(m.meshIface, osIface); err != nil {
 		return fmt.Errorf("enable forwarding: %w", err)
 	}
 	if err := m.rewriter.AddMeshSourceRewrite(osIface, m.meshIface); err != nil {
+		if rerr := m.disableForwarding(osIface); rerr != nil {
+			m.logger.Error("bridge: user access: release forwarding failed",
+				"component", "bridge",
+				"provider_id", p.entry.ID,
+				"interface", iface,
+				"error", rerr,
+			)
+		}
 		return fmt.Errorf("add mesh source rewrite: %w", err)
+	}
+	return nil
+}
+
+// disableForwarding gives back the forwarding pair the manager claimed for
+// osIface when ReleaseForwarding asks for it, and does nothing otherwise.
+func (m *UserAccessManager) disableForwarding(osIface string) error {
+	if !m.releaseForwarding {
+		return nil
+	}
+	if err := m.routes.DisableForwarding(m.meshIface, osIface); err != nil {
+		return fmt.Errorf("bridge: user access: release forwarding %s: %w", osIface, err)
 	}
 	return nil
 }
@@ -938,7 +972,7 @@ func (m *UserAccessManager) join(ctx context.Context, j *userAccessJoin) {
 		m.stopClient(j)
 		return
 	}
-	if err := m.forwardIntoMesh(iface); err != nil {
+	if err := m.forwardIntoMesh(j.p, iface, iface); err != nil {
 		m.mu.Unlock()
 		m.stopClient(j)
 		m.joinFailed(j, UserAccessReasonSetupFailed, err)
@@ -975,8 +1009,8 @@ func (m *UserAccessManager) stopClient(j *userAccessJoin) {
 
 // stopProvider tears down what p serves on: a vendor provider's client is
 // stopped, a wireguard provider's interface removed, and the source rewrite of
-// either removed. A provider that is down holds nothing. p reads down
-// afterwards.
+// either removed, and with ReleaseForwarding its forwarding claim is given
+// back. A provider that is down holds nothing. p reads down afterwards.
 func (m *UserAccessManager) stopProvider(p *userAccessProvider) error {
 	if !p.up {
 		return nil
@@ -991,6 +1025,9 @@ func (m *UserAccessManager) stopProvider(p *userAccessProvider) error {
 	}
 	if err := m.rewriter.RemoveMeshSourceRewrite(p.osIface, m.meshIface); err != nil {
 		errs = append(errs, fmt.Errorf("bridge: user access: remove mesh source rewrite %s: %w", p.osIface, err))
+	}
+	if err := m.disableForwarding(p.osIface); err != nil {
+		errs = append(errs, err)
 	}
 	p.up = false
 	p.iface, p.osIface, p.publicKey, p.client = "", "", "", nil

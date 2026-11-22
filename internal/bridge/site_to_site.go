@@ -83,11 +83,18 @@ type SiteToSiteDeps struct {
 	// and the tun device of an openvpn tunnel.
 	VPN VPNController
 	// Routes switches forwarding on between a tunnel's link and the mesh
-	// interface and routes the tunnel's allowed_subnets into the link. The
-	// manager never switches forwarding off: a tunnel's link is deleted with
-	// the tunnel, and the mesh interface's forwarding belongs to the bridge
-	// manager.
+	// interface and routes the tunnel's allowed_subnets into the link.
+	// Without ReleaseForwarding the manager never switches forwarding off: a
+	// tunnel's link is deleted with the tunnel, and on Linux the knob
+	// DisableForwarding would turn is the mesh interface's own, which belongs
+	// to the bridge manager.
 	Routes RouteController
+	// ReleaseForwarding gives back every forwarding pair the manager claimed
+	// with Routes.DisableForwarding: when a tunnel that is up is torn down,
+	// and when a bring-up fails after its forwarding was switched on. It is
+	// for a platform with one forwarding knob for the whole host, macOS,
+	// whose route controller restores the knob once its last pair lets go.
+	ReleaseForwarding bool
 	// Rewriter rewrites the source of what a tunnel forwards into the mesh to
 	// the bridge's mesh address. nil: this platform serves no tunnel; one
 	// that passes its checks reads kind_not_served, one that fails them
@@ -143,6 +150,9 @@ type SiteToSiteManager struct {
 	meshCIDR  string
 	logger    *slog.Logger
 	now       func() time.Time
+
+	// releaseForwarding is SiteToSiteDeps.ReleaseForwarding.
+	releaseForwarding bool
 
 	// mu protects the fields below from concurrent access by the reconcile
 	// loop, Teardown and the status readers.
@@ -245,6 +255,8 @@ func NewSiteToSiteManager(deps SiteToSiteDeps) *SiteToSiteManager {
 		logger:    deps.Logger,
 		now:       time.Now,
 		changed:   make(chan struct{}, 1),
+
+		releaseForwarding: deps.ReleaseForwarding,
 	}
 }
 
@@ -1044,13 +1056,23 @@ func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAtte
 
 	osIface := osInterfaceName(m.vpn, name)
 	var routed []string
-	rewritten := false
+	forwarded, rewritten := false, false
 	undo := func() {
 		for _, s := range slices.Backward(routed) {
 			_ = m.routes.RemoveRoute(s, osIface)
 		}
 		if rewritten {
 			_ = m.rewriter.RemoveMeshSourceRewrite(osIface, m.meshIface)
+		}
+		if forwarded {
+			if err := m.disableForwarding(osIface); err != nil {
+				m.logger.Error("bridge: site-to-site: release forwarding failed",
+					"component", "bridge",
+					"tunnel_id", t.entry.ID,
+					"interface", name,
+					"error", err,
+				)
+			}
 		}
 		_ = m.vpn.RemoveTunnelInterface(name)
 	}
@@ -1059,6 +1081,7 @@ func (m *SiteToSiteManager) bringUpLocked(ctx context.Context, a *siteToSiteAtte
 		m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("enable forwarding: %w", err))
 		return
 	}
+	forwarded = true
 	if err := m.rewriter.AddMeshSourceRewrite(osIface, m.meshIface); err != nil {
 		undo()
 		m.downLocked(t, SiteToSiteReasonSetupFailed, fmt.Errorf("add mesh source rewrite: %w", err))
@@ -1125,8 +1148,9 @@ func (m *SiteToSiteManager) createProviderTunnel(ctx context.Context, a *siteToS
 }
 
 // stopTunnel tears down what t serves on: the provider's side of an ipsec or
-// openvpn tunnel, a route for each allowed subnet, the source rewrite and the
-// link. A tunnel that is down holds nothing. t reads down afterwards.
+// openvpn tunnel, a route for each allowed subnet, the source rewrite, with
+// ReleaseForwarding the forwarding claim, and the link. A tunnel that is down
+// holds nothing. t reads down afterwards.
 func (m *SiteToSiteManager) stopTunnel(t *siteToSiteTunnel) error {
 	if !t.up {
 		return nil
@@ -1149,12 +1173,27 @@ func (m *SiteToSiteManager) stopTunnel(t *siteToSiteTunnel) error {
 	if err := m.rewriter.RemoveMeshSourceRewrite(t.osIface, m.meshIface); err != nil {
 		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove mesh source rewrite %s: %w", t.osIface, err))
 	}
+	if err := m.disableForwarding(t.osIface); err != nil {
+		errs = append(errs, err)
+	}
 	if err := m.vpn.RemoveTunnelInterface(t.iface); err != nil {
 		errs = append(errs, fmt.Errorf("bridge: site-to-site: remove interface %s: %w", t.iface, err))
 	}
 	t.up = false
 	t.iface, t.osIface, t.publicKey, t.version = "", "", "", 0
 	return errors.Join(errs...)
+}
+
+// disableForwarding gives back the forwarding pair the manager claimed for
+// osIface when ReleaseForwarding asks for it, and does nothing otherwise.
+func (m *SiteToSiteManager) disableForwarding(osIface string) error {
+	if !m.releaseForwarding {
+		return nil
+	}
+	if err := m.routes.DisableForwarding(m.meshIface, osIface); err != nil {
+		return fmt.Errorf("bridge: site-to-site: release forwarding %s: %w", osIface, err)
+	}
+	return nil
 }
 
 // upLocked records that t is up and logs it. The caller holds mu.
