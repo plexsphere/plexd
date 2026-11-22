@@ -109,18 +109,40 @@ func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridg
 // operation. The DarwinController is its own, so the mesh, the access and the
 // tunnel devices live in three backends, each keyed by the names it created.
 //
-// The access utun stays unnumbered. User access needs forwarding between the
-// access and the mesh interface, and no route is installed over the device.
+// A wireguard provider's utun carries the first address of its pool, which
+// the user access manager passes, and the on-link route for the pool, which
+// the replies to its devices take. The manager hands the utunN name the
+// controller reports to forwarding and to the pf rewrite, and keeps the
+// configured name for the device and the status report.
 func newAccessController(logger *slog.Logger) bridge.AccessController {
 	return bridge.NewWGAccessController(wireguard.NewDarwinController(logger), logger)
 }
 
-// newMeshSourceRewriter returns nil: macOS has no mesh source rewrite yet, so
-// every user access provider (plexd#213) and every site-to-site tunnel reads
-// kind_not_served.
-func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
+// newMeshSourceRewriter returns the firewall controller: PFController
+// rewrites the source of what a user access provider or a site-to-site
+// tunnel forwards into the mesh, in the anchor that holds the policy chains
+// and the bridge NAT. A fw that implements no MeshSourceRewriter, nil or a
+// test's fake, yields an untyped nil, which serves no provider and no tunnel.
+func newMeshSourceRewriter(_ bridge.RouteController, fw policy.FirewallController) bridge.MeshSourceRewriter {
+	if r, ok := fw.(bridge.MeshSourceRewriter); ok {
+		return r
+	}
 	return nil
 }
+
+// newTunnelProviders returns no provider on macOS: the xfrm interface of an
+// ipsec tunnel and the persistent tun device of an openvpn tunnel are Linux
+// kernel features, so such a tunnel reads kind_not_served rather than
+// failing its link create. A wireguard tunnel needs no provider.
+func newTunnelProviders(_ string, _ *slog.Logger) map[string]bridge.TunnelProvider {
+	return nil
+}
+
+// forwardingKnobIsShared is true on macOS: net.inet.ip.forwarding is one knob
+// for the whole host, so the user access and site-to-site managers give back
+// each forwarding pair they claim, and the route controller restores the knob
+// once the last pair lets go.
+const forwardingKnobIsShared = true
 
 // newVPNController creates the utun-backed controller for bridge
 // site-to-site tunnels on macOS. It needs root for the same reason, and it

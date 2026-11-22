@@ -678,32 +678,38 @@ func runAgent(ctx context.Context) error {
 		// state pull enables: a WireGuard interface with a kept key under
 		// <data_dir>/user-access for each wireguard provider, and the vendor
 		// client of each tailscale or netbird provider, joined with the key
-		// its Secret holds. Without a mesh source rewrite, on macOS and
-		// Windows, it serves no provider: one that passes its checks reads
-		// kind_not_served, one that fails them invalid_provider. Setup first
-		// removes the interfaces and rewrites a killed process left behind.
-		// An opted-out bridge builds no manager and removes them all the
-		// same, so no interface of an earlier process keeps a port open.
+		// its Secret holds. Linux rewrites the source of what a provider
+		// forwards into the mesh with nftables and macOS with pf. Without a
+		// mesh source rewrite, on Windows, it serves no provider: one that
+		// passes its checks reads kind_not_served, one that fails them
+		// invalid_provider. The mesh interface is the kernel's name, utunN
+		// on macOS, which forwarding and the rewrite take, and macOS, whose
+		// host has one forwarding knob, gives back each pair it claims.
+		// Setup first removes the interfaces and rewrites a killed process
+		// left behind. An opted-out bridge builds no manager and removes
+		// them all the same, so no interface of an earlier process keeps a
+		// port open.
 		if !cfg.Bridge.UserAccessOptedOut() {
 			userAccessMgr = bridge.NewUserAccessManager(bridge.UserAccessDeps{
 				Access:   newAccessController(logger),
 				Routes:   routeCtrl,
-				Rewriter: newMeshSourceRewriter(routeCtrl),
+				Rewriter: newMeshSourceRewriter(routeCtrl, fwCtrl),
 				Keys:     bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "user-access")),
 				Secrets:  secrets,
 				Clients: map[string]bridge.UserAccessClient{
 					api.UserAccessKindTailscale: bridge.NewTailscaleProvider(bridge.NewStdCommandExecutor(), logger),
 					api.UserAccessKindNetbird:   bridge.NewNetbirdProvider(bridge.NewStdCommandExecutor(), logger),
 				},
-				MeshInterface: cfg.WireGuard.InterfaceName,
-				MeshCIDR:      userAccessMeshCIDR(wgMgr.MeshPrefix()),
-				Logger:        logger,
+				MeshInterface:     wgMgr.OSInterfaceName(),
+				MeshCIDR:          userAccessMeshCIDR(wgMgr.MeshPrefix()),
+				ReleaseForwarding: forwardingKnobIsShared,
+				Logger:            logger,
 			})
 			if err := userAccessMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: user access setup: %w", err)
 			}
 		} else {
-			if err := bridge.CleanupUserAccess(newAccessController(logger), newMeshSourceRewriter(routeCtrl)); err != nil {
+			if err := bridge.CleanupUserAccess(newAccessController(logger), newMeshSourceRewriter(routeCtrl, fwCtrl)); err != nil {
 				logger.Error("bridge: user access: clean up failed",
 					"component", "bridge",
 					"error", err,
@@ -721,34 +727,36 @@ func runAgent(ctx context.Context) error {
 		// interface and a strongSwan connection file in swanctl_conf_dir,
 		// <run dir>/swanctl by default, for each ipsec tunnel, and a tun
 		// device with an openvpn process for each openvpn tunnel, each
-		// joined with the key its Secret holds. Without a mesh source
-		// rewrite, on macOS and Windows, it serves no tunnel: one that
-		// passes its checks reads kind_not_served, one that fails them
-		// invalid_tunnel. Setup first removes the links and files a killed
-		// process left behind; the rewrites went with the user access
-		// cleanup above, which resets the table both managers share. An
-		// opted-out bridge builds no manager and removes them all the same,
-		// so no link of an earlier process keeps a port open.
+		// joined with the key its Secret holds. macOS serves wireguard
+		// tunnels alone: newTunnelProviders builds no ipsec or openvpn
+		// provider there, whose links are Linux kernel features, so such a
+		// tunnel reads kind_not_served. Without a mesh source rewrite, on
+		// Windows, it serves no tunnel: one that passes its checks reads
+		// kind_not_served, one that fails them invalid_tunnel. The mesh
+		// interface and the forwarding claim are the user access manager's.
+		// Setup first removes the links and files a killed process left
+		// behind; the rewrites went with the user access cleanup above,
+		// which resets the rewrites both managers share. An opted-out bridge
+		// builds no manager and removes them all the same, so no link of an
+		// earlier process keeps a port open.
 		swanctlDir := cfg.Bridge.SwanctlConfDir
 		if swanctlDir == "" {
 			swanctlDir = filepath.Join(paths.RunDir(), "swanctl")
 		}
 		vpnCtrl := newVPNController(logger, identity.MeshIP)
-		tunnelProviders := map[string]bridge.TunnelProvider{
-			api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
-			api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
-		}
+		tunnelProviders := newTunnelProviders(swanctlDir, logger)
 		if !cfg.Bridge.SiteToSiteOptedOut() {
 			s2sMgr = bridge.NewSiteToSiteManager(bridge.SiteToSiteDeps{
-				VPN:           vpnCtrl,
-				Routes:        routeCtrl,
-				Rewriter:      newMeshSourceRewriter(routeCtrl),
-				Keys:          bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "site-to-site")),
-				Secrets:       secrets,
-				Providers:     tunnelProviders,
-				MeshInterface: cfg.WireGuard.InterfaceName,
-				MeshCIDR:      userAccessMeshCIDR(wgMgr.MeshPrefix()),
-				Logger:        logger,
+				VPN:               vpnCtrl,
+				Routes:            routeCtrl,
+				Rewriter:          newMeshSourceRewriter(routeCtrl, fwCtrl),
+				Keys:              bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "site-to-site")),
+				Secrets:           secrets,
+				Providers:         tunnelProviders,
+				MeshInterface:     wgMgr.OSInterfaceName(),
+				MeshCIDR:          userAccessMeshCIDR(wgMgr.MeshPrefix()),
+				ReleaseForwarding: forwardingKnobIsShared,
+				Logger:            logger,
 			})
 			if err := s2sMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: site-to-site setup: %w", err)

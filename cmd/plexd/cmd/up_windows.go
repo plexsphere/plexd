@@ -120,9 +120,24 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 // newMeshSourceRewriter returns nil: Windows has no mesh source rewrite yet,
 // so every user access provider (plexd#214) and every site-to-site tunnel
 // reads kind_not_served.
-func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
+func newMeshSourceRewriter(_ bridge.RouteController, _ policy.FirewallController) bridge.MeshSourceRewriter {
 	return nil
 }
+
+// newTunnelProviders returns the providers of the site-to-site kinds other
+// than wireguard: strongSwan for ipsec, with its connection files in
+// swanctlDir, and an openvpn process for openvpn.
+func newTunnelProviders(swanctlDir string, logger *slog.Logger) map[string]bridge.TunnelProvider {
+	return map[string]bridge.TunnelProvider{
+		api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
+		api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
+	}
+}
+
+// forwardingKnobIsShared is false on Windows: neither the user access nor the
+// site-to-site manager serves there, so the bridge manager is the only
+// claimant of the mesh adapter's forwarding flag.
+const forwardingKnobIsShared = false
 
 // newVPNController creates the Wintun-backed controller for bridge
 // site-to-site tunnels on Windows. It needs Administrator for the same

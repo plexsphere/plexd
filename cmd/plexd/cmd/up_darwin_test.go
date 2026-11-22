@@ -76,6 +76,31 @@ func TestNewRouteController_Darwin_NilFirewall(t *testing.T) {
 	}
 }
 
+// TestNewMeshSourceRewriter_Darwin pins the pf controller as the mesh source
+// rewriter on macOS, and an untyped nil without a firewall controller, which
+// serves no user access provider and no site-to-site tunnel.
+func TestNewMeshSourceRewriter_Darwin(t *testing.T) {
+	logger := discardLogger()
+	fw := policy.NewPFController(logger)
+	routes := newRouteController(logger, fw)
+
+	if got, ok := newMeshSourceRewriter(routes, fw).(*policy.PFController); !ok || got != fw {
+		t.Errorf("newMeshSourceRewriter(routes, fw) = %T %p, want the pf controller %p itself", got, got, fw)
+	}
+	if got := newMeshSourceRewriter(routes, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(routes, nil) = %#v, want an untyped nil", got)
+	}
+}
+
+// TestNewTunnelProviders_Darwin pins that macOS builds no ipsec and no
+// openvpn provider: their links are Linux kernel features, so such a tunnel
+// reads kind_not_served.
+func TestNewTunnelProviders_Darwin(t *testing.T) {
+	if got := newTunnelProviders(t.TempDir(), discardLogger()); len(got) != 0 {
+		t.Errorf("newTunnelProviders() = %v, want no provider on macOS", got)
+	}
+}
+
 func TestNewSystemReader_Darwin(t *testing.T) {
 	reader := newSystemReader(discardLogger())
 	if reader == nil {

@@ -98,19 +98,34 @@ func TestNewVPNController_Linux(t *testing.T) {
 // provider.
 func TestNewMeshSourceRewriter_Linux(t *testing.T) {
 	routes := newRouteController(discardLogger(), nil)
-	rewriter := newMeshSourceRewriter(routes)
+	rewriter := newMeshSourceRewriter(routes, nil)
 	if rewriter == nil {
 		t.Fatal("newMeshSourceRewriter() = nil, want the netlink route controller on Linux")
 	}
 	if got, ok := rewriter.(*bridge.NetlinkRouteController); !ok || got != routes {
 		t.Errorf("newMeshSourceRewriter() = %T %p, want the route controller %p itself", rewriter, rewriter, routes)
 	}
-	if got := newMeshSourceRewriter(nil); got != nil {
-		t.Errorf("newMeshSourceRewriter(nil) = %#v, want nil", got)
+	if got := newMeshSourceRewriter(nil, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(nil, nil) = %#v, want nil", got)
 	}
 	var typedNil *bridge.NetlinkRouteController
-	if got := newMeshSourceRewriter(typedNil); got != nil {
-		t.Errorf("newMeshSourceRewriter(typed nil) = %#v, want an untyped nil", got)
+	if got := newMeshSourceRewriter(typedNil, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(typed nil, nil) = %#v, want an untyped nil", got)
+	}
+}
+
+// TestNewTunnelProviders_Linux pins the two providers a Linux bridge serves
+// ipsec and openvpn tunnels with.
+func TestNewTunnelProviders_Linux(t *testing.T) {
+	providers := newTunnelProviders(t.TempDir(), discardLogger())
+	if _, ok := providers[api.SiteToSiteKindIPsec].(*bridge.IPsecProvider); !ok {
+		t.Errorf("ipsec provider = %T, want *bridge.IPsecProvider", providers[api.SiteToSiteKindIPsec])
+	}
+	if _, ok := providers[api.SiteToSiteKindOpenVPN].(*bridge.OpenVPNProvider); !ok {
+		t.Errorf("openvpn provider = %T, want *bridge.OpenVPNProvider", providers[api.SiteToSiteKindOpenVPN])
+	}
+	if len(providers) != 2 {
+		t.Errorf("newTunnelProviders() = %v, want the ipsec and the openvpn provider alone", providers)
 	}
 }
 

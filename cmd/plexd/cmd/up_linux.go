@@ -88,13 +88,29 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 // NetlinkRouteController rewrites the source of user access and site-to-site
 // traffic into the mesh in its nftables table plexd-mesh-nat. It returns nil
 // for any other route controller, which serves no user access provider and
-// no site-to-site tunnel.
-func newMeshSourceRewriter(routes bridge.RouteController) bridge.MeshSourceRewriter {
+// no site-to-site tunnel. The firewall controller plays no part here.
+func newMeshSourceRewriter(routes bridge.RouteController, _ policy.FirewallController) bridge.MeshSourceRewriter {
 	if r, ok := routes.(*bridge.NetlinkRouteController); ok && r != nil {
 		return r
 	}
 	return nil
 }
+
+// newTunnelProviders returns the providers of the site-to-site kinds other
+// than wireguard: strongSwan for ipsec, with its connection files in
+// swanctlDir, and an openvpn process for openvpn.
+func newTunnelProviders(swanctlDir string, logger *slog.Logger) map[string]bridge.TunnelProvider {
+	return map[string]bridge.TunnelProvider{
+		api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
+		api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
+	}
+}
+
+// forwardingKnobIsShared is false on Linux: each interface has a forwarding
+// knob of its own, and DisableForwarding would switch off the mesh
+// interface's, which belongs to the bridge manager, so the user access and
+// site-to-site managers never release forwarding.
+const forwardingKnobIsShared = false
 
 // newVPNController creates a NetlinkVPNController for site-to-site tunnels on
 // Linux. The mesh IP is unused: the tunnel link stays unnumbered, because a

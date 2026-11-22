@@ -69,9 +69,23 @@ func newAccessController(_ *slog.Logger) bridge.AccessController {
 }
 
 // newMeshSourceRewriter returns nil on platforms without an implementation.
-func newMeshSourceRewriter(_ bridge.RouteController) bridge.MeshSourceRewriter {
+func newMeshSourceRewriter(_ bridge.RouteController, _ policy.FirewallController) bridge.MeshSourceRewriter {
 	return nil
 }
+
+// newTunnelProviders returns the providers of the site-to-site kinds other
+// than wireguard: strongSwan for ipsec, with its connection files in
+// swanctlDir, and an openvpn process for openvpn.
+func newTunnelProviders(swanctlDir string, logger *slog.Logger) map[string]bridge.TunnelProvider {
+	return map[string]bridge.TunnelProvider{
+		api.SiteToSiteKindIPsec:   bridge.NewIPsecProvider(bridge.NewStdCommandExecutor(), swanctlDir, logger),
+		api.SiteToSiteKindOpenVPN: bridge.NewOpenVPNProvider(bridge.NewStdCommandExecutor(), bridge.DefaultTunnelConfigDir, logger),
+	}
+}
+
+// forwardingKnobIsShared is false on platforms that serve no provider and no
+// tunnel.
+const forwardingKnobIsShared = false
 
 // newVPNController returns nil on platforms without an implementation.
 func newVPNController(_ *slog.Logger, _ string) bridge.VPNController {

@@ -5,6 +5,7 @@ package cmd
 import (
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
@@ -90,6 +91,32 @@ func TestNewSystemLogSource_Windows(t *testing.T) {
 	}
 	if _, ok := src.(*logfwd.EventLogSource); !ok {
 		t.Errorf("newSystemLogSource() = %T, want *logfwd.EventLogSource", src)
+	}
+}
+
+// TestNewMeshSourceRewriter_Windows pins that Windows has no mesh source
+// rewrite yet (plexd#214), so it serves no user access provider and no
+// site-to-site tunnel.
+func TestNewMeshSourceRewriter_Windows(t *testing.T) {
+	logger := discardLogger()
+	fw := newFirewallController(logger, "plexd0")
+	if got := newMeshSourceRewriter(newRouteController(logger, fw), fw); got != nil {
+		t.Errorf("newMeshSourceRewriter() = %#v, want nil on Windows", got)
+	}
+}
+
+// TestNewTunnelProviders_Windows pins the two providers plexd up builds on
+// Windows, as on Linux; without a mesh source rewrite no tunnel reaches them.
+func TestNewTunnelProviders_Windows(t *testing.T) {
+	providers := newTunnelProviders(t.TempDir(), discardLogger())
+	if _, ok := providers[api.SiteToSiteKindIPsec].(*bridge.IPsecProvider); !ok {
+		t.Errorf("ipsec provider = %T, want *bridge.IPsecProvider", providers[api.SiteToSiteKindIPsec])
+	}
+	if _, ok := providers[api.SiteToSiteKindOpenVPN].(*bridge.OpenVPNProvider); !ok {
+		t.Errorf("openvpn provider = %T, want *bridge.OpenVPNProvider", providers[api.SiteToSiteKindOpenVPN])
+	}
+	if len(providers) != 2 {
+		t.Errorf("newTunnelProviders() = %v, want the ipsec and the openvpn provider alone", providers)
 	}
 }
 

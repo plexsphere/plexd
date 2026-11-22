@@ -1261,6 +1261,26 @@ func TestSiteToSiteManager_KindNotServed(t *testing.T) {
 		fx.requireNoCalls(t, "Apply of a gre tunnel")
 	})
 
+	// macOS builds no ipsec and no openvpn provider: their links are Linux
+	// kernel features. Its wireguard tunnels come up beside them.
+	t.Run("no providers", func(t *testing.T) {
+		fx := newS2SFixture(t, func(d *SiteToSiteDeps) { d.Providers = nil })
+		fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin, dcEast, office))
+
+		// Read before the status, which reads the wireguard tunnel's device.
+		if got := fx.vpn.vpnMethods(); !slices.Equal(got, []string{"CreateTunnelInterface", "ConfigureTunnelPeer"}) {
+			t.Errorf("VPN calls = %q, want the wireguard tunnel's alone", got)
+		}
+		requireTunnelUp(t, fx.mgr, s2sID1)
+		for id, kind := range map[string]string{s2sID2: "ipsec", s2sID3: "openvpn"} {
+			requireTunnelDown(t, fx.mgr, id, SiteToSiteReasonKindNotServed)
+			if got := logLines(fx.logs, "level=WARN", `msg="site-to-site tunnel down"`, "tunnel_id="+id,
+				"reason=kind_not_served", "no "+kind+" provider is built in"); got != 1 {
+				t.Errorf("%d down lines for the %s tunnel, want 1:\n%s", got, kind, fx.logs.String())
+			}
+		}
+	})
+
 	t.Run("no provider", func(t *testing.T) {
 		fx := newS2SFixture(t, func(d *SiteToSiteDeps) { delete(d.Providers, api.SiteToSiteKindIPsec) })
 		fx.mgr.Apply(t.Context(), s2sBlock(dcEast))
