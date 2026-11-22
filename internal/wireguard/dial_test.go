@@ -818,6 +818,92 @@ func TestRunEndpointSelection(t *testing.T) {
 			requireLogLine(t, logs.String(), "wireguard: endpoint selection started", want)
 		}
 	})
+
+	t.Run("pass interval", func(t *testing.T) {
+		mgr := NewManager(&statsController{}, Config{}, discardLogger())
+		if got := mgr.passInterval(5 * time.Second); got != 5*time.Second {
+			t.Errorf("passInterval(5s) with no value = %v, want 5s", got)
+		}
+		if got := mgr.passInterval(100 * time.Millisecond); got != 100*time.Millisecond {
+			t.Errorf("passInterval(100ms) with no value = %v, want 100ms", got)
+		}
+		for _, tt := range []struct{ d, want time.Duration }{
+			{15 * time.Second, time.Second},
+			{30 * time.Second, 2 * time.Second},
+			{180 * time.Second, 5 * time.Second},
+		} {
+			mgr.SetFailureDetection(tt.d)
+			if got := mgr.passInterval(5 * time.Second); got != tt.want {
+				t.Errorf("passInterval(5s) under %v = %v, want %v", tt.d, got, tt.want)
+			}
+			if got := mgr.passInterval(100 * time.Millisecond); got != 100*time.Millisecond {
+				t.Errorf("passInterval(100ms) under %v = %v, want 100ms", tt.d, got)
+			}
+		}
+	})
+
+	t.Run("a value set while it runs", func(t *testing.T) {
+		ctrl := &statsController{}
+		mgr := NewManager(ctrl, Config{}, discardLogger())
+		passes := func() int {
+			ctrl.mu.Lock()
+			defer ctrl.mu.Unlock()
+			n := 0
+			for _, c := range ctrl.calls {
+				if c.Method == "PeerStats" {
+					n++
+				}
+			}
+			return n
+		}
+		waitPasses := func(n int) bool {
+			deadline := time.Now().Add(5 * time.Second)
+			for passes() < n {
+				if time.Now().After(deadline) {
+					return false
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			return true
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- mgr.RunEndpointSelection(ctx, 50*time.Millisecond) }()
+
+		if !waitPasses(2) {
+			t.Fatalf("%d passes within 5s of the start, want 2", passes())
+		}
+		mgr.SetFailureDetection(15 * time.Second)
+		after := passes()
+		if !waitPasses(after + 3) {
+			t.Errorf("%d passes within 5s of SetFailureDetection(15s), want %d", passes()-after, 3)
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("RunEndpointSelection() = %v, want nil", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("RunEndpointSelection did not return after its context was cancelled")
+		}
+	})
+
+	t.Run("keepalive off with a value held", func(t *testing.T) {
+		var logs bytes.Buffer
+		zero := time.Duration(0)
+		mgr := NewManager(&statsController{}, Config{PersistentKeepalive: &zero}, slogTextLogger(&logs))
+		mgr.SetFailureDetection(15 * time.Second)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// A live context: only the disabled path returns at once.
+		if err := mgr.RunEndpointSelection(ctx, time.Millisecond); err != nil {
+			t.Fatalf("RunEndpointSelection() = %v, want nil", err)
+		}
+		if !strings.Contains(logs.String(), "endpoint selection disabled, persistent_keepalive is 0s") {
+			t.Errorf("no disabled line:\n%s", logs.String())
+		}
+	})
 }
 
 // syncBuffer is a bytes.Buffer safe for a logger writing from one goroutine
@@ -3407,4 +3493,394 @@ func TestOnLinkFirst(t *testing.T) {
 	if got := onLinkFirst([]string{}, local); len(got) != 0 {
 		t.Errorf("onLinkFirst of an empty slice = %v, want an empty result", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Failure-detection time
+// ---------------------------------------------------------------------------
+
+// silentMsg is the line watchRelay logs when it dials the next relay of a
+// relayed peer that stayed silent past the failure-detection time.
+const silentMsg = "wireguard: relayed peer silent past the failure detection time, dialing the relay again"
+
+// detectHandshake is when relayedManager's peer completed its handshake over
+// the relay, the pass that turned it connected.
+var detectHandshake = selectionStart.Add(31 * time.Second)
+
+// detectingManager returns relayedManager's peer, connected over its relay at
+// 31 s with 100 bytes received, on a manager that holds the failure-detection
+// time d and sends its probes through the returned fakeProbe.
+func detectingManager(t *testing.T, logs *bytes.Buffer, d time.Duration, mutate func(*api.Peer)) (*Manager, *statsController, *fakeClock, [32]byte, *fakeProbe) {
+	t.Helper()
+	mgr, ctrl, clock, key := relayedManager(t, logs, mutate)
+	if _, changed := mgr.SetFailureDetection(d); !changed {
+		t.Fatalf("SetFailureDetection(%v) changed nothing", d)
+	}
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	return mgr, ctrl, clock, key, probe
+}
+
+// watchPasses runs a pass at from and every step after it up to and including
+// until, with the device reporting the handshake at 31 s and rx(after) bytes
+// received from relayedManager's peer at the pass at after.
+func watchPasses(t *testing.T, mgr *Manager, ctrl *statsController, clock *fakeClock, key [32]byte, from, step, until time.Duration, rx func(after time.Duration) uint64) {
+	t.Helper()
+	for after := from; after <= until; after += step {
+		ctrl.stats = []PeerStat{relayStat(key, detectHandshake, rx(after))}
+		passAt(t, mgr, clock, after)
+	}
+}
+
+// still is a receive counter that never moves from the 100 bytes the peer
+// connected with.
+func still(time.Duration) uint64 { return 100 }
+
+// movesUntil returns a receive counter that moves on every pass up to and
+// including the one at last, and stands still after it.
+func movesUntil(last time.Duration) func(time.Duration) uint64 {
+	return func(after time.Duration) uint64 { return 100 + uint64(min(after, last)/time.Second) }
+}
+
+// movesEvery returns a receive counter that moves on each pass a multiple of
+// every after the handshake at 31 s.
+func movesEvery(every time.Duration) func(time.Duration) uint64 {
+	return func(after time.Duration) uint64 { return 100 + uint64((after-31*time.Second)/every) }
+}
+
+// twoRelays gives p a dial order of one direct entry and the relay set E, F
+// (standbyR1, standbyR2), with both relays as its Fallbacks.
+func twoRelays(p *api.Peer) {
+	p.Endpoints = standbyOrder[:3]
+	p.Endpoint = standbyOrder[0]
+	p.Fallbacks = standbyOrder[1:3]
+}
+
+func TestDetectTiming(t *testing.T) {
+	for _, tt := range []struct{ d, pass, silence time.Duration }{
+		{5 * time.Second, time.Second, 4 * time.Second},
+		{14 * time.Second, time.Second, 13 * time.Second},
+		{15 * time.Second, time.Second, 14 * time.Second},
+		{29 * time.Second, time.Second, 28 * time.Second},
+		{30 * time.Second, 2 * time.Second, 28 * time.Second},
+		{60 * time.Second, 4 * time.Second, 56 * time.Second},
+		{75 * time.Second, 5 * time.Second, 70 * time.Second},
+		{180 * time.Second, 5 * time.Second, 175 * time.Second},
+	} {
+		if got := detectPass(tt.d); got != tt.pass {
+			t.Errorf("detectPass(%v) = %v, want %v", tt.d, got, tt.pass)
+		}
+		if got := detectSilence(tt.d); got != tt.silence {
+			t.Errorf("detectSilence(%v) = %v, want %v", tt.d, got, tt.silence)
+		}
+	}
+}
+
+func TestSetFailureDetection(t *testing.T) {
+	if MaxFailureDetection != connectedHandshakeAge {
+		t.Errorf("MaxFailureDetection = %v, want connectedHandshakeAge %v", MaxFailureDetection, connectedHandshakeAge)
+	}
+
+	var logs bytes.Buffer
+	mgr, _, _ := newSelectionManager(Config{}, &logs)
+	const msg = "wireguard: failure detection time set"
+	setLines := func() int { return len(logLines(logs.String(), msg)) }
+	set := func(v, want time.Duration, wantChanged bool) {
+		t.Helper()
+		if got, changed := mgr.SetFailureDetection(v); got != want || changed != wantChanged {
+			t.Errorf("SetFailureDetection(%v) = %v, %v, want %v, %v", v, got, changed, want, wantChanged)
+		}
+	}
+
+	if d, held := mgr.FailureDetection(); d != 0 || held {
+		t.Errorf("FailureDetection() before any value = %v, %v, want 0s, false", d, held)
+	}
+	set(0, 0, false)
+	set(-time.Second, 0, false)
+	if n := setLines(); n != 0 {
+		t.Fatalf("%d set lines for zero and negative values, want none:\n%s", n, logs.String())
+	}
+
+	set(15*time.Second, 15*time.Second, true)
+	requireLogLine(t, logs.String(), msg, "level=INFO", "component=wireguard", "detect_after=15s", "previous=0s", "pass=1s")
+	set(15*time.Second, 15*time.Second, false)
+	set(0, 15*time.Second, false)
+	set(-time.Second, 15*time.Second, false)
+	if n := setLines(); n != 1 {
+		t.Fatalf("%d set lines after a repeat and two ignored values, want 1:\n%s", n, logs.String())
+	}
+	if d, held := mgr.FailureDetection(); d != 15*time.Second || !held {
+		t.Errorf("FailureDetection() = %v, %v, want 15s, true", d, held)
+	}
+
+	set(2*time.Second, 5*time.Second, true)
+	requireLogLine(t, logs.String(), msg, "detect_after=5s", "previous=15s", "pass=1s")
+	set(time.Hour, 180*time.Second, true)
+	requireLogLine(t, logs.String(), msg, "detect_after=3m0s", "previous=5s", "pass=5s")
+}
+
+func TestSelectEndpoints_FailureDetectionProbesARelayedPeer(t *testing.T) {
+	meshIP := netip.MustParseAddr("10.0.0.2")
+
+	t.Run("every pass, whether or not the counter moves", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, probe := detectingManager(t, &logs, 15*time.Second, nil)
+		before := len(deviceWrites(ctrl))
+		rx := movesUntil(41 * time.Second)
+		for i, after := 1, 32*time.Second; after <= 51*time.Second; i, after = i+1, after+time.Second {
+			ctrl.stats = []PeerStat{relayStat(key, detectHandshake, rx(after))}
+			passAt(t, mgr, clock, after)
+			if len(probe.sent) != i {
+				t.Fatalf("probes after the pass at %v = %d, want %d, one per pass", after, len(probe.sent), i)
+			}
+		}
+		if slices.ContainsFunc(probe.sent, func(ip netip.Addr) bool { return ip != meshIP }) {
+			t.Errorf("probes = %v, want each to %v", probe.sent, meshIP)
+		}
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Errorf("device writes = %v, want none for a peer silent for 10 s", got)
+		}
+		if lines := logLines(logs.String(), "wireguard: relayed peer silent, probing"); len(lines) != 0 {
+			t.Errorf("silent, probing lines = %v, want none under a failure-detection time", lines)
+		}
+	})
+
+	t.Run("two per detectPass for a caller that ticks faster", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, probe := detectingManager(t, &logs, 15*time.Second, nil)
+		watchPasses(t, mgr, ctrl, clock, key, 31*time.Second+100*time.Millisecond, 100*time.Millisecond, 32*time.Second, still)
+		if len(probe.sent) != 2 {
+			t.Errorf("probes over 10 passes 100 ms apart = %d, want 2", len(probe.sent))
+		}
+	})
+
+	t.Run("every pass under 60 s", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, probe := detectingManager(t, &logs, 60*time.Second, nil)
+		watchPasses(t, mgr, ctrl, clock, key, 35*time.Second, 4*time.Second, 71*time.Second, still)
+		if len(probe.sent) != 10 {
+			t.Errorf("probes over 10 passes 4 s apart = %d, want 10", len(probe.sent))
+		}
+	})
+}
+
+func TestSelectEndpoints_FailureDetectionDialsTheNextRelay(t *testing.T) {
+	t.Run("15 s: 14 s after the pass that counted the last packet", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 15*time.Second, nil)
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 53*time.Second, movesUntil(40*time.Second))
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Fatalf("device writes 13 s after the last packet = %v, want none", got)
+		}
+		passAt(t, mgr, clock, 54*time.Second)
+		// A set of one: the next relay is the same relay.
+		if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + relayOrder[1]}; !slices.Equal(got, want) {
+			t.Fatalf("device writes 14 s after the last packet = %v, want %v", got, want)
+		}
+		requireLogLine(t, logs.String(), silentMsg, "level=INFO", "component=wireguard", "peer_id=node-a",
+			"from="+relayOrder[1], "endpoint="+relayOrder[1], "silent_for=14s", "detect_after=15s")
+		if st := mgr.dial["node-a"]; st.connected || !st.relayed {
+			t.Errorf("state = connected %v, relayed %v, want false, true", st.connected, st.relayed)
+		}
+	})
+
+	t.Run("60 s: kept at 52 s, dialed at 56 s", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 60*time.Second, nil)
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 35*time.Second, 4*time.Second, 83*time.Second, still)
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Fatalf("device writes after 52 s of silence = %v, want none", got)
+		}
+		passAt(t, mgr, clock, 87*time.Second)
+		if got := deviceWrites(ctrl)[before:]; len(got) != 2 {
+			t.Fatalf("device writes after 56 s of silence = %v, want the re-dial", got)
+		}
+		requireLogLine(t, logs.String(), silentMsg, "silent_for=56s", "detect_after=1m0s")
+	})
+
+	t.Run("15 s: a packet every 11 s holds, one every 15 s does not", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 15*time.Second, nil)
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 151*time.Second, movesEvery(11*time.Second))
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Errorf("device writes over 120 s with a packet every 11 s = %v, want none", got)
+		}
+
+		var slow bytes.Buffer
+		mgr, ctrl, clock, key, _ = detectingManager(t, &slow, 15*time.Second, nil)
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 151*time.Second, movesEvery(15*time.Second))
+		requireLogLine(t, slow.String(), silentMsg, "peer_id=node-a", "silent_for=14s")
+	})
+
+	t.Run("5 s: 4 s after the pass that counted the last packet", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 5*time.Second, nil)
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 43*time.Second, movesUntil(40*time.Second))
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Fatalf("device writes 3 s after the last packet = %v, want none", got)
+		}
+		passAt(t, mgr, clock, 44*time.Second)
+		if got := deviceWrites(ctrl)[before:]; len(got) != 2 {
+			t.Fatalf("device writes 4 s after the last packet = %v, want the re-dial", got)
+		}
+		requireLogLine(t, logs.String(), silentMsg, "silent_for=4s", "detect_after=5s")
+
+		var steady bytes.Buffer
+		mgr, ctrl, clock, key, _ = detectingManager(t, &steady, 5*time.Second, nil)
+		before = len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 91*time.Second, movesEvery(3*time.Second))
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Errorf("device writes over 60 s with a packet every 3 s = %v, want none", got)
+		}
+	})
+
+	t.Run("the next relay of the set", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 15*time.Second, twoRelays)
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 45*time.Second, still)
+		if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR2}; !slices.Equal(got, want) {
+			t.Fatalf("device writes = %v, want %v", got, want)
+		}
+		requireLogLine(t, logs.String(), silentMsg, "peer_id=node-a", "from="+standbyR1, "endpoint="+standbyR2, "silent_for=14s")
+		if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || st.connected {
+			t.Errorf("idx = %d, relayed = %v, connected = %v, want 2, true, false", st.idx, st.relayed, st.connected)
+		}
+	})
+
+	t.Run("a failed device write", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 15*time.Second, twoRelays)
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 44*time.Second, still)
+
+		addErr := errors.New("add refused")
+		ctrl.addPeerErr = addErr
+		clock.Set(selectionStart.Add(45 * time.Second))
+		err := mgr.selectEndpoints()
+		if err == nil || !strings.HasPrefix(err.Error(), "wireguard: switch endpoint of peer node-a: add device peer:") || !errors.Is(err, addErr) {
+			t.Fatalf("selectEndpoints = %v, want wireguard: switch endpoint of peer node-a: add device peer: wrapping %v", err, addErr)
+		}
+		requireLogLine(t, logs.String(), "wireguard: endpoint switch failed", "level=WARN", "peer_id=node-a", "endpoint="+standbyR2)
+		if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || st.connected {
+			t.Errorf("idx = %d, relayed = %v, connected = %v, want 2, true, false", st.idx, st.relayed, st.connected)
+		}
+	})
+}
+
+func TestSelectEndpoints_FailureDetectionProbeSendFailure(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key, probe := detectingManager(t, &logs, 15*time.Second, nil)
+	probe.err = errors.New("probe refused")
+	before := len(deviceWrites(ctrl))
+	const msg = "wireguard: relay probe send failed"
+	countAt := func(level string) int {
+		n := 0
+		for _, line := range logLines(logs.String(), msg) {
+			if strings.Contains(line, "level="+level) {
+				n++
+			}
+		}
+		return n
+	}
+
+	passAt(t, mgr, clock, 32*time.Second)
+	requireLogLine(t, logs.String(), msg, "level=WARN", "peer_id=node-a", "mesh_ip=10.0.0.2")
+	if !strings.Contains(logs.String(), `error="probe refused"`) {
+		t.Errorf("the send failure does not name its error:\n%s", logs.String())
+	}
+	watchPasses(t, mgr, ctrl, clock, key, 33*time.Second, time.Second, 91*time.Second, still)
+	if len(probe.sent) != 60 || countAt("WARN") != 1 || countAt("DEBUG") != 59 {
+		t.Errorf("over 60 s of failed sends: %d sends, %d Warn and %d Debug lines, want 60, 1, 59",
+			len(probe.sent), countAt("WARN"), countAt("DEBUG"))
+	}
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Errorf("device writes while every send failed = %v, want none", got)
+	}
+	if lines := logLines(logs.String(), silentMsg); len(lines) != 0 {
+		t.Errorf("silence re-dial lines while every send failed = %v, want none", lines)
+	}
+}
+
+func TestSelectEndpoints_FailureDetectionNoVerdictWithoutAProbe(t *testing.T) {
+	t.Run("no sender", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key := relayedManager(t, &logs, nil)
+		mgr.SetFailureDetection(5 * time.Second)
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 91*time.Second, still)
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Errorf("device writes over 60 s without a sender = %v, want none", got)
+		}
+	})
+
+	t.Run("mesh ip outside the mesh prefix", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, probe := detectingManager(t, &logs, 5*time.Second, func(p *api.Peer) { p.MeshIP = "10.1.0.2" })
+		before := len(deviceWrites(ctrl))
+		watchPasses(t, mgr, ctrl, clock, key, 32*time.Second, time.Second, 91*time.Second, still)
+		if len(probe.sent) != 0 {
+			t.Errorf("probes = %v, want none", probe.sent)
+		}
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Errorf("device writes over 60 s = %v, want none", got)
+		}
+	})
+
+	for _, d := range []time.Duration{5 * time.Second, 15 * time.Second, 180 * time.Second} {
+		t.Run("direct peer under "+d.String(), func(t *testing.T) {
+			var logs bytes.Buffer
+			mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+			mgr.meshPrefix = netip.MustParsePrefix("10.0.0.0/24")
+			mgr.SetFailureDetection(d)
+			key, b64 := testKey(0x0a)
+			peer := orderedPeer("node-a", b64, relayOrder...)
+			peer.Fallbacks = []string{relayOrder[1]}
+			if err := mgr.AddPeer(peer); err != nil {
+				t.Fatalf("AddPeer: %v", err)
+			}
+			probe := &fakeProbe{}
+			mgr.SetRelayProbe(probe.send)
+			ctrl.stats = []PeerStat{directStat(key, detectHandshake, 100)}
+			passAt(t, mgr, clock, 31*time.Second) // connected on 10.0.0.5:51820
+			before := len(deviceWrites(ctrl))
+			for after := 32 * time.Second; after <= 210*time.Second; after += time.Second {
+				passAt(t, mgr, clock, after)
+			}
+			if len(probe.sent) != 0 {
+				t.Errorf("probes to a peer connected on a direct entry = %v, want none", probe.sent)
+			}
+			if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+				t.Errorf("device writes = %v, want none", got)
+			}
+		})
+	}
+}
+
+func TestSelectEndpoints_FailureDetectionChangeRestartsTheSilence(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key, _ := detectingManager(t, &logs, 60*time.Second, nil)
+	before := len(deviceWrites(ctrl))
+	watchPasses(t, mgr, ctrl, clock, key, 35*time.Second, 4*time.Second, 59*time.Second, still)
+
+	// Silent for 30 s at 61 s: past the 4 s of silence a 5 s value allows, had
+	// the change not restarted the window.
+	clock.Set(selectionStart.Add(61 * time.Second))
+	if d, changed := mgr.SetFailureDetection(5 * time.Second); d != 5*time.Second || !changed {
+		t.Fatalf("SetFailureDetection(5s) = %v, %v, want 5s, true", d, changed)
+	}
+	for _, after := range []time.Duration{62 * time.Second, 63 * time.Second, 64 * time.Second} {
+		passAt(t, mgr, clock, after)
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Fatalf("device writes at %v, %v after the change = %v, want none", after, after-61*time.Second, got)
+		}
+	}
+	passAt(t, mgr, clock, 65*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + relayOrder[1]}; !slices.Equal(got, want) {
+		t.Fatalf("device writes 4 s after the change = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), silentMsg, "silent_for=4s", "detect_after=5s")
 }
