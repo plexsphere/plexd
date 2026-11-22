@@ -181,7 +181,7 @@ func (s *dialState) relayedOver(stat MeshPeerStat) (relay string, ok bool) {
 }
 
 // onRelay records that relay, one of the peer's relays, was just written on a
-// fresh device peer (see Manager.redialRelay): the position is the relay's,
+// fresh device peer (see Manager.redial): the position is the relay's,
 // the peer is not connected, its timer restarts, and the probe starts over,
 // because the new device peer counts its bytes from 0. The Fallbacks end the
 // order (see dialOrder), so the relay's position is found.
@@ -391,7 +391,7 @@ func (m *Manager) selectEndpoints() error {
 			sameSession := stat.LastHandshake.Equal(st.handshakeAt)
 			st.handshakeAt = stat.LastHandshake
 			// A relay drops every packet of a session whose handshake it did
-			// not forward (see redialRelay), so a roam between relays with no
+			// not forward (see redial), so a roam between relays with no
 			// new handshake almost always means a stale packet moved the
 			// device, and the session still runs over the entry programmed. A
 			// pass that reads the device in the round trip before a partner's
@@ -624,7 +624,7 @@ func (m *Manager) checkRelay(nodeID string, st *dialState, stat MeshPeerStat, no
 // marks the peer connected again first, over the relay it came from (see
 // dialState.relayedOver).
 func (m *Manager) redialInPass(nodeID string, st *dialState, relay string, now time.Time) error {
-	if err := m.redialRelay(st.peer, relay); err != nil {
+	if err := m.redial(st.peer, relay); err != nil {
 		m.logger.Warn("wireguard: endpoint switch failed",
 			"component", "wireguard",
 			"peer_id", nodeID,
