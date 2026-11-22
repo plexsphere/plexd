@@ -137,65 +137,77 @@ func bridgeNetlinkRouteController() *Figure {
 // to, for docs/reference/bridge/route-controllers-macos-windows.md.
 // The bridge manager runs in bridge mode only; the WireGuard manager
 // adds the peer routes on every node. The user access and site-to-site
-// managers serve providers and tunnels on macOS alone: they call
-// DarwinRouteController for forwarding and routes and PFController for
-// the mesh source rewrite, and never reach the Windows controller,
-// since Windows has no mesh source rewrite.
+// managers serve providers and tunnels in bridge mode on both
+// platforms: they call the route controller for forwarding and routes,
+// and the mesh source rewrite of the platform, PFController on macOS
+// and wireguard.MeshRewriter on Windows, which rewrites inside the
+// plexd process between its own wireguard-go devices. On Windows the
+// site-to-site manager also exempts a tunnel's adapter from the bridge
+// NAT through WFPController. Those two managers sit in a row of their
+// own below the bus of the other two, so none of their calls crosses
+// it.
 func bridgeRouteControllersMacOSWindows() *Figure {
 	f := &Figure{Name: "bridge-route-controllers-macos-windows", Title: "The macOS and Windows route controllers and what they program"}
-	const ctrlY = brgCallerH + 106
-	const leafY, leafW, leafGap = ctrlY + 160, 180.0, 30.0
-	bridgeMgr := f.box(roleAgent, spec{x: 0, y: 0, w: 300, h: brgCallerH, lines: []Line{
+	const busY, servedY, servedH = brgCallerH + 50, brgCallerH + 100, 120.0
+	const ctrlY = servedY + servedH + 80
+	const leafY, leafW, leafH = ctrlY + 160, 180.0, 76.0
+	leaf := func(x float64, r role, lines ...Line) *node {
+		return f.box(r, spec{x: x, y: leafY, w: leafW, h: leafH, lines: lines})
+	}
+	route := leaf(0, roleSubstrate, codeName("route(8)"))
+	sysctl := leaf(210, roleSubstrate, codeName("sysctl(8)"))
+	pf := leaf(420, roleAgent, codeName("PFController"), body("NAT, rewrite"))
+	wfp := leaf(810, roleAgent, codeName("WFPController"), body("NAT, exemption"))
+	ipcfg := leaf(1020, roleSubstrate, codeName("winipcfg"))
+
+	// The rewriter sits between the two route controllers, with a gap
+	// on either side for the managers' calls to PFController and
+	// WFPController.
+	darwin := f.filled(roleAgent, spec{x: 180, y: ctrlY, w: 300, h: 64, lines: []Line{codeName("DarwinRouteController")}})
+	rewriter := f.box(roleAgent, spec{x: 540, y: ctrlY, w: 270, h: 64, lines: []Line{
+		codeName("wireguard.MeshRewriter"), body("rewrite on Windows"),
+	}})
+	windows := f.filled(roleAgent, spec{x: 870, y: ctrlY, w: 300, h: 64, lines: []Line{codeName("WindowsRouteController")}})
+
+	bridgeMgr := f.box(roleAgent, spec{y: 0, w: 300, h: brgCallerH, lines: []Line{
 		name("Bridge Manager"), body("access routes,"), body("forwarding, NAT"),
 	}})
+	bridgeMgr.x = darwin.cx() - bridgeMgr.w/2
 	f.chipOn(bridgeMgr, "bridge mode", colorGrey)
-	served := f.box(roleAgent, spec{x: 330, y: 0, w: 300, h: brgCallerH, lines: []Line{
-		codeName("UserAccessManager"), codeName("SiteToSiteManager"), body("forwarding, routes, rewrite"),
+	wgMgr := f.box(roleAgent, spec{y: 0, w: 300, h: brgCallerH, lines: []Line{
+		codeName("wireguard.Manager"), body("peer routes on every node,"), body("through utunN on macOS"),
 	}})
-	f.chipOn(served, "bridge mode, macOS", colorGrey)
-	mgrs := []*node{
-		bridgeMgr,
-		f.box(roleAgent, spec{x: 735, y: 0, w: 300, h: brgCallerH, lines: []Line{
-			codeName("wireguard.Manager"), body("peer routes on every node,"), body("through utunN on macOS"),
-		}}),
-	}
-	leaf := func(i int, r role, label string) *node {
-		x := float64(i) * (leafW + leafGap)
-		if i >= 3 {
-			x += 60
-		}
-		return f.box(r, spec{x: x, y: leafY, w: leafW, h: 64, lines: []Line{codeName(label)}})
-	}
-	route := leaf(0, roleSubstrate, "route(8)")
-	sysctl := leaf(1, roleSubstrate, "sysctl(8)")
-	pf := leaf(2, roleAgent, "PFController")
-	ipcfg := leaf(3, roleSubstrate, "winipcfg")
-	wfp := leaf(4, roleAgent, "WFPController")
-
-	darwin := f.filled(roleAgent, spec{y: ctrlY, w: 300, h: 64, lines: []Line{codeName("DarwinRouteController")}})
-	darwin.x = sysctl.cx() - darwin.w/2
-	windows := f.filled(roleAgent, spec{y: ctrlY, w: 300, h: 64, lines: []Line{codeName("WindowsRouteController")}})
-	windows.x = (ipcfg.x+wfp.x+wfp.w)/2 - windows.w/2
-
-	busY := brgCallerH + 53
-	for _, m := range mgrs {
+	wgMgr.x = windows.cx() - wgMgr.w/2
+	for _, m := range []*node{bridgeMgr, wgMgr} {
 		for _, c := range []*node{darwin, windows} {
 			f.arrow(flow, vhv(m.bottom(), c.top(), busY)...)
 		}
 	}
+
+	// The user access and site-to-site managers reach every box they
+	// call on a stem of their own: the two route controllers, the
+	// rewriter, and PFController and WFPController through the gaps
+	// beside the rewriter.
+	served := f.box(roleAgent, spec{x: pf.x, y: servedY, w: windows.x + 60 - pf.x, h: servedH, lines: []Line{
+		codeName("UserAccessManager"), codeName("SiteToSiteManager"),
+		body("forwarding, routes, rewrite,"), body("a tunnel's NAT exemption"),
+	}})
+	f.chipOn(served, "bridge mode", colorGrey)
+	gapL, gapR := (darwin.x+darwin.w+rewriter.x)/2, (rewriter.x+rewriter.w+windows.x)/2
+	f.arrow(flow, served.bottomAt(darwin.x+darwin.w-25), darwin.topAt(darwin.x+darwin.w-25))
+	f.arrow(flow, served.bottomAt(gapL), pf.topAt(gapL))
+	f.arrow(flow, served.bottomAt(rewriter.cx()), rewriter.top())
+	f.arrow(flow, served.bottomAt(gapR), wfp.topAt(gapR))
+	f.arrow(flow, served.bottomAt(windows.x+30), windows.topAt(windows.x+30))
+
 	// Each arrow leaves its controller on its own stem, so a call and a
 	// delegation never share a segment.
 	leafBus := darwin.y + darwin.h + 48
 	f.arrow(call, vhv(darwin.bottomAt(darwin.x+50), route.top(), leafBus)...)
 	f.arrow(call, darwin.bottomAt(sysctl.cx()), sysctl.top())
-	f.arrow(flow, vhv(darwin.bottomAt(darwin.x+darwin.w-50), pf.top(), leafBus)...)
-	f.arrow(call, windows.bottomAt(ipcfg.cx()), ipcfg.top())
-	f.arrow(flow, windows.bottomAt(wfp.cx()), wfp.top())
-	// The two managers reach DarwinRouteController above its delegation
-	// to PFController, and PFController itself through the gap between
-	// the two route controllers, apart from that delegation's stem.
-	f.arrow(flow, served.bottomAt(darwin.x+darwin.w-30), darwin.topAt(darwin.x+darwin.w-30))
-	f.arrow(flow, served.bottomAt(pf.x+pf.w-40), pf.topAt(pf.x+pf.w-40))
+	f.arrow(flow, vhv(darwin.bottomAt(darwin.x+darwin.w-80), pf.topAt(pf.x+30), leafBus)...)
+	f.arrow(flow, windows.bottomAt(wfp.x+wfp.w-40), wfp.topAt(wfp.x+wfp.w-40))
+	f.arrow(call, windows.bottomAt(ipcfg.x+ipcfg.w-90), ipcfg.topAt(ipcfg.x+ipcfg.w-90))
 	return f
 }
 

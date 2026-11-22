@@ -1,56 +1,68 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="522" viewBox="0 0 1160 522" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The macOS and Windows route controllers and what they program">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="728" viewBox="0 0 1280 728" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="The macOS and Windows route controllers and what they program">
 <title>The macOS and Windows route controllers and what they program</title>
-<rect width="1160" height="522" fill="#F6F5F1"/>
-<rect x="40" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="190" y="88.6" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Manager</text>
-<text x="190" y="109.75" font-size="17" fill="#55606E" text-anchor="middle">access routes,</text>
-<text x="190" y="130.15" font-size="17" fill="#55606E" text-anchor="middle">forwarding, NAT</text>
-<rect x="201" y="40" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
-<text x="264.5" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
-<rect x="370" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="520" y="87.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">UserAccessManager</text>
-<text x="520" y="107.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteManager</text>
-<text x="520" y="128.35" font-size="17" fill="#55606E" text-anchor="middle">forwarding, routes, rewrite</text>
-<rect x="461" y="40" width="197" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
-<text x="559.5" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode, macOS</text>
-<rect x="775" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="925" y="87.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">wireguard.Manager</text>
-<text x="925" y="107.95" font-size="17" fill="#55606E" text-anchor="middle">peer routes on every node,</text>
-<text x="925" y="128.35" font-size="17" fill="#55606E" text-anchor="middle">through utunN on macOS</text>
-<rect x="40" y="418" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="130" y="455.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">route(8)</text>
-<rect x="250" y="418" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="340" y="455.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">sysctl(8)</text>
-<rect x="460" y="418" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="550" y="455.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">PFController</text>
-<rect x="730" y="418" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
-<text x="820" y="455.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">winipcfg</text>
-<rect x="940" y="418" width="180" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="1030" y="455.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WFPController</text>
-<rect x="190" y="258" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
-<text x="340" y="295.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">DarwinRouteController</text>
-<rect x="775" y="258" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
-<text x="925" y="295.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WindowsRouteController</text>
-<polyline points="190,152 190,205 340,205 340,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="340,258 334,245 346,245" fill="#3A4452"/>
-<polyline points="190,152 190,205 925,205 925,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="925,258 919,245 931,245" fill="#3A4452"/>
-<polyline points="925,152 925,205 340,205 340,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="340,258 334,245 346,245" fill="#3A4452"/>
-<polyline points="925,152 925,205 925,205 925,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="925,258 919,245 931,245" fill="#3A4452"/>
-<polyline points="240,322 240,370 130,370 130,409" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="130,418 124,405 136,405" fill="#2457C5"/>
-<polyline points="340,322 340,409" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="340,418 334,405 346,405" fill="#2457C5"/>
-<polyline points="440,322 440,370 550,370 550,409" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="550,418 544,405 556,405" fill="#3A4452"/>
-<polyline points="820,322 820,409" fill="none" stroke="#2457C5" stroke-width="2.5"/>
-<polygon points="820,418 814,405 826,405" fill="#2457C5"/>
-<polyline points="1030,322 1030,409" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="1030,418 1024,405 1036,405" fill="#3A4452"/>
-<polyline points="460,152 460,249" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="460,258 454,245 466,245" fill="#3A4452"/>
-<polyline points="600,152 600,409" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="600,418 594,405 606,405" fill="#3A4452"/>
+<rect width="1280" height="728" fill="#F6F5F1"/>
+<rect x="40" y="612" width="180" height="76" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="130" y="655.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">route(8)</text>
+<rect x="250" y="612" width="180" height="76" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="340" y="655.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">sysctl(8)</text>
+<rect x="460" y="612" width="180" height="76" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="550" y="645.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">PFController</text>
+<text x="550" y="666.15" font-size="17" fill="#55606E" text-anchor="middle">NAT, rewrite</text>
+<rect x="850" y="612" width="180" height="76" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="940" y="645.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WFPController</text>
+<text x="940" y="666.15" font-size="17" fill="#55606E" text-anchor="middle">NAT, exemption</text>
+<rect x="1060" y="612" width="180" height="76" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="1150" y="655.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">winipcfg</text>
+<rect x="220" y="452" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="370" y="489.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">DarwinRouteController</text>
+<rect x="580" y="452" width="270" height="64" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="715" y="479.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">wireguard.MeshRewriter</text>
+<text x="715" y="500.15" font-size="17" fill="#55606E" text-anchor="middle">rewrite on Windows</text>
+<rect x="910" y="452" width="300" height="64" rx="8" fill="#E6F1EA" stroke="#2F8A57" stroke-width="2"/>
+<text x="1060" y="489.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">WindowsRouteController</text>
+<rect x="220" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="370" y="88.6" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Bridge Manager</text>
+<text x="370" y="109.75" font-size="17" fill="#55606E" text-anchor="middle">access routes,</text>
+<text x="370" y="130.15" font-size="17" fill="#55606E" text-anchor="middle">forwarding, NAT</text>
+<rect x="381" y="40" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="444.5" y="57.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+<rect x="910" y="52" width="300" height="100" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="1060" y="87.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">wireguard.Manager</text>
+<text x="1060" y="107.95" font-size="17" fill="#55606E" text-anchor="middle">peer routes on every node,</text>
+<text x="1060" y="128.35" font-size="17" fill="#55606E" text-anchor="middle">through utunN on macOS</text>
+<polyline points="370,152 370,202 370,202 370,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,452 364,439 376,439" fill="#3A4452"/>
+<polyline points="370,152 370,202 1060,202 1060,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1060,452 1054,439 1066,439" fill="#3A4452"/>
+<polyline points="1060,152 1060,202 370,202 370,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="370,452 364,439 376,439" fill="#3A4452"/>
+<polyline points="1060,152 1060,202 1060,202 1060,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="1060,452 1054,439 1066,439" fill="#3A4452"/>
+<rect x="460" y="252" width="510" height="120" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="715" y="287.35" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">UserAccessManager</text>
+<text x="715" y="307.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">SiteToSiteManager</text>
+<text x="715" y="328.15" font-size="17" fill="#55606E" text-anchor="middle">forwarding, routes, rewrite,</text>
+<text x="715" y="348.55" font-size="17" fill="#55606E" text-anchor="middle">a tunnel's NAT exemption</text>
+<rect x="831" y="240" width="127" height="24" rx="12" fill="#FDFCF9" stroke="#7D8794" stroke-width="1.5"/>
+<text x="894.5" y="257.25" font-size="15" font-weight="700" fill="#7D8794" text-anchor="middle">bridge mode</text>
+<polyline points="495,372 495,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="495,452 489,439 501,439" fill="#3A4452"/>
+<polyline points="550,372 550,603" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="550,612 544,599 556,599" fill="#3A4452"/>
+<polyline points="715,372 715,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="715,452 709,439 721,439" fill="#3A4452"/>
+<polyline points="880,372 880,603" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="880,612 874,599 886,599" fill="#3A4452"/>
+<polyline points="940,372 940,443" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="940,452 934,439 946,439" fill="#3A4452"/>
+<polyline points="270,516 270,564 130,564 130,603" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="130,612 124,599 136,599" fill="#2457C5"/>
+<polyline points="340,516 340,603" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="340,612 334,599 346,599" fill="#2457C5"/>
+<polyline points="440,516 440,564 490,564 490,603" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="490,612 484,599 496,599" fill="#3A4452"/>
+<polyline points="990,516 990,603" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="990,612 984,599 996,599" fill="#3A4452"/>
+<polyline points="1150,516 1150,603" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="1150,612 1144,599 1156,599" fill="#2457C5"/>
 </svg>

@@ -210,6 +210,153 @@ The UAPI named pipe is `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>
 
 Windows Defender Firewall may drop unsolicited inbound handshakes on the listen port: plexd's own WFP permits are soft and cannot open a port the host firewall closes (see [Soft permits](./pf-wfp-firewall.md#soft-permits)). The [Windows installation guide](../../how-to/windows-installation.md) adds the inbound rule. Handshakes plexd initiates are unaffected, so a node behind it still reaches peers that are reachable.
 
+### The mesh rewriter
+
+```go
+func (c *WindowsController) SetMeshRewriter(r *MeshRewriter)
+```
+
+`SetMeshRewriter` hands the controller a [mesh rewriter](#in-process-mesh-source-rewrite) and is called before `CreateInterface`. With a rewriter, `createAdapter` hands wireguard-go `r.Wrap(name, tdev)` in place of the Wintun tun: it wraps after it has taken the adapter's LUID and set the default MTU, and before `UserspaceBackend.CreateDevice`, so the LUID and `ForceMTU` stay the raw device's. Without a rewriter nothing changes.
+
+`plexd up` builds the rewriter with `newMeshRewriter` only on a Windows node in bridge mode that does not opt out of both user access and site-to-site tunnels, and sets it on all three `WindowsController`s: the mesh controller's, before the mesh device is created, the user access controller's and the site-to-site controller's. Every other node hands wireguard-go the raw tun, so it pays no copy per packet.
+
+`controller_windows_test.go` checks that `AddMeshSourceRewrite` between two interfaces of a controller with `SetMeshRewriter` returns nil, that the LUID and the MTU hook stay the raw adapter's, and that deleting an interface closes its wrapper and the rewriter forgets it; for the interfaces of a controller without a rewriter it returns `the mesh interface is no device of this process`.
+
+## In-process mesh source rewrite
+
+A bridge rewrites the source of what a provider's interface or a tunnel's link forwards into the mesh to its own mesh address, the only source a mesh node accepts from it. Linux does it with nftables and macOS with pf (see [Mesh Source Rewrite](../bridge/netlink-route-controller.md#mesh-source-rewrite) and [Mesh source rewrite](./pf-wfp-firewall.md#mesh-source-rewrite)). Windows has no kernel mechanism that fits: WinNAT translates nothing into the mesh while the bridge NAT's object covers the mesh prefix, and what it translates passes no WFP forward filter (see [What WinNAT does, measured](./pf-wfp-firewall.md#what-winnat-does-measured)). A Windows bridge therefore rewrites inside the plexd process.
+
+Both ends of the forwarding step are wireguard-go devices of plexd's own: the mesh device and the device of a `wireguard` provider or a `wireguard` tunnel. The rewrite sits at the seam every packet already passes, the `tun.Device` a `WindowsController` hands wireguard-go. A wrapper around it sees a far end's packet before Windows does, and a mesh peer's reply before Windows does, so translated traffic never crosses Windows forwarding, WinNAT or the WFP forward layer. The code is platform neutral, `internal/wireguard/meshrewrite.go` and `internal/wireguard/meshrewrite_nat.go` without a build tag, and its tests run on Linux, macOS and Windows. Only Windows wires it.
+
+```go
+// MeshRewriter rewrites, inside the process, the source of what the far end
+// of a registered interface sends into the mesh to the mesh interface's
+// address.
+type MeshRewriter struct{ /* ... */ }
+
+func NewMeshRewriter(logger *slog.Logger) *MeshRewriter
+
+// Wrap returns the tun.Device to hand wireguard-go in place of dev and
+// knows it under name until it is closed.
+func (r *MeshRewriter) Wrap(name string, dev tun.Device) tun.Device
+
+func (r *MeshRewriter) AddMeshSourceRewrite(fromIface, meshIface string) error
+func (r *MeshRewriter) RemoveMeshSourceRewrite(fromIface, meshIface string) error
+func (r *MeshRewriter) ResetMeshSourceRewrite() error
+```
+
+The three methods have the signatures of `bridge.MeshSourceRewriter`. `internal/wireguard` does not import `internal/bridge`, so the assertion `var _ bridge.MeshSourceRewriter = (*wireguard.MeshRewriter)(nil)` lives in `cmd/plexd/cmd/up_windows.go`. There `newMeshSourceRewriter` returns the rewriter to the user access and site-to-site managers, and an untyped nil for a nil one.
+
+A connection belongs to the side that opened it. What a far end opens is translated in process. What the host or a mesh node opens through a provider's interface or a tunnel's link goes through Windows, and its replies are handed to Windows untouched. Linux gets the same split from connection tracking, which masquerades new connections only. What a mesh node sends to a site stays in Windows forwarding, because that is where the bridge's policy filters it (see [Routes and Policy](../bridge/site-to-site-vpn.md#routes-and-policy)).
+
+### The wrapper
+
+`Wrap` returns nil for a nil device, so `CreateDevice` still refuses it. The wrapper it returns otherwise behaves as follows. A wrapper whose interface takes part in no rewrite passes every packet through.
+
+- `Write(bufs, offset)` decides each packet by the [rules](#what-the-rewriter-does-with-a-packet) below. Packets for Windows go to the wrapped device's `Write` in one call, in their order. A packet the rules translate is copied and queued for the device it leaves through. It returns `len(bufs)` and the wrapped device's error.
+- `Read(bufs, sizes, offset)` returns the next packets from two sources: what a goroutine of the wrapper reads from the wrapped device, one copy each, and the queue of translated packets. It blocks until a packet arrives, fills up to `len(bufs)` packets without blocking again, and returns an error wrapping `os.ErrClosed` once the device is closed.
+- The queue holds 512 packets. A packet that finds it full is dropped and counted as `queue_full`, so a slow device never blocks the device the packet came from.
+- `Close` closes the wrapped device, ends the goroutine, and forgets the name, every rewrite the interface took part in, as the source or as the mesh interface, and the flows of those rewrites. `MTU`, `Name`, `File`, `Events` and `BatchSize` are the wrapped device's.
+
+### Adding and removing a rewrite
+
+`AddMeshSourceRewrite(fromIface, meshIface)`:
+
+- It checks the mesh interface first. When `meshIface` names no device `Wrap` knows, it returns `bridge: add mesh source rewrite from "<from>" to "<mesh>": the mesh interface is no device of this process`, whatever `fromIface` names, so a rewriter that knows neither interface returns this error.
+- When `fromIface` names no such device, it returns nil and logs at Info `mesh source rewrite not needed, the interface is no device of this process` with `from_iface` and `mesh_iface`. A vendor client's adapter, such as Tailscale's, is such an interface.
+- A rewrite that exists for `fromIface` is left alone: it returns nil, logs at Debug `mesh source rewrite already present, idempotent success` and reads no address.
+- Otherwise it reads the IPv4 prefixes of both interfaces through the seam `addrs func(iface string) ([]netip.Prefix, error)`, in production `net.InterfaceByName` and its `Addrs`, the mesh interface's first. The first IPv4 address of the mesh interface is the mesh address. A failed read of either interface, or a mesh interface without an IPv4 address, returns `bridge: add mesh source rewrite from "<from>" to "<mesh>": address of the mesh interface: <cause>`: a failed read of the source interface's addresses carries the same suffix, and a mesh interface without one the cause `no IPv4 address`. None of these leaves a rewrite behind. The source interface may carry no address.
+
+`RemoveMeshSourceRewrite` forgets the rewrite of `fromIface` and its flows, and returns nil for an interface without one. `ResetMeshSourceRewrite` forgets every rewrite and returns nil: nothing of a rewrite outlives the process, so a start has nothing to remove. `plexd up` calls it through `CleanupUserAccess` at start, as on Linux and macOS.
+
+### What the rewriter does with a packet
+
+Only IPv4 is rewritten, as on Linux and macOS. The far end is the device or the site host behind a source interface, the remote the mesh address it talks to. All state sits under one mutex and reads time through the seam `now func() time.Time`. The rules are free of I/O.
+
+A packet wireguard-go writes to a source interface's device comes from the far end. wireguard-go has already checked its source against the peer's allowed IPs. The first row that applies decides:
+
+| # | Packet | What happens |
+|---|---|---|
+| A1 | No IPv4 packet, or its header length or total length does not fit its bytes | To Windows, unchanged |
+| A2 | The destination is the mesh address, lies in a prefix the source interface carries, lies in `224.0.0.0/4` or is `255.255.255.255` | To Windows |
+| A3 | It answers a flow the host sent through this interface: its addresses and ports, or echo id, are the reverse of a host flow, it is an ICMP error that quotes a packet of one, or it is a later fragment whose first fragment answered one and left a record naming that host flow | To Windows |
+| A4 | An ICMP error that quotes the reply of a translated flow of this interface | Outer source becomes the mesh address, the quoted destination the mesh address and mesh port. Queued for the mesh device |
+| A5 | A later fragment (fragment offset above 0) | With the record its first fragment left: source becomes the mesh address, queued for the mesh device. Without one: dropped, `fragment` |
+| A6 | Neither TCP, UDP nor an ICMP echo request | Dropped, `unsupported_protocol` |
+| A7 | TTL of 1 or 0 | Dropped, `ttl`. An ICMP time exceeded (type 11, code 0) goes from the mesh address to the far end |
+| A8 | Longer than the mesh device's `MTU()` | With DF: dropped without being counted under any reason, and an ICMP destination unreachable (type 3, code 4) that names that MTU goes from the mesh address to the far end. Without DF: dropped, `oversize` |
+| A9 | Anything else | Translated: source becomes the mesh address and the flow's mesh port (echo: mesh id), TTL minus 1, checksums updated. Queued for the mesh device. A first fragment leaves a fragment record |
+
+Right after A2, a packet that is no later fragment and whose TCP, UDP or ICMP header does not fit its bytes is dropped and counted as `unsupported_protocol`, the reason of A6, rather than handed to Windows: rows A3 and A4 need the header it cuts short, and Windows would forward it with the far end's own source. A packet of another protocol has no such header and goes on to A6.
+
+A packet wireguard-go writes to the mesh device comes from a mesh peer:
+
+| # | Packet | What happens |
+|---|---|---|
+| B1 | The destination is the mesh address, and protocol, destination port (echo reply: id), source address and source port are a translated flow's | Destination becomes the far end's address and port (echo reply: id), TTL minus 1, checksums updated. Queued for the flow's source interface. A first fragment leaves a fragment record. TTL of 1 or 0: dropped, `ttl`, with no ICMP time exceeded. Longer than that device's `MTU()`: as A8, the ICMP error to the mesh peer |
+| B2 | A later fragment to the mesh address with a fragment record | Destination becomes the far end's address. Queued for the flow's source interface |
+| B3 | An ICMP error to the mesh address that quotes a packet of a translated flow | Outer destination becomes the far end's address, the quoted source the far end's address and port. Queued for the flow's source interface |
+| B4 | Anything else, also a packet whose IPv4 header, total length or TCP, UDP or ICMP header does not fit its bytes, and a later fragment without a record | To Windows, unchanged |
+
+A TCP or UDP packet or an ICMP echo request that the host hands a source interface's device, which the wrapper reads from the wrapped device for `Read`, passes through and creates or refreshes a host flow of that interface. An echo reply creates none, and neither does a later fragment. That is how the reply to a connection a mesh node opened toward a site, which Windows forwarded out of the tunnel's link, is known in A3. A first fragment of such a reply leaves a record that names the host flow, so its later fragments go to Windows too.
+
+A far end therefore reaches the bridge itself and what a mesh peer's allowed IPs cover, and nothing else the Windows host routes: Windows gets only what rows A1 to A3 hand it, and on the mesh device wireguard-go drops a packet that no peer's allowed IPs cover.
+
+### Flows and mesh ports
+
+A translated flow is keyed by source interface, protocol, far end address, far end port or echo id, remote address and remote port. Its mesh port, or mesh id, lies in 32768 to 49151 and is unique per protocol, remote address and remote port, so two far ends that send from the same port to the same remote leave with different mesh ports. The search starts at a hash of the far end's address and port.
+
+The range lies below Windows' default dynamic ports, 49152 to 65535, so the host's own sockets on the mesh address do not draw from it. plexd does not guard a mesh port against a host socket that binds a number inside 32768 to 49151 explicitly: when such a socket talks to the same remote address and port as a translated flow that holds the same number, the remote's packets to it match the flow in B1 and go to the far end, and the socket receives none of them.
+
+A fragment record is keyed by the source address, destination address, protocol and IP identification the fragments arrive with, and names the flow: a translated flow, or the host flow a first fragment answered. A later fragment from a far end that arrives before its first finds no record and is dropped as `fragment` (A5); one from a mesh peer finds none either and goes to Windows (B4). The rewriter reassembles nothing.
+
+### Lifetimes
+
+An entry lives for the time below after its last packet. The values are netfilter's connection tracking defaults (`nf_conntrack_tcp_timeout_established` 432000, `nf_conntrack_udp_timeout` 30, `nf_conntrack_udp_timeout_stream` 120, `nf_conntrack_icmp_timeout` 30), so a flow lives about as long on a Windows bridge as on a Linux one.
+
+| Entry | Lifetime |
+|---|---|
+| TCP flow | 120 s until packets of both directions were seen, 432,000 s after that, 120 s once a FIN or RST was seen |
+| UDP flow | 30 s until both directions were seen, 120 s after |
+| ICMP echo flow | 30 s |
+| Fragment record | 30 s |
+
+An expired entry is removed when a lookup finds it, and by a sweep inside packet handling at most every 30 s. A TCP or UDP reply to a host flow that has expired is taken as opened by the far end (A9), as a Linux bridge masquerades a flow whose connection tracking entry has expired. An echo reply opens no flow, so one whose host flow has expired is dropped as `unsupported_protocol` (A6).
+
+### Limits of the rewrite
+
+- At most 65,536 translated flows and 65,536 host flows exist. A packet that would create one more, or finds no free mesh port, is dropped as `table_full`: a far end's packet in A9, or a packet the host sends through a source interface's device that would open a host flow. The limit bounds memory: one far end can fill the table, as it can fill a Linux bridge's connection tracking table.
+- At most 65,536 fragment records exist. A first fragment beyond the limit still translates, or still goes to Windows, but leaves no record, so its later fragments from a far end are dropped as `fragment` and those from a mesh peer go to Windows (B4).
+- Each wrapper queues at most 512 translated packets (see [The wrapper](#the-wrapper)).
+- Only TCP, UDP and ICMP echo are translated. Another protocol, an oversize packet without DF and a later fragment from a far end that arrives before its first are dropped and counted, where the Linux kernel carries, fragments or reassembles them.
+
+### Checksums and ICMP errors
+
+The IPv4 header checksum and the TCP and UDP checksums are updated incrementally (RFC 1624), so a fragment needs no reassembly. A UDP checksum of 0 stays 0, and one that the update turns into 0 is sent as `0xffff` (RFC 768). An ICMP echo's checksum is updated for its id. An ICMP error's checksum is recomputed over the message, the quoted header's checksum is recomputed, and the quoted transport checksum is left alone.
+
+An ICMP error plexd sends of its own (A7, A8 and B1) leaves with TTL 64, without DF and with IP identification 0, and quotes the offending packet's IP header and the first 8 bytes after it. plexd sends at most 100 per second, counted in a fixed window of one second that starts with the first error after the last window ended, and none for an ICMP error or a later fragment.
+
+### Drops and log lines
+
+Drops are counted per reason: `queue_full`, `fragment`, `unsupported_protocol`, `ttl`, `oversize` and `table_full`. Each reason is logged at Warn as `mesh source rewrite dropped packets` with `reason` and `count`, the number since the last line of that reason, at most once per 60 s per reason. The first drop of a reason, and a drop 60 s or more after that reason's last line, is logged at once. A drop within 60 s of the last line waits, and the waiting count is reported by the next packet the rewriter handles 60 s or more after that line, whatever that packet is. No log line carries a packet's content.
+
+The rewriter logs with `component=bridge`, in the wording of the Linux controller:
+
+| Level | Message | Keys |
+|---|---|---|
+| `Debug` | `mesh source rewrite added` | `from_iface`, `mesh_iface`, `mesh_addr` |
+| `Debug` | `mesh source rewrite already present, idempotent success` | `from_iface`, `mesh_iface` |
+| `Debug` | `mesh source rewrite removed`, `mesh source rewrite not found, idempotent success` | `from_iface`, `mesh_iface` |
+| `Debug` | `mesh source rewrites reset` | (none) |
+| `Info` | `mesh source rewrite not needed, the interface is no device of this process` | `from_iface`, `mesh_iface` |
+| `Warn` | `mesh source rewrite dropped packets` | `reason`, `count` |
+
+### Tests
+
+`meshrewrite_nat_test.go` drives the rows above with a fake clock, the lifetimes, the limits, the ICMP error budget and the checksums. `meshrewrite_test.go` covers the wrapper, the three methods and the drop lines, and `TestMeshRewriter_Devices` runs four wireguard-go devices in one process over channel tuns, with real UDP on `127.0.0.1`: the bridge's mesh device (`10.255.241.1`) and provider device (pool `10.255.242.0/24`) over `rewriter.Wrap`, node N (`10.255.241.2`) and device D (`10.255.242.2`, and `10.255.242.3` for two far ends on one source port). N's peer entry for the bridge allows `10.255.241.1/32` alone, so wireguard-go at N drops a packet that kept D's address, as a mesh node does. Both files run in `Run unit tests` on Linux, macOS and Windows.
+
+`TestMeshSourceRewrite_RealWintun` in `internal/bridge/meshrewrite_windows_test.go` proves the rewrite on real Wintun adapters, built by the production constructors, with WireGuard traffic between three wireguard-go far ends, and the NAT exemption of a tunnel's adapter with it. It skips unless `PLEXD_TEST_REAL_WINTUN=1`, `PLEXD_TEST_REAL_ROUTES=1` and `PLEXD_TEST_REAL_WFP=1` are set and the token is elevated. It is the only proof of either on Windows and runs in the step `Run real mesh source rewrite tests` (see [CI Workflow](../development/ci-workflow.md)).
+
 ## PeerConfig
 
 WireGuard-native peer configuration. Keys are raw bytes (decoded from base64).
