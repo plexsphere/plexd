@@ -40,9 +40,22 @@ type Manager struct {
 	meshPrefix netip.Prefix
 
 	// localPrefixes returns the prefixes of this host's interface addresses
-	// that a candidate may be on-link with. It returns nil, nil until
-	// SetLocalPrefixes replaces it.
+	// that a candidate may be on-link with. The reconcile handler reads it to
+	// order a peer's on-link candidates first, and endpoint selection reads it
+	// to find a local network that makes a relayed peer's direct entry on-link
+	// (see localNetworksChanged). It returns nil, nil until SetLocalPrefixes
+	// replaces it.
 	localPrefixes func() ([]netip.Prefix, error)
+
+	// localNets is the networks of endpoint selection's last successful read
+	// of localPrefixes, localAt when it last tried a read, localKnown whether
+	// a read has succeeded, and localFailing whether the last read failed (see
+	// localNetworksChanged). Only the endpoint selection goroutine touches
+	// them, so they need no lock.
+	localNets    []netip.Prefix
+	localAt      time.Time
+	localKnown   bool
+	localFailing bool
 
 	// now is endpoint selection's clock; tests replace it.
 	now func() time.Time
@@ -209,8 +222,10 @@ func (m *Manager) MeshPrefix() netip.Prefix {
 }
 
 // SetLocalPrefixes sets the function the reconcile handler reads this host's
-// interface prefixes from, to order a peer's on-link candidates first. Call
-// it before the handler runs.
+// interface prefixes from, to order a peer's on-link candidates first.
+// Endpoint selection reads it too, to try a relayed peer's direct entries
+// again when a local network makes one of them on-link. Call it before the
+// handler and RunEndpointSelection run.
 func (m *Manager) SetLocalPrefixes(fn func() ([]netip.Prefix, error)) {
 	m.localPrefixes = fn
 }
