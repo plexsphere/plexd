@@ -112,7 +112,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the twelve fields
+distinguishes a nil pointer from a populated block. None of the thirteen fields
 carry `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -129,8 +129,9 @@ carry `omitempty`.
 | `SigningKey`   | `*NodeStateSigningKey` | `"signing_key"`  | The key the node's Domain signs envelopes and session tokens with. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) means "keep the key you hold", never "drop it" |
 | `Hooks`        | `*[]NodeStateHook`     | `"hooks"`        | The published hook versions a rollout assigns the node, ordered by name ascending: the node's full desired set. A pointer, like `Secrets`: `[]` removes every rolled-out hook, and a `nil` value (the wire's `null`, which the control plane sends when it could not compute the set, or a pull from a control plane that predates the block and omits it) keeps every one |
 | `DNS`          | `*NodeStateDNS`        | `"dns"`          | The mesh DNS names of the node's Domain and the node's DNS forwarding setting: the full set, never a delta, which replaces the names the node answers. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the names and the forwarding the node holds |
+| `FailureDetection` | `json.RawMessage` | `"failure_detection"` | The Domain's failure-detection time, a `NodeStateFailureDetection`, carried raw like `Reachability` and decoded leniently by the WireGuard manager's dispatch handler, so a malformed block never fails the pull. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the value the node holds |
 
-Seven members are consumed on the dispatch seam rather than by the differ.
+Eight members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
@@ -145,6 +146,9 @@ to the installer on every successful pull (see `NodeStateHook` below).
 `dns` is never diffed either: the mesh resolver's dispatch handler builds the
 names it answers and the table it forwards with from it on every successful
 pull (see `NodeStateDNS` below).
+`failure_detection` is never diffed either: the WireGuard manager's
+`FailureDetectionDispatchHandler` decodes it on every successful pull and hands
+the time to the manager (see `NodeStateFailureDetection` below).
 `peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
 `policy` goes to both as well: the differ reports a new fingerprint as policy
@@ -679,6 +683,29 @@ record's type does not take.
 | `Weight`   | `*int`     | `"weight,omitempty"`    | `SRV`: 0 to 65535 |
 | `Port`     | `*int`     | `"port,omitempty"`      | `SRV`: 0 to 65535 |
 | `Text`     | `[]string` | `"text,omitempty"`      | `TXT`: at least one string, each of at most 255 bytes, answered in order |
+
+**NodeStateFailureDetection**
+
+The interior of the `failure_detection` block: the Domain's failure-detection
+time, as the "Failure detection" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. The envelope carries the block raw, and
+`wireguard.FailureDetectionDispatchHandler` decodes it on every successful
+pull. A `null` block keeps the value the node holds and logs nothing. A block
+`json.Unmarshal` refuses, such as a string or a `detect_after_seconds` of
+`15.5` or `"15"`, keeps it too and is logged at Warn as
+`wireguard: failure detection block malformed`, once until a block decodes
+again. A value of zero or less changes nothing. The handler clamps a positive
+value to 5 to 180 s (`wireguard.MinFailureDetection` and
+`wireguard.MaxFailureDetection`) and hands it to `Manager.SetFailureDetection`.
+A value outside 5 to 180 is logged at Warn as
+`wireguard: failure detection time out of range`, once until a block carries
+another value. See
+[Failure detection time](../networking/wireguard.md#failure-detection-time).
+
+| Field                | Type    | JSON Tag                 | Description                                         |
+|----------------------|---------|--------------------------|-----------------------------------------------------|
+| `DetectAfterSeconds` | `int64` | `"detect_after_seconds"` | How long a relayed peer may stay silent before plexd dials the next relay of its set: a whole number of seconds from 5 to 180, and 15 for a Domain that never set it. `int64` rather than `int`, so a value out of range decodes on a 32-bit build too and is clamped rather than refused as malformed. A block without the member, `{}`, reads as 0 and changes nothing |
 
 ### Supporting types
 

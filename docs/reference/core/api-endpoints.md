@@ -1569,6 +1569,9 @@ absence.
       ],
       "catch_all": ["10.1.2.53"]
     }
+  },
+  "failure_detection": {
+    "detect_after_seconds": 15
   }
 }
 ```
@@ -1656,10 +1659,14 @@ on it for about 270 s, and starts over after about 540 s. Only a relayed peer,
 one last seen connected over one of its relays, dials the standbys. Any other
 peer walks its order only up to and including the first relay.
 
-plexd never switches a peer connected on a direct path. A peer that runs over a
-relay and received nothing for one trial gets a probe through the tunnel.
-plexd dials the next relay of a relayed peer's set, on a fresh WireGuard
-session, when nothing comes back from the probe within 15 s, when the handshake
+plexd never switches a peer connected on a direct path. On a node that holds no
+failure-detection time, a peer that runs over a relay and received nothing for
+one trial gets a probe through the tunnel, and plexd dials the next relay of the
+peer's set, on a fresh WireGuard session, when nothing comes back from the probe
+within 15 s. A node that holds one (see `failure_detection` below) probes each
+relayed peer on every pass, silent or not, and dials the next relay once the
+peer has been silent for the time less one pass, 14 to 15 s after its last
+packet at the default 15 s. plexd also dials the next relay when the handshake
 goes stale, or when a relay's hold passes without a handshake. The next relay
 after the last is the first, and for a set of one it is the same relay again.
 Both sides of a pair hold the same set and detect a dead relay in the same
@@ -1680,9 +1687,12 @@ of the node's own local networks makes one of them on-link. A pull that adds
 such an entry and takes the relay away runs the retry first and ends it on the
 pull's first relay. The retry tries each direct entry for 10 s on a fresh
 WireGuard session, which cuts the relayed one, and a handshake over a direct
-entry leaves the relay. A retry that fails costs the pair 10 to 15 s per entry,
-about 1 min with four entries and up to 2 min 15 s with nine, and about 5 s
-more for the handshake back over the relay. A relayed peer also walks its
+entry leaves the relay. With the 5 s pass of a node that holds no
+failure-detection time, a retry that fails costs the pair 10 to 15 s per entry,
+about 1 min with four entries and up to 2 min 15 s with nine. With the 1 s pass
+of the default 15 s, it costs 10 to 11 s per entry, up to 44 s with four
+entries and 1 min 39 s with nine. Either way the handshake back over the relay
+takes about 5 s more. A relayed peer also walks its
 direct entries again when the pull drops every relay or the peer, its key
 rotates, plexd restarts, or WireGuard roamed it to a direct path that then
 failed. A plexd that predates `fallback_endpoints` dials only
@@ -1690,7 +1700,8 @@ failed. A plexd that predates `fallback_endpoints` dials only
 side fails over only when the control plane names a new first relay.
 See [Dial order](../networking/wireguard.md#dial-order),
 [Endpoint selection](../networking/wireguard.md#endpoint-selection),
-[Relay liveness probe](../networking/wireguard.md#relay-liveness-probe) and
+[Relay liveness probe](../networking/wireguard.md#relay-liveness-probe),
+[Failure detection time](../networking/wireguard.md#failure-detection-time) and
 [Direct retry](../networking/wireguard.md#direct-retry).
 
 `bridge.relay` asks a bridge to relay WireGuard for the pairs that hold it
@@ -2034,6 +2045,37 @@ or `localhost`, a record of a type it does not answer, or a loopback resolver,
 and logs `mesh dns skipped invalid entries` at Warn. The block is
 not desired state for the differ: the reconcile snapshot neither stores nor
 compares it. See [Mesh DNS](../networking/mesh-dns.md).
+
+`failure_detection` carries the Domain's failure-detection time, as the
+"Failure detection" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. `detect_after_seconds` is a whole number of seconds from 5 to
+180, and 15 for a Domain that never set it. It is how long a relayed peer may
+stay silent before plexd dials the next relay of the peer's set. A peer on a
+direct path is never watched. A plexd whose WireGuard interface came up reads
+the block on every successful pull, drift or not. No event carries a change,
+so a new value reaches the node with its next pull, within one reconcile
+interval (60 s by default), or sooner on a triggered pull. plexd does not
+persist the value: the first pull after a start delivers it again. The block is
+not desired state for the differ: the reconcile snapshot neither stores nor
+compares it. See
+[Failure detection time](../networking/wireguard.md#failure-detection-time).
+
+plexd decodes the block leniently, so a malformed block never fails the pull
+that carries the peers and the policy. `null`, or a key missing because the
+control plane predates the block, means the control plane did not say: plexd
+keeps the value of the last pull that carried one, and a node that never
+received one keeps the built-in timing, one trial of silence and a 15 s probe.
+A block plexd cannot decode, such as a string or a `detect_after_seconds` of
+`15.5` or `"15"`, changes nothing and is logged at Warn as
+`wireguard: failure detection block malformed`, once until a block decodes
+again. A `detect_after_seconds` of zero or less, `{}` included, changes nothing.
+A value from 1 to 4 applies 5 s, and one above 180 applies 180 s. plexd logs
+each of these values at Warn as `wireguard: failure detection time out of range`
+with `detect_after_seconds`, and with `applied` when it applied a bound, once
+until a block carries another value. A value that changes the time in force is
+logged at Info as `wireguard: failure detection time set` with `detect_after`,
+`previous` and `pass`.
 
 ## Secrets
 
