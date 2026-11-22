@@ -3,14 +3,90 @@ package wireguard
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
 )
+
+// FailureDetectionDispatchHandler returns a reconcile.DispatchHandler that
+// hands the failure-detection time of every successful pull to mgr (see
+// Manager.SetFailureDetection). The block is decoded here rather than in
+// FetchState, and leniently, as the reachability block is: a malformed tuning
+// value must not fail the pull that carries the peers and the policy.
+//
+// Per pull:
+//   - An absent block or a null changes nothing and logs nothing: the node
+//     keeps the value of its last pull that carried one.
+//   - A block json.Unmarshal refuses, such as a string or a fractional
+//     detect_after_seconds, changes nothing and logs wireguard: failure
+//     detection block malformed at Warn, once until a block decodes again.
+//   - A detect_after_seconds of zero or less, {} included, changes nothing.
+//     A value from 1 to 4 applies MinFailureDetection, and one above 180
+//     applies MaxFailureDetection. The integer is bounded before it is
+//     multiplied by time.Second, so no value overflows a time.Duration.
+//     Each logs wireguard: failure detection time out of range at Warn, once
+//     per run of the same raw value; a value from 5 to 180 ends the run.
+//   - A value in range, clamped or not, goes to SetFailureDetection, which
+//     logs the value when it changed.
+//
+// The state lives in the closure, which only the reconcile goroutine enters,
+// so it needs no lock.
+func FailureDetectionDispatchHandler(mgr *Manager) reconcile.DispatchHandler {
+	const (
+		minSeconds = int64(MinFailureDetection / time.Second)
+		maxSeconds = int64(MaxFailureDetection / time.Second)
+	)
+	var (
+		malformedLogged bool
+		outOfRange      bool  // the last block that decoded held a value out of range
+		outOfRangeRaw   int64 // that value, logged once for its run
+	)
+	return func(_ context.Context, desired *api.NodeStateSnapshot) {
+		if desired == nil || len(desired.FailureDetection) == 0 {
+			return
+		}
+		var block *api.NodeStateFailureDetection
+		if err := json.Unmarshal(desired.FailureDetection, &block); err != nil {
+			if !malformedLogged {
+				mgr.logger.Warn("wireguard: failure detection block malformed",
+					"component", "wireguard",
+					"error", err,
+				)
+				malformedLogged = true
+			}
+			return
+		}
+		// A literal null decodes to a nil block: like an absent key, it says
+		// nothing about the value.
+		if block == nil {
+			return
+		}
+		malformedLogged = false
+
+		raw := block.DetectAfterSeconds
+		seconds := min(max(raw, minSeconds), maxSeconds)
+		if raw == seconds {
+			outOfRange = false
+		} else if !outOfRange || raw != outOfRangeRaw {
+			attrs := []any{"component", "wireguard", "detect_after_seconds", raw}
+			if raw > 0 {
+				attrs = append(attrs, "applied", time.Duration(seconds)*time.Second)
+			}
+			mgr.logger.Warn("wireguard: failure detection time out of range", attrs...)
+			outOfRange, outOfRangeRaw = true, raw
+		}
+		if raw <= 0 {
+			return
+		}
+		mgr.SetFailureDetection(time.Duration(seconds) * time.Second)
+	}
+}
 
 // EdgePSKLookup returns the edge PSK fetched for a peer, keyed by the peer's
 // node ID and the public key it was fetched for. A PSK fetched for another key

@@ -1254,6 +1254,12 @@ func runAgent(ctx context.Context) error {
 	// need the same device and are skipped on the same condition, so this one
 	// line accounts for all five.
 	if wgReady {
+		// The Domain's failure-detection time is taken on every pull, drift
+		// or not, and tunes endpoint selection's relay watch (step 17b). A
+		// pull without the block keeps the value the last one carried, and a
+		// node that never received one keeps the built-in timing.
+		reconciler.RegisterDispatchHandler(wireguard.FailureDetectionDispatchHandler(wgMgr))
+
 		// The typed lookup keeps the interface a true nil when edge PSKs are
 		// off, as the rotator's device variable does.
 		var psksLookup wireguard.EdgePSKLookup
@@ -1444,9 +1450,10 @@ func runAgent(ctx context.Context) error {
 
 	// 17b. Start endpoint selection. It tries each peer's dial order until a
 	// handshake completes, reading the same device as the handshake reporter.
-	// A peer connected over its relay that falls silent is probed with a
-	// datagram the host routes into the mesh interface, so a relay that
-	// stopped forwarding is dialed again within about a minute.
+	// A peer connected over its relay is probed with a datagram the host
+	// routes into the mesh interface, so a relay that stopped forwarding is
+	// dialed again within the Domain's failure-detection time, or within
+	// about a minute when the control plane sends none.
 	if wgReady {
 		wgMgr.SetRelayProbe(wireguard.SendRelayProbe)
 		wg.Add(1)
