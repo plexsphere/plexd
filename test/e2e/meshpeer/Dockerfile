@@ -4,8 +4,10 @@
 # the state fixture's peer 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2: the phase gives
 # its wg0 a key pair of its own and the edge PSK the mock derives for that peer,
 # peers it with plexd, and probes plexd's policy enforcement through the tunnel
-# with nc. openssl derives the PSK, ss tells when a listener is up. Like the
-# plexd container it needs CAP_NET_ADMIN and the host's wireguard module.
+# with nc. openssl derives the PSK, ss tells when a listener is up, and socat
+# holds UDP port 9 in step (d1), so the probes plexd sends meet a socket and
+# draw no ICMP answer. Like the plexd container it needs CAP_NET_ADMIN and the
+# host's wireguard module.
 #
 # The systemd suite's public ingress phase runs the same image, without
 # CAP_NET_ADMIN, as the ingress rules' target: openssl serves TLS on three
