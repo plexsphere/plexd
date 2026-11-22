@@ -3017,3 +3017,394 @@ func TestSelectEndpoints_EveryRelaySharesTheFirstRelaysHold(t *testing.T) {
 	requireLogLine(t, logs.String(), "wireguard: still no handshake over the relay, dialing it again",
 		"peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR1, "trial=1m0s")
 }
+
+// ---------------------------------------------------------------------------
+// Local network trigger
+// ---------------------------------------------------------------------------
+
+// localOrder is the dial order of the local network tests: a direct entry no
+// local network of the tests holds, a direct entry the network 10.0.0.0/24
+// makes on-link, and the relay.
+var localOrder = []string{"198.51.100.7:51820", "10.0.0.5:51820", "203.0.113.1:51820"}
+
+// localOrdered gives p the dial order localOrder with its last entry as the
+// Fallback. It is relayedManager's mutate for these tests.
+func localOrdered(p *api.Peer) {
+	p.Endpoints = slices.Clone(localOrder)
+	p.Endpoint = localOrder[0]
+	p.Fallbacks = []string{localOrder[2]}
+}
+
+// localUpdate returns node-a keyed with b64 and ordered localOrder with
+// 172.31.4.9:51820 in front: a pull that adds a direct entry, which starts a
+// direct retry for a relayed peer.
+func localUpdate(b64 string) api.Peer {
+	p := orderedPeer("node-a", b64, "172.31.4.9:51820", localOrder[0], localOrder[1], localOrder[2])
+	p.Fallbacks = []string{localOrder[2]}
+	return p
+}
+
+// localNetworks parses cidrs, and returns nil for none.
+func localNetworks(cidrs ...string) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, c := range cidrs {
+		prefixes = append(prefixes, netip.MustParsePrefix(c))
+	}
+	return prefixes
+}
+
+// localReader is a local prefix function for SetLocalPrefixes: read returns
+// prefixes and err and counts its calls.
+type localReader struct {
+	prefixes []netip.Prefix
+	err      error
+	calls    int
+}
+
+func (r *localReader) read() ([]netip.Prefix, error) {
+	r.calls++
+	return r.prefixes, r.err
+}
+
+// localPasses runs a selection pass every EndpointSelectionInterval from
+// from to to, both included, as RunEndpointSelection does.
+func localPasses(t *testing.T, mgr *Manager, clock *fakeClock, from, to time.Duration) {
+	t.Helper()
+	for after := from; after <= to; after += EndpointSelectionInterval {
+		passAt(t, mgr, clock, after)
+	}
+}
+
+// A local network that makes a direct entry of a relayed peer on-link starts
+// a direct retry at the first read after the network appears, one
+// localNetworksInterval after the baseline read at 30 s. The retry tries the
+// on-link entry first and ends on the relay the peer is connected over.
+func TestSelectEndpoints_LocalNetworkChangeStartsADirectRetry(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, localOrdered)
+	reader := &localReader{prefixes: localNetworks("10.0.0.9/24")}
+	mgr.SetLocalPrefixes(reader.read)
+	before := len(deviceWrites(ctrl))
+
+	passAt(t, mgr, clock, 55*time.Second)
+	if reader.calls != 0 {
+		t.Fatalf("reads at 55 s = %d, want none within 30 s of the read at 30 s", reader.calls)
+	}
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Fatalf("device writes at 55 s = %v, want none", got)
+	}
+
+	passAt(t, mgr, clock, 60*time.Second)
+	if reader.calls != 1 {
+		t.Fatalf("reads at 60 s = %d, want 1", reader.calls)
+	}
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + localOrder[1]}; !slices.Equal(got, want) {
+		t.Fatalf("device writes at 60 s = %v, want %v", got, want)
+	}
+	st := mgr.dial["node-a"]
+	if want := []string{localOrder[0]}; !slices.Equal(st.retry, want) || st.retryRelay != localOrder[2] {
+		t.Errorf("state = retry %v, retryRelay %q; want %v, %q", st.retry, st.retryRelay, want, localOrder[2])
+	}
+	out := logs.String()
+	requireLogLine(t, out, "wireguard: trying the direct endpoints again",
+		"level=INFO", "peer_id=node-a", "reason=local_networks", "endpoint="+localOrder[1], "entries=2", "relay="+localOrder[2])
+	requireLogLine(t, out, "wireguard: local networks changed", "level=DEBUG", "networks=[10.0.0.0/24]")
+}
+
+// A read that makes no direct entry on-link starts no retry: a network that
+// holds no entry, a host prefix, which makes nothing on-link, an IPv6 network
+// for IPv4 entries, no prefixes at all, and a new address in the network the
+// baseline read found, which is no change.
+func TestSelectEndpoints_LocalNetworkChangeWithoutANewOnLinkEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		prefixes []netip.Prefix
+		changed  bool // the networks differ from the baseline's
+	}{
+		{"another network", localNetworks("192.168.1.9/24"), true},
+		{"a host prefix", localNetworks("10.0.0.9/32"), false},
+		{"an IPv6 network", localNetworks("2001:db8::9/64"), true},
+		{"no prefixes", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			mgr, ctrl, clock, _ := relayedManager(t, &logs, localOrdered)
+			reader := &localReader{prefixes: tc.prefixes}
+			mgr.SetLocalPrefixes(reader.read)
+			before := len(deviceWrites(ctrl))
+
+			localPasses(t, mgr, clock, 35*time.Second, 120*time.Second)
+			if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+				t.Errorf("device writes up to 120 s = %v, want none", got)
+			}
+			if reader.calls != 3 {
+				t.Errorf("reads up to 120 s = %d, want 3, at 60 s, 90 s and 120 s", reader.calls)
+			}
+			want := 0
+			if tc.changed {
+				want = 1
+			}
+			if got := len(logLines(logs.String(), "wireguard: local networks changed")); got != want {
+				t.Errorf("local networks changed lines = %d, want %d:\n%s", got, want, logs.String())
+			}
+		})
+	}
+
+	t.Run("a new address in the baseline network", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+		reader := &localReader{prefixes: localNetworks("10.0.0.9/24")}
+		mgr.SetLocalPrefixes(reader.read)
+		key, b64 := testKey(0x0a)
+		peer := keyedPeer("node-a", b64)
+		localOrdered(&peer)
+		if err := mgr.AddPeer(peer); err != nil {
+			t.Fatalf("AddPeer: %v", err)
+		}
+		passAt(t, mgr, clock, 30*time.Second) // the baseline, 10.0.0.0/24
+		reader.prefixes = localNetworks("10.0.0.77/24")
+		ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(31*time.Second), 100)}
+		passAt(t, mgr, clock, 31*time.Second)
+		if st := mgr.dial["node-a"]; !st.connected || !st.relayed {
+			t.Fatalf("after the handshake over the relay connected = %v, relayed = %v, want both", st.connected, st.relayed)
+		}
+		before := len(deviceWrites(ctrl))
+
+		localPasses(t, mgr, clock, 35*time.Second, 120*time.Second)
+		if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+			t.Errorf("device writes up to 120 s = %v, want none", got)
+		}
+		if reader.calls != 4 {
+			t.Errorf("reads up to 120 s = %d, want 4, at 30 s, 60 s, 90 s and 120 s", reader.calls)
+		}
+		if got := logLines(logs.String(), "wireguard: local networks changed"); len(got) != 0 {
+			t.Errorf("local networks changed lines = %v, want none", got)
+		}
+	})
+}
+
+// Only a relayed peer, or one in a direct retry, retries when a local
+// network changes: a peer connected on the entry the new network makes
+// on-link and a peer that never connected get no fresh device peer.
+func TestSelectEndpoints_LocalNetworkChangeLeavesOtherPeersAlone(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+	keyA, b64A := testKey(0x0a)
+	keyB, b64B := testKey(0x0b)
+	keyC, b64C := testKey(0x0c)
+	for _, p := range []struct{ id, b64 string }{{"node-a", b64A}, {"node-b", b64B}, {"node-c", b64C}} {
+		peer := keyedPeer(p.id, p.b64)
+		localOrdered(&peer)
+		if err := mgr.AddPeer(peer); err != nil {
+			t.Fatalf("AddPeer(%s): %v", p.id, err)
+		}
+	}
+	passAt(t, mgr, clock, 30*time.Second)
+	// node-a connects over the relay, node-b on 10.0.0.5:51820, which the walk
+	// programmed at 30 s, and node-c never connects.
+	handshake := selectionStart.Add(31 * time.Second)
+	ctrl.stats = []PeerStat{relayStat(keyA, handshake, 100), directStat(keyB, handshake, 100), {PublicKey: keyC}}
+	passAt(t, mgr, clock, 31*time.Second)
+	a, b, c := mgr.dial["node-a"], mgr.dial["node-b"], mgr.dial["node-c"]
+	if !a.connected || !a.relayed || !b.connected || b.relayed || c.connected {
+		t.Fatalf("after 31 s node-a connected %v relayed %v, node-b connected %v relayed %v, node-c connected %v; want true true, true false, false",
+			a.connected, a.relayed, b.connected, b.relayed, c.connected)
+	}
+	reader := &localReader{prefixes: localNetworks("10.0.0.9/24")}
+	mgr.SetLocalPrefixes(reader.read)
+	removes := len(ctrl.callsFor("RemovePeer"))
+
+	passAt(t, mgr, clock, 60*time.Second)
+	var removed [][]byte
+	for _, call := range ctrl.callsFor("RemovePeer")[removes:] {
+		removed = append(removed, call.Args[1].([]byte))
+	}
+	if len(removed) != 1 || !bytes.Equal(removed[0], keyA[:]) {
+		t.Errorf("RemovePeer keys at 60 s = %x, want node-a's %x alone", removed, keyA)
+	}
+	for _, id := range []string{"node-b", "node-c"} {
+		if st := mgr.dial[id]; st.retrying() {
+			t.Errorf("%s is in a direct retry, want none", id)
+		}
+		for _, line := range logLines(logs.String(), "wireguard: trying the direct endpoints again") {
+			if slices.Contains(strings.Fields(line), "peer_id="+id) {
+				t.Errorf("%s logged a direct retry: %s", id, line)
+			}
+		}
+	}
+	if st := mgr.dial["node-b"]; !st.connected || st.relayed {
+		t.Errorf("node-b connected = %v, relayed = %v, want true, false", st.connected, st.relayed)
+	}
+}
+
+// A direct entry that failed a retry starts none when a local network makes
+// it on-link within directRetryMemory: the retry the update at 40 s started
+// tried all three direct entries by 70 s, so 10.0.0.5:51820 is remembered
+// when the read at 90 s finds 10.0.0.0/24.
+func TestSelectEndpoints_LocalNetworkChangeSkipsARememberedEntry(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, localOrdered)
+	_, b64 := testKey(0x0a)
+	before := len(deviceWrites(ctrl))
+
+	clock.Set(selectionStart.Add(40 * time.Second))
+	if err := mgr.UpdatePeer(localUpdate(b64)); err != nil {
+		t.Fatalf("UpdatePeer: %v", err)
+	}
+	localPasses(t, mgr, clock, 45*time.Second, 70*time.Second)
+	want := []string{
+		"remove", "add 172.31.4.9:51820",
+		"remove", "add " + localOrder[0],
+		"remove", "add " + localOrder[1],
+		"remove", "add " + localOrder[2],
+	}
+	if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, want) {
+		t.Fatalf("device writes of the retry = %v, want %v", got, want)
+	}
+	st := mgr.dial["node-a"]
+	if !st.relayed || st.retrying() {
+		t.Fatalf("after the retry relayed = %v, retryRelay = %q; want true, empty", st.relayed, st.retryRelay)
+	}
+	for _, e := range []string{"172.31.4.9:51820", localOrder[0], localOrder[1]} {
+		if _, ok := st.tried[e]; !ok {
+			t.Fatalf("tried = %v, want it to hold %s", st.tried, e)
+		}
+	}
+
+	ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(71*time.Second), 100)}
+	passAt(t, mgr, clock, 71*time.Second)
+	if st := mgr.dial["node-a"]; !st.connected || !st.relayed {
+		t.Fatalf("after the handshake over the relay at 71 s connected = %v, relayed = %v, want both", st.connected, st.relayed)
+	}
+
+	reader := &localReader{prefixes: localNetworks("10.0.0.9/24")}
+	mgr.SetLocalPrefixes(reader.read)
+	before = len(deviceWrites(ctrl))
+	localPasses(t, mgr, clock, 75*time.Second, 90*time.Second)
+	if reader.calls != 1 {
+		t.Fatalf("reads up to 90 s = %d, want 1, at 90 s", reader.calls)
+	}
+	requireLogLine(t, logs.String(), "wireguard: local networks changed", "level=DEBUG", "networks=[10.0.0.0/24]")
+	localPasses(t, mgr, clock, 95*time.Second, 120*time.Second)
+	if got := deviceWrites(ctrl)[before:]; slices.Contains(got, "remove") {
+		t.Errorf("device writes from 75 s to 120 s = %v, want no remove", got)
+	}
+}
+
+// A failed read starts nothing and keeps the networks of the last read that
+// succeeded. It logs at Warn, then at Debug while the reads keep failing,
+// and at Warn again after a read succeeded. The read at 120 s compares with
+// the baseline of 30 s and starts the retry.
+func TestSelectEndpoints_LocalNetworkReadFailure(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, localOrdered)
+	boom := errors.New("nat: list interfaces: boom")
+	reader := &localReader{err: boom}
+	mgr.SetLocalPrefixes(reader.read)
+	before := len(deviceWrites(ctrl))
+	const msg = "wireguard: read local networks failed"
+	levels := func() []string {
+		var got []string
+		for _, line := range logLines(logs.String(), msg) {
+			for _, f := range strings.Fields(line) {
+				if level, ok := strings.CutPrefix(f, "level="); ok {
+					got = append(got, level)
+				}
+			}
+		}
+		return got
+	}
+
+	passAt(t, mgr, clock, 60*time.Second)
+	if got := levels(); !slices.Equal(got, []string{"WARN"}) {
+		t.Fatalf("%q levels at 60 s = %v, want [WARN]", msg, got)
+	}
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Fatalf("device writes at 60 s = %v, want none", got)
+	}
+	passAt(t, mgr, clock, 90*time.Second)
+	if got := levels(); !slices.Equal(got, []string{"WARN", "DEBUG"}) {
+		t.Fatalf("%q levels at 90 s = %v, want [WARN DEBUG]", msg, got)
+	}
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Fatalf("device writes at 90 s = %v, want none", got)
+	}
+
+	reader.prefixes, reader.err = localNetworks("10.0.0.9/24"), nil
+	passAt(t, mgr, clock, 120*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + localOrder[1]}; !slices.Equal(got, want) {
+		t.Fatalf("device writes at 120 s = %v, want %v", got, want)
+	}
+
+	reader.err = boom
+	passAt(t, mgr, clock, 150*time.Second)
+	if got := levels(); !slices.Equal(got, []string{"WARN", "DEBUG", "WARN"}) {
+		t.Errorf("%q levels at 150 s = %v, want [WARN DEBUG WARN]", msg, got)
+	}
+	for _, line := range logLines(logs.String(), msg) {
+		if !strings.Contains(line, `error="nat: list interfaces: boom"`) {
+			t.Errorf("%q line without the read's error: %s", msg, line)
+		}
+	}
+}
+
+// A local network change during a direct retry starts the retry over: the
+// entry that became on-link first, then the other entries that are not
+// remembered, the one in its window included, and it ends on the relay the
+// running retry ends on.
+func TestSelectEndpoints_LocalNetworkChangeDuringADirectRetry(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, localOrdered)
+	_, b64 := testKey(0x0a)
+	before := len(deviceWrites(ctrl))
+
+	clock.Set(selectionStart.Add(58 * time.Second))
+	if err := mgr.UpdatePeer(localUpdate(b64)); err != nil {
+		t.Fatalf("UpdatePeer: %v", err)
+	}
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add 172.31.4.9:51820"}; !slices.Equal(got, want) {
+		t.Fatalf("device writes of the update = %v, want %v", got, want)
+	}
+	if !mgr.dial["node-a"].retrying() {
+		t.Fatal("the update at 58 s started no direct retry")
+	}
+	reader := &localReader{prefixes: localNetworks("10.0.0.9/24")}
+	mgr.SetLocalPrefixes(reader.read)
+	before = len(deviceWrites(ctrl))
+
+	passAt(t, mgr, clock, 60*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + localOrder[1]}; !slices.Equal(got, want) {
+		t.Fatalf("device writes at 60 s = %v, want %v", got, want)
+	}
+	st := mgr.dial["node-a"]
+	if want := []string{"172.31.4.9:51820", localOrder[0]}; !slices.Equal(st.retry, want) || st.retryRelay != localOrder[2] {
+		t.Errorf("state = retry %v, retryRelay %q; want %v, %q", st.retry, st.retryRelay, want, localOrder[2])
+	}
+	requireLogLine(t, logs.String(), "wireguard: trying the direct endpoints again",
+		"peer_id=node-a", "reason=local_networks", "endpoint="+localOrder[1], "entries=3", "relay="+localOrder[2])
+}
+
+// networksOf keeps the networks of its prefixes, masked, sorted and without
+// duplicates, and leaves out a host prefix.
+func TestNetworksOf(t *testing.T) {
+	got := networksOf(localNetworks("10.0.0.9/24", "10.0.0.77/24", "10.0.0.9/32", "2001:db8::9/64"))
+	if want := localNetworks("10.0.0.0/24", "2001:db8::/64"); !slices.Equal(got, want) {
+		t.Errorf("networksOf = %v, want %v", got, want)
+	}
+	if got := networksOf(nil); len(got) != 0 {
+		t.Errorf("networksOf(nil) = %v, want an empty result", got)
+	}
+}
+
+// onLinkFirst moves the on-link entries to the front and keeps each group in
+// its order. A hostname is not on-link.
+func TestOnLinkFirst(t *testing.T) {
+	local := localNetworks("10.0.0.9/24")
+	got := onLinkFirst([]string{"198.51.100.7:51820", "relay.example:51820", "10.0.0.5:51820"}, local)
+	if want := []string{"10.0.0.5:51820", "198.51.100.7:51820", "relay.example:51820"}; !slices.Equal(got, want) {
+		t.Errorf("onLinkFirst = %v, want %v", got, want)
+	}
+	if got := onLinkFirst([]string{}, local); len(got) != 0 {
+		t.Errorf("onLinkFirst of an empty slice = %v, want an empty result", got)
+	}
+}

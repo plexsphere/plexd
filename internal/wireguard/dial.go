@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -59,6 +60,13 @@ const directRetryTimeout = 10 * time.Second
 // It also keeps a second pull within the window from trying again what the
 // first retry just tried.
 const directRetryMemory = 10 * time.Minute
+
+// localNetworksInterval is how often, at most, endpoint selection reads the
+// local prefixes to find a network that makes a relayed peer's direct entry
+// on-link (see Manager.localNetworksChanged). A read every 30 s finds a new
+// network soon enough for a pair that would otherwise wait for a restart, on
+// every platform and without a watcher for interface changes.
+const localNetworksInterval = 30 * time.Second
 
 // dialState is one peer's endpoint selection: the peer as last written, the
 // position in its dial order of the endpoint programmed on the device (after a
@@ -408,6 +416,87 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 	return false
 }
 
+// onLinkFirst returns entries with those on-link with local (see isOnLink)
+// moved to the front, each group in its order. An entry that is not an
+// address and port, such as a hostname, is not on-link.
+func onLinkFirst(entries []string, local []netip.Prefix) []string {
+	var onLink, offLink []string
+	for _, e := range entries {
+		if ap, err := netip.ParseAddrPort(e); err == nil && isOnLink(ap.Addr(), local) {
+			onLink = append(onLink, e)
+		} else {
+			offLink = append(offLink, e)
+		}
+	}
+	return append(onLink, offLink...)
+}
+
+// networksOf returns the networks prefixes name: each prefix shorter than a
+// host prefix, masked, sorted by address and then by length, without
+// duplicates. A host prefix (/32 or /128) is left out, because it makes
+// nothing on-link (see isOnLink). nil and an empty slice give an empty
+// result.
+func networksOf(prefixes []netip.Prefix) []netip.Prefix {
+	nets := []netip.Prefix{}
+	for _, p := range prefixes {
+		if p.IsValid() && p.Bits() < p.Addr().BitLen() {
+			nets = append(nets, p.Masked())
+		}
+	}
+	slices.SortFunc(nets, func(a, b netip.Prefix) int {
+		if c := a.Addr().Compare(b.Addr()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Bits(), b.Bits())
+	})
+	return slices.Compact(nets)
+}
+
+// localNetworksChanged reads the local networks through localPrefixes, at
+// most once per localNetworksInterval, and reports whether they changed
+// since the last successful read, with the networks before and after. It
+// compares networks, not addresses (see networksOf), so a new address inside
+// a known network is no change. The first successful read is the baseline
+// and reports no change. A failed read logs wireguard: read local networks
+// failed, at Warn the first time and at Debug while the reads keep failing,
+// keeps the networks it had and reports no change; the next read follows one
+// interval later. Only the endpoint selection goroutine calls it.
+func (m *Manager) localNetworksChanged(now time.Time) (old, cur []netip.Prefix, changed bool) {
+	if !m.localAt.IsZero() && now.Sub(m.localAt) < localNetworksInterval {
+		return nil, nil, false
+	}
+	m.localAt = now
+	prefixes, err := m.localPrefixes()
+	if err != nil {
+		level := slog.LevelWarn
+		if m.localFailing {
+			level = slog.LevelDebug
+		}
+		m.logger.Log(context.Background(), level, "wireguard: read local networks failed",
+			"component", "wireguard",
+			"error", err,
+		)
+		m.localFailing = true
+		return nil, nil, false
+	}
+	m.localFailing = false
+	cur = networksOf(prefixes)
+	if !m.localKnown {
+		m.localKnown = true
+		m.localNets = cur
+		return nil, nil, false
+	}
+	if slices.Equal(cur, m.localNets) {
+		return nil, nil, false
+	}
+	m.logger.Debug("wireguard: local networks changed",
+		"component", "wireguard",
+		"networks", cur,
+	)
+	old, m.localNets = m.localNets, cur
+	return old, cur, true
+}
+
 // selectEndpoints runs one pass of endpoint selection over every peer it
 // tracks, in node-ID order. A peer whose latest handshake is younger than
 // connectedHandshakeAge is connected, and its device endpoint is left alone,
@@ -435,10 +524,14 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // the next entry on a fresh device peer, and after the last one dials the
 // relay the retry ends on (see stepRetry). A handshake ends the retry, and
 // the device endpoint decides, as for any peer that turns connected, whether
-// the peer is relayed.
+// the peer is relayed. The pass starts a retry too, for a relayed peer or one
+// in a retry, when the local networks changed so that a direct entry of the
+// peer that is not remembered became on-link (see retryOnLink).
 //
 // The device is read before mu is taken. A read error, ErrPeerStatsUnsupported
-// included, is returned unchanged with no state touched. A failed switch of
+// included, is returned unchanged with no state touched. The local networks
+// are read after the device and before mu is taken, at most once per
+// localNetworksInterval (see localNetworksChanged). A failed switch of
 // the walk is logged, leaves the peer on the entry still programmed, and is
 // joined into the returned error; its next attempt waits that entry's full
 // trial again. A failed relay re-dial is logged and joined the same way, but
@@ -453,6 +546,7 @@ func (m *Manager) selectEndpoints() error {
 	if err != nil {
 		return err
 	}
+	old, cur, changed := m.localNetworksChanged(m.now())
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -469,6 +563,15 @@ func (m *Manager) selectEndpoints() error {
 	var errs []error
 	for _, nodeID := range slices.Sorted(maps.Keys(m.dial)) {
 		st := m.dial[nodeID]
+		if changed && (st.relayed || st.retrying()) {
+			attempted, err := m.retryOnLink(nodeID, st, old, cur, now)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if attempted {
+				continue
+			}
+		}
 		stat, isFresh := fresh[nodeID]
 		// The device was read before mu was taken, so UpdatePeer may have
 		// replaced the device peer since. A handshake older than that belongs
@@ -662,6 +765,50 @@ func (m *Manager) restoreRelay(nodeID string, st *dialState, roamed string) erro
 		"endpoint", endpoint,
 	)
 	return nil
+}
+
+// retryOnLink starts a direct retry for st, a relayed peer or one in a
+// retry, when the local networks changed from old to cur so that a direct
+// entry of st that is not remembered is on-link with cur and was not with
+// old. The retry tries every direct entry that is not remembered, those
+// on-link with cur first, each group in the order st holds, and ends on the
+// relay a running retry ends on, or on the relay st has programmed. It
+// reports whether it wrote. A failed write is logged and wrapped like a
+// failed switch and leaves st as it was, and this change starts no retry
+// again. Callers hold m.mu.
+func (m *Manager) retryOnLink(nodeID string, st *dialState, old, cur []netip.Prefix, now time.Time) (bool, error) {
+	newlyOnLink := func(e string) bool {
+		ap, err := netip.ParseAddrPort(e)
+		return err == nil && isOnLink(ap.Addr(), cur) && !isOnLink(ap.Addr(), old) && !st.remembered(e, now)
+	}
+	if !slices.ContainsFunc(st.direct(), newlyOnLink) {
+		return false, nil
+	}
+	entries := onLinkFirst(st.untried(now), cur)
+	relay := st.retryRelay
+	if relay == "" {
+		relay = st.endpoint()
+	}
+	next, err := m.retryDirect(st.peer, entries, relay, st.tried, now)
+	if err != nil {
+		m.logger.Warn("wireguard: endpoint switch failed",
+			"component", "wireguard",
+			"peer_id", nodeID,
+			"endpoint", entries[0],
+			"error", err,
+		)
+		return true, fmt.Errorf("wireguard: switch endpoint of peer %s: %w", nodeID, err)
+	}
+	m.dial[nodeID] = next
+	m.logger.Info("wireguard: trying the direct endpoints again",
+		"component", "wireguard",
+		"peer_id", nodeID,
+		"reason", "local_networks",
+		"endpoint", entries[0],
+		"entries", len(entries),
+		"relay", relay,
+	)
+	return true, nil
 }
 
 // stepRetry runs one pass of a direct retry for st (see
