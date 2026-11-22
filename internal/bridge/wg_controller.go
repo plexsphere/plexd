@@ -3,10 +3,12 @@ package bridge
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"syscall"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
@@ -41,6 +43,13 @@ type wgOps struct {
 // A second create for the same name fails: DarwinController and
 // WindowsController return an error wrapping os.ErrExist, which is what
 // EEXIST is for the Linux netlink controllers.
+//
+// A listen port another socket holds fails with an error wrapping
+// ErrListenPortInUse besides its cause. wireguard-go binds the port when it
+// brings the device up, inside the wrapped CreateInterface, and the bind's
+// EADDRINUSE arrives wrapped. Windows reports a taken port as WSAEADDRINUSE,
+// which Go does not equate with syscall.EADDRINUSE, so a taken port is a
+// plain failure there.
 func (o *wgOps) create(name string, privateKey []byte, listenPort int, address string) error {
 	key, err := wgtypes.NewKey(privateKey)
 	if err != nil {
@@ -48,6 +57,9 @@ func (o *wgOps) create(name string, privateKey []byte, listenPort int, address s
 	}
 
 	if err := o.wg.CreateInterface(name, key[:], listenPort); err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return fmt.Errorf("bridge: %s: create interface %s: %w: %w", o.prefix, name, ErrListenPortInUse, err)
+		}
 		return fmt.Errorf("bridge: %s: create interface %s: %w", o.prefix, name, err)
 	}
 
@@ -182,6 +194,22 @@ func (o *wgOps) osName(name string) (string, bool) {
 		return name, true
 	}
 	return namer.OSInterfaceName(name)
+}
+
+// osInterfaceName returns the name the operating system knows the interface
+// created under name by: the name ctrl reports when it implements
+// wireguard.OSInterfaceNamer and finds the interface, and name in every other
+// case, a nil ctrl, one without a namer or one that does not find it. The
+// managers hand this name to forwarding, the mesh source rewrite and the
+// routes, which reach sysctl, pf and route(8) on macOS, and keep name for
+// everything that goes through plexd.
+func osInterfaceName(ctrl any, name string) string {
+	if namer, ok := ctrl.(wireguard.OSInterfaceNamer); ok {
+		if osName, found := namer.OSInterfaceName(name); found {
+			return osName
+		}
+	}
+	return name
 }
 
 // resolveEndpoint turns a host:port endpoint into an address:port literal

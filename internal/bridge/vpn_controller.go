@@ -43,7 +43,8 @@ type VPNController interface {
 	//
 	// A failure after the interface exists removes it again. A listen port
 	// another socket holds fails with an error wrapping ErrListenPortInUse
-	// where the implementation can tell; NetlinkVPNController does.
+	// where the implementation can tell: NetlinkVPNController does, and
+	// WGVPNController does over the utun controller on macOS.
 	//
 	// Not idempotent: a name that already exists fails with an error wrapping
 	// os.ErrExist, which is what EEXIST is on Linux. The caller owns the

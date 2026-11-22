@@ -33,7 +33,10 @@ var utunNameRE = regexp.MustCompile(`^utun[0-9]+$`)
 //
 // The unnumbered subtest records the reason plexd up puts an address on a
 // site-to-site utun: route(8) refuses an on-link route over a utun that has
-// none.
+// none. The access subtest also proves what the user access manager relies
+// on: the kernel name the controller reports, the address and on-link route
+// of a provider's utun, and that a port another utun holds reads
+// ErrListenPortInUse.
 //
 // CI runs it in its own privileged step on the macOS runner.
 func TestWGControllers_RealUTUN(t *testing.T) {
@@ -192,10 +195,9 @@ func TestWGControllers_RealUTUN(t *testing.T) {
 			}
 		})
 
-		// The access controller exposes no name mapping of its own: nothing
-		// hands the access interface back to the operating system on macOS.
-		// The utun the create made is asserted through the controller it wraps.
-		osName, ok := wg.OSInterfaceName(name)
+		// The user access manager hands this name to forwarding, the mesh
+		// source rewrite and the routes.
+		osName, ok := ctrl.OSInterfaceName(name)
 		if !ok || !utunNameRE.MatchString(osName) {
 			t.Fatalf("OSInterfaceName(%q) = (%q, %v), want a utunN name", name, osName, ok)
 		}
@@ -219,6 +221,44 @@ func TestWGControllers_RealUTUN(t *testing.T) {
 
 		if err := ctrl.RemoveInterface(name); err != nil {
 			t.Errorf("second RemoveInterface = %v, want nil", err)
+		}
+
+		// A provider's utun carries the first address of its pool and the
+		// on-link route for the pool, which the replies to its devices take.
+		// 10.255.252.0/24 holds the /30 of TestDarwinRouteController_Real,
+		// which runs in this package one test at a time and removes its
+		// route.
+		const (
+			addressed     = "plexd-accaddr"
+			taken         = "plexd-acctaken"
+			addressedPort = 51993
+		)
+		if err := ctrl.CreateInterface(addressed, testPrivateKey(t), addressedPort, "10.255.252.1/24"); err != nil {
+			t.Fatalf("CreateInterface(%q): %v", addressed, err)
+		}
+		t.Cleanup(func() { _ = ctrl.RemoveInterface(addressed) })
+
+		addressedOS, ok := ctrl.OSInterfaceName(addressed)
+		if !ok || !utunNameRE.MatchString(addressedOS) {
+			t.Fatalf("OSInterfaceName(%q) = (%q, %v), want a utunN name", addressed, addressedOS, ok)
+		}
+		link, err := net.InterfaceByName(addressedOS)
+		if err != nil {
+			t.Fatalf("InterfaceByName(%q): %v", addressedOS, err)
+		}
+		if !hasAddr(t, link, "10.255.252.1") {
+			t.Errorf("%s does not carry 10.255.252.1", addressedOS)
+		}
+		if iface, ok := routeGetInterface(t, "10.255.252.2"); !ok || iface != addressedOS {
+			t.Errorf("route -n get 10.255.252.2 names interface %q (found %v), want %s", iface, ok, addressedOS)
+		}
+
+		// wireguard-go binds the port as it brings the device up, so a second
+		// utun cannot take the port the first one holds.
+		err = ctrl.CreateInterface(taken, testPrivateKey(t), addressedPort, "")
+		t.Cleanup(func() { _ = ctrl.RemoveInterface(taken) })
+		if !errors.Is(err, ErrListenPortInUse) {
+			t.Errorf("CreateInterface(%q) on port %d = %v, want an error wrapping ErrListenPortInUse", taken, addressedPort, err)
 		}
 	})
 }

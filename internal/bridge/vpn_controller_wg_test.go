@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -158,10 +159,27 @@ func TestWGVPNController_CreateTunnelInterfaceErrors(t *testing.T) {
 		if !errors.Is(err, fakeErr) {
 			t.Errorf("errors.Is(err, fakeErr) = false, want true")
 		}
+		if errors.Is(err, ErrListenPortInUse) {
+			t.Errorf("errors.Is(err, ErrListenPortInUse) = true for %v, want false", err)
+		}
 		for _, method := range []string{"ConfigureAddress", "SetInterfaceUp", "DeleteInterface"} {
 			if calls := fake.wgCallsFor(method); len(calls) != 0 {
 				t.Errorf("%s calls = %d, want 0", method, len(calls))
 			}
+		}
+	})
+
+	t.Run("create fails on a taken port", func(t *testing.T) {
+		fake := &fakeWGController{createInterfaceErr: takenPortErr()}
+		c := NewWGVPNController(fake, testVPNAddress, discardLogger())
+
+		err := c.CreateTunnelInterface(testVPNIface, testPrivateKey(t), testVPNPort)
+		wantWGErrPrefix(t, err, "bridge: vpn: create interface wg-s2s-0: listen port in use:")
+		if !errors.Is(err, ErrListenPortInUse) {
+			t.Errorf("errors.Is(err, ErrListenPortInUse) = false for %v, want true", err)
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Errorf("errors.Is(err, syscall.EADDRINUSE) = false for %v, want true", err)
 		}
 	})
 
