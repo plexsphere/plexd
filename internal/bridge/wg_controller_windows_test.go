@@ -11,8 +11,10 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -194,12 +196,11 @@ func TestWGControllers_RealWintun(t *testing.T) {
 // The mesh and the peer of TestPeerRoutes_RealWintun. No other test that runs
 // against Windows uses these prefixes, so the routes cannot collide.
 const (
-	peerRoutesInterface  = "plexd-peerrt"
-	peerRoutesListenPort = 51994
-	peerRoutesMeshIP     = "10.99.0.1"
-	peerRoutesMeshCIDR   = "10.99.0.0/24"
-	peerRoutesPeerIP     = "10.99.0.2"
-	peerRoutesSubnet     = "10.20.0.0/16"
+	peerRoutesInterface = "plexd-peerrt"
+	peerRoutesMeshIP    = "10.99.0.1"
+	peerRoutesMeshCIDR  = "10.99.0.0/24"
+	peerRoutesPeerIP    = "10.99.0.2"
+	peerRoutesSubnet    = "10.20.0.0/16"
 )
 
 // TestPeerRoutes_RealWintun proves the peer routes on Windows without
@@ -214,6 +215,10 @@ const (
 // does. It creates an adapter and alters the routing table, so it runs only
 // when both PLEXD_TEST_REAL_WINTUN and PLEXD_TEST_REAL_ROUTES are set. CI runs
 // it in the Wintun step, which fails unless it passed.
+//
+// The manager listens on a port from freeUDPPort. A fixed one, 51994, was
+// refused once on a windows-latest runner, with the error a bind gets inside
+// a UDP port reservation.
 func TestPeerRoutes_RealWintun(t *testing.T) {
 	if os.Getenv("PLEXD_TEST_REAL_WINTUN") != "1" || os.Getenv("PLEXD_TEST_REAL_ROUTES") != "1" {
 		t.Skip("set PLEXD_TEST_REAL_WINTUN=1 and PLEXD_TEST_REAL_ROUTES=1 to create a real Wintun adapter and route over it")
@@ -225,7 +230,8 @@ func TestPeerRoutes_RealWintun(t *testing.T) {
 	prefix := netip.MustParsePrefix(peerRoutesSubnet)
 
 	ctrl := wireguard.NewWindowsController(discardLogger())
-	mgr := wireguard.NewManager(ctrl, wireguard.Config{InterfaceName: peerRoutesInterface, ListenPort: peerRoutesListenPort}, discardLogger())
+	listenPort := freeUDPPort(t)
+	mgr := wireguard.NewManager(ctrl, wireguard.Config{InterfaceName: peerRoutesInterface, ListenPort: listenPort}, discardLogger())
 	mgr.SetPeerRouter(NewWindowsRouteController(discardLogger(), nil))
 	identity := &registration.NodeIdentity{
 		NodeID:         "node-peer-routes",
@@ -234,7 +240,7 @@ func TestPeerRoutes_RealWintun(t *testing.T) {
 		PrivateKey:     testPrivateKey(t),
 	}
 	if err := mgr.Setup(ctx, identity); err != nil {
-		t.Fatalf("Setup: %v", err)
+		t.Fatalf("Setup on listen port %d: %v", listenPort, err)
 	}
 	// Teardown removes the peer route the test leaves behind, then the
 	// adapter.
@@ -325,4 +331,120 @@ func uapiDump(t *testing.T, path string) string {
 		t.Fatalf("read uapi: %v", err)
 	}
 	return string(buf[:n])
+}
+
+// freeUDPPort returns a UDP port the kernel hands out on port 0, taken for
+// IPv4 on every address, as wireguard-go takes its own on a listen port of 0,
+// and released again. The test cannot pass 0 on: NewManager reads it as the
+// default port. On port 0 Windows leaves out the ports the host reserved for
+// UDP and those in use, so the number binds again unless another process
+// takes that one port of the 16384 dynamic ones before the caller does.
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		t.Fatalf("ListenUDP on port 0: %v", err)
+	}
+	defer func() { _ = udp.Close() }()
+	return udp.LocalAddr().(*net.UDPAddr).Port
+}
+
+// reservedUDPPorts is how many neighbouring ports reserveUDPPorts reserves.
+// The windows-latest runner boots with reservations of that size, two side by
+// side for UDP on most boots, at a place that differs from boot to boot.
+const reservedUDPPorts = 100
+
+// reserveUDPPorts makes a persistent UDP port reservation of reservedUDPPorts
+// neighbouring dynamic ports and returns the first of them. The test's
+// cleanup deletes it. A bind of a reserved port for UDP fails with WSAEACCES
+// for everyone but the holder of the reservation's token. It takes the ports
+// from 51900 when they and the port before them bind, which holds 51994, the
+// port TestPeerRoutes_RealWintun listened on until a runner refused it.
+func reserveUDPPorts(t *testing.T) int {
+	t.Helper()
+
+	free := func(first int) bool {
+		for port := first - 1; port < first+reservedUDPPorts; port++ {
+			udp, err := net.ListenUDP("udp4", &net.UDPAddr{Port: port})
+			if err != nil {
+				return false
+			}
+			_ = udp.Close()
+		}
+		return true
+	}
+	iphlpapi := windows.NewLazySystemDLL("iphlpapi.dll")
+	// Both calls take the first port in network byte order.
+	htons := func(port int) uintptr { return uintptr(uint16(port)<<8 | uint16(port)>>8) }
+	for first := 51900; first < 64000; first += 2 * reservedUDPPorts {
+		if !free(first) {
+			continue
+		}
+		var token uint64
+		if rc, _, _ := iphlpapi.NewProc("CreatePersistentUdpPortReservation").Call(htons(first), reservedUDPPorts, uintptr(unsafe.Pointer(&token))); rc != 0 {
+			t.Fatalf("CreatePersistentUdpPortReservation(%d, %d) = %v", first, reservedUDPPorts, syscall.Errno(rc))
+		}
+		t.Cleanup(func() {
+			if rc, _, _ := iphlpapi.NewProc("DeletePersistentUdpPortReservation").Call(htons(first), reservedUDPPorts); rc != 0 {
+				t.Errorf("DeletePersistentUdpPortReservation(%d, %d) = %v", first, reservedUDPPorts, syscall.Errno(rc))
+			}
+		})
+		udp, err := net.ListenUDP("udp4", &net.UDPAddr{Port: first})
+		if !errors.Is(err, windows.WSAEACCES) {
+			if err == nil {
+				_ = udp.Close()
+			}
+			t.Fatalf("ListenUDP on the reserved port %d = %v, want an error wrapping %v", first, err, error(windows.WSAEACCES))
+		}
+		return first
+	}
+	t.Fatalf("no %d neighbouring ports between 51900 and 64000 are free for UDP", reservedUDPPorts)
+	return 0
+}
+
+// windUDPPickBefore takes UDP ports from the kernel until it has handed out
+// the port before the reserved ports that start at first, so the next UDP
+// bind on port 0 is the one that meets them. It fails the test when the
+// kernel hands out a reserved port.
+func windUDPPickBefore(t *testing.T, first int) {
+	t.Helper()
+
+	// Two laps of the 16384 dynamic ports.
+	for range 2 * 16384 {
+		switch port := freeUDPPort(t); {
+		case port >= first && port < first+reservedUDPPorts:
+			t.Fatalf("the kernel handed out UDP port %d, one of the reserved ports %d to %d", port, first, first+reservedUDPPorts-1)
+		case port == first-1:
+			return
+		}
+	}
+	t.Fatalf("the kernel's UDP pick never reached %d, the port before the reserved ports", first-1)
+}
+
+// TestPeerRoutes_RealWintunAtReservedUDPPorts pins that
+// TestPeerRoutes_RealWintun gets a listen port while the host holds ports
+// reserved for UDP and the kernel's UDP pick has reached them. The
+// windows-latest runner boots with such reservations, and the test failed
+// there on its fixed port 51994 with "wireguard: setup: wireguard: create
+// interface: up: An attempt was made to access a socket in a way forbidden
+// by its access permissions."
+//
+// It reserves ports of the host, and a reservation outlives a killed test and
+// a reboot, so it needs PLEXD_TEST_REAL_PORT_RESERVATION=1 on top of the
+// gates of TestPeerRoutes_RealWintun. It moves the kernel's UDP pick, which
+// every process of the host shares, so no other test may run beside it: CI
+// runs it in the port reservation step.
+func TestPeerRoutes_RealWintunAtReservedUDPPorts(t *testing.T) {
+	if os.Getenv("PLEXD_TEST_REAL_PORT_RESERVATION") != "1" {
+		t.Skip("set PLEXD_TEST_REAL_PORT_RESERVATION=1 to reserve UDP ports on this host")
+	}
+	if os.Getenv("PLEXD_TEST_REAL_WINTUN") != "1" || os.Getenv("PLEXD_TEST_REAL_ROUTES") != "1" {
+		t.Skip("set PLEXD_TEST_REAL_WINTUN=1 and PLEXD_TEST_REAL_ROUTES=1 to create a real Wintun adapter and route over it")
+	}
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("reserving UDP ports, creating a Wintun adapter and altering routes need Administrator")
+	}
+	windUDPPickBefore(t, reserveUDPPorts(t))
+	t.Run("peer routes", TestPeerRoutes_RealWintun)
 }
