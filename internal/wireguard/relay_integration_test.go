@@ -861,6 +861,84 @@ func TestRelayIntegration_PairFailsOverToTheStandbyOnItsOwn(t *testing.T) {
 	}
 }
 
+// TestRelayIntegration_FailureDetectionMovesThePairToTheStandby connects two
+// Managers that both hold a failure-detection time of 5 s over relay E, the
+// first of their relay set E, F. Each probes its peer on every pass, so a pair
+// left idle on a live relay counts the other's packets and stays on it. Once
+// E stops, neither counts anything, and each dials F when its peer has been
+// silent for 4 s, with no probe verdict and no update in between.
+func TestRelayIntegration_FailureDetectionMovesThePairToTheStandby(t *testing.T) {
+	t.Parallel()
+	relayLogs := &logBuffer{}
+	dumpOnFailure(t, relayLogs)
+	const (
+		silentLine     = "wireguard: relayed peer silent past the failure detection time, dialing the relay again"
+		unansweredLine = "wireguard: relayed peer did not answer the probe, dialing the relay again"
+	)
+
+	a := newMeshNode(t, "node-a", "10.99.0.1")
+	b := newMeshNode(t, "node-b", "10.99.0.2")
+	relayE, e := startRelay(t, relayLogs, "E", a, b)
+	_, f := startRelay(t, relayLogs, "F", a, b)
+
+	for _, n := range []*meshNode{a, b} {
+		if d, changed := n.mgr.SetFailureDetection(5 * time.Second); d != 5*time.Second || !changed {
+			t.Fatalf("%s: SetFailureDetection(5s) = %v, %t, want 5s, true", n.id, d, changed)
+		}
+		n.mgr.SetRelayProbe(n.sendProbe)
+		n.startSelection()
+	}
+
+	if err := a.mgr.AddPeer(b.peerOnSet(e, f)); err != nil {
+		t.Fatalf("%s: AddPeer(%s): %v", a.id, b.id, err)
+	}
+	if err := b.mgr.AddPeer(a.peerOnSet(e, f)); err != nil {
+		t.Fatalf("%s: AddPeer(%s): %v", b.id, a.id, err)
+	}
+	pingBoth(t, a, b, 1, 20*time.Second)
+	waitSelectedRelayed(t, a, b)
+	waitSelectedRelayed(t, b, a)
+
+	// Idle on a live relay: nothing crosses but the keepalives and the
+	// probes, and each node counts the other's every pass.
+	time.Sleep(20 * time.Second)
+	for _, n := range []*meshNode{a, b} {
+		if logged(n.logs.String(), silentLine) {
+			t.Fatalf("%s: logged %q while the pair sat idle on the live relay E", n.id, silentLine)
+		}
+	}
+
+	if err := relayE.Stop(); err != nil {
+		t.Fatalf("relay E: Stop: %v, want nil", err)
+	}
+	// No handshake completes over E once it stopped, so one later than this
+	// that the device reports at F's address went through F.
+	stoppedAt := time.Now()
+	relayF := netip.MustParseAddrPort(f)
+	overF := func(n, partner *meshNode) bool {
+		s, ok := deviceStat(t, n, partner)
+		return ok && s.LastHandshake.After(stoppedAt) && deviceEndpoint(s) == relayF
+	}
+	if !waitFor(15*time.Second, func() bool { return overF(a, b) && overF(b, a) }) {
+		t.Fatalf("after 15s a handshake over F later than E's stop: %s = %t, %s = %t, want both",
+			a.id, overF(a, b), b.id, overF(b, a))
+	}
+	t.Logf("both nodes handshook over the standby relay after %v", time.Since(stoppedAt).Round(time.Millisecond))
+
+	pingBoth(t, a, b, 2, 10*time.Second)
+
+	for _, n := range []struct{ node, partner *meshNode }{{a, b}, {b, a}} {
+		log := n.node.logs.String()
+		fields := []string{"peer_id=" + n.partner.id, "from=" + e, "endpoint=" + f}
+		if !logged(log, silentLine, fields...) {
+			t.Errorf("%s: no %q line with %v", n.node.id, silentLine, fields)
+		}
+		if logged(log, unansweredLine) {
+			t.Errorf("%s: logged %q, want the failure-detection time to decide", n.node.id, unansweredLine)
+		}
+	}
+}
+
 // TestRelayIntegration_ResumedRelayLeavesThePairAlone freezes relay F under a
 // connected pair behind a relayFront. Unanswered data makes each node's
 // WireGuard send initiations, which queue on the frozen relay, and each Manager
