@@ -20,6 +20,10 @@
 #   - A direct retry on the kernel device: a pull that adds a direct endpoint
 #     moves relayed fixture peer ...a0b2, meshpeer, off its relay (phase 12e
 #     step d1)
+#   - The failure-detection time from the state pull: the served 15 s holds
+#     relayed meshpeer, a kernel WireGuard peer that sends nothing on its own
+#     (phase 12e step d1), and spliced values are set, kept across a null
+#     block and clamped (phase 12f)
 #   - Mesh MTU sized from the uplink probe and held by the device (same
 #     skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
@@ -1272,8 +1276,9 @@ fi
 # path.
 #
 # The fallback is then held for 30s too before the order starts over, and each
-# switch lands on a 5s selection tick, so the switch onto 203.0.113.1:51820
-# comes back every 60 to 70s. The phase waits for the next one and, while plexd
+# switch lands on the next selection pass, 1s apart under the 15s
+# failure-detection time the mock serves, so the switch onto 203.0.113.1:51820
+# comes back every 60 to 62s. The phase waits for the next one and, while plexd
 # holds the peer on that relay, has the mock name 203.0.113.2:51820 as the
 # peer's fallback and nudges a pull. plexd must move the peer to the new relay
 # at once, logging "relay fallback changed, moving to the new relay", and must
@@ -1336,7 +1341,9 @@ else
     # Read line by line and match with case, as in phase 4c: no grep -q in a
     # pipeline. By now the switch has usually been logged already; the 75s cover
     # the first entry's 30s timeout, counted from the pull that programmed it,
-    # with room for the 5s selection tick and a slow start.
+    # with room for the selection pass and a slow start. The passes are 1s apart
+    # under the 15s failure-detection time the mock serves, once the first pull
+    # set it, and 5s apart before that.
     SWITCH_TIMEOUT=75
     SWITCH_ELAPSED=0
     SWITCH_FOUND=0
@@ -1364,10 +1371,12 @@ else
     # Wait for the next switch onto the fallback: it starts a 30s hold on the
     # relay, and the new fallback must arrive inside it. The waits below run on
     # the wall clock, and each loop reads the log once more at its deadline.
-    # One cycle of the order is at most 70s (two 30s trials, each ending on
-    # the next 5s tick), and a switch just before the baseline means a full
-    # cycle, so the wait covers 70s plus the 2s poll and a pull's worth of
-    # slack.
+    # One cycle of the order is at most 62s (two 30s trials, each ending on
+    # the next selection pass, 1s apart under the 15s the mock serves), and a
+    # switch just before the baseline means a full cycle, so the wait covers
+    # 62s plus the 2s poll and a pull's worth of slack. It also covers the 70s
+    # a cycle takes on a node that holds no failure-detection time, whose
+    # passes are 5s apart.
     RELAY_LOGS=$(dc logs plexd 2>/dev/null || true)
     RELAY_HOLDS_BEFORE=$(count_log_lines "${RELAY_LOGS}" "trying next endpoint candidate" "${FIXTURE_PEER_B1}" "203.0.113.1:51820")
     RELAY_FAILS_BEFORE=$(count_log_lines "${RELAY_LOGS}" "endpoint switch failed" "${FIXTURE_PEER_B1}")
@@ -5409,11 +5418,14 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # Step (d1) follows the handshake at once and runs the direct retry on the
 # kernel device. meshpeer gains a second address on e2e-net, and the peer is
 # spliced to carry no endpoint and meshpeer's first address as its
-# fallback_endpoint, so the next selection pass marks it relayed. A splice that
-# adds the second address as its endpoint then makes plexd log "wireguard:
-# trying the direct endpoints again" with reason=pull and "wireguard: endpoint
-# selected" with relayed=false for that address within 30 s, and meshpeer
-# reports a later handshake. The rest of the phase runs over that tunnel.
+# fallback_endpoint, so the next selection pass marks it relayed. For the next
+# 32 s plexd probes it on every pass and must not dial the relay again for
+# silence, which proves the 15 s failure-detection time the mock serves against
+# a peer that sends nothing on its own. A splice that adds the second address
+# as its endpoint then makes plexd log "wireguard: trying the direct endpoints
+# again" with reason=pull and "wireguard: endpoint selected" with
+# relayed=false for that address within 30 s, and meshpeer reports a later
+# handshake. The rest of the phase runs over that tunnel.
 #
 # The phase runs before Phase 13, which replaces the fixture, and ends by
 # serving the saved peers and policy again. Like Phase 12d it needs kernel
@@ -5886,7 +5898,7 @@ wait_direct_retry_line() {
             return 0
         fi
         if [ $((SECONDS - MESH_RETRY_START)) -ge 30 ]; then
-            fail "[direct retry] 30s after the splice that added endpoint ${MESH_SECOND_ENDPOINT} to peer ...a0b2, which came 12s after the splice that made ${MESHPEER_IP}:51820 its relay, the plexd log holds ${n} '${msg}' line(s) with $*, want more than ${base}"
+            fail "[direct retry] 30s after the splice that added endpoint ${MESH_SECOND_ENDPOINT} to peer ...a0b2, which came 32s after the splice that made ${MESHPEER_IP}:51820 its relay, the plexd log holds ${n} '${msg}' line(s) with $*, want more than ${base}"
         fi
         sleep 2
     done
@@ -5997,8 +6009,9 @@ echo "  PASS: [mesh policy] meshpeer completed a handshake with plexd $((SECONDS
 # and meshpeer's first address as its fallback_endpoint, so the address plexd
 # is connected at becomes its relay. A splice that adds the second address as
 # its endpoint makes plexd try that on a fresh device peer, which completes a
-# handshake there and leaves the relay. The step follows (d) at once, so the
-# session (d) waited for is far younger than the 120 s at which meshpeer, its
+# handshake there and leaves the relay. The step still follows (d) at once, so
+# even with the 32 s wait below and the 30 s the retry may take, the session
+# step (d) waited for is younger than the 120 s at which meshpeer, its
 # initiator, starts a rekey. That rekey leaves from meshpeer's first address,
 # and plexd would answer it there and be back on the relay. The peer is not
 # restored: steps (e) to (h) run over the tunnel as before, and step (i)
@@ -6037,14 +6050,42 @@ case "${MESH_SECOND_LEN}" in
 esac
 echo "  meshpeer's eth0 holds ${MESH_SECOND_IP}/${MESH_SECOND_LEN} beside ${MESHPEER_IP}"
 
-# The address plexd is connected at becomes the peer's relay, and the next
-# selection pass marks the peer relayed. No log line shows that mark for a
-# peer that stays connected, so the step waits a fixed 12 s: two pass
-# intervals of 5 s plus 2 s.
+# The address plexd is connected at becomes the peer's relay. The next
+# selection pass, 1 s apart under the 15 s failure-detection time the mock
+# serves, marks the peer relayed, and from then plexd probes it on every pass.
+# No log line shows that mark for a peer that stays connected, but the direct
+# retry below starts only for a relayed peer, so its line shows the mark held.
+# meshpeer is a kernel WireGuard peer with no plexd, set up in step (c) with a
+# 5 s persistent keepalive, which plexd's probes keep pushing out. A socket on
+# its UDP port 9, the relay probe port, takes the probes, so its kernel answers
+# none of them with an ICMP port unreachable, as it would for a closed port.
+# meshpeer then sends nothing on its own and answers only through its 10 s
+# keepalive timer, up to 10 s plus one pass apart, inside the 14 s silence
+# window. The step waits 32 s, more than twice that window, and a silence
+# re-dial for the peer in the wait fails the step. That proves the 15 s
+# default against a peer that sends nothing on its own. The socket goes after
+# the wait, because step (g) listens on port 9 itself.
+MESH_SILENCE_MSG='msg="wireguard: relayed peer silent past the failure detection time, dialing the relay again"'
+dc exec -d -T meshpeer socat -u UDP4-RECV:9 /dev/null \
+    || fail "[direct retry] could not start a socket on UDP port 9 in meshpeer"
+await_listening "direct retry" meshpeer_udp_listening 9 yes
+MESH_SILENCE_LOG=$(dc logs plexd 2>&1) || fail "[direct retry] dc logs plexd failed: ${MESH_SILENCE_LOG}"
+MESH_SILENCE_BASE=$(count_log_lines "${MESH_SILENCE_LOG}" "${MESH_SILENCE_MSG}" "peer_id=${FIXTURE_PEER_B2}")
 splice_state "direct-retry-relay" \
     '.peers |= map(if .node_id == $v.id then del(.endpoint) | .fallback_endpoint = $v.relay else . end)' \
     "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg relay "${MESHPEER_IP}:51820" '{id: $id, relay: $relay}')"
-sleep 12
+sleep 32
+MESH_SILENCE_LOG=$(dc logs plexd 2>&1) || fail "[direct retry] dc logs plexd failed: ${MESH_SILENCE_LOG}"
+MESH_SILENCE=$(count_log_lines "${MESH_SILENCE_LOG}" "${MESH_SILENCE_MSG}" "peer_id=${FIXTURE_PEER_B2}")
+if [ "${MESH_SILENCE}" -gt "${MESH_SILENCE_BASE}" ]; then
+    fail "[direct retry] in the 32s after the splice that made ${MESHPEER_IP}:51820 the relay of peer ...a0b2, plexd logged $((MESH_SILENCE - MESH_SILENCE_BASE)) 'wireguard: relayed peer silent past the failure detection time, dialing the relay again' line(s) for it (${MESH_SILENCE_BASE} before the splice): meshpeer, a kernel WireGuard peer that sends nothing on its own, did not answer plexd's probes inside the 14s silence window of the 15s failure-detection time"
+fi
+if ! meshpeer_udp_listening 9; then
+    fail "[direct retry] the socket on UDP port 9 in meshpeer no longer listened after the 32s wait, so meshpeer may have answered plexd's probes with an ICMP port unreachable, and the wait without a silence re-dial proves nothing about its keepalive timer"
+fi
+dc exec -T meshpeer pkill -f "socat -u UDP4-RECV:9" >/dev/null 2>&1 || true
+await_listening "direct retry" meshpeer_udp_bound 9 no
+echo "  PASS: [direct retry] plexd logged no silence re-dial for peer ...a0b2 in the 32s after the splice that made ${MESHPEER_IP}:51820 its relay, with a socket on meshpeer's UDP port 9 taking the probes"
 
 MESH_RETRY_KEYS=("peer_id=${FIXTURE_PEER_B2}" reason=pull "endpoint=${MESH_SECOND_ENDPOINT}")
 MESH_SELECTED_KEYS=("peer_id=${FIXTURE_PEER_B2}" "endpoint=${MESH_SECOND_ENDPOINT}" relayed=false)
@@ -6075,7 +6116,7 @@ while :; do
         break
     fi
     if [ $((SECONDS - MESH_RETRY_START)) -ge 30 ]; then
-        fail "[direct retry] 30s after the splice that added endpoint ${MESH_SECOND_ENDPOINT} to peer ...a0b2, which came 12s after the splice that made ${MESHPEER_IP}:51820 its relay, meshpeer's latest handshake with plexd is at ${MESH_HS_TIME}, want one later than ${MESH_HS_BEFORE}, the one before the splice; wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
+        fail "[direct retry] 30s after the splice that added endpoint ${MESH_SECOND_ENDPOINT} to peer ...a0b2, which came 32s after the splice that made ${MESHPEER_IP}:51820 its relay, meshpeer's latest handshake with plexd is at ${MESH_HS_TIME}, want one later than ${MESH_HS_BEFORE}, the one before the splice; wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
     fi
     sleep 2
 done
@@ -6295,6 +6336,160 @@ fi
 echo "  PASS: [mesh policy status] the mock refused none of plexd's policy status reports in this phase"
 
 echo "=== Phase 12e PASSED: policy enforcement on the mesh interface ==="
+
+# ===================================================================
+# Phase 12f: failure-detection time from the state pull
+# ===================================================================
+# The mock serves the failure_detection block {"detect_after_seconds": 15},
+# what the control plane serves for a Domain that never set the value, and
+# plexd reads the block on every pull and hands its value to the WireGuard
+# manager. The manager logs "wireguard: failure detection time set" with
+# detect_after, previous and pass when the value changes, and the first pull
+# after each start sets it. The phase splices other values into the live
+# snapshot with splice_state and reads plexd's log after each:
+#
+#   (a) the log already holds the set line with detect_after=15s previous=0s
+#       pass=1s
+#   (b) {"detect_after_seconds": 20} adds a set line with detect_after=20s
+#       previous=15s within 15 s
+#   (c) null changes nothing: once plexd pulled again after the splice, the
+#       log holds no new set, malformed or out-of-range line
+#   (d) {"detect_after_seconds": 2}, below the 5 s floor, adds "wireguard:
+#       failure detection time out of range" with detect_after_seconds=2
+#       applied=5s and a set line with detect_after=5s previous=20s within
+#       15 s, which also shows that the null of (c) kept 20 s
+#   (e) {"detect_after_seconds": 15} adds a set line with detect_after=15s
+#       previous=5s within 15 s, so Phase 13 starts from the default
+#
+# No peer is relayed and connected here: step (i) of Phase 12e served the
+# saved peers again, whose keys no node holds, and deleted meshpeer's wg0. The
+# pass interval is 1 s under each of the values. Phase 13 then posts its own
+# state without the key, which plexd reads as "keep 15 s". plexd registers the
+# handler only when WireGuard came up, so the phase fails without it, as
+# Phase 12e does.
+echo "=== Testing the failure-detection time from the state pull ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    fail "[failure detection] WireGuard did not come up in the plexd container: plexd registers the failure-detection handler only on an interface that came up"
+fi
+
+FD_SET_MSG="wireguard: failure detection time set"
+FD_MALFORMED_MSG="wireguard: failure detection block malformed"
+FD_RANGE_MSG="wireguard: failure detection time out of range"
+
+# fd_log_lines <log> prints the lines of log that carry a "wireguard: failure
+# detection" message, joined by " | ", or "none", for a failure message.
+fd_log_lines() {
+    local line out=
+    while IFS= read -r line; do
+        case "${line}" in
+            *'msg="wireguard: failure detection'*) out="${out:+${out} | }${line}" ;;
+        esac
+    done <<< "$1"
+    printf '%s' "${out:-none}"
+}
+
+# wait_fd_line <tag> <msg> <baseline> <key=value>... reads the plexd log every
+# 2 s until it holds more than baseline lines that carry msg="<msg>" and every
+# key=value, and fails 15 s after FD_SPLICE_START, when the step spliced its
+# value.
+wait_fd_line() {
+    local tag=$1 msg=$2 base=$3 log n
+    shift 3
+    while :; do
+        log=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${log}"
+        n=$(count_log_lines "${log}" "msg=\"${msg}\"" "$@")
+        if [ "${n}" -gt "${base}" ]; then
+            echo "  PASS: [${tag}] plexd logged '${msg}' with $* $((SECONDS - FD_SPLICE_START))s after the splice"
+            return 0
+        fi
+        if [ $((SECONDS - FD_SPLICE_START)) -ge 15 ]; then
+            fail "[${tag}] 15s after the splice, the plexd log holds ${n} '${msg}' line(s) with $*, want more than ${base}; its failure detection lines: $(fd_log_lines "${log}")"
+        fi
+        sleep 2
+    done
+}
+
+# (a) The first pull after each start set the 15 s the mock serves.
+FD_LOG=$(dc logs plexd 2>&1) || fail "[failure detection] dc logs plexd failed: ${FD_LOG}"
+FD_DEFAULT=$(count_log_lines "${FD_LOG}" "msg=\"${FD_SET_MSG}\"" detect_after=15s previous=0s pass=1s)
+if [ "${FD_DEFAULT}" -lt 1 ]; then
+    fail "[failure detection] the plexd log holds no '${FD_SET_MSG}' line with detect_after=15s previous=0s pass=1s, want one from the first pull after each start, which carries the 15s the mock serves; its failure detection lines: $(fd_log_lines "${FD_LOG}")"
+fi
+echo "  PASS: [failure detection] plexd logged '${FD_SET_MSG}' with detect_after=15s previous=0s pass=1s ${FD_DEFAULT} time(s)"
+
+# (b) A changed value is set.
+FD_SET_KEYS=(detect_after=20s previous=15s)
+FD_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_SET_MSG}\"" "${FD_SET_KEYS[@]}")
+splice_state "fd-20" '.failure_detection = $v' '{"detect_after_seconds":20}'
+FD_SPLICE_START=${SECONDS}
+wait_fd_line "failure detection 20" "${FD_SET_MSG}" "${FD_BASE}" "${FD_SET_KEYS[@]}"
+
+# (c) A null block keeps the value. The mock counts a state GET when it serves
+# it, so the step reads state_count after the splice, whose own GET it then
+# includes, and waits for a pull plexd made after that: the nudge brings one,
+# and so do the heartbeat's reconcile hint, about every 30 s, and the 60 s
+# reconcile ticker. plexd logs while it handles the answer, after the mock
+# counted it, so the step reads the log 2 s after it saw the count grow.
+FD_LOG=$(dc logs plexd 2>&1) || fail "[failure detection null] dc logs plexd failed: ${FD_LOG}"
+FD_SET_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_SET_MSG}\"")
+FD_MALFORMED_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_MALFORMED_MSG}\"")
+FD_RANGE_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_RANGE_MSG}\"")
+splice_state "fd-null" '.failure_detection = $v' 'null'
+FD_SERVED=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null \
+    | jq -c '.failure_detection' 2>/dev/null || true)
+if [ "${FD_SERVED}" != "null" ]; then
+    fail "[failure detection null] the mock serves failure_detection '${FD_SERVED}' after the splice, want null"
+fi
+FD_STATE_BASE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+case "${FD_STATE_BASE}" in
+    *[!0-9]* | '') fail "[failure detection null] could not read state_count from ${ASSERT_URL} (got '${FD_STATE_BASE}')" ;;
+esac
+FD_PULL_START=${SECONDS}
+while :; do
+    FD_STATE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    case "${FD_STATE}" in
+        *[!0-9]* | '') FD_STATE=0 ;;
+    esac
+    if [ "${FD_STATE}" -gt "${FD_STATE_BASE}" ]; then
+        break
+    fi
+    if [ $((SECONDS - FD_PULL_START)) -ge 75 ]; then
+        fail "[failure detection null] state_count stayed at ${FD_STATE_BASE} for 75s after the splice that served a null failure_detection block, want a pull"
+    fi
+    sleep 3
+done
+sleep 2
+FD_LOG=$(dc logs plexd 2>&1) || fail "[failure detection null] dc logs plexd failed: ${FD_LOG}"
+FD_SET=$(count_log_lines "${FD_LOG}" "msg=\"${FD_SET_MSG}\"")
+FD_MALFORMED=$(count_log_lines "${FD_LOG}" "msg=\"${FD_MALFORMED_MSG}\"")
+FD_RANGE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_RANGE_MSG}\"")
+if [ "${FD_SET}" -gt "${FD_SET_BASE}" ] || [ "${FD_MALFORMED}" -gt "${FD_MALFORMED_BASE}" ] || [ "${FD_RANGE}" -gt "${FD_RANGE_BASE}" ]; then
+    fail "[failure detection null] after a pull of a null failure_detection block (state_count ${FD_STATE_BASE} to ${FD_STATE}), the plexd log holds ${FD_SET} '${FD_SET_MSG}' (${FD_SET_BASE} before), ${FD_MALFORMED} '${FD_MALFORMED_MSG}' (${FD_MALFORMED_BASE} before) and ${FD_RANGE} '${FD_RANGE_MSG}' (${FD_RANGE_BASE} before) line(s), want no new one; its failure detection lines: $(fd_log_lines "${FD_LOG}")"
+fi
+echo "  PASS: [failure detection null] plexd pulled a null failure_detection block (state_count ${FD_STATE_BASE} to ${FD_STATE}) and logged no new set, malformed or out-of-range line"
+
+# (d) A value below the floor is clamped to 5 s. Its set line names 20 s as
+# the previous value, which the null of (c) kept.
+FD_RANGE_KEYS=(detect_after_seconds=2 applied=5s)
+FD_SET_KEYS=(detect_after=5s previous=20s)
+FD_LOG=$(dc logs plexd 2>&1) || fail "[failure detection 2] dc logs plexd failed: ${FD_LOG}"
+FD_RANGE_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_RANGE_MSG}\"" "${FD_RANGE_KEYS[@]}")
+FD_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_SET_MSG}\"" "${FD_SET_KEYS[@]}")
+splice_state "fd-2" '.failure_detection = $v' '{"detect_after_seconds":2}'
+FD_SPLICE_START=${SECONDS}
+wait_fd_line "failure detection 2" "${FD_RANGE_MSG}" "${FD_RANGE_BASE}" "${FD_RANGE_KEYS[@]}"
+wait_fd_line "failure detection 2" "${FD_SET_MSG}" "${FD_BASE}" "${FD_SET_KEYS[@]}"
+
+# (e) The default again, so Phase 13 starts from it.
+FD_SET_KEYS=(detect_after=15s previous=5s)
+FD_LOG=$(dc logs plexd 2>&1) || fail "[failure detection 15] dc logs plexd failed: ${FD_LOG}"
+FD_BASE=$(count_log_lines "${FD_LOG}" "msg=\"${FD_SET_MSG}\"" "${FD_SET_KEYS[@]}")
+splice_state "fd-15" '.failure_detection = $v' '{"detect_after_seconds":15}'
+FD_SPLICE_START=${SECONDS}
+wait_fd_line "failure detection 15" "${FD_SET_MSG}" "${FD_BASE}" "${FD_SET_KEYS[@]}"
+
+echo "=== Phase 12f PASSED: failure-detection time from the state pull ==="
 
 # ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
