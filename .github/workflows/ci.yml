@@ -267,6 +267,37 @@ jobs:
             exit 1
           }
 
+      # The Windows runner boots with runs of 100 neighbouring ports reserved
+      # for TCP and others reserved for UDP, two side by side for each on most
+      # boots. A bind inside a run fails with WSAEACCES, and on port 0 the
+      # kernel still hands those numbers out to the protocol that did not
+      # reserve them, one after the other. A pick that takes a kernel-chosen
+      # UDP port and binds TCP on the same number met ten refused neighbours
+      # in a row there. The two tests reserve 100 TCP ports of their own, move
+      # the kernel's UDP pick to them and ask the mesh DNS server, the fake
+      # resolver of its tests and the mock API's DNS stub for port 0.
+      # Reserving ports needs Administrator, and a reservation outlives a
+      # killed test and a reboot. The runner has Administrator, so the gate is
+      # this variable for the same reason as above: without one the tests
+      # would reserve ports inside the ordinary step. Every process of the
+      # host shares the one UDP pick, so -p 1 runs the two packages one after
+      # the other. The step fails unless both tests passed: a skip would pass
+      # as well otherwise.
+      - name: Run real port reservation tests
+        if: runner.os == 'Windows'
+        env:
+          PLEXD_TEST_REAL_PORT_RESERVATION: '1'
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'real-ports.txt'
+          go test -race -count=1 -p 1 -v -run '^(TestServer_ListenPortZeroAtReservedTCPPorts|TestDNSStub_ListenPortZeroAtReservedTCPPorts)$' ./internal/meshdns/ ./test/e2e/mockapi/ | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($name in 'TestServer_ListenPortZeroAtReservedTCPPorts', 'TestDNSStub_ListenPortZeroAtReservedTCPPorts') {
+            if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern "--- PASS: $name ")) {
+              Write-Error "$name did not pass"
+              exit 1
+            }
+          }
+
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
