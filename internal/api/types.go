@@ -97,7 +97,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// twelve fields carry omitempty.
+// thirteen fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -137,6 +137,26 @@ type NodeStateSnapshot struct {
 	// means the control plane did not say this time, and the node keeps the
 	// names it holds.
 	DNS *NodeStateDNS `json:"dns"`
+	// FailureDetection is the Domain's failure-detection time, a
+	// NodeStateFailureDetection. It is carried raw, as Reachability is, so
+	// its consumer decodes it leniently and a malformed tuning value never
+	// fails the pull that carries the peers and the policy. A nil value, the
+	// wire's null or a key a control plane predating the block never wrote,
+	// means the control plane did not say this time, and the node keeps the
+	// value it holds.
+	FailureDetection json.RawMessage `json:"failure_detection"`
+}
+
+// NodeStateFailureDetection is the failure_detection block of the state pull,
+// as the "Failure detection" section of plexsphere's agent contract
+// (docs/reference/api/plexd-agent-contract.md) describes it.
+// DetectAfterSeconds is how long a path the node watches on its own, today a
+// relay, may stay silent before the node moves: a whole number of seconds
+// from 5 to 180, and 15 for a Domain that never set it. It is int64 rather
+// than int so a value out of range decodes on 32-bit builds too, and is
+// clamped rather than refused as malformed.
+type NodeStateFailureDetection struct {
+	DetectAfterSeconds int64 `json:"detect_after_seconds"`
 }
 
 // NodeStateDNS is the dns block of the state pull, as the "Mesh DNS names"
