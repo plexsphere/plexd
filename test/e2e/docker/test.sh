@@ -17,6 +17,9 @@
 #   - Endpoint candidates report, an endpoint selection switch on a
 #     fixture peer, and its move to a new relay fallback (same skip
 #     condition)
+#   - A direct retry on the kernel device: a pull that adds a direct endpoint
+#     moves relayed fixture peer ...a0b2, meshpeer, off its relay (phase 12e
+#     step d1)
 #   - Mesh MTU sized from the uplink probe and held by the device (same
 #     skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
@@ -5403,6 +5406,15 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # reconcile that drops the member again logs the route as removed, the route is
 # gone, and the same connection fails.
 #
+# Step (d1) follows the handshake at once and runs the direct retry on the
+# kernel device. meshpeer gains a second address on e2e-net, and the peer is
+# spliced to carry no endpoint and meshpeer's first address as its
+# fallback_endpoint, so the next selection pass marks it relayed. A splice that
+# adds the second address as its endpoint then makes plexd log "wireguard:
+# trying the direct endpoints again" with reason=pull and "wireguard: endpoint
+# selected" with relayed=false for that address within 30 s, and meshpeer
+# reports a later handshake. The rest of the phase runs over that tunnel.
+#
 # The phase runs before Phase 13, which replaces the fixture, and ends by
 # serving the saved peers and policy again. Like Phase 12d it needs kernel
 # WireGuard and fails without it.
@@ -5859,6 +5871,27 @@ wait_peer_route_line() {
     done
 }
 
+# wait_direct_retry_line <msg> <baseline> <key=value>... reads the plexd log
+# every 2 s until it holds more than baseline lines that carry msg="<msg>" and
+# every key=value, and fails 30 s after MESH_RETRY_START, when step (d1)
+# spliced the second address onto peer ...a0b2 as its endpoint.
+wait_direct_retry_line() {
+    local msg=$1 base=$2 log n
+    shift 2
+    while :; do
+        log=$(dc logs plexd 2>&1) || fail "[direct retry] dc logs plexd failed: ${log}"
+        n=$(count_log_lines "${log}" "msg=\"${msg}\"" "$@")
+        if [ "${n}" -gt "${base}" ]; then
+            echo "  PASS: [direct retry] plexd logged '${msg}' with $* $((SECONDS - MESH_RETRY_START))s after the splice"
+            return 0
+        fi
+        if [ $((SECONDS - MESH_RETRY_START)) -ge 30 ]; then
+            fail "[direct retry] 30s after the splice that added endpoint ${MESH_SECOND_ENDPOINT} to peer ...a0b2, which came 12s after the splice that made ${MESHPEER_IP}:51820 its relay, the plexd log holds ${n} '${msg}' line(s) with $*, want more than ${base}"
+        fi
+        sleep 2
+    done
+}
+
 # (a) Save the snapshot's peers and policy, which step (i) serves again. The
 # policy must be the fixture's, whose revision step (i) waits for.
 MESH_SAVED=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null \
@@ -5957,6 +5990,96 @@ while :; do
     sleep 2
 done
 echo "  PASS: [mesh policy] meshpeer completed a handshake with plexd $((SECONDS - MESH_HS_START))s after the splice"
+
+# (d1) The direct retry on the kernel device. meshpeer gains a second address
+# on e2e-net, the first three octets of its own with 250 as the last, at the
+# prefix length eth0 holds its own at. Peer ...a0b2 then carries no endpoint
+# and meshpeer's first address as its fallback_endpoint, so the address plexd
+# is connected at becomes its relay. A splice that adds the second address as
+# its endpoint makes plexd try that on a fresh device peer, which completes a
+# handshake there and leaves the relay. The step follows (d) at once, so the
+# session (d) waited for is far younger than the 120 s at which meshpeer, its
+# initiator, starts a rekey. That rekey leaves from meshpeer's first address,
+# and plexd would answer it there and be back on the relay. The peer is not
+# restored: steps (e) to (h) run over the tunnel as before, and step (i)
+# serves the saved peers again.
+MESH_SECOND_IP=${MESHPEER_IP%.*}.250
+case "${MESH_SECOND_IP}" in
+    "${MESHPEER_IP}" | *[!0-9.]* | '') fail "[direct retry] meshpeer's address ${MESHPEER_IP} gives '${MESH_SECOND_IP}' as its second address, want an IPv4 address other than meshpeer's own" ;;
+esac
+MESH_SECOND_ENDPOINT="${MESH_SECOND_IP}:51820"
+# The script finds the prefix length of $1, meshpeer's address on e2e-net, in
+# what ip -o -4 addr show dev eth0 prints, adds $2 to eth0 at that length, and
+# prints the length last. set -f keeps the words of that output from globbing.
+MESH_SECOND_SETUP='
+set -f
+addrs=$(ip -o -4 addr show dev eth0)
+len=
+for word in $addrs; do
+    case "$word" in
+        "$1"/*) len=${word#*/} ;;
+    esac
+done
+case "$len" in
+    *[!0-9]* | "")
+        echo "ip -o -4 addr show dev eth0 prints no prefix length for $1: $addrs"
+        exit 1
+        ;;
+esac
+ip address add "$2/$len" dev eth0
+echo "$len"
+'
+MESH_SECOND_OUT=$(dc exec -T meshpeer sh -euc "${MESH_SECOND_SETUP}" sh "${MESHPEER_IP}" "${MESH_SECOND_IP}" 2>&1) \
+    || fail "[direct retry] adding ${MESH_SECOND_IP} to meshpeer's eth0 failed: ${MESH_SECOND_OUT}"
+MESH_SECOND_LEN=${MESH_SECOND_OUT##*$'\n'}
+case "${MESH_SECOND_LEN}" in
+    *[!0-9]* | '') fail "[direct retry] adding ${MESH_SECOND_IP} to meshpeer's eth0 printed '${MESH_SECOND_OUT}', want the prefix length on the last line" ;;
+esac
+echo "  meshpeer's eth0 holds ${MESH_SECOND_IP}/${MESH_SECOND_LEN} beside ${MESHPEER_IP}"
+
+# The address plexd is connected at becomes the peer's relay, and the next
+# selection pass marks the peer relayed. No log line shows that mark for a
+# peer that stays connected, so the step waits a fixed 12 s: two pass
+# intervals of 5 s plus 2 s.
+splice_state "direct-retry-relay" \
+    '.peers |= map(if .node_id == $v.id then del(.endpoint) | .fallback_endpoint = $v.relay else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg relay "${MESHPEER_IP}:51820" '{id: $id, relay: $relay}')"
+sleep 12
+
+MESH_RETRY_KEYS=("peer_id=${FIXTURE_PEER_B2}" reason=pull "endpoint=${MESH_SECOND_ENDPOINT}")
+MESH_SELECTED_KEYS=("peer_id=${FIXTURE_PEER_B2}" "endpoint=${MESH_SECOND_ENDPOINT}" relayed=false)
+MESH_RETRY_LOG=$(dc logs plexd 2>&1) || fail "[direct retry] dc logs plexd failed: ${MESH_RETRY_LOG}"
+MESH_RETRY_BASE=$(count_log_lines "${MESH_RETRY_LOG}" 'msg="wireguard: trying the direct endpoints again"' "${MESH_RETRY_KEYS[@]}")
+MESH_SELECTED_BASE=$(count_log_lines "${MESH_RETRY_LOG}" 'msg="wireguard: endpoint selected"' "${MESH_SELECTED_KEYS[@]}")
+MESH_HS=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+    || fail "[direct retry] wg show wg0 latest-handshakes in meshpeer failed: ${MESH_HS}"
+MESH_HS_BEFORE=${MESH_HS##*[[:space:]]}
+case "${MESH_HS_BEFORE}" in
+    *[!0-9]* | '' | 0) fail "[direct retry] wg show wg0 latest-handshakes in meshpeer printed '${MESH_HS}' before the splice, want the time of the handshake step (d) waited for" ;;
+esac
+
+splice_state "direct-retry-endpoint" \
+    '.peers |= map(if .node_id == $v.id then .endpoint = $v.endpoint else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg endpoint "${MESH_SECOND_ENDPOINT}" '{id: $id, endpoint: $endpoint}')"
+MESH_RETRY_START=${SECONDS}
+wait_direct_retry_line "wireguard: trying the direct endpoints again" "${MESH_RETRY_BASE}" "${MESH_RETRY_KEYS[@]}"
+wait_direct_retry_line "wireguard: endpoint selected" "${MESH_SELECTED_BASE}" "${MESH_SELECTED_KEYS[@]}"
+while :; do
+    MESH_HS=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+        || fail "[direct retry] wg show wg0 latest-handshakes in meshpeer failed: ${MESH_HS}"
+    MESH_HS_TIME=${MESH_HS##*[[:space:]]}
+    case "${MESH_HS_TIME}" in
+        *[!0-9]* | '') MESH_HS_TIME=0 ;;
+    esac
+    if [ "${MESH_HS_TIME}" -gt "${MESH_HS_BEFORE}" ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_RETRY_START)) -ge 30 ]; then
+        fail "[direct retry] 30s after the splice that added endpoint ${MESH_SECOND_ENDPOINT} to peer ...a0b2, which came 12s after the splice that made ${MESHPEER_IP}:51820 its relay, meshpeer's latest handshake with plexd is at ${MESH_HS_TIME}, want one later than ${MESH_HS_BEFORE}, the one before the splice; wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
+    fi
+    sleep 2
+done
+echo "  PASS: [direct retry] meshpeer completed a handshake with plexd at ${MESH_HS_TIME}, later than ${MESH_HS_BEFORE} before the splice"
 
 # (e) Policy A: 7001 is open to meshpeer and 7002 is not, and plexd's answers
 # on 7001 leave through the output chain as replies. plexd's container connects
