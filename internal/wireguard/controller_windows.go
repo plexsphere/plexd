@@ -66,6 +66,13 @@ type ipConfigurator interface {
 // Unlike macOS, the adapter carries the configured interface name, so there is
 // no kernel name to map and the controller does not implement OSInterfaceNamer:
 // the readiness check resolves the configured name directly.
+//
+// With a MeshRewriter set (SetMeshRewriter), wireguard-go runs every device the
+// controller creates over the rewriter's wrapper around the adapter's tun, so
+// the in-process mesh source rewrite sees each packet of the device before
+// Windows does. The mesh device and the devices of the user access providers
+// and site-to-site tunnels on a bridge come from three controllers of this
+// type that share one rewriter.
 type WindowsController struct {
 	backend *UserspaceBackend
 	logger  *slog.Logger
@@ -82,6 +89,10 @@ type WindowsController struct {
 	ipcfg          ipConfigurator
 	lookup         func(name string) (*net.Interface, error)
 	visibleTimeout time.Duration
+
+	// rewriter wraps the tun of every adapter created after SetMeshRewriter;
+	// nil leaves the tun as wireguard-go's.
+	rewriter *MeshRewriter
 }
 
 // wintunAdapter is one live adapter: the LUID the IP Helper API addresses it
@@ -106,6 +117,15 @@ func NewWindowsController(logger *slog.Logger) *WindowsController {
 		lookup:         net.InterfaceByName,
 		visibleTimeout: adapterVisibleTimeout,
 	}
+}
+
+// SetMeshRewriter makes every interface CreateInterface creates from now on a
+// device r knows, so r can rewrite between them. It is called before the
+// first CreateInterface; an interface created before keeps its plain tun.
+func (c *WindowsController) SetMeshRewriter(r *MeshRewriter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rewriter = r
 }
 
 // ensureDLLBesideExecutable writes the embedded Wintun driver into the
@@ -249,6 +269,15 @@ func (c *WindowsController) createAdapter(name string, privateKey []byte, listen
 	if err := c.ipcfg.SetMTU(luid, device.DefaultMTU); err != nil {
 		tdev.Close()
 		return fmt.Errorf("wireguard: create interface: set default mtu: %w", err)
+	}
+
+	// With a rewriter wireguard-go reads and writes the adapter through the
+	// rewriter's wrapper. The LUID and the MTU hook above stay the raw
+	// device's: the IP Helper API addresses the adapter, and wireguard-go's
+	// Windows tun keeps its MTU in a field of its own, which the wrapper's
+	// MTU reads.
+	if c.rewriter != nil {
+		tdev = c.rewriter.Wrap(name, tdev)
 	}
 
 	// The backend takes ownership of tdev here: it closes the tun on every error
