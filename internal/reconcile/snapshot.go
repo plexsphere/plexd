@@ -15,7 +15,8 @@ import (
 // nothing for the differ to converge on. Nor is the secret inventory: the node
 // API's dispatch handler hands it to the secret index on every pull. Nor are the
 // mesh DNS names of the dns block: the mesh resolver's dispatch handler takes
-// them on every pull.
+// them on every pull. Nor is the failure-detection time: the WireGuard
+// manager's dispatch handler takes it on every pull.
 type stateSnapshot struct {
 	mu      sync.RWMutex
 	peers   []api.SnapshotPeer

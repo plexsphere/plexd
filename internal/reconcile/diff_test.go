@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 
@@ -580,6 +581,33 @@ func TestComputeDiff_DNSIsNoDrift(t *testing.T) {
 			diff := ComputeDiff(&api.NodeStateSnapshot{DNS: tt.desired}, &api.NodeStateSnapshot{DNS: tt.current})
 			if !diff.IsEmpty() {
 				t.Errorf("diff = %s, want none for a change of the dns block alone", diff.Summary())
+			}
+		})
+	}
+}
+
+// The failure_detection block is consumed on the dispatch seam, every pull, by
+// the WireGuard manager. It is not desired state the differ converges on, so a
+// pull that changes only the failure-detection time is no drift and runs no
+// reconcile handler.
+func TestComputeDiff_FailureDetectionIsNoDrift(t *testing.T) {
+	fifteen := json.RawMessage(`{"detect_after_seconds":15}`)
+	sixty := json.RawMessage(`{"detect_after_seconds":60}`)
+
+	tests := []struct {
+		name             string
+		desired, current json.RawMessage
+	}{
+		{"nil to populated", fifteen, nil},
+		{"populated to nil", nil, fifteen},
+		{"populated to null", json.RawMessage("null"), fifteen},
+		{"changed value", sixty, fifteen},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{FailureDetection: tt.desired}, &api.NodeStateSnapshot{FailureDetection: tt.current})
+			if !diff.IsEmpty() {
+				t.Errorf("diff = %s, want none for a change of the failure_detection block alone", diff.Summary())
 			}
 		})
 	}

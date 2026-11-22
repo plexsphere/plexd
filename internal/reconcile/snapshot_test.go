@@ -52,7 +52,8 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 			Data:     []api.StateEntry{},
 			Reports:  []api.StateEntry{},
 		},
-		Secrets: &[]api.NodeStateSecret{{Name: "db-password", Version: 2}},
+		Secrets:          &[]api.NodeStateSecret{{Name: "db-password", Version: 2}},
+		FailureDetection: json.RawMessage(`{"detect_after_seconds":15}`),
 	}
 }
 
@@ -113,6 +114,11 @@ func TestStateSnapshot_Update(t *testing.T) {
 	// consumes it on every pull.
 	if got.Secrets != nil {
 		t.Errorf("expected nil Secrets after update, got %v", got.Secrets)
+	}
+	// Nor is the failure-detection time: the WireGuard manager's dispatch
+	// handler takes it on every pull.
+	if got.FailureDetection != nil {
+		t.Errorf("expected nil FailureDetection after update, got %s", got.FailureDetection)
 	}
 }
 

@@ -553,19 +553,23 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			Records:      sixDNSRecords(),
 			ReverseZones: []string{"42.10.in-addr.arpa"},
 		},
+		FailureDetection: json.RawMessage(`{"detect_after_seconds":15}`),
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the twelve contract keys must appear.
+	// Exactly the thirteen contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 12 {
-		t.Errorf("expected exactly 12 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 13 {
+		t.Errorf("expected exactly 13 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns"} {
+	if got := string(raw["failure_detection"]); got != `{"detect_after_seconds":15}` {
+		t.Errorf("failure_detection = %s, want the block byte for byte", got)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -603,7 +607,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all twelve keys PRESENT.
+	// Marshalling nil blocks emits literal null with all thirteen keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -612,10 +616,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 12 {
-		t.Errorf("expected exactly 12 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 13 {
+		t.Errorf("expected exactly 13 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -788,6 +792,51 @@ func TestNodeStateSnapshot_DNSBlock(t *testing.T) {
 		!slices.Equal(populated.DNS.Hosts, wantHosts) ||
 		!slices.Equal(populated.DNS.ReverseZones, []string{"42.10.in-addr.arpa"}) {
 		t.Errorf("dns = %+v, want the populated block", populated.DNS)
+	}
+}
+
+// TestNodeStateSnapshot_FailureDetectionBlock pins the shapes the
+// failure_detection block arrives in. A missing key decodes to an empty value
+// and null to the literal null, which the WireGuard manager's dispatch handler
+// both reads as "keep the value you hold". The block is carried raw, so a
+// value of the wrong type, such as a string, does not fail the decode of the
+// envelope: its consumer decodes it on its own, and the peers and the policy
+// beside it arrive intact.
+func TestNodeStateSnapshot_FailureDetectionBlock(t *testing.T) {
+	const others = `"peers":[{"node_id":"n-1","mesh_ip":"10.42.0.2","public_key":"pk"}],"reachability":null,` +
+		`"policy":{"revision_id":"rev-1","fingerprint":"fp","rules":[]},"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]`
+
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{name: "key absent", src: `{` + others + `}`, want: ""},
+		{name: "null", src: `{` + others + `,"failure_detection":null}`, want: "null"},
+		{name: "a string", src: `{` + others + `,"failure_detection":"soon"}`, want: `"soon"`},
+		{name: "populated", src: `{` + others + `,"failure_detection":{"detect_after_seconds":15}}`, want: `{"detect_after_seconds":15}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			if err := json.Unmarshal([]byte(tt.src), &snap); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := string(snap.FailureDetection); got != tt.want {
+				t.Errorf("failure_detection = %q, want %q", got, tt.want)
+			}
+			if len(snap.Peers) != 1 || snap.Peers[0].NodeID != "n-1" {
+				t.Errorf("peers = %+v, want the one peer n-1", snap.Peers)
+			}
+			if snap.Policy == nil || snap.Policy.RevisionID != "rev-1" {
+				t.Errorf("policy = %+v, want revision rev-1", snap.Policy)
+			}
+		})
+	}
+
+	var block NodeStateFailureDetection
+	if err := json.Unmarshal([]byte(`{"detect_after_seconds":9000000000000}`), &block); err != nil || block.DetectAfterSeconds != 9000000000000 {
+		t.Errorf("decode of 9000000000000 = %+v, %v, want the value and no error", block, err)
 	}
 }
 
