@@ -14,13 +14,16 @@ import (
 
 // newVendorFixture returns a manager whose clients are the real Tailscale and
 // NetBird clients over runner, set up, with the Secret value listed in its
-// inventory as ts-join and nb-setup version 2.
+// inventory as ts-join and nb-setup version 2. The Tailscale client finds no
+// interface for its address, so it serves on tailscale0 on every host.
 func newVendorFixture(t *testing.T, runner *mockCommandExecutor, value string) *uaFixture {
 	t.Helper()
 	logger, _ := newRelayLogger()
+	tailscale := NewTailscaleProvider(runner, logger)
+	tailscale.ifaceByAddr = noHostInterface
 	fx := newUAFixture(t, func(d *UserAccessDeps) {
 		d.Clients = map[string]UserAccessClient{
-			api.UserAccessKindTailscale: NewTailscaleProvider(runner, logger),
+			api.UserAccessKindTailscale: tailscale,
 			api.UserAccessKindNetbird:   NewNetbirdProvider(runner, logger),
 		}
 	})
