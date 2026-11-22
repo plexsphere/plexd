@@ -62,7 +62,12 @@ const UserAccessInterfacePrefix = "wg-ua-"
 // It is a dependency of its own rather than a method of NATController, so a
 // NAT backend need not implement it. NetlinkRouteController implements it
 // through nftables, and policy.PFController through pf on macOS, beside the
-// NAT rule it holds. The WinNAT backend on Windows does not implement it.
+// NAT rule it holds. On Windows wireguard.MeshRewriter implements it inside
+// the process, between plexd's own wireguard-go devices, and the WinNAT
+// backend does not: WinNAT translates nothing into the mesh beside the
+// NetNat object the bridge NAT keeps for the mesh prefix. A vendor client's
+// adapter is no device of the process, so the rewriter adds no rewrite for
+// it; the vendor's client already sends with the host's address.
 // All methods must be idempotent.
 type MeshSourceRewriter interface {
 	// AddMeshSourceRewrite rewrites the source of packets that arrive on

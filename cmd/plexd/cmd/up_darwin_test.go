@@ -78,17 +78,40 @@ func TestNewRouteController_Darwin_NilFirewall(t *testing.T) {
 
 // TestNewMeshSourceRewriter_Darwin pins the pf controller as the mesh source
 // rewriter on macOS, and an untyped nil without a firewall controller, which
-// serves no user access provider and no site-to-site tunnel.
+// serves no user access provider and no site-to-site tunnel. The in-process
+// rewriter changes neither.
 func TestNewMeshSourceRewriter_Darwin(t *testing.T) {
 	logger := discardLogger()
 	fw := policy.NewPFController(logger)
 	routes := newRouteController(logger, fw)
 
-	if got, ok := newMeshSourceRewriter(routes, fw).(*policy.PFController); !ok || got != fw {
-		t.Errorf("newMeshSourceRewriter(routes, fw) = %T %p, want the pf controller %p itself", got, got, fw)
+	if got, ok := newMeshSourceRewriter(routes, fw, nil).(*policy.PFController); !ok || got != fw {
+		t.Errorf("newMeshSourceRewriter(routes, fw, nil) = %T %p, want the pf controller %p itself", got, got, fw)
 	}
-	if got := newMeshSourceRewriter(routes, nil); got != nil {
-		t.Errorf("newMeshSourceRewriter(routes, nil) = %#v, want an untyped nil", got)
+	if got, ok := newMeshSourceRewriter(routes, fw, wireguard.NewMeshRewriter(logger)).(*policy.PFController); !ok || got != fw {
+		t.Errorf("newMeshSourceRewriter(routes, fw, rewriter) = %T %p, want the pf controller %p itself", got, got, fw)
+	}
+	if got := newMeshSourceRewriter(routes, nil, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(routes, nil, nil) = %#v, want an untyped nil", got)
+	}
+}
+
+// TestNewMeshRewriter_Darwin pins that macOS builds no in-process rewriter,
+// even for a bridge that serves: pf rewrites in the kernel.
+func TestNewMeshRewriter_Darwin(t *testing.T) {
+	if got := newMeshRewriter(true, discardLogger()); got != nil {
+		t.Errorf("newMeshRewriter(true) = %p, want nil on macOS", got)
+	}
+}
+
+// TestNewNATExempter_Darwin pins that macOS exempts no tunnel's link from the
+// bridge NAT, which translates only what leaves the access interface.
+func TestNewNATExempter_Darwin(t *testing.T) {
+	if got := newNATExempter(nil); got != nil {
+		t.Errorf("newNATExempter(nil) = %#v, want nil on macOS", got)
+	}
+	if got := newNATExempter(policy.NewPFController(discardLogger())); got != nil {
+		t.Errorf("newNATExempter(fw) = %#v, want nil on macOS", got)
 	}
 }
 
@@ -122,7 +145,7 @@ func TestNewSystemLogSource_Darwin(t *testing.T) {
 }
 
 func TestNewAccessController_Darwin(t *testing.T) {
-	ctrl := newAccessController(discardLogger())
+	ctrl := newAccessController(discardLogger(), nil)
 	if ctrl == nil {
 		t.Fatal("newAccessController() = nil, want the utun-backed access controller on macOS")
 	}
@@ -134,7 +157,7 @@ func TestNewAccessController_Darwin(t *testing.T) {
 func TestNewVPNController_Darwin(t *testing.T) {
 	logger := discardLogger()
 
-	ctrl := newVPNController(logger, "10.42.0.5")
+	ctrl := newVPNController(logger, "10.42.0.5", nil)
 	if ctrl == nil {
 		t.Fatal("newVPNController() = nil, want the utun-backed tunnel controller on macOS")
 	}
@@ -150,8 +173,8 @@ func TestNewVPNController_Darwin(t *testing.T) {
 
 	// An identity without a mesh IP leaves the utun unnumbered instead of
 	// leaving the node without a tunnel controller.
-	if c := newVPNController(logger, ""); c == nil {
-		t.Fatal(`newVPNController(logger, "") = nil, want a controller that leaves the utun unnumbered`)
+	if c := newVPNController(logger, "", nil); c == nil {
+		t.Fatal(`newVPNController(logger, "", nil) = nil, want a controller that leaves the utun unnumbered`)
 	}
 }
 

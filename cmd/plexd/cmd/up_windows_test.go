@@ -5,7 +5,6 @@ package cmd
 import (
 	"testing"
 
-	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
@@ -94,63 +93,116 @@ func TestNewSystemLogSource_Windows(t *testing.T) {
 	}
 }
 
-// TestNewMeshSourceRewriter_Windows pins that Windows has no mesh source
-// rewrite yet (plexd#214), so it serves no user access provider and no
-// site-to-site tunnel.
+// TestNewMeshRewriter_Windows pins that a Windows bridge that serves user
+// access or site-to-site gets the in-process rewriter, and every other
+// Windows node none, so it pays no wrapper's copy per packet.
+func TestNewMeshRewriter_Windows(t *testing.T) {
+	logger := discardLogger()
+	if got := newMeshRewriter(true, logger); got == nil {
+		t.Error("newMeshRewriter(true) = nil, want the in-process rewriter on a Windows bridge that serves")
+	}
+	if got := newMeshRewriter(false, logger); got != nil {
+		t.Errorf("newMeshRewriter(false) = %p, want nil", got)
+	}
+}
+
+// TestNewMeshSourceRewriter_Windows pins the in-process rewriter as the mesh
+// source rewriter on Windows, which serves user access providers and
+// wireguard site-to-site tunnels, and an untyped nil without one, which
+// serves neither.
 func TestNewMeshSourceRewriter_Windows(t *testing.T) {
 	logger := discardLogger()
 	fw := newFirewallController(logger, "plexd0")
-	if got := newMeshSourceRewriter(newRouteController(logger, fw), fw); got != nil {
-		t.Errorf("newMeshSourceRewriter() = %#v, want nil on Windows", got)
+	routes := newRouteController(logger, fw)
+	rewriter := wireguard.NewMeshRewriter(logger)
+
+	if got, ok := newMeshSourceRewriter(routes, fw, rewriter).(*wireguard.MeshRewriter); !ok || got != rewriter {
+		t.Errorf("newMeshSourceRewriter(routes, fw, rewriter) = %T %p, want the rewriter %p itself", got, got, rewriter)
+	}
+	if got := newMeshSourceRewriter(routes, fw, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(routes, fw, nil) = %#v, want an untyped nil", got)
 	}
 }
 
-// TestNewTunnelProviders_Windows pins the two providers plexd up builds on
-// Windows, as on Linux; without a mesh source rewrite no tunnel reaches them.
+// TestNewNATExempter_Windows pins the WFP controller as the exempter of a
+// tunnel's adapter from the bridge NAT, and an untyped nil without a
+// firewall controller.
+func TestNewNATExempter_Windows(t *testing.T) {
+	fw := newFirewallController(discardLogger(), "plexd0")
+
+	if got, ok := newNATExempter(fw).(*policy.WFPController); !ok || got != fw {
+		t.Errorf("newNATExempter(fw) = %T %p, want the WFP controller %p itself", got, got, fw)
+	}
+	if got := newNATExempter(nil); got != nil {
+		t.Errorf("newNATExempter(nil) = %#v, want an untyped nil", got)
+	}
+}
+
+// TestNewTunnelProviders_Windows pins that Windows builds no ipsec and no
+// openvpn provider, as macOS does: their links are Linux kernel features, so
+// such a tunnel reads kind_not_served.
 func TestNewTunnelProviders_Windows(t *testing.T) {
-	providers := newTunnelProviders(t.TempDir(), discardLogger())
-	if _, ok := providers[api.SiteToSiteKindIPsec].(*bridge.IPsecProvider); !ok {
-		t.Errorf("ipsec provider = %T, want *bridge.IPsecProvider", providers[api.SiteToSiteKindIPsec])
-	}
-	if _, ok := providers[api.SiteToSiteKindOpenVPN].(*bridge.OpenVPNProvider); !ok {
-		t.Errorf("openvpn provider = %T, want *bridge.OpenVPNProvider", providers[api.SiteToSiteKindOpenVPN])
-	}
-	if len(providers) != 2 {
-		t.Errorf("newTunnelProviders() = %v, want the ipsec and the openvpn provider alone", providers)
+	if got := newTunnelProviders(t.TempDir(), discardLogger()); len(got) != 0 {
+		t.Errorf("newTunnelProviders() = %v, want no ipsec and no openvpn provider on Windows", got)
 	}
 }
 
+// TestNewAccessController_Windows pins the Wintun-backed access controller
+// with the rewriter of a bridge that serves and without one.
 func TestNewAccessController_Windows(t *testing.T) {
-	ctrl := newAccessController(discardLogger())
-	if ctrl == nil {
-		t.Fatal("newAccessController() = nil, want the Wintun-backed access controller on Windows")
-	}
-	if _, ok := ctrl.(*bridge.WGAccessController); !ok {
-		t.Errorf("newAccessController() = %T, want *bridge.WGAccessController", ctrl)
+	logger := discardLogger()
+
+	for _, tt := range []struct {
+		name     string
+		rewriter *wireguard.MeshRewriter
+	}{
+		{name: "with a rewriter", rewriter: wireguard.NewMeshRewriter(logger)},
+		{name: "without a rewriter"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := newAccessController(logger, tt.rewriter)
+			if ctrl == nil {
+				t.Fatal("newAccessController() = nil, want the Wintun-backed access controller on Windows")
+			}
+			if _, ok := ctrl.(*bridge.WGAccessController); !ok {
+				t.Errorf("newAccessController() = %T, want *bridge.WGAccessController", ctrl)
+			}
+		})
 	}
 }
 
 func TestNewVPNController_Windows(t *testing.T) {
 	logger := discardLogger()
 
-	ctrl := newVPNController(logger, "10.42.0.5")
-	if ctrl == nil {
-		t.Fatal("newVPNController() = nil, want the Wintun-backed tunnel controller on Windows")
-	}
-	if _, ok := ctrl.(*bridge.WGVPNController); !ok {
-		t.Errorf("newVPNController() = %T, want *bridge.WGVPNController", ctrl)
-	}
+	for _, tt := range []struct {
+		name     string
+		rewriter *wireguard.MeshRewriter
+	}{
+		{name: "with a rewriter", rewriter: wireguard.NewMeshRewriter(logger)},
+		{name: "without a rewriter"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := newVPNController(logger, "10.42.0.5", tt.rewriter)
+			if ctrl == nil {
+				t.Fatal("newVPNController() = nil, want the Wintun-backed tunnel controller on Windows")
+			}
+			if _, ok := ctrl.(*bridge.WGVPNController); !ok {
+				t.Errorf("newVPNController() = %T, want *bridge.WGVPNController", ctrl)
+			}
 
-	// The site-to-site manager asks for a kernel name through this interface.
-	// A Wintun adapter keeps the configured name, so the controller reports no
-	// mapping and the manager routes over the configured name.
-	if _, ok := ctrl.(wireguard.OSInterfaceNamer); !ok {
-		t.Errorf("%T does not implement wireguard.OSInterfaceNamer", ctrl)
-	}
+			// The site-to-site manager asks for a kernel name through this
+			// interface. A Wintun adapter keeps the configured name, so the
+			// controller reports no mapping and the manager routes over the
+			// configured name.
+			if _, ok := ctrl.(wireguard.OSInterfaceNamer); !ok {
+				t.Errorf("%T does not implement wireguard.OSInterfaceNamer", ctrl)
+			}
 
-	// The mesh IP is unused on Windows: an identity without one yields the
-	// same unnumbered adapter.
-	if c := newVPNController(logger, ""); c == nil {
-		t.Fatal(`newVPNController(logger, "") = nil, want the unnumbered tunnel controller`)
+			// The mesh IP is unused on Windows: an identity without one
+			// yields the same unnumbered adapter.
+			if c := newVPNController(logger, "", tt.rewriter); c == nil {
+				t.Fatal(`newVPNController(logger, "", rewriter) = nil, want the unnumbered tunnel controller`)
+			}
+		})
 	}
 }

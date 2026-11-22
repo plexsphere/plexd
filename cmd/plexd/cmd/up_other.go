@@ -63,13 +63,18 @@ func newRouteController(_ *slog.Logger, _ policy.FirewallController) bridge.Rout
 	return nil
 }
 
+// newMeshRewriter returns nil on platforms without an implementation.
+func newMeshRewriter(_ bool, _ *slog.Logger) *wireguard.MeshRewriter {
+	return nil
+}
+
 // newAccessController returns nil on platforms without an implementation.
-func newAccessController(_ *slog.Logger) bridge.AccessController {
+func newAccessController(_ *slog.Logger, _ *wireguard.MeshRewriter) bridge.AccessController {
 	return nil
 }
 
 // newMeshSourceRewriter returns nil on platforms without an implementation.
-func newMeshSourceRewriter(_ bridge.RouteController, _ policy.FirewallController) bridge.MeshSourceRewriter {
+func newMeshSourceRewriter(_ bridge.RouteController, _ policy.FirewallController, _ *wireguard.MeshRewriter) bridge.MeshSourceRewriter {
 	return nil
 }
 
@@ -83,12 +88,17 @@ func newTunnelProviders(swanctlDir string, logger *slog.Logger) map[string]bridg
 	}
 }
 
+// newNATExempter returns nil on platforms without an implementation.
+func newNATExempter(_ policy.FirewallController) bridge.NATExempter {
+	return nil
+}
+
 // forwardingKnobIsShared is false on platforms that serve no provider and no
 // tunnel.
 const forwardingKnobIsShared = false
 
 // newVPNController returns nil on platforms without an implementation.
-func newVPNController(_ *slog.Logger, _ string) bridge.VPNController {
+func newVPNController(_ *slog.Logger, _ string, _ *wireguard.MeshRewriter) bridge.VPNController {
 	return nil
 }
 

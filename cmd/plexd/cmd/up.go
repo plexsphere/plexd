@@ -298,7 +298,18 @@ func runAgent(ctx context.Context) error {
 	verifier := api.NewEd25519Verifier(identity.SigningKeyID, ed25519.PublicKey(sigKey))
 
 	// 5a. Initialize WireGuard subsystem.
+	// A Windows bridge that serves user access or site-to-site rewrites the
+	// source of what a provider or a tunnel forwards into the mesh inside
+	// this process, between its wireguard-go devices, and the rewriter must
+	// know the mesh device among them. The mesh controller wraps a device
+	// when it creates it, so it gets the rewriter here, before wgMgr.Setup
+	// creates the mesh device. Every other node gets nil and wraps nothing.
+	meshRewriter := newMeshRewriter(cfg.Mode == "bridge" && cfg.Bridge.Enabled &&
+		(!cfg.Bridge.UserAccessOptedOut() || !cfg.Bridge.SiteToSiteOptedOut()), logger)
 	wgCtrl := wgController(logger)
+	if s, ok := wgCtrl.(interface{ SetMeshRewriter(*wireguard.MeshRewriter) }); ok && meshRewriter != nil {
+		s.SetMeshRewriter(meshRewriter)
+	}
 	wgMgr := wireguard.NewManager(wgCtrl, cfg.WireGuard, logger)
 	wgReady := false
 	if wgCtrl != nil {
@@ -679,21 +690,24 @@ func runAgent(ctx context.Context) error {
 		// <data_dir>/user-access for each wireguard provider, and the vendor
 		// client of each tailscale or netbird provider, joined with the key
 		// its Secret holds. Linux rewrites the source of what a provider
-		// forwards into the mesh with nftables and macOS with pf. Without a
-		// mesh source rewrite, on Windows, it serves no provider: one that
-		// passes its checks reads kind_not_served, one that fails them
-		// invalid_provider. The mesh interface is the kernel's name, utunN
-		// on macOS, which forwarding and the rewrite take, and macOS, whose
-		// host has one forwarding knob, gives back each pair it claims.
+		// forwards into the mesh with nftables, macOS with pf, and Windows
+		// inside this process with meshRewriter, between a wireguard
+		// provider's device and the mesh device. On Windows a tailscale or
+		// netbird provider gets no rewrite: its vendor client's adapter is
+		// no device of this process, and the vendor documents that what the
+		// client forwards leaves with the host's address. The mesh interface
+		// is the kernel's name, utunN on macOS, which forwarding and the
+		// rewrite take, and macOS, whose host has one forwarding knob, gives
+		// back each pair it claims.
 		// Setup first removes the interfaces and rewrites a killed process
 		// left behind. An opted-out bridge builds no manager and removes
 		// them all the same, so no interface of an earlier process keeps a
 		// port open.
 		if !cfg.Bridge.UserAccessOptedOut() {
 			userAccessMgr = bridge.NewUserAccessManager(bridge.UserAccessDeps{
-				Access:   newAccessController(logger),
+				Access:   newAccessController(logger, meshRewriter),
 				Routes:   routeCtrl,
-				Rewriter: newMeshSourceRewriter(routeCtrl, fwCtrl),
+				Rewriter: newMeshSourceRewriter(routeCtrl, fwCtrl, meshRewriter),
 				Keys:     bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "user-access")),
 				Secrets:  secrets,
 				Clients: map[string]bridge.UserAccessClient{
@@ -709,7 +723,7 @@ func runAgent(ctx context.Context) error {
 				return fmt.Errorf("plexd up: user access setup: %w", err)
 			}
 		} else {
-			if err := bridge.CleanupUserAccess(newAccessController(logger), newMeshSourceRewriter(routeCtrl, fwCtrl)); err != nil {
+			if err := bridge.CleanupUserAccess(newAccessController(logger, meshRewriter), newMeshSourceRewriter(routeCtrl, fwCtrl, meshRewriter)); err != nil {
 				logger.Error("bridge: user access: clean up failed",
 					"component", "bridge",
 					"error", err,
@@ -727,29 +741,34 @@ func runAgent(ctx context.Context) error {
 		// interface and a strongSwan connection file in swanctl_conf_dir,
 		// <run dir>/swanctl by default, for each ipsec tunnel, and a tun
 		// device with an openvpn process for each openvpn tunnel, each
-		// joined with the key its Secret holds. macOS serves wireguard
-		// tunnels alone: newTunnelProviders builds no ipsec or openvpn
-		// provider there, whose links are Linux kernel features, so such a
-		// tunnel reads kind_not_served. Without a mesh source rewrite, on
-		// Windows, it serves no tunnel: one that passes its checks reads
-		// kind_not_served, one that fails them invalid_tunnel. The mesh
+		// joined with the key its Secret holds. macOS and Windows serve
+		// wireguard tunnels alone: newTunnelProviders builds no ipsec or
+		// openvpn provider there, whose links are Linux kernel features, so
+		// such a tunnel reads kind_not_served. Windows rewrites with
+		// meshRewriter, as for user access, and the NAT exempter, the WFP
+		// controller, exempts each tunnel's adapter from the bridge NAT with
+		// a 169.254 /30 and a NetNat object of its own while the bridge NAT's
+		// object covers the mesh prefix, so what a mesh node sends to the
+		// site keeps its source; it is nil on every other platform. The mesh
 		// interface and the forwarding claim are the user access manager's.
-		// Setup first removes the links and files a killed process left
-		// behind; the rewrites went with the user access cleanup above,
-		// which resets the rewrites both managers share. An opted-out bridge
-		// builds no manager and removes them all the same, so no link of an
-		// earlier process keeps a port open.
+		// Setup first removes the links, files and NAT exemptions a killed
+		// process left behind; the rewrites went with the user access
+		// cleanup above, which resets the rewrites both managers share. An
+		// opted-out bridge builds no manager and removes them all the same,
+		// so no link of an earlier process keeps a port open.
 		swanctlDir := cfg.Bridge.SwanctlConfDir
 		if swanctlDir == "" {
 			swanctlDir = filepath.Join(paths.RunDir(), "swanctl")
 		}
-		vpnCtrl := newVPNController(logger, identity.MeshIP)
+		vpnCtrl := newVPNController(logger, identity.MeshIP, meshRewriter)
 		tunnelProviders := newTunnelProviders(swanctlDir, logger)
+		natExempter := newNATExempter(fwCtrl)
 		if !cfg.Bridge.SiteToSiteOptedOut() {
 			s2sMgr = bridge.NewSiteToSiteManager(bridge.SiteToSiteDeps{
 				VPN:               vpnCtrl,
 				Routes:            routeCtrl,
-				Rewriter:          newMeshSourceRewriter(routeCtrl, fwCtrl),
+				Rewriter:          newMeshSourceRewriter(routeCtrl, fwCtrl, meshRewriter),
+				NATExempter:       natExempter,
 				Keys:              bridge.NewInterfaceKeyStore(filepath.Join(cfg.DataDir, "site-to-site")),
 				Secrets:           secrets,
 				Providers:         tunnelProviders,
@@ -762,7 +781,7 @@ func runAgent(ctx context.Context) error {
 				return fmt.Errorf("plexd up: site-to-site setup: %w", err)
 			}
 		} else {
-			if err := bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders, nil); err != nil {
+			if err := bridge.CleanupSiteToSite(vpnCtrl, tunnelProviders, natExempter); err != nil {
 				logger.Error("bridge: site-to-site: clean up failed",
 					"component", "bridge",
 					"error", err,

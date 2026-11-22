@@ -17,6 +17,7 @@ import (
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/tunnel"
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // writeJournalctlStub creates an executable journalctl stub in a temporary
@@ -80,10 +81,41 @@ func TestNewSystemReader_Linux(t *testing.T) {
 	}
 }
 
+// TestNewMeshRewriter_Linux pins that Linux builds no in-process rewriter,
+// even for a bridge that serves: nftables rewrites in the kernel.
+func TestNewMeshRewriter_Linux(t *testing.T) {
+	if got := newMeshRewriter(true, discardLogger()); got != nil {
+		t.Errorf("newMeshRewriter(true) = %p, want nil on Linux", got)
+	}
+}
+
+// TestNewNATExempter_Linux pins that Linux exempts no tunnel's link from the
+// bridge NAT, which masquerades only what leaves the access interface.
+func TestNewNATExempter_Linux(t *testing.T) {
+	if got := newNATExempter(nil); got != nil {
+		t.Errorf("newNATExempter(nil) = %#v, want nil on Linux", got)
+	}
+	if got := newNATExempter(newFirewallController(discardLogger(), "plexd0")); got != nil {
+		t.Errorf("newNATExempter(fw) = %#v, want nil on Linux", got)
+	}
+}
+
+// TestNewAccessController_Linux pins the netlink access controller, which
+// takes no in-process rewriter.
+func TestNewAccessController_Linux(t *testing.T) {
+	ctrl := newAccessController(discardLogger(), nil)
+	if ctrl == nil {
+		t.Fatal("newAccessController() = nil, want the netlink access controller on Linux")
+	}
+	if _, ok := ctrl.(*bridge.NetlinkAccessController); !ok {
+		t.Errorf("newAccessController() = %T, want *bridge.NetlinkAccessController", ctrl)
+	}
+}
+
 // TestNewVPNController_Linux pins the mesh IP as behaviour-neutral on Linux:
 // the tunnel link stays unnumbered whatever identity the node came up with.
 func TestNewVPNController_Linux(t *testing.T) {
-	ctrl := newVPNController(discardLogger(), "10.42.0.5")
+	ctrl := newVPNController(discardLogger(), "10.42.0.5", nil)
 	if ctrl == nil {
 		t.Fatal("newVPNController() = nil, want the netlink tunnel controller on Linux")
 	}
@@ -95,22 +127,25 @@ func TestNewVPNController_Linux(t *testing.T) {
 // TestNewMeshSourceRewriter_Linux pins that the netlink route controller is
 // the mesh source rewriter on Linux, and that any other route controller, a
 // nil one included, yields an untyped nil, which serves no user access
-// provider.
+// provider. The in-process rewriter changes neither.
 func TestNewMeshSourceRewriter_Linux(t *testing.T) {
 	routes := newRouteController(discardLogger(), nil)
-	rewriter := newMeshSourceRewriter(routes, nil)
+	rewriter := newMeshSourceRewriter(routes, nil, nil)
 	if rewriter == nil {
 		t.Fatal("newMeshSourceRewriter() = nil, want the netlink route controller on Linux")
 	}
 	if got, ok := rewriter.(*bridge.NetlinkRouteController); !ok || got != routes {
 		t.Errorf("newMeshSourceRewriter() = %T %p, want the route controller %p itself", rewriter, rewriter, routes)
 	}
-	if got := newMeshSourceRewriter(nil, nil); got != nil {
-		t.Errorf("newMeshSourceRewriter(nil, nil) = %#v, want nil", got)
+	if got, ok := newMeshSourceRewriter(routes, nil, wireguard.NewMeshRewriter(discardLogger())).(*bridge.NetlinkRouteController); !ok || got != routes {
+		t.Errorf("newMeshSourceRewriter(routes, nil, rewriter) = %T %p, want the route controller %p itself", got, got, routes)
+	}
+	if got := newMeshSourceRewriter(nil, nil, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(nil, nil, nil) = %#v, want nil", got)
 	}
 	var typedNil *bridge.NetlinkRouteController
-	if got := newMeshSourceRewriter(typedNil, nil); got != nil {
-		t.Errorf("newMeshSourceRewriter(typed nil, nil) = %#v, want an untyped nil", got)
+	if got := newMeshSourceRewriter(typedNil, nil, nil); got != nil {
+		t.Errorf("newMeshSourceRewriter(typed nil, nil, nil) = %#v, want an untyped nil", got)
 	}
 }
 

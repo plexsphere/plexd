@@ -104,6 +104,13 @@ func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridg
 	return bridge.NewDarwinRouteController(logger, nat)
 }
 
+// newMeshRewriter returns nil on macOS: PFController rewrites the source of
+// user access and site-to-site traffic in pf, so no device of this process
+// needs the in-process rewriter.
+func newMeshRewriter(_ bool, _ *slog.Logger) *wireguard.MeshRewriter {
+	return nil
+}
+
 // newAccessController creates the utun-backed controller for bridge user
 // access on macOS. It needs root: creating a utun device is a privileged
 // operation. The DarwinController is its own, so the mesh, the access and the
@@ -113,8 +120,9 @@ func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridg
 // the user access manager passes, and the on-link route for the pool, which
 // the replies to its devices take. The manager hands the utunN name the
 // controller reports to forwarding and to the pf rewrite, and keeps the
-// configured name for the device and the status report.
-func newAccessController(logger *slog.Logger) bridge.AccessController {
+// configured name for the device and the status report. The in-process
+// rewriter is unused: pf rewrites what leaves the utun.
+func newAccessController(logger *slog.Logger, _ *wireguard.MeshRewriter) bridge.AccessController {
 	return bridge.NewWGAccessController(wireguard.NewDarwinController(logger), logger)
 }
 
@@ -123,7 +131,8 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 // tunnel forwards into the mesh, in the anchor that holds the policy chains
 // and the bridge NAT. A fw that implements no MeshSourceRewriter, nil or a
 // test's fake, yields an untyped nil, which serves no provider and no tunnel.
-func newMeshSourceRewriter(_ bridge.RouteController, fw policy.FirewallController) bridge.MeshSourceRewriter {
+// The in-process rewriter plays no part here.
+func newMeshSourceRewriter(_ bridge.RouteController, fw policy.FirewallController, _ *wireguard.MeshRewriter) bridge.MeshSourceRewriter {
 	if r, ok := fw.(bridge.MeshSourceRewriter); ok {
 		return r
 	}
@@ -135,6 +144,13 @@ func newMeshSourceRewriter(_ bridge.RouteController, fw policy.FirewallControlle
 // kernel features, so such a tunnel reads kind_not_served rather than
 // failing its link create. A wireguard tunnel needs no provider.
 func newTunnelProviders(_ string, _ *slog.Logger) map[string]bridge.TunnelProvider {
+	return nil
+}
+
+// newNATExempter returns nil on macOS: the bridge NAT translates only what
+// leaves through bridge.access_interface, so it never translates what is
+// forwarded between the mesh and a tunnel's link.
+func newNATExempter(_ policy.FirewallController) bridge.NATExempter {
 	return nil
 }
 
@@ -157,8 +173,9 @@ const forwardingKnobIsShared = true
 // unnumbered-interface idiom: traffic the node originates towards the remote
 // site leaves with the mesh IP as its source, which the remote site routes
 // back through the tunnel. An identity without a mesh IP leaves the utun
-// unnumbered instead of failing ConfigureAddress on the string "/32".
-func newVPNController(logger *slog.Logger, meshIP string) bridge.VPNController {
+// unnumbered instead of failing ConfigureAddress on the string "/32". The
+// in-process rewriter is unused: pf rewrites what leaves the utun.
+func newVPNController(logger *slog.Logger, meshIP string, _ *wireguard.MeshRewriter) bridge.VPNController {
 	return bridge.NewWGVPNController(wireguard.NewDarwinController(logger), tunnelAddress(meshIP), logger)
 }
 

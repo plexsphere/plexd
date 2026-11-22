@@ -207,9 +207,14 @@ func (c *WindowsRouteController) RemoveRoute(subnet, iface string) error {
 // EnableForwarding switches IPv4 forwarding on for both interfaces. Each flag
 // goes through the ledger, because every pair that names the mesh adapter
 // claims its flag and the first of them to tear down must not switch
-// forwarding off under another. The bridge manager is the only claimant: the
-// user access and site-to-site managers claim no flag, since neither serves a
-// provider or a tunnel on Windows.
+// forwarding off under another. The bridge manager claims a pair, and so do
+// the user access and site-to-site managers, one for each provider and each
+// tunnel. Those two give none back: a provider's or a tunnel's adapter goes
+// with it and the mesh adapter with the process, and a release after the
+// adapter is gone would fail on its LUID. For a wireguard provider the flag
+// carries nothing, since the mesh source rewrite takes every packet that is
+// not for the host; for a tunnel it carries what a mesh node opens toward the
+// site and the replies.
 func (c *WindowsRouteController) EnableForwarding(meshIface, accessIface string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -28,9 +28,9 @@ const (
 	// not retried until the entry changes.
 	UserAccessReasonInvalidProvider = "invalid_provider"
 	// UserAccessReasonKindNotServed: this plexd serves no provider of the
-	// kind, because the platform has no mesh source rewrite, as Windows has
-	// none, the kind is unknown, or no client of the kind is built in. It is
-	// not retried until the entry changes.
+	// kind, because the platform has no mesh source rewrite, as no platform
+	// but Linux, macOS and Windows has one, the kind is unknown, or no client
+	// of the kind is built in. It is not retried until the entry changes.
 	UserAccessReasonKindNotServed = "kind_not_served"
 	// UserAccessReasonKeyUnavailable: the key of a wireguard provider's
 	// interface could not be read or created.
@@ -90,9 +90,13 @@ type UserAccessDeps struct {
 	// whose route controller restores the knob once its last pair lets go.
 	ReleaseForwarding bool
 	// Rewriter rewrites the source of device traffic to the bridge's mesh
-	// address: nftables on Linux, pf on macOS. nil, on Windows: this platform
-	// serves no provider; one that passes its checks reads kind_not_served,
-	// one that fails them invalid_provider.
+	// address: nftables on Linux, pf on macOS, and on Windows
+	// wireguard.MeshRewriter inside the process, between a wireguard
+	// provider's device and the mesh device. A vendor client's adapter is no
+	// device of the process, so on Windows it gets no rewrite: the vendor's
+	// client already sends with the host's address. nil, on a platform
+	// without a rewrite: it serves no provider; one that passes its checks
+	// reads kind_not_served, one that fails them invalid_provider.
 	Rewriter MeshSourceRewriter
 	// Keys keeps the private key of each wireguard provider's interface. It
 	// must not be nil.

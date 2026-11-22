@@ -30,10 +30,10 @@ const (
 	// not retried until the entry changes.
 	SiteToSiteReasonInvalidTunnel = "invalid_tunnel"
 	// SiteToSiteReasonKindNotServed: this plexd serves no tunnel of the kind,
-	// because the platform has no mesh source rewrite, as Windows has none,
-	// the kind is unknown, or no provider of the kind is built in, as macOS
-	// builds none for ipsec and openvpn. It is not retried until the entry
-	// changes.
+	// because the platform has no mesh source rewrite, as no platform but
+	// Linux, macOS and Windows has one, the kind is unknown, or no provider of
+	// the kind is built in, as macOS and Windows build none for ipsec and
+	// openvpn. It is not retried until the entry changes.
 	SiteToSiteReasonKindNotServed = "kind_not_served"
 	// SiteToSiteReasonKeyUnavailable: the key of a wireguard tunnel's
 	// interface could not be read or created.
@@ -97,9 +97,11 @@ type SiteToSiteDeps struct {
 	// whose route controller restores the knob once its last pair lets go.
 	ReleaseForwarding bool
 	// Rewriter rewrites the source of what a tunnel forwards into the mesh to
-	// the bridge's mesh address: nftables on Linux, pf on macOS. nil, on
-	// Windows: this platform serves no tunnel; one that passes its checks
-	// reads kind_not_served, one that fails them invalid_tunnel.
+	// the bridge's mesh address: nftables on Linux, pf on macOS, and on
+	// Windows wireguard.MeshRewriter inside the process, between a wireguard
+	// tunnel's device and the mesh device. nil, on a platform without a
+	// rewrite: it serves no tunnel; one that passes its checks reads
+	// kind_not_served, one that fails them invalid_tunnel.
 	Rewriter MeshSourceRewriter
 	// NATExempter exempts each tunnel's link from the host's NAT. nil on
 	// every platform but Windows, where it keeps the bridge NAT off what is
