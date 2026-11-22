@@ -3,12 +3,10 @@ package bridge
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
-	"syscall"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
@@ -47,9 +45,10 @@ type wgOps struct {
 // A listen port another socket holds fails with an error wrapping
 // ErrListenPortInUse besides its cause. wireguard-go binds the port when it
 // brings the device up, inside the wrapped CreateInterface, and the bind's
-// EADDRINUSE arrives wrapped. Windows reports a taken port as WSAEADDRINUSE,
-// which Go does not equate with syscall.EADDRINUSE, so a taken port is a
-// plain failure there.
+// error arrives wrapped. isAddrInUse tells a taken port by that error:
+// EADDRINUSE, and on Windows also WSAEADDRINUSE, which Go does not equate
+// with syscall.EADDRINUSE. A port inside one of Windows' reserved ranges
+// fails with WSAEACCES, which is no taken port, and stays a plain failure.
 func (o *wgOps) create(name string, privateKey []byte, listenPort int, address string) error {
 	key, err := wgtypes.NewKey(privateKey)
 	if err != nil {
@@ -57,7 +56,7 @@ func (o *wgOps) create(name string, privateKey []byte, listenPort int, address s
 	}
 
 	if err := o.wg.CreateInterface(name, key[:], listenPort); err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
+		if isAddrInUse(err) {
 			return fmt.Errorf("bridge: %s: create interface %s: %w: %w", o.prefix, name, ErrListenPortInUse, err)
 		}
 		return fmt.Errorf("bridge: %s: create interface %s: %w", o.prefix, name, err)

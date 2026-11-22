@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -173,6 +174,18 @@ func TestWGControllers_RealWintun(t *testing.T) {
 			t.Fatalf("InterfaceByName(%q) right after CreateInterface: %v", name, err)
 		}
 
+		// wireguard-go binds the port as it brings the device up, so a second
+		// adapter cannot take the port the first one's device holds. Windows
+		// reports that bind as WSAEADDRINUSE, which has to read as
+		// ErrListenPortInUse for the managers to report bind_failed.
+		const taken = "plexd-acctaken"
+		port := uapiListenPort(t, uapiDump(t, uapiPipePrefix+name))
+		err := ctrl.CreateInterface(taken, testPrivateKey(t), port, "")
+		t.Cleanup(func() { _ = ctrl.RemoveInterface(taken) })
+		if !errors.Is(err, ErrListenPortInUse) {
+			t.Errorf("CreateInterface(%q) on port %d, which %s holds = %v, want an error wrapping ErrListenPortInUse", taken, port, name, err)
+		}
+
 		// A user-access peer dials the node, so it carries no endpoint.
 		publicKey, _ := testPeerKey(t)
 		if err := ctrl.ConfigurePeer(name, publicKey, []string{tunnelSubnet}, ""); err != nil {
@@ -331,6 +344,24 @@ func uapiDump(t *testing.T, path string) string {
 		t.Fatalf("read uapi: %v", err)
 	}
 	return string(buf[:n])
+}
+
+// uapiListenPort returns the listen port a UAPI dump reports, and fails the
+// test when it reports none.
+func uapiListenPort(t *testing.T, dump string) int {
+	t.Helper()
+
+	for _, line := range strings.Split(dump, "\n") {
+		if value, ok := strings.CutPrefix(line, "listen_port="); ok {
+			port, err := strconv.Atoi(value)
+			if err != nil {
+				t.Fatalf("listen_port=%q in the uapi dump: %v", value, err)
+			}
+			return port
+		}
+	}
+	t.Fatalf("uapi dump = %q, want a listen_port line", dump)
+	return 0
 }
 
 // freeUDPPort returns a UDP port the kernel hands out on port 0, taken for
