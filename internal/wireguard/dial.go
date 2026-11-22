@@ -45,6 +45,21 @@ const relayProbeTimeout = 15 * time.Second
 // without a rule (policy.RelayProbePort), so the probe leaves under any policy.
 const relayProbePort = 9
 
+// directRetryTimeout is how long a direct retry tries one direct entry of a
+// relayed peer (see Manager.retryDirect). The fresh device peer sends its
+// handshake initiation at once and again after WireGuard's RekeyTimeout of
+// 5 s, so the window holds two initiations.
+const directRetryTimeout = 10 * time.Second
+
+// directRetryMemory is how long a direct entry that left a relayed peer's dial
+// order, or failed a direct retry, starts no retry and is left out of one. The
+// control plane leaves a peer's direct endpoint out while it has no fresh
+// observation and lists only unexpired candidates, so without the memory
+// every stale-and-back cycle of a peer's reports would cut its relayed pairs.
+// It also keeps a second pull within the window from trying again what the
+// first retry just tried.
+const directRetryMemory = 10 * time.Minute
+
 // dialState is one peer's endpoint selection: the peer as last written, the
 // position in its dial order of the endpoint programmed on the device (after a
 // failed relay re-dial, of the relay it tried; see redialInPass), when that
@@ -54,14 +69,24 @@ const relayProbePort = 9
 // relayed records that the peer was last seen connected over one of its
 // relays (see relayedOver). A relayed peer stays on its relays: when its
 // connection fails, plexd dials the next relay of its set instead of the
-// direct entries before them, which already failed. relayed implies
-// onFallback. recreatedAt is when a relay re-dial last replaced the device
-// peer; a handshake older than that belongs to the session the re-dial
-// dropped. handshakeAt tells a new session from the one a pass already saw, so
-// a roam that brought no handshake is recognized. A re-dial needs no reset of
-// it: the peer is then not connected, and turning connected sets it.
+// direct entries before them, which already failed, until a direct retry
+// tries them again (see Manager.retryDirect). relayed implies onFallback.
+// recreatedAt is when a re-dial, of a relay or of a direct retry's entry,
+// last replaced the device peer; a handshake older than that belongs to the
+// session the re-dial dropped. handshakeAt tells a new session from the one a
+// pass already saw, so a roam that brought no handshake is recognized. A
+// re-dial needs no reset of it: the peer is then not connected, and turning
+// connected sets it.
 // restoredFor limits a session to one move back (see restoreRelay). The
-// remaining fields are the relay liveness probe's state (see checkRelay).
+// probe fields are the relay liveness probe's state (see checkRelay).
+//
+// The last three fields are the direct retry's state. retry holds the direct
+// entries a running retry tries after the one programmed, in order, and
+// retryRelay the relay it dials when no entry answers; retryRelay is
+// non-empty exactly while a retry runs. While a retry runs, the peer is not
+// connected and not relayed, and idx is the position of the entry tried.
+// tried holds the direct entries that left the peer's order or failed a
+// retry, with the time, and stays nil until the first one is recorded.
 type dialState struct {
 	peer         api.Peer
 	idx          int
@@ -76,6 +101,10 @@ type dialState struct {
 	rxAt         time.Time // when the silence window started: rxBytes changed, the peer turned connected or came back on the relay, or a probe send failed
 	probedAt     time.Time // when the outstanding probe went out, zero when none is
 	probeFailing bool      // the last probe send failed
+
+	retry      []string
+	retryRelay string
+	tried      map[string]time.Time
 }
 
 // order returns the peer's dial order: Endpoints, or Endpoint alone for a
@@ -211,6 +240,84 @@ func (s *dialState) trial(idx int, timeout time.Duration) time.Duration {
 	return timeout
 }
 
+// direct returns the peer's direct entries: its dial order before the first
+// relay, or the whole order for a peer without relays.
+func (s *dialState) direct() []string {
+	order := s.order()
+	if first := s.firstRelay(); first >= 0 {
+		return order[:first]
+	}
+	return order
+}
+
+// retrying reports whether a direct retry runs for the peer.
+func (s *dialState) retrying() bool {
+	return s.retryRelay != ""
+}
+
+// remembered reports whether tried holds entry from less than
+// directRetryMemory before now.
+func (s *dialState) remembered(entry string, now time.Time) bool {
+	at, ok := s.tried[entry]
+	return ok && now.Sub(at) < directRetryMemory
+}
+
+// remember drops every entry of tried recorded directRetryMemory or more
+// before now, then records entry at now.
+func (s *dialState) remember(entry string, now time.Time) {
+	maps.DeleteFunc(s.tried, func(_ string, at time.Time) bool { return now.Sub(at) >= directRetryMemory })
+	if s.tried == nil {
+		s.tried = make(map[string]time.Time)
+	}
+	s.tried[entry] = now
+}
+
+// untried returns the direct entries that are not remembered at now, in
+// order.
+func (s *dialState) untried(now time.Time) []string {
+	return slices.DeleteFunc(slices.Clone(s.direct()), func(e string) bool { return s.remembered(e, now) })
+}
+
+// triedAfter returns the memory an update to peer leaves st with: st.tried
+// without the entries recorded directRetryMemory or more before now, plus
+// every direct entry of st that the direct entries of peer no longer hold,
+// recorded at now. It returns nil when that is empty.
+func triedAfter(st *dialState, peer api.Peer, now time.Time) map[string]time.Time {
+	tried := maps.Clone(st.tried)
+	maps.DeleteFunc(tried, func(_ string, at time.Time) bool { return now.Sub(at) >= directRetryMemory })
+	listed := (&dialState{peer: peer}).direct()
+	for _, e := range st.direct() {
+		if slices.Contains(listed, e) {
+			continue
+		}
+		if tried == nil {
+			tried = make(map[string]time.Time)
+		}
+		tried[e] = now
+	}
+	if len(tried) == 0 {
+		return nil
+	}
+	return tried
+}
+
+// relayAfter returns the relay a direct retry that an update to peer starts or
+// continues ends on: the relay a running retry ends on, or the relay st has
+// programmed when none runs, unless the update takes that relay away by the
+// rule of relayMoved, which makes it peer's first relay. peer names at least
+// one relay, and so does st.peer.
+func relayAfter(st *dialState, peer api.Peer) string {
+	relay := st.retryRelay
+	if relay == "" {
+		relay = st.endpoint()
+	}
+	first := peer.Fallbacks[0]
+	if !slices.Contains(peer.Fallbacks, relay) || (first != st.peer.Fallbacks[0] && first != relay) {
+		return first
+	}
+	return relay
+}
+
 // relaySet returns p's relays in dial order: its fallback_endpoints when the
 // pull carries any, otherwise its fallback_endpoint alone, the only relay a
 // control plane that predates the set sends, and nil when it has neither.
@@ -312,15 +419,23 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // direct entries, n times that. The switch is logged with the trial of the
 // entry it programs.
 //
-// A relayed peer (see dialState) never moves to a direct entry. While it is
-// connected, checkRelay probes it once it falls silent. When its handshake
-// goes stale, or the probe goes unanswered, the next relay of its set is
-// dialed on a fresh device peer, and the next one again each time a relay's
-// trial passes without a handshake. A connected relayed peer the device
-// reports at another relay of its set follows that relay when a new handshake
-// came with the roam. Without one it is moved back to the entry programmed,
-// once per session, and a second roam in the session is followed (see
-// restoreRelay).
+// A relayed peer (see dialState) moves to a direct entry only in a direct
+// retry. While it is connected, checkRelay probes it once it falls silent.
+// When its handshake goes stale, or the probe goes unanswered, the next relay
+// of its set is dialed on a fresh device peer, and the next one again each
+// time a relay's trial passes without a handshake. A connected relayed peer
+// the device reports at another relay of its set follows that relay when a
+// new handshake came with the roam. Without one it is moved back to the entry
+// programmed, once per session, and a second roam in the session is followed
+// (see restoreRelay).
+//
+// A direct retry (see Manager.retryDirect), which UpdatePeer starts when a
+// pull adds a direct entry to a relayed peer, holds each of its entries for
+// directRetryTimeout. When that passes without a handshake, the pass writes
+// the next entry on a fresh device peer, and after the last one dials the
+// relay the retry ends on (see stepRetry). A handshake ends the retry, and
+// the device endpoint decides, as for any peer that turns connected, whether
+// the peer is relayed.
 //
 // The device is read before mu is taken. A read error, ErrPeerStatsUnsupported
 // included, is returned unchanged with no state touched. A failed switch of
@@ -330,7 +445,9 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // moves the peer's position to the relay it tried, so the next attempt, one
 // relay hold later, dials the relay after it (see redialInPass). A failed move
 // back is logged and joined too, and records nothing, so the next pass writes
-// again.
+// again. A failed write of a retry's entry is logged and joined the same way,
+// and moves the position to that entry, so the next step, one window later,
+// tries the entry after it.
 func (m *Manager) selectEndpoints() error {
 	stats, err := m.MeshPeerStats()
 	if err != nil {
@@ -372,6 +489,8 @@ func (m *Manager) selectEndpoints() error {
 			st.rxAt = now
 			st.probedAt = time.Time{}
 			st.probeFailing = false
+			st.retry = nil
+			st.retryRelay = ""
 			var endpoint string
 			if stat.Endpoint.IsValid() {
 				endpoint = stat.Endpoint.String()
@@ -468,6 +587,13 @@ func (m *Manager) selectEndpoints() error {
 			continue
 		}
 
+		if st.retrying() {
+			if err := m.stepRetry(nodeID, st, now); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+
 		// A peer that lost its relayed mark while on a standby sits beyond its
 		// walk, and goes back to the walk's first entry.
 		walk := st.walk()
@@ -535,6 +661,54 @@ func (m *Manager) restoreRelay(nodeID string, st *dialState, roamed string) erro
 		"from", roamed,
 		"endpoint", endpoint,
 	)
+	return nil
+}
+
+// stepRetry runs one pass of a direct retry for st (see
+// Manager.retryDirect). While the entry programmed has been tried for less
+// than directRetryTimeout it does nothing. Then it remembers that entry as
+// failed and writes the next entry of the retry on a fresh device peer, or,
+// after the last one, dials the relay the retry ends on, which leaves the
+// peer relayed and not connected as after any relay re-dial. A failed write
+// of an entry is logged and wrapped like a failed switch, and still moves the
+// position to that entry and restarts its window, so the step after it, one
+// window later, tries the entry after it. Callers hold m.mu.
+func (m *Manager) stepRetry(nodeID string, st *dialState, now time.Time) error {
+	if now.Sub(st.programmedAt) < directRetryTimeout {
+		return nil
+	}
+	st.remember(st.endpoint(), now)
+	if len(st.retry) == 0 {
+		relay := st.retryRelay
+		st.retryRelay = ""
+		st.relayed = true
+		m.logger.Info("wireguard: no direct endpoint answered, dialing the relay again",
+			"component", "wireguard",
+			"peer_id", nodeID,
+			"endpoint", relay,
+		)
+		return m.redialInPass(nodeID, st, relay, now)
+	}
+	entry := st.retry[0]
+	st.retry = st.retry[1:]
+	m.logger.Info("wireguard: direct retry, trying the next endpoint",
+		"component", "wireguard",
+		"peer_id", nodeID,
+		"endpoint", entry,
+		"remaining", len(st.retry),
+	)
+	st.idx = max(slices.Index(st.order(), entry), 0)
+	st.programmedAt = now
+	if err := m.redial(st.peer, entry); err != nil {
+		m.logger.Warn("wireguard: endpoint switch failed",
+			"component", "wireguard",
+			"peer_id", nodeID,
+			"endpoint", entry,
+			"error", err,
+		)
+		return fmt.Errorf("wireguard: switch endpoint of peer %s: %w", nodeID, err)
+	}
+	st.recreatedAt = now
 	return nil
 }
 

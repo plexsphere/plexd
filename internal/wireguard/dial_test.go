@@ -1068,12 +1068,18 @@ func TestUpdatePeer_NewFallbackMovesAPeerInItsRelayHold(t *testing.T) {
 
 func TestUpdatePeer_RelayedPeerKeepsItsRelay(t *testing.T) {
 	_, b64 := testKey(0x0a)
-	update := orderedPeer("node-a", b64, "172.31.4.9:51820", relayOrder[0], relayOrder[1])
+	update := orderedPeer("node-a", b64, relayOrder...)
 	update.Fallbacks = []string{relayOrder[1]}
+	// The peer starts with a direct entry the update drops, so the update
+	// adds none and starts no direct retry.
+	dropped := func(p *api.Peer) {
+		p.Endpoints = []string{"172.31.4.9:51820", relayOrder[0], relayOrder[1]}
+		p.Endpoint = p.Endpoints[0]
+	}
 
 	t.Run("connected", func(t *testing.T) {
 		var logs bytes.Buffer
-		mgr, ctrl, _, _ := relayedManager(t, &logs, nil)
+		mgr, ctrl, _, _ := relayedManager(t, &logs, dropped)
 		before := len(deviceWrites(ctrl))
 		if err := mgr.UpdatePeer(update); err != nil {
 			t.Fatalf("UpdatePeer: %v", err)
@@ -1081,14 +1087,14 @@ func TestUpdatePeer_RelayedPeerKeepsItsRelay(t *testing.T) {
 		if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"add "}) {
 			t.Fatalf("device writes = %v, want one write without an endpoint", got)
 		}
-		if st := mgr.dial["node-a"]; st.idx != 2 || !st.connected || !st.relayed {
-			t.Errorf("state = idx %d, connected %v, relayed %v, want 2, true, true", st.idx, st.connected, st.relayed)
+		if st := mgr.dial["node-a"]; st.idx != 1 || !st.connected || !st.relayed {
+			t.Errorf("state = idx %d, connected %v, relayed %v, want 1, true, true", st.idx, st.connected, st.relayed)
 		}
 	})
 
 	t.Run("not connected", func(t *testing.T) {
 		var logs bytes.Buffer
-		mgr, ctrl, clock, key := relayedManager(t, &logs, nil)
+		mgr, ctrl, clock, key := relayedManager(t, &logs, dropped)
 		passAt(t, mgr, clock, 212*time.Second) // stale: the relay is dialed again
 		ctrl.stats = []PeerStat{{PublicKey: key}}
 
@@ -1101,23 +1107,23 @@ func TestUpdatePeer_RelayedPeerKeepsItsRelay(t *testing.T) {
 			t.Fatalf("device writes = %v, want one write without an endpoint", got)
 		}
 		st := mgr.dial["node-a"]
-		if st.idx != 2 || st.connected || !st.relayed || !st.programmedAt.Equal(selectionStart.Add(212*time.Second)) {
-			t.Errorf("state = idx %d, connected %v, relayed %v, programmedAt %v; want 2, false, true, 212 s",
+		if st.idx != 1 || st.connected || !st.relayed || !st.programmedAt.Equal(selectionStart.Add(212*time.Second)) {
+			t.Errorf("state = idx %d, connected %v, relayed %v, programmedAt %v; want 1, false, true, 212 s",
 				st.idx, st.connected, st.relayed, st.programmedAt.Sub(selectionStart))
 		}
 
-		// The relay's trial in a three-entry order is two trials, 60 s.
+		// The relay's trial in a two-entry order is one trial, 30 s.
 		passAt(t, mgr, clock, 240*time.Second)
-		passAt(t, mgr, clock, 271*time.Second)
+		passAt(t, mgr, clock, 241*time.Second)
 		if got := deviceWrites(ctrl)[before:]; len(got) != 1 {
 			t.Fatalf("device writes before the relay's trial ran out = %v, want only the update", got)
 		}
-		passAt(t, mgr, clock, 272*time.Second)
+		passAt(t, mgr, clock, 242*time.Second)
 		if got, want := deviceWrites(ctrl)[before:], []string{"add ", "remove", "add " + relayOrder[1]}; !slices.Equal(got, want) {
 			t.Errorf("device writes = %v, want %v", got, want)
 		}
-		if slices.Contains(deviceWrites(ctrl), "add 172.31.4.9:51820") {
-			t.Errorf("a relayed peer was programmed on a direct entry: %v", deviceWrites(ctrl))
+		if got := deviceWrites(ctrl)[before:]; slices.Contains(got, "add 172.31.4.9:51820") || slices.Contains(got, "add "+relayOrder[0]) {
+			t.Errorf("a relayed peer was programmed on a direct entry: %v", got)
 		}
 	})
 }
@@ -1737,6 +1743,473 @@ func TestUpdatePeer_UnchangedFallbackRestartsAPeerInItsRelayHold(t *testing.T) {
 	if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"add 172.31.4.9:51820"}) {
 		t.Errorf("device writes = %v, want the new order's first entry: a peer that never connected over the relay is not relayed", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Direct retry on a pull
+// ---------------------------------------------------------------------------
+
+// pullEntry is the direct entry the update adds in front of relayOrder.
+const pullEntry = "172.31.4.9:51820"
+
+// pullOrder is the update's dial order: pullEntry, then relayOrder.
+var pullOrder = []string{pullEntry, relayOrder[0], relayOrder[1]}
+
+// pullUpdate returns node-a keyed with b64, ordered order, with relayOrder's
+// relay as its Fallback. pullUpdate(b64, pullOrder...) is the update.
+func pullUpdate(b64 string, order ...string) api.Peer {
+	p := orderedPeer("node-a", b64, slices.Clone(order)...)
+	p.Fallbacks = []string{relayOrder[1]}
+	return p
+}
+
+// pullAt applies update at selectionStart plus after.
+func pullAt(t *testing.T, mgr *Manager, clock *fakeClock, after time.Duration, update api.Peer) {
+	t.Helper()
+	clock.Set(selectionStart.Add(after))
+	if err := mgr.UpdatePeer(update); err != nil {
+		t.Fatalf("UpdatePeer at %v: %v", after, err)
+	}
+}
+
+// pullWrites fails t unless the device writes ctrl recorded after the first
+// before are want, and returns the number of writes recorded.
+func pullWrites(t *testing.T, ctrl *statsController, before int, when string, want ...string) int {
+	t.Helper()
+	got := deviceWrites(ctrl)
+	if !slices.Equal(got[before:], want) {
+		t.Fatalf("device writes %s = %v, want %v", when, got[before:], want)
+	}
+	return len(got)
+}
+
+// pullRetrying returns relayedManager's peer after the update at 40 s, which
+// starts a direct retry on pullEntry, and the number of device writes
+// recorded then. The device still reports the handshake of 31 s.
+func pullRetrying(t *testing.T, logs *bytes.Buffer) (*Manager, *statsController, *fakeClock, [32]byte, int) {
+	t.Helper()
+	mgr, ctrl, clock, key := relayedManager(t, logs, nil)
+	_, b64 := testKey(0x0a)
+	before := len(deviceWrites(ctrl))
+	pullAt(t, mgr, clock, 40*time.Second, pullUpdate(b64, pullOrder...))
+	n := pullWrites(t, ctrl, before, "after the update", "remove", "add "+pullEntry)
+	if st := mgr.dial["node-a"]; !st.retrying() {
+		t.Fatal("the update started no direct retry")
+	}
+	return mgr, ctrl, clock, key, n
+}
+
+// An update that adds a direct entry to a relayed peer starts a direct retry:
+// the device peer is written anew on the first direct entry, and the state
+// holds the entries left and the relay the retry ends on.
+func TestUpdatePeer_NewDirectEntryStartsADirectRetry(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+	_, b64 := testKey(0x0a)
+
+	before := len(deviceWrites(ctrl))
+	pullAt(t, mgr, clock, 40*time.Second, pullUpdate(b64, pullOrder...))
+	pullWrites(t, ctrl, before, "after the update", "remove", "add "+pullEntry)
+	cfgs := addPeerConfigs(t, &ctrl.mockController)
+	added := cfgs[len(cfgs)-1]
+	if added.PersistentKeepalive != 25 {
+		t.Errorf("PersistentKeepalive = %d, want 25", added.PersistentKeepalive)
+	}
+	if !slices.Equal(added.AllowedIPs, []string{"10.0.0.2/32"}) {
+		t.Errorf("AllowedIPs = %v, want [10.0.0.2/32]", added.AllowedIPs)
+	}
+
+	st := mgr.dial["node-a"]
+	if st.idx != 0 || st.connected || st.relayed {
+		t.Errorf("state = idx %d, connected %v, relayed %v; want 0, false, false", st.idx, st.connected, st.relayed)
+	}
+	if !slices.Equal(st.retry, []string{relayOrder[0]}) || st.retryRelay != relayOrder[1] {
+		t.Errorf("retry = %v, retryRelay = %q; want [%s], %q", st.retry, st.retryRelay, relayOrder[0], relayOrder[1])
+	}
+	at := selectionStart.Add(40 * time.Second)
+	if !st.programmedAt.Equal(at) || !st.recreatedAt.Equal(at) {
+		t.Errorf("programmedAt = %v, recreatedAt = %v; want 40 s for both",
+			st.programmedAt.Sub(selectionStart), st.recreatedAt.Sub(selectionStart))
+	}
+	requireLogLine(t, logs.String(), "wireguard: trying the direct endpoints again",
+		"level=INFO", "peer_id=node-a", "reason=pull", "endpoint="+pullEntry, "entries=2", "relay="+relayOrder[1])
+}
+
+// A direct retry that gets no handshake tries each of its entries for
+// directRetryTimeout, then dials the relay it started from and holds it for
+// the relay's trial, as after any relay re-dial. Both direct entries are then
+// remembered as failed.
+func TestSelectEndpoints_DirectRetryWalksTheEntriesOnce(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _, before := pullRetrying(t, &logs)
+
+	passAt(t, mgr, clock, 45*time.Second)
+	pullWrites(t, ctrl, before, "at 45 s")
+	passAt(t, mgr, clock, 50*time.Second)
+	before = pullWrites(t, ctrl, before, "at 50 s", "remove", "add "+relayOrder[0])
+	requireLogLine(t, logs.String(), "wireguard: direct retry, trying the next endpoint",
+		"level=INFO", "peer_id=node-a", "endpoint="+relayOrder[0], "remaining=0")
+
+	passAt(t, mgr, clock, 55*time.Second)
+	pullWrites(t, ctrl, before, "at 55 s")
+	passAt(t, mgr, clock, 60*time.Second)
+	before = pullWrites(t, ctrl, before, "at 60 s", "remove", "add "+relayOrder[1])
+	requireLogLine(t, logs.String(), "wireguard: no direct endpoint answered, dialing the relay again",
+		"level=INFO", "peer_id=node-a", "endpoint="+relayOrder[1])
+	st := mgr.dial["node-a"]
+	if !st.relayed || st.connected || st.retryRelay != "" || st.idx != 2 {
+		t.Errorf("state = relayed %v, connected %v, retryRelay %q, idx %d; want true, false, empty, 2",
+			st.relayed, st.connected, st.retryRelay, st.idx)
+	}
+	if len(st.tried) != 2 || !st.tried[pullEntry].Equal(selectionStart.Add(50*time.Second)) ||
+		!st.tried[relayOrder[0]].Equal(selectionStart.Add(60*time.Second)) {
+		t.Errorf("tried = %v, want %s at 50 s and %s at 60 s", st.tried, pullEntry, relayOrder[0])
+	}
+
+	// The relay follows two direct entries, so its hold is two trials, 60 s.
+	for after := 65 * time.Second; after <= 115*time.Second; after += 5 * time.Second {
+		passAt(t, mgr, clock, after)
+	}
+	pullWrites(t, ctrl, before, "from 65 s to 115 s")
+	passAt(t, mgr, clock, 120*time.Second)
+	requireLogLine(t, logs.String(), "wireguard: still no handshake over the relay, dialing it again",
+		"peer_id=node-a", "endpoint="+relayOrder[1])
+}
+
+// A handshake ends a direct retry, and the device endpoint decides, as for
+// any peer that turns connected, whether the peer is relayed. A device that
+// reports no new handshake leaves the retry running.
+func TestSelectEndpoints_DirectRetryEndsOnAHandshake(t *testing.T) {
+	handshake := selectionStart.Add(41 * time.Second)
+
+	t.Run("over the direct entry", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, before := pullRetrying(t, &logs)
+		ctrl.stats = []PeerStat{roamedStat(key, handshake, 100, pullEntry)}
+		passAt(t, mgr, clock, 45*time.Second)
+		st := mgr.dial["node-a"]
+		if !st.connected || st.relayed || st.retry != nil || st.retryRelay != "" {
+			t.Errorf("state = connected %v, relayed %v, retry %v, retryRelay %q; want true, false, nil, empty",
+				st.connected, st.relayed, st.retry, st.retryRelay)
+		}
+		requireLogLine(t, logs.String(), "wireguard: endpoint selected",
+			"peer_id=node-a", "endpoint="+pullEntry, "relayed=false")
+
+		passAt(t, mgr, clock, 50*time.Second)
+		passAt(t, mgr, clock, 60*time.Second)
+		pullWrites(t, ctrl, before, "from 45 s to 60 s")
+	})
+
+	t.Run("over the relay", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, key, _ := pullRetrying(t, &logs)
+		ctrl.stats = []PeerStat{relayStat(key, handshake, 100)}
+		passAt(t, mgr, clock, 45*time.Second)
+		if st := mgr.dial["node-a"]; !st.connected || !st.relayed || st.idx != 2 || st.retryRelay != "" {
+			t.Errorf("state = connected %v, relayed %v, idx %d, retryRelay %q; want true, true, 2, empty",
+				st.connected, st.relayed, st.idx, st.retryRelay)
+		}
+	})
+
+	t.Run("no new handshake", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, _, clock, _, _ := pullRetrying(t, &logs)
+		passAt(t, mgr, clock, 45*time.Second)
+		if st := mgr.dial["node-a"]; st.connected || st.retryRelay != relayOrder[1] {
+			t.Errorf("state = connected %v, retryRelay %q; want false, %q", st.connected, st.retryRelay, relayOrder[1])
+		}
+	})
+}
+
+// An update that adds no direct entry starts no direct retry: a relayed peer
+// keeps its relay, and a peer that is not relayed keeps today's rules. A
+// direct entry the update drops is remembered.
+func TestUpdatePeer_NoDirectRetryWithoutANewEntry(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	check := func(t *testing.T, logs *bytes.Buffer, mgr *Manager, ctrl *statsController, clock *fakeClock, update api.Peer) {
+		t.Helper()
+		before := len(deviceWrites(ctrl))
+		pullAt(t, mgr, clock, 40*time.Second, update)
+		pullWrites(t, ctrl, before, "after the update", "add ")
+		if lines := logLines(logs.String(), "wireguard: trying the direct endpoints again"); len(lines) != 0 {
+			t.Errorf("direct retry lines %v, want none", lines)
+		}
+	}
+
+	t.Run("routed subnet added", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+		update := pullUpdate(b64, relayOrder...)
+		update.RoutedSubnets = []string{"10.50.0.0/16"}
+		check(t, &logs, mgr, ctrl, clock, update)
+	})
+
+	t.Run("direct entry dropped", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+		check(t, &logs, mgr, ctrl, clock, pullUpdate(b64, relayOrder[1]))
+		if st := mgr.dial["node-a"]; len(st.tried) != 1 || !st.tried[relayOrder[0]].Equal(selectionStart.Add(40*time.Second)) {
+			t.Errorf("tried = %v, want %s at 40 s", st.tried, relayOrder[0])
+		}
+	})
+
+	t.Run("no relays", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+		update := pullUpdate(b64, pullOrder...)
+		update.Fallbacks = nil
+		check(t, &logs, mgr, ctrl, clock, update)
+	})
+
+	t.Run("not relayed", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+		key, _ := testKey(0x0a)
+		if err := mgr.AddPeer(pullUpdate(b64, relayOrder...)); err != nil {
+			t.Fatalf("AddPeer: %v", err)
+		}
+		ctrl.stats = []PeerStat{directStat(key, selectionStart.Add(31*time.Second), 100)}
+		passAt(t, mgr, clock, 31*time.Second)
+		if st := mgr.dial["node-a"]; !st.connected || st.relayed || st.endpoint() != relayOrder[0] {
+			t.Fatalf("connected = %v, relayed = %v on %q, want true, false on %s", st.connected, st.relayed, st.endpoint(), relayOrder[0])
+		}
+		check(t, &logs, mgr, ctrl, clock, pullUpdate(b64, pullOrder...))
+	})
+}
+
+// A relayed peer that is not connected, because its handshake went stale and
+// its relay was dialed again, gets a direct retry from an update that adds a
+// direct entry, as a connected one does.
+func TestUpdatePeer_RelayedPeerThatIsNotConnectedRetriesToo(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, nil)
+	_, b64 := testKey(0x0a)
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 212*time.Second) // stale: the relay is dialed again
+	before = pullWrites(t, ctrl, before, "when the handshake went stale", "remove", "add "+relayOrder[1])
+	if st := mgr.dial["node-a"]; st.connected || !st.relayed {
+		t.Fatalf("after the stale handshake connected = %v, relayed = %v, want false, true", st.connected, st.relayed)
+	}
+	ctrl.stats = []PeerStat{{PublicKey: key}}
+
+	pullAt(t, mgr, clock, 220*time.Second, pullUpdate(b64, pullOrder...))
+	pullWrites(t, ctrl, before, "after the update", "remove", "add "+pullEntry)
+	if st := mgr.dial["node-a"]; st.retryRelay != relayOrder[1] {
+		t.Errorf("retryRelay = %q, want %q", st.retryRelay, relayOrder[1])
+	}
+}
+
+// A direct entry that left a relayed peer's order is remembered for
+// directRetryMemory: when it comes back within that time it starts no direct
+// retry, and when it comes back after it, it does.
+func TestUpdatePeer_ReturningEntryIsNotTriedWithinTenMinutes(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	start := func(t *testing.T, logs *bytes.Buffer) (*Manager, *statsController, *fakeClock, int) {
+		t.Helper()
+		mgr, ctrl, clock, _ := relayedManager(t, logs, nil)
+		before := len(deviceWrites(ctrl))
+		pullAt(t, mgr, clock, 40*time.Second, pullUpdate(b64, relayOrder[1]))
+		return mgr, ctrl, clock, pullWrites(t, ctrl, before, "after the update that drops the direct entry", "add ")
+	}
+
+	t.Run("at 639 s", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, before := start(t, &logs)
+		pullAt(t, mgr, clock, 639*time.Second, pullUpdate(b64, relayOrder...))
+		pullWrites(t, ctrl, before, "after the entry came back", "add ")
+	})
+
+	t.Run("at 640 s", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, before := start(t, &logs)
+		pullAt(t, mgr, clock, 640*time.Second, pullUpdate(b64, relayOrder...))
+		pullWrites(t, ctrl, before, "after the entry came back", "remove", "add "+relayOrder[0])
+		requireLogLine(t, logs.String(), "wireguard: trying the direct endpoints again",
+			"peer_id=node-a", "reason=pull", "endpoint="+relayOrder[0], "entries=1")
+	})
+}
+
+// A direct retry leaves out the entries that are remembered: after a retry
+// that failed on both direct entries, an update that adds a third tries the
+// new one alone.
+func TestUpdatePeer_DirectRetrySkipsEntriesThatJustFailed(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _, _ := pullRetrying(t, &logs)
+	_, b64 := testKey(0x0a)
+	for _, after := range []time.Duration{45 * time.Second, 50 * time.Second, 55 * time.Second, 60 * time.Second} {
+		passAt(t, mgr, clock, after)
+	}
+	if st := mgr.dial["node-a"]; st.retrying() || !st.relayed {
+		t.Fatalf("at 60 s retrying = %v, relayed = %v, want false, true: the retry ended on the relay", st.retrying(), st.relayed)
+	}
+
+	const added = "172.31.9.9:51820"
+	before := len(deviceWrites(ctrl))
+	mark := logs.Len()
+	pullAt(t, mgr, clock, 120*time.Second, pullUpdate(b64, append([]string{added}, pullOrder...)...))
+	pullWrites(t, ctrl, before, "after the update", "remove", "add "+added)
+	requireLogLine(t, logs.String()[mark:], "wireguard: trying the direct endpoints again",
+		"peer_id=node-a", "reason=pull", "endpoint="+added, "entries=1")
+	if st := mgr.dial["node-a"]; len(st.retry) != 0 {
+		t.Errorf("retry = %v, want empty: the other direct entries failed at 50 s and 60 s", st.retry)
+	}
+}
+
+// An update that takes the relay away and adds a direct entry tries the
+// direct entries first, instead of moving to the new relay at once, and ends
+// the retry on the update's first relay.
+func TestUpdatePeer_NewRelayAndNewDirectEntryRetriesFirst(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+	_, b64 := testKey(0x0a)
+	update := orderedPeer("node-a", b64, pullEntry, relayOrder[0], newRelay)
+	update.Fallbacks = []string{newRelay}
+
+	before := len(deviceWrites(ctrl))
+	pullAt(t, mgr, clock, 40*time.Second, update)
+	pullWrites(t, ctrl, before, "after the update", "remove", "add "+pullEntry)
+	requireLogLine(t, logs.String(), "wireguard: trying the direct endpoints again",
+		"peer_id=node-a", "endpoint="+pullEntry, "relay="+newRelay)
+	if lines := logLines(logs.String(), "wireguard: relay fallback changed, moving to the new relay"); len(lines) != 0 {
+		t.Errorf("relay move lines %v, want none", lines)
+	}
+
+	passAt(t, mgr, clock, 50*time.Second)
+	passAt(t, mgr, clock, 60*time.Second)
+	if got := deviceWrites(ctrl); !slices.Equal(got[len(got)-2:], []string{"remove", "add " + newRelay}) {
+		t.Errorf("device writes after the update = %v, want the last two to be remove, add %s", got[before:], newRelay)
+	}
+}
+
+// An update during a direct retry that adds no direct entry goes on with the
+// entries the retry had left that the update still lists, dials the relay at
+// once when none is left, and starts the walk over when it names no relays.
+// One that adds a direct entry starts the retry over without the entry that
+// already failed.
+func TestUpdatePeer_DuringADirectRetry(t *testing.T) {
+	_, b64 := testKey(0x0a)
+
+	t.Run("routed subnet added", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _, before := pullRetrying(t, &logs)
+		update := pullUpdate(b64, pullOrder...)
+		update.RoutedSubnets = []string{"10.50.0.0/16"}
+		pullAt(t, mgr, clock, 45*time.Second, update)
+		pullWrites(t, ctrl, before, "after the second update", "remove", "add "+pullEntry)
+		st := mgr.dial["node-a"]
+		if !slices.Equal(st.retry, []string{relayOrder[0]}) || !st.programmedAt.Equal(selectionStart.Add(45*time.Second)) {
+			t.Errorf("retry = %v, programmedAt = %v; want [%s], 45 s", st.retry, st.programmedAt.Sub(selectionStart), relayOrder[0])
+		}
+	})
+
+	t.Run("direct entries dropped", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _, before := pullRetrying(t, &logs)
+		pullAt(t, mgr, clock, 45*time.Second, pullUpdate(b64, relayOrder[1]))
+		pullWrites(t, ctrl, before, "after the second update", "remove", "add "+relayOrder[1])
+		if st := mgr.dial["node-a"]; !st.relayed || st.retryRelay != "" {
+			t.Errorf("state = relayed %v, retryRelay %q; want true, empty", st.relayed, st.retryRelay)
+		}
+		requireLogLine(t, logs.String(), "wireguard: no direct endpoint answered, dialing the relay again",
+			"level=INFO", "peer_id=node-a", "endpoint="+relayOrder[1])
+	})
+
+	t.Run("relays dropped", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _, before := pullRetrying(t, &logs)
+		pullAt(t, mgr, clock, 45*time.Second, orderedPeer("node-a", b64, pullEntry, relayOrder[0]))
+		pullWrites(t, ctrl, before, "after the second update", "add "+pullEntry)
+		if st := mgr.dial["node-a"]; st.relayed || st.retryRelay != "" {
+			t.Errorf("state = relayed %v, retryRelay %q; want false, empty", st.relayed, st.retryRelay)
+		}
+	})
+
+	t.Run("new entry after a failed one", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _, before := pullRetrying(t, &logs)
+		passAt(t, mgr, clock, 50*time.Second)
+		before = pullWrites(t, ctrl, before, "at 50 s", "remove", "add "+relayOrder[0])
+
+		const added = "172.31.7.7:51820"
+		pullAt(t, mgr, clock, 52*time.Second, pullUpdate(b64, append([]string{added}, pullOrder...)...))
+		pullWrites(t, ctrl, before, "after the second update", "remove", "add "+added)
+		if st := mgr.dial["node-a"]; !slices.Equal(st.retry, []string{relayOrder[0]}) {
+			t.Errorf("retry = %v, want [%s]: %s failed at 50 s", st.retry, relayOrder[0], pullEntry)
+		}
+	})
+}
+
+// A failed write of the update that starts a direct retry returns the error
+// and leaves the state as it was, so the reconciler applies the update again
+// on its next cycle.
+func TestUpdatePeer_DirectRetryWriteFailures(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	unchanged := func(t *testing.T, st *dialState) {
+		t.Helper()
+		if !st.connected || !st.relayed || st.retryRelay != "" || st.idx != 1 ||
+			!st.programmedAt.Equal(selectionStart.Add(30*time.Second)) || !slices.Equal(st.peer.Endpoints, relayOrder) {
+			t.Errorf("state = connected %v, relayed %v, retryRelay %q, idx %d, programmedAt %v, order %v; want true, true, empty, 1, 30 s, %v",
+				st.connected, st.relayed, st.retryRelay, st.idx, st.programmedAt.Sub(selectionStart), st.peer.Endpoints, relayOrder)
+		}
+	}
+
+	t.Run("remove fails", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+		removeErr := errors.New("remove refused")
+		ctrl.removePeerErr = removeErr
+
+		before := len(deviceWrites(ctrl))
+		clock.Set(selectionStart.Add(40 * time.Second))
+		err := mgr.UpdatePeer(pullUpdate(b64, pullOrder...))
+		if err == nil || !strings.HasPrefix(err.Error(), "wireguard: update peer: remove device peer:") || !errors.Is(err, removeErr) {
+			t.Fatalf("UpdatePeer = %v, want wireguard: update peer: remove device peer: wrapping %v", err, removeErr)
+		}
+		pullWrites(t, ctrl, before, "after the failed update", "remove")
+		unchanged(t, mgr.dial["node-a"])
+	})
+
+	t.Run("add fails", func(t *testing.T) {
+		var logs bytes.Buffer
+		mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+		addErr := errors.New("add refused")
+		ctrl.addPeerErr = addErr
+
+		before := len(deviceWrites(ctrl))
+		clock.Set(selectionStart.Add(40 * time.Second))
+		err := mgr.UpdatePeer(pullUpdate(b64, pullOrder...))
+		if err == nil || !strings.HasPrefix(err.Error(), "wireguard: update peer: add device peer:") || !errors.Is(err, addErr) {
+			t.Fatalf("UpdatePeer = %v, want wireguard: update peer: add device peer: wrapping %v", err, addErr)
+		}
+		pullWrites(t, ctrl, before, "after the failed update", "remove", "add "+pullEntry)
+		unchanged(t, mgr.dial["node-a"])
+	})
+}
+
+// A failed write of a direct retry's next entry is logged and returned, and
+// still moves the retry to that entry and restarts its window, so the step
+// after it, one window later, dials the relay.
+func TestSelectEndpoints_DirectRetryWriteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _, _ := pullRetrying(t, &logs)
+	addErr := errors.New("add refused")
+	ctrl.addPeerErr = addErr
+
+	clock.Set(selectionStart.Add(50 * time.Second))
+	err := mgr.selectEndpoints()
+	if err == nil || !strings.Contains(err.Error(), "wireguard: switch endpoint of peer node-a: add device peer:") || !errors.Is(err, addErr) {
+		t.Fatalf("selectEndpoints = %v, want wireguard: switch endpoint of peer node-a: add device peer: wrapping %v", err, addErr)
+	}
+	requireLogLine(t, logs.String(), "wireguard: endpoint switch failed",
+		"level=WARN", "peer_id=node-a", "endpoint="+relayOrder[0])
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.programmedAt.Equal(selectionStart.Add(50*time.Second)) {
+		t.Errorf("state = idx %d, programmedAt %v; want 1, 50 s", st.idx, st.programmedAt.Sub(selectionStart))
+	}
+
+	ctrl.addPeerErr = nil
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 60*time.Second)
+	pullWrites(t, ctrl, before, "at 60 s", "remove", "add "+relayOrder[1])
 }
 
 func TestSendRelayProbe(t *testing.T) {
@@ -2423,8 +2896,9 @@ func checkStandbyUpdate(t *testing.T, update api.Peer, writes []string, idx int,
 
 func TestUpdatePeer_PeerOnAStandbyKeepsItWhileTheFirstRelayStays(t *testing.T) {
 	_, b64 := testKey(0x0a)
-	checkStandbyUpdate(t, withRelays(b64, 3, "172.31.4.9:51820", "10.0.0.5:51820", standbyR1, standbyR2, standbyR3),
-		[]string{"add "}, 3, "")
+	update := withRelays(b64, 3, standbyOrder...)
+	update.RoutedSubnets = []string{"10.50.0.0/16"}
+	checkStandbyUpdate(t, update, []string{"add "}, 2, "")
 }
 
 func TestUpdatePeer_PeerOnAStandbyKeepsItWhenItBecomesFirst(t *testing.T) {
