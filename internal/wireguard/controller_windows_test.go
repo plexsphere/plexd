@@ -735,6 +735,72 @@ func TestWindowsController_PeerOperations_Unknown(t *testing.T) {
 	}
 }
 
+// meshRewriterAddrs is the addrs seam of the rewriter tests: fake adapters are
+// no interfaces of the host.
+func meshRewriterAddrs() func(string) ([]netip.Prefix, error) {
+	return fakeAddrs(map[string][]netip.Prefix{
+		"plexd0":         {netip.MustParsePrefix("10.255.241.1/24")},
+		"wg-ua-a0a0a0e1": {netip.MustParsePrefix("10.255.242.1/24")},
+	})
+}
+
+func TestWindowsController_SetMeshRewriter(t *testing.T) {
+	r := NewMeshRewriter(discardLogger())
+	r.addrs = meshRewriterAddrs()
+	c, tuns, ipcfg := newTestWindowsController(t)
+	c.SetMeshRewriter(r)
+
+	createTestInterface(t, c, "plexd0")
+	createTestInterface(t, c, "wg-ua-a0a0a0e1")
+
+	if err := r.AddMeshSourceRewrite("wg-ua-a0a0a0e1", "plexd0"); err != nil {
+		t.Fatalf("AddMeshSourceRewrite between two interfaces of the controller = %v, want nil", err)
+	}
+
+	tuns.mu.Lock()
+	mesh, access := tuns.tuns[0], tuns.tuns[1]
+	tuns.mu.Unlock()
+
+	// The LUID and the MTU hook are the raw adapter's, not the wrapper's.
+	if err := c.SetMTU("plexd0", 1380); err != nil {
+		t.Fatalf("SetMTU: %v", err)
+	}
+	want := []mtuCall{{luid: testLUID, mtu: 1420}, {luid: testLUID, mtu: 1420}, {luid: testLUID, mtu: 1380}}
+	if got := ipcfg.mtuCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("MTU calls = %v, want %v", got, want)
+	}
+	if forced := mesh.forced(); len(forced) != 1 || forced[0] != 1380 {
+		t.Errorf("ForceMTU calls on the mesh adapter = %v, want [1380]", forced)
+	}
+
+	// Deleting the provider's interface closes the wrapper and the adapter's
+	// tun, and the rewriter forgets the device and its rewrite.
+	if err := c.DeleteInterface("wg-ua-a0a0a0e1"); err != nil {
+		t.Fatalf("DeleteInterface: %v", err)
+	}
+	if !access.closed.Load() {
+		t.Error("the adapter's tun is still open after DeleteInterface")
+	}
+	if r.nat.known("wg-ua-a0a0a0e1") || r.nat.involved("plexd0") {
+		t.Error("the rewriter still knows the deleted interface or its rewrite")
+	}
+}
+
+func TestWindowsController_WithoutMeshRewriter(t *testing.T) {
+	r := NewMeshRewriter(discardLogger())
+	r.addrs = meshRewriterAddrs()
+	c, _, _ := newTestWindowsController(t)
+
+	createTestInterface(t, c, "plexd0")
+	createTestInterface(t, c, "wg-ua-a0a0a0e1")
+
+	err := r.AddMeshSourceRewrite("wg-ua-a0a0a0e1", "plexd0")
+	const want = "the mesh interface is no device of this process"
+	if err == nil || !strings.HasSuffix(err.Error(), want) {
+		t.Errorf("AddMeshSourceRewrite between interfaces of a controller without a rewriter = %v, want an error ending in %q", err, want)
+	}
+}
+
 func TestAdapterGUID_Deterministic(t *testing.T) {
 	first := adapterGUID("plexd0")
 	if second := adapterGUID("plexd0"); *first != *second {
