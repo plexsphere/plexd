@@ -2217,9 +2217,13 @@ func (s *DNSStub) Addr() netip.AddrPort
 func (s *DNSStub) Serve(ctx context.Context) error
 ```
 
-`ListenDNS` binds UDP first and TCP on the port UDP got. With port 0 it tries a
-fresh port, up to ten times, when that port is taken for TCP. A failure of
-either bind closes the socket that did bind and returns
+`ListenDNS` binds UDP first and TCP on the port UDP got. With port 0 the kernel
+chooses the UDP port, and when TCP refuses that port each later try draws a
+port from the dynamic ports, 49152 to 65535, at random and binds both on it, up
+to ten tries in all. A fresh port from the kernel would be the neighbour of the
+refused one on Windows, which keeps runs of 100 and more neighbouring ports
+reserved for one protocol and still hands them out to the other on port 0. A
+failure of either bind closes the socket that did bind and returns
 `mockapi: listen dns <addr>: <cause>`. `Addr` returns the bound address,
 unmapped. `Serve` answers until its context ends, then closes both sockets and
 every open connection and returns `nil`; a UDP read or a TCP accept that fails

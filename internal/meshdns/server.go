@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"slices"
@@ -96,9 +97,17 @@ const maxForwards = 256
 // reads nothing more from such a client until it reads again.
 const maxConnForwards = 16
 
-// listenAttempts is how often Listen tries a fresh kernel-chosen port when the
-// TCP side finds the port that UDP got already taken.
+// listenAttempts is how many ports Listen tries on port 0: the one the kernel
+// chose for UDP, then ports drawn from the dynamic ports.
 const listenAttempts = 10
+
+// The dynamic ports of RFC 6335, 49152 to 65535, which a process binds
+// without a privilege on every supported system. listenPair draws from them
+// once TCP refused the port the kernel chose for UDP.
+const (
+	dynamicPortMin   = 49152
+	dynamicPortCount = 65535 - dynamicPortMin + 1
+)
 
 // Server answers DNS queries for the mesh names over UDP and TCP on one
 // address, and forwards a query for any other name that its forwarding table
@@ -177,7 +186,7 @@ func (s *Server) SetForwarding(f *Forwarding) {
 
 // Addr returns the address the server is bound to. Before Listen, and when
 // addr named a port other than 0, it is addr itself; after Listen on port 0
-// it carries the port the kernel chose, which is the same for UDP and TCP.
+// it carries the port Listen found, which is the same for UDP and TCP.
 func (s *Server) Addr() netip.AddrPort {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,10 +196,9 @@ func (s *Server) Addr() netip.AddrPort {
 // Listen binds UDP and TCP on the server's address and port. A resolver that
 // answers on one of them only would fail systemd-resolved as soon as it moves
 // to TCP after repeated UDP losses, so a failure of either bind fails Listen
-// and closes the socket that did bind. With port 0, UDP binds first and TCP
-// takes the port UDP got; when that port is taken for TCP, Listen tries a
-// fresh one, up to listenAttempts times. A server listens once: after a
-// Listen that succeeded, Listen fails, before, during and after Serve.
+// and closes the socket that did bind. With port 0, listenPair finds a port
+// that both take. A server listens once: after a Listen that succeeded,
+// Listen fails, before, during and after Serve.
 func (s *Server) Listen() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -204,32 +212,62 @@ func (s *Server) Listen() error {
 		return fmt.Errorf("meshdns: listen %s: %w", s.addr, errors.New("no address to listen on"))
 	}
 
+	udp, tcp, bound, err := listenPair(s.addr)
+	if err != nil {
+		return fmt.Errorf("meshdns: listen %s: %w", s.addr, err)
+	}
+	s.udp, s.tcp, s.bound, s.listened = udp, tcp, bound, true
+	return nil
+}
+
+// listenPair binds UDP and TCP on addr and returns both sockets and the
+// address they hold. A failure of either bind closes the socket that did
+// bind. A port other than 0 gets one try.
+//
+// With port 0, UDP binds first on a port the kernel chooses and TCP takes
+// that number. A port the kernel chose for UDP need not be free for TCP:
+// another socket may hold it, and Windows keeps runs of 100 and more
+// neighbouring ports reserved for one protocol, refuses a bind inside such a
+// run with WSAEACCES, and still hands those numbers out to the other
+// protocol on port 0, one after the other. A fresh port from the kernel
+// would be the neighbour of the refused one there, and ten neighbours do not
+// leave a run. So each try after the first draws a port from the dynamic
+// ports at random and binds both protocols on it, up to listenAttempts tries
+// in all. The error of the last try is returned. A try that draws its port
+// retries on any error rather than on one errno, because the errno of a
+// taken port differs between operating systems.
+func listenPair(addr netip.AddrPort) (*net.UDPConn, *net.TCPListener, netip.AddrPort, error) {
 	attempts := 1
-	if s.addr.Port() == 0 {
+	if addr.Port() == 0 {
 		attempts = listenAttempts
 	}
 	var err error
-	for range attempts {
-		var udp *net.UDPConn
-		udp, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(s.addr))
-		if err != nil {
-			return fmt.Errorf("meshdns: listen %s: %w", s.addr, err)
+	for try := range attempts {
+		at := addr
+		if try > 0 {
+			at = netip.AddrPortFrom(addr.Addr(), uint16(dynamicPortMin+rand.IntN(dynamicPortCount)))
 		}
-		bound := netip.AddrPortFrom(s.addr.Addr(), udp.LocalAddr().(*net.UDPAddr).AddrPort().Port())
+		var udp *net.UDPConn
+		udp, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(at))
+		if err != nil {
+			if try == 0 {
+				// Not even the address the caller named binds, on its
+				// own port or on one the kernel chooses: no other port
+				// would.
+				return nil, nil, netip.AddrPort{}, err
+			}
+			continue
+		}
+		bound := netip.AddrPortFrom(addr.Addr(), udp.LocalAddr().(*net.UDPAddr).AddrPort().Port())
 		var tcp *net.TCPListener
 		tcp, err = net.ListenTCP("tcp", net.TCPAddrFromAddrPort(bound))
 		if err != nil {
-			// The UDP bind of the same address worked, so on a port the
-			// kernel chose the TCP bind can only fail because that port is
-			// taken. The errno for that differs between operating systems,
-			// so any error is retried rather than one errno matched.
 			_ = udp.Close()
 			continue
 		}
-		s.udp, s.tcp, s.bound, s.listened = udp, tcp, bound, true
-		return nil
+		return udp, tcp, bound, nil
 	}
-	return fmt.Errorf("meshdns: listen %s: %w", s.addr, err)
+	return nil, nil, netip.AddrPort{}, err
 }
 
 // Serve answers queries on the sockets Listen bound until ctx ends, then

@@ -29,7 +29,7 @@ type fakeQuery struct {
 }
 
 // fakeResolver stands in for a forward resolver: a DNS server on UDP and TCP
-// of one port of 127.0.0.1 that the kernel picked. It sends back what its
+// of one port of 127.0.0.1 that listenPair found. It sends back what its
 // answer function returns for each query, in order, and records every query.
 // While it holds, it keeps the replies back until release, so a test decides
 // when a resolver answers. It runs until the test ends, and the cleanup waits
@@ -59,23 +59,13 @@ type fakeResolver struct {
 func newFakeResolver(t *testing.T, answer func(query []byte) [][]byte) *fakeResolver {
 	t.Helper()
 	f := &fakeResolver{answer: answer, conns: make(map[net.Conn]struct{}), arrived: make(chan struct{})}
-	for range listenAttempts {
-		udp, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
-		if err != nil {
-			t.Fatalf("fake resolver: listen udp: %v", err)
-		}
-		addr := udp.LocalAddr().(*net.UDPAddr).AddrPort()
-		tcp, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(addr))
-		if err != nil {
-			_ = udp.Close()
-			continue
-		}
-		f.addr, f.udp, f.tcp = addr, udp, tcp
-		break
+	// The server's own pick, so the fake finds a port wherever the server
+	// does.
+	udp, tcp, addr, err := listenPair(netip.MustParseAddrPort("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("fake resolver: no port free for UDP and TCP in %d attempts: %v", listenAttempts, err)
 	}
-	if f.udp == nil {
-		t.Fatalf("fake resolver: no port free for UDP and TCP in %d attempts", listenAttempts)
-	}
+	f.addr, f.udp, f.tcp = addr, udp, tcp
 	f.wg.Add(2)
 	go f.serveUDP()
 	go f.serveTCP()

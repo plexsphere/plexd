@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"strings"
@@ -30,9 +31,17 @@ const dnsStubIdleTimeout = 10 * time.Second
 // record of a reply to a query that carries one.
 const dnsStubPayloadSize = 1232
 
-// dnsStubListenAttempts is how often ListenDNS tries a fresh kernel-chosen
-// port when the TCP side finds the port that UDP got already taken.
+// dnsStubListenAttempts is how many ports ListenDNS tries on port 0: the one
+// the kernel chose for UDP, then ports drawn from the dynamic ports.
 const dnsStubListenAttempts = 10
+
+// The dynamic ports of RFC 6335, 49152 to 65535, which a process binds
+// without a privilege. ListenDNS draws from them once TCP refused the port
+// the kernel chose for UDP.
+const (
+	dnsStubDynamicPortMin   = 49152
+	dnsStubDynamicPortCount = 65535 - dnsStubDynamicPortMin + 1
+)
 
 // dnsStubMaxMessage is the largest DNS message UDP or the two-byte TCP length
 // can carry, so a read never cuts a message short.
@@ -59,10 +68,14 @@ type DNSStub struct {
 }
 
 // ListenDNS binds UDP and TCP on addr, a host:port as net.Listen takes it,
-// and returns the stub that serves them once Serve runs. With port 0, UDP
-// binds first and TCP takes the port UDP got; when that port is taken for
-// TCP, ListenDNS tries a fresh one, up to ten times. A failure of either bind
-// fails ListenDNS and closes the socket that did bind.
+// and returns the stub that serves them once Serve runs. A failure of either
+// bind fails ListenDNS and closes the socket that did bind. With port 0, UDP
+// binds first on a port the kernel chooses and TCP takes that number. When
+// TCP refuses it, each later try draws a port from the dynamic ports at
+// random and binds both on it, up to ten tries in all: a fresh port from the
+// kernel would be the neighbour of the refused one on Windows, which keeps
+// runs of 100 and more neighbouring ports reserved for one protocol and
+// still hands them out to the other on port 0.
 func ListenDNS(addr string) (*DNSStub, error) {
 	local, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -72,11 +85,18 @@ func ListenDNS(addr string) (*DNSStub, error) {
 	if local.Port == 0 {
 		attempts = dnsStubListenAttempts
 	}
-	for range attempts {
+	for try := range attempts {
+		at := local
+		if try > 0 {
+			at = &net.UDPAddr{IP: local.IP, Port: dnsStubDynamicPortMin + rand.IntN(dnsStubDynamicPortCount), Zone: local.Zone}
+		}
 		var udp *net.UDPConn
-		udp, err = net.ListenUDP("udp", local)
+		udp, err = net.ListenUDP("udp", at)
 		if err != nil {
-			return nil, fmt.Errorf("mockapi: listen dns %s: %w", addr, err)
+			if try == 0 {
+				return nil, fmt.Errorf("mockapi: listen dns %s: %w", addr, err)
+			}
+			continue
 		}
 		bound := udp.LocalAddr().(*net.UDPAddr).AddrPort()
 		var tcp *net.TCPListener
