@@ -42,15 +42,28 @@ const (
 	// reports what the deny lines dropped under one name. DropCounts sums the
 	// lines of this label.
 	pfDropLabel = "plexd-default-deny"
+
+	// pfMeshRewriteTag is the tag the filter lines of a mesh source rewrite
+	// set on what arrives on its source interface, and the tag its nat line
+	// matches. pf has no way to match the interface a packet arrived on in a
+	// nat rule, so the tag carries that fact to the outgoing interface.
+	pfMeshRewriteTag = "plexd-mesh-rewrite"
 )
 
 // pfTokenRE finds the reference token pfctl -E prints ("Token : 1397...").
 var pfTokenRE = regexp.MustCompile(`Token\s*:\s*([0-9]+)`)
 
-// PFController implements FirewallController, ConnReporter, DropCounter and
-// bridge.NATController on macOS with pfctl(8). It keeps the desired state
-// itself and renders the whole anchor on every change, because pfctl -f
-// replaces an anchor's rules wholesale: there is no way to add one rule to it.
+// pfIfaceNameRE is what a name AddMeshSourceRewrite takes looks like: the
+// characters of a kernel interface name, at most 15 of them. A vendor client
+// reports the name of its interface, and the name becomes pf rule text, so
+// anything else is refused before it is rendered.
+var pfIfaceNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
+
+// PFController implements FirewallController, ConnReporter, DropCounter,
+// bridge.NATController and bridge.MeshSourceRewriter on macOS with pfctl(8).
+// It keeps the desired state itself and renders the whole anchor on every
+// change, because pfctl -f replaces an anchor's rules wholesale: there is no
+// way to add one rule to it.
 type PFController struct {
 	run    commandRunner
 	logger *slog.Logger
@@ -58,6 +71,7 @@ type PFController struct {
 	mu       sync.Mutex
 	chains   map[string][]FirewallRule // chain name -> rules; a key exists once EnsureChain ran
 	natIface string                    // access interface with masquerade, "" for none
+	rewrites map[string]string         // mesh source rewrites: source interface -> mesh interface
 	token    string                    // pf enable reference from pfctl -E, "" while released
 	sink     ConnSink                  // where the pflog reader reports, nil for nobody
 	reader   *pflogReader              // the pflog reader opened last, nil for none
@@ -77,9 +91,10 @@ type PFController struct {
 // NewPFController returns a controller driving the host's pfctl binary.
 func NewPFController(logger *slog.Logger) *PFController {
 	c := &PFController{
-		run:    execCommand,
-		logger: logger,
-		chains: make(map[string][]FirewallRule),
+		run:      execCommand,
+		logger:   logger,
+		chains:   make(map[string][]FirewallRule),
+		rewrites: make(map[string]string),
 	}
 	c.openLog = c.openPflog
 	return c
@@ -124,19 +139,35 @@ func (c *PFController) pfctl(op string, stdin []byte, args ...string) ([]byte, e
 	return out, fmt.Errorf("policy: pf: %s: %s: %w%s", op, argv, err, hint)
 }
 
-// render builds the whole anchor text from the desired state. The nat rule
-// comes first because pf requires translation rules ahead of filter rules in
-// a file. Chains are rendered in name order so the same state always yields
-// the same text. Each chain opens with the relay probe line for every
-// interface it mentions, in order of first appearance, and then holds the
-// lines renderRule returns for each rule. A chain without rules renders as
-// its comment line alone.
+// render builds the whole anchor text from the desired state. The nat rules
+// come first because pf requires translation rules ahead of filter rules in
+// a file: the bridge NAT line, then one line per mesh interface the mesh
+// source rewrites name, in name order. Chains are rendered in name order so
+// the same state always yields the same text. Each chain opens with the relay
+// probe line for every interface it mentions, in order of first appearance,
+// and then holds the lines renderRule returns for each rule. A chain without
+// rules renders as its comment line alone. The two filter lines of each mesh
+// source rewrite follow the last chain, in the name order of their source
+// interfaces.
+//
+// A rewrite's nat line carries pass, which makes pf skip the filter rules for
+// the packet it translates: the translated packet carries the mesh
+// interface's own address and would otherwise meet the default deny's block
+// out line, so the bridge would filter device traffic Linux lets through.
+// pf cannot match in a nat rule the interface a packet arrived on, so the
+// pass in line tags what arrives on the source interface and the nat line
+// matches the tag. Both filter lines keep state: a reply to a connection a
+// mesh node opened through the source interface returns on the state its
+// first packet created and is never tagged, so its source stays its own, as
+// Linux's connection tracking masquerades new connections only. Neither is
+// quick, so a host's own rules for the interface still decide.
 //
 // The map takes pf's number of each line that starts "pass in log " or "pass
 // out log " to the tag of the rule the line came from. A pflog record carries
 // that number as its subrulenr. pf numbers the filter rules of an anchor from
 // 0 in the order they load, and the header, the chain comments and the nat
-// line load none. pfctl loads a line holding a brace list as one rule per
+// lines load none. The filter lines of the rewrites follow every chain, so
+// they move no logged line's number. pfctl loads a line holding a brace list as one rule per
 // item, so an ICMP reply mirror takes four numbers, or five for ICMPv6, and
 // every other line takes one. pfctl's ruleset optimizer reorders and merges
 // rules only within a run of lines alike in action, log and state. A logged
@@ -162,6 +193,9 @@ func (c *PFController) render() ([]byte, map[uint32]string) {
 
 	if c.natIface != "" {
 		fmt.Fprintf(&b, "nat on %s inet from any to any -> (%s)\n", c.natIface, c.natIface)
+	}
+	for _, mesh := range slices.Compact(slices.Sorted(maps.Values(c.rewrites))) {
+		fmt.Fprintf(&b, "nat pass on %s inet from any to any tagged %s -> (%s)\n", mesh, pfMeshRewriteTag, mesh)
 	}
 
 	for _, name := range slices.Sorted(maps.Keys(c.chains)) {
@@ -195,6 +229,11 @@ func (c *PFController) render() ([]byte, map[uint32]string) {
 				filter(line, rule.LogTag)
 			}
 		}
+	}
+
+	for _, from := range slices.Sorted(maps.Keys(c.rewrites)) {
+		fmt.Fprintf(&b, "pass out on %s inet all keep state\n", from)
+		fmt.Fprintf(&b, "pass in on %s inet all keep state tag %s\n", from, pfMeshRewriteTag)
 	}
 
 	return []byte(b.String()), tags
@@ -454,27 +493,11 @@ func pfAddress(addr string) (string, error) {
 // kernel may then hold newer anchor text than the fields describe; the next
 // successful sync overwrites it.
 func (c *PFController) sync(op string) error {
-	if len(c.chains) == 0 && c.natIface == "" {
+	if len(c.chains) == 0 && c.natIface == "" && len(c.rewrites) == 0 {
 		if c.token == "" {
 			return nil
 		}
-		if _, err := c.pfctl(op, nil, "-a", pfAnchor, "-F", "all"); err != nil {
-			return err
-		}
-		c.setLogTags(nil)
-		// The reference is dropped even when -X failed: pf then keeps a leaked
-		// one, which only means pf stays enabled, and a retry with the same
-		// token could never release it either.
-		_, err := c.pfctl(op, nil, "-X", c.token)
-		c.token = ""
-		if err != nil {
-			return err
-		}
-		c.logger.Debug("pf anchor flushed and reference released",
-			"component", "policy",
-			"anchor", pfAnchor,
-		)
-		return nil
+		return c.flush(op)
 	}
 
 	text, tags := c.render()
@@ -501,6 +524,34 @@ func (c *PFController) sync(op string) error {
 		"component", "policy",
 		"anchor", pfAnchor,
 		"token", c.token,
+	)
+	return nil
+}
+
+// flush empties the anchor and gives the enable reference back when the
+// controller holds one. sync calls it once nothing is left to enforce, and
+// ResetMeshSourceRewrite whatever the controller holds.
+//
+// The caller holds c.mu.
+func (c *PFController) flush(op string) error {
+	if _, err := c.pfctl(op, nil, "-a", pfAnchor, "-F", "all"); err != nil {
+		return err
+	}
+	c.setLogTags(nil)
+	if c.token == "" {
+		return nil
+	}
+	// The reference is dropped even when -X failed: pf then keeps a leaked
+	// one, which only means pf stays enabled, and a retry with the same token
+	// could never release it either.
+	_, err := c.pfctl(op, nil, "-X", c.token)
+	c.token = ""
+	if err != nil {
+		return err
+	}
+	c.logger.Debug("pf anchor flushed and reference released",
+		"component", "policy",
+		"anchor", pfAnchor,
 	)
 	return nil
 }
@@ -711,8 +762,9 @@ func (c *PFController) FlushChain(chain string) error {
 	return nil
 }
 
-// DeleteChain forgets the named chain. When it was the last one and no NAT is
-// configured, the anchor is flushed and the pf reference released. Once no
+// DeleteChain forgets the named chain. When it was the last one and neither
+// NAT nor a mesh source rewrite is configured, the anchor is flushed and the
+// pf reference released. Once no
 // chain is left, no logged line is either, and the pflog reader is closed.
 // Idempotent: deleting a chain that was never ensured returns nil.
 func (c *PFController) DeleteChain(chain string) error {
@@ -887,6 +939,131 @@ func (c *PFController) RemoveNATMasquerade(iface string) error {
 	c.logger.Debug("NAT masquerade removed",
 		"component", "bridge",
 		"interface", iface,
+	)
+	return nil
+}
+
+// AddMeshSourceRewrite rewrites the source of what arrives on fromIface and
+// leaves through meshIface to the address of meshIface, the bridge's mesh
+// address. It implements bridge.MeshSourceRewriter through the anchor's nat
+// pass line for meshIface and the two filter lines for fromIface that render
+// describes. Only IPv4 is rewritten, as on Linux.
+//
+// Both names are checked before anything is rendered. When the controller
+// holds neither a rewrite nor the bridge NAT it probes the main ruleset
+// first, for the reason AddNATMasquerade does: an anchor the kernel never
+// evaluates translates nothing while every command still succeeds. A failed
+// probe or load leaves the controller's rewrites as they were.
+// Idempotent: a rewrite that exists for fromIface is left alone, whatever
+// meshIface it names, and runs no pfctl.
+func (c *PFController) AddMeshSourceRewrite(fromIface, meshIface string) error {
+	for _, name := range []string{fromIface, meshIface} {
+		if !pfIfaceNameRE.MatchString(name) {
+			return fmt.Errorf("bridge: add mesh source rewrite: invalid interface name %q", name)
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.rewrites[fromIface]; ok {
+		c.logger.Debug("mesh source rewrite already present, idempotent success",
+			"component", "bridge",
+			"from_iface", fromIface,
+			"mesh_iface", meshIface,
+			"anchor", pfAnchor,
+		)
+		return nil
+	}
+
+	if len(c.rewrites) == 0 && c.natIface == "" {
+		if err := c.Probe(); err != nil {
+			return fmt.Errorf("bridge: add mesh source rewrite from %q to %q: %w", fromIface, meshIface, err)
+		}
+	}
+
+	c.rewrites[fromIface] = meshIface
+	if err := c.sync("add mesh source rewrite"); err != nil {
+		delete(c.rewrites, fromIface)
+		return fmt.Errorf("bridge: add mesh source rewrite from %q to %q: %w", fromIface, meshIface, err)
+	}
+
+	c.logger.Debug("mesh source rewrite added",
+		"component", "bridge",
+		"from_iface", fromIface,
+		"mesh_iface", meshIface,
+		"anchor", pfAnchor,
+	)
+	return nil
+}
+
+// RemoveMeshSourceRewrite drops the rewrite for fromIface and loads the
+// anchor without its lines; with nothing else left the anchor is flushed and
+// the pf reference released. meshIface is only logged. A failed load keeps
+// the rewrite. Idempotent: an unknown fromIface returns nil and runs no
+// pfctl.
+func (c *PFController) RemoveMeshSourceRewrite(fromIface, meshIface string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	prev, ok := c.rewrites[fromIface]
+	if !ok {
+		c.logger.Debug("mesh source rewrite not found, idempotent success",
+			"component", "bridge",
+			"from_iface", fromIface,
+			"mesh_iface", meshIface,
+			"anchor", pfAnchor,
+		)
+		return nil
+	}
+
+	delete(c.rewrites, fromIface)
+	if err := c.sync("remove mesh source rewrite"); err != nil {
+		c.rewrites[fromIface] = prev
+		return fmt.Errorf("bridge: remove mesh source rewrite from %q: %w", fromIface, err)
+	}
+
+	c.logger.Debug("mesh source rewrite removed",
+		"component", "bridge",
+		"from_iface", fromIface,
+		"mesh_iface", meshIface,
+		"anchor", pfAnchor,
+	)
+	return nil
+}
+
+// ResetMeshSourceRewrite forgets every rewrite and writes the anchor once,
+// whatever the controller held: with a chain or the bridge NAT left it loads
+// the rendered text, and with nothing left it flushes the anchor, also while
+// it holds no pf reference, and releases the reference when it holds one.
+//
+// The write is unconditional because a pf anchor outlives the process that
+// loaded it and a utun does not: the kernel hands a freed utunN to the next
+// device that asks, so the lines a killed process left would tag another
+// interface's traffic. plexd up resets once at start, through
+// bridge.CleanupUserAccess. A failure restores the rewrites.
+func (c *PFController) ResetMeshSourceRewrite() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	const op = "reset mesh source rewrite"
+	prev := c.rewrites
+	c.rewrites = make(map[string]string)
+
+	var err error
+	if len(c.chains) == 0 && c.natIface == "" {
+		err = c.flush(op)
+	} else {
+		err = c.sync(op)
+	}
+	if err != nil {
+		c.rewrites = prev
+		return fmt.Errorf("bridge: reset mesh source rewrite: %w", err)
+	}
+
+	c.logger.Debug("mesh source rewrites reset",
+		"component", "bridge",
+		"anchor", pfAnchor,
 	)
 	return nil
 }
