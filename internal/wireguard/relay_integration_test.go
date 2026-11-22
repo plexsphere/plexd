@@ -54,12 +54,14 @@ func (b *logBuffer) String() string {
 
 // tunController is a WGController that runs the interface as a wireguard-go
 // device of a userspace backend on a channel TUN, so the test reads and writes
-// the interface's packets. A channel TUN has no address, MTU or interface
-// flag, so those writes do nothing. AddPeer, RemovePeer, SetPrivateKey and
-// PeerStats are the backend's.
+// the interface's packets. The device listens on port, which the test picks,
+// not on the port the Manager asks for. A channel TUN has no address, MTU or
+// interface flag, so those writes do nothing. AddPeer, RemovePeer,
+// SetPrivateKey and PeerStats are the backend's.
 type tunController struct {
 	*wireguard.UserspaceBackend
-	tun *tuntest.ChannelTUN
+	tun  *tuntest.ChannelTUN
+	port int
 }
 
 var (
@@ -68,7 +70,7 @@ var (
 )
 
 func (c *tunController) CreateInterface(name string, privateKey []byte, _ int) error {
-	return c.CreateDevice(name, c.tun.TUN(), privateKey, 0)
+	return c.CreateDevice(name, c.tun.TUN(), privateKey, c.port)
 }
 
 func (c *tunController) DeleteInterface(name string) error { return c.DeleteDevice(name) }
@@ -79,13 +81,15 @@ func (c *tunController) SetInterfaceUp(string) error { return nil }
 
 func (c *tunController) SetMTU(string, int) error { return nil }
 
-// meshNode is one node of the pair: a Manager on a channel TUN, and the
-// goroutine that drains the TUN's unbuffered Inbound into received, so the
-// device never blocks delivering a packet while the test is not reading.
+// meshNode is one node of the pair: a Manager on a channel TUN whose device
+// listens on port, and the goroutine that drains the TUN's unbuffered Inbound
+// into received, so the device never blocks delivering a packet while the
+// test is not reading.
 type meshNode struct {
 	id   string
 	ip   netip.Addr
 	key  wgtypes.Key
+	port int
 	tun  *tuntest.ChannelTUN
 	mgr  *wireguard.Manager
 	logs *logBuffer
@@ -100,8 +104,9 @@ type meshNode struct {
 
 // newMeshNode sets up a Manager for id with mesh IP ip in 10.99.0.0/24, a
 // keepalive of relayKeepalive and its log at Debug in a buffer of its own.
-// Endpoint selection is not running yet (see startSelection). The node is
-// torn down on cleanup.
+// Its device listens on a free UDP port (see freeUDPPort), so a partner can
+// dial it directly (see direct). Endpoint selection is not running yet (see
+// startSelection). The node is torn down on cleanup.
 func newMeshNode(t *testing.T, id, ip string) *meshNode {
 	t.Helper()
 	key, err := wgtypes.GeneratePrivateKey()
@@ -112,13 +117,14 @@ func newMeshNode(t *testing.T, id, ip string) *meshNode {
 		id:       id,
 		ip:       netip.MustParseAddr(ip),
 		key:      key,
+		port:     freeUDPPort(t),
 		tun:      tuntest.NewChannelTUN(),
 		logs:     &logBuffer{},
 		received: make(chan []byte, 64),
 		stop:     make(chan struct{}),
 		drained:  make(chan struct{}),
 	}
-	ctrl := &tunController{UserspaceBackend: wireguard.NewLoopbackUserspaceBackend(t), tun: n.tun}
+	ctrl := &tunController{UserspaceBackend: wireguard.NewLoopbackUserspaceBackend(t), tun: n.tun, port: n.port}
 	keepalive := relayKeepalive
 	logger := slog.New(slog.NewTextHandler(n.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	n.mgr = wireguard.NewManager(ctrl, wireguard.Config{
@@ -218,6 +224,23 @@ func (n *meshNode) peerOn(relay string) api.Peer {
 	}
 }
 
+// direct returns the address n's device listens on, 127.0.0.1 and its port:
+// n's direct endpoint for a partner on this host.
+func (n *meshNode) direct() string {
+	return netip.AddrPortFrom(relayLoopback, uint16(n.port)).String()
+}
+
+// peerVia returns n as the mesh peer of its partner with direct as its direct
+// endpoint and relay as its only relay: the dial order is direct, then relay.
+// A pull never lists a loopback address, which the handler refuses, so the
+// tests pass the built peer to UpdatePeer.
+func (n *meshNode) peerVia(direct, relay string) api.Peer {
+	p := n.peerOn(relay)
+	p.Endpoint = direct
+	p.Endpoints = []string{direct, relay}
+	return p
+}
+
 // peerOnSet returns n as the mesh peer of its partner, dialed through relays
 // alone, in order: they are its whole dial order and its relay set.
 func (n *meshNode) peerOnSet(relays ...string) api.Peer {
@@ -232,14 +255,7 @@ func (n *meshNode) peerOnSet(relays ...string) api.Peer {
 // It is stopped on cleanup.
 func startRelay(t *testing.T, logs *logBuffer, name string, a, b *meshNode) (*bridge.Relay, string) {
 	t.Helper()
-	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: relayLoopback.AsSlice()})
-	if err != nil {
-		t.Fatalf("listen on %s: %v", relayLoopback, err)
-	}
-	port := c.LocalAddr().(*net.UDPAddr).Port
-	if err := c.Close(); err != nil {
-		t.Fatalf("close the port probe: %v", err)
-	}
+	port := freeUDPPort(t)
 
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})).With("relay", name)
 	r := bridge.NewRelay(logger)
@@ -248,6 +264,21 @@ func startRelay(t *testing.T, logs *logBuffer, name string, a, b *meshNode) (*br
 	}
 	t.Cleanup(func() { _ = r.Stop() })
 	return r, netip.AddrPortFrom(relayLoopback, uint16(port)).String()
+}
+
+// freeUDPPort returns a UDP port that was free on relayLoopback a moment
+// ago: the port of a socket it opens there on port 0 and closes again.
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: relayLoopback.AsSlice()})
+	if err != nil {
+		t.Fatalf("listen on %s: %v", relayLoopback, err)
+	}
+	port := c.LocalAddr().(*net.UDPAddr).Port
+	if err := c.Close(); err != nil {
+		t.Fatalf("close the port probe: %v", err)
+	}
+	return port
 }
 
 // relayPeers is the peer set a relay forwards among: both nodes' keys.
@@ -339,6 +370,18 @@ func pingBoth(t *testing.T, a, b *meshNode, round uint16, within time.Duration) 
 		}
 	}
 	t.Logf("round %d: pings crossed both ways after %v", round, time.Since(start).Round(time.Millisecond))
+}
+
+// loggedLines counts the lines of log that have msg and every one of the
+// key=value fields.
+func loggedLines(log, msg string, fields ...string) int {
+	n := 0
+	for line := range strings.SplitSeq(log, "\n") {
+		if logged(line, msg, fields...) {
+			n++
+		}
+	}
+	return n
 }
 
 // logged reports whether one line of log has msg and every one of the
@@ -998,5 +1041,128 @@ func TestRelayIntegration_ResumedRelayLeavesThePairAlone(t *testing.T) {
 	if !stat.LastHandshake.Equal(handshakes[moved.node.id]) {
 		t.Errorf("%s: the last handshake with %s after the move back is %v, want %v unchanged",
 			moved.node.id, moved.partner.id, stat.LastHandshake, handshakes[moved.node.id])
+	}
+}
+
+// TestRelayIntegration_NewDirectEndpointMovesThePairOffTheRelay connects two
+// Managers over relay E, then updates node a's peer b with b's direct address
+// in front of E, as a pull that adds a direct entry does. Node a has b
+// relayed, so the update starts a direct retry: a writes b anew on a fresh
+// device peer with the direct address, and the keepalive, relayKeepalive
+// (1 s), makes that device peer send its initiation at once. b answers it
+// directly, and the next pass, at most 100 ms later, finds b connected off
+// the relay. The 5 s wait is half the retry's 10 s window, after which a
+// would dial E again, and no node has a relay probe, so neither leaves E on
+// its own: only the retry moves the pair. With E stopped, only the direct
+// path then carries the pings.
+func TestRelayIntegration_NewDirectEndpointMovesThePairOffTheRelay(t *testing.T) {
+	t.Parallel()
+	relayLogs := &logBuffer{}
+	dumpOnFailure(t, relayLogs)
+
+	a := newMeshNode(t, "node-a", "10.99.0.1")
+	b := newMeshNode(t, "node-b", "10.99.0.2")
+	relayE, e := startRelay(t, relayLogs, "E", a, b)
+
+	a.startSelection()
+	b.startSelection()
+
+	addPeers(t, a, b, e)
+	pingBoth(t, a, b, 1, 20*time.Second)
+	waitSelectedRelayed(t, a, b)
+	waitSelectedRelayed(t, b, a)
+
+	before := len(a.logs.String())
+	updatedAt := time.Now()
+	if err := a.mgr.UpdatePeer(b.peerVia(b.direct(), e)); err != nil {
+		t.Fatalf("%s: UpdatePeer(%s) via %s: %v, want nil", a.id, b.id, b.direct(), err)
+	}
+
+	selected := []string{"peer_id=" + b.id, "relayed=false"}
+	if !waitFor(5*time.Second, func() bool {
+		return logged(a.logs.String()[before:], "wireguard: endpoint selected", selected...)
+	}) {
+		t.Fatalf(`%s: no "wireguard: endpoint selected" line with %v within 5s of the update`, a.id, selected)
+	}
+	t.Logf("%s connected to %s off the relay %v after the update", a.id, b.id, time.Since(updatedAt).Round(time.Millisecond))
+
+	// UpdatePeer logged the start of the retry before it returned.
+	retried := []string{"peer_id=" + b.id, "reason=pull", "endpoint=" + b.direct(), "entries=1", "relay=" + e}
+	if !logged(a.logs.String()[before:], "wireguard: trying the direct endpoints again", retried...) {
+		t.Errorf(`%s: no "wireguard: trying the direct endpoints again" line with %v after the update`, a.id, retried)
+	}
+	direct := netip.MustParseAddrPort(b.direct())
+	if stat, ok := deviceStat(t, a, b); !ok || deviceEndpoint(stat) != direct {
+		t.Fatalf("%s: the device endpoint of %s is %v (listed = %t), want its direct address %s",
+			a.id, b.id, stat.Endpoint, ok, direct)
+	}
+
+	if err := relayE.Stop(); err != nil {
+		t.Fatalf("relay E: Stop: %v, want nil", err)
+	}
+	pingBoth(t, a, b, 2, 5*time.Second)
+}
+
+// TestRelayIntegration_DeadDirectEndpointReturnsToTheRelay connects two
+// Managers over relay E, then updates node a's peer b with a direct address
+// nothing listens on in front of E. The retry tries it for its 10 s window:
+// the fresh device peer sends an initiation at once, as the keepalive,
+// relayKeepalive (1 s), turns on, and another after WireGuard's 5 s
+// RekeyTimeout, and neither gets an answer. The first pass after the window,
+// at most 100 ms later, dials E again on a fresh device peer, inside 15 s of
+// the update. E holds back that device peer's first initiation for its retry,
+// because a and b still have a session on E that carries transport messages:
+// b, whose handshake stays fresh and which has no relay probe, never leaves
+// E, and keeps sending its keepalives there. WireGuard's next initiation, 5 s
+// later, passes (see docs/reference/bridge/nat-relay.md:190), so the pair
+// meets on E again about 5 s after the re-dial, inside 20 s.
+func TestRelayIntegration_DeadDirectEndpointReturnsToTheRelay(t *testing.T) {
+	t.Parallel()
+	relayLogs := &logBuffer{}
+	dumpOnFailure(t, relayLogs)
+
+	a := newMeshNode(t, "node-a", "10.99.0.1")
+	b := newMeshNode(t, "node-b", "10.99.0.2")
+	_, e := startRelay(t, relayLogs, "E", a, b)
+
+	a.startSelection()
+	b.startSelection()
+
+	addPeers(t, a, b, e)
+	pingBoth(t, a, b, 1, 20*time.Second)
+	waitSelectedRelayed(t, a, b)
+	waitSelectedRelayed(t, b, a)
+
+	// Nothing listens on the port once freeUDPPort has closed its socket.
+	dead := netip.AddrPortFrom(relayLoopback, uint16(freeUDPPort(t))).String()
+	updatedAt := time.Now()
+	if err := a.mgr.UpdatePeer(b.peerVia(dead, e)); err != nil {
+		t.Fatalf("%s: UpdatePeer(%s) via %s: %v, want nil", a.id, b.id, dead, err)
+	}
+	retried := []string{"peer_id=" + b.id, "reason=pull", "endpoint=" + dead, "entries=1", "relay=" + e}
+	if !logged(a.logs.String(), "wireguard: trying the direct endpoints again", retried...) {
+		t.Fatalf(`%s: no "wireguard: trying the direct endpoints again" line with %v after the update`, a.id, retried)
+	}
+
+	redialed := []string{"peer_id=" + b.id, "endpoint=" + e}
+	if !waitFor(15*time.Second, func() bool {
+		return logged(a.logs.String(), "wireguard: no direct endpoint answered, dialing the relay again", redialed...)
+	}) {
+		t.Fatalf(`%s: no "wireguard: no direct endpoint answered, dialing the relay again" line with %v within 15s of the update`,
+			a.id, redialed)
+	}
+	t.Logf("%s dialed the relay again %v after the update", a.id, time.Since(updatedAt).Round(time.Millisecond))
+
+	pingBoth(t, a, b, 2, 20*time.Second)
+
+	// The first line is the one waitSelectedRelayed saw. The pass that logs
+	// the second runs at most 100 ms after the handshake the pings needed.
+	selected := []string{"peer_id=" + b.id, "relayed=true"}
+	lines := func() int { return loggedLines(a.logs.String(), "wireguard: endpoint selected", selected...) }
+	if !waitFor(time.Second, func() bool { return lines() >= 2 }) {
+		t.Fatalf(`%s: %d "wireguard: endpoint selected" lines with %v 1s after the pings crossed, want 2`, a.id, lines(), selected)
+	}
+	if n := lines(); n != 2 {
+		t.Errorf(`%s: %d "wireguard: endpoint selected" lines with %v, want 2`, a.id, n, selected)
 	}
 }
