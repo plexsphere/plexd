@@ -1583,6 +1583,21 @@ func runAgent(ctx context.Context) error {
 		_ = policyStatusReporter.Run(ctx)
 	}()
 
+	// 17f. Start the round-trip probe. It sends one datagram per heartbeat
+	// interval to UDP port 7911 of each peer with a fresh handshake, answers
+	// the peers' probes on the same port of the mesh address, and keeps the
+	// latest value per peer, which MeshPeerStats hands to the handshake
+	// reporter of step 17a. It follows the heartbeat's interval because the
+	// report it feeds does. Without the interface there is no mesh address to
+	// bind and no peer to probe.
+	if wgReady {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = wgMgr.RunRTTProbe(ctx, hbCfg.Interval)
+		}()
+	}
+
 	// 18. Start reconciler.
 	wg.Add(1)
 	go func() {
