@@ -89,10 +89,13 @@ var sixRules = []FirewallRule{
 }
 
 // sixRulesText is the anchor sixRules renders to in chain plexd-mesh: the
-// relay probe line for utun4, then every line of each rule in order.
+// relay probe line and the two round-trip probe lines for utun4, then every
+// line of each rule in order.
 const sixRulesText = pfHeader +
 	"# chain plexd-mesh\n" +
 	"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+	"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state\n" +
+	"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state\n" +
 	// tcp 443
 	"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state\n" +
 	"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
@@ -351,7 +354,11 @@ func TestPFController_ApplyRules_TwoInterfaces(t *testing.T) {
 	want := pfHeader +
 		"# chain plexd-mesh\n" +
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+		"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state\n" +
+		"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state\n" +
 		"pass out quick on utun5 proto udp from (utun5) to any port 9 no state\n" +
+		"pass out quick on utun5 proto udp from (utun5) to any port 7911 no state\n" +
+		"pass in quick on utun5 proto udp from any to (utun5) port 7911 no state\n" +
 		"pass in quick on utun4 inet from 10.0.0.0/24 to any no state\n" +
 		"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to any keep state\n" +
 		"pass out quick on utun4 inet from 10.0.0.0/24 to any no state\n" +
@@ -445,6 +452,8 @@ func TestPFController_ApplyRules_IPv6Address(t *testing.T) {
 	want := pfHeader +
 		"# chain plexd-mesh\n" +
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+		"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state\n" +
+		"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state\n" +
 		"pass in quick on utun4 inet6 from fd00::/64 to any no state\n" +
 		"pass out quick on utun4 inet6 proto tcp from fd00::/64 to any keep state\n" +
 		"pass out quick on utun4 inet6 from fd00::/64 to any no state\n" +
@@ -694,10 +703,12 @@ func TestPFController_RenderRuleLines(t *testing.T) {
 	})
 }
 
-// The relay probe line opens a chain once per interface, in the order the
-// rules first name each one, and it is the only pass out line whose source
-// is an interface's own addresses: the node's own traffic is matched by the
-// rules, not by an interface-wide pass.
+// The relay probe line and the two round-trip probe lines open a chain once
+// per interface, in the order the rules first name each one, the round-trip
+// probe lines right after that interface's relay probe line. They are the
+// only pass lines that name an interface's own addresses, the pass out lines
+// as source and the pass in line as destination: the node's own traffic is
+// matched by the rules, not by an interface-wide pass.
 func TestPFController_RenderProbeLines(t *testing.T) {
 	ctrl := NewPFController(testLogger())
 	ctrl.chains["plexd-mesh"] = []FirewallRule{
@@ -709,18 +720,33 @@ func TestPFController_RenderProbeLines(t *testing.T) {
 	}
 
 	text, _ := ctrl.render()
+	lines := strings.Split(string(text), "\n")
 	var got []string
-	for _, line := range strings.Split(string(text), "\n") {
-		if strings.HasPrefix(line, "pass out ") && strings.Contains(line, " from (") {
+	for _, line := range lines {
+		if (strings.HasPrefix(line, "pass out ") && strings.Contains(line, " from (")) ||
+			(strings.HasPrefix(line, "pass in ") && strings.Contains(line, " to (")) {
 			got = append(got, line)
 		}
 	}
 	want := []string{
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state",
+		"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state",
+		"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state",
 		"pass out quick on utun5 proto udp from (utun5) to any port 9 no state",
+		"pass out quick on utun5 proto udp from (utun5) to any port 7911 no state",
+		"pass in quick on utun5 proto udp from any to (utun5) port 7911 no state",
 	}
 	if !slices.Equal(got, want) {
-		t.Errorf("pass out lines from an interface =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+		t.Errorf("pass lines that name an interface's own addresses =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	// They are the chain's first filter lines, ahead of every rule.
+	open := slices.Index(lines, "# chain plexd-mesh")
+	if open < 0 || len(lines) < open+1+len(want) {
+		t.Fatalf("render() has no chain plexd-mesh with %d lines:\n%s", len(want), text)
+	}
+	if first := lines[open+1 : open+1+len(want)]; !slices.Equal(first, want) {
+		t.Errorf("chain plexd-mesh opens with\n%s\nwant\n%s", strings.Join(first, "\n"), strings.Join(want, "\n"))
 	}
 }
 
@@ -871,11 +897,11 @@ func TestPFController_RenderRuleLogged(t *testing.T) {
 
 // render maps each logged line to its rule's tag under the number pf gives
 // it, which counts the rules pfctl loads from the first filter line on. In
-// the chain below the relay probe line is filter line 0 and the untagged
-// rule's lines are 1 to 4, so the logged rule's pass in log line is filter
-// line 5 and its pass out log line 7. pfctl loads the untagged rule's ICMP
-// mirror as four rules, one per icmp-type, so pf numbers those two lines 8
-// and 10.
+// the chain below the relay probe line is filter line 0, the two round-trip
+// probe lines are 1 and 2, and the untagged rule's lines are 3 to 6, so the
+// logged rule's pass in log line is filter line 7 and its pass out log line
+// 9. pfctl loads the untagged rule's ICMP mirror as four rules, one per
+// icmp-type, so pf numbers those two lines 10 and 12.
 func TestPFController_RenderLogTags(t *testing.T) {
 	filterLines := func(text []byte) []string {
 		var lines []string
@@ -898,25 +924,31 @@ func TestPFController_RenderLogTags(t *testing.T) {
 		text, tags := ctrl.render()
 
 		lines := filterLines(text)
-		if len(lines) != 12 {
-			t.Fatalf("filter lines = %d, want 12:\n%s", len(lines), text)
+		if len(lines) != 14 {
+			t.Fatalf("filter lines = %d, want 14:\n%s", len(lines), text)
 		}
-		if want := "pass out quick on utun4 proto udp from (utun4) to any port 9 no state"; lines[0] != want {
-			t.Errorf("filter line 0 = %q, want %q", lines[0], want)
+		for i, want := range []string{
+			"pass out quick on utun4 proto udp from (utun4) to any port 9 no state",
+			"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state",
+			"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state",
+		} {
+			if lines[i] != want {
+				t.Errorf("filter line %d = %q, want %q", i, lines[i], want)
+			}
 		}
-		if want := "pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.6 port 8443 flags S/SA no state"; lines[5] != want {
-			t.Errorf("filter line 5 = %q, want %q", lines[5], want)
-		}
-		if want := "pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.6 port 8443 keep state"; lines[7] != want {
+		if want := "pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.6 port 8443 flags S/SA no state"; lines[7] != want {
 			t.Errorf("filter line 7 = %q, want %q", lines[7], want)
 		}
-		if want := map[uint32]string{8: "1/1", 10: "1/1"}; !maps.Equal(tags, want) {
+		if want := "pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.6 port 8443 keep state"; lines[9] != want {
+			t.Errorf("filter line 9 = %q, want %q", lines[9], want)
+		}
+		if want := map[uint32]string{10: "1/1", 12: "1/1"}; !maps.Equal(tags, want) {
 			t.Errorf("render() tags = %v, want %v", tags, want)
 		}
 	})
 
 	// A rule without addresses has an ICMP mirror for each family, four and
-	// five rules, so the logged rule behind it starts at 18.
+	// five rules, so the logged rule behind it starts at 20.
 	t.Run("after both icmp mirrors", func(t *testing.T) {
 		ctrl := NewPFController(testLogger())
 		ctrl.chains["plexd-mesh"] = []FirewallRule{
@@ -926,7 +958,7 @@ func TestPFController_RenderLogTags(t *testing.T) {
 		}
 		_, tags := ctrl.render()
 
-		want := map[uint32]string{1: "2/0", 3: "2/0", 4: "2/0", 6: "2/0", 18: "2/1", 20: "2/1"}
+		want := map[uint32]string{3: "2/0", 5: "2/0", 6: "2/0", 8: "2/0", 20: "2/1", 22: "2/1"}
 		if !maps.Equal(tags, want) {
 			t.Errorf("render() tags = %v, want %v", tags, want)
 		}
@@ -977,6 +1009,8 @@ const (
 	tcp443LoggedText = pfHeader +
 		"# chain plexd-mesh\n" +
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+		"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state\n" +
+		"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state\n" +
 		"pass in log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 flags S/SA no state\n" +
 		"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state\n" +
 		"pass out log quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
@@ -988,6 +1022,8 @@ const (
 	tcp443UnloggedText = pfHeader +
 		"# chain plexd-mesh\n" +
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state\n" +
+		"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state\n" +
+		"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state\n" +
 		"pass in quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 no state\n" +
 		"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state\n" +
 		"pass out quick on utun4 inet proto tcp from 10.1.0.5 port 443 to 10.0.0.0/24 flags A/A no state\n" +
@@ -1017,7 +1053,7 @@ func TestPFController_ApplyRules_ConnLog(t *testing.T) {
 		runnerCall{Args: []string{"-a", pfAnchor, "-f", "-"}, Stdin: tcp443LoggedText},
 		runnerCall{Args: []string{"-E"}},
 	)
-	if want := map[uint32]string{1: "1/0", 3: "1/0"}; !maps.Equal(ctrl.logTags, want) {
+	if want := map[uint32]string{3: "1/0", 5: "1/0"}; !maps.Equal(ctrl.logTags, want) {
 		t.Errorf("logTags = %v, want %v", ctrl.logTags, want)
 	}
 
@@ -1027,10 +1063,10 @@ func TestPFController_ApplyRules_ConnLog(t *testing.T) {
 	if opens != 1 {
 		t.Errorf("openLog calls = %d, want 1", opens)
 	}
-	if tag, ok := ctrl.pflogTag(3); !ok || tag != "2/0" {
-		t.Errorf("pflogTag(3) = %q, %v, want %q, true", tag, ok, "2/0")
+	if tag, ok := ctrl.pflogTag(5); !ok || tag != "2/0" {
+		t.Errorf("pflogTag(5) = %q, %v, want %q, true", tag, ok, "2/0")
 	}
-	if want := map[uint32]string{1: "1/0", 3: "1/0"}; !maps.Equal(ctrl.prevLogTags, want) {
+	if want := map[uint32]string{3: "1/0", 5: "1/0"}; !maps.Equal(ctrl.prevLogTags, want) {
 		t.Errorf("prevLogTags = %v, want %v", ctrl.prevLogTags, want)
 	}
 
@@ -1040,7 +1076,7 @@ func TestPFController_ApplyRules_ConnLog(t *testing.T) {
 	if err := ctrl.ApplyRules("plexd-mesh", tcp443Rules("3/0")); err == nil {
 		t.Fatal("ApplyRules() error = nil, want the load error")
 	}
-	if want := map[uint32]string{1: "2/0", 3: "2/0"}; !maps.Equal(ctrl.logTags, want) {
+	if want := map[uint32]string{3: "2/0", 5: "2/0"}; !maps.Equal(ctrl.logTags, want) {
 		t.Errorf("logTags after a refused load = %v, want %v", ctrl.logTags, want)
 	}
 	delete(runner.outputs, loadKey)
@@ -1060,8 +1096,8 @@ func TestPFController_ApplyRules_ConnLog(t *testing.T) {
 	if len(ctrl.logTags) != 0 {
 		t.Errorf("logTags after the flush = %v, want none", ctrl.logTags)
 	}
-	if tag, ok := ctrl.pflogTag(1); !ok || tag != "2/0" {
-		t.Errorf("pflogTag(1) after the flush = %q, %v, want %q, true", tag, ok, "2/0")
+	if tag, ok := ctrl.pflogTag(3); !ok || tag != "2/0" {
+		t.Errorf("pflogTag(3) after the flush = %q, %v, want %q, true", tag, ok, "2/0")
 	}
 }
 
@@ -1243,9 +1279,9 @@ func TestPFController_ApplyRules_LoadFails(t *testing.T) {
 func TestPFController_RenderParses(t *testing.T) {
 	ctrl := NewPFController(testLogger())
 	ctrl.natIface = "en1"
-	// sixRules yields the relay probe line, the keep state and no state pass
-	// out lines, the flags A/A mirror, a udp mirror with a port range, the
-	// ICMP mirror and the inet block out lines.
+	// sixRules yields the relay probe line, the two round-trip probe lines,
+	// the keep state and no state pass out lines, the flags A/A mirror, a udp
+	// mirror with a port range, the ICMP mirror and the inet block out lines.
 	ctrl.chains["plexd-mesh"] = sixRules
 	// The second chain carries the lines sixRules cannot produce: inet6,
 	// icmp6 and the ICMPv6 mirror, the IPv6 wildcard, a flags A/A mirror with
@@ -1285,6 +1321,10 @@ func TestPFController_RenderParses(t *testing.T) {
 		"pass in on utun7 inet all keep state tag plexd-mesh-rewrite",
 		"pass out quick on utun4 proto udp from (utun4) to any port 9 no state",
 		"pass out quick on utun5 proto udp from (utun5) to any port 9 no state",
+		"pass out quick on utun4 proto udp from (utun4) to any port 7911 no state",
+		"pass in quick on utun4 proto udp from any to (utun4) port 7911 no state",
+		"pass out quick on utun5 proto udp from (utun5) to any port 7911 no state",
+		"pass in quick on utun5 proto udp from any to (utun5) port 7911 no state",
 		"pass out quick on utun4 inet proto tcp from 10.0.0.0/24 to 10.1.0.5 port 443 keep state",
 		"pass out quick on utun4 inet proto udp from 10.0.0.0/24 to 10.1.0.0/24 port 53:60 no state",
 		"pass out quick on utun5 inet6 proto tcp from fd00::1 port 8000:8080 to fd00::/64 flags A/A no state",
@@ -2279,9 +2319,9 @@ func TestPFController_Real(t *testing.T) {
 	// per type. The IPv6 rule's port has no /etc/services name, so its lines
 	// read the same whether pfctl prints a port by number or by service
 	// name. The relay probe's port has one, discard, so the probe line is
-	// accepted in either spelling. These normalised forms are what
-	// macos-latest must confirm; where it prints another form, that form is
-	// the one to assert.
+	// accepted in either spelling. The round-trip probe's port 7911 has none,
+	// as the IPv6 rule's. These normalised forms are what macos-latest must
+	// confirm; where it prints another form, that form is the one to assert.
 	loaded := pfctlOut("-a", pfAnchor, "-s", "rules")
 	wants := []string{
 		"pass in quick on plexd99 inet proto tcp from 10.255.252.0/30 to 10.255.252.4/30",
@@ -2305,27 +2345,49 @@ func TestPFController_Real(t *testing.T) {
 		}
 	}
 
-	// The relay probe line is the only pass out line whose source is the
-	// interface's own addresses: the pass out pair the anchor opened with
-	// before #178 is gone.
-	probe := []string{
-		"pass out quick on plexd99 proto udp from (plexd99) to any port = discard no state",
-		"pass out quick on plexd99 proto udp from (plexd99) to any port = 9 no state",
+	// The probe lines are the only pass lines that name the interface's own
+	// addresses: the relay probe line and the round-trip probe's pass out
+	// line as source, the round-trip probe's pass in line as destination.
+	// The pass out pair the anchor opened with before #178 is gone.
+	probes := []struct {
+		name  string
+		forms []string
+		count int
+	}{
+		{name: "relay probe", forms: []string{
+			"pass out quick on plexd99 proto udp from (plexd99) to any port = discard no state",
+			"pass out quick on plexd99 proto udp from (plexd99) to any port = 9 no state",
+		}},
+		{name: "round-trip probe pass out", forms: []string{
+			"pass out quick on plexd99 proto udp from (plexd99) to any port = 7911 no state",
+		}},
+		{name: "round-trip probe pass in", forms: []string{
+			"pass in quick on plexd99 proto udp from any to (plexd99) port = 7911 no state",
+		}},
 	}
-	probes := 0
 	for _, line := range strings.Split(loaded, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "pass out ") || !strings.Contains(line, "from (plexd99)") {
+		own := (strings.HasPrefix(line, "pass out ") && strings.Contains(line, "from (plexd99)")) ||
+			(strings.HasPrefix(line, "pass in ") && strings.Contains(line, "to (plexd99)"))
+		if !own {
 			continue
 		}
-		if !slices.Contains(probe, line) {
-			t.Errorf("loaded rules pass %q, want only the relay probe line from (plexd99)", line)
-			continue
+		found := false
+		for i := range probes {
+			if slices.Contains(probes[i].forms, line) {
+				probes[i].count++
+				found = true
+				break
+			}
 		}
-		probes++
+		if !found {
+			t.Errorf("loaded rules pass %q, want only the probe lines to and from (plexd99)", line)
+		}
 	}
-	if probes != 1 {
-		t.Errorf("loaded rules hold %d relay probe lines, want 1, in one of %q:\n%s", probes, probe, loaded)
+	for _, probe := range probes {
+		if probe.count != 1 {
+			t.Errorf("loaded rules hold %d %s lines, want 1, in one of %q:\n%s", probe.count, probe.name, probe.forms, loaded)
+		}
 	}
 	if nat := pfctlOut("-a", pfAnchor, "-s", "nat"); !strings.Contains(nat, "nat on plexd99 inet all -> (plexd99)") {
 		t.Errorf("loaded nat misses the masquerade rule:\n%s", nat)

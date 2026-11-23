@@ -144,8 +144,9 @@ func (c *PFController) pfctl(op string, stdin []byte, args ...string) ([]byte, e
 // a file: the bridge NAT line, then one line per mesh interface the mesh
 // source rewrites name, in name order. Chains are rendered in name order so
 // the same state always yields the same text. Each chain opens with the relay
-// probe line for every interface it mentions, in order of first appearance,
-// and then holds the lines renderRule returns for each rule. A chain without
+// probe line and the two round-trip probe lines for every interface it
+// mentions, in order of first appearance, and then holds the lines
+// renderRule returns for each rule. A chain without
 // rules renders as its comment line alone. The two filter lines of each mesh
 // source rewrite follow the last chain, in the name order of their source
 // interfaces.
@@ -215,6 +216,15 @@ func (c *PFController) render() ([]byte, map[uint32]string) {
 			// address family, so it covers IPv4 and IPv6. It keeps no state,
 			// so it lets nothing back in.
 			filter(fmt.Sprintf("pass out quick on %s proto udp from (%s) to any port %d no state", rule.Interface, rule.Interface, RelayProbePort), "")
+			// The round-trip probe passes ahead of the rules in both
+			// directions, as RTTProbePort records: what the node sends to the
+			// port and what arrives for the node on it. (<if>) keeps the
+			// packets the Mac forwards out of both lines, the source of the
+			// first and the destination of the second. pf keeps no state for
+			// these lines, so an answer leaves a Mac only when it goes to port
+			// RTTProbePort, which the answer to a plexd probe does.
+			filter(fmt.Sprintf("pass out quick on %s proto udp from (%s) to any port %d no state", rule.Interface, rule.Interface, RTTProbePort), "")
+			filter(fmt.Sprintf("pass in quick on %s proto udp from any to (%s) port %d no state", rule.Interface, rule.Interface, RTTProbePort), "")
 		}
 
 		for _, rule := range c.chains[name] {
