@@ -320,11 +320,14 @@ func TestTypesEndpointCandidatesResponse(t *testing.T) {
 }
 
 func TestTypesHandshakeReportRequest(t *testing.T) {
-	// The contract's request example.
+	// The contract's request example, without the shared_subnets member plexd
+	// does not send: the first entry carries a round-trip time, the second
+	// has none.
+	rtt := int32(23400)
 	orig := HandshakeReportRequest{
 		ObservedAt: time.Date(2026, 10, 21, 10, 15, 30, 0, time.UTC),
 		Peers: []HandshakeReportPeer{
-			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2", LastHandshakeAgeSeconds: 42, Endpoint: "198.51.100.7:51820"},
+			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2", LastHandshakeAgeSeconds: 42, Endpoint: "198.51.100.7:51820", RTTMicroseconds: &rtt},
 			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", LastHandshakeAgeSeconds: 117, Endpoint: "[2001:db8::7]:51820"},
 		},
 	}
@@ -332,14 +335,15 @@ func TestTypesHandshakeReportRequest(t *testing.T) {
 	requireEqual(t, orig, got)
 
 	const want = `{"observed_at":"2026-10-21T10:15:30Z","peers":[` +
-		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2","last_handshake_age_seconds":42,"endpoint":"198.51.100.7:51820"},` +
+		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2","last_handshake_age_seconds":42,"endpoint":"198.51.100.7:51820","rtt_microseconds":23400},` +
 		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3","last_handshake_age_seconds":117,"endpoint":"[2001:db8::7]:51820"}]}`
 	if string(data) != want {
 		t.Errorf("serialized =\n  %s\nwant\n  %s", data, want)
 	}
 
 	// The handler decodes with DisallowUnknownFields, so the envelope and each
-	// entry must carry exactly the contract's keys.
+	// entry must carry exactly the contract's keys: the three required ones,
+	// and rtt_microseconds only on the entry that holds a value.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
@@ -359,20 +363,28 @@ func TestTypesHandshakeReportRequest(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("peers = %d entries, want 2", len(entries))
 	}
+	wantKeys := [][]string{
+		{"peer_node_id", "last_handshake_age_seconds", "endpoint", "rtt_microseconds"},
+		{"peer_node_id", "last_handshake_age_seconds", "endpoint"},
+	}
 	for i, entry := range entries {
-		if len(entry) != 3 {
-			t.Errorf("peers[%d]: expected exactly 3 JSON keys, got %d: %v", i, len(entry), entry)
+		if len(entry) != len(wantKeys[i]) {
+			t.Errorf("peers[%d]: expected exactly %d JSON keys, got %d: %v", i, len(wantKeys[i]), len(entry), entry)
 		}
-		for _, key := range []string{"peer_node_id", "last_handshake_age_seconds", "endpoint"} {
+		for _, key := range wantKeys[i] {
 			if _, ok := entry[key]; !ok {
 				t.Errorf("peers[%d]: expected JSON key %q", i, key)
 			}
 		}
 	}
+	if v := string(entries[0]["rtt_microseconds"]); v != "23400" {
+		t.Errorf("peers[0].rtt_microseconds = %s, want 23400", v)
+	}
 }
 
-// A zero-valued entry still carries all three keys: the contract refuses an
-// entry missing its age, and an age of 0 is a handshake within the last second.
+// A zero-valued entry still carries all three required keys: the contract
+// refuses an entry missing its age, and an age of 0 is a handshake within the
+// last second. It carries no rtt_microseconds, which a nil pointer leaves off.
 func TestTypesHandshakeReportPeer_ZeroValuesOnWire(t *testing.T) {
 	data, got := roundTrip(t, HandshakeReportPeer{})
 	requireEqual(t, HandshakeReportPeer{}, got)
