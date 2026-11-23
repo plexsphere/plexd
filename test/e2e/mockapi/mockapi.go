@@ -3372,9 +3372,11 @@ const (
 )
 
 // handshakeReportBody is the mock's reading of a handshake report. Every member
-// is a pointer, so a missing or null one decodes to nil and is refused as
-// missing instead of passing as a zero value. The age is an int64, so a value
-// outside the contract's int32 range reaches the range check in
+// is a pointer, so a missing or null one decodes to nil instead of passing as a
+// zero value: a required member is refused as missing, and the optional
+// rtt_microseconds reads as no measurement, as the contract treats both an
+// absent member and null. The age and the round-trip time are int64s, so a
+// value outside the contract's int32 range reaches the range check in
 // checkHandshakeReport instead of failing the decode with a less telling error.
 type handshakeReportBody struct {
 	ObservedAt *time.Time              `json:"observed_at"`
@@ -3386,6 +3388,7 @@ type handshakeReportEntry struct {
 	PeerNodeID              *string `json:"peer_node_id"`
 	LastHandshakeAgeSeconds *int64  `json:"last_handshake_age_seconds"`
 	Endpoint                *string `json:"endpoint"`
+	RTTMicroseconds         *int64  `json:"rtt_microseconds"`
 }
 
 // checkHandshakeReport runs the contract's structural invariants over a decoded
@@ -3418,6 +3421,8 @@ func checkHandshakeReport(req handshakeReportBody) string {
 			return fmt.Sprintf("peers[%d].last_handshake_age_seconds is required.", i)
 		case *p.LastHandshakeAgeSeconds < 0 || *p.LastHandshakeAgeSeconds > math.MaxInt32:
 			return fmt.Sprintf("peers[%d].last_handshake_age_seconds is outside 0..%d.", i, math.MaxInt32)
+		case p.RTTMicroseconds != nil && (*p.RTTMicroseconds < 1 || *p.RTTMicroseconds > math.MaxInt32):
+			return fmt.Sprintf("peers[%d].rtt_microseconds is outside 1..%d.", i, math.MaxInt32)
 		}
 		id := strings.ToLower(*p.PeerNodeID)
 		if _, dup := seen[id]; dup {

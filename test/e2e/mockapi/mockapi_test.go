@@ -5208,6 +5208,14 @@ func handshakeEntry(peerID string, age int64, endpoint string) string {
 	return fmt.Sprintf(`{"peer_node_id":%q,"last_handshake_age_seconds":%d,"endpoint":%q}`, peerID, age, endpoint)
 }
 
+// handshakeEntryRTT renders a handshake report entry that carries
+// rtt_microseconds. rtt is the member's JSON value verbatim, so a test can send
+// null or a string as well as a number.
+func handshakeEntryRTT(peerID string, age int64, endpoint, rtt string) string {
+	return fmt.Sprintf(`{"peer_node_id":%q,"last_handshake_age_seconds":%d,"endpoint":%q,"rtt_microseconds":%s}`,
+		peerID, age, endpoint, rtt)
+}
+
 // handshakeBodyAt renders a handshake report observed at observedAt, carrying
 // the given entries verbatim.
 func handshakeBodyAt(observedAt time.Time, entries ...string) string {
@@ -5263,8 +5271,75 @@ func TestHandshakes_RecordsFixturePeersAndIgnoresTheRest(t *testing.T) {
 	}
 }
 
-// An empty report is valid and records nothing. It is the only body the e2e run
-// ever sends, because the fixture peers never complete a handshake.
+// rtt_microseconds is optional: a value in 1..2147483647, null and an absent
+// member all pass, and the entry that carries it is recorded like any other.
+// Each case sends the member on one fixture peer beside a second fixture peer
+// without it, since an id may appear only once in a report.
+func TestHandshakes_AcceptsTheRoundTripTime(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		{"one microsecond", handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "1")},
+		{"23.4 ms", handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "23400")},
+		{"int32 ceiling", handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "2147483647")},
+		{"null", handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "null")},
+		{"absent", handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			body := handshakeBody(tt.entry, handshakeEntry(testFixturePeerB2, 9, "198.51.100.8:51820"))
+			resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+			defer resp.Body.Close()
+
+			receipt := decodeHandshakeReceipt(t, resp)
+			if receipt.Recorded != 2 || receipt.Ignored != 0 {
+				t.Errorf("recorded = %d, ignored = %d, want 2 and 0", receipt.Recorded, receipt.Ignored)
+			}
+			if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 1 {
+				t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
+			}
+			if got := string(getCapturedBody(t, ts.URL, "handshakes")); got != body {
+				t.Errorf("captured body = %s, want %s", got, body)
+			}
+		})
+	}
+}
+
+// A string where the contract wants an integer fails the strict decode, so the
+// refusal names the decode rather than the range check.
+func TestHandshakes_RefusesAStringRoundTripTimeInTheDecode(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := handshakeBody(handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", `"12"`))
+	resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, b)
+	}
+
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != "malformed_handshake_report" {
+		t.Errorf("code = %v, want malformed_handshake_report (detail: %v)", problem["code"], problem["detail"])
+	}
+	detail, _ := problem["detail"].(string)
+	const decodePrefix = "request body is not a valid HandshakeReportRequest: "
+	if !strings.HasPrefix(detail, decodePrefix) || !strings.Contains(detail, "rtt_microseconds") {
+		t.Errorf("detail = %q, want the decode's refusal (prefix %q) naming rtt_microseconds", detail, decodePrefix)
+	}
+	if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 0 {
+		t.Errorf("handshake_report_count = %d, want 0", a.HandshakeReportCount)
+	}
+}
+
+// An empty report is valid and records nothing. It is the body phase 4b of the
+// e2e run reads, because the fixture peers never complete a handshake there.
 func TestHandshakes_EmptyPeers_Returns200(t *testing.T) {
 	_, ts := newTestServer(t)
 
@@ -5355,6 +5430,21 @@ func TestHandshakes_RefusesNonContractBody(t *testing.T) {
 		{"age -1", handshakeBody(handshakeEntry(testFixturePeerB1, -1, "198.51.100.7:51820")), "malformed_handshake_report", ""},
 		{"age above int32", handshakeBody(handshakeEntry(testFixturePeerB1, 2147483648, "198.51.100.7:51820")), "malformed_handshake_report", ""},
 		{
+			"rtt 0",
+			handshakeBody(handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "0")),
+			"malformed_handshake_report", "peers[0].rtt_microseconds is outside 1..2147483647.",
+		},
+		{
+			"rtt -1",
+			handshakeBody(handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "-1")),
+			"malformed_handshake_report", "peers[0].rtt_microseconds is outside 1..2147483647.",
+		},
+		{
+			"rtt above int32",
+			handshakeBody(handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "2147483648")),
+			"malformed_handshake_report", "peers[0].rtt_microseconds is outside 1..2147483647.",
+		},
+		{
 			"repeated peer_node_id",
 			handshakeBody(valid, handshakeEntry(testFixturePeerB1, 9, "198.51.100.8:51820")),
 			"malformed_handshake_report", "",
@@ -5369,6 +5459,12 @@ func TestHandshakes_RefusesNonContractBody(t *testing.T) {
 			"malformed beats clock skew",
 			handshakeBodyAt(time.Now().Add(-time.Hour), handshakeEntry(testFixturePeerB1, -1, "198.51.100.7:51820")),
 			"malformed_handshake_report", "",
+		},
+		{
+			// The round-trip time's range is structural too.
+			"rtt out of range beats clock skew",
+			handshakeBodyAt(time.Now().Add(-time.Hour), handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "0")),
+			"malformed_handshake_report", "peers[0].rtt_microseconds is outside 1..2147483647.",
 		},
 		{
 			// A later entry's structure is judged before an earlier entry's endpoint.
