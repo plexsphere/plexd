@@ -108,6 +108,15 @@ New-NetFirewallRule -DisplayName 'plexd bridge WireGuard' -Direction Inbound `
 
 51821 and 51830 stand for the ports the state pull delivers; each provider's and each tunnel's entry in the node API's [`status.user-access`](../reference/core/nodeapi.md#status-user-access) and [`status.site-to-site`](../reference/core/nodeapi.md#status-site-to-site) reports carries its `listen_port`. See [User Access Integration](../reference/bridge/user-access-integration.md#windows) and [Site-to-Site VPN](../reference/bridge/site-to-site-vpn.md#routes-and-policy).
 
+Every node also needs a rule for plexd's [round-trip probe](../reference/networking/wireguard.md#round-trip-probe). plexd answers its peers' probes on UDP port 7911 of its mesh address, inside the tunnel. Its WFP permit for that port is soft too and cannot open the port where Windows Defender Firewall closes it:
+
+```powershell
+New-NetFirewallRule -DisplayName 'plexd round-trip probe' -Direction Inbound `
+  -Protocol UDP -LocalPort 7911 -Action Allow
+```
+
+A node without the rule still measures its peers, because the answer to its own probe comes back on the flow the probe opened, but it answers no peer's probe, so its peers report no round-trip time for it.
+
 ## Automated installation
 
 Pre-provision the token before installing, then leave `--token` off:

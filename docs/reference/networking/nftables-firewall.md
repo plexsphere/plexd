@@ -32,7 +32,7 @@ Logger entries use `component=policy`.
 |---------------|-----------------------------------------------------------------------|
 | `Probe`       | `ListTablesOfFamily(INet)`, read-only                                 |
 | `EnsureChain` | `ListTablesOfFamily(IPv4)`, then in one batch `DelTable` of `ip plexd` if listed, `AddTable` and `AddChain` for all three chains, `Flush` |
-| `ApplyRules`  | `chainRuleExprs` for both lists, then on a socket sized by `applyBufferBytes`: `AddTable` + `AddChain` and `FlushChain` for all three chains + `AddRule` per rule of the input list into the input and forward chains and of the output list into the output chain + `Flush` |
+| `ApplyRules`  | `chainRuleExprs` for the three lists, then on a socket sized by `applyBufferBytes`: `AddTable` + `AddChain` and `FlushChain` for all three chains + `AddRule` per rule of each list into its own chain + `Flush` |
 | `FlushChain`  | `ListChainsOfTableFamily(INet)` → `FlushChain` for each chain found + `Flush` |
 | `DeleteChain` | `ListChainsOfTableFamily(INet)` → `DelChain` for each chain found + `Flush`; closes the NFLOG reader, also when no chain exists |
 | `DropCounts`  | `GetRules` for each of the three chains, read-only, then `sumDropCounters` over the rules |
@@ -51,22 +51,22 @@ A failed listing returns `policy: nftables: ensure chain: list tables: <error>`.
 
 ### ApplyRules
 
-Atomically replaces the rules of all three chains. It builds two lists from the same rules before it touches the batch. The input list matches the interface a packet arrives on (`meta iifname`), and the output list the interface a packet leaves through (`meta oifname`):
+Atomically replaces the rules of all three chains. It builds one list for each chain from the same rules before it touches the batch. The input and forward lists match the interface a packet arrives on (`meta iifname`), and the output list the interface a packet leaves through (`meta oifname`):
 
-1. Validates each `FirewallRule` and converts it into nftables expressions, once for each list: `chainRuleExprs(rules, dirIn)` and `chainRuleExprs(rules, dirOut)`
-2. Opens each list with the two [connection tracking rules](#connection-tracking) once per distinct `Interface` among the rules, in order of first appearance. The output list follows them with that interface's foreign-source rule and relay probe rule. One rule per `FirewallRule` follows, in the order given, and a rule with a `LogTag` has its [log rule](#log-rules) directly in front of it
+1. Validates each `FirewallRule` and converts it into nftables expressions, once for each list: `chainRuleExprs(rules, hookInput)`, `chainRuleExprs(rules, hookForward)` and `chainRuleExprs(rules, hookOutput)`
+2. Opens each list with the two [connection tracking rules](#connection-tracking) once per distinct `Interface` among the rules, in order of first appearance. The input list follows them with that interface's round-trip probe rule, and the output list with its foreign-source rule, relay probe rule and round-trip probe rule. The forward list adds none, so nothing the node forwards passes an exemption. One rule per `FirewallRule` follows, in the order given, and a rule with a `LogTag` has its [log rule](#log-rules) directly in front of it
 3. Ensures the table and all three chains exist
 4. Flushes all three chains
-5. Writes the input list into the input and forward chains, and the output list into the output chain
+5. Writes each list into its own chain
 6. Commits everything in one batch via `Flush()`, so the three chains change together or not at all
 
-If validation or expression building fails for any rule (an invalid address, mixed families, an unsupported protocol or action), the whole operation is aborted before `Flush()`, and the chains keep the rules they had. The error texts are the same for both lists.
+If validation or expression building fails for any rule (an invalid address, mixed families, an unsupported protocol or action), the whole operation is aborted before `Flush()`, and the chains keep the rules they had. The error texts are the same for all three lists.
 
 When a rule carries a `LogTag` and no NFLOG reader runs, `ApplyRules` opens one. If no sink is set or the reader does not open, it writes the rules without their tags, so no log rule reaches the kernel, and on a failed open it logs `policy connection logging unavailable, logged rules are enforced without it` at Warn with `error`. See [Connection Logging](#connection-logging).
 
-For n policy rules on one interface the kernel holds 3n + 11 rules: n + 3 in each of the input and forward chains (the n rules, the two connection tracking rules and the default deny), and n + 5 in the output chain, which adds the foreign-source rule and the relay probe rule. Each logged rule adds its log rule to all three chains, so m logged rules make it 3(n + m) + 11. A packet is evaluated only by the chain whose hook it takes. plexd sets no cap of its own on n; the control plane's compile bounds it.
+For n policy rules on one interface the kernel holds 3n + 13 rules: n + 3 in the forward chain (the n rules, the two connection tracking rules and the default deny), n + 4 in the input chain, which adds the round-trip probe rule, and n + 6 in the output chain, which adds the foreign-source rule, the relay probe rule and the round-trip probe rule. Each logged rule adds its log rule to all three chains, so m logged rules make it 3(n + m) + 13. A packet is evaluated only by the chain whose hook it takes. plexd sets no cap of its own on n; the control plane's compile bounds it.
 
-The kernel echoes every rule add back on the batch's netlink socket, and the echoes queue there until the batch is acknowledged. With the default socket buffers a batch failed with `ENOBUFS` or `EMSGSIZE` from about 55 policy rules with two chains, and from about 40 with three, measured on Linux 6.8. `ApplyRules` therefore sizes the socket to the batch. `applyBufferBytes` returns 1 MiB plus 8 KiB per rule the batch adds, counting the input list twice and the output list once. `sizeSocketBuffers` sets the send and receive buffers to that size with `SO_SNDBUFFORCE` and `SO_RCVBUFFORCE`, which go past the host's `net.core.wmem_max` and `net.core.rmem_max` and need `CAP_NET_ADMIN`. Without the capability it falls back to `SO_SNDBUF` and `SO_RCVBUF`, which the host caps. The option never returns an error, because google/nftables v0.3.0 leaves the netlink socket open when one does. A batch that still does not fit fails on its own, with the kernel's `ENOBUFS` or `EMSGSIZE` in the error `ApplyRules` returns. `TestNftablesController_Real` applies 1000 policy rules in one batch.
+The kernel echoes every rule add back on the batch's netlink socket, and the echoes queue there until the batch is acknowledged. With the default socket buffers a batch failed with `ENOBUFS` or `EMSGSIZE` from about 55 policy rules with two chains, and from about 40 with three, measured on Linux 6.8. `ApplyRules` therefore sizes the socket to the batch. `applyBufferBytes` returns 1 MiB plus 8 KiB per rule the batch adds, counting each of the three lists once. `sizeSocketBuffers` sets the send and receive buffers to that size with `SO_SNDBUFFORCE` and `SO_RCVBUFFORCE`, which go past the host's `net.core.wmem_max` and `net.core.rmem_max` and need `CAP_NET_ADMIN`. Without the capability it falls back to `SO_SNDBUF` and `SO_RCVBUF`, which the host caps. The option never returns an error, because google/nftables v0.3.0 leaves the netlink socket open when one does. A batch that still does not fit fails on its own, with the kernel's `ENOBUFS` or `EMSGSIZE` in the error `ApplyRules` returns. `TestNftablesController_Real` applies 1000 policy rules in one batch.
 
 ### FlushChain and DeleteChain
 
@@ -80,29 +80,33 @@ The kernel echoes every rule add back on the batch's netlink socket, and the ech
 
 ## Connection Tracking
 
-Each chain starts with two rules per interface. The input and forward chains match the interface a packet arrives on:
+Each chain starts with two rules per interface. The input and forward chains match the interface a packet arrives on, and the input chain follows the two rules with the round-trip probe rule:
 
 ```
 iifname "plexd0" ct state established ct direction reply counter accept
 iifname "plexd0" ct state related counter accept
+iifname "plexd0" meta l4proto udp th dport 7911 counter accept
 ```
 
-The output chain matches the interface a packet leaves through, and follows the two rules with the foreign-source rule and the relay probe rule:
+The forward chain holds the first two alone. The output chain matches the interface a packet leaves through, and follows the two rules with the foreign-source rule, the relay probe rule and the round-trip probe rule:
 
 ```
 oifname "plexd0" ct state established ct direction reply counter accept
 oifname "plexd0" ct state related counter accept
 oifname "plexd0" fib saddr . oif type != local counter accept
 oifname "plexd0" meta l4proto udp th dport 9 counter accept
+oifname "plexd0" meta l4proto udp th dport 7911 counter accept
 ```
 
 `connTrackExprs(iface, dir)` builds the first two. The first passes a packet in the reply direction of a connection the kernel tracks. In the input and forward chains those are the replies to a connection the node opened over the mesh, or that a host behind the node opened through it. In the output chain they are the replies the node sends to a connection the policy let in. None needs a policy rule of its own. The second passes a packet the kernel relates to a tracked connection, such as an ICMP error about it, in either direction.
 
 Only the reply direction bypasses the rules. A packet in a connection's original direction is matched against the rules every time, so a revoked rule cuts an established inbound or forwarded connection at its next packet, as the stateless chain of earlier releases did. The output chain does the same for a connection the node's own sockets opened. Accepting every established packet instead would keep a revoked connection alive until conntrack forgets it. For the same reason plexd flushes no conntrack entry when a ruleset changes.
 
-The third rule, built by `foreignSourceExprs(iface)`, lets a packet out unfiltered when its source is not an address of the mesh interface. `fib saddr . oif type` asks the routing table for the type of the source address on the outgoing interface, which is `local` only for an address assigned to that interface, so the node's mesh address is filtered and any other source is not. IPVS sends a Pod's packet to a Service endpoint behind the mesh through the output hook with the Pod's address as source, and a socket can bind another address of the node. Masquerade gives such a packet the mesh address only at postrouting, after the output chain, so no rule could match it. It leaves as forwarded traffic leaves, and a packet that still carries a foreign source when it leaves is dropped by the receiving peer's WireGuard, which accepts from a peer only the addresses it allows for that peer. kube-proxy's DNAT of a host-network connection to a Service never meets the output chain as `plexd0` traffic: the filter chains of the output hook see the interface of the route the connection started on.
+The third rule of the output chain, built by `foreignSourceExprs(iface)`, lets a packet out unfiltered when its source is not an address of the mesh interface. `fib saddr . oif type` asks the routing table for the type of the source address on the outgoing interface, which is `local` only for an address assigned to that interface, so the node's mesh address is filtered and any other source is not. IPVS sends a Pod's packet to a Service endpoint behind the mesh through the output hook with the Pod's address as source, and a socket can bind another address of the node. Masquerade gives such a packet the mesh address only at postrouting, after the output chain, so no rule could match it. It leaves as forwarded traffic leaves, and a packet that still carries a foreign source when it leaves is dropped by the receiving peer's WireGuard, which accepts from a peer only the addresses it allows for that peer. kube-proxy's DNAT of a host-network connection to a Service never meets the output chain as `plexd0` traffic: the filter chains of the output hook see the interface of the route the connection started on.
 
-The fourth rule is the relay probe exemption, built from `relayProbeRule(iface)`: UDP to port 9, `RelayProbePort`, with no address, so it covers IPv4 and IPv6. It lets plexd's [relay liveness probe](./wireguard.md#relay-liveness-probe) out ahead of the policy rules. Any local process can send to that port, to any address the mesh routes, and the receiving node's inbound rules still apply.
+The fourth rule of the output chain is the relay probe exemption, built from `relayProbeRule(iface)`: UDP to port 9, `RelayProbePort`, with no address, so it covers IPv4 and IPv6. It lets plexd's [relay liveness probe](./wireguard.md#relay-liveness-probe) out ahead of the policy rules. Any local process can send to that port, to any address the mesh routes, and the receiving node's inbound rules still apply.
+
+The round-trip probe exemption, built from `rttProbeRule(iface)`, is the third rule of the input chain and the fifth of the output chain: UDP to port 7911, `RTTProbePort`, with no address, so it covers IPv4 and IPv6. It passes plexd's [round-trip probe](./wireguard.md#round-trip-probe) ahead of the policy rules in both directions: the input chain passes what arrives for the node on the port, and the output chain what the node sends to it. The forward chain does not hold it, so nothing the node forwards passes it. The `DECISION` at `RTTProbePort` (`firewall.go`) records why: one socket on port 7911 of the mesh address sends plexd's probes and answers the peers' probes, so a probe and its answer both travel from port 7911 to port 7911, and one rule shape, UDP to port 7911 on the mesh interface, covers both directions, on a backend that keeps no state too. Any local process on a peer can therefore send UDP to port 7911 of the node, where it reaches the socket that holds the port on the mesh address, which is plexd's.
 
 The output chain filters only what the node itself sends from an address of the mesh interface: the packets of its own sockets, and the ICMP errors and TCP resets its kernel generates, which pass as related or reply traffic. A packet the node forwards into the mesh takes the forward hook instead, whose chain matches the interface the packet arrived on. Traffic forwarded out through the mesh is therefore not filtered on its way out, whether it comes from a user-access client, a site-to-site peer, a host behind a bridge, or a container or Pod masqueraded onto the node's mesh address.
 
@@ -118,7 +122,7 @@ Each `FirewallRule` is converted to a sequence of nftables expressions. Every ad
 
 | FirewallRule Field | nftables Expression                                       | Condition            |
 |--------------------|-----------------------------------------------------------|----------------------|
-| `Interface`        | `Meta(IIFNAME)` + `Cmp` in the input list, `Meta(OIFNAME)` + `Cmp` in the output list | Non-empty |
+| `Interface`        | `Meta(IIFNAME)` + `Cmp` in the input and forward lists, `Meta(OIFNAME)` + `Cmp` in the output list | Non-empty |
 | (family)           | `Meta(NFPROTO)` + `Cmp` against `ipv4` or `ipv6`          | At least one address |
 | `SrcIP`            | `Payload(NetworkHeader)` + `Cmp`, or + `Bitwise` + `Cmp`  | Prefix length above 0 |
 | `DstIP`            | `Payload(NetworkHeader)` + `Cmp`, or + `Bitwise` + `Cmp`  | Prefix length above 0 |
@@ -154,7 +158,7 @@ A zero-length prefix is every address of its family: the rule still matches that
 
 ### Log Rules
 
-A rule with a `LogTag` gets a log rule directly in front of it, in both lists. `logRuleExprs(rule, dir)` builds it from the rule's own matches, without the counter and the verdict, and appends:
+A rule with a `LogTag` gets a log rule directly in front of it, in all three lists. `logRuleExprs(rule, dir)` builds it from the rule's own matches, without the counter and the verdict, and appends:
 
 | Expression | Meaning |
 |---|---|
@@ -173,6 +177,7 @@ table inet plexd {
         type filter hook input priority filter; policy accept;
         iifname "plexd0" ct state established ct direction reply counter accept
         iifname "plexd0" ct state related counter accept
+        iifname "plexd0" meta l4proto udp th dport 7911 counter accept
         iifname "plexd0" meta nfproto ipv4 ip saddr 10.99.0.0/24 ip daddr 10.99.0.1 meta l4proto tcp th dport 443 ct state new log prefix "1/0" group 28772
         iifname "plexd0" meta nfproto ipv4 ip saddr 10.99.0.0/24 ip daddr 10.99.0.1 meta l4proto tcp th dport 443 counter accept
         iifname "plexd0" meta nfproto ipv6 ip6 saddr fd00:99::/64 ip6 daddr fd00:99::1 meta l4proto tcp th dport 443 counter accept
@@ -180,7 +185,7 @@ table inet plexd {
     }
     chain plexd-mesh-forward {
         type filter hook forward priority filter; policy accept;
-        # the same six rules
+        # the six rules of the input chain other than its dport 7911 rule
     }
     chain plexd-mesh-output {
         type filter hook output priority filter; policy accept;
@@ -188,6 +193,7 @@ table inet plexd {
         oifname "plexd0" ct state related counter accept
         oifname "plexd0" fib saddr . oif type != local counter accept
         oifname "plexd0" meta l4proto udp th dport 9 counter accept
+        oifname "plexd0" meta l4proto udp th dport 7911 counter accept
         oifname "plexd0" meta nfproto ipv4 ip saddr 10.99.0.0/24 ip daddr 10.99.0.1 meta l4proto tcp th dport 443 ct state new log prefix "1/0" group 28772
         oifname "plexd0" meta nfproto ipv4 ip saddr 10.99.0.0/24 ip daddr 10.99.0.1 meta l4proto tcp th dport 443 counter accept
         oifname "plexd0" meta nfproto ipv6 ip6 saddr fd00:99::/64 ip6 daddr fd00:99::1 meta l4proto tcp th dport 443 counter accept
@@ -278,7 +284,9 @@ Every test in `nftables_linux_test.go` that calls the controller runs through `i
 
 `TestSumDropCounters` needs no privilege either. It checks that `sumDropCounters` sums the counters of the rules that end in a drop verdict, ignores the rules that end in accept, and returns 0 packets and 0 bytes for an empty and for a nil rule list.
 
-The connection logging tests need no privilege. `nftables_linux_test.go` checks that `chainRuleExprs` puts the log rule, ending in the new-state match and the log expression for group 28772 with the tag, directly in front of a tagged rule in both lists, and that an untagged ruleset yields the lists it yielded before. Through the `openLog` seam it checks that a reader that fails to open with `EBUSY`, and a controller without a sink, both make `ApplyRules` write the rules without their log rules, and that only the first logs the Warn line. `nflog_linux_test.go` pins the bytes of the two config messages, the hooks, tags and attributes `parseNflogPacket` accepts and refuses, and the read loop, fed a `receive` that returns `ENOBUFS` and then a packet, or another error.
+The list tests need no privilege either. `TestChainRuleExprs`, `TestChainRuleExprsForward` and `TestChainRuleExprsOut` pin how each list opens for every interface: the connection tracking pair and the round-trip probe rule in the input list, the pair alone in the forward list, and the pair, the foreign-source rule, the relay probe rule and the round-trip probe rule in the output list. An empty ruleset yields three empty lists, and an invalid rule the same error for all three. `TestRTTProbeRule` checks that `rttProbeRule` is UDP to port 7911 on the interface and passes `Validate`, and `TestApplyBufferBytes` that `applyBufferBytes` counts the rules of each list once.
+
+The connection logging tests need no privilege. `nftables_linux_test.go` checks that `chainRuleExprs` puts the log rule, ending in the new-state match and the log expression for group 28772 with the tag, directly in front of a tagged rule in all three lists, behind the rules each list opens with, and that an untagged ruleset yields the lists it yielded before. Through the `openLog` seam it checks that a reader that fails to open with `EBUSY`, and a controller without a sink, both make `ApplyRules` write the rules without their log rules, and that only the first logs the Warn line. `nflog_linux_test.go` pins the bytes of the two config messages, the hooks, tags and attributes `parseNflogPacket` accepts and refuses, and the read loop, fed a `receive` that returns `ENOBUFS` and then a packet, or another error.
 
 `TestNftablesController_Real` (`nftables_real_linux_test.go`) drives the real kernel. It runs only with `PLEXD_TEST_REAL_NFTABLES=1` and an effective uid of 0. It builds three network namespaces with `github.com/vishvananda/netlink` and `github.com/vishvananda/netns`: a peer P, joined by a veth pair to the node N's `plexd0` (10.99.0.2/24 and fd00:99::2/64 on P, 10.99.0.1/24 and fd00:99::1/64 on N), and an external host E behind N's `lan0` (192.0.2.1/24 on N, 192.0.2.2/24 on E). N forwards IPv4. Every link is created inside the test's namespaces, never in the host's, which may run a live `plexd0`, and the controller runs on a goroutine locked to N. The rules include `allowOut9001`, N's own copy of a rule from N (10.99.0.1/32) to P (10.99.0.2/32) on TCP 9001, the copy the control plane compiles for the source node. The test shows that:
 
@@ -286,7 +294,8 @@ The connection logging tests need no privilege. `nftables_linux_test.go` checks 
 - P connects through N to E at 192.0.2.2:8001, which a rule allows, and times out on 8002. That rule, `allow8001`, carries the tag `9/0`, and the test's recording sink receives an event with that tag, direction forward, source 10.99.0.2, destination 192.0.2.2, protocol 6 and destination port 8001, which proves the forward hook's NFLOG records.
 - N connects to P at 10.99.0.2:9001, which `allowOut9001` allows, and is blocked on 9003 while P listens there: the dial times out within 2 s or fails with `EPERM`, and is never refused.
 - E connects through N to P at 10.99.0.2:9002 with no rule naming that direction, so what N forwards out of `plexd0` is not filtered on its way out.
-- With no rule naming UDP, a byte N sends to P's UDP port 9, the relay probe's, arrives within 2 s, and a byte sent to UDP port 10 does not. A send error on port 10 is accepted.
+- With no rule naming UDP, a byte N sends to P's UDP port 9, the relay probe's, arrives within 2 s, and so does one sent to P's UDP port 7911, the round-trip probe's. A byte sent to UDP port 10 does not arrive. A send error on port 10 is accepted.
+- A byte P sends to UDP port 7911 of E, which N forwards, does not arrive within 2 s: the forward chain holds no round-trip probe exemption.
 - After `ApplyRules` drops the 7001 rule, bytes P writes on an already established 7001 connection do not reach N within 2 s.
 - After `ApplyRules` drops `allowOut9001`, bytes N writes on its established 9001 connection do not reach P within 2 s.
 - With a nat table in N that DNATs 10.96.0.10:9003 onto P's 9003, as kube-proxy does for a Service, and masquerades what leaves `plexd0`, N connects to 10.96.0.10:9003, and a socket bound to N's `lan0` address 192.0.2.1 connects to P's 9003 straight through `plexd0`, as IPVS sends a Pod's packet. No rule allows 9003: the foreign-source rule lets the second connection out, and without it the dial times out.
@@ -297,7 +306,7 @@ The connection logging tests need no privilege. `nftables_linux_test.go` checks 
 - After `DeleteChain`, none of the three chains remains, P connects to 10.99.0.1:7002 again, N connects to P at 9003, and a second `DeleteChain` returns `nil`.
 - With only the input and forward chains in table `inet plexd`, as a plexd before the output chain leaves them, `FlushChain` and `DeleteChain` return `nil` and no chain remains, and `FlushChain` of a chain name that does not exist returns `nil`.
 
-`TestNftablesController_RealTraffic` (`tuntraffic_linux_test.go`) runs the traffic checks the macOS and Windows backends run, described under [Tests](./pf-wfp-firewall.md#tests), through a TUN device. It has the same gate. It creates a fresh network namespace N, creates the TUN device `plexdtun0` there with 10.255.247.1/30, and hands `runTunTrafficChecks` the controller, the device, an offset of 16, which leaves room for the 10-byte virtio header wireguard-go's Linux device writes in front of each packet, and N's `do`, so N's sockets and the controller's calls run inside N. The device, its address and every rule stay in N, never in the host's namespace. Among the checks is the drop check: `DropCounts` before and after one injected packet that no rule allows must differ by at least 1 packet and at least that packet's length in bytes, which proves on the real kernel that the sum reads the default deny's counters.
+`TestNftablesController_RealTraffic` (`tuntraffic_linux_test.go`) runs the traffic checks the macOS and Windows backends run, described under [Tests](./pf-wfp-firewall.md#tests), through a TUN device. It has the same gate. It creates a fresh network namespace N, creates the TUN device `plexdtun0` there with 10.255.247.1/30, and hands `runTunTrafficChecks` the controller, the device, an offset of 16, which leaves room for the 10-byte virtio header wireguard-go's Linux device writes in front of each packet, and N's `do`, so N's sockets and the controller's calls run inside N. The device, its address and every rule stay in N, never in the host's namespace. With no rule naming port 7911, the checks see N's round-trip probe to P's port 7911 leave through the output chain, P's probe from its port 7911 reach an echo on N's port 7911 through the input chain, and the echo's answer to P's port 7911 leave. Among the checks is the drop check: `DropCounts` before and after one injected packet that no rule allows must differ by at least 1 packet and at least that packet's length in bytes, which proves on the real kernel that the sum reads the default deny's counters.
 
 `TestNftablesController_RealConnLog` (`tuntraffic_linux_test.go`) has the same gate and builds the same namespace and device through `newTunTestHarness`, which the traffic test calls too. It runs the connection logging checks the macOS test runs too, `runTunConnLogChecks`, described under [Tests](./pf-wfp-firewall.md#tests). The NFLOG reader opens inside N, so it binds group 28772 in N's namespace, not in the host's.
 
