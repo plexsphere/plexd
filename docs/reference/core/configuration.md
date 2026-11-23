@@ -487,7 +487,8 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > A destination behind a bridge is not a mesh address, so it needs a rule that names it,
 > which the bridge needs to forward the traffic anyway. UDP to port 9, plexd's relay
 > liveness probe, passes without a rule on every platform; any local process can send to
-> that port over the mesh, and the receiving node's inbound rules still apply. Traffic the
+> that port over the mesh, and the receiving node's inbound rules still apply. UDP to port
+> 7911, plexd's round-trip probe, passes without a rule in both directions. Traffic the
 > node forwards into the mesh, from a user-access client, a site-to-site peer or a host
 > behind a bridge, and on Linux a container or Pod masqueraded onto the node's mesh address,
 > is not filtered on its way out. On Linux `chain_name` now names three chains:
