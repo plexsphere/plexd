@@ -67,8 +67,10 @@ type Peer struct {
 	AllowedIPs []string `json:"allowed_ips"`
 	PSK        string   `json:"psk"`
 	// RoutedSubnets are the subnets of the peer's routed_subnets this node
-	// accepted, in the list's order, and nil when it accepted none. The
-	// WireGuard manager routes each of them through the mesh interface.
+	// accepted that are no shared subnet, in the list's order, followed by
+	// the shared subnets the peer holds, sorted by address and then by
+	// prefix length, and nil when there are none. The WireGuard manager
+	// routes each of them through the mesh interface.
 	RoutedSubnets []string `json:"routed_subnets,omitempty"`
 }
 
@@ -339,7 +341,9 @@ type SnapshotPeer struct {
 	// RoutedSubnets are the IPv4 networks the control plane routes through
 	// the peer as CIDRs: the networks behind the site-to-site tunnels of a
 	// peer that is a bridge. A node adds the ones it accepts to the peer's
-	// allowed IPs and routes them through the mesh interface. The field is
+	// allowed IPs and routes them through the mesh interface, except a
+	// subnet the pull's shared_subnets names, which the node takes from
+	// that block and routes through one of its bridges. The field is
 	// absent for a peer that routes no network, and the registration
 	// response never carries it.
 	RoutedSubnets []string `json:"routed_subnets,omitempty"`

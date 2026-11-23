@@ -105,10 +105,20 @@ type EdgePSKLookup interface {
 // order dialOrder builds, the relays that end it as Fallbacks, and the edge
 // PSK psks holds for the peer's current public key. A nil psks programs no
 // PSK.
-// Order: removes first, then updates, then adds, then the peer routes: the
-// handler ends with syncPeerRoutes, which routes the routed subnets of the
-// peers now on the device through the mesh interface and removes the routes
-// no peer lists any more.
+// Order: removes first, then the pull's shared subnets, then updates, then
+// adds, then the shared subnet writes, then the peer routes. The shared
+// subnets step (see Manager.setSharedSubnets) takes the shared_subnets block
+// and picks each subnet's holder before the updates and adds convert a peer,
+// so every peer written carries the shared subnets it holds and none it does
+// not. A pull can change a holder without changing either peer entry, so the
+// shared subnet writes (see Manager.syncSharedSubnets) then write every peer
+// on the device whose routed subnets the holders changed. They leave out a
+// peer whose update or add failed in the run: a failed write leaves the peer
+// as it was, and the next run applies the whole entry. A nil desired skips
+// both steps, and the manager keeps the shared subnets it holds. The handler
+// ends with syncPeerRoutes, which routes the routed subnets of the peers now
+// on the device through the mesh interface and removes the routes no peer
+// lists any more.
 // Individual failures are logged and collected; an aggregated error is returned.
 //
 // The host's interface prefixes and the mesh prefix are read once per call.
@@ -118,6 +128,8 @@ type EdgePSKLookup interface {
 func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandler {
 	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
 		var errs []error
+		// failed holds the node IDs whose update or add failed in this run.
+		failed := make(map[string]struct{})
 
 		local, err := mgr.localPrefixes()
 		if err != nil {
@@ -144,7 +156,12 @@ func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandl
 			}
 		}
 
-		// 2. Update peers.
+		// 2. Take the pull's shared subnets and pick their holders.
+		if desired != nil {
+			mgr.setSharedSubnets(desired.SharedSubnets, desired.Peers, mesh, local)
+		}
+
+		// 3. Update peers.
 		for _, peer := range diff.PeersToUpdate {
 			p, err := mgr.snapshotPeer(peer, psks, local, mesh)
 			if err != nil {
@@ -154,6 +171,7 @@ func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandl
 					"error", err,
 				)
 				errs = append(errs, err)
+				failed[peer.NodeID] = struct{}{}
 				continue
 			}
 			if err := mgr.UpdatePeer(p); err != nil {
@@ -163,10 +181,11 @@ func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandl
 					"error", err,
 				)
 				errs = append(errs, err)
+				failed[p.ID] = struct{}{}
 			}
 		}
 
-		// 3. Add peers.
+		// 4. Add peers.
 		for _, peer := range diff.PeersToAdd {
 			p, err := mgr.snapshotPeer(peer, psks, local, mesh)
 			if err != nil {
@@ -176,6 +195,7 @@ func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandl
 					"error", err,
 				)
 				errs = append(errs, err)
+				failed[peer.NodeID] = struct{}{}
 				continue
 			}
 			if err := mgr.AddPeer(p); err != nil {
@@ -185,10 +205,23 @@ func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandl
 					"error", err,
 				)
 				errs = append(errs, err)
+				failed[p.ID] = struct{}{}
 			}
 		}
 
-		// 4. Route the peers' routed subnets through the mesh interface.
+		// 5. Write the peers whose routed subnets the holders changed, but
+		// not one whose update or add failed above.
+		if desired != nil {
+			peers := slices.DeleteFunc(slices.Clone(desired.Peers), func(p api.SnapshotPeer) bool {
+				_, f := failed[p.NodeID]
+				return f
+			})
+			if err := mgr.syncSharedSubnets(peers, mesh, local); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		// 6. Route the peers' routed subnets through the mesh interface.
 		if err := mgr.syncPeerRoutes(); err != nil {
 			errs = append(errs, err)
 		}
@@ -198,8 +231,10 @@ func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandl
 }
 
 // snapshotPeer converts a snapshot peer with its dial order, the PSK psks
-// holds for it and the routed subnets usableRoutedSubnets accepts, and logs a
-// direct endpoint, candidates and routed subnets it had to refuse.
+// holds for it and the routed subnets routedSubnets gives it: the subnets of
+// its routed_subnets usableRoutedSubnets accepts that are no shared subnet,
+// followed by the shared subnets it holds. It logs a direct endpoint,
+// candidates and routed subnets it had to refuse.
 func (m *Manager) snapshotPeer(p api.SnapshotPeer, psks EdgePSKLookup, local []netip.Prefix, mesh netip.Prefix) (api.Peer, error) {
 	var psk []byte
 	if psks != nil {
@@ -208,7 +243,7 @@ func (m *Manager) snapshotPeer(p api.SnapshotPeer, psks EdgePSKLookup, local []n
 		}
 	}
 	order, relays, dropped := dialOrder(p, local, mesh)
-	routed, skipped := usableRoutedSubnets(p.RoutedSubnets, mesh, local)
+	routed, skipped := m.routedSubnets(p, mesh, local)
 	peer, err := peerFromSnapshot(p, order, order[len(order)-relays:], psk, routed)
 	if err != nil {
 		return api.Peer{}, err
@@ -246,17 +281,17 @@ func (m *Manager) snapshotPeer(p api.SnapshotPeer, psks EdgePSKLookup, local []n
 // that end order (see dialOrder), and nil when there are none; endpoint
 // selection holds them longer than the others and moves a relayed peer along
 // them. psk, the edge PSK fetched for the peer, is carried base64-encoded; a
-// nil psk programs none. routed is the list usableRoutedSubnets accepted from
-// the peer's routed_subnets, and RoutedSubnets carries it, nil when it is
-// empty.
+// nil psk programs none. routed is the list Manager.routedSubnets gives the
+// peer, and RoutedSubnets carries it, nil when it is empty.
 //
 // AllowedIPs is WireGuard's cryptokey routing table — the authorization boundary
 // deciding which source addresses a peer key may send from. MeshIP is therefore
 // validated as a bare IPv4 address rather than string-concatenated: an IPv6
 // mesh_ip would parse as a /32 host route only after masking a 128-bit address
 // into a /32 prefix, silently authorizing a huge range through the tunnel. For
-// the same reason routed must come from usableRoutedSubnets, which refuses a
-// subnet that would widen the range past the networks behind the peer.
+// the same reason routed must come from Manager.routedSubnets, whose every
+// entry passed the rules of usableRoutedSubnets, which refuse a subnet that
+// would widen the range past the networks behind the peer.
 func peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte, routed []string) (api.Peer, error) {
 	addr, err := netip.ParseAddr(p.MeshIP)
 	if err != nil || !addr.Is4() {
@@ -273,9 +308,6 @@ func peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte,
 	if psk != nil {
 		pskB64 = base64.StdEncoding.EncodeToString(psk)
 	}
-	allowed := make([]string, 0, 1+len(routed))
-	allowed = append(allowed, netip.PrefixFrom(addr, 32).String())
-	allowed = append(allowed, routed...)
 	var routedSubnets []string
 	if len(routed) > 0 {
 		routedSubnets = slices.Clone(routed)
@@ -287,14 +319,25 @@ func peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte,
 		Endpoint:      endpoint,
 		Endpoints:     order,
 		Fallbacks:     fallbacks,
-		AllowedIPs:    allowed,
+		AllowedIPs:    peerAllowedIPs(addr, routed),
 		PSK:           pskB64,
 		RoutedSubnets: routedSubnets,
 	}, nil
 }
 
+// peerAllowedIPs returns the allowed IPs of a peer whose mesh address is addr
+// and whose routed subnets are routed: the host /32 of addr followed by
+// routed, in its order.
+func peerAllowedIPs(addr netip.Addr, routed []string) []string {
+	allowed := make([]string, 0, 1+len(routed))
+	allowed = append(allowed, netip.PrefixFrom(addr, 32).String())
+	return append(allowed, routed...)
+}
+
 // The reasons usableRoutedSubnets gives for a routed subnet it skips, as the
-// Warn "wireguard: routed subnet not programmed" logs them.
+// Warn "wireguard: routed subnet not programmed" logs them. setSharedSubnets
+// gives them for a shared subnet it skips, as the Warn "wireguard: shared
+// subnet not programmed" logs them, beside routedSubnetNoBridge.
 const (
 	// routedSubnetInvalid: the entry is no IPv4 prefix, or has host bits set.
 	routedSubnetInvalid = "invalid"
@@ -333,28 +376,37 @@ type skippedSubnet struct {
 func usableRoutedSubnets(subnets []string, mesh netip.Prefix, local []netip.Prefix) (accepted []string, skipped []skippedSubnet) {
 	seen := make(map[netip.Prefix]struct{}, len(subnets))
 	for _, subnet := range subnets {
-		prefix, err := netip.ParsePrefix(subnet)
-		var reason string
-		switch {
-		case err != nil || !prefix.Addr().Is4() || prefix != prefix.Masked():
-			reason = routedSubnetInvalid
-		case mesh.IsValid() && prefix.Overlaps(mesh):
-			reason = routedSubnetOverlapsMesh
-		case insideLocalNetwork(prefix, local):
-			reason = routedSubnetInsideLocalNetwork
-		default:
-			if _, dup := seen[prefix]; dup {
-				reason = routedSubnetDuplicate
-			}
-		}
+		prefix, reason := checkRoutedSubnet(subnet, mesh, local, seen)
 		if reason != "" {
 			skipped = append(skipped, skippedSubnet{Subnet: subnet, Reason: reason})
 			continue
 		}
-		seen[prefix] = struct{}{}
 		accepted = append(accepted, prefix.String())
 	}
 	return accepted, skipped
+}
+
+// checkRoutedSubnet applies the rules of usableRoutedSubnets to subnet, one
+// entry of a list whose earlier accepted entries seen holds. For an entry it
+// accepts, it adds the prefix to seen and returns it with an empty reason;
+// for any other, it returns the reason of the first rule that applies.
+// setSharedSubnets checks the subnets of the shared_subnets block with it, so
+// a shared subnet passes the rules a routed subnet passes.
+func checkRoutedSubnet(subnet string, mesh netip.Prefix, local []netip.Prefix, seen map[netip.Prefix]struct{}) (netip.Prefix, string) {
+	prefix, err := netip.ParsePrefix(subnet)
+	switch {
+	case err != nil || !prefix.Addr().Is4() || prefix != prefix.Masked():
+		return prefix, routedSubnetInvalid
+	case mesh.IsValid() && prefix.Overlaps(mesh):
+		return prefix, routedSubnetOverlapsMesh
+	case insideLocalNetwork(prefix, local):
+		return prefix, routedSubnetInsideLocalNetwork
+	}
+	if _, dup := seen[prefix]; dup {
+		return prefix, routedSubnetDuplicate
+	}
+	seen[prefix] = struct{}{}
+	return prefix, ""
 }
 
 // insideLocalNetwork reports whether one prefix of local contains the address
