@@ -17,13 +17,15 @@ import (
 // RTTProbePort is the UDP port of the round-trip probe. Every plexd holds one
 // socket on this port of its mesh address, which sends the node's probes and
 // answers its peers' probes, so a probe and its answer both travel from this
-// port to this port. It lies above 1023, so plexd binds it without
-// CAP_NET_BIND_SERVICE, and below 32768, outside Linux's ephemeral range and
-// the mesh ports of the mesh source rewrite. The policy backends pass UDP to
-// this port over the mesh interface without a rule (policy.RTTProbePort), so
-// a probe and its answer pass under any policy. The backends cannot import
-// this package, so TestRTTProbePortIsPolicyExempt keeps the two constants in
-// step.
+// port to this port. The bridge watch of shared subnets (see
+// Manager.watchBridges) writes its round-trip requests on the same socket,
+// so they and their answers travel the same way. It lies above 1023, so
+// plexd binds it without CAP_NET_BIND_SERVICE, and below 32768, outside
+// Linux's ephemeral range and the mesh ports of the mesh source rewrite. The
+// policy backends pass UDP to this port over the mesh interface without a
+// rule (policy.RTTProbePort), so a probe and its answer pass under any
+// policy. The backends cannot import this package, so
+// TestRTTProbePortIsPolicyExempt keeps the two constants in step.
 const RTTProbePort = 7911
 
 // DefaultRTTProbeInterval is the interval RunRTTProbe runs a round at when it
@@ -347,7 +349,12 @@ func rttProbeAddr(meshIP netip.Addr) net.Addr {
 // what nobody reads. At the default interval that costs a node two 108-byte
 // packets per peer every 30 s, its probe and its answer to the peer's probe (a
 // 16-byte datagram is an 80-byte WireGuard message), about 0.6 MB a day per
-// peer.
+// peer. The bridge watch of shared subnets writes requests on the same socket
+// to each bridge that holds a value, on every endpoint selection pass (see
+// Manager.watchBridges). The reader drops their replies, whose nonce matches
+// no outstanding probe (see rttTable.answered), so they measure nothing and
+// the decision stands; they move the device's RxBytes, which is what the
+// watch reads.
 func (m *Manager) RunRTTProbe(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		interval = DefaultRTTProbeInterval

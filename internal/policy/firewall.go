@@ -78,7 +78,9 @@ func familyOf(prefix netip.Prefix) addrFamily {
 }
 
 // RelayProbePort is the UDP port of plexd's relay liveness probe
-// (relayProbePort in internal/wireguard/dial.go).
+// (relayProbePort in internal/wireguard/dial.go). The bridge watch of shared
+// subnets sends the same probe to a bridge that answers no round-trip probe,
+// so the exemption below covers it as well.
 //
 // DECISION: every backend lets the node send UDP to this port over the mesh
 // interface without a rule, ahead of the policy rules (author, 2026-11-12,
@@ -99,7 +101,11 @@ const RelayProbePort = 9
 // address, which is plexd's. One socket sends the probes and answers the
 // peers' probes, so a probe and its answer both travel from port 7911 to
 // port 7911, and one rule shape, UDP to port 7911 on the mesh interface,
-// covers both directions on a stateless backend too.
+// covers both directions on a stateless backend too. The bridge watch of
+// shared subnets is a second sender on the port: it writes a round-trip
+// request to a bridge of a shared subnet from the same socket, so the
+// request and its answer also travel from port 7911 to port 7911 on the
+// mesh interface, and the same rule covers them.
 const RTTProbePort = 7911
 
 // FirewallRule describes a single packet filter rule. An address field holds

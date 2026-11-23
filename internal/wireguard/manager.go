@@ -84,14 +84,16 @@ type Manager struct {
 	now func() time.Time
 
 	// sendProbe sends the relay liveness probe to a relayed peer's mesh IP
-	// (see checkRelay). It is nil until SetRelayProbe sets it, and no probe
-	// goes out then.
+	// (see checkRelay), and to a bridge of a shared subnet that answers no
+	// round-trip probe (see watchBridges). It is nil until SetRelayProbe sets
+	// it, and no probe goes out then.
 	sendProbe func(meshIP netip.Addr) error
 
 	// detectAfter is the failure-detection time the last pull that carried
 	// one delivered (see SetFailureDetection), guarded by mu. It is zero while
 	// no pull carried a value, and endpoint selection then keeps the relay
-	// liveness probe's fixed windows and its own pass interval.
+	// liveness probe's fixed windows and its own pass interval, and watches
+	// no bridge of a shared subnet.
 	detectAfter time.Duration
 
 	// probe measures the uplink: it returns the largest IPv4 packet size, in
@@ -295,7 +297,11 @@ func (m *Manager) Teardown() error {
 // and keeps its route until the last of them drops it. A shared subnet is the
 // routed subnet of one peer at a time, its holder (see setSharedSubnets), so
 // the union, and with it the routes, do not change when the subnet moves
-// from one bridge to another.
+// from one bridge to another. A move of endpoint selection's bridge watch
+// (see moveSharedSubnet) makes no route call: it changes the union only when
+// a failed handler run left the old holder's record without the subnet, and
+// the handler's next run, which the reconciler makes because the run failed,
+// routes it.
 //
 // A call that fails is logged at Error and leaves that subnet's state as it
 // was, so the next run tries it again; the failures are returned joined, so
@@ -458,8 +464,10 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 // apply their own wire rules.
 //
 // RTT is the latest round-trip time the round-trip probe measured to the peer
-// (see RunRTTProbe), zero when the peer holds no value. The tunnel metrics and
-// endpoint selection ignore it.
+// (see RunRTTProbe), zero when the peer holds no value. The tunnel metrics
+// ignore it. Endpoint selection reads it only in the bridge watch, where a
+// value makes the bridge proven, which picks its stimulus and its window (see
+// watchBridges).
 //
 // SharedSubnets are the shared subnets whose holder the peer is when the call
 // reads them (see setSharedSubnets), each list the caller's own. They are
