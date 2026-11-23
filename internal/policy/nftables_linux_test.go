@@ -828,16 +828,18 @@ func TestChainRuleExprs(t *testing.T) {
 		{Interface: "wg0", Action: "deny"},
 	}
 
-	got, err := chainRuleExprs(rules, dirIn)
+	got, err := chainRuleExprs(rules, hookInput)
 	if err != nil {
 		t.Fatalf("chainRuleExprs returned error: %v", err)
 	}
 
-	// One connection tracking pair per interface, in order of first
-	// appearance, then the rules in the order given.
+	// Per interface, in order of first appearance, the connection tracking
+	// pair and the round-trip probe rule, then the rules in the order given.
 	var want [][]expr.Any
-	want = append(want, connTrackExprs("wg0", dirIn)...)
-	want = append(want, connTrackExprs("wg1", dirIn)...)
+	for _, iface := range []string{"wg0", "wg1"} {
+		want = append(want, connTrackExprs(iface, dirIn)...)
+		want = append(want, pinnedRTTProbeExprs(iface, expr.MetaKeyIIFNAME))
+	}
 	for _, rule := range rules {
 		exprs, err := buildRuleExprs(rule, dirIn)
 		if err != nil {
@@ -853,13 +855,44 @@ func TestChainRuleExprs(t *testing.T) {
 	}
 }
 
-func TestChainRuleExprsEmpty(t *testing.T) {
-	got, err := chainRuleExprs(nil, dirIn)
+// The forward list opens with the connection tracking pair alone: nothing
+// the node forwards passes the round-trip probe exemption.
+func TestChainRuleExprsForward(t *testing.T) {
+	rules := []FirewallRule{
+		{Interface: "wg0", DstIP: "10.0.0.1/32", Protocol: "tcp", Port: 22, Action: "allow"},
+		{Interface: "wg1", DstIP: "fd00::1/128", Action: "allow"},
+		{Interface: "wg0", Action: "deny"},
+	}
+
+	got, err := chainRuleExprs(rules, hookForward)
 	if err != nil {
 		t.Fatalf("chainRuleExprs returned error: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("chainRuleExprs(nil) returned %d rules, want none", len(got))
+
+	// One connection tracking pair per interface, in order of first
+	// appearance, then the rules in the order given.
+	var want [][]expr.Any
+	want = append(want, pinnedConnTrackExprs("wg0", expr.MetaKeyIIFNAME)...)
+	want = append(want, pinnedConnTrackExprs("wg1", expr.MetaKeyIIFNAME)...)
+	for _, rule := range rules {
+		exprs, err := buildRuleExprs(rule, dirIn)
+		if err != nil {
+			t.Fatalf("buildRuleExprs returned error: %v", err)
+		}
+		want = append(want, exprs)
+	}
+	assertNftRuleLists(t, got, want)
+}
+
+func TestChainRuleExprsEmpty(t *testing.T) {
+	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+		got, err := chainRuleExprs(nil, hook)
+		if err != nil {
+			t.Fatalf("chainRuleExprs(nil, hook %d) returned error: %v", hook, err)
+		}
+		if len(got) != 0 {
+			t.Errorf("chainRuleExprs(nil, hook %d) returned %d rules, want none", hook, len(got))
+		}
 	}
 }
 
@@ -867,7 +900,7 @@ func TestChainRuleExprsRejectsInvalidRule(t *testing.T) {
 	_, err := chainRuleExprs([]FirewallRule{
 		{Interface: "wg0", Action: "allow"},
 		{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
-	}, dirIn)
+	}, hookInput)
 	want := "policy: nftables: apply rules: policy: firewall rule:"
 	if err == nil || !strings.HasPrefix(err.Error(), want) {
 		t.Fatalf("chainRuleExprs error = %v, want one starting %q", err, want)
@@ -900,7 +933,7 @@ func TestChainRuleExprsOut(t *testing.T) {
 		{Interface: "wg0", Action: "deny"},
 	}
 
-	got, err := chainRuleExprs(rules, dirOut)
+	got, err := chainRuleExprs(rules, hookOutput)
 	if err != nil {
 		t.Fatalf("chainRuleExprs returned error: %v", err)
 	}
@@ -925,13 +958,14 @@ func TestChainRuleExprsOut(t *testing.T) {
 	}
 
 	// Per interface, in order of first appearance, the connection tracking
-	// pair, the foreign-source rule and the relay probe rule, then the rules
-	// in the order given.
+	// pair, the foreign-source rule, the relay probe rule and the round-trip
+	// probe rule, then the rules in the order given.
 	var want [][]expr.Any
 	for _, iface := range []string{"wg0", "wg1"} {
 		want = append(want, pinnedConnTrackExprs(iface, expr.MetaKeyOIFNAME)...)
 		want = append(want, pinnedForeignSourceExprs(iface))
 		want = append(want, probe(iface))
+		want = append(want, pinnedRTTProbeExprs(iface, expr.MetaKeyOIFNAME))
 	}
 	for _, rule := range rules {
 		exprs, err := buildRuleExprs(rule, dirOut)
@@ -959,12 +993,12 @@ func TestChainRuleExprsOut(t *testing.T) {
 
 func TestChainRuleExprsOutEmpty(t *testing.T) {
 	for _, rules := range [][]FirewallRule{nil, {}} {
-		got, err := chainRuleExprs(rules, dirOut)
+		got, err := chainRuleExprs(rules, hookOutput)
 		if err != nil {
-			t.Fatalf("chainRuleExprs(%#v, dirOut) returned error: %v", rules, err)
+			t.Fatalf("chainRuleExprs(%#v, hookOutput) returned error: %v", rules, err)
 		}
 		if len(got) != 0 {
-			t.Errorf("chainRuleExprs(%#v, dirOut) returned %d rules, want none", rules, len(got))
+			t.Errorf("chainRuleExprs(%#v, hookOutput) returned %d rules, want none", rules, len(got))
 		}
 	}
 }
@@ -974,13 +1008,15 @@ func TestChainRuleExprsOutRejectsInvalidRule(t *testing.T) {
 		{Interface: "wg0", Action: "allow"},
 		{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
 	}
-	_, err := chainRuleExprs(rules, dirOut)
+	_, err := chainRuleExprs(rules, hookOutput)
 	want := "policy: nftables: apply rules: policy: firewall rule:"
 	if err == nil || !strings.HasPrefix(err.Error(), want) {
 		t.Fatalf("chainRuleExprs error = %v, want one starting %q", err, want)
 	}
-	if _, errIn := chainRuleExprs(rules, dirIn); errIn == nil || errIn.Error() != err.Error() {
-		t.Errorf("chainRuleExprs errors differ by direction: dirIn %v, dirOut %v", errIn, err)
+	for _, hook := range []chainHook{hookInput, hookForward} {
+		if _, errOther := chainRuleExprs(rules, hook); errOther == nil || errOther.Error() != err.Error() {
+			t.Errorf("chainRuleExprs errors differ by chain: hook %d %v, hookOutput %v", hook, errOther, err)
+		}
 	}
 }
 
@@ -1048,19 +1084,29 @@ func TestRelayProbeRule(t *testing.T) {
 	}
 }
 
-// An ApplyRules batch writes the input list into two chains and the output
-// list into one, and every rule it adds gets the per-rule allowance on top of
-// the base.
+func TestRTTProbeRule(t *testing.T) {
+	got := rttProbeRule("plexd0")
+	want := FirewallRule{Interface: "plexd0", Protocol: "udp", Port: 7911, Action: "allow"}
+	if got != want {
+		t.Errorf("rttProbeRule(plexd0) = %+v, want %+v", got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("rttProbeRule(plexd0).Validate() = %v, want nil", err)
+	}
+}
+
+// An ApplyRules batch writes each of the three lists into its own chain, and
+// every rule it adds gets the per-rule allowance on top of the base.
 func TestApplyBufferBytes(t *testing.T) {
 	for _, tc := range []struct {
-		in, out, want int
+		in, fwd, out, want int
 	}{
-		{0, 0, netlinkBufferBase},
-		{3, 4, netlinkBufferBase + 10*netlinkBufferPerRule},
-		{1003, 1004, netlinkBufferBase + 3010*netlinkBufferPerRule},
+		{0, 0, 0, netlinkBufferBase},
+		{3, 2, 4, netlinkBufferBase + 9*netlinkBufferPerRule},
+		{1004, 1003, 1006, netlinkBufferBase + 3013*netlinkBufferPerRule},
 	} {
-		if got := applyBufferBytes(tc.in, tc.out); got != tc.want {
-			t.Errorf("applyBufferBytes(%d, %d) = %d, want %d", tc.in, tc.out, got, tc.want)
+		if got := applyBufferBytes(tc.in, tc.fwd, tc.out); got != tc.want {
+			t.Errorf("applyBufferBytes(%d, %d, %d) = %d, want %d", tc.in, tc.fwd, tc.out, got, tc.want)
 		}
 	}
 }
@@ -1202,13 +1248,36 @@ func pinnedRelayProbeExprs(iface string) []expr.Any {
 	}
 }
 
-// pinnedChainOpening is what opens a chain for plexd0 in direction dir: the
-// connection tracking pair and, for dirOut, the foreign-source rule and the
-// relay probe rule.
-func pinnedChainOpening(dir ifaceDir) [][]expr.Any {
-	if dir == dirOut {
+// pinnedRTTProbeExprs is the round-trip probe rule of the input and output
+// chains: UDP to port 7911 on iface, from and to any address of either
+// family, with key as the interface match: MetaKeyIIFNAME for the input
+// chain, MetaKeyOIFNAME for the output chain.
+func pinnedRTTProbeExprs(iface string, key expr.MetaKey) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: key, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{17}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		// 7911 in network byte order.
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x1e, 0xe7}},
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}
+}
+
+// pinnedChainOpening is what opens the chain hook selects for plexd0: the
+// connection tracking pair, then the round-trip probe rule in the input
+// chain, and the foreign-source rule, the relay probe rule and the round-trip
+// probe rule in the output chain. The forward chain opens with the pair alone.
+func pinnedChainOpening(hook chainHook) [][]expr.Any {
+	switch hook {
+	case hookInput:
+		opening := pinnedConnTrackExprs("plexd0", expr.MetaKeyIIFNAME)
+		return append(opening, pinnedRTTProbeExprs("plexd0", expr.MetaKeyIIFNAME))
+	case hookOutput:
 		opening := pinnedConnTrackExprs("plexd0", expr.MetaKeyOIFNAME)
-		return append(opening, pinnedForeignSourceExprs("plexd0"), pinnedRelayProbeExprs("plexd0"))
+		return append(opening, pinnedForeignSourceExprs("plexd0"), pinnedRelayProbeExprs("plexd0"), pinnedRTTProbeExprs("plexd0", expr.MetaKeyOIFNAME))
 	}
 	return pinnedConnTrackExprs("plexd0", expr.MetaKeyIIFNAME)
 }
@@ -1237,42 +1306,45 @@ func assertNftRuleLists(t *testing.T, got, want [][]expr.Any) {
 	}
 }
 
-// A logged rule gets its log rule directly in front of it, in the input and
-// forward list behind the connection tracking pair, and in the output list
-// behind the foreign-source and relay probe rules too.
+// A logged rule gets its log rule directly in front of it, in every list
+// behind the chain's opening rules: the connection tracking pair, then the
+// round-trip probe rule in the input list, and the foreign-source, relay
+// probe and round-trip probe rules in the output list.
 func TestChainRuleExprsLogged(t *testing.T) {
 	for _, tc := range []struct {
-		dir ifaceDir
-		key expr.MetaKey
+		hook chainHook
+		key  expr.MetaKey
 	}{
-		{dirIn, expr.MetaKeyIIFNAME},
-		{dirOut, expr.MetaKeyOIFNAME},
+		{hookInput, expr.MetaKeyIIFNAME},
+		{hookForward, expr.MetaKeyIIFNAME},
+		{hookOutput, expr.MetaKeyOIFNAME},
 	} {
-		got, err := chainRuleExprs(nftLoggedRules(), tc.dir)
+		got, err := chainRuleExprs(nftLoggedRules(), tc.hook)
 		if err != nil {
-			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", tc.dir, err)
+			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", tc.hook, err)
 		}
-		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.dir), pinnedLoggedRules(tc.key)...))
+		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.hook), pinnedLoggedRules(tc.key)...))
 	}
 }
 
 // Without a log tag the lists are the ones plexd wrote before connection
-// logging: no log rule in either direction.
+// logging: no log rule in any chain.
 func TestChainRuleExprsUntaggedUnchanged(t *testing.T) {
 	for _, tc := range []struct {
-		dir ifaceDir
-		key expr.MetaKey
+		hook chainHook
+		key  expr.MetaKey
 	}{
-		{dirIn, expr.MetaKeyIIFNAME},
-		{dirOut, expr.MetaKeyOIFNAME},
+		{hookInput, expr.MetaKeyIIFNAME},
+		{hookForward, expr.MetaKeyIIFNAME},
+		{hookOutput, expr.MetaKeyOIFNAME},
 	} {
-		got, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), tc.dir)
+		got, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), tc.hook)
 		if err != nil {
-			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", tc.dir, err)
+			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", tc.hook, err)
 		}
-		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.dir), pinnedLoggedRules(tc.key)[1:]...))
+		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.hook), pinnedLoggedRules(tc.key)[1:]...))
 		if n := nftLogRuleCount(got); n != 0 {
-			t.Errorf("dir %d: %d log rules, want none", tc.dir, n)
+			t.Errorf("hook %d: %d log rules, want none", tc.hook, n)
 		}
 	}
 }
@@ -1283,21 +1355,21 @@ func TestLogRuleExprsRejectsInvalidRule(t *testing.T) {
 	}
 }
 
-// assertNoNftLogRules checks that rules, written into either list, carry no
-// log rule and match the lists of nftLoggedRules without tags.
+// assertNoNftLogRules checks that rules, written into any of the three lists,
+// carry no log rule and match the lists of nftLoggedRules without tags.
 func assertNoNftLogRules(t *testing.T, rules []FirewallRule) {
 	t.Helper()
-	for _, dir := range []ifaceDir{dirIn, dirOut} {
-		got, err := chainRuleExprs(rules, dir)
+	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+		got, err := chainRuleExprs(rules, hook)
 		if err != nil {
-			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", dir, err)
+			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", hook, err)
 		}
 		if n := nftLogRuleCount(got); n != 0 {
-			t.Errorf("dir %d: %d log rules, want none", dir, n)
+			t.Errorf("hook %d: %d log rules, want none", hook, n)
 		}
-		want, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), dir)
+		want, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), hook)
 		if err != nil {
-			t.Fatalf("chainRuleExprs(dir %d) returned error: %v", dir, err)
+			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", hook, err)
 		}
 		assertNftRuleLists(t, got, want)
 	}

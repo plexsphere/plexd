@@ -433,6 +433,8 @@ func TestNftablesController_Real(t *testing.T) {
 	p.listen(t, "10.99.0.2:9003")
 	pUDP9 := p.listenUDP(t, "10.99.0.2:9")
 	pUDP10 := p.listenUDP(t, "10.99.0.2:10")
+	pUDP7911 := p.listenUDP(t, "10.99.0.2:7911")
+	eUDP7911 := e.listenUDP(t, "192.0.2.2:7911")
 
 	const chain = DefaultChainName
 
@@ -606,7 +608,7 @@ func TestNftablesController_Real(t *testing.T) {
 		t.Fatalf("namespace N: delete the service nat table: %v", err)
 	}
 
-	t.Log("N sends UDP to P's port 9, the relay probe's, without a rule, and nothing to port 10")
+	t.Log("N sends UDP to P's port 9, the relay probe's, and to port 7911, the round-trip probe's, without a rule, and nothing to port 10")
 	sendUDP := func(addr string) error {
 		return n.do(func() error {
 			c, err := net.Dial("udp", addr)
@@ -630,6 +632,17 @@ func TestNftablesController_Real(t *testing.T) {
 	} else if string(dgram[:nr]) != "u" {
 		t.Errorf("P read %q from %s on udp port 9, want \"u\"", dgram[:nr], from)
 	}
+	if err := sendUDP("10.99.0.2:7911"); err != nil {
+		t.Errorf("N send to udp 10.99.0.2:7911: %v", err)
+	}
+	if err := pUDP7911.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, from, err := pUDP7911.ReadFrom(dgram); err != nil {
+		t.Errorf("P read on udp port 7911: %v, want N's datagram within 2 s", err)
+	} else if string(dgram[:nr]) != "u" {
+		t.Errorf("P read %q from %s on udp port 7911, want \"u\"", dgram[:nr], from)
+	}
 	if err := sendUDP("10.99.0.2:10"); err != nil {
 		t.Logf("N send to udp 10.99.0.2:10: %v", err)
 	}
@@ -642,6 +655,30 @@ func TestNftablesController_Real(t *testing.T) {
 		var netErr net.Error
 		if !errors.As(err, &netErr) || !netErr.Timeout() {
 			t.Errorf("P read on udp port 10: %v, want a timeout", err)
+		}
+	}
+
+	t.Log("what P sends to UDP port 7911 of E is forwarded by N and meets no exemption: nothing arrives")
+	if err := p.do(func() error {
+		c, err := net.Dial("udp", "192.0.2.2:7911")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close() }()
+		_, err = c.Write([]byte("f"))
+		return err
+	}); err != nil {
+		t.Errorf("P send to udp 192.0.2.2:7911: %v", err)
+	}
+	if err := eUDP7911.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, from, err := eUDP7911.ReadFrom(dgram); err == nil {
+		t.Errorf("E read %q from %s on udp port 7911, want nothing within 2 s: the forward chain holds no round-trip probe exemption", dgram[:nr], from)
+	} else {
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("E read on udp port 7911: %v, want a timeout", err)
 		}
 	}
 
