@@ -1320,6 +1320,9 @@ return an error matching `ErrHandshakeReportTooMany` without sending a request.
 | `PeerNodeID`              | `string` | `"peer_node_id"`               | Peer node ID, a non-zero UUID; unique within the report |
 | `LastHandshakeAgeSeconds` | `int32`  | `"last_handshake_age_seconds"` | Seconds since the latest completed handshake, 0 to 2147483647 |
 | `Endpoint`                | `string` | `"endpoint"`                   | Endpoint WireGuard uses for the peer, `host:port` with an IPv6 host in brackets; a non-zero port, a specified address and no zone |
+| `RTTMicroseconds`         | `*int32` | `"rtt_microseconds,omitempty"` | Round-trip time to the peer through the tunnel in whole microseconds, 1 to 2147483647; nil when the node holds no measurement, which leaves the member off the wire. A control plane older than plexsphere/plexsphere#1145 refuses a report that carries it with `400 malformed_handshake_report` |
+
+The three required fields are not `omitempty`: an age of 0, a handshake within the last second, has to reach the wire rather than be dropped as a zero value and refused as missing. `RTTMicroseconds` is a pointer with `omitempty`, so only a missing measurement leaves it off.
 
 **HandshakeReportResponse** (`200 OK`)
 
