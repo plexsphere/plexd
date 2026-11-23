@@ -97,7 +97,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// thirteen fields carry omitempty.
+// fourteen fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -145,6 +145,29 @@ type NodeStateSnapshot struct {
 	// means the control plane did not say this time, and the node keeps the
 	// value it holds.
 	FailureDetection json.RawMessage `json:"failure_detection"`
+	// SharedSubnets is the order of the bridges each shared site subnet of
+	// the node's Project may be routed through, one entry per subnet. A nil
+	// value, the wire's null or a key a control plane predating the block
+	// never wrote, and [] all mean no shared subnet: only such a control
+	// plane leaves the key out, and it has none. The member is typed, as
+	// Peers is, so a value of another JSON type fails the pull's decode; the
+	// WireGuard manager validates the entries.
+	SharedSubnets []NodeStateSharedSubnet `json:"shared_subnets"`
+}
+
+// MaxSharedSubnetBridges is the contract's ceiling on the bridges of one
+// shared_subnets entry: a carrier and up to seven standbys.
+const MaxSharedSubnetBridges = 8
+
+// NodeStateSharedSubnet is one entry of the shared_subnets block of the state
+// pull, as the "Shared site subnets" section of plexsphere's agent contract
+// (docs/reference/api/plexd-agent-contract.md) describes it. Subnet is a CIDR.
+// Bridges are node IDs, each the node_id of a peer of the same pull: the
+// carrier first, then the standbys in the order the node fails over through.
+// The carrier's peer entry lists the subnet in its routed_subnets as well.
+type NodeStateSharedSubnet struct {
+	Subnet  string   `json:"subnet"`
+	Bridges []string `json:"bridges"`
 }
 
 // NodeStateFailureDetection is the failure_detection block of the state pull,
@@ -1166,10 +1189,16 @@ type EndpointCandidatesResponse struct {
 // refuses one before sending it.
 const MaxHandshakeReportPeers = 4096
 
+// MaxHandshakeSharedSubnets is the contract's ceiling on the shared_subnets
+// of one handshake report entry. A longer list is refused whole with 400
+// malformed_handshake_report.
+const MaxHandshakeSharedSubnets = 256
+
 // HandshakeReportRequest is the body of POST /v1/nodes/{node_id}/handshakes:
 // for each mesh peer the node has completed a WireGuard handshake with, the age
-// of the latest handshake, the endpoint WireGuard used for it and, when the node
-// holds one, the round-trip time through the tunnel.
+// of the latest handshake, the endpoint WireGuard used for it, when the node
+// holds one, the round-trip time through the tunnel, and the shared subnets the
+// node routes through the peer.
 //
 // The control plane anchors every age on its own receive time, so a body is
 // only true for the attempt it was assembled for. The agent builds a fresh one,
@@ -1194,7 +1223,9 @@ type HandshakeReportRequest struct {
 // the last second) is as legitimate as any other, so it must reach the wire
 // rather than be dropped as a zero value and refused as missing. The optional
 // RTTMicroseconds is omitempty and a pointer, so it leaves the wire only when
-// the node holds no measurement, never for a value.
+// the node holds no measurement, never for a value. The optional SharedSubnets
+// is omitempty too: an entry that carries none sends no member, which the
+// control plane reads as none.
 type HandshakeReportPeer struct {
 	// PeerNodeID is the peer's node_id, a non-zero UUID that no other entry of
 	// the report repeats. An id the control plane does not know as a live peer
@@ -1214,6 +1245,15 @@ type HandshakeReportPeer struct {
 	// than plexsphere/plexsphere#1145 decodes without unknown fields and refuses
 	// a report that carries it with 400 malformed_handshake_report.
 	RTTMicroseconds *int32 `json:"rtt_microseconds,omitempty"`
+	// SharedSubnets are the subnets of the pull's shared_subnets the node
+	// routes through the peer when it assembles the report, as CIDRs without
+	// host bits, none repeated, at most MaxHandshakeSharedSubnets. An absent
+	// member, null and [] all mean none, and the control plane then clears
+	// what it stored for the edge. A control plane that predates the member
+	// refuses a report that carries it with 400 malformed_handshake_report;
+	// the node sends it only for a subnet a pull named, which such a control
+	// plane never does.
+	SharedSubnets []string `json:"shared_subnets,omitempty"`
 }
 
 // HandshakeReportResponse is the 200 body of

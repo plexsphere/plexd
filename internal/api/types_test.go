@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -320,14 +321,14 @@ func TestTypesEndpointCandidatesResponse(t *testing.T) {
 }
 
 func TestTypesHandshakeReportRequest(t *testing.T) {
-	// The contract's request example, without the shared_subnets member plexd
-	// does not send: the first entry carries a round-trip time, the second
-	// has none.
+	// The contract's request example: the first entry carries a round-trip
+	// time and the shared subnet the node routes through that peer, the second
+	// carries neither, so it sends neither member.
 	rtt := int32(23400)
 	orig := HandshakeReportRequest{
 		ObservedAt: time.Date(2026, 10, 21, 10, 15, 30, 0, time.UTC),
 		Peers: []HandshakeReportPeer{
-			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2", LastHandshakeAgeSeconds: 42, Endpoint: "198.51.100.7:51820", RTTMicroseconds: &rtt},
+			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2", LastHandshakeAgeSeconds: 42, Endpoint: "198.51.100.7:51820", RTTMicroseconds: &rtt, SharedSubnets: []string{"10.20.0.0/16"}},
 			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", LastHandshakeAgeSeconds: 117, Endpoint: "[2001:db8::7]:51820"},
 		},
 	}
@@ -335,7 +336,7 @@ func TestTypesHandshakeReportRequest(t *testing.T) {
 	requireEqual(t, orig, got)
 
 	const want = `{"observed_at":"2026-10-21T10:15:30Z","peers":[` +
-		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2","last_handshake_age_seconds":42,"endpoint":"198.51.100.7:51820","rtt_microseconds":23400},` +
+		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2","last_handshake_age_seconds":42,"endpoint":"198.51.100.7:51820","rtt_microseconds":23400,"shared_subnets":["10.20.0.0/16"]},` +
 		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3","last_handshake_age_seconds":117,"endpoint":"[2001:db8::7]:51820"}]}`
 	if string(data) != want {
 		t.Errorf("serialized =\n  %s\nwant\n  %s", data, want)
@@ -343,7 +344,8 @@ func TestTypesHandshakeReportRequest(t *testing.T) {
 
 	// The handler decodes with DisallowUnknownFields, so the envelope and each
 	// entry must carry exactly the contract's keys: the three required ones,
-	// and rtt_microseconds only on the entry that holds a value.
+	// and rtt_microseconds and shared_subnets only on the entry that holds a
+	// value.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
@@ -364,7 +366,7 @@ func TestTypesHandshakeReportRequest(t *testing.T) {
 		t.Fatalf("peers = %d entries, want 2", len(entries))
 	}
 	wantKeys := [][]string{
-		{"peer_node_id", "last_handshake_age_seconds", "endpoint", "rtt_microseconds"},
+		{"peer_node_id", "last_handshake_age_seconds", "endpoint", "rtt_microseconds", "shared_subnets"},
 		{"peer_node_id", "last_handshake_age_seconds", "endpoint"},
 	}
 	for i, entry := range entries {
@@ -380,11 +382,15 @@ func TestTypesHandshakeReportRequest(t *testing.T) {
 	if v := string(entries[0]["rtt_microseconds"]); v != "23400" {
 		t.Errorf("peers[0].rtt_microseconds = %s, want 23400", v)
 	}
+	if v := string(entries[0]["shared_subnets"]); v != `["10.20.0.0/16"]` {
+		t.Errorf("peers[0].shared_subnets = %s, want [\"10.20.0.0/16\"]", v)
+	}
 }
 
 // A zero-valued entry still carries all three required keys: the contract
 // refuses an entry missing its age, and an age of 0 is a handshake within the
-// last second. It carries no rtt_microseconds, which a nil pointer leaves off.
+// last second. It carries no rtt_microseconds, which a nil pointer leaves off,
+// and no shared_subnets, which a nil list leaves off.
 func TestTypesHandshakeReportPeer_ZeroValuesOnWire(t *testing.T) {
 	data, got := roundTrip(t, HandshakeReportPeer{})
 	requireEqual(t, HandshakeReportPeer{}, got)
@@ -566,22 +572,28 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			ReverseZones: []string{"42.10.in-addr.arpa"},
 		},
 		FailureDetection: json.RawMessage(`{"detect_after_seconds":15}`),
+		SharedSubnets: []NodeStateSharedSubnet{
+			{Subnet: "10.20.0.0/16", Bridges: []string{"n-002", "n-003"}},
+		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the thirteen contract keys must appear.
+	// Exactly the fourteen contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 13 {
-		t.Errorf("expected exactly 13 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 14 {
+		t.Errorf("expected exactly 14 JSON keys, got %d: %v", len(raw), raw)
 	}
 	if got := string(raw["failure_detection"]); got != `{"detect_after_seconds":15}` {
 		t.Errorf("failure_detection = %s, want the block byte for byte", got)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection"} {
+	if got, want := string(raw["shared_subnets"]), `[{"subnet":"10.20.0.0/16","bridges":["n-002","n-003"]}]`; got != want {
+		t.Errorf("shared_subnets = %s, want %s", got, want)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -619,7 +631,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all thirteen keys PRESENT.
+	// Marshalling nil blocks emits literal null with all fourteen keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -628,10 +640,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 13 {
-		t.Errorf("expected exactly 13 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 14 {
+		t.Errorf("expected exactly 14 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -643,6 +655,45 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		if string(v) != "null" {
 			t.Errorf("key %q = %s, want null", key, v)
 		}
+	}
+}
+
+// TestNodeStateSnapshot_SharedSubnetsBlock pins the shapes the shared_subnets
+// block arrives in. An absent key, null and [] all decode without an error to
+// no entry, which the node reads as no shared subnet. The member is typed, so
+// a value of another JSON type fails the decode, as a malformed peers does.
+func TestNodeStateSnapshot_SharedSubnetsBlock(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"absent", `{"peers":[]}`},
+		{"null", `{"peers":[],"shared_subnets":null}`},
+		{"empty", `{"peers":[],"shared_subnets":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			if err := json.Unmarshal([]byte(tc.body), &snap); err != nil {
+				t.Fatalf("unmarshal %s: %v, want nil", tc.body, err)
+			}
+			if len(snap.SharedSubnets) != 0 {
+				t.Errorf("SharedSubnets = %v, want none", snap.SharedSubnets)
+			}
+		})
+	}
+
+	for _, tc := range []struct{ name, body string }{
+		{"shared_subnets", `{"peers":[],"shared_subnets":"x"}`},
+		{"peers", `{"peers":"x"}`},
+	} {
+		t.Run("malformed "+tc.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			err := json.Unmarshal([]byte(tc.body), &snap)
+			var typeErr *json.UnmarshalTypeError
+			if !errors.As(err, &typeErr) {
+				t.Fatalf("unmarshal %s = %v, want a *json.UnmarshalTypeError", tc.body, err)
+			}
+			if typeErr.Field != tc.name {
+				t.Errorf("UnmarshalTypeError.Field = %q, want %q", typeErr.Field, tc.name)
+			}
+		})
 	}
 }
 

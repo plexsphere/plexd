@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -682,7 +683,7 @@ func TestReportHandshakes_Success(t *testing.T) {
 	if !got.ObservedAt.Equal(testHandshakeObservedAt) {
 		t.Errorf("observed_at = %v, want %v", got.ObservedAt, testHandshakeObservedAt)
 	}
-	if !slices.Equal(got.Peers, peers) {
+	if !reflect.DeepEqual(got.Peers, peers) {
 		t.Errorf("peers = %+v, want %+v", got.Peers, peers)
 	}
 
@@ -789,7 +790,7 @@ func TestReportHandshakes_PeerCeiling(t *testing.T) {
 		if len(got.Peers) != MaxHandshakeReportPeers {
 			t.Fatalf("request carried %d peers, want %d", len(got.Peers), MaxHandshakeReportPeers)
 		}
-		if !slices.Equal(got.Peers, peers) {
+		if !reflect.DeepEqual(got.Peers, peers) {
 			t.Error("request peers differ from the ones passed")
 		}
 	})
