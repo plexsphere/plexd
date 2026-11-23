@@ -238,23 +238,38 @@ func (s *rttSocket) close() {
 
 // listenRTT is the default rttListen: it listens on UDP port RTTProbePort of
 // the node's mesh IP, as Setup stored it, on a socket bound to the mesh
-// interface (ifbind.Control). A mesh IP that is not IPv4, the zero
-// address included, is refused, so the socket is never bound to the wildcard
-// address.
+// interface (ifbind.Control), and returns the socket that rttMeshOnly makes
+// of it, which on macOS hands the reader only what arrived on the mesh
+// interface. A mesh IP that is not IPv4, the zero address included, is
+// refused, so the socket is never bound to the wildcard address. A listen
+// error is returned as it is, and rttMeshOnly closes the socket when it
+// fails.
 //
-// DECISION: the socket is bound to the mesh interface as well as to the mesh
-// IP (author, 2026-11-23, #218). Linux and macOS deliver a datagram for any
-// address of the host on whichever interface it arrives, so a host on another
-// network that routes the mesh IP through the node and spoofs a mesh source
-// would otherwise draw an answer into the tunnel, which the output chain
-// passes as a reply. Windows receives on the strong host model by default and
-// needs no option.
+// DECISION: the socket takes only what arrives on the mesh interface, not
+// everything that arrives for the mesh IP (author, 2026-11-23, #218; #245
+// corrected it for macOS). A host on another network that routes the mesh
+// IP through the node and spoofs a mesh source would otherwise draw an
+// answer into the tunnel, which the output chain passes as a reply. Linux
+// delivers a datagram for any local address on whichever interface it
+// arrives, and SO_BINDTODEVICE confines what the socket receives and sends
+// to the mesh interface. A Mac that does not forward drops in the kernel
+// what arrives for the mesh IP on another interface. On a forwarding Mac, a
+// bridge, IP_BOUND_IF confines only what the socket sends, so a forged mesh
+// source from another network would still draw an answer into the mesh:
+// rttMeshOnly drops, by the arrival interface the kernel reports with each
+// datagram, whatever did not arrive on the mesh utun. Windows receives on
+// the strong host model and needs neither.
 func (m *Manager) listenRTT() (net.PacketConn, error) {
 	if !m.meshIP.Is4() {
 		return nil, fmt.Errorf("wireguard: rtt probe: mesh ip %s is not IPv4", m.meshIP)
 	}
-	lc := net.ListenConfig{Control: ifbind.Control(m.OSInterfaceName())}
-	return lc.ListenPacket(context.Background(), "udp4", netip.AddrPortFrom(m.meshIP, RTTProbePort).String())
+	iface := m.OSInterfaceName()
+	lc := net.ListenConfig{Control: ifbind.Control(iface)}
+	conn, err := lc.ListenPacket(context.Background(), "udp4", netip.AddrPortFrom(m.meshIP, RTTProbePort).String())
+	if err != nil {
+		return nil, err
+	}
+	return rttMeshOnly(conn, iface, m.logger)
 }
 
 // rttProbeAddr is the default rttAddr: UDP port RTTProbePort of meshIP.
