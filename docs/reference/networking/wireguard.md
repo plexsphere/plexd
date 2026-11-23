@@ -446,6 +446,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, or per pass of the [failure-detection time](#failure-detection-time) when that is shorter, until `ctx` is done; see [Endpoint selection](#endpoint-selection) |
 | `SetPathMTUProbe` | `(probe func(context.Context) (int, error))`                              | Sets the function `Setup` and `RunMTUProbe` measure the uplink's path MTU with. Call it before `Setup`. See [MTU detection](#mtu-detection) |
 | `RunMTUProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the uplink again once per `interval` and lowers or raises the MTU to fit, until `ctx` is done; see [Probing again](#probing-again) |
+| `RunRTTProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the round-trip time to each connected peer once per `interval` and answers the peers' probes on UDP port 7911 of the mesh address, until `ctx` is done; `MeshPeerStats` reports the values. See [Round-trip probe](#round-trip-probe) |
 
 The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order). The package function `SendRelayProbe` (`dial.go`) is the sender `plexd up` passes to `SetRelayProbe`; see [Relay liveness probe](#relay-liveness-probe). The package function `FailureDetectionDispatchHandler` (`handler.go`) is the [dispatch handler](../core/reconciliation.md#dispatchhandler) `plexd up` registers to hand each pull's `failure_detection` block to `SetFailureDetection`; see [Failure detection time](#failure-detection-time).
 
@@ -467,6 +468,7 @@ type MeshPeerStat struct {
     Endpoint      netip.AddrPort
     LastHandshake time.Time
     RxBytes, TxBytes uint64
+    RTT           time.Duration
 }
 
 var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer stats")
@@ -477,6 +479,7 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 - It keeps peers with no handshake (a zero `LastHandshake`), because the metrics report them.
 - It returns the result sorted by `NodeID`, and an empty, non-nil slice when nothing maps.
 - `Endpoint` passes through unfiltered. The handshake reporter applies the wire rules.
+- `RTT` is the latest round-trip time the [round-trip probe](#round-trip-probe) measured to the peer, read from the probe's table, and zero when the peer holds no value. The handshake reporter sends it as `rtt_microseconds`; the tunnel metrics and endpoint selection ignore it.
 
 ### Endpoint selection
 
@@ -601,6 +604,82 @@ A failed add leaves the peer off the device until the next attempt. That attempt
 A re-dial makes a new device peer, as a key rotation does, so its handshake time and byte counters start over. The [handshake report](../core/heartbeat-service.md#handshake-reporter) leaves the peer out until its new handshake completes, as it does for any new device peer, and the [tunnel metrics](../observability/metrics-collection.md#tunnelcollector) count its `rx_bytes` and `tx_bytes` from 0 again.
 
 On a node that holds no failure-detection time, the probe costs at most one datagram per relayed peer per silence window, sent only while the peer receives nothing and answered by one 32-byte keepalive. A node that holds one sends a probe on every pass (see [Cost](#cost)). A re-dial costs one extra handshake, whether it dials the same relay or the next one of the set. The probe is off with `persistent_keepalive: 0s`, which turns endpoint selection off, and without `SetRelayProbe`. Nothing on the wire changes: the peer's WireGuard answers the probe, not its plexd, so the probe works against a peer on any version, and a node on an older plexd keeps the 180 s hold. A failure-detection time under 15 s is the exception: against a peer that sends no probes of its own, it re-dials a healthy relay (see [Failure detection time](#failure-detection-time)).
+
+#### Round-trip probe
+
+Since [plexsphere/plexsphere#1145](https://github.com/plexsphere/plexsphere/pull/1145) the control plane ranks the relays a pair already holds for each other by the round-trip times between the two nodes and each relay's bridge, and shows the time on the mesh edge. Only the node can measure it. Kernel WireGuard exposes no timing, and the [relay liveness probe](#relay-liveness-probe) is answered by the peer's keepalive up to 10 s later, which cannot be timed. The round-trip probe (`rtt.go`) is a UDP echo between two plexd through the tunnel: once per heartbeat interval a node sends a 16-byte request to each connected peer, the peer's plexd sends it back, and the time from the send to the answer is the value. [`MeshPeerStats`](#mesh-peer-stats) hands the value to the [handshake report](../core/heartbeat-service.md#handshake-reporter), which sends it as `rtt_microseconds`.
+
+```go
+const RTTProbePort = 7911
+const DefaultRTTProbeInterval = 30 * time.Second
+
+const rttProbeTimeout = 5 * time.Second     // a later answer does not count
+const rttProbeGap = 5 * time.Millisecond    // between two sends of one round
+const rttMaxUnanswered = 3                  // unanswered probes in a row that drop a value
+
+func (m *Manager) RunRTTProbe(ctx context.Context, interval time.Duration) error
+```
+
+Every plexd holds one UDP socket on port 7911, `RTTProbePort`, of its mesh address. The socket sends the node's probes and answers the peers' probes, so a probe and its answer both travel from port 7911 to port 7911. IANA lists 7904 to 7912 as unassigned. The port lies above 1023, so plexd binds it without `CAP_NET_BIND_SERVICE`, and below 32768, so it lies outside Linux's ephemeral range and outside the mesh ports 32768 to 49151 of the in-process mesh source rewrite (see [Flows and mesh ports](#flows-and-mesh-ports)). The socket is bound to the node's mesh IP, which `Setup` stores from the identity, and never to the wildcard address. It is also bound to the mesh interface, with `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` on macOS (`rttBindToInterface`). Linux and macOS deliver a datagram for any address of the host on whichever interface it arrives, so without that binding a host on another network that routes the mesh IP through the node and spoofs a mesh source would draw an answer into the tunnel, which the output chain passes as a reply to the datagram it saw arrive. Windows receives on the strong host model by default, which drops a datagram for the mesh IP that arrives on another adapter, so plexd sets no option there. A Linux kernel before 5.7 allows the binding only with `CAP_NET_RAW`, and the listen fails without it. `TestRTTProbe_RealAnswersOnlyTheMeshInterface` proves the binding in network namespaces on a real kernel: a socket bound to the mesh IP alone answers a spoofed request that arrives on another interface, and the probe's socket does not. On macOS, `TestDarwinController_RealUTUN` opens the probe's socket with `IP_BOUND_IF` on a real utun. A mesh IP that is not IPv4, one that did not parse included, fails the listen with `wireguard: rtt probe: mesh ip <ip> is not IPv4`. The probe has no configuration key for its port or its interval: a Domain cannot use a per-node port, and the interval follows `heartbeat.interval`.
+
+The datagram is 16 bytes:
+
+| Bytes | Content |
+|---|---|
+| 0 to 3 | The ASCII magic `PXRT` |
+| 4 | The version, `1` |
+| 5 | The kind, `1` for a request and `2` for a reply |
+| 6 and 7 | Zero. The reader does not check them |
+| 8 to 15 | A nonce from `crypto/rand`, new for each probe |
+
+One reader goroutine handles what arrives on the socket. Its buffer holds 64 KiB, so a datagram of any length is read whole and then dropped by its length: Windows fails a read whose datagram does not fit the buffer (`WSAEMSGSIZE`), and a smaller buffer would count each longer datagram as a failed read there. The reader takes the receive instant right after the read returns, before any lock, and then:
+
+- It drops a datagram that is not 16 bytes long, that carries another magic, another version or a kind other than `1` and `2`, or whose source, unmapped, is not an IPv4 address inside the [mesh prefix](#mesh-prefix).
+- It answers a request with the same 16 bytes, kind `2`, to the request's source address and port. A failed write logs `wireguard: rtt probe answer failed` at Debug, and the reader reads on.
+- It counts a reply when a probe to the peer with that mesh IP is outstanding, carries the same nonce and was sent at most 5 s (`rttProbeTimeout`) before the reply arrived. The value is the receive instant minus the send instant, which the round takes right before the write, both from the manager's clock (`time.Now`, which reads the monotonic clock). It is at least 1 ns, because zero means no value and a clock can read the same instant twice, as Windows' can. The reply clears the outstanding probe and the peer's unanswered count. Any other reply changes nothing, and no reply draws a datagram, so two nodes cannot answer each other in a loop.
+- A read error that is `net.ErrClosed` ends the reader. Any other logs `wireguard: rtt probe read failed` at Debug, and the reader reads on. After 10 failed reads in a row, which a good read resets, it closes the socket, and the next round listens again. An ICMP port unreachable for an earlier send is no read error: Linux and macOS report none to a socket that is not connected, and on Windows Go turns `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off on every UDP socket it creates, so no `WSAECONNRESET` reaches the reader.
+
+`RunRTTProbe` replaces a non-positive `interval` with `DefaultRTTProbeInterval`, logs `wireguard: rtt probe started`, and runs its first round half an interval after it starts and one round per interval after that. At the heartbeat interval a round's answers are therefore in before the handshake report that follows it. A round runs these steps in order:
+
+1. It listens when it holds no socket, none yet or one whose reader ended. A failed listen logs `wireguard: rtt probe listen failed`, at Warn the first time and at Debug while the listens keep failing; a listen that succeeds ends the run. The round then sends nothing, counts one unanswered probe for every peer that holds a value, and ends. A probe still outstanding from a socket whose reader ended stays recorded, so the first round that sends again counts it as unanswered in step 4.
+2. It reads `MeshPeerStats`. `ErrPeerStatsUnsupported` logs `wireguard: rtt probe unavailable, the controller cannot read peer stats`, closes the socket and ends the probe: `RunRTTProbe` returns nil. Any other error logs `wireguard: rtt probe round failed` and ends the round with every value as it was.
+3. It takes each peer whose `LastHandshake` is non-zero and younger than 180 s (`connectedHandshakeAge`), whose [dial state](#programmed-peers) exists, and whose `MeshIP` parses as an IPv4 address inside the mesh prefix other than the node's own. It copies the mesh IPs out of the dial states under the manager's mutex and releases it before it touches the probe's table, which has a mutex of its own. The entry of every other peer, a node ID the read no longer lists included, is deleted.
+4. For each taken peer, in node ID order, it counts the previous probe as unanswered when that probe is still outstanding, drops the value when the device endpoint (`MeshPeerStat.Endpoint`) differs from the one the value was measured over, and drops it when three probes in a row (`rttMaxUnanswered`) went unanswered. It then records a new probe and sends it to port 7911 of the peer's mesh IP. The record comes first, so a fast answer cannot beat it. A failed send clears the record, logs `wireguard: rtt probe send failed`, at Warn the first time for that peer and at Debug while its sends keep failing, and counts as an unanswered probe at once; a send that goes out ends the peer's run of failures. The round waits 5 ms (`rttProbeGap`) between two sends, and not after the last one.
+
+One probe per peer is outstanding at a time, and a new one replaces it. A round that outlasts the interval delays the next one: with the contract's 4096 peers a round sends for about 20 s. A done `ctx` ends a round between two sends, and `RunRTTProbe` then closes the socket, waits for the reader and returns nil.
+
+A peer holds the latest value measured, not a minimum or a mean over a window: one probe per interval gives a window too few samples to smooth anything, and the latest value follows a path that got slower at once. The peer keeps its value through two unanswered probes and loses it in the round that counts the third, three intervals after the first unanswered probe went out, so one lost datagram does not clear the value the control plane stores. A failed send counts in its own round, so a failed send that makes the third miss drops the value in that round. A peer also loses its value:
+
+- when the device endpoint changes: the endpoint names the path the tunnel runs on, a direct address or a relay, and the old path's time would rank the new path until the next answer;
+- when it leaves the device read or its handshake goes stale: the next round deletes its entry, so a peer that comes back under the same node ID starts without a value.
+
+The next answer gives the peer a value again. The values live in memory only, so a restarted plexd starts every peer without one.
+
+A node whose identity carries no usable `domain_mesh_cidr` holds a host `/32` as its mesh prefix, so it probes nobody and answers nobody, as it sends no relay probe.
+
+Every policy backend passes UDP to port 7911 over the mesh interface without a rule, ahead of the policy rules, both what the node sends and what arrives for the node itself, and never what the node forwards: the nftables input and output chains each hold a rule for it (see [Connection Tracking](./nftables-firewall.md#connection-tracking)), and so do the pf anchor and the WFP connect and receive-accept layers (see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern)). The backends name the port `policy.RTTProbePort`. `TestRTTProbePortIsPolicyExempt` (`rtt_test.go`) fails when `RTTProbePort` and `policy.RTTProbePort` differ. A probe and its answer both go to port 7911, so one rule shape, UDP to port 7911 on the mesh interface, covers both directions on a backend that keeps no state too. Any local process on a peer can send UDP to port 7911 of any node, where it reaches plexd's socket. An answer is as long as its request and goes only to a mesh address, so the probe amplifies nothing. A host firewall plexd does not manage, Windows Defender Firewall included, has to admit the port on its own: plexd's WFP permits are soft, so Windows Defender Firewall can still drop an inbound probe.
+
+Relay liveness is unchanged: `checkRelay` and `watchRelay` keep reading `RxBytes`, which the answer to a probe moves like any other packet from the peer.
+
+A pair measures each other only when both run a plexd with the probe. A peer on an older plexd, a plain WireGuard peer and a node whose host firewall drops the port answer nothing, so the node reports them without `rtt_microseconds`, at the cost of one datagram per interval each. The control plane takes either end's value for a node and a relay bridge, so one answering side is enough for the ranking (see [Upgrade order](../core/heartbeat-service.md#upgrade-order)).
+
+`plexd up` runs `RunRTTProbe` as step 17f with `hbCfg.Interval`, the heartbeat interval with its defaults applied, and only when the WireGuard interface came up: without it there is no mesh address to bind and no peer to probe.
+
+A node sends one probe per connected peer per interval, because the value travels once per heartbeat interval with the handshake report and more probes would measure what nobody reads. At the default 30 s that costs a node two 108-byte packets per peer per interval, its probe and its answer to the peer's probe: the 16-byte datagram is an 80-byte WireGuard message, 108 bytes with its UDP and IPv4 headers. That is about 0.6 MB a day per peer. Each round also reads the device once.
+
+All lines carry `component=wireguard`.
+
+| Level | Message | Keys |
+|-------|---------|------|
+| `Info` | `wireguard: rtt probe started` | `interval` (the interval in force, such as `30s`), `port` (`7911`) |
+| `Info` | `wireguard: rtt probe unavailable, the controller cannot read peer stats` | none |
+| `Warn` | `wireguard: rtt probe round failed` | `error` |
+| `Warn`, `Debug` | `wireguard: rtt probe listen failed` | `address` (`<mesh ip>:7911`), `error`. `Warn` for the first failure, `Debug` while the listens keep failing |
+| `Warn`, `Debug` | `wireguard: rtt probe send failed` | `peer_id`, `mesh_ip`, `error`. `Warn` for the first failure for that peer, `Debug` while its sends keep failing |
+| `Debug` | `wireguard: rtt probe read failed` | `error` |
+| `Debug` | `wireguard: rtt probe answer failed` | `error` |
+
+`rtt_test.go` drives the reader and the round over an in-memory `net.PacketConn` with a fake clock, and `TestRTTProbe_TwoManagersMeasureEachOther` runs two managers against each other over real UDP on `127.0.0.1`. The Docker suite's phase 12e checks the report against `meshpeer`, a kernel WireGuard peer that answers through `rtt-echo.sh` under socat (see [Docker E2E Test](../development/docker-e2e-test.md)).
 
 #### Failure detection time
 
@@ -729,7 +808,7 @@ func (m *Manager) RunEndpointSelection(ctx context.Context, interval time.Durati
 
 #### Cost
 
-The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, on a node that holds no failure-detection time, and one interface read, of the local networks, every 30 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default). On such a node the [relay liveness probe](#relay-liveness-probe) adds at most one datagram per relayed peer that received nothing for 30 s, answered by one keepalive. A node that holds a [failure-detection time](#failure-detection-time) reads the device once per pass instead, every 1 s at the default 15 s against every 5 s, and sends one probe per pass per relayed connected peer: a 64-byte WireGuard message, 92 bytes with its UDP and IPv4 headers, about 8 MB a day per relayed peer and direction at the default, and a fifth of that from 75 s up. Each relay re-dial adds one handshake, whether it dials the same relay or the next one of the set. A [move back](#the-trial) adds at most one device write per peer per session, and a failed write is tried again on the next pass. A [direct retry](#direct-retry) adds one handshake per entry tried, and the relay re-dial that ends a failed one adds its own.
+The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, on a node that holds no failure-detection time, and one interface read, of the local networks, every 30 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default). On such a node the [relay liveness probe](#relay-liveness-probe) adds at most one datagram per relayed peer that received nothing for 30 s, answered by one keepalive. A node that holds a [failure-detection time](#failure-detection-time) reads the device once per pass instead, every 1 s at the default 15 s against every 5 s, and sends one probe per pass per relayed connected peer: a 64-byte WireGuard message, 92 bytes with its UDP and IPv4 headers, about 8 MB a day per relayed peer and direction at the default, and a fifth of that from 75 s up. Each relay re-dial adds one handshake, whether it dials the same relay or the next one of the set. A [move back](#the-trial) adds at most one device write per peer per session, and a failed write is tried again on the next pass. A [direct retry](#direct-retry) adds one handshake per entry tried, and the relay re-dial that ends a failed one adds its own. The [round-trip probe](#round-trip-probe) adds one device read per heartbeat interval and, per connected peer and interval, two 108-byte packets, its probe and its answer to the peer's probe: about 0.6 MB a day per peer at the default 30 s.
 
 #### Endpoint selection log lines
 
@@ -908,6 +987,11 @@ r.RegisterHandler(wireguard.ReconcileHandler(mgr, psks))
 mgr.SetRelayProbe(wireguard.SendRelayProbe)
 go mgr.RunEndpointSelection(ctx, wireguard.EndpointSelectionInterval)
 
+// Measure the round-trip time to each connected peer once per heartbeat
+// interval and answer the peers' probes; MeshPeerStats hands the values to
+// the handshake report (step 17f of plexd up; blocks until ctx is done)
+go mgr.RunRTTProbe(ctx, hbCfg.Interval)
+
 // Individual peer operations (driven by reconciliation; see ReconcileHandler)
 mgr.AddPeer(newPeer)
 mgr.UpdatePeer(updatedPeer)
@@ -926,7 +1010,7 @@ if err := mgr.Teardown(); err != nil {
 3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, whose allowed IPs start with `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 4. `SetMTU(name, mtu)` — only if `Config.MTU > 0` or the chosen MTU is not 1420, the MTU every controller creates the device with
 5. `SetInterfaceUp(name)` — bring the interface up
-6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix)
+6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix), and the identity's mesh IP, which the [round-trip probe](#round-trip-probe) binds (the zero address when it does not parse)
 
 ### Error Handling
 
@@ -939,6 +1023,7 @@ if err := mgr.Teardown(); err != nil {
 | `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
 | `RunEndpointSelection` | A failed switch or relay re-dial is logged at warn and the pass goes on; the next re-dial, one relay hold later, dials the relay after the one that failed. A failed move back is logged at warn too, and the next pass tries the same relay again. A failed write of a [direct retry](#direct-retry)'s entry is logged at warn: the next step, one window later, tries the entry after it, and a retry that a change of the local networks starts is not tried again for that change. A failed probe send is logged at warn, then at debug while it keeps failing, and takes no verdict: the next probe follows one trial later, or on the next pass under a [failure-detection time](#failure-detection-time). A failed read of the local networks is logged at warn, then at debug while it keeps failing, and the next read follows 30 s later | Returns nil |
 | `RunMTUProbe`     | A failed probe or `SetMTU` is logged at warn. The next round probes again and retries a failed lowering; a failed raise starts the two-round wait over | Returns nil |
+| `RunRTTProbe`     | A failed listen, device read or send is logged at warn, a repeated failed listen or send at debug, and the next round tries again. A failed read of the socket or a failed answer is logged at debug and the reader reads on; ten failed reads in a row close the socket, and the next round listens again. A controller that cannot read peer stats ends the probe, which returns nil. See [Round-trip probe](#round-trip-probe) | Returns nil |
 
 ### Logging
 
@@ -953,7 +1038,7 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |
 | `Error` | Peer operation failed (bulk) | `peer_id`, `error`                    |
 
-Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), and the reconcile handler the dial order lines in [Dial order](#dial-order) and the peer route lines in [Routed subnets](#routed-subnets). `FailureDetectionDispatchHandler` and `SetFailureDetection` write the failure-detection lines in [Endpoint selection log lines](#endpoint-selection-log-lines).
+Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), the round-trip probe the lines in [Round-trip probe](#round-trip-probe), and the reconcile handler the dial order lines in [Dial order](#dial-order) and the peer route lines in [Routed subnets](#routed-subnets). `FailureDetectionDispatchHandler` and `SetFailureDetection` write the failure-detection lines in [Endpoint selection log lines](#endpoint-selection-log-lines).
 
 ## ReconcileHandler
 

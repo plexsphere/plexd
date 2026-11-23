@@ -517,7 +517,8 @@ waits `nat.refresh_interval` before the next one.
 ### POST /v1/nodes/{node_id}/handshakes
 
 Reports, for every mesh peer the node has completed a WireGuard handshake with,
-the age of the latest handshake and the endpoint WireGuard used for it. The
+the age of the latest handshake, the endpoint WireGuard used for it and, when
+the node measured one, the round-trip time to the peer through the tunnel. The
 control plane keeps the latest observation per directed edge and derives each
 mesh edge's `status`, `mode`, `handshake_age_seconds` and `endpoint` from it.
 When at least two live nodes report a direct handshake with the same peer at the
@@ -538,7 +539,8 @@ samples on the [metrics batch](#observability).
     {
       "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2",
       "last_handshake_age_seconds": 42,
-      "endpoint": "198.51.100.7:51820"
+      "endpoint": "198.51.100.7:51820",
+      "rtt_microseconds": 23400
     },
     {
       "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
@@ -565,11 +567,24 @@ samples on the [metrics batch](#observability).
 - `endpoint`: the endpoint WireGuard currently uses for the peer, as `host:port`
   with an IPv6 host in brackets. The port is in 1..65535, the address is not
   unspecified, and the host carries no IPv6 zone.
+- `rtt_microseconds`: optional, the round-trip time to the peer through the
+  tunnel in whole microseconds as the node last measured it, an integer from 1
+  to 2147483647. An absent member and `null` both mean no measurement and clear
+  the value the control plane stored for that edge. Since
+  [plexsphere/plexsphere#1145](https://github.com/plexsphere/plexsphere/pull/1145)
+  the control plane ranks the relays a pair already holds for each other by
+  these times, so the pair can dial a faster relay first, and shows the time on
+  the mesh edge. plexd sends the member when its
+  [round-trip probe](../networking/wireguard.md#round-trip-probe) holds a value
+  for the peer, and leaves it off otherwise. The second entry above carries
+  none.
 
 Every `400` refuses the whole report, so one bad entry would cost every edge in
 it. plexd therefore applies these rules before it sends: it leaves out an entry
 whose node ID is not a non-zero UUID or whose endpoint cannot be sent, unmaps an
-IPv4-mapped IPv6 address, strips an IPv6 zone, and keeps one entry per peer. See
+IPv4-mapped IPv6 address, strips an IPv6 zone, keeps one entry per peer, and
+raises a round-trip time below a microsecond to 1 and caps one above the range
+at 2147483647. See
 [Handshake Reporter](heartbeat-service.md#handshake-reporter) for the full build
 rules.
 
@@ -598,12 +613,23 @@ each age on its receive time, so a replayed age would make the handshake look
 newer than it was. The next tick sends a fresh report instead. `ReportHandshakes`
 has no internal retry, and Go's HTTP transport does not replay a `POST`.
 
+**Rollout.** No plexd release through v0.38.0 sends `rtt_microseconds`. A
+control plane older than plexsphere/plexsphere#1145 decodes the report with
+unknown fields refused, so it answers every report that carries the member with
+`400 malformed_handshake_report` and records nothing of it. plexd has no
+fallback: it sends the member whenever it holds a value, so the control plane is
+upgraded first. A pair measures each other only when both nodes run a plexd with
+the probe. A peer on an older plexd, a plain WireGuard peer and a node whose host
+firewall drops UDP port 7911 are reported without the member. The control plane
+takes either end's value for a node and a relay bridge, so one answering side is
+enough for the ranking. See [Upgrade order](heartbeat-service.md#upgrade-order).
+
 **Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
 
 | Status | Problem `code` | Meaning | plexd behavior |
 |---|---|---|---|
 | `200 OK` | — | Report accepted; body is a `HandshakeReportResponse` | Logged at Debug; after a not-served phase, one Info line that the control plane accepts reports |
-| `400 Bad Request` | `malformed_handshake_report` | Body is not valid JSON or carries an unknown field; `observed_at` or `peers` is missing; `peers` is `null` or holds more than 4096 entries; an entry misses `peer_node_id` or `last_handshake_age_seconds`, carries a zero `peer_node_id`, an age outside 0..2147483647, or a `peer_node_id` another entry already named | Logged at Warn; the next tick sends a fresh report |
+| `400 Bad Request` | `malformed_handshake_report` | Body is not valid JSON or carries an unknown field, which `rtt_microseconds` is to a control plane older than plexsphere/plexsphere#1145; `observed_at` or `peers` is missing; `peers` is `null` or holds more than 4096 entries; an entry misses `peer_node_id` or `last_handshake_age_seconds`, carries a zero `peer_node_id`, an age outside 0..2147483647, an `rtt_microseconds` outside 1..2147483647, or a `peer_node_id` another entry already named | Logged at Warn; the next tick sends a fresh report. A control plane that refuses `rtt_microseconds` as unknown refuses every report that carries it, and plexd, which has no fallback, logs `agent: handshake report: send failed` at Warn on every tick whose report carries the member, with an `error` that starts with `api: HTTP 400 (malformed_handshake_report):` |
 | `400 Bad Request` | `handshake_clock_skew` | `observed_at` more than 60s from server time | Logged at Error, asking the operator to synchronize the system clock via NTP; the next tick sends a fresh report |
 | `400 Bad Request` | `handshake_endpoint_unparseable` | An `endpoint` is not a `host:port` pair, its port is 0, its address is unspecified, or it carries an IPv6 zone; the `detail` names the entry index | Logged at Warn; the next tick sends a fresh report |
 | `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn; the next tick sends a fresh report |
