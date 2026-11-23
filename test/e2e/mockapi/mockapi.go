@@ -397,7 +397,8 @@ func (s *Server) Assertions() AssertionCounters {
 // peers entry, so every name a suite resolves points at an address of the
 // agent's mesh. The failure_detection block carries 15 s, what the control
 // plane serves for a Domain that never set it, so the e2e suites run the
-// timing production runs.
+// timing production runs. The fixture has no shared subnet, so GetState serves
+// shared_subnets as [].
 func newStateFixture() api.NodeStateSnapshot {
 	rules := []api.PolicyRule{
 		{Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"},
@@ -3362,22 +3363,26 @@ func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// Handshake report contract bounds. maxHandshakeReportPeers is the mock's own
-// copy of the contract's 4096 rather than api.MaxHandshakeReportPeers, so it
-// checks the contract, not the agent's reading of it: a client constant that
-// drifted upwards would otherwise move the mock's ceiling with it.
+// Handshake report contract bounds. maxHandshakeReportPeers and
+// maxHandshakeSharedSubnets are the mock's own copies of the contract's 4096
+// and 256 rather than api.MaxHandshakeReportPeers and
+// api.MaxHandshakeSharedSubnets, so they check the contract, not the agent's
+// reading of it: a client constant that drifted upwards would otherwise move
+// the mock's ceiling with it.
 const (
-	maxHandshakeReportBody  = 1 << 20
-	maxHandshakeReportPeers = 4096
+	maxHandshakeReportBody    = 1 << 20
+	maxHandshakeReportPeers   = 4096
+	maxHandshakeSharedSubnets = 256
 )
 
 // handshakeReportBody is the mock's reading of a handshake report. Every member
 // is a pointer, so a missing or null one decodes to nil instead of passing as a
-// zero value: a required member is refused as missing, and the optional
-// rtt_microseconds reads as no measurement, as the contract treats both an
-// absent member and null. The age and the round-trip time are int64s, so a
-// value outside the contract's int32 range reaches the range check in
-// checkHandshakeReport instead of failing the decode with a less telling error.
+// zero value: a required member is refused as missing, the optional
+// rtt_microseconds reads as no measurement, and the optional shared_subnets
+// reads as none, as the contract treats both an absent member and null. The
+// age and the round-trip time are int64s, so a value outside the contract's
+// int32 range reaches the range check in checkHandshakeReport instead of
+// failing the decode with a less telling error.
 type handshakeReportBody struct {
 	ObservedAt *time.Time              `json:"observed_at"`
 	Peers      *[]handshakeReportEntry `json:"peers"`
@@ -3385,10 +3390,11 @@ type handshakeReportBody struct {
 
 // handshakeReportEntry is one entry of a handshakeReportBody.
 type handshakeReportEntry struct {
-	PeerNodeID              *string `json:"peer_node_id"`
-	LastHandshakeAgeSeconds *int64  `json:"last_handshake_age_seconds"`
-	Endpoint                *string `json:"endpoint"`
-	RTTMicroseconds         *int64  `json:"rtt_microseconds"`
+	PeerNodeID              *string   `json:"peer_node_id"`
+	LastHandshakeAgeSeconds *int64    `json:"last_handshake_age_seconds"`
+	Endpoint                *string   `json:"endpoint"`
+	RTTMicroseconds         *int64    `json:"rtt_microseconds"`
+	SharedSubnets           *[]string `json:"shared_subnets"`
 }
 
 // checkHandshakeReport runs the contract's structural invariants over a decoded
@@ -3396,6 +3402,13 @@ type handshakeReportEntry struct {
 // when the report is well formed. Every one of them answers 400
 // malformed_handshake_report. The endpoint is not checked here: it has a code
 // of its own and is judged only after the clock.
+//
+// The gates run in this order: observed_at present and not the zero time;
+// peers present and not null; at most maxHandshakeReportPeers entries; then,
+// entry by entry, peer_node_id present and a non-zero UUID,
+// last_handshake_age_seconds present and in the int32 range, rtt_microseconds
+// absent, null or in 1..2147483647, shared_subnets as checkSharedSubnets
+// judges it, and peer_node_id not named by an earlier entry.
 //
 // A peer_node_id repeats regardless of case, since a UUID's hex digits are
 // case-insensitive and two spellings of one id name the same edge.
@@ -3424,11 +3437,46 @@ func checkHandshakeReport(req handshakeReportBody) string {
 		case p.RTTMicroseconds != nil && (*p.RTTMicroseconds < 1 || *p.RTTMicroseconds > math.MaxInt32):
 			return fmt.Sprintf("peers[%d].rtt_microseconds is outside 1..%d.", i, math.MaxInt32)
 		}
+		if p.SharedSubnets != nil {
+			if detail := checkSharedSubnets(i, *p.SharedSubnets); detail != "" {
+				return detail
+			}
+		}
 		id := strings.ToLower(*p.PeerNodeID)
 		if _, dup := seen[id]; dup {
 			return fmt.Sprintf("peers[%d].peer_node_id names a peer an earlier entry already named.", i)
 		}
 		seen[id] = struct{}{}
+	}
+	return ""
+}
+
+// checkSharedSubnets judges the shared_subnets of the report entry at index i
+// and returns the detail of the first rule it breaks, or "" when the list is
+// well formed: at most maxHandshakeSharedSubnets entries, each a CIDR that
+// netip.ParsePrefix reads and that has no host bits set, none equal to an
+// earlier one. The caller skips an absent member and null, and [] passes, so
+// all three mean none. A detail names the entry by its index and never repeats
+// its value, as the contract says it must.
+//
+// The mock compares no list with its state fixture, as the control plane
+// compares none with its plan: a subnet the fixture's shared_subnets never
+// named, or one reported on a bridge its entry does not list, passes.
+func checkSharedSubnets(i int, subnets []string) string {
+	if len(subnets) > maxHandshakeSharedSubnets {
+		return fmt.Sprintf("peers[%d].shared_subnets carries %d entries, at most %d are accepted.",
+			i, len(subnets), maxHandshakeSharedSubnets)
+	}
+	seen := make(map[netip.Prefix]struct{}, len(subnets))
+	for j, s := range subnets {
+		p, err := netip.ParsePrefix(s)
+		if err != nil || p != p.Masked() {
+			return fmt.Sprintf("peers[%d].shared_subnets[%d] is not a network prefix.", i, j)
+		}
+		if _, dup := seen[p]; dup {
+			return fmt.Sprintf("peers[%d].shared_subnets[%d] repeats an earlier entry.", i, j)
+		}
+		seen[p] = struct{}{}
 	}
 	return ""
 }
@@ -4906,8 +4954,9 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 }
 
 // GetState returns the current state fixture with the peers, executions,
-// sessions, and secrets slices normalized to non-nil so they always serialize
-// as [] rather than null. The thirteen envelope blocks carry no omitempty, so
+// sessions, secrets, and shared_subnets slices normalized to non-nil so they
+// always serialize as [] rather than null; the contract never sends null for
+// shared_subnets. The fourteen envelope blocks carry no omitempty, so
 // all keys are emitted (null for unpopulated blocks). The hooks block is left as
 // configured: a fixture without one serves null, which keeps every hook a
 // rollout installed. The dns block is left as configured too: a fixture
@@ -4916,8 +4965,8 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 // failure-detection time the node holds.
 //
 // The result is a SHALLOW copy: the policy, bridge, state, reports, and dns
-// pointers and the peers, executions, sessions, and secrets backing arrays
-// alias the live fixture, and so do the failure_detection bytes.
+// pointers and the peers, executions, sessions, secrets, and shared_subnets
+// backing arrays alias the live fixture, and so do the failure_detection bytes.
 // Reading is safe — SetState replaces the whole struct under the mutex, so no
 // caller observes a half-written fixture — but callers must NOT mutate through
 // the returned pointers or slices, which would race the state handler serving a
@@ -4937,6 +4986,9 @@ func (s *Server) GetState() api.NodeStateSnapshot {
 	}
 	if state.Secrets == nil {
 		state.Secrets = &[]api.NodeStateSecret{}
+	}
+	if state.SharedSubnets == nil {
+		state.SharedSubnets = []api.NodeStateSharedSubnet{}
 	}
 	return state
 }

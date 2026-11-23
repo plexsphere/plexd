@@ -1541,6 +1541,52 @@ func TestState_CarriesTheFailureDetectionBlock(t *testing.T) {
 	}
 }
 
+// TestState_CarriesTheSharedSubnetsBlock proves the Mock criterion "Get the
+// default state and read "shared_subnets":[]; put a state with an entry and
+// read it back": a fresh mock serves the block as [], a configured entry is
+// served back with its bridges in order, and a state configured with null is
+// served with [] again, since the contract never sends null.
+func TestState_CarriesTheSharedSubnetsBlock(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"shared_subnets":[]`)) {
+		t.Errorf("default state = %s, want it to carry \"shared_subnets\":[]", raw)
+	}
+
+	// Configure the served state with one entry, the way a suite splices a
+	// state together, and read it back from the pull.
+	want := []api.NodeStateSharedSubnet{
+		{Subnet: "10.20.0.0/16", Bridges: []string{testFixturePeerB2, testFixturePeerB1}},
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := stateEnvelope(t, ts.URL)
+	configured["shared_subnets"] = encoded
+	configureStateEnvelope(t, ts.URL, configured)
+	if got := getState(t, ts.URL).SharedSubnets; !reflect.DeepEqual(got, want) {
+		t.Errorf("shared_subnets after configure-state = %+v, want %+v", got, want)
+	}
+
+	// Configure it with null and read [] back.
+	withNull := stateEnvelope(t, ts.URL)
+	withNull["shared_subnets"] = json.RawMessage("null")
+	configureStateEnvelope(t, ts.URL, withNull)
+	if got := stateEnvelope(t, ts.URL)["shared_subnets"]; string(got) != "[]" {
+		t.Errorf("shared_subnets after configure-state with null = %s, want [] (never null)", got)
+	}
+}
+
 // configureStateEnvelope posts envelope, a served state with members changed
 // by key, to /test/configure-state, failing the test on a non-204 answer.
 func configureStateEnvelope(t *testing.T, baseURL string, envelope map[string]json.RawMessage) {
@@ -5216,6 +5262,23 @@ func handshakeEntryRTT(peerID string, age int64, endpoint, rtt string) string {
 		peerID, age, endpoint, rtt)
 }
 
+// handshakeEntryShared renders a handshake report entry that carries
+// shared_subnets. subnets is the member's JSON value verbatim, so a test can
+// send null or [] as well as a list.
+func handshakeEntryShared(peerID string, age int64, endpoint, subnets string) string {
+	return fmt.Sprintf(`{"peer_node_id":%q,"last_handshake_age_seconds":%d,"endpoint":%q,"shared_subnets":%s}`,
+		peerID, age, endpoint, subnets)
+}
+
+// sharedSubnetList renders n distinct /32 network prefixes as a JSON array.
+func sharedSubnetList(n int) string {
+	subnets := make([]string, n)
+	for i := range subnets {
+		subnets[i] = fmt.Sprintf(`"10.20.%d.%d/32"`, i/256, i%256)
+	}
+	return "[" + strings.Join(subnets, ",") + "]"
+}
+
 // handshakeBodyAt renders a handshake report observed at observedAt, carrying
 // the given entries verbatim.
 func handshakeBodyAt(observedAt time.Time, entries ...string) string {
@@ -5338,6 +5401,51 @@ func TestHandshakes_RefusesAStringRoundTripTimeInTheDecode(t *testing.T) {
 	}
 }
 
+// TestHandshakes_AcceptsSharedSubnets proves the Mock criterion "Post a report
+// with shared_subnets: ["10.20.0.0/16"] and read 200 and the member in GET
+// /test/last-request/handshakes; post null and [] and read 200". The ceiling is
+// inclusive: 256 entries pass. An absent member passes too, which
+// TestHandshakes_RecordsFixturePeersAndIgnoresTheRest covers. Each case sends
+// the member on one fixture peer beside a second fixture peer without it.
+func TestHandshakes_AcceptsSharedSubnets(t *testing.T) {
+	tests := []struct {
+		name    string
+		subnets string
+	}{
+		{"one subnet", `["10.20.0.0/16"]`},
+		{"null", "null"},
+		{"empty", "[]"},
+		{"256 subnets", sharedSubnetList(256)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			body := handshakeBody(
+				handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", tt.subnets),
+				handshakeEntry(testFixturePeerB2, 9, "198.51.100.8:51820"),
+			)
+			resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+			defer resp.Body.Close()
+
+			receipt := decodeHandshakeReceipt(t, resp)
+			if receipt.Recorded != 2 || receipt.Ignored != 0 {
+				t.Errorf("recorded = %d, ignored = %d, want 2 and 0", receipt.Recorded, receipt.Ignored)
+			}
+			if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 1 {
+				t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
+			}
+			captured := getCapturedBody(t, ts.URL, "handshakes")
+			if string(captured) != body {
+				t.Errorf("captured body = %s, want %s", captured, body)
+			}
+			if member := `"shared_subnets":` + tt.subnets; !strings.Contains(string(captured), member) {
+				t.Errorf("captured body = %s, want it to carry %s", captured, member)
+			}
+		})
+	}
+}
+
 // An empty report is valid and records nothing. It is the body phase 4b of the
 // e2e run reads, because the fixture peers never complete a handshake there.
 func TestHandshakes_EmptyPeers_Returns200(t *testing.T) {
@@ -5384,7 +5492,10 @@ func TestHandshakes_RecordedFollowsStateFixture(t *testing.T) {
 
 // TestHandshakes_RefusesNonContractBody walks the contract's 400 refusals in its
 // gate order. A refused report is never counted, and a report that breaks an
-// earlier gate is refused by that one, whatever it breaks later.
+// earlier gate is refused by that one, whatever it breaks later. Its shared
+// subnet cases prove the Mock criterion "Post ["10.20.0.1/16"], ["x"], a
+// repeated entry and 257 entries and read 400 malformed_handshake_report with
+// the detail that names the entry by index".
 func TestHandshakes_RefusesNonContractBody(t *testing.T) {
 	valid := handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820")
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -5445,6 +5556,38 @@ func TestHandshakes_RefusesNonContractBody(t *testing.T) {
 			"malformed_handshake_report", "peers[0].rtt_microseconds is outside 1..2147483647.",
 		},
 		{
+			"shared subnet with host bits",
+			handshakeBody(handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", `["10.20.0.1/16"]`)),
+			"malformed_handshake_report", "peers[0].shared_subnets[0] is not a network prefix.",
+		},
+		{
+			// The detail names both indexes of the entry it refuses.
+			"shared subnet with host bits on a later entry",
+			handshakeBody(valid, handshakeEntryShared(testFixturePeerB2, 9, "198.51.100.8:51820", `["10.21.0.0/16","10.20.0.1/16"]`)),
+			"malformed_handshake_report", "peers[1].shared_subnets[1] is not a network prefix.",
+		},
+		{
+			"shared subnet not a prefix",
+			handshakeBody(handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", `["x"]`)),
+			"malformed_handshake_report", "peers[0].shared_subnets[0] is not a network prefix.",
+		},
+		{
+			"repeated shared subnet",
+			handshakeBody(handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", `["10.20.0.0/16","10.20.0.0/16"]`)),
+			"malformed_handshake_report", "peers[0].shared_subnets[1] repeats an earlier entry.",
+		},
+		{
+			// Entries compare as parsed prefixes, not as strings.
+			"repeated shared subnet in another spelling",
+			handshakeBody(handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", `["fd00::/64","10.20.0.0/16","fd00:0::/64"]`)),
+			"malformed_handshake_report", "peers[0].shared_subnets[2] repeats an earlier entry.",
+		},
+		{
+			"more than 256 shared subnets",
+			handshakeBody(handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", sharedSubnetList(257))),
+			"malformed_handshake_report", "peers[0].shared_subnets carries 257 entries, at most 256 are accepted.",
+		},
+		{
 			"repeated peer_node_id",
 			handshakeBody(valid, handshakeEntry(testFixturePeerB1, 9, "198.51.100.8:51820")),
 			"malformed_handshake_report", "",
@@ -5465,6 +5608,12 @@ func TestHandshakes_RefusesNonContractBody(t *testing.T) {
 			"rtt out of range beats clock skew",
 			handshakeBodyAt(time.Now().Add(-time.Hour), handshakeEntryRTT(testFixturePeerB1, 5, "198.51.100.7:51820", "0")),
 			"malformed_handshake_report", "peers[0].rtt_microseconds is outside 1..2147483647.",
+		},
+		{
+			// So is the form of the shared subnets.
+			"shared subnet not a prefix beats clock skew",
+			handshakeBodyAt(time.Now().Add(-time.Hour), handshakeEntryShared(testFixturePeerB1, 5, "198.51.100.7:51820", `["x"]`)),
+			"malformed_handshake_report", "peers[0].shared_subnets[0] is not a network prefix.",
 		},
 		{
 			// A later entry's structure is judged before an earlier entry's endpoint.
