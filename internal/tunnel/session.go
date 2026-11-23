@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/ifbind"
 )
 
 // Session represents an active tunnel session with a local TCP listener
@@ -21,6 +22,9 @@ type Session struct {
 	TargetHost string
 	TargetPort int
 	MeshIP     string
+	// MeshInterface is the interface the listener is bound to, set before
+	// Start. Empty binds the address alone.
+	MeshInterface string
 
 	listener  net.Listener
 	cancel    context.CancelFunc
@@ -116,16 +120,30 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 	}
 }
 
-// Start opens a TCP listener bound to the mesh IP and begins accepting
-// connections. Everything the session runs hangs off the child context Start
-// derives here, which Close cancels: the accept loop, the idle monitor when an
-// idle window is armed, and the activity report when a reporter is wired.
-// Nothing outlives the session.
+// Start opens a TCP listener bound to the mesh IP and, when MeshInterface is
+// set, to that interface, and begins accepting connections. Everything the
+// session runs hangs off the child context Start derives here, which Close
+// cancels: the accept loop, the idle monitor when an idle window is armed, and
+// the activity report when a reporter is wired. Nothing outlives the session.
+//
+// DECISION: the listener is bound to the mesh interface as well as to the mesh
+// IP (author, 2026-11-23, #245). Linux delivers a segment for the mesh IP on
+// whichever interface it arrives, so a host on a LAN that routes the mesh IP
+// through the node reached the unauthenticated forward. With SO_BINDTODEVICE
+// the kernel refuses that host with a reset, and a client on the node that
+// dials the mesh IP from its default source still connects. A client on the
+// node that sends from 127.0.0.1 or another local address no longer connects,
+// because the answer leaves through the mesh interface. On macOS IP_BOUND_IF
+// confines what the listener sends to the mesh utun: a client on another
+// network gets no answer, and one that forges a mesh source completes a
+// handshake only if it can read the SYN-ACK the node sends into the mesh.
+// Windows receives on the strong host model and binds nothing.
 func (s *Session) Start(ctx context.Context) (string, error) {
 	ctx, s.cancel = context.WithCancel(ctx)
 
 	addr := net.JoinHostPort(s.MeshIP, "0")
-	ln, err := net.Listen("tcp", addr)
+	lc := net.ListenConfig{Control: ifbind.Control(s.MeshInterface)}
+	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		s.cancel()
 		return "", fmt.Errorf("tunnel: listen on %s: %w", addr, err)

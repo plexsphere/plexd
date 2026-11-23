@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ import (
 
 func newTestManager(t *testing.T, cfg Config) *SessionManager {
 	t.Helper()
-	mgr := NewSessionManager(cfg, "127.0.0.1", slog.Default())
+	mgr := NewSessionManager(cfg, "127.0.0.1", "", slog.Default())
 	t.Cleanup(func() { mgr.Shutdown() })
 	return mgr
 }
@@ -108,7 +109,7 @@ func TestSessionManager_CloseSession(t *testing.T) {
 
 func TestSessionManager_Shutdown(t *testing.T) {
 	echoAddr := startEchoServer(t)
-	mgr := NewSessionManager(Config{}, "127.0.0.1", slog.Default())
+	mgr := NewSessionManager(Config{}, "127.0.0.1", "", slog.Default())
 
 	_, err := mgr.CreateSession(context.Background(), echoSession(t, "sh1", echoAddr))
 	if err != nil {
@@ -660,7 +661,7 @@ func TestSessionManager_OnClosedFiresForShutdown(t *testing.T) {
 	// The session_ended row is the only carrier of a session's byte counters,
 	// so a node restart must not drop it for the sessions that were still live.
 	echoAddr := startEchoServer(t)
-	mgr := NewSessionManager(Config{}, "127.0.0.1", slog.Default())
+	mgr := NewSessionManager(Config{}, "127.0.0.1", "", slog.Default())
 
 	var (
 		mu      sync.Mutex
@@ -697,7 +698,7 @@ func TestSessionManager_OnClosedFiresForShutdown(t *testing.T) {
 // per-report bound; concurrent closing keeps it near a single report's cost.
 func TestSessionManager_ShutdownReportsConcurrently(t *testing.T) {
 	echoAddr := startEchoServer(t)
-	mgr := NewSessionManager(Config{}, "127.0.0.1", slog.Default())
+	mgr := NewSessionManager(Config{}, "127.0.0.1", "", slog.Default())
 
 	const (
 		sessionCount = 8
@@ -783,7 +784,7 @@ func TestSessionManager_UnbindableMeshIPRejected(t *testing.T) {
 		{"not an address", "mesh.example.com"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			mgr := NewSessionManager(Config{}, tt.meshIP, slog.Default())
+			mgr := NewSessionManager(Config{}, tt.meshIP, "", slog.Default())
 			t.Cleanup(func() { mgr.Shutdown() })
 
 			_, err := mgr.CreateSession(context.Background(), echoSession(t, "mesh-ip", echoAddr))
@@ -794,6 +795,28 @@ func TestSessionManager_UnbindableMeshIPRejected(t *testing.T) {
 				t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
 			}
 		})
+	}
+}
+
+// TestSessionManager_SetsMeshInterface shows that the manager hands its mesh
+// interface to every tcp session it creates: with a name no interface
+// carries, the session's listener cannot be bound, so CreateSession returns
+// the binding's error and registers no session.
+func TestSessionManager_SetsMeshInterface(t *testing.T) {
+	requireInterfaceBinding(t)
+	echoAddr := startEchoServer(t)
+	mgr := NewSessionManager(Config{}, "127.0.0.1", "plexd-none0", slog.Default())
+	t.Cleanup(mgr.Shutdown)
+
+	addr, err := mgr.CreateSession(context.Background(), echoSession(t, "sess-iface", echoAddr))
+	if want := "bind to interface plexd-none0"; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("CreateSession(tcp) = %q, %v, want an error that contains %q", addr, err, want)
+	}
+	if addr != "" {
+		t.Errorf("CreateSession(tcp) address = %q, want none", addr)
+	}
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
 	}
 }
 

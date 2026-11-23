@@ -65,7 +65,7 @@ func endedRows(reporter *mockReporter, sessionID string) []sessionEndedCall {
 // builds in production.
 func newIntegrationDispatcher(t *testing.T, cfg Config) (*Dispatcher, *SessionManager, *mockReporter) {
 	t.Helper()
-	mgr := NewSessionManager(cfg, "127.0.0.1", slog.Default())
+	mgr := NewSessionManager(cfg, "127.0.0.1", "", slog.Default())
 	t.Cleanup(func() { mgr.Shutdown() })
 
 	reporter := &mockReporter{}

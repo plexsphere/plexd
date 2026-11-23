@@ -75,7 +75,11 @@ type managedSession interface {
 type SessionManager struct {
 	cfg    Config
 	meshIP string
-	logger *slog.Logger
+	// meshIface is the operating system's name of the mesh interface, which
+	// the manager binds every tcp session listener to. Empty binds the mesh
+	// IP alone.
+	meshIface string
+	logger    *slog.Logger
 
 	mu       sync.Mutex
 	sessions map[string]managedSession
@@ -87,13 +91,14 @@ type SessionManager struct {
 }
 
 // NewSessionManager creates a new SessionManager with default config applied.
-func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionManager {
+func NewSessionManager(cfg Config, meshIP, meshIface string, logger *slog.Logger) *SessionManager {
 	cfg.ApplyDefaults()
 	return &SessionManager{
-		cfg:      cfg,
-		meshIP:   meshIP,
-		logger:   logger.With("component", "tunnel"),
-		sessions: make(map[string]managedSession),
+		cfg:       cfg,
+		meshIP:    meshIP,
+		meshIface: meshIface,
+		logger:    logger.With("component", "tunnel"),
+		sessions:  make(map[string]managedSession),
 	}
 }
 
@@ -174,7 +179,8 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 	}
 
 	// A tcp session listener carries no authentication of its own, so the mesh
-	// address it binds is the whole of its reachability boundary. The address is
+	// address it binds and the mesh interface it is bound to (see
+	// Session.Start) are the whole of its reachability boundary. The address is
 	// copied verbatim from the control plane's registration response into
 	// identity.json, so it is parsed here rather than trusted: an empty value,
 	// something that is not an address at all, or an unspecified one (0.0.0.0,
@@ -246,6 +252,7 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		}
 	} else {
 		tcp := NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+		tcp.MeshInterface = m.meshIface
 		// Only a tcp tunnel reports its traffic: the control plane counts an
 		// ssh session's at its attach gateway. Like the idle window, the report
 		// is armed before start, which launches it.

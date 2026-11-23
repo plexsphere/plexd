@@ -2,11 +2,14 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -85,6 +88,107 @@ func TestSession_ForwardBidirectional(t *testing.T) {
 
 	if string(buf) != msg {
 		t.Errorf("expected %q, got %q", msg, string(buf))
+	}
+}
+
+// requireInterfaceBinding skips the test unless it runs on Linux or macOS,
+// the only systems on which ifbind.Control binds a socket to an interface.
+func requireInterfaceBinding(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("%s binds no interface", runtime.GOOS)
+	}
+}
+
+// loopbackInterface returns the name of the loopback interface, lo on Linux
+// and lo0 on macOS, and skips the test on every other system.
+func loopbackInterface(t *testing.T) string {
+	t.Helper()
+	requireInterfaceBinding(t)
+	if runtime.GOOS == "darwin" {
+		return "lo0"
+	}
+	return "lo"
+}
+
+// TestSession_BindsMeshInterface shows that a listener bound to an interface
+// still forwards what reaches it there: a session on 127.0.0.1, bound to the
+// loopback interface, forwards a local connection to its target.
+func TestSession_BindsMeshInterface(t *testing.T) {
+	lo := loopbackInterface(t)
+	echoAddr := startEchoServer(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustAtoi(t, portStr)
+
+	session := NewSession("test-iface", host, port, "127.0.0.1", time.Now().Add(5*time.Minute), slog.Default())
+	session.MeshInterface = lo
+	t.Cleanup(func() { session.Close() })
+
+	addr, err := session.Start(context.Background())
+	if errors.Is(err, syscall.EPERM) {
+		t.Skipf("Start() with MeshInterface %q: %v; a Linux kernel before 5.7 asks for CAP_NET_RAW", lo, err)
+	}
+	if err != nil {
+		t.Fatalf("Start() with MeshInterface %q error: %v", lo, err)
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial(%s) error: %v, want a connection to the listener bound to %s", addr, err, lo)
+	}
+	defer conn.Close()
+
+	msg := "hello bound tunnel"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+
+	buf := make([]byte, len(msg))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("ReadFull() error: %v", err)
+	}
+
+	if string(buf) != msg {
+		t.Errorf("expected %q, got %q", msg, string(buf))
+	}
+}
+
+// TestSession_UnknownMeshInterfaceFailsStart shows that a listener that
+// cannot be bound to its interface is never opened: Start returns the
+// session's error around the binding's, and the session holds no listener.
+// net.ListenConfig puts its own *net.OpError between the two, so the error
+// reads "tunnel: listen on 127.0.0.1:0: listen tcp 127.0.0.1:0: bind to
+// interface plexd-none0: ...".
+func TestSession_UnknownMeshInterfaceFailsStart(t *testing.T) {
+	requireInterfaceBinding(t)
+	const name = "plexd-none0"
+
+	session := NewSession("test-no-iface", "127.0.0.1", 9999, "127.0.0.1", time.Now().Add(5*time.Minute), slog.Default())
+	session.MeshInterface = name
+	t.Cleanup(func() { _ = session.Close() })
+
+	addr, err := session.Start(context.Background())
+	if addr != "" {
+		t.Errorf("Start() address = %q, want none", addr)
+	}
+	if err == nil {
+		t.Fatalf("Start() with MeshInterface %q returned no error, want the binding refused", name)
+	}
+	if want := "tunnel: listen on 127.0.0.1:0: "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("Start() error = %q, want the prefix %q", err, want)
+	}
+	if want := "bind to interface " + name; !strings.Contains(err.Error(), want) {
+		t.Errorf("Start() error = %q, want it to contain %q", err, want)
+	}
+	if runtime.GOOS == "linux" && !errors.Is(err, syscall.ENODEV) {
+		t.Errorf("Start() error = %v, want it to wrap ENODEV", err)
+	}
+	if got := session.ListenAddr(); got != "" {
+		t.Errorf("ListenAddr() = %q, want empty", got)
+	}
+	if err := session.Close(); err != nil {
+		t.Errorf("Close() = %v, want nil", err)
 	}
 }
 

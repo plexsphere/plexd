@@ -658,7 +658,7 @@ func (h *hookHandler) WithGroup(string) slog.Handler { return h }
 func TestDispatcher_RevocationDuringProvisionClosesTheSession(t *testing.T) {
 	echoAddr := startEchoServer(t)
 	hook := &hookHandler{msg: "session expiry capped below the granted expires_at; the session will end early"}
-	mgr := NewSessionManager(Config{}, "127.0.0.1", slog.New(hook))
+	mgr := NewSessionManager(Config{}, "127.0.0.1", "", slog.New(hook))
 	t.Cleanup(mgr.Shutdown)
 	reporter := &mockReporter{}
 	logs := newCountingHandler()
