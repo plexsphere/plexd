@@ -227,6 +227,23 @@ func meshPeerRTT(nodeID, endpoint string, lastHandshake time.Time, rtt time.Dura
 	return s
 }
 
+// meshPeerShared is meshPeer with the shared subnets the device read holds on
+// the peer, nil when none are given.
+func meshPeerShared(nodeID, endpoint string, lastHandshake time.Time, subnets ...string) wireguard.MeshPeerStat {
+	s := meshPeer(nodeID, endpoint, lastHandshake)
+	s.SharedSubnets = subnets
+	return s
+}
+
+// sharedSubnetList returns n distinct /24 subnets in ascending order.
+func sharedSubnetList(n int) []string {
+	subnets := make([]string, 0, n)
+	for i := range n {
+		subnets = append(subnets, fmt.Sprintf("10.%d.%d.0/24", i/256, i%256))
+	}
+	return subnets
+}
+
 // entryJSON marshals one report entry as it goes on the wire.
 func entryJSON(t *testing.T, p api.HandshakeReportPeer) string {
 	t.Helper()
@@ -258,7 +275,7 @@ func TestBuildHandshakeReport_AgesAndEndpointsSortedByAge(t *testing.T) {
 		meshPeer(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second)),
 	}
 
-	req, skipped, truncated := buildHandshakeReport(testObservedAt, stats)
+	req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, stats)
 
 	if !req.ObservedAt.Equal(testObservedAt) {
 		t.Errorf("ObservedAt = %v, want %v", req.ObservedAt, testObservedAt)
@@ -295,7 +312,7 @@ func TestBuildHandshakeReport_NothingToReport(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, skipped, truncated := buildHandshakeReport(testObservedAt, tt.stats)
+			req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, tt.stats)
 			if req.Peers == nil {
 				t.Fatal("Peers = nil, want a non-nil empty slice")
 			}
@@ -364,7 +381,7 @@ func TestBuildHandshakeReport_Normalization(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			stats := []wireguard.MeshPeerStat{{NodeID: testPeerA, Endpoint: tt.endpoint, LastHandshake: tt.lastHandshake}}
 
-			req, skipped, _ := buildHandshakeReport(testObservedAt, stats)
+			req, skipped, _, _ := buildHandshakeReport(testObservedAt, stats)
 
 			want := []api.HandshakeReportPeer{{PeerNodeID: testPeerA, LastHandshakeAgeSeconds: tt.wantAge, Endpoint: tt.wantEndpoint}}
 			if !reflect.DeepEqual(req.Peers, want) {
@@ -399,7 +416,7 @@ func TestBuildHandshakeReport_SkipsEntriesTheContractRefuses(t *testing.T) {
 				meshPeer(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second)),
 			}
 
-			req, skipped, truncated := buildHandshakeReport(testObservedAt, stats)
+			req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, stats)
 
 			want := []api.HandshakeReportPeer{{PeerNodeID: testPeerA, LastHandshakeAgeSeconds: 5, Endpoint: "198.51.100.7:51820"}}
 			if !reflect.DeepEqual(req.Peers, want) {
@@ -429,7 +446,7 @@ func TestBuildHandshakeReport_RepeatedNodeIDKeepsSmallerAge(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, skipped, truncated := buildHandshakeReport(testObservedAt, tt.stats)
+			req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, tt.stats)
 			if !reflect.DeepEqual(req.Peers, want) {
 				t.Errorf("Peers = %+v, want %+v", req.Peers, want)
 			}
@@ -448,7 +465,7 @@ func TestBuildHandshakeReport_EqualAgesSortByPeerNodeID(t *testing.T) {
 		meshPeer(testPeerB, "198.51.100.2:51820", handshake),
 	}
 
-	req, _, _ := buildHandshakeReport(testObservedAt, stats)
+	req, _, _, _ := buildHandshakeReport(testObservedAt, stats)
 
 	got := make([]string, 0, len(req.Peers))
 	for _, p := range req.Peers {
@@ -472,7 +489,7 @@ func TestBuildHandshakeReport_TruncatesToTheMostRecent(t *testing.T) {
 		))
 	}
 
-	req, skipped, truncated := buildHandshakeReport(testObservedAt, stats)
+	req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, stats)
 
 	if len(req.Peers) != api.MaxHandshakeReportPeers {
 		t.Fatalf("len(Peers) = %d, want %d", len(req.Peers), api.MaxHandshakeReportPeers)
@@ -510,7 +527,7 @@ func TestBuildHandshakeReport_RTTInWholeMicroseconds(t *testing.T) {
 				meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), tt.rtt),
 			}
 
-			req, skipped, truncated := buildHandshakeReport(testObservedAt, stats)
+			req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, stats)
 
 			if len(req.Peers) != 1 {
 				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
@@ -536,7 +553,7 @@ func TestBuildHandshakeReport_NoRTTLeavesTheMemberOff(t *testing.T) {
 				meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), rtt),
 			}
 
-			req, _, _ := buildHandshakeReport(testObservedAt, stats)
+			req, _, _, _ := buildHandshakeReport(testObservedAt, stats)
 
 			if len(req.Peers) != 1 {
 				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
@@ -583,7 +600,7 @@ func TestBuildHandshakeReport_RepeatedNodeIDKeepsTheRTTOfTheKeptEntry(t *testing
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, skipped, truncated := buildHandshakeReport(testObservedAt, tt.stats)
+			req, skipped, truncated, _ := buildHandshakeReport(testObservedAt, tt.stats)
 			if len(req.Peers) != 1 {
 				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
 			}
@@ -592,6 +609,169 @@ func TestBuildHandshakeReport_RepeatedNodeIDKeepsTheRTTOfTheKeptEntry(t *testing
 			}
 			if skipped != 0 || truncated != 0 {
 				t.Errorf("skipped, truncated = %d, %d, want 0, 0", skipped, truncated)
+			}
+		})
+	}
+}
+
+// "Build a report from a stat with two shared subnets and read them on that
+// entry in the stat's order; read no member on an entry without any." The
+// stat's order here is not sorted, so a report that sorted the list would
+// fail. A nil list and an empty one both leave the entry with a nil list and
+// no shared_subnets key on the wire.
+func TestBuildHandshakeReport_SharedSubnetsInTheStatsOrder(t *testing.T) {
+	handshake := testObservedAt.Add(-5 * time.Second)
+	empty := meshPeer(testPeerC, "198.51.100.9:51820", handshake)
+	empty.SharedSubnets = []string{}
+	stats := []wireguard.MeshPeerStat{
+		meshPeerShared(testPeerA, "198.51.100.7:51820", handshake, "10.30.0.0/16", "10.20.0.0/16"),
+		meshPeer(testPeerB, "198.51.100.8:51820", handshake),
+		empty,
+	}
+
+	req, skipped, truncated, sharedCut := buildHandshakeReport(testObservedAt, stats)
+
+	if len(req.Peers) != 3 {
+		t.Fatalf("Peers = %s, want three entries", entriesJSON(t, req.Peers))
+	}
+	if got, want := req.Peers[0].SharedSubnets, []string{"10.30.0.0/16", "10.20.0.0/16"}; !slices.Equal(got, want) {
+		t.Errorf("%s SharedSubnets = %v, want %v", req.Peers[0].PeerNodeID, got, want)
+	}
+	const wantA = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":5,` +
+		`"endpoint":"198.51.100.7:51820","shared_subnets":["10.30.0.0/16","10.20.0.0/16"]}`
+	if got := entryJSON(t, req.Peers[0]); got != wantA {
+		t.Errorf("entry = %s, want %s", got, wantA)
+	}
+	for _, p := range req.Peers[1:] {
+		if p.SharedSubnets != nil {
+			t.Errorf("%s SharedSubnets = %#v, want nil", p.PeerNodeID, p.SharedSubnets)
+		}
+		got := entryJSON(t, p)
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(got), &keys); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := keys["shared_subnets"]; ok {
+			t.Errorf("entry = %s, want no shared_subnets key", got)
+		}
+	}
+	if skipped != 0 || truncated != 0 || sharedCut != 0 {
+		t.Errorf("skipped, truncated, sharedCut = %d, %d, %d, want 0, 0, 0", skipped, truncated, sharedCut)
+	}
+}
+
+// "Build one from a stat with 257 subnets and read 256 on the entry, sharedCut
+// 1": an entry keeps the first api.MaxHandshakeSharedSubnets subnets in the
+// stat's order. sharedCut sums the subnets left out over the entries, and an
+// entry the peer ceiling cuts adds nothing, since its list never reaches the
+// wire.
+func TestBuildHandshakeReport_CutsSharedSubnetsAtTheContractCeiling(t *testing.T) {
+	handshake := testObservedAt.Add(-5 * time.Second)
+
+	// Ages 0 to 4096, one more entry than the peer ceiling. The newest holds
+	// one subnet too many and is kept; the oldest holds 300 and is cut.
+	beyondPeers := make([]wireguard.MeshPeerStat, 0, api.MaxHandshakeReportPeers+1)
+	for age := range api.MaxHandshakeReportPeers + 1 {
+		beyondPeers = append(beyondPeers, meshPeer(
+			fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", age+1),
+			"198.51.100.7:51820",
+			testObservedAt.Add(-time.Duration(age)*time.Second),
+		))
+	}
+	beyondPeers[0].SharedSubnets = sharedSubnetList(257)
+	beyondPeers[api.MaxHandshakeReportPeers].SharedSubnets = sharedSubnetList(300)
+
+	tests := []struct {
+		name          string
+		stats         []wireguard.MeshPeerStat
+		wantTruncated int
+		wantCut       int
+	}{
+		{
+			name: "257 on one entry",
+			stats: []wireguard.MeshPeerStat{
+				meshPeerShared(testPeerA, "198.51.100.7:51820", handshake, sharedSubnetList(257)...),
+			},
+			wantCut: 1,
+		},
+		{
+			name: "summed over the entries",
+			stats: []wireguard.MeshPeerStat{
+				meshPeerShared(testPeerA, "198.51.100.7:51820", handshake, sharedSubnetList(257)...),
+				meshPeerShared(testPeerB, "198.51.100.8:51820", handshake, sharedSubnetList(258)...),
+				meshPeerShared(testPeerC, "198.51.100.9:51820", handshake, sharedSubnetList(api.MaxHandshakeSharedSubnets)...),
+			},
+			wantCut: 3,
+		},
+		{name: "an entry the peer ceiling cuts adds nothing", stats: beyondPeers, wantTruncated: 1, wantCut: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			held := make(map[string][]string, len(tt.stats))
+			for _, s := range tt.stats {
+				held[s.NodeID] = s.SharedSubnets
+			}
+
+			req, skipped, truncated, sharedCut := buildHandshakeReport(testObservedAt, tt.stats)
+
+			if want := len(tt.stats) - tt.wantTruncated; len(req.Peers) != want {
+				t.Fatalf("len(Peers) = %d, want %d", len(req.Peers), want)
+			}
+			for _, p := range req.Peers {
+				want := held[p.PeerNodeID]
+				want = want[:min(len(want), api.MaxHandshakeSharedSubnets)]
+				if !slices.Equal(p.SharedSubnets, want) {
+					t.Errorf("%s carries %d shared subnets, want the first %d of the stat's %d",
+						p.PeerNodeID, len(p.SharedSubnets), len(want), len(held[p.PeerNodeID]))
+				}
+			}
+			if sharedCut != tt.wantCut {
+				t.Errorf("sharedCut = %d, want %d", sharedCut, tt.wantCut)
+			}
+			if skipped != 0 || truncated != tt.wantTruncated {
+				t.Errorf("skipped, truncated = %d, %d, want 0, %d", skipped, truncated, tt.wantTruncated)
+			}
+		})
+	}
+}
+
+// "Build one from a repeated NodeID and read the list of the entry with the
+// smaller age", in either order, and never a list of the other entry. The
+// ceiling applies to the kept entry alone, so a dropped entry's long list is
+// not counted in sharedCut.
+func TestBuildHandshakeReport_RepeatedNodeIDKeepsTheSharedSubnetsOfTheKeptEntry(t *testing.T) {
+	older := meshPeerShared(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-30*time.Second), "10.20.0.0/16")
+	olderOver := meshPeerShared(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-30*time.Second), sharedSubnetList(257)...)
+	newer := meshPeerShared(testPeerA, "203.0.113.9:51820", testObservedAt.Add(-10*time.Second), "10.30.0.0/16", "10.40.0.0/16")
+	newerWithout := meshPeer(testPeerA, "203.0.113.9:51820", testObservedAt.Add(-10*time.Second))
+	const (
+		wantNewer = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":10,` +
+			`"endpoint":"203.0.113.9:51820","shared_subnets":["10.30.0.0/16","10.40.0.0/16"]}`
+		wantNewerWithout = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":10,"endpoint":"203.0.113.9:51820"}`
+	)
+
+	tests := []struct {
+		name  string
+		stats []wireguard.MeshPeerStat
+		want  string
+	}{
+		{name: "older first", stats: []wireguard.MeshPeerStat{older, newer}, want: wantNewer},
+		{name: "newer first", stats: []wireguard.MeshPeerStat{newer, older}, want: wantNewer},
+		{name: "newer without any, older first", stats: []wireguard.MeshPeerStat{older, newerWithout}, want: wantNewerWithout},
+		{name: "newer without any, newer first", stats: []wireguard.MeshPeerStat{newerWithout, older}, want: wantNewerWithout},
+		{name: "older over the ceiling", stats: []wireguard.MeshPeerStat{olderOver, newer}, want: wantNewer},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, skipped, truncated, sharedCut := buildHandshakeReport(testObservedAt, tt.stats)
+			if len(req.Peers) != 1 {
+				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
+			}
+			if got := entryJSON(t, req.Peers[0]); got != tt.want {
+				t.Errorf("entry = %s, want %s", got, tt.want)
+			}
+			if skipped != 0 || truncated != 0 || sharedCut != 0 {
+				t.Errorf("skipped, truncated, sharedCut = %d, %d, %d, want 0, 0, 0", skipped, truncated, sharedCut)
 			}
 		})
 	}
@@ -1153,5 +1333,85 @@ func TestHandshakeReporter_AcceptedLogCountsEntriesWithRTT(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// "Build one from a stat with 257 subnets and read 256 on the entry, sharedCut
+// 1 and the Warn line": reportOnce sends the cut list and logs the subnets
+// left out as count beside the contract's max.
+func TestHandshakeReporter_SharedSubnetCutLoggedAtWarn(t *testing.T) {
+	const sharedCutMsg = "agent: handshake report: more shared subnets than the contract allows"
+	client := &fakeHandshakeClient{}
+	source := &fakeStatsSource{stats: []wireguard.MeshPeerStat{
+		meshPeerShared(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), sharedSubnetList(257)...),
+	}}
+	logger, logs := newDebugLogger()
+	r := newFixedClockReporter(client, source, logger)
+
+	r.reportOnce(context.Background())
+
+	_, reqs := client.recorded()
+	if len(reqs) != 1 || len(reqs[0].Peers) != 1 {
+		t.Fatalf("reports = %d, want 1 with one entry", len(reqs))
+	}
+	if n := len(reqs[0].Peers[0].SharedSubnets); n != api.MaxHandshakeSharedSubnets {
+		t.Errorf("sent %d shared subnets on the entry, want %d", n, api.MaxHandshakeSharedSubnets)
+	}
+	got := logs.String()
+	line := logLine(t, got, sharedCutMsg)
+	for _, want := range []string{"level=WARN", "component=handshake-report", "count=1 ", "max=256"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("shared subnet cut log = %q, want it to contain %q", line, want)
+		}
+	}
+	if n := countLogLines(got, "agent: handshake report: more peers than the contract allows, reporting the most recent"); n != 0 {
+		t.Errorf("peer truncation logged %d times with nothing truncated, want 0", n)
+	}
+	logLine(t, got, "agent: handshake report: accepted")
+}
+
+// "Read with_shared_subnets=1 on the accepted line": it counts the sent
+// entries that carry shared_subnets and follows with_rtt. An entry with an
+// empty list, a skipped peer and a peer without a handshake do not count,
+// whatever shared subnets their read holds.
+func TestHandshakeReporter_AcceptedLogCountsEntriesWithSharedSubnets(t *testing.T) {
+	const testPeerD = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b4"
+	empty := meshPeer(testPeerC, "198.51.100.9:51820", testObservedAt.Add(-7*time.Second))
+	empty.SharedSubnets = []string{}
+	client := &fakeHandshakeClient{}
+	source := &fakeStatsSource{stats: []wireguard.MeshPeerStat{
+		meshPeerShared(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), "10.20.0.0/16", "10.30.0.0/16"),
+		meshPeer(testPeerB, "198.51.100.8:51820", testObservedAt.Add(-6*time.Second)),
+		empty,
+		meshPeerShared(testPeerD, "198.51.100.10:51820", time.Time{}, "10.40.0.0/16"),
+		meshPeerShared("peer-1", "198.51.100.11:51820", testObservedAt.Add(-8*time.Second), "10.50.0.0/16"),
+	}}
+	logger, logs := newDebugLogger()
+	r := newFixedClockReporter(client, source, logger)
+
+	r.reportOnce(context.Background())
+
+	_, reqs := client.recorded()
+	if len(reqs) != 1 {
+		t.Fatalf("reports = %d, want 1", len(reqs))
+	}
+	carrying := 0
+	for _, p := range reqs[0].Peers {
+		if len(p.SharedSubnets) > 0 {
+			carrying++
+		}
+	}
+	if len(reqs[0].Peers) != 3 || carrying != 1 {
+		t.Errorf("sent %d entries, %d with shared_subnets, want 3 and 1", len(reqs[0].Peers), carrying)
+	}
+	got := logs.String()
+	line := logLine(t, got, "agent: handshake report: accepted")
+	for _, want := range []string{"level=DEBUG", "sent=3 ", "with_rtt=0 with_shared_subnets=1 "} {
+		if !strings.Contains(line, want) {
+			t.Errorf("accepted log = %q, want it to contain %q", line, want)
+		}
+	}
+	if n := countLogLines(got, "agent: handshake report: more shared subnets than the contract allows"); n != 0 {
+		t.Errorf("shared subnet cut logged %d times with nothing cut, want 0", n)
 	}
 }

@@ -42,7 +42,9 @@ const nilUUID = "00000000-0000-0000-0000-000000000000"
 // it to POST /v1/nodes/{node_id}/handshakes. The control plane derives each
 // mesh edge's status, mode, handshake age and endpoint from these reports. An
 // entry also carries the round-trip time to the peer through the tunnel when
-// the device read holds one, which the control plane ranks a pair's relays by.
+// the device read holds one, which the control plane ranks a pair's relays by,
+// and the shared subnets the node routes through the peer, which the control
+// plane shows on the edge.
 //
 // DECISION (author, 2026-11-23, #218): the reporter sends rtt_microseconds
 // whenever it holds a value and has no fallback for a control plane that
@@ -50,6 +52,16 @@ const nilUUID = "00000000-0000-0000-0000-000000000000"
 // answers 400 malformed_handshake_report, so nothing of that report is
 // recorded; logSendError reports it as any failed send, on every tick until
 // the control plane is upgraded. The control plane is therefore upgraded first.
+//
+// DECISION: the reporter sends shared_subnets for every entry whose peer holds
+// a shared subnet and has no fallback for a control plane that predates the
+// member, which would refuse the report as it refuses rtt_microseconds. The
+// fallback is never needed: the node holds a shared subnet only for an entry
+// of a pull's shared_subnets, and such a control plane sends no
+// shared_subnets entry, so no report to it carries the member. During a
+// rolling deploy of the control plane a report can still reach a replica that
+// predates the member; that send fails as any other, and the next tick builds
+// a fresh report.
 //
 // DECISION: the reporter runs its own loop at the heartbeat interval rather
 // than riding on HeartbeatService.sendHeartbeat. The contract asks for one
@@ -131,7 +143,7 @@ func (r *HandshakeReporter) reportOnce(ctx context.Context) {
 	// step, no handshake the read saw postdates it and no age comes out
 	// negative.
 	observedAt := r.now().UTC()
-	req, skipped, truncated := buildHandshakeReport(observedAt, stats)
+	req, skipped, truncated, sharedCut := buildHandshakeReport(observedAt, stats)
 	if skipped > 0 {
 		r.logger.DebugContext(ctx, "agent: handshake report: skipped peers", "count", skipped)
 	}
@@ -139,6 +151,12 @@ func (r *HandshakeReporter) reportOnce(ctx context.Context) {
 		r.logger.WarnContext(ctx, "agent: handshake report: more peers than the contract allows, reporting the most recent",
 			"peers", len(req.Peers)+truncated,
 			"max", api.MaxHandshakeReportPeers,
+		)
+	}
+	if sharedCut > 0 {
+		r.logger.WarnContext(ctx, "agent: handshake report: more shared subnets than the contract allows",
+			"count", sharedCut,
+			"max", api.MaxHandshakeSharedSubnets,
 		)
 	}
 
@@ -152,15 +170,19 @@ func (r *HandshakeReporter) reportOnce(ctx context.Context) {
 		r.logger.InfoContext(ctx, "agent: handshake report: control plane accepts handshake reports")
 		r.notServed = false
 	}
-	withRTT := 0
+	withRTT, withShared := 0, 0
 	for _, p := range req.Peers {
 		if p.RTTMicroseconds != nil {
 			withRTT++
+		}
+		if len(p.SharedSubnets) > 0 {
+			withShared++
 		}
 	}
 	r.logger.DebugContext(ctx, "agent: handshake report: accepted",
 		"sent", len(req.Peers),
 		"with_rtt", withRTT,
+		"with_shared_subnets", withShared,
 		"recorded", resp.Recorded,
 		"ignored", resp.Ignored,
 		"accepted_at", resp.AcceptedAt,
@@ -226,13 +248,20 @@ func (r *HandshakeReporter) logSendError(ctx context.Context, err error) {
 // rtt_microseconds, rendered by rttMicroseconds, when the device read holds a
 // round-trip time for the peer, and leaves the member off when it holds none;
 // there is no fallback for a control plane that predates the member (see
-// HandshakeReporter). A NodeID that repeats keeps the entry with the smaller
-// age, its round-trip time included; the contract refuses a repeated
-// peer_node_id and the newer handshake is the truer one. The entries are
-// sorted by age and then PeerNodeID, and beyond api.MaxHandshakeReportPeers the
-// oldest are cut and counted in truncated, since the freshest handshakes are
-// the ones that keep edges from reading stale.
-func buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) (req api.HandshakeReportRequest, skipped, truncated int) {
+// HandshakeReporter). An entry carries shared_subnets, the stat's
+// SharedSubnets in the stat's order, when the peer holds a shared subnet, and
+// leaves the member off, with a nil list, when it holds none; there is no
+// fallback for it either. A NodeID that repeats keeps the entry with the
+// smaller age, its round-trip time and shared subnets included; the contract
+// refuses a repeated peer_node_id and the newer handshake is the truer one.
+// The entries are sorted by age and then PeerNodeID, and beyond
+// api.MaxHandshakeReportPeers the oldest are cut and counted in truncated,
+// since the freshest handshakes are the ones that keep edges from reading
+// stale. A kept entry's list longer than api.MaxHandshakeSharedSubnets is then
+// cut after its first api.MaxHandshakeSharedSubnets subnets, and the subnets
+// left out, summed over the kept entries, are counted in sharedCut: the
+// contract refuses the whole report for one longer list.
+func buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) (req api.HandshakeReportRequest, skipped, truncated, sharedCut int) {
 	req.ObservedAt = observedAt
 	req.Peers = make([]api.HandshakeReportPeer, 0, len(stats))
 
@@ -258,6 +287,9 @@ func buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) 
 			Endpoint:                endpoint,
 			RTTMicroseconds:         rttMicroseconds(s.RTT),
 		}
+		if len(s.SharedSubnets) > 0 {
+			peer.SharedSubnets = s.SharedSubnets
+		}
 		if i, dup := seen[s.NodeID]; dup {
 			if peer.LastHandshakeAgeSeconds < req.Peers[i].LastHandshakeAgeSeconds {
 				req.Peers[i] = peer
@@ -278,8 +310,14 @@ func buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) 
 		truncated = n - api.MaxHandshakeReportPeers
 		req.Peers = req.Peers[:api.MaxHandshakeReportPeers]
 	}
+	for i := range req.Peers {
+		if n := len(req.Peers[i].SharedSubnets); n > api.MaxHandshakeSharedSubnets {
+			sharedCut += n - api.MaxHandshakeSharedSubnets
+			req.Peers[i].SharedSubnets = req.Peers[i].SharedSubnets[:api.MaxHandshakeSharedSubnets]
+		}
+	}
 
-	return req, skipped, truncated
+	return req, skipped, truncated, sharedCut
 }
 
 // wireEndpoint renders ep in the form the contract accepts, reporting false
