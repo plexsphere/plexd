@@ -101,10 +101,12 @@ status report were gated from the start:
   the contract's gate order: `400 malformed_handshake_report` for a missing or
   zero `observed_at`, a missing or `null` `peers`, more than 4096 entries, a
   `peer_node_id` that is missing, not a UUID or all zeros, an age that is missing
-  or outside 0..2147483647, or a repeated `peer_node_id`; then
+  or outside 0..2147483647, an `rtt_microseconds` outside 1..2147483647, or a
+  repeated `peer_node_id`; then
   `400 handshake_clock_skew` for an `observed_at` more than 60s from the mock's
   clock; then `400 handshake_endpoint_unparseable` for an `endpoint` that is
-  missing, has port 0, an unspecified address or a zone. A report naming no
+  missing, has port 0, an unspecified address or a zone. `rtt_microseconds` is
+  optional: an entry without it or with `null` passes. A report naming no
   fixture peer is still accepted: its entries count as `ignored`, as upstream.
   See [the route](#post-v1-nodes-id-handshakes) for the full order.
 - **`GET /v1/nodes/{id}/peers/{peer_node_id}/psk`** answers
@@ -525,8 +527,8 @@ zero one. `handshake_report_count` increments only when every check passes.
 **Validation order.** The handler returns at the first failure:
 
 1. **Body size** → `413` `handshake_report_too_large` if the body exceeds 1 MiB.
-2. **Body decode** → `400` `malformed_handshake_report` if the body is not valid JSON or carries an unknown field.
-3. **Report shape** → `400` `malformed_handshake_report` if `observed_at` is missing or zero, `peers` is missing or `null`, `peers` holds more than 4096 entries, a `peer_node_id` is missing, does not match the UUID pattern or is all zeros, an age is missing, below 0 or above 2147483647, or a `peer_node_id` repeats.
+2. **Body decode** → `400` `malformed_handshake_report` if the body is not valid JSON or carries an unknown field, or a member holds a value of another type, such as an `rtt_microseconds` of `"12"`. The `detail` starts with `request body is not a valid HandshakeReportRequest:` and names the decoder's error.
+3. **Report shape** → `400` `malformed_handshake_report` if `observed_at` is missing or zero, `peers` is missing or `null`, `peers` holds more than 4096 entries, a `peer_node_id` is missing, does not match the UUID pattern or is all zeros, an age is missing, below 0 or above 2147483647, an entry carries an `rtt_microseconds` below 1 or above 2147483647, or a `peer_node_id` repeats. `rtt_microseconds` is optional, so an absent member and `null` pass, as the contract reads both as no measurement. The `detail` of an out-of-range value names the entry: `peers[<i>].rtt_microseconds is outside 1..2147483647.`
 4. **Clock skew** → `400` `handshake_clock_skew` if `observed_at` is more than 60s from the mock's clock.
 5. **Endpoints** → `400` `handshake_endpoint_unparseable` if an `endpoint` is missing, fails `netip.ParseAddrPort`, has port 0, an unspecified address or a zone. The `detail` names the entry: `peers[<i>].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone.`
 
@@ -539,7 +541,8 @@ zero one. `handshake_report_count` increments only when every check passes.
     {
       "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
       "last_handshake_age_seconds": 42,
-      "endpoint": "198.51.100.7:51820"
+      "endpoint": "198.51.100.7:51820",
+      "rtt_microseconds": 23400
     }
   ]
 }
@@ -557,8 +560,12 @@ zero one. `handshake_report_count` increments only when every check passes.
 
 `recorded` counts the entries naming a fixture peer (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1`
 or `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`), `ignored` every other entry. A report
-with `"peers": []` is answered `recorded: 0, ignored: 0`, which is what the
-Docker e2e run expects: the fixture peers never complete a handshake.
+with `"peers": []` is answered `recorded: 0, ignored: 0`, which is what phase
+`4b` of the Docker e2e run expects: the fixture peers never complete a handshake
+there. Phase `12e` reads reports that list fixture peer
+`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`, for which the meshpeer container stands
+in, first without `rtt_microseconds` and then with it; see the
+[Docker e2e run](docker-e2e-test.md#phase-8-cont-network-policy-over-a-wireguard-peer).
 
 **Content-Type:** `application/json` (errors use `application/problem+json`).
 
