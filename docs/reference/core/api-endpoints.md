@@ -517,8 +517,9 @@ waits `nat.refresh_interval` before the next one.
 ### POST /v1/nodes/{node_id}/handshakes
 
 Reports, for every mesh peer the node has completed a WireGuard handshake with,
-the age of the latest handshake, the endpoint WireGuard used for it and, when
-the node measured one, the round-trip time to the peer through the tunnel. The
+the age of the latest handshake, the endpoint WireGuard used for it, when the
+node measured one, the round-trip time to the peer through the tunnel and, for
+a bridge, the shared site subnets the node routes through it. The
 control plane keeps the latest observation per directed edge and derives each
 mesh edge's `status`, `mode`, `handshake_age_seconds` and `endpoint` from it.
 When at least two live nodes report a direct handshake with the same peer at the
@@ -540,7 +541,8 @@ samples on the [metrics batch](#observability).
       "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2",
       "last_handshake_age_seconds": 42,
       "endpoint": "198.51.100.7:51820",
-      "rtt_microseconds": 23400
+      "rtt_microseconds": 23400,
+      "shared_subnets": ["10.20.0.0/16"]
     },
     {
       "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
@@ -578,13 +580,26 @@ samples on the [metrics batch](#observability).
   [round-trip probe](../networking/wireguard.md#round-trip-probe) holds a value
   for the peer, and leaves it off otherwise. The second entry above carries
   none.
+- `shared_subnets`: optional, the subnets of the pull's
+  [`shared_subnets`](#get-v1-nodes-node-id-state) the node routes through the
+  peer when it assembles the report, at most 256 network prefixes in CIDR
+  notation, none with host bits set and none repeated. An absent member,
+  `null` and `[]` all mean none and clear what the control plane stored for
+  that edge. The control plane stores the list sorted, does not compare it
+  with its plan, shows it as the mesh edge's `shared_subnets`, and counts per
+  bridge the nodes of the Project that do not read `unreachable` and whose
+  stored report lists the subnet. plexd
+  sends the member on the entry of the bridge that holds a shared subnet, and
+  leaves it off every other entry (see
+  [Shared subnets](../networking/wireguard.md#shared-subnets)). The second
+  entry above carries none.
 
 Every `400` refuses the whole report, so one bad entry would cost every edge in
 it. plexd therefore applies these rules before it sends: it leaves out an entry
 whose node ID is not a non-zero UUID or whose endpoint cannot be sent, unmaps an
-IPv4-mapped IPv6 address, strips an IPv6 zone, keeps one entry per peer, and
-raises a round-trip time below a microsecond to 1 and caps one above the range
-at 2147483647. See
+IPv4-mapped IPv6 address, strips an IPv6 zone, keeps one entry per peer, raises
+a round-trip time below a microsecond to 1 and caps one above the range at
+2147483647, and cuts a `shared_subnets` list after its 256th entry. See
 [Handshake Reporter](heartbeat-service.md#handshake-reporter) for the full build
 rules.
 
@@ -624,12 +639,21 @@ firewall drops UDP port 7911 are reported without the member. The control plane
 takes either end's value for a node and a relay bridge, so one answering side is
 enough for the ranking. See [Upgrade order](heartbeat-service.md#upgrade-order).
 
+No plexd release through v0.38.0 sends `shared_subnets` either. A control plane
+that predates the member refuses a report that carries it with
+`400 malformed_handshake_report`, as an unknown member, and records nothing of
+it. plexd has no fallback here either, and needs none: it sends the member only
+for a subnet a pull named in `shared_subnets`, which such a control plane never
+does. During a rolling deploy of a control plane that gains the member, a
+report can reach a replica that refuses it; plexd logs the failed send for that
+tick, and the next tick builds a fresh report.
+
 **Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
 
 | Status | Problem `code` | Meaning | plexd behavior |
 |---|---|---|---|
 | `200 OK` | — | Report accepted; body is a `HandshakeReportResponse` | Logged at Debug; after a not-served phase, one Info line that the control plane accepts reports |
-| `400 Bad Request` | `malformed_handshake_report` | Body is not valid JSON or carries an unknown field, which `rtt_microseconds` is to a control plane older than plexsphere/plexsphere#1145; `observed_at` or `peers` is missing; `peers` is `null` or holds more than 4096 entries; an entry misses `peer_node_id` or `last_handshake_age_seconds`, carries a zero `peer_node_id`, an age outside 0..2147483647, an `rtt_microseconds` outside 1..2147483647, or a `peer_node_id` another entry already named | Logged at Warn; the next tick sends a fresh report. A control plane that refuses `rtt_microseconds` as unknown refuses every report that carries it, and plexd, which has no fallback, logs `agent: handshake report: send failed` at Warn on every tick whose report carries the member, with an `error` that starts with `api: HTTP 400 (malformed_handshake_report):` |
+| `400 Bad Request` | `malformed_handshake_report` | Body is not valid JSON or carries an unknown field, which `rtt_microseconds` is to a control plane older than plexsphere/plexsphere#1145 and `shared_subnets` to one that predates that member; `observed_at` or `peers` is missing; `peers` is `null` or holds more than 4096 entries; an entry misses `peer_node_id` or `last_handshake_age_seconds`, carries a zero `peer_node_id`, an age outside 0..2147483647, an `rtt_microseconds` outside 1..2147483647, or a `peer_node_id` another entry already named; a `shared_subnets` entry is not a network prefix without host bits, repeats an earlier entry of the list, or is the 257th, with a `detail` that names the entry by index, such as `peers[3].shared_subnets[1] is not a network prefix` | Logged at Warn; the next tick sends a fresh report. A control plane that refuses `rtt_microseconds` as unknown refuses every report that carries it, and plexd, which has no fallback, logs `agent: handshake report: send failed` at Warn on every tick whose report carries the member, with an `error` that starts with `api: HTTP 400 (malformed_handshake_report):` |
 | `400 Bad Request` | `handshake_clock_skew` | `observed_at` more than 60s from server time | Logged at Error, asking the operator to synchronize the system clock via NTP; the next tick sends a fresh report |
 | `400 Bad Request` | `handshake_endpoint_unparseable` | An `endpoint` is not a `host:port` pair, its port is 0, its address is unspecified, or it carries an IPv6 zone; the `detail` names the entry index | Logged at Warn; the next tick sends a fresh report |
 | `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn; the next tick sends a fresh report |
@@ -1096,8 +1120,11 @@ a create or an update of a tunnel on its bridge Resource with
 opt-out, keeps delivering them in the
 [`bridge.site_to_site`](#get-v1-nodes-node-id-state) block with
 `enabled: true`, and allows a delete. A bridge that never reported reads
-`not_reported` and accepts tunnels. A report moves no other node's pull: the
-`routed_subnets` of the bridge's peer entry follow the stored tunnels whatever
+`not_reported` and accepts tunnels. A report moves another node's pull only
+through the control plane's plan of the shared site subnets: its next pass can
+move the carrier of a shared subnet whose tunnel the report shows lost, and
+with it the `routed_subnets` and `shared_subnets` the other nodes of the
+Project pull. A subnet of one bridge alone follows the stored tunnels whatever
 the bridge reports. The control plane's side is
 [plexsphere/plexsphere#1109](https://github.com/plexsphere/plexsphere/pull/1109).
 See [Site-to-Site VPN](../bridge/site-to-site-vpn.md) for how plexd derives the
@@ -1598,7 +1625,16 @@ absence.
   },
   "failure_detection": {
     "detect_after_seconds": 15
-  }
+  },
+  "shared_subnets": [
+    {
+      "subnet": "10.50.0.0/16",
+      "bridges": [
+        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+      ]
+    }
+  ]
 }
 ```
 
@@ -1643,14 +1679,20 @@ its order included, is enough for the differ to update the peer, so a pull that
 only changes a standby reaches the WireGuard handler.
 
 A peer's `routed_subnets` lists, as CIDRs, the networks behind the site-to-site
-tunnels of the peer's bridge Resource: the union of their `allowed_subnets`,
-each prefix once, sorted by address and then by prefix length. Only the nodes
-whose Resource belongs to the bridge Resource's Project receive it. The member
-is absent when the list would be empty, follows the stored tunnels whatever the
-bridge reports about them, and is never carried by the registration response,
-so a node programs it from its first pull. plexd adds the entries it accepts to
-the peer's allowed IPs, after the mesh address, and routes them through the
-mesh interface; it removes both when a pull no longer lists them. It skips an
+tunnels of the peer's bridge Resource that the node routes through the peer,
+each prefix once, sorted by address and then by prefix length: a subnet that
+only that bridge's tunnels list in the Project, a shared site subnet on the
+entry of its carrier alone, and no subnet of the node's own tunnels. Only the
+nodes whose Resource belongs to the bridge Resource's Project receive it. The
+member is absent when the list would be empty and is never carried by the
+registration response, so a node programs it from its first pull. A subnet of
+one bridge alone follows the stored tunnels whatever the bridge reports about
+them, and a shared subnet follows the control plane's plan. plexd adds the
+entries it accepts to the peer's allowed IPs, after the mesh address, and
+routes them through the mesh interface; it removes both when a pull no longer
+lists them. plexd takes a subnet that `shared_subnets` names from that block
+and not from this list (see `shared_subnets` below), so it puts a shared subnet
+on the allowed IPs of the bridge that holds it, whichever peer lists it here. It skips an
 entry that is no IPv4 prefix or has host bits set, one that overlaps the Domain
 mesh prefix, one inside a network of one of the host's interfaces and one that
 repeats an earlier entry, each with a Warn. A route admits no traffic by
@@ -2076,8 +2118,11 @@ compares it. See [Mesh DNS](../networking/mesh-dns.md).
 (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
 describes it. `detect_after_seconds` is a whole number of seconds from 5 to
 180, and 15 for a Domain that never set it. It is how long a relayed peer may
-stay silent before plexd dials the next relay of the peer's set. A peer on a
-direct path is never watched. A plexd whose WireGuard interface came up reads
+stay silent before plexd dials the next relay of the peer's set, and how long
+the path to the bridge that holds a shared subnet may stay dead before plexd
+moves the subnet to the next live bridge of its entry (see `shared_subnets`
+below). plexd never switches the endpoint of a peer on a direct path. A plexd
+whose WireGuard interface came up reads
 the block on every successful pull, drift or not. No event carries a change,
 so a new value reaches the node with its next pull, within one reconcile
 interval (60 s by default), or sooner on a triggered pull. plexd does not
@@ -2090,7 +2135,8 @@ plexd decodes the block leniently, so a malformed block never fails the pull
 that carries the peers and the policy. `null`, or a key missing because the
 control plane predates the block, means the control plane did not say: plexd
 keeps the value of the last pull that carried one, and a node that never
-received one keeps the built-in timing, one trial of silence and a 15 s probe.
+received one keeps the built-in timing, one trial of silence and a 15 s probe,
+and moves no shared subnet on its own.
 A block plexd cannot decode, such as a string or a `detect_after_seconds` of
 `15.5` or `"15"`, changes nothing and is logged at Warn as
 `wireguard: failure detection block malformed`, once until a block decodes
@@ -2101,6 +2147,58 @@ with `detect_after_seconds`, and with `applied` when it applied a bound, once
 until a block carries another value. A value that changes the time in force is
 logged at Info as `wireguard: failure detection time set` with `detect_after`,
 `previous` and `pass`.
+
+`shared_subnets` carries the bridges each shared site subnet of the node's
+Project may be routed through, as the "Shared site subnets" section of
+plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in
+plexsphere/plexsphere) describes it. A shared site subnet is a subnet that
+tunnels on two or more bridge Resources of the Project list. Each entry carries
+`subnet`, in CIDR notation, and `bridges`, at most 8 node IDs, each the
+`node_id` of a peer of the same pull: the carrier first, then the standbys in
+the order the control plane ranks them. The block is required and never
+`null`, `[]` when there is none, and its entries are sorted by address and then
+by prefix length. The subnet also appears in the `routed_subnets` of the
+carrier's peer entry. A subnet of the node's own tunnels gets no entry, and
+neither does one whose plan holds no standby or that the plan has not ranked
+yet. A node of another Project of the Domain receives `[]`. No event announces
+a carrier move: the node takes the new order from its next pull.
+
+plexd takes each shared subnet from the block, not from `routed_subnets`. An
+absent key and `null` mean none, as `[]` does, and a value of another JSON type
+fails the pull's decode, as a malformed `peers` does. plexd keeps the subnet on
+the allowed IPs of exactly one bridge peer at a time, its holder, and starts on
+the first entry of `bridges`. A pull that still lists the holder keeps the
+subnet there, whichever entry is first, so a bridge that comes back stays a
+standby. A pull that no longer lists the holder, or no longer names the subnet,
+moves the subnet at once, to the first bridge or to the peer whose
+`routed_subnets` lists it. On a node that holds a failure-detection time,
+endpoint selection watches every bridge of every entry on each pass, and moves
+the subnet to the next bridge whose path is alive, the first again after the
+last, once the path to the holder has been dead for that time, without a pull.
+With no live bridge the subnet stays. A bridge whose plexd answers the
+round-trip probe is judged against the time less one pass, 14 s at the default
+15 s, and any other bridge against at least 15 s: a bridge on a plexd through
+v0.38.0, a plain WireGuard peer and a bridge behind a host firewall that drops
+UDP port 7911 answer no round-trip probe. A node that holds no failure-detection
+time, runs with `persistent_keepalive: 0s`, or whose controller cannot read
+peer stats moves no subnet on its own and follows the pulls.
+
+plexd skips an entry whose subnet is no IPv4 prefix or has host bits set,
+overlaps the Domain mesh prefix, lies inside a network of one of the host's
+interfaces or repeats an earlier entry, and an entry that names no bridge that
+is a peer of the pull, each with a Warn. It drops a bridge that names no peer
+of the pull or repeats an earlier one, and keeps at most 8. The differ compares
+the block in order, the `bridges` of each entry included, so a pull that
+changes only the order reaches the WireGuard handler. The holder lives in
+memory only: a restarted plexd starts every shared subnet on the first bridge
+again. The return path is the site's duty: the remote site answers a flow
+through the tunnel it arrived on, or routes the Domain mesh CIDR into the
+carrier's tunnel. plexd names the subnets it routes through each bridge in the
+`shared_subnets` member of its
+[handshake report](#post-v1-nodes-node-id-handshakes). No plexd release through
+v0.38.0 reads the block or sends the member; such a release routes a shared
+subnet through its carrier and follows a carrier move with its next pull. See
+[Shared subnets](../networking/wireguard.md#shared-subnets).
 
 ## Secrets
 

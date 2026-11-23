@@ -101,12 +101,14 @@ status report were gated from the start:
   the contract's gate order: `400 malformed_handshake_report` for a missing or
   zero `observed_at`, a missing or `null` `peers`, more than 4096 entries, a
   `peer_node_id` that is missing, not a UUID or all zeros, an age that is missing
-  or outside 0..2147483647, an `rtt_microseconds` outside 1..2147483647, or a
-  repeated `peer_node_id`; then
+  or outside 0..2147483647, an `rtt_microseconds` outside 1..2147483647, a
+  `shared_subnets` list of more than 256 entries or with an entry that is no
+  network prefix or repeats an earlier one, or a repeated `peer_node_id`; then
   `400 handshake_clock_skew` for an `observed_at` more than 60s from the mock's
   clock; then `400 handshake_endpoint_unparseable` for an `endpoint` that is
-  missing, has port 0, an unspecified address or a zone. `rtt_microseconds` is
-  optional: an entry without it or with `null` passes. A report naming no
+  missing, has port 0, an unspecified address or a zone. `rtt_microseconds` and
+  `shared_subnets` are optional: an entry without them or with `null` passes,
+  and so does `"shared_subnets": []`. A report naming no
   fixture peer is still accepted: its entries count as `ignored`, as upstream.
   See [the route](#post-v1-nodes-id-handshakes) for the full order.
 - **`GET /v1/nodes/{id}/peers/{peer_node_id}/psk`** answers
@@ -528,7 +530,7 @@ zero one. `handshake_report_count` increments only when every check passes.
 
 1. **Body size** → `413` `handshake_report_too_large` if the body exceeds 1 MiB.
 2. **Body decode** → `400` `malformed_handshake_report` if the body is not valid JSON or carries an unknown field, or a member holds a value of another type, such as an `rtt_microseconds` of `"12"`. The `detail` starts with `request body is not a valid HandshakeReportRequest:` and names the decoder's error.
-3. **Report shape** → `400` `malformed_handshake_report` if `observed_at` is missing or zero, `peers` is missing or `null`, `peers` holds more than 4096 entries, a `peer_node_id` is missing, does not match the UUID pattern or is all zeros, an age is missing, below 0 or above 2147483647, an entry carries an `rtt_microseconds` below 1 or above 2147483647, or a `peer_node_id` repeats. `rtt_microseconds` is optional, so an absent member and `null` pass, as the contract reads both as no measurement. The `detail` of an out-of-range value names the entry: `peers[<i>].rtt_microseconds is outside 1..2147483647.`
+3. **Report shape** → `400` `malformed_handshake_report` if `observed_at` is missing or zero, `peers` is missing or `null`, `peers` holds more than 4096 entries, a `peer_node_id` is missing, does not match the UUID pattern or is all zeros, an age is missing, below 0 or above 2147483647, an entry carries an `rtt_microseconds` below 1 or above 2147483647, an entry's `shared_subnets` breaks a rule below, or a `peer_node_id` repeats. `rtt_microseconds` is optional, so an absent member and `null` pass, as the contract reads both as no measurement. The `detail` of an out-of-range value names the entry: `peers[<i>].rtt_microseconds is outside 1..2147483647.` `shared_subnets` is optional too: an absent member, `null` and `[]` pass, as the contract reads all three as none. A list is refused when it holds more than 256 entries (`peers[<i>].shared_subnets carries <n> entries, at most 256 are accepted.`), when an entry does not parse with `netip.ParsePrefix` or has host bits set (`peers[<i>].shared_subnets[<j>] is not a network prefix.`), and when an entry equals an earlier one of the same list (`peers[<i>].shared_subnets[<j>] repeats an earlier entry.`). The `detail` names the entry by its index and never repeats its value. The ceiling is the mock's own copy of the contract's 256, as the peer ceiling is. The mock compares no reported list with its state fixture, as the control plane compares none with its plan, so a subnet the fixture never named passes.
 4. **Clock skew** → `400` `handshake_clock_skew` if `observed_at` is more than 60s from the mock's clock.
 5. **Endpoints** → `400` `handshake_endpoint_unparseable` if an `endpoint` is missing, fails `netip.ParseAddrPort`, has port 0, an unspecified address or a zone. The `detail` names the entry: `peers[<i>].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone.`
 
@@ -542,7 +544,8 @@ zero one. `handshake_report_count` increments only when every check passes.
       "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
       "last_handshake_age_seconds": 42,
       "endpoint": "198.51.100.7:51820",
-      "rtt_microseconds": 23400
+      "rtt_microseconds": 23400,
+      "shared_subnets": ["10.50.0.0/16"]
     }
   ]
 }
@@ -564,7 +567,8 @@ with `"peers": []` is answered `recorded: 0, ignored: 0`, which is what phase
 `4b` of the Docker e2e run expects: the fixture peers never complete a handshake
 there. Phase `12e` reads reports that list fixture peer
 `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`, for which the meshpeer container stands
-in, first without `rtt_microseconds` and then with it; see the
+in, first without `rtt_microseconds` and then with it, and in its step `(h1)`
+with `shared_subnets` and again without; see the
 [Docker e2e run](docker-e2e-test.md#phase-8-cont-network-policy-over-a-wireguard-peer).
 
 **Content-Type:** `application/json` (errors use `application/problem+json`).
@@ -936,7 +940,7 @@ Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
 default it is an enriched envelope containing two peers, a merged policy with three
 rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions`,
-`sessions`, and `secrets` blocks.
+`sessions`, `secrets` and `shared_subnets` blocks.
 It also carries a `dns` block that names the node and both peers, holds eight records, and carries a `forwarding` member with two empty lists.
 Its `failure_detection` block carries the Domain's default failure-detection time, 15 s.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
@@ -964,6 +968,7 @@ therefore hands the node the new key.
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
 | `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa`; `forwarding` with `forward_zones` `[]` and `catch_all` `[]` |
 | `failure_detection` | `{"detect_after_seconds": 15}`, what the control plane serves for a Domain that never set the value, so every suite runs the timing production runs: the node probes its relayed peers on every pass, 1 s apart, and dials the next relay of a silent peer's set 14 to 15 s after its last packet. See [Failure detection time](../networking/wireguard.md#failure-detection-time) |
+| `shared_subnets` | `[]`: the fixture has no shared subnet. `GET /v1/nodes/{id}/state` serves a nil list as `[]`, never `null`, as the contract never sends `null` for the block. The Docker suite's phase `12e` splices an entry in its step `(h1)`. See [Shared subnets](../networking/wireguard.md#shared-subnets) |
 
 The `dns` block names the node at the mesh IP `POST /v1/register` assigns it and
 each peer at the mesh IP of its `peers` entry, so every name a suite resolves

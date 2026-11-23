@@ -73,7 +73,7 @@ SSE `peer_*` events.
 | `Fallbacks`  | `[]string` | `"fallbacks,omitempty"` | The peer's relays as they end `Endpoints`, in dial order: the relay of its assigned bridge first, then its standby relays. Nil when the peer has no relay. Endpoint selection holds each relay as long as the entries before the first relay took together, and only a peer that connected over a relay dials the standbys (see [The trial](../networking/wireguard.md#the-trial)) |
 | `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32` followed by `RoutedSubnets`, derived locally |
 | `PSK`        | `string`   | `"psk"`        | Edge PSK fetched for the peer's current public key, standard base64; empty when plexd holds none |
-| `RoutedSubnets` | `[]string` | `"routed_subnets,omitempty"` | The entries of the peer's `routed_subnets` this node accepted, in the list's order and in canonical form; nil when it accepted none. The WireGuard manager routes each through the mesh interface (see [Routed subnets](../networking/wireguard.md#routed-subnets)) |
+| `RoutedSubnets` | `[]string` | `"routed_subnets,omitempty"` | The entries of the peer's `routed_subnets` this node accepted that are no shared subnet, in the list's order and in canonical form, followed by the shared subnets whose holder the peer is, sorted by address and then by prefix length; nil when the list is empty. The WireGuard manager routes each through the mesh interface (see [Routed subnets](../networking/wireguard.md#routed-subnets) and [Shared subnets](../networking/wireguard.md#shared-subnets)) |
 
 ## Heartbeat
 
@@ -112,7 +112,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the thirteen fields
+distinguishes a nil pointer from a populated block. None of the fourteen fields
 carry `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -130,6 +130,7 @@ carry `omitempty`.
 | `Hooks`        | `*[]NodeStateHook`     | `"hooks"`        | The published hook versions a rollout assigns the node, ordered by name ascending: the node's full desired set. A pointer, like `Secrets`: `[]` removes every rolled-out hook, and a `nil` value (the wire's `null`, which the control plane sends when it could not compute the set, or a pull from a control plane that predates the block and omits it) keeps every one |
 | `DNS`          | `*NodeStateDNS`        | `"dns"`          | The mesh DNS names of the node's Domain and the node's DNS forwarding setting: the full set, never a delta, which replaces the names the node answers. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the names and the forwarding the node holds |
 | `FailureDetection` | `json.RawMessage` | `"failure_detection"` | The Domain's failure-detection time, a `NodeStateFailureDetection`, carried raw like `Reachability` and decoded leniently by the WireGuard manager's dispatch handler, so a malformed block never fails the pull. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the value the node holds |
+| `SharedSubnets` | `[]NodeStateSharedSubnet` | `"shared_subnets"` | Per shared site subnet of the node's Project, the bridges it may be routed through, the carrier first; the control plane sends `[]` when there is none, never `null`. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) and `[]` both mean no shared subnet. Typed, as `Peers` is, so a value of another JSON type fails the pull's decode; the WireGuard manager validates the entries (see `NodeStateSharedSubnet` below) |
 
 Eight members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
@@ -155,13 +156,18 @@ from it, and the edge PSK store reads it on the dispatch seam.
 drift in the cycle log, and the policy dispatch handler applies the block on
 every successful pull (see
 [DispatchHandler](../networking/network-policy.md#dispatchhandler)).
+`shared_subnets` goes to the differ alone: it reports a changed list as
+`shared_subnets` drift, and the WireGuard reconcile handler takes the block
+from the desired snapshot (see `NodeStateSharedSubnet` below).
 
 **SnapshotPeer**
 
 Carries the peer's direct `endpoint`, its `endpoint_candidates` and its
 `routed_subnets` but **no** `psk` or `allowed_ips`. plexd derives `AllowedIPs`
 locally as `mesh_ip/32` followed by the entries of `routed_subnets` it accepts
-(see [Routed subnets](../networking/wireguard.md#routed-subnets)). plexd
+that are no shared subnet, and then by the shared subnets it routes through the
+peer (see [Routed subnets](../networking/wireguard.md#routed-subnets) and
+[Shared subnets](../networking/wireguard.md#shared-subnets)). plexd
 builds the peer's dial order from the candidates on a subnet this node is also
 on, then `endpoint` when it is usable, then the remaining candidates, then the
 peer's relays (`fallback_endpoints`, or `fallback_endpoint` alone when that list
@@ -192,7 +198,7 @@ empty relay entry and a repeated one, and it does not cap the list. When
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | The first entry of `FallbackEndpoints`, and the only relay a control plane that predates the set sends. The dial order uses it only when `FallbackEndpoints` is empty. Absent while the peer has no relay |
 | `FallbackEndpoints` | `[]string` | `"fallback_endpoints,omitempty"` | The peer's relays as `host:port` (an IPv6 host in brackets) in dial order, at most 4 by the contract: the relay of the peer's assigned bridge first, then its standby relays. Both nodes of a pair receive the same list for each other, and it never names this node. Absent while the peer has no relay; `null` reads as absent |
 | `EndpointCandidates` | `[]string` | `"endpoint_candidates,omitempty"` | The peer's endpoint candidates as `host:port` strings, at most 8: first its peer-observed endpoints, the addresses at which at least two live nodes of the Domain report a direct handshake with it, then its last accepted, unexpired local candidates (`PUT /v1/nodes/{node_id}/endpoint-candidates`) in the order it sent them (see [State](api-endpoints.md#get-v1-nodes-node-id-state)); absent when the peer has none and on every control plane that does not deliver them |
-| `RoutedSubnets` | `[]string` | `"routed_subnets,omitempty"` | The IPv4 networks the control plane routes through the peer as CIDRs: the networks behind the site-to-site tunnels of a peer that is a bridge, each once, sorted. Delivered only to the nodes of the bridge Resource's Project, absent for a peer that routes no network, and never carried by the registration response. plexd adds the entries it accepts to the peer's allowed IPs and routes them through the mesh interface, and skips one that is malformed, overlaps the mesh prefix, lies inside a network of this host's interfaces or repeats an earlier one. The differ compares the list in order; absent and `[]` compare equal |
+| `RoutedSubnets` | `[]string` | `"routed_subnets,omitempty"` | The IPv4 networks the control plane routes through the peer as CIDRs: the networks behind the site-to-site tunnels of a peer that is a bridge, each once, sorted, a shared site subnet on the entry of its carrier alone. Delivered only to the nodes of the bridge Resource's Project, absent for a peer that routes no network, and never carried by the registration response. plexd adds the entries it accepts to the peer's allowed IPs and routes them through the mesh interface, and skips one that is malformed, overlaps the mesh prefix, lies inside a network of this host's interfaces or repeats an earlier one. An entry that `SharedSubnets` names is taken from that block instead. The differ compares the list in order; absent and `[]` compare equal |
 
 **ReachabilitySnapshot**
 
@@ -706,6 +712,33 @@ another value. See
 | Field                | Type    | JSON Tag                 | Description                                         |
 |----------------------|---------|--------------------------|-----------------------------------------------------|
 | `DetectAfterSeconds` | `int64` | `"detect_after_seconds"` | How long a relayed peer may stay silent before plexd dials the next relay of its set: a whole number of seconds from 5 to 180, and 15 for a Domain that never set it. `int64` rather than `int`, so a value out of range decodes on a 32-bit build too and is clamped rather than refused as malformed. A block without the member, `{}`, reads as 0 and changes nothing |
+
+**NodeStateSharedSubnet**
+
+One entry of the `shared_subnets` block: a shared site subnet, a subnet that
+tunnels on two or more bridge Resources of the node's Project list, with the
+bridges the node may route it through, as the "Shared site subnets" section of
+plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in
+plexsphere/plexsphere) describes it. The control plane sorts the entries by
+address and then by prefix length, and lists the subnet in the
+`routed_subnets` of the carrier's peer entry as well. plexd takes the subnet
+from this block and not from `routed_subnets`. The differ compares the entries
+in order and each entry's `Bridges` in order, because the order is the failover
+order; a `nil` and an empty list compare equal. The WireGuard reconcile handler
+hands the entries to the manager, which skips an entry with a Warn when its
+subnet fails a rule of the routed subnets (`invalid`, `overlaps_mesh`,
+`inside_local_network`, `duplicate`) or when no bridge names a peer of the pull
+(`no_bridge`). See
+[Shared subnets](../networking/wireguard.md#shared-subnets).
+
+| Field     | Type       | JSON Tag    | Description                                         |
+|-----------|------------|-------------|-----------------------------------------------------|
+| `Subnet`  | `string`   | `"subnet"`  | The subnet in CIDR notation. plexd accepts an IPv4 prefix without host bits alone, and skips any other as `invalid` |
+| `Bridges` | `[]string` | `"bridges"` | At most `MaxSharedSubnetBridges` node IDs, each the `node_id` of a peer of the same pull: the carrier first, then the standbys in the order the node fails over through. plexd drops a node ID that names no peer of the pull or repeats an earlier one, and keeps the first 8 of the rest. It starts on the first and moves to the next live one once the path to its bridge has been dead for the failure-detection time |
+
+| Constant                 | Value | Description                                          |
+|--------------------------|-------|------------------------------------------------------|
+| `MaxSharedSubnetBridges` | `8`   | The contract's ceiling on the bridges of one entry: a carrier and up to seven standbys |
 
 ### Supporting types
 
@@ -1321,8 +1354,9 @@ return an error matching `ErrHandshakeReportTooMany` without sending a request.
 | `LastHandshakeAgeSeconds` | `int32`  | `"last_handshake_age_seconds"` | Seconds since the latest completed handshake, 0 to 2147483647 |
 | `Endpoint`                | `string` | `"endpoint"`                   | Endpoint WireGuard uses for the peer, `host:port` with an IPv6 host in brackets; a non-zero port, a specified address and no zone |
 | `RTTMicroseconds`         | `*int32` | `"rtt_microseconds,omitempty"` | Round-trip time to the peer through the tunnel in whole microseconds, 1 to 2147483647; nil when the node holds no measurement, which leaves the member off the wire. A control plane older than plexsphere/plexsphere#1145 refuses a report that carries it with `400 malformed_handshake_report` |
+| `SharedSubnets`           | `[]string` | `"shared_subnets,omitempty"` | The subnets of the pull's `shared_subnets` the node routes through the peer when it assembles the report, as CIDRs without host bits, none repeated, at most `MaxHandshakeSharedSubnets` (256). An absent member, `null` and `[]` all mean none, and the control plane then clears what it stored for the edge. A control plane that predates the member refuses a report that carries it with `400 malformed_handshake_report`; plexd sends it only for a subnet a pull named, which such a control plane never does |
 
-The three required fields are not `omitempty`: an age of 0, a handshake within the last second, has to reach the wire rather than be dropped as a zero value and refused as missing. `RTTMicroseconds` is a pointer with `omitempty`, so only a missing measurement leaves it off.
+The three required fields are not `omitempty`: an age of 0, a handshake within the last second, has to reach the wire rather than be dropped as a zero value and refused as missing. `RTTMicroseconds` is a pointer with `omitempty`, so only a missing measurement leaves it off. `SharedSubnets` is `omitempty` too, so an entry of a peer that holds no shared subnet sends no member.
 
 **HandshakeReportResponse** (`200 OK`)
 
@@ -1337,6 +1371,7 @@ The three required fields are not `omitempty`: an age of 0, a handshake within t
 | Constant                  | Value  | Description                                          |
 |---------------------------|--------|------------------------------------------------------|
 | `MaxHandshakeReportPeers` | `4096` | Most entries one report may carry (the contract's `maxItems`) |
+| `MaxHandshakeSharedSubnets` | `256` | Most `shared_subnets` one entry may carry; the control plane refuses a longer list whole with `400 malformed_handshake_report` |
 
 ## Relay Status
 
