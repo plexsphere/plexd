@@ -419,7 +419,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
-- Creates an empty `PeerIndex` and an empty [dial state](#programmed-peers) map
+- Creates an empty `PeerIndex`, an empty [dial state](#programmed-peers) map and an empty map of [shared subnets](#shared-subnets)
 - Sets a local-prefix function that returns no prefixes, until `SetLocalPrefixes` replaces it
 
 ### Methods
@@ -441,18 +441,18 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first and to skip a routed subnet inside a local network. Endpoint selection reads it too, at most once per 30 s, to start a [direct retry](#direct-retry) when a local network makes a relayed peer's direct entry on-link. Call it before the handler and `RunEndpointSelection` run. See [Dial order](#dial-order) |
 | `SetPeerRouter` | `(r PeerRouter)`                                                             | Sets the router the reconcile handler programs the routes of the peers' routed subnets with. Call it before the handler runs. Without one the manager programs the routed subnets as allowed IPs and adds no route. See [Routed subnets](#routed-subnets) |
 | `SetRelayProbe` | `(send func(meshIP netip.Addr) error)`                                       | Sets the function endpoint selection sends the relay liveness probe with; `plexd up` passes `SendRelayProbe`. Call it before `RunEndpointSelection`. Without it no probe goes out. See [Relay liveness probe](#relay-liveness-probe) |
-| `SetFailureDetection` | `(detectAfter time.Duration) (time.Duration, bool)`                    | Sets the failure-detection time, how long a relayed peer may stay silent before endpoint selection dials the next relay of its set. Ignores a value of zero or less, clamps any other to `MinFailureDetection` (5 s) and `MaxFailureDetection` (180 s), and returns the value in force and whether it changed. See [Failure detection time](#failure-detection-time) |
+| `SetFailureDetection` | `(detectAfter time.Duration) (time.Duration, bool)`                    | Sets the failure-detection time, how long a relayed peer may stay silent before endpoint selection dials the next relay of its set, and how long the path to the bridge that holds a [shared subnet](#shared-subnets) may stay dead before endpoint selection moves the subnet to the next bridge. Ignores a value of zero or less, clamps any other to `MinFailureDetection` (5 s) and `MaxFailureDetection` (180 s), and returns the value in force and whether it changed. See [Failure detection time](#failure-detection-time) |
 | `FailureDetection` | `() (time.Duration, bool)`                                                | The failure-detection time held, and `0, false` while none is. See [Failure detection time](#failure-detection-time) |
-| `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, or per pass of the [failure-detection time](#failure-detection-time) when that is shorter, until `ctx` is done; see [Endpoint selection](#endpoint-selection) |
+| `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, or per pass of the [failure-detection time](#failure-detection-time) when that is shorter, until `ctx` is done. While a failure-detection time is held, each pass also watches the bridges of the [shared subnets](#the-bridge-watch) and moves a subnet off a dead bridge; see [Endpoint selection](#endpoint-selection) |
 | `SetPathMTUProbe` | `(probe func(context.Context) (int, error))`                              | Sets the function `Setup` and `RunMTUProbe` measure the uplink's path MTU with. Call it before `Setup`. See [MTU detection](#mtu-detection) |
 | `RunMTUProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the uplink again once per `interval` and lowers or raises the MTU to fit, until `ctx` is done; see [Probing again](#probing-again) |
-| `RunRTTProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the round-trip time to each connected peer once per `interval` and answers the peers' probes on UDP port 7911 of the mesh address, until `ctx` is done; `MeshPeerStats` reports the values. See [Round-trip probe](#round-trip-probe) |
+| `RunRTTProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the round-trip time to each connected peer once per `interval` and answers the peers' probes on UDP port 7911 of the mesh address, until `ctx` is done; `MeshPeerStats` reports the values, and the [bridge watch](#the-bridge-watch) writes its requests on the same socket. See [Round-trip probe](#round-trip-probe) |
 
 The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order). The package function `SendRelayProbe` (`dial.go`) is the sender `plexd up` passes to `SetRelayProbe`; see [Relay liveness probe](#relay-liveness-probe). The package function `FailureDetectionDispatchHandler` (`handler.go`) is the [dispatch handler](../core/reconciliation.md#dispatchhandler) `plexd up` registers to hand each pull's `failure_detection` block to `SetFailureDetection`; see [Failure detection time](#failure-detection-time).
 
 ### Programmed peers
 
-The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. It also records whether the peer is [relayed](#the-trial), last seen connected over one of its relays, when a re-dial, of a relay or of a direct retry's entry, last replaced its device peer, the `LastHandshake` at the last pass that found it fresh, the session a [move back](#the-trial) was last written for, and the [relay liveness probe](#relay-liveness-probe)'s state: the device's `RxBytes` for the peer at the last pass, when the silence window started (the counter moved, the peer turned connected or came back on a relay, a pass followed a roam to another relay of its set, or a probe send failed), when the outstanding probe went out (zero when none is; under a [failure-detection time](#failure-detection-time), when the last probe was sent), and whether the last probe send failed. For the [direct retry](#direct-retry) it records the direct entries a running retry tries after the one programmed, in order, the relay the retry dials when no entry answers, which is set exactly while a retry runs, and the direct entries that left the peer's dial order or failed a retry, each with the time it was recorded, which the retry remembers for 10 min. While a retry runs, the peer is neither connected nor relayed, and the position is that of the entry tried. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, the [peer routes](#routed-subnets) follow the routed subnets of the stored peers, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths. The manager also holds the [failure-detection time](#failure-detection-time), zero while no pull carried one, and the same mutex guards it.
+The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. It also records whether the peer is [relayed](#the-trial), last seen connected over one of its relays, when a re-dial, of a relay or of a direct retry's entry, last replaced its device peer, the `LastHandshake` at the last pass that found it fresh, the session a [move back](#the-trial) was last written for, and the [relay liveness probe](#relay-liveness-probe)'s state: the device's `RxBytes` for the peer at the last pass, when the silence window started (the counter moved, the peer turned connected or came back on a relay, a pass followed a roam to another relay of its set, or a probe send failed), when the outstanding probe went out (zero when none is; under a [failure-detection time](#failure-detection-time), when the last probe was sent), and whether the last probe send failed. For the [bridge watch](#the-bridge-watch) it records when a pass last saw the path to the peer alive, the device's `RxBytes` for the peer at the last pass, and when the last stimulus went out. For the [direct retry](#direct-retry) it records the direct entries a running retry tries after the one programmed, in order, the relay the retry dials when no entry answers, which is set exactly while a retry runs, and the direct entries that left the peer's dial order or failed a retry, each with the time it was recorded, which the retry remembers for 10 min. While a retry runs, the peer is neither connected nor relayed, and the position is that of the entry tried. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, the [peer routes](#routed-subnets) follow the routed subnets of the stored peers, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths. The manager also holds the [failure-detection time](#failure-detection-time), zero while no pull carried one, and the [shared subnets](#shared-subnets) of the last pull with the holder of each, and the same mutex guards both.
 
 ### Mesh prefix
 
@@ -469,6 +469,7 @@ type MeshPeerStat struct {
     LastHandshake time.Time
     RxBytes, TxBytes uint64
     RTT           time.Duration
+    SharedSubnets []string
 }
 
 var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer stats")
@@ -479,7 +480,8 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 - It keeps peers with no handshake (a zero `LastHandshake`), because the metrics report them.
 - It returns the result sorted by `NodeID`, and an empty, non-nil slice when nothing maps.
 - `Endpoint` passes through unfiltered. The handshake reporter applies the wire rules.
-- `RTT` is the latest round-trip time the [round-trip probe](#round-trip-probe) measured to the peer, read from the probe's table, and zero when the peer holds no value. The handshake reporter sends it as `rtt_microseconds`; the tunnel metrics and endpoint selection ignore it.
+- `RTT` is the latest round-trip time the [round-trip probe](#round-trip-probe) measured to the peer, read from the probe's table, and zero when the peer holds no value. The handshake reporter sends it as `rtt_microseconds`; the tunnel metrics ignore it, and endpoint selection reads it only to tell whether a [watched bridge](#the-bridge-watch) answers the probe.
+- `SharedSubnets` are the [shared subnets](#shared-subnets) whose holder is the peer when the call reads them, sorted by address and then by prefix length, and nil when there are none. Each list is the caller's own. The call copies them under the manager's mutex and releases it before it takes the round-trip probe's mutex, so the two are never held together, and none of its callers holds the manager's mutex. The handshake reporter sends them as `shared_subnets`; the tunnel metrics ignore them.
 
 ### Endpoint selection
 
@@ -539,6 +541,8 @@ The pass walks the peers in node-ID order:
 | Not fresh, not connected, in a direct retry, window over, no entry left | Remembers the entry programmed as failed, ends the retry, marks the peer relayed, logs `wireguard: no direct endpoint answered, dialing the relay again`, and dials the relay the retry ends on, on a fresh device peer, as a relay re-dial does |
 | Not fresh, not connected, not relayed, no direct retry, with an empty order, on the only entry of its walk, or programmed less than the entry's trial ago | Nothing |
 | Not fresh, not connected, not relayed, no direct retry, trial over | Programs the next entry of its walk (after the last one, the first again; from a standby, the first), restarts the timer and logs `wireguard: trying next endpoint candidate` with `trial`, how long it tries the entry it programmed: one trial, or the relay hold for the first relay |
+
+After the last peer, the pass runs the [bridge watch](#the-bridge-watch) of the shared subnets under the same mutex and joins its error into the pass's. The watch does nothing on a node that holds no failure-detection time or no shared subnet.
 
 The relay hold is one trial per entry before the first relay, and one trial when the order starts with its relays. A relay re-dial removes the device peer and adds it again with the relay it dials as its endpoint; see [Relay liveness probe](#relay-liveness-probe) for why. A successful one leaves the peer relayed, not connected, programmed now, at the position of the relay it dialed, and with its probe started over.
 
@@ -620,7 +624,7 @@ const rttMaxUnanswered = 3                  // unanswered probes in a row that d
 func (m *Manager) RunRTTProbe(ctx context.Context, interval time.Duration) error
 ```
 
-Every plexd holds one UDP socket on port 7911, `RTTProbePort`, of its mesh address. The socket sends the node's probes and answers the peers' probes, so a probe and its answer both travel from port 7911 to port 7911. IANA lists 7904 to 7912 as unassigned. The port lies above 1023, so plexd binds it without `CAP_NET_BIND_SERVICE`, and below 32768, so it lies outside Linux's ephemeral range and outside the mesh ports 32768 to 49151 of the in-process mesh source rewrite (see [Flows and mesh ports](#flows-and-mesh-ports)). The socket is bound to the node's mesh IP, which `Setup` stores from the identity, and never to the wildcard address. It is also bound to the mesh interface, with `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` on macOS (`ifbind.Control`). Linux delivers a datagram for any address of the host on whichever interface it arrives, and macOS, with `net.inet.ip.check_interface=1`, the value measured on macOS 26, does so only while forwarding is on, as on a macOS bridge. On a socket bound to the mesh IP alone, a host on another network that routes the mesh IP through the node and spoofs a mesh source would therefore draw an answer into the tunnel, which the output chain passes as a reply to the datagram it saw arrive. On Linux `SO_BINDTODEVICE` confines what the socket receives and sends to the mesh interface. On macOS `IP_BOUND_IF` confines only what the socket sends: a Mac that does not forward drops such a datagram in the kernel already, but on a forwarding Mac it still reaches the bound socket, and the answer leaves through the mesh utun. On macOS `rttMeshOnly` therefore switches `FlagInterface` of `golang.org/x/net/ipv4` on, which sets `IP_RECVPKTINFO` there, reads the index of the arrival interface from the `IP_PKTINFO` control message of each datagram, and drops every datagram that did not arrive on the mesh utun, and one without that control message too. On Linux and Windows `rttMeshOnly` returns the socket as it is. Windows receives on the strong host model by default, which drops a datagram for the mesh IP that arrives on another adapter, so plexd sets no option there. A Linux kernel before 5.7 allows the binding only with `CAP_NET_RAW`, and the listen fails without it. `TestRTTProbe_RealAnswersOnlyTheMeshInterface` proves the binding in network namespaces on a real kernel: a socket bound to the mesh IP alone answers a spoofed request that arrives on another interface, and the probe's socket does not. On macOS, `TestDarwinController_RealUTUN` opens the probe's socket with `IP_BOUND_IF` on a real utun, and `TestRTTProbe_RealUTUN` proves the drop with two utuns and forwarding on: a socket with `IP_BOUND_IF` alone answers a request with a mesh source that arrives on the other utun, out of the mesh utun, and the probe's socket answers a peer's request on the mesh utun and draws no reply out of either utun for the request that arrives on the other utun. A mesh IP that is not IPv4, one that did not parse included, fails the listen with `wireguard: rtt probe: mesh ip <ip> is not IPv4`. The probe has no configuration key for its port or its interval: a Domain cannot use a per-node port, and the interval follows `heartbeat.interval`.
+Every plexd holds one UDP socket on port 7911, `RTTProbePort`, of its mesh address. The socket sends the node's probes and answers the peers' probes, so a probe and its answer both travel from port 7911 to port 7911. The [bridge watch](#the-bridge-watch) writes its requests to a bridge that answers the probe on the same socket. IANA lists 7904 to 7912 as unassigned. The port lies above 1023, so plexd binds it without `CAP_NET_BIND_SERVICE`, and below 32768, so it lies outside Linux's ephemeral range and outside the mesh ports 32768 to 49151 of the in-process mesh source rewrite (see [Flows and mesh ports](#flows-and-mesh-ports)). The socket is bound to the node's mesh IP, which `Setup` stores from the identity, and never to the wildcard address. It is also bound to the mesh interface, with `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` on macOS (`ifbind.Control`). Linux delivers a datagram for any address of the host on whichever interface it arrives, and macOS, with `net.inet.ip.check_interface=1`, the value measured on macOS 26, does so only while forwarding is on, as on a macOS bridge. On a socket bound to the mesh IP alone, a host on another network that routes the mesh IP through the node and spoofs a mesh source would therefore draw an answer into the tunnel, which the output chain passes as a reply to the datagram it saw arrive. On Linux `SO_BINDTODEVICE` confines what the socket receives and sends to the mesh interface. On macOS `IP_BOUND_IF` confines only what the socket sends: a Mac that does not forward drops such a datagram in the kernel already, but on a forwarding Mac it still reaches the bound socket, and the answer leaves through the mesh utun. On macOS `rttMeshOnly` therefore switches `FlagInterface` of `golang.org/x/net/ipv4` on, which sets `IP_RECVPKTINFO` there, reads the index of the arrival interface from the `IP_PKTINFO` control message of each datagram, and drops every datagram that did not arrive on the mesh utun, and one without that control message too. On Linux and Windows `rttMeshOnly` returns the socket as it is. Windows receives on the strong host model by default, which drops a datagram for the mesh IP that arrives on another adapter, so plexd sets no option there. A Linux kernel before 5.7 allows the binding only with `CAP_NET_RAW`, and the listen fails without it. `TestRTTProbe_RealAnswersOnlyTheMeshInterface` proves the binding in network namespaces on a real kernel: a socket bound to the mesh IP alone answers a spoofed request that arrives on another interface, and the probe's socket does not. On macOS, `TestDarwinController_RealUTUN` opens the probe's socket with `IP_BOUND_IF` on a real utun, and `TestRTTProbe_RealUTUN` proves the drop with two utuns and forwarding on: a socket with `IP_BOUND_IF` alone answers a request with a mesh source that arrives on the other utun, out of the mesh utun, and the probe's socket answers a peer's request on the mesh utun and draws no reply out of either utun for the request that arrives on the other utun. A mesh IP that is not IPv4, one that did not parse included, fails the listen with `wireguard: rtt probe: mesh ip <ip> is not IPv4`. The probe has no configuration key for its port or its interval: a Domain cannot use a per-node port, and the interval follows `heartbeat.interval`.
 
 The datagram is 16 bytes:
 
@@ -636,7 +640,7 @@ One reader goroutine handles what arrives on the socket. Its buffer holds 64 KiB
 
 - It drops a datagram that is not 16 bytes long, that carries another magic, another version or a kind other than `1` and `2`, or whose source, unmapped, is not an IPv4 address inside the [mesh prefix](#mesh-prefix).
 - It answers a request with the same 16 bytes, kind `2`, to the request's source address and port. A failed write logs `wireguard: rtt probe answer failed` at Debug, and the reader reads on.
-- It counts a reply when a probe to the peer with that mesh IP is outstanding, carries the same nonce and was sent at most 5 s (`rttProbeTimeout`) before the reply arrived. The value is the receive instant minus the send instant, which the round takes right before the write, both from the manager's clock (`time.Now`, which reads the monotonic clock). It is at least 1 ns, because zero means no value and a clock can read the same instant twice, as Windows' can. The reply clears the outstanding probe and the peer's unanswered count. Any other reply changes nothing, and no reply draws a datagram, so two nodes cannot answer each other in a loop.
+- It counts a reply when a probe to the peer with that mesh IP is outstanding, carries the same nonce and was sent at most 5 s (`rttProbeTimeout`) before the reply arrived. The value is the receive instant minus the send instant, which the round takes right before the write, both from the manager's clock (`time.Now`, which reads the monotonic clock). It is at least 1 ns, because zero means no value and a clock can read the same instant twice, as Windows' can. The reply clears the outstanding probe and the peer's unanswered count. Any other reply, such as the answer to a request of the bridge watch, changes nothing, and no reply draws a datagram, so two nodes cannot answer each other in a loop.
 - A read error that is `net.ErrClosed` ends the reader. Any other logs `wireguard: rtt probe read failed` at Debug, and the reader reads on. After 10 failed reads in a row, which a good read resets, it closes the socket, and the next round listens again. An ICMP port unreachable for an earlier send is no read error: Linux and macOS report none to a socket that is not connected, and on Windows Go turns `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off on every UDP socket it creates, so no `WSAECONNRESET` reaches the reader.
 
 `RunRTTProbe` replaces a non-positive `interval` with `DefaultRTTProbeInterval`, logs `wireguard: rtt probe started`, and runs its first round half an interval after it starts and one round per interval after that. At the heartbeat interval a round's answers are therefore in before the handshake report that follows it. A round runs these steps in order:
@@ -647,6 +651,8 @@ One reader goroutine handles what arrives on the socket. Its buffer holds 64 KiB
 4. For each taken peer, in node ID order, it counts the previous probe as unanswered when that probe is still outstanding, drops the value when the device endpoint (`MeshPeerStat.Endpoint`) differs from the one the value was measured over, and drops it when three probes in a row (`rttMaxUnanswered`) went unanswered. It then records a new probe and sends it to port 7911 of the peer's mesh IP. The record comes first, so a fast answer cannot beat it. A failed send clears the record, logs `wireguard: rtt probe send failed`, at Warn the first time for that peer and at Debug while its sends keep failing, and counts as an unanswered probe at once; a send that goes out ends the peer's run of failures. The round waits 5 ms (`rttProbeGap`) between two sends, and not after the last one.
 
 One probe per peer is outstanding at a time, and a new one replaces it. A round that outlasts the interval delays the next one: with the contract's 4096 peers a round sends for about 20 s. A done `ctx` ends a round between two sends, and `RunRTTProbe` then closes the socket, waits for the reader and returns nil.
+
+The probe's table keeps a handle to the socket the probe holds, under the probe's mutex, for the [bridge watch](#the-bridge-watch), which runs on the endpoint selection goroutine. A listen that succeeds sets the handle before it starts the reader. The reader clears it when it ends, only while the handle still names the reader's socket, and before it signals its end. The handle is therefore nil once the socket is closed, after ten failed reads or on shutdown, and once `RunRTTProbe` has returned. Endpoint selection reads the handle after its device read and before it takes the manager's mutex, so the two mutexes are still never held together. A `net.PacketConn` takes concurrent writes, and a write after the socket closed fails with `net.ErrClosed`.
 
 A peer holds the latest value measured, not a minimum or a mean over a window: one probe per interval gives a window too few samples to smooth anything, and the latest value follows a path that got slower at once. The peer keeps its value through two unanswered probes and loses it in the round that counts the third, three intervals after the first unanswered probe went out, so one lost datagram does not clear the value the control plane stores. A failed send counts in its own round, so a failed send that makes the third miss drops the value in that round. A peer also loses its value:
 
@@ -659,13 +665,13 @@ A node whose identity carries no usable `domain_mesh_cidr` holds a host `/32` as
 
 Every policy backend passes UDP to port 7911 over the mesh interface without a rule, ahead of the policy rules, both what the node sends and what arrives for the node itself, and never what the node forwards: the nftables input and output chains each hold a rule for it (see [Connection Tracking](./nftables-firewall.md#connection-tracking)), and so do the pf anchor and the WFP connect and receive-accept layers (see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern)). The backends name the port `policy.RTTProbePort`. `TestRTTProbePortIsPolicyExempt` (`rtt_test.go`) fails when `RTTProbePort` and `policy.RTTProbePort` differ. A probe and its answer both go to port 7911, so one rule shape, UDP to port 7911 on the mesh interface, covers both directions on a backend that keeps no state too. Any local process on a peer can send UDP to port 7911 of any node, where it reaches plexd's socket. An answer is as long as its request and goes only to a mesh address, so the probe amplifies nothing. A host firewall plexd does not manage, Windows Defender Firewall included, has to admit the port on its own: plexd's WFP permits are soft, so Windows Defender Firewall can still drop an inbound probe.
 
-Relay liveness is unchanged: `checkRelay` and `watchRelay` keep reading `RxBytes`, which the answer to a probe moves like any other packet from the peer.
+Relay liveness is unchanged: `checkRelay` and `watchRelay` keep reading `RxBytes`, which the answer to a probe moves like any other packet from the peer. The [bridge watch](#the-bridge-watch) reads `RxBytes` the same way, and uses the round-trip time only to choose its stimulus and its window.
 
 A pair measures each other only when both run a plexd with the probe. A peer on an older plexd, a plain WireGuard peer and a node whose host firewall drops the port answer nothing, so the node reports them without `rtt_microseconds`, at the cost of one datagram per interval each. The control plane takes either end's value for a node and a relay bridge, so one answering side is enough for the ranking (see [Upgrade order](../core/heartbeat-service.md#upgrade-order)).
 
 `plexd up` runs `RunRTTProbe` as step 17f with `hbCfg.Interval`, the heartbeat interval with its defaults applied, and only when the WireGuard interface came up: without it there is no mesh address to bind and no peer to probe.
 
-A node sends one probe per connected peer per interval, because the value travels once per heartbeat interval with the handshake report and more probes would measure what nobody reads. At the default 30 s that costs a node two 108-byte packets per peer per interval, its probe and its answer to the peer's probe: the 16-byte datagram is an 80-byte WireGuard message, 108 bytes with its UDP and IPv4 headers. That is about 0.6 MB a day per peer. Each round also reads the device once.
+A node sends one probe per connected peer per interval, because the value travels once per heartbeat interval with the handshake report and more probes would measure what nobody reads. At the default 30 s that costs a node two 108-byte packets per peer per interval, its probe and its answer to the peer's probe: the 16-byte datagram is an 80-byte WireGuard message, 108 bytes with its UDP and IPv4 headers. That is about 0.6 MB a day per peer. Each round also reads the device once. The bridge watch's requests, one per pass to each watched bridge that answers the probe, do not change this rule, because they measure nothing: their answers match no outstanding probe, and the reader drops them after they have moved the device's `RxBytes` (see [Cost of the watch](#cost-of-the-watch)).
 
 All lines carry `component=wireguard`.
 
@@ -684,7 +690,7 @@ All lines carry `component=wireguard`.
 
 #### Failure detection time
 
-A Domain sets how long a relayed peer may stay silent before its nodes dial the next relay of the peer's set. The [state pull](../core/api-endpoints.md#get-v1-nodes-node-id-state) carries that time as the `failure_detection` block. Its `detect_after_seconds` is a whole number of seconds from 5 to 180, and 15 for a Domain that never set it:
+A Domain sets how long a relayed peer may stay silent before its nodes dial the next relay of the peer's set, and how long the path to the bridge that holds a [shared subnet](#shared-subnets) may stay dead before its nodes move the subnet to the next bridge. The [state pull](../core/api-endpoints.md#get-v1-nodes-node-id-state) carries that time as the `failure_detection` block. Its `detect_after_seconds` is a whole number of seconds from 5 to 180, and 15 for a Domain that never set it:
 
 ```json
 "failure_detection": {
@@ -692,7 +698,7 @@ A Domain sets how long a relayed peer may stay silent before its nodes dial the 
 }
 ```
 
-A node that holds the value watches each relayed peer against it instead of the fixed windows of the [relay liveness probe](#relay-liveness-probe). Under the default of 15 s the node dials the next relay 14 to 15 s after the relay's last packet, where a node that holds no value takes 45 to 60 s. A change reaches the node with its next pull, at most one reconcile interval later (60 s by default). No event carries it.
+A node that holds the value watches each relayed peer against it instead of the fixed windows of the [relay liveness probe](#relay-liveness-probe). Under the default of 15 s the node dials the next relay 14 to 15 s after the relay's last packet, where a node that holds no value takes 45 to 60 s. It also judges the path to every bridge of a shared subnet against the value (see [The bridge watch](#the-bridge-watch)), and a node that holds no value moves no shared subnet on its own. A change reaches the node with its next pull, at most one reconcile interval later (60 s by default). No event carries it.
 
 ```go
 const (
@@ -717,9 +723,9 @@ func FailureDetectionDispatchHandler(mgr *Manager) reconcile.DispatchHandler
 - The out-of-range line is logged once per run of the same raw value. A value from 5 to 180 ends the run.
 - Every positive value, clamped or not, goes to `SetFailureDetection`.
 
-`SetFailureDetection` ignores a value of zero or less and clamps any other to `MinFailureDetection` and `MaxFailureDetection`. It returns the value in force and whether it changed. A change restarts the silence window of every relayed peer and clears its probe state, so no peer is judged against a window it did not start under, and logs `wireguard: failure detection time set` at Info with `detect_after`, `previous` (`0s` when none was held) and `pass`. A pull that repeats the value logs nothing. `FailureDetection` returns the value held, and `0, false` while none is. The ceiling is the stale-handshake age: once a relayed peer's handshake is 180 s old, the pass dials the next relay whatever the value says (see [The trial](#the-trial)). Site gateway failover ([#217](https://github.com/plexsphere/plexd/issues/217)) is not built yet; it will read the value through `FailureDetection`.
+`SetFailureDetection` ignores a value of zero or less and clamps any other to `MinFailureDetection` and `MaxFailureDetection`. It returns the value in force and whether it changed. A change restarts the silence window of every relayed peer and clears its probe state, and restarts the window of every [watched bridge](#the-bridge-watch) and clears its stimulus, so no peer is judged against a window it did not start under. It logs `wireguard: failure detection time set` at Info with `detect_after`, `previous` (`0s` when none was held) and `pass`. A pull that repeats the value logs nothing. `FailureDetection` returns the value held, and `0, false` while none is. The ceiling is the stale-handshake age: once a relayed peer's handshake is 180 s old, the pass dials the next relay whatever the value says (see [The trial](#the-trial)), and a bridge whose handshake is that old no longer counts as connected, so its path is no longer alive.
 
-The value lives in memory only. It is not persisted and has no config key or flag: the Domain owns it, the first pull after a start delivers it again, and a restarted plexd starts every peer at the first entry of its dial order anyway. A node that never received a value, such as one whose control plane sends no block, keeps `checkRelay` with its silence window of one trial (30 s with the default keepalive), its 15 s verdict and the pass every 5 s of `plexd up` (see [Relay liveness probe](#relay-liveness-probe)).
+The value lives in memory only. It is not persisted and has no config key or flag: the Domain owns it, the first pull after a start delivers it again, and a restarted plexd starts every peer at the first entry of its dial order anyway. A node that never received a value, such as one whose control plane sends no block, keeps `checkRelay` with its silence window of one trial (30 s with the default keepalive), its 15 s verdict and the pass every 5 s of `plexd up` (see [Relay liveness probe](#relay-liveness-probe)). It watches no bridge, so it keeps each shared subnet where the pulls put it (see [When a node moves no subnet on its own](#when-a-node-moves-no-subnet-on-its-own)).
 
 The value held, `d`, sets two times (`dial.go`):
 
@@ -754,9 +760,9 @@ A value under 15 s holds only once every node of the Domain runs a release that 
 
 While a value is held, `RunEndpointSelection` runs its passes every `passInterval(interval)`, the shorter of `interval` and `detectPass(d)`. With no value held, `passInterval` returns `interval`. In `plexd up`, which passes `EndpointSelectionInterval`, a value gives a pass every `detectPass(d)`: 1 s at the default 15 s. The loop reads it again after every pass and resets its ticker when it changed, so a new value takes effect at most one pass of the old interval late. The trial, the relay hold, the direct retry's 10 s window and the 180 s stale-handshake age keep their lengths. They compare the clock against their windows and close on the first pass after their end, which comes sooner under a value.
 
-A peer connected over a direct path is never watched, under any value: WireGuard's roaming owns that path, and the value governs the paths a node watches on its own, which today are its relays.
+Endpoint selection never switches the endpoint of a peer connected over a direct path, under any value: WireGuard's roaming owns that path. The value governs the paths a node watches on its own: its relays, and the path to each bridge of a [shared subnet](#shared-subnets), direct or relayed. A dead path to a bridge moves the subnet to another bridge and leaves the bridge's endpoint as it is (see [The bridge watch](#the-bridge-watch)).
 
-A value adds one device read per pass and one probe per pass per relayed connected peer; see [Cost](#cost).
+A value adds one device read per pass, one probe per pass per relayed connected peer, and one datagram per pass per watched bridge; see [Cost](#cost).
 
 #### Direct retry
 
@@ -798,18 +804,18 @@ const EndpointSelectionInterval = 5 * time.Second
 func (m *Manager) RunEndpointSelection(ctx context.Context, interval time.Duration) error
 ```
 
-- With `persistent_keepalive: 0s` it logs `wireguard: endpoint selection disabled, persistent_keepalive is 0s` and returns nil at once. Every peer keeps the first entry of its dial order, so no standby relay is ever dialed, no [direct retry](#direct-retry) runs, and the local networks are never read.
+- With `persistent_keepalive: 0s` it logs `wireguard: endpoint selection disabled, persistent_keepalive is 0s` and returns nil at once. Every peer keeps the first entry of its dial order, so no standby relay is ever dialed, no [direct retry](#direct-retry) runs, the local networks are never read, and no bridge is watched, so every shared subnet stays where the pulls put it.
 - Otherwise it logs `wireguard: endpoint selection started` with `interval`, the interval it was given, `timeout` (the trial) and `relay_probe`, true when `SetRelayProbe` set a sender, and runs a pass on every tick, the first one tick after it starts.
 - It ticks every `passInterval(interval)`: `interval` while no [failure-detection time](#failure-detection-time) is held, and the shorter of `interval` and `detectPass` of the value while one is. It reads that again after every pass and resets its ticker when it changed, so a new value takes effect at most one pass of the old interval late.
-- A pass that returns `ErrPeerStatsUnsupported` logs `wireguard: endpoint selection unavailable, the controller cannot read peer stats` and returns nil. Peers keep the entry they have.
+- A pass that returns `ErrPeerStatsUnsupported` logs `wireguard: endpoint selection unavailable, the controller cannot read peer stats` and returns nil. Peers keep the entry they have, and every shared subnet stays where the pulls put it.
 - Any other pass error logs `wireguard: endpoint selection pass failed` with `error`, and the next tick runs again.
 - It returns nil once `ctx` is done.
 
-`plexd up` runs it with `EndpointSelectionInterval` as step 17b, only when the WireGuard interface came up. The step first calls `SetRelayProbe(wireguard.SendRelayProbe)`, so the probe is on and the started line carries `relay_probe=true`. On the same condition `plexd up` registers `FailureDetectionDispatchHandler`, so step 17b's relay watch follows the Domain's value: a pass every 1 s at the default 15 s.
+`plexd up` runs it with `EndpointSelectionInterval` as step 17b, only when the WireGuard interface came up. The step first calls `SetRelayProbe(wireguard.SendRelayProbe)`, so the probe is on and the started line carries `relay_probe=true`. On the same condition `plexd up` registers `FailureDetectionDispatchHandler`, so step 17b's relay watch and bridge watch follow the Domain's value: a pass every 1 s at the default 15 s.
 
 #### Cost
 
-The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, on a node that holds no failure-detection time, and one interface read, of the local networks, every 30 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default). On such a node the [relay liveness probe](#relay-liveness-probe) adds at most one datagram per relayed peer that received nothing for 30 s, answered by one keepalive. A node that holds a [failure-detection time](#failure-detection-time) reads the device once per pass instead, every 1 s at the default 15 s against every 5 s, and sends one probe per pass per relayed connected peer: a 64-byte WireGuard message, 92 bytes with its UDP and IPv4 headers, about 8 MB a day per relayed peer and direction at the default, and a fifth of that from 75 s up. Each relay re-dial adds one handshake, whether it dials the same relay or the next one of the set. A [move back](#the-trial) adds at most one device write per peer per session, and a failed write is tried again on the next pass. A [direct retry](#direct-retry) adds one handshake per entry tried, and the relay re-dial that ends a failed one adds its own. The [round-trip probe](#round-trip-probe) adds one device read per heartbeat interval and, per connected peer and interval, two 108-byte packets, its probe and its answer to the peer's probe: about 0.6 MB a day per peer at the default 30 s.
+The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, on a node that holds no failure-detection time, and one interface read, of the local networks, every 30 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default). On such a node the [relay liveness probe](#relay-liveness-probe) adds at most one datagram per relayed peer that received nothing for 30 s, answered by one keepalive. A node that holds a [failure-detection time](#failure-detection-time) reads the device once per pass instead, every 1 s at the default 15 s against every 5 s, and sends one probe per pass per relayed connected peer: a 64-byte WireGuard message, 92 bytes with its UDP and IPv4 headers, about 8 MB a day per relayed peer and direction at the default, and a fifth of that from 75 s up. Each relay re-dial adds one handshake, whether it dials the same relay or the next one of the set. A [move back](#the-trial) adds at most one device write per peer per session, and a failed write is tried again on the next pass. A [direct retry](#direct-retry) adds one handshake per entry tried, and the relay re-dial that ends a failed one adds its own. The [round-trip probe](#round-trip-probe) adds one device read per heartbeat interval and, per connected peer and interval, two 108-byte packets, its probe and its answer to the peer's probe: about 0.6 MB a day per peer at the default 30 s. The [bridge watch](#the-bridge-watch) adds one datagram and its answer per pass for each watched bridge, and no device read: for a bridge that answers the round-trip probe, two 108-byte packets per second at the 1 s pass of the default 15 s, about 19 MB a day per bridge and node; for a relayed bridge nothing beyond the relay probe; and for any other bridge the relay probe's 92-byte datagram on every pass (see [Cost of the watch](#cost-of-the-watch)).
 
 #### Endpoint selection log lines
 
@@ -839,6 +845,13 @@ All carry `component=wireguard`.
 | `Info` | `wireguard: no direct endpoint answered, dialing the relay again` | `peer_id`, `endpoint` (the relay dialed, the one the retry ends on). Logged by a pass after the last entry's window, and by `UpdatePeer` when an update leaves a running retry no entry |
 | `Debug` | `wireguard: local networks changed` | `networks` (the networks of the new read, such as `[10.0.0.0/24]`) |
 | `Warn`, `Debug` | `wireguard: read local networks failed` | `error`. `Warn` for the first failure, `Debug` while the reads keep failing |
+| `Warn` | `wireguard: shared subnet not programmed` | `subnet` (as the pull carried it), `reason` (`invalid`, `overlaps_mesh`, `inside_local_network`, `duplicate` or `no_bridge`). Logged by `setSharedSubnets` for each entry of the `shared_subnets` block it skips, whenever the reconcile handler runs. See [Accepting an entry](#accepting-an-entry) |
+| `Info` | `wireguard: shared subnet assigned` | `subnet`, `bridge` (the holder), `bridges` (the number of bridges kept). Logged by `setSharedSubnets` for a shared subnet it did not hold |
+| `Info` | `wireguard: shared subnet moved` | `subnet`, `from` (the old holder), `to` (the new holder), `reason`: `pull` when a pull replaced the holder, logged by `setSharedSubnets`, or `bridge_dead` when the [bridge watch](#the-bridge-watch) moved the subnet off a dead path, logged with `silent_for` (the time since the pass last saw the old holder's path alive, such as `14s`) and `window` (the window it was judged against, such as `14s`) |
+| `Info` | `wireguard: shared subnet released` | `subnet`, `bridge` (the last holder). Logged by `setSharedSubnets` for a shared subnet no accepted entry names any more |
+| `Warn` | `wireguard: shared subnet move failed` | `subnet`, `from`, `to`, `error`. Logged by the bridge watch when the write of the new holder, or the write of the old holder after it, fails |
+| `Warn` | `wireguard: shared subnet has no live bridge` | `subnet`, `bridge` (the holder), `silent_for`, `window`. Logged by the bridge watch once until the holder changes or its path is alive again |
+| `Debug` | `wireguard: bridge probe send failed` | `peer_id`, `error`. Logged by the bridge watch for a stimulus that did not leave |
 | `Warn` | `wireguard: endpoint switch failed` | `peer_id`, `endpoint` (the entry it tried to program, the relay it tried to dial for a failed relay re-dial, the entry it tried to write for a failed write of a direct retry), `error` |
 | `Warn` | `wireguard: endpoint selection pass failed` | `error` |
 
@@ -976,7 +989,7 @@ if err := mgr.Setup(ctx, identity); err != nil {
 go mgr.RunMTUProbe(ctx, wireguard.MTUProbeInterval)
 
 // Take the Domain's failure-detection time from every pull; it tunes the
-// relay watch of endpoint selection
+// relay watch and the bridge watch of endpoint selection
 r.RegisterDispatchHandler(wireguard.FailureDetectionDispatchHandler(mgr))
 
 // Peers come from the state pull, not from the registration response:
@@ -984,7 +997,8 @@ r.RegisterDispatchHandler(wireguard.FailureDetectionDispatchHandler(mgr))
 r.RegisterHandler(wireguard.ReconcileHandler(mgr, psks))
 
 // Probe relayed peers, then try each peer's dial order every 5 seconds,
-// or every pass of the failure-detection time (blocks until ctx is done)
+// or every pass of the failure-detection time, and under that time watch
+// the bridges of the shared subnets (blocks until ctx is done)
 mgr.SetRelayProbe(wireguard.SendRelayProbe)
 go mgr.RunEndpointSelection(ctx, wireguard.EndpointSelectionInterval)
 
@@ -1022,7 +1036,7 @@ if err := mgr.Teardown(); err != nil {
 | `UpdatePeer`      | Returns `wireguard: update peer: <cause>` and leaves the state as it was. A failed move to a new relay or a failed write of a [direct retry](#direct-retry) names `remove device peer` or `add device peer`, and the reconciler retries it on its next cycle | — |
 | `ConfigurePeers`  | Logged at error, continues       | Returns context error      |
 | `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
-| `RunEndpointSelection` | A failed switch or relay re-dial is logged at warn and the pass goes on; the next re-dial, one relay hold later, dials the relay after the one that failed. A failed move back is logged at warn too, and the next pass tries the same relay again. A failed write of a [direct retry](#direct-retry)'s entry is logged at warn: the next step, one window later, tries the entry after it, and a retry that a change of the local networks starts is not tried again for that change. A failed probe send is logged at warn, then at debug while it keeps failing, and takes no verdict: the next probe follows one trial later, or on the next pass under a [failure-detection time](#failure-detection-time). A failed read of the local networks is logged at warn, then at debug while it keeps failing, and the next read follows 30 s later | Returns nil |
+| `RunEndpointSelection` | A failed switch or relay re-dial is logged at warn and the pass goes on; the next re-dial, one relay hold later, dials the relay after the one that failed. A failed move back is logged at warn too, and the next pass tries the same relay again. A failed write of a [direct retry](#direct-retry)'s entry is logged at warn: the next step, one window later, tries the entry after it, and a retry that a change of the local networks starts is not tried again for that change. A failed probe send is logged at warn, then at debug while it keeps failing, and takes no verdict: the next probe follows one trial later, or on the next pass under a [failure-detection time](#failure-detection-time). A failed read of the local networks is logged at warn, then at debug while it keeps failing, and the next read follows 30 s later. A failed move of a [shared subnet](#the-bridge-watch) is logged at warn and joined into the pass's error, and the next pass tries it again; a failed stimulus is logged at debug and takes no verdict | Returns nil |
 | `RunMTUProbe`     | A failed probe or `SetMTU` is logged at warn. The next round probes again and retries a failed lowering; a failed raise starts the two-round wait over | Returns nil |
 | `RunRTTProbe`     | A failed listen, device read or send is logged at warn, a repeated failed listen or send at debug, and the next round tries again. A failed read of the socket or a failed answer is logged at debug and the reader reads on; ten failed reads in a row close the socket, and the next round listens again. A controller that cannot read peer stats ends the probe, which returns nil. See [Round-trip probe](#round-trip-probe) | Returns nil |
 
@@ -1039,11 +1053,11 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |
 | `Error` | Peer operation failed (bulk) | `peer_id`, `error`                    |
 
-Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), the round-trip probe the lines in [Round-trip probe](#round-trip-probe), and the reconcile handler the dial order lines in [Dial order](#dial-order) and the peer route lines in [Routed subnets](#routed-subnets). `FailureDetectionDispatchHandler` and `SetFailureDetection` write the failure-detection lines in [Endpoint selection log lines](#endpoint-selection-log-lines).
+Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), the round-trip probe the lines in [Round-trip probe](#round-trip-probe), and the reconcile handler the dial order lines in [Dial order](#dial-order) and the peer route lines in [Routed subnets](#routed-subnets). The reconcile handler and endpoint selection write the shared subnet lines in [Endpoint selection log lines](#endpoint-selection-log-lines). `FailureDetectionDispatchHandler` and `SetFailureDetection` write the failure-detection lines in [Endpoint selection log lines](#endpoint-selection-log-lines).
 
 ## ReconcileHandler
 
-Factory function returning a `reconcile.ReconcileHandler` that applies peer changes from the `StateDiff`. Peer membership comes solely from the snapshot `peers` block.
+Factory function returning a `reconcile.ReconcileHandler` that applies peer changes from the `StateDiff`. Peer membership comes solely from the snapshot `peers` block, and the [shared subnets](#shared-subnets) from its `shared_subnets` block.
 
 ```go
 func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandler
@@ -1059,12 +1073,16 @@ type EdgePSKLookup interface {
 
 ### Processing Order
 
-1. **Removes** — `diff.PeersToRemove` (node IDs) via `RemovePeerByID`; a node ID the peer index no longer holds is already gone and is skipped, because a failed cycle hands the same removal over again on the next tick
-2. **Updates** — `diff.PeersToUpdate` via `UpdatePeer`
-3. **Adds** — `diff.PeersToAdd` via `AddPeer`
-4. **Peer routes** — `syncPeerRoutes` routes the routed subnets of the peers now on the device through the mesh interface and removes the routes no peer lists any more (see [Routed subnets](#routed-subnets))
+1. **Removes**: `diff.PeersToRemove` (node IDs) via `RemovePeerByID`; a node ID the peer index no longer holds is already gone and is skipped, because a failed cycle hands the same removal over again on the next tick
+2. **Shared subnets**: `setSharedSubnets` takes the pull's `shared_subnets` block and picks the holder of each shared subnet, so every peer the next two steps write carries the shared subnets it holds and none it does not (see [Shared subnets](#shared-subnets))
+3. **Updates**: `diff.PeersToUpdate` via `UpdatePeer`
+4. **Adds**: `diff.PeersToAdd` via `AddPeer`
+5. **Shared subnet writes**: `syncSharedSubnets` writes every peer on the device whose routed subnets the holders changed, since a pull can move a shared subnet without changing either peer entry (see [Writing the holders](#writing-the-holders))
+6. **Peer routes**: `syncPeerRoutes` routes the routed subnets of the peers now on the device through the mesh interface and removes the routes no peer lists any more (see [Routed subnets](#routed-subnets))
 
-Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, order, fallbacks, psk, routed)`, where `order` is the peer's [dial order](#dial-order), `fallbacks` its last `relays` entries, the relays that end it, and `routed` the entries of its `routed_subnets` that [`usableRoutedSubnets`](#routed-subnets) accepts:
+Steps 2 and 5 run only with a desired snapshot. A call with a nil `desired`, as the handler tests make, skips both, and the manager keeps the shared subnets it holds.
+
+Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, order, fallbacks, psk, routed)`, where `order` is the peer's [dial order](#dial-order), `fallbacks` its last `relays` entries, the relays that end it, and `routed` the list `Manager.routedSubnets` gives the peer: the entries of its `routed_subnets` that are no shared subnet and that [`usableRoutedSubnets`](#routed-subnets) accepts, followed by the [shared subnets](#shared-subnets) it holds:
 
 - `AllowedIPs` is derived locally as `mesh_ip/32` followed by `routed`, in the list's order. The snapshot never sends allowed IPs. A `mesh_ip` that is not a bare IPv4 address fails the peer. `RoutedSubnets` carries `routed`, and is nil when it is empty.
 - `Endpoints` is the dial order and `Endpoint` its first entry, empty for an empty order. The manager programs the first entry and [endpoint selection](#endpoint-selection) moves along the order until a handshake completes. See [Dial order](#dial-order).
@@ -1132,9 +1150,9 @@ func (m *Manager) SetPeerRouter(r PeerRouter)
 func usableRoutedSubnets(subnets []string, mesh netip.Prefix, local []netip.Prefix) (accepted []string, skipped []skippedSubnet)
 ```
 
-A peer's `routed_subnets` lists the IPv4 networks the control plane routes through it: the networks behind the site-to-site tunnels of a peer that is a bridge, the union of their `allowed_subnets`, each prefix once. The control plane delivers the member only to the nodes of the bridge Resource's Project, and the registration response never carries it, so a node programs the subnets from its first pull. See [Site-to-Site VPN](../bridge/site-to-site-vpn.md) for the tunnels behind them.
+A peer's `routed_subnets` lists the IPv4 networks the control plane routes through it: the networks behind the site-to-site tunnels of a peer that is a bridge, the union of their `allowed_subnets`, each prefix once. A subnet that tunnels on two or more bridges of the Project list, a shared site subnet, is on the entry of its carrier alone, and the pull's `shared_subnets` block names its bridges; plexd takes such a subnet from that block and not from `routed_subnets` (see [Shared subnets](#shared-subnets)). The control plane delivers the member only to the nodes of the bridge Resource's Project, and the registration response never carries it, so a node programs the subnets from its first pull. See [Site-to-Site VPN](../bridge/site-to-site-vpn.md) for the tunnels behind them.
 
-For each peer it adds or updates, the handler splits the list with `usableRoutedSubnets`, against the mesh prefix and the local prefixes it reads for the [dial order](#dial-order). The peer's allowed IPs are its mesh address as a `/32` followed by the accepted subnets, in the list's order and in canonical form. The first rule that applies skips an entry:
+For each peer it adds or updates, the handler takes the entries of the list that are no shared subnet and splits them with `usableRoutedSubnets`, against the mesh prefix and the local prefixes it reads for the [dial order](#dial-order). The peer's allowed IPs are its mesh address as a `/32` followed by the accepted subnets, in the list's order and in canonical form, and then by the shared subnets the peer holds. The first rule that applies skips an entry:
 
 | Reason | The entry |
 |---|---|
@@ -1149,7 +1167,7 @@ The first two would let the peer's key send from addresses past the networks beh
 wireguard: routed subnet not programmed  component=wireguard peer_id=<node id> subnet=10.20.0.1/16 reason=invalid
 ```
 
-The handler ends with `syncPeerRoutes`, which brings the routes on the mesh interface in line with the [programmed peers](#programmed-peers), the peers the manager last wrote. The wanted set is the union of their `RoutedSubnets`. It removes the route of every subnet it programmed that no such peer lists any more, then adds a route for every wanted subnet that has none, in subnet order, each through the `PeerRouter` on `OSInterfaceName()`, the name the operating system knows the mesh interface by (`utunN` on macOS). A subnet two peers list is routed once and keeps its route until the last of them drops it. plexd does not arbitrate between two peers that list the same subnet: the control plane refuses a second tunnel of a Project to an overlapping subnet, and the device gives an equal prefix to the peer written last. A peer the handler removes, or whose update drops the member, loses its routes in the same run, and `SetPeerPSK` writes a peer's routed subnets again with its PSK, since every device write replaces the allowed IPs. A run that changed a route logs the change once at Info:
+The handler ends with `syncPeerRoutes`, which brings the routes on the mesh interface in line with the [programmed peers](#programmed-peers), the peers the manager last wrote. The wanted set is the union of their `RoutedSubnets`. It removes the route of every subnet it programmed that no such peer lists any more, then adds a route for every wanted subnet that has none, in subnet order, each through the `PeerRouter` on `OSInterfaceName()`, the name the operating system knows the mesh interface by (`utunN` on macOS). A subnet two peers list is routed once and keeps its route until the last of them drops it. A subnet the pull names in `shared_subnets` is on the allowed IPs of one peer at a time, its holder, whichever peers list it in `routed_subnets` (see [Shared subnets](#shared-subnets)). A subnet that two peers list without such an entry, which only a replica of a control plane that predates the block sends, for at most one rolling deploy, goes into the allowed IPs of both, and the device gives the equal prefix to the peer written last. A peer the handler removes, or whose update drops the member, loses its routes in the same run, and `SetPeerPSK` writes a peer's routed subnets again with its PSK, since every device write replaces the allowed IPs. A run that changed a route logs the change once at Info:
 
 ```
 wireguard: peer routes changed  component=wireguard added=[10.20.0.0/16] removed=[]
@@ -1170,6 +1188,163 @@ Every `bridge.RouteController` satisfies `PeerRouter`: `NetlinkRouteController` 
 A route admits no traffic by itself. The node's [policy](./network-policy.md) filters what it sends into the mesh, and the control plane compiles a rule to a network behind a bridge with that network as `destination_cidr`. plexd does not guard against a routed subnet that holds the control plane's address or a peer's endpoint: it cannot tell which addresses the host must reach outside the mesh, and the control plane refuses the overlaps it can see.
 
 The [Docker e2e test](../development/docker-e2e-test.md) proves the routes on Linux with traffic, and `TestPeerRoutes_RealUTUN` and `TestPeerRoutes_RealWintun` read the allowed IPs, through `PeerStat.AllowedIPs`, and the route on macOS and Windows on the CI runners, without traffic (see [CI Workflow](../development/ci-workflow.md)).
+
+### Shared subnets
+
+```go
+// bridgeProbeFloor is the shortest failure-detection time a bridge that
+// answers no round-trip probe is judged against.
+const bridgeProbeFloor = 15 * time.Second
+
+func (m *Manager) setSharedSubnets(entries []api.NodeStateSharedSubnet, peers []api.SnapshotPeer, mesh netip.Prefix, local []netip.Prefix)
+func (m *Manager) routedSubnets(p api.SnapshotPeer, mesh netip.Prefix, local []netip.Prefix) (routed []string, skipped []skippedSubnet)
+func (m *Manager) syncSharedSubnets(peers []api.SnapshotPeer, mesh netip.Prefix, local []netip.Prefix) error
+func (m *Manager) watchBridges(stats map[string]MeshPeerStat, echo net.PacketConn, now time.Time) error
+func (m *Manager) moveSharedSubnet(subnet, from, to string, now time.Time) error
+```
+
+Tunnels on two or more bridge Resources of a Project may list the same subnet, so that the site behind them stays reachable when one bridge fails. The control plane ranks the bridges of each such subnet, a carrier and up to seven standbys, and the [state pull](../core/api-endpoints.md#get-v1-nodes-node-id-state) carries the order as the `shared_subnets` block, as the "Shared site subnets" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes it:
+
+```json
+"shared_subnets": [
+  {
+    "subnet": "10.20.0.0/16",
+    "bridges": [
+      "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a5",
+      "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6"
+    ]
+  }
+]
+```
+
+Each entry names a subnet in CIDR notation and at most 8 bridges, each the `node_id` of a peer of the same pull: the carrier first, then the standbys in the order the node fails over through. The control plane sends the block on every pull, `[]` when there is none and never `null`, with its entries sorted by address and then by prefix length. It lists the subnet in the `routed_subnets` of the carrier's peer entry as well, and a node that reads the block takes the subnet from the block and not from `routed_subnets`. A subnet of the node's own tunnels gets no entry, and neither does one whose plan holds no standby or that the plan has not ranked yet: the node routes it through the peer whose `routed_subnets` lists it.
+
+plexd decodes the block into `api.NodeStateSnapshot.SharedSubnets`, a slice of `api.NodeStateSharedSubnet`. An absent key, `null` and `[]` all mean no shared subnet: only a control plane that predates the block leaves the key out, and such a control plane has none. The member is typed, as `peers` is, so a value of another JSON type fails the pull's decode; the manager validates the entries. The differ compares the block in order, each entry's `bridges` included, because the order is the failover order, so a pull that changes only the block still runs the handler (see [ComputeDiff](../core/reconciliation.md#computediff)).
+
+plexd keeps each shared subnet on the allowed IPs of exactly one bridge peer and starts on the first bridge of its entry. [Endpoint selection](#the-bridge-watch) moves the subnet to the next live bridge once the path to its bridge has been dead for the Domain's [failure-detection time](#failure-detection-time), without a pull, and the [handshake report](../core/heartbeat-service.md#handshake-reporter) names the subnets the node routes through each peer. This section uses four terms. A **shared subnet** is a subnet an accepted entry names. Its **bridges** are the entry's node IDs that name a peer of the pull, in their order. The **holder** is the bridge whose allowed IPs carry the subnet; every other bridge of the entry is a standby. A **watched** peer is a bridge of at least one shared subnet.
+
+#### Accepting an entry
+
+`setSharedSubnets` replaces the shared subnets the manager holds with the accepted entries of a pull, under the manager's mutex. The [reconcile handler](#processing-order) calls it after the removals and before the updates, and it writes nothing to the device. It takes the entries in their order and skips an entry by the first rule that applies, with the Warn `wireguard: shared subnet not programmed` with `subnet`, as the pull carried it, and `reason`:
+
+| Reason | The entry |
+|---|---|
+| `invalid` | Its subnet does not parse with `netip.ParsePrefix`, is not IPv4, or has host bits set, such as `10.20.0.1/16`, `fd00::/64` or `x` |
+| `overlaps_mesh` | Its subnet overlaps the [mesh prefix](#mesh-prefix) |
+| `inside_local_network` | Its subnet lies inside a local prefix, by the rule of [Routed subnets](#routed-subnets) |
+| `duplicate` | Its subnet repeats the subnet of an earlier entry that passed the rules above, one skipped as `no_bridge` included |
+| `no_bridge` | None of its bridges is the `node_id` of a peer of the same pull, an empty `bridges` included |
+
+The first four are the rules of [Routed subnets](#routed-subnets), checked by the same code and applied to the entries' subnets as one list. A bridge that is the `node_id` of no peer of the pull, or repeats an earlier bridge of the entry, is dropped. Of the bridges left, the first 8, `api.MaxSharedSubnetBridges`, are kept. The cap counts after the drops, so an unknown or repeated ID does not cost a usable standby. A skipped entry is no shared subnet: its subnet stays on the peers whose `routed_subnets` list it. The manager keys each shared subnet by its CIDR in canonical form.
+
+#### Picking the holder
+
+For each accepted entry the holder is, by the first rule that applies:
+
+1. The holder the manager records for the subnet, when the entry's bridges still list it.
+2. The first of the entry's bridges whose peer, as last written, carries the subnet among its routed subnets: the bridge that had it through its `routed_subnets`.
+3. The first bridge.
+
+Rule 1 keeps a holder at any position of the entry, so a bridge the node moved away from stays a standby when it comes back, and a pull that lists the old holder first does not move the subnet back. A pull that no longer lists the holder moves the subnet at once, by rule 2 or 3. Rule 2 keeps the subnet on the bridge a node already routed it through by that bridge's `routed_subnets`. A node never tests a path at assignment: at the start no path has been seen alive yet, and a liveness test would spread the nodes of a Project over the bridges by handshake order.
+
+A subnet the manager did not hold logs `wireguard: shared subnet assigned` at Info with `subnet`, the holder as `bridge`, and `bridges`, the number of bridges kept. A recorded holder that rule 2 or 3 replaces logs `wireguard: shared subnet moved` at Info with `subnet`, `from`, `to` and `reason=pull`. A subnet the manager held that no accepted entry names any more logs `wireguard: shared subnet released` at Info with `subnet` and its last holder as `bridge`, after the entries and in the string order of the CIDRs; the subnet goes back to the peers whose `routed_subnets` list it. A kept holder logs nothing.
+
+#### A peer's routed subnets
+
+`routedSubnets` returns a peer's effective list: the entries of its `routed_subnets` that are no shared subnet, as `usableRoutedSubnets` accepts them and in their order, followed by the shared subnets whose holder the peer is, sorted by address and then by prefix length. An entry is compared with the shared subnets parsed and in canonical form; one that does not parse goes on to `usableRoutedSubnets`, which skips it as `invalid`. `snapshotPeer` takes the peer's list from it, so `api.Peer.RoutedSubnets` and `AllowedIPs` carry the effective list, and every write the manager makes carries the holder's subnets: an update, an add, a [PSK write](#installing-a-psk) and the write of a rotated key. `syncPeerRoutes` routes the union of the lists. A move takes the subnet off one record and puts it on another, so it changes no route on the mesh interface while the old holder's record lists the subnet. After a failed handler run the holder's record can lack it, a bridge whose add failed has no record at all, and the next run of the handler, which the reconciler makes because the run failed, then routes the subnet.
+
+#### Writing the holders
+
+A pull can change a holder without changing either peer entry, and then neither the update nor the add writes the two peers. `syncSharedSubnets` runs after the adds and before `syncPeerRoutes`, and holds the manager's mutex for the whole step, so no move of endpoint selection runs in between. The handler hands it the pull's peers without those whose update or add failed in the run: a failed write leaves a peer as it was, and the next run applies its whole entry.
+
+Each peer the manager tracks gets a target list. For a peer of the pull last written with the pull's public key it is the effective list. Any other tracked peer only loses subnets: its target is the list it was last written with, less the shared subnets another peer holds. Such a peer is one the pull no longer lists and whose removal failed, one whose key rotation failed, so that its device peer belongs to the old key, or one whose update or add failed in the run.
+
+The step then writes in two rounds, each in node ID order:
+
+1. A peer of the pull whose target holds a subnet its record lacks, or that holds a shared subnet another tracked peer was last written with, is written with its target and with every subnet its record lists that the target drops.
+2. Every peer whose record differs from its target is written with its target and with each subnet the target drops that has not landed yet: a shared subnet whose holder has no record or was not written with it, or another subnet the target of an other peer holds while that peer's record lacks it.
+
+The device takes a subnet off a peer when another peer is written with it. A peer therefore gives a subnet up only once the peer that carries it next has it, and a failed or skipped write of that peer leaves the subnet where it was instead of on no peer. A peer that both gains and loses is written twice.
+
+The second case of the first round repairs a race. `snapshotPeer` reads the holders before `UpdatePeer` takes the mutex, so a move of endpoint selection in between writes the old holder back with the subnet, and the device gives an equal prefix to the peer written last. In steady state only the holder carries a shared subnet, and the second case writes nothing.
+
+Each write is the one `SetPeerPSK` makes: the recorded peer with the new routed subnets and allowed IPs and an empty endpoint, which leaves the device endpoint and the endpoint selection state as they are. A failed write logs `reconcile: update peer failed` at Error with `peer_id` and `error`, leaves the peer's record as it was, and is returned joined as `wireguard: write routed subnets of peer <node id>: <cause>`, so the reconciler applies the snapshot again; a peer whose write failed in the first round is not written in the second. That run changes no holder, because rule 1 keeps each.
+
+#### The bridge watch
+
+Endpoint selection watches every bridge an entry lists, the holder and the standbys, on every pass, so a subnet moves only to a bridge that answered within its window. After its turn over the peers, each [pass](#the-trial) calls `watchBridges` under the manager's mutex and joins its error into its own. The watch does nothing while no failure-detection time is held or no shared subnet is. The pass reads the [round-trip probe](#round-trip-probe)'s socket handle under the probe's mutex right after its device read, before it takes the manager's mutex, and hands it to the watch as the echo socket. A failed device read, `ErrPeerStatsUnsupported` included, ends the pass before the watch, so the pass sends no stimulus and moves no subnet.
+
+For each watched peer with a dial state, in node ID order, with `d` the value held, a pass takes three steps:
+
+1. **Evidence.** When the peer is connected, its handshake is not older than the last replacement of its device peer, and the device's `RxBytes` for it differs from the last pass, the pass has seen the path alive. The pass records the counter on every pass, and 0 for a peer the device does not report.
+2. **Stimulus.** A connected peer whose mesh IP parses and lies inside the mesh prefix gets one datagram when none went out yet or the last one went out `detectPass(d)/2` or longer ago. A peer is proven when the pass holds an echo socket and `MeshPeerStat.RTT` is above zero. A proven peer gets one round-trip request, the 16-byte `PXRT` datagram of kind 1 with a fresh nonce, written on the echo socket to port 7911 of its mesh IP. Its plexd answers at once, and the probe's reader drops the answer, because its nonce matches no outstanding probe; the answer has moved `RxBytes` by then. Any other peer gets the [relay liveness probe](#relay-liveness-probe) through the sender `SetRelayProbe` set, unless it is relayed: `watchRelay` probed it in the same pass. A failed send logs `wireguard: bridge probe send failed` at Debug with `peer_id` and `error` and counts the path as seen alive at that pass, so no verdict follows a probe that never left. A connected peer that neither this step nor `watchRelay` can probe, for lack of a sender or of a usable mesh IP, counts as seen alive on every pass too: its path counts as dead only once its handshake is stale.
+3. **Window.** The window is `detectSilence(d)` for a proven peer and `detectSilence(max(d, bridgeProbeFloor))` for any other. A path is alive while the peer is connected and the time since the pass last saw it alive is below the window. It is dead for the time once that time reaches the window.
+
+A peer's window starts over, with the time of the pass as the time it was last seen alive and its stimulus cleared, when it joins the watched set, when a pull assigns or moves a subnet to it, and when `SetFailureDetection` changes the value, as it does for the relayed peers. A pass also sets a time that was never set to the time of the pass before it judges the peer, which covers a dial state that `AddPeer` or `UpdatePeer` created after the pull. No path is therefore judged against a window it did not start under, and a first bridge that never connects keeps the subnet for one window.
+
+Then, for each shared subnet in the string order of the CIDRs whose holder's path is dead for the time, a holder without a dial state counted from when it became the holder:
+
+- The target is the first bridge after the holder, in the entry's order and after the last the first again, whose path is alive.
+- With a target, `moveSharedSubnet` writes the target with the subnet added to its recorded routed subnets and an empty endpoint, which moves the prefix on the device, and records it. The entries that are no shared subnet stay first and in their order, and the shared ones follow with the subnet among them, sorted as `routedSubnets` sorts them. It then writes the old holder, and any other tracked peer whose record still lists the subnet, without it and otherwise as recorded, and records each that way whatever the write returns, because the device no longer holds the prefix there. A move adds and removes this one subnet: a shared subnet another peer's record lists by mistake stays for `syncSharedSubnets`, which writes its holder first. The move logs `wireguard: shared subnet moved` at Info with `subnet`, `from`, `to`, `reason=bridge_dead`, `silent_for` and `window`.
+- A failed write of the target logs `wireguard: shared subnet move failed` at Warn with `subnet`, `from`, `to` and `error`, changes nothing, and returns `wireguard: move shared subnet <subnet> to peer <node id>: <cause>`, which the pass joins into its error. The next pass tries again. A failed write of the old holder, or of another peer, logs the same line, and `moveSharedSubnet` returns nil, since the subnet is on the target.
+- Without a target the subnet stays where it is, and the pass logs `wireguard: shared subnet has no live bridge` at Warn with `subnet`, the holder as `bridge`, `silent_for` and `window`, once until the holder changes or its path is alive again.
+
+A move records the target as the holder, so the next pull keeps it by rule 1, and the old holder stays a standby when its path comes back. Only a dead path of the new holder, or a pull that no longer lists it, moves the subnet again. The routes on the mesh interface do not change while the old holder's record lists the subnet (see [A peer's routed subnets](#a-peer-s-routed-subnets)).
+
+#### Watch windows
+
+| Value | Pass and stimulus | Window of a proven bridge | Window of any other bridge |
+|---|---|---|---|
+| 5 s | 1 s | 4 s | 14 s |
+| 10 s | 1 s | 9 s | 14 s |
+| 15 s | 1 s | 14 s | 14 s |
+| 30 s | 2 s | 28 s | 28 s |
+| 60 s | 4 s | 56 s | 56 s |
+| 180 s | 5 s | 175 s | 175 s |
+
+A proven bridge answers each request at once, so its `RxBytes` moves on every pass while its path is alive. A pass counts a packet up to one pass after it arrived, and moves the subnet on the first pass at which the window is reached. At the default 15 s a node therefore leaves a dead bridge 14 to 15 s after its last packet, and one pass later when a pass runs late, as it leaves a dead relay.
+
+#### The 15-second floor
+
+A bridge that holds no round-trip time answers only through its WireGuard: the relay liveness probe draws a keepalive within `KeepaliveTimeout`, 10 s, so a healthy idle bridge can stay silent for 10 s plus one stimulus interval, 11 s at a 1 s pass (see [Failure detection time](#failure-detection-time)). A shorter window would leave a healthy idle bridge, so such a bridge is judged against at least 15 s, `bridgeProbeFloor`, whose window is 14 s. A bridge holds no round-trip time when:
+
+- it runs a plexd through v0.38.0, since no release carries the [round-trip probe](#round-trip-probe): v0.38.0 predates it;
+- it is a plain WireGuard peer without plexd;
+- a host firewall drops UDP port 7911: plexd's own policy passes the port on every platform, but plexd opens no port in a host firewall it does not manage.
+
+A bridge is judged against the floor too until its first answer to the round-trip probe, half a heartbeat interval after the start at the earliest, and every bridge is while the node holds no echo socket. Under a value of 15 s or more the floor changes nothing.
+
+#### When a node moves no subnet on its own
+
+A node moves a shared subnet on its own only while endpoint selection runs and a failure-detection time is held. In two cases it moves none, keeps each subnet where the pulls put it, starting on the first bridge, and follows the pulls:
+
+- It holds no failure-detection time. Every control plane that sends a `shared_subnets` entry sends `failure_detection` in the same pull, and `plexd up` registers the dispatch handler that takes it before the reconcile handler, so a node normally holds the value by the time it applies its first entry.
+- Endpoint selection does not run: `RunEndpointSelection` returns at once under `persistent_keepalive: 0s`, and after one pass when the controller cannot read peer stats.
+
+Such a node leaves a dead bridge when the control plane drops it from the entry: the pull that no longer lists the holder moves the subnet at once.
+
+#### Cost of the watch
+
+The watch costs one datagram and its answer per pass for each watched peer, and no device read beyond the pass's own. For a proven peer at the 1 s pass of the default 15 s that is two 108-byte packets per second, the request and its answer: the 16-byte datagram is an 80-byte WireGuard message, 108 bytes with its UDP and IPv4 headers. That comes to about 19 MB a day per bridge and node, and a fifth of that from 75 s up, where a pass runs every 5 s. The figure is computed, not measured. A relayed bridge costs nothing beyond the probe `watchRelay` sends it. Any other bridge gets the relay probe's 92-byte datagram on every pass, about 8 MB a day, and its WireGuard answers with a keepalive within 10 s when it has nothing else to send. Every node of the Project that pulls the entry watches each of its bridges, so a bridge receives the stimulus of each such node on every pass.
+
+#### Limits of the failover
+
+- IPv4 only: plexd routes IPv4 subnets alone and skips an IPv6 entry as `invalid`, as it skips one in `routed_subnets`.
+- The holder lives in memory only. A restarted plexd starts every shared subnet on the first bridge of its entry again, as it starts every peer at the first entry of its dial order, and the watch moves it on from there.
+- The proof lags. `MeshPeerStat.RTT` stays above zero for up to three round-trip intervals after a bridge's plexd stopped answering, 90 s at the default heartbeat interval of 30 s. Under a value below 15 s, a bridge whose plexd stopped while its WireGuard still forwards is judged against the short window in that time, and can lose its subnets to a live standby.
+- The return path is the site's duty. A bridge forwards traffic from the mesh into its tunnel with the source unchanged, and a node accepts a shared subnet from one bridge at a time, so the remote site answers a flow through the tunnel it arrived on, or routes the Domain mesh CIDR into the carrier's tunnel (see [Site-to-Site VPN](../bridge/site-to-site-vpn.md#routes-and-policy)).
+- A peer without a completed handshake has no entry in the handshake report, so a subnet on a bridge that never connected is not reported.
+- A node on v0.38.0 or older beside upgraded nodes routes each shared subnet through the carrier its `routed_subnets` name, and follows a carrier move with its next pull.
+- `GET /v1/peers` and `plexd peers` do not show the holder, as they show neither a peer's routed subnets nor the endpoint that endpoint selection settled on. The handshake report and the log lines carry it.
+- No configuration key sets the floor or turns the watch off: the Domain owns the failure-detection time, and the floor follows from WireGuard's 10 s keepalive timeout.
+
+#### Reporting the holder
+
+`MeshPeerStats` hands each peer's shared subnets to the [handshake reporter](../core/heartbeat-service.md#build-rules), which sends them as the entry's `shared_subnets`, at most 256 per entry. An entry of a peer that holds none carries no member, which the control plane reads as none, and it clears what it stored for the edge.
+
+#### Tests of the failover
+
+`shared_test.go` drives the assignment, the validation and the watch on the fake clock and the fake probe of the endpoint selection tests, with an in-memory socket as the echo socket. `TestWatchBridges_ReturningBridgeStaysStandby` revives the old holder after a move and reads the subnet on the new holder after 60 more passes and after a pull that lists the old holder first. `TestSharedSubnetIntegration_DeadBridgeMovesTheSubnetToTheStandby` (`shared_integration_test.go`) runs a node N and two bridges A and B on wireguard-go in one process, over real UDP on `127.0.0.1`, with a failure-detection time of 5 s: it reads no move over 20 idle seconds and a packet for the subnet on A's tun, removes N from A's device, and reads the move to B and the next packet on B's tun. It runs in `Run unit tests` on Linux, macOS and Windows. The Docker suite's phase `12e` moves a subnet off a bridge that never answers to meshpeer, a kernel WireGuard peer, and reaches the site address behind it (see [Docker E2E Test](../development/docker-e2e-test.md#phase-8-cont-network-policy-over-a-wireguard-peer)).
 
 ### Registration
 
@@ -1202,7 +1377,7 @@ plexd never decodes their payloads. The reconcile loop then pulls the snapshot, 
 `peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte, routed []string) (api.Peer, error)`
 builds each programmed peer from a snapshot entry: `AllowedIPs` derived locally as
 `mesh_ip/32` followed by `routed`, the [routed subnets](#routed-subnets) the node
-accepted, `Endpoints` set to the [dial order](#dial-order) and `Endpoint` to its
+accepted and the [shared subnets](#shared-subnets) the peer holds, `Endpoints` set to the [dial order](#dial-order) and `Endpoint` to its
 first entry, `Fallbacks` set to `fallbacks`, the relays that end the order, and
 `psk` base64-encoded (none for a nil `psk`). The manager then adds,
 updates, or removes peers so the interface matches the desired set, routes the
