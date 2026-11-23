@@ -528,6 +528,78 @@ func TestReconciler_DispatchHandlerRunsOnEmptyDiff(t *testing.T) {
 	}
 }
 
+// TestReconciler_SharedSubnetsOnlyPullRunsHandlerOnce proves the Acceptance
+// Criterion "serve a pull that differs only in shared_subnets and observe one
+// handler call". Cycle 1 serves two bridge peers, cycle 2 the same peers plus
+// a shared_subnets entry, and cycle 3 the same pull as cycle 2 again: cycle 2
+// runs the handler once with a diff that names only shared_subnets, and cycle
+// 3 runs it not at all.
+func TestReconciler_SharedSubnetsOnlyPullRunsHandlerOnce(t *testing.T) {
+	// pull returns a fresh snapshot on every call, as every pull decodes one.
+	pull := func(shared bool) *api.NodeStateSnapshot {
+		snap := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{
+				{NodeID: "bridge-a", MeshIP: "10.0.0.1", RoutedSubnets: []string{"10.20.0.0/16"}},
+				{NodeID: "bridge-b", MeshIP: "10.0.0.2", RoutedSubnets: []string{"10.20.0.0/16"}},
+			},
+		}
+		if shared {
+			snap.SharedSubnets = []api.NodeStateSharedSubnet{
+				{Subnet: "10.20.0.0/16", Bridges: []string{"bridge-a", "bridge-b"}},
+			}
+		}
+		return snap
+	}
+	var served *api.NodeStateSnapshot
+	fetcher := &mockFetcher{
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return served, nil
+		},
+	}
+
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+
+	var diffs []StateDiff
+	var desireds []*api.NodeStateSnapshot
+	r.RegisterHandler(func(_ context.Context, d *api.NodeStateSnapshot, diff StateDiff) error {
+		desireds = append(desireds, d)
+		diffs = append(diffs, diff)
+		return nil
+	})
+
+	served = pull(false)
+	r.runCycle(context.Background(), "node-1")
+	if len(diffs) != 1 {
+		t.Fatalf("handler calls after cycle 1 = %d, want 1 (the peers are new)", len(diffs))
+	}
+
+	served = pull(true)
+	r.runCycle(context.Background(), "node-1")
+	if len(diffs) != 2 {
+		t.Fatalf("handler calls after cycle 2 = %d, want 2 (one for the shared_subnets change)", len(diffs))
+	}
+	diff := diffs[1]
+	if !diff.SharedSubnetsChanged {
+		t.Error("cycle 2 diff: SharedSubnetsChanged = false, want true")
+	}
+	if len(diff.PeersToAdd) != 0 || len(diff.PeersToRemove) != 0 || len(diff.PeersToUpdate) != 0 {
+		t.Errorf("cycle 2 diff: peers add/remove/update = %d/%d/%d, want 0/0/0",
+			len(diff.PeersToAdd), len(diff.PeersToRemove), len(diff.PeersToUpdate))
+	}
+	if got := diff.Summary(); got != "shared_subnets" {
+		t.Errorf("cycle 2 diff Summary = %q, want %q", got, "shared_subnets")
+	}
+	if desireds[1] != served {
+		t.Error("cycle 2 handler did not receive the fetched snapshot")
+	}
+
+	served = pull(true)
+	r.runCycle(context.Background(), "node-1")
+	if len(diffs) != 2 {
+		t.Errorf("handler calls after cycle 3 = %d, want 2 (cycle 3 serves cycle 2's pull again, an empty diff)", len(diffs))
+	}
+}
+
 func TestReconciler_DispatchHandlerPanicRecovered(t *testing.T) {
 	desired := &api.NodeStateSnapshot{
 		Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},

@@ -10,9 +10,11 @@ import (
 )
 
 // StateDiff describes the drift between a desired NodeStateSnapshot (from the
-// control plane) and the current locally-observed snapshot. The four block
-// flags are presence-aware: a nil block and a populated block are distinct, so
-// null on the wire ("not populated") drives convergence rather than a no-op.
+// control plane) and the current locally-observed snapshot. The four flags of
+// the pointer blocks (policy, bridge, state and reports) are presence-aware: a
+// nil block and a populated block are distinct, so null on the wire ("not
+// populated") drives convergence rather than a no-op. SharedSubnetsChanged is
+// not: a nil and an empty shared_subnets list both mean no shared subnet.
 type StateDiff struct {
 	PeersToAdd    []api.SnapshotPeer
 	PeersToRemove []string          // node IDs
@@ -22,6 +24,11 @@ type StateDiff struct {
 	BridgeChanged  bool
 	StateChanged   bool
 	ReportsChanged bool
+	// SharedSubnetsChanged is true when the shared_subnets lists differ in
+	// length, in a Subnet, or in a Bridges list compared in order, because
+	// the order is the failover order. A nil and an empty list are equal, as
+	// are a nil and an empty Bridges list.
+	SharedSubnetsChanged bool
 }
 
 // IsEmpty reports whether there is no drift at all.
@@ -32,12 +39,13 @@ func (d StateDiff) IsEmpty() bool {
 		!d.PolicyChanged &&
 		!d.BridgeChanged &&
 		!d.StateChanged &&
-		!d.ReportsChanged
+		!d.ReportsChanged &&
+		!d.SharedSubnetsChanged
 }
 
 // Summary returns a compact human-readable description of the diff for the
-// cycle log, e.g. "peers+1-0~2 policy bridge state reports". Only changed parts
-// are mentioned; an empty diff returns "none".
+// cycle log, e.g. "peers+1-0~2 policy bridge state reports shared_subnets".
+// Only changed parts are mentioned; an empty diff returns "none".
 func (d StateDiff) Summary() string {
 	if d.IsEmpty() {
 		return "none"
@@ -58,6 +66,9 @@ func (d StateDiff) Summary() string {
 	}
 	if d.ReportsChanged {
 		parts = append(parts, "reports")
+	}
+	if d.SharedSubnetsChanged {
+		parts = append(parts, "shared_subnets")
 	}
 	return strings.Join(parts, " ")
 }
@@ -84,8 +95,20 @@ func ComputeDiff(desired, current *api.NodeStateSnapshot) StateDiff {
 	diff.BridgeChanged = !reflect.DeepEqual(desired.Bridge, cur.Bridge)
 	diff.StateChanged = !reflect.DeepEqual(desired.State, cur.State)
 	diff.ReportsChanged = !reflect.DeepEqual(desired.Reports, cur.Reports)
+	diff.SharedSubnetsChanged = sharedSubnetsChanged(desired.SharedSubnets, cur.SharedSubnets)
 
 	return diff
+}
+
+// sharedSubnetsChanged reports whether the shared_subnets lists differ. The
+// entries compare in order, and each entry's Bridges in order, because the
+// order is the failover order. slices.EqualFunc and slices.Equal compare
+// lengths, so nil and empty are equal: a pull that drops the key and one that
+// carries [] read the same.
+func sharedSubnetsChanged(desired, current []api.NodeStateSharedSubnet) bool {
+	return !slices.EqualFunc(desired, current, func(d, c api.NodeStateSharedSubnet) bool {
+		return d.Subnet == c.Subnet && slices.Equal(d.Bridges, c.Bridges)
+	})
 }
 
 func diffPeers(desired, current []api.SnapshotPeer, diff *StateDiff) {

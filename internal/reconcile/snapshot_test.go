@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -420,6 +421,41 @@ func TestStateSnapshot_CopiesUserAccessDevices(t *testing.T) {
 	}
 	if diff := ComputeDiff(empty, &got); diff.BridgeChanged {
 		t.Error("an unchanged user access block with no devices reads as bridge drift")
+	}
+}
+
+// TestStateSnapshot_CopiesSharedSubnets proves copySharedSubnets clones the
+// entries and each entry's Bridges on both Update and Get, the Acceptance
+// Criterion "mutate a Bridges slice after Update and read the stored snapshot
+// unchanged".
+func TestStateSnapshot_CopiesSharedSubnets(t *testing.T) {
+	served := func() []api.NodeStateSharedSubnet {
+		return []api.NodeStateSharedSubnet{
+			{Subnet: "10.20.0.0/16", Bridges: []string{"bridge-a", "bridge-b"}},
+			{Subnet: "10.21.0.0/16", Bridges: []string{"bridge-b", "bridge-a"}},
+		}
+	}
+	snap := NewStateSnapshot()
+	desired := &api.NodeStateSnapshot{SharedSubnets: served()}
+	snap.Update(desired)
+
+	got := snap.Get()
+	if !reflect.DeepEqual(got.SharedSubnets, served()) {
+		t.Fatalf("stored shared subnets = %+v, want %+v", got.SharedSubnets, served())
+	}
+
+	// Mutate the source after Update: the snapshot must be unaffected.
+	desired.SharedSubnets[0].Bridges[0] = "mutated"
+	desired.SharedSubnets[1].Subnet = "mutated"
+	if got2 := snap.Get(); !reflect.DeepEqual(got2.SharedSubnets, served()) {
+		t.Errorf("stored shared subnets = %+v after mutating the source, want %+v", got2.SharedSubnets, served())
+	}
+
+	// Mutate a Bridges slice of the returned value: the snapshot must be
+	// unaffected.
+	got.SharedSubnets[1].Bridges[1] = "mutated"
+	if got3 := snap.Get(); !reflect.DeepEqual(got3.SharedSubnets, served()) {
+		t.Errorf("stored shared subnets = %+v after mutating a copy, want %+v", got3.SharedSubnets, served())
 	}
 }
 
