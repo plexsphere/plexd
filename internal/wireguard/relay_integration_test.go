@@ -102,12 +102,19 @@ type meshNode struct {
 	selected chan struct{} // closed when RunEndpointSelection returns
 }
 
-// newMeshNode sets up a Manager for id with mesh IP ip in 10.99.0.0/24, a
-// keepalive of relayKeepalive and its log at Debug in a buffer of its own.
-// Its device listens on a free UDP port (see freeUDPPort), so a partner can
-// dial it directly (see direct). Endpoint selection is not running yet (see
-// startSelection). The node is torn down on cleanup.
+// newMeshNode is newMeshNodeKeepalive with a keepalive of relayKeepalive.
 func newMeshNode(t *testing.T, id, ip string) *meshNode {
+	t.Helper()
+	return newMeshNodeKeepalive(t, id, ip, relayKeepalive)
+}
+
+// newMeshNodeKeepalive sets up a Manager for id with mesh IP ip in
+// 10.99.0.0/24, keepalive as its persistent keepalive, and its log at Debug
+// in a buffer of its own. Its device listens on a free UDP port (see
+// freeUDPPort), so a partner can dial it directly (see direct). Endpoint
+// selection is not running yet (see startSelection). The node is torn down on
+// cleanup.
+func newMeshNodeKeepalive(t *testing.T, id, ip string, keepalive time.Duration) *meshNode {
 	t.Helper()
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
@@ -125,7 +132,6 @@ func newMeshNode(t *testing.T, id, ip string) *meshNode {
 		drained:  make(chan struct{}),
 	}
 	ctrl := &tunController{UserspaceBackend: wireguard.NewLoopbackUserspaceBackend(t), tun: n.tun, port: n.port}
-	keepalive := relayKeepalive
 	logger := slog.New(slog.NewTextHandler(n.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	n.mgr = wireguard.NewManager(ctrl, wireguard.Config{
 		InterfaceName:       "wg-" + id,
