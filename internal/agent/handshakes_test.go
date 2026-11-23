@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -266,7 +267,7 @@ func TestBuildHandshakeReport_AgesAndEndpointsSortedByAge(t *testing.T) {
 		{PeerNodeID: testPeerA, LastHandshakeAgeSeconds: 5, Endpoint: "198.51.100.7:51820"},
 		{PeerNodeID: testPeerB, LastHandshakeAgeSeconds: 130, Endpoint: "[2001:db8::7]:51820"},
 	}
-	if !slices.Equal(req.Peers, want) {
+	if !reflect.DeepEqual(req.Peers, want) {
 		t.Errorf("Peers = %+v, want %+v", req.Peers, want)
 	}
 	if skipped != 0 || truncated != 0 {
@@ -366,7 +367,7 @@ func TestBuildHandshakeReport_Normalization(t *testing.T) {
 			req, skipped, _ := buildHandshakeReport(testObservedAt, stats)
 
 			want := []api.HandshakeReportPeer{{PeerNodeID: testPeerA, LastHandshakeAgeSeconds: tt.wantAge, Endpoint: tt.wantEndpoint}}
-			if !slices.Equal(req.Peers, want) {
+			if !reflect.DeepEqual(req.Peers, want) {
 				t.Errorf("Peers = %+v, want %+v", req.Peers, want)
 			}
 			if skipped != 0 {
@@ -401,7 +402,7 @@ func TestBuildHandshakeReport_SkipsEntriesTheContractRefuses(t *testing.T) {
 			req, skipped, truncated := buildHandshakeReport(testObservedAt, stats)
 
 			want := []api.HandshakeReportPeer{{PeerNodeID: testPeerA, LastHandshakeAgeSeconds: 5, Endpoint: "198.51.100.7:51820"}}
-			if !slices.Equal(req.Peers, want) {
+			if !reflect.DeepEqual(req.Peers, want) {
 				t.Errorf("Peers = %+v, want only the valid peer %+v", req.Peers, want)
 			}
 			if skipped != 1 {
@@ -429,7 +430,7 @@ func TestBuildHandshakeReport_RepeatedNodeIDKeepsSmallerAge(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req, skipped, truncated := buildHandshakeReport(testObservedAt, tt.stats)
-			if !slices.Equal(req.Peers, want) {
+			if !reflect.DeepEqual(req.Peers, want) {
 				t.Errorf("Peers = %+v, want %+v", req.Peers, want)
 			}
 			if skipped != 0 || truncated != 0 {
@@ -697,7 +698,7 @@ func TestHandshakeReporter_RunReportsEveryTickWithAFreshBody(t *testing.T) {
 			LastHandshakeAgeSeconds: int32(5 + 10*k),
 			Endpoint:                "198.51.100.7:51820",
 		}}
-		if !slices.Equal(req.Peers, want) {
+		if !reflect.DeepEqual(req.Peers, want) {
 			t.Errorf("report %d Peers = %+v, want %+v", k, req.Peers, want)
 		}
 	}
