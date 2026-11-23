@@ -1138,6 +1138,83 @@ func TestRTTProbe_RunRTTProbe(t *testing.T) {
 	})
 }
 
+// TestRTTProbe_SocketHandleFollowsTheSocket reads "the socket handle of
+// rttTable set after rttOpen listened, and nil after the reader ended and
+// after RunRTTProbe returned", the socket the bridge watch writes its
+// round-trip requests on.
+func TestRTTProbe_SocketHandleFollowsTheSocket(t *testing.T) {
+	t.Run("rounds", func(t *testing.T) {
+		first, second := newFakeRTTConn(), newFakeRTTConn()
+		h := newRTTHarness(t, on(first), on(second))
+		if got := h.mgr.rtt.socket(); got != nil {
+			t.Fatalf("socket() = %p before the first round, want nil", got)
+		}
+
+		h.round(t)
+		if got := h.mgr.rtt.socket(); got != first {
+			t.Fatalf("socket() = %p after the first round listened, want its socket %p", got, first)
+		}
+
+		done := h.sock.done
+		for range rttMaxReadErrors {
+			first.failRead(errors.New("read:failed"))
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reader did not end after ten failed reads in a row")
+		}
+		// The reader clears the handle before it closes done, so no wait
+		// beyond done is needed.
+		if got := h.mgr.rtt.socket(); got != nil {
+			t.Fatalf("socket() = %p after the reader ended, want nil", got)
+		}
+
+		h.round(t)
+		if got := h.mgr.rtt.socket(); got != second {
+			t.Fatalf("socket() = %p after the next round listened again, want its socket %p", got, second)
+		}
+
+		// A reader of a socket the handle does not name leaves the handle.
+		other := newFakeRTTConn()
+		otherDone := make(chan struct{})
+		go h.mgr.rttRead(other, otherDone)
+		_ = other.Close()
+		<-otherDone
+		if got := h.mgr.rtt.socket(); got != second {
+			t.Errorf("socket() = %p after the reader of another socket ended, want %p", got, second)
+		}
+	})
+
+	t.Run("RunRTTProbe returned", func(t *testing.T) {
+		conn := newFakeRTTConn()
+		h := newRTTHarness(t, on(conn))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errc := make(chan error, 1)
+		go func() { errc <- h.mgr.RunRTTProbe(ctx, 10*time.Millisecond) }()
+
+		waitUntil(t, "the handle of the socket the first round listened on", func() bool {
+			return h.mgr.rtt.socket() == conn
+		})
+		cancel()
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Errorf("RunRTTProbe() = %v, want nil", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("RunRTTProbe did not return after its context ended")
+		}
+		if got := h.mgr.rtt.socket(); got != nil {
+			t.Errorf("socket() = %p after RunRTTProbe returned, want nil", got)
+		}
+		if !conn.isClosed() {
+			t.Error("RunRTTProbe returned without closing its socket")
+		}
+	})
+}
+
 func TestRTTProbe_MeshPeerStatsWhileRoundsRun(t *testing.T) {
 	var sendsA, sendsB atomic.Int64
 	connA, connB := listenLoopback(t), listenLoopback(t)

@@ -72,9 +72,11 @@ const rttMaxReadErrors = 10
 // toward rttMaxReadErrors there.
 const rttReadBufferLen = 1 << 16
 
-// rttTable is the round-trip probe's state, per node ID. Its mutex is never
-// held together with Manager.mu: a round copies what it needs out of the dial
-// states under Manager.mu and releases it before it touches the table.
+// rttTable is the round-trip probe's state, per node ID, and the socket the
+// probe holds. Its mutex is never held together with Manager.mu: a round
+// copies what it needs out of the dial states under Manager.mu and releases
+// it before it touches the table, and endpoint selection reads conn under mu
+// between its device read and taking Manager.mu.
 //
 // Only the RunRTTProbe goroutine adds and deletes entries. The reader changes
 // the fields of entries that exist and MeshPeerStats reads them, both under
@@ -86,6 +88,32 @@ type rttTable struct {
 	// byIP maps the mesh IP of each peer the last round took to its node ID,
 	// for the reader to find the peer a reply comes from.
 	byIP map[netip.Addr]string
+	// conn is the socket the probe holds, nil while it holds none. rttOpen
+	// sets it after a successful listen, and the socket's reader clears it
+	// when it ends (see forget), so it is nil once the socket is closed and
+	// once RunRTTProbe returned. A sender other than the probe's goroutine
+	// may write on it (see socket).
+	conn net.PacketConn
+}
+
+// socket returns the socket the probe holds, nil while it holds none. A
+// sender other than the probe's goroutine may write on it: a net.PacketConn
+// takes concurrent writes, and a write that comes after the socket closed
+// fails with net.ErrClosed. Callers hold neither t.mu nor Manager.mu.
+func (t *rttTable) socket() net.PacketConn {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn
+}
+
+// forget clears the socket handle when it is still conn, whose reader ended.
+// A handle that names another socket stays.
+func (t *rttTable) forget(conn net.PacketConn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conn == conn {
+		t.conn = nil
+	}
 }
 
 // rttEntry is one peer's round-trip probe state.
@@ -215,7 +243,8 @@ type rttTarget struct {
 }
 
 // rttSocket is the probe socket a RunRTTProbe run holds. Only that run's
-// goroutine touches it.
+// goroutine touches it; other senders reach the socket through
+// rttTable.socket.
 type rttSocket struct {
 	// conn is the socket, nil while none is held.
 	conn net.PacketConn
@@ -226,7 +255,9 @@ type rttSocket struct {
 }
 
 // close closes the socket and waits for its reader to end. It does nothing
-// while no socket is held.
+// while no socket is held. The reader clears the socket handle of rttTable
+// before it closes done (see rttRead), so the handle is nil when close
+// returns, and close needs no clear of its own.
 func (s *rttSocket) close() {
 	if s.conn == nil {
 		return
@@ -279,7 +310,8 @@ func rttProbeAddr(meshIP netip.Addr) net.Addr {
 
 // RunRTTProbe measures the round-trip time to each mesh peer through the
 // tunnel until ctx is done, and then closes its socket, waits for the reader
-// and returns nil. MeshPeerStats reports the values as MeshPeerStat.RTT. A
+// and returns nil, with the socket handle (rttTable.socket) nil.
+// MeshPeerStats reports the values as MeshPeerStat.RTT. A
 // non-positive interval is replaced with DefaultRTTProbeInterval. The first
 // round runs half an interval after the start and one round runs per interval
 // after that, so a round's answers are in before the handshake report that
@@ -399,9 +431,11 @@ func (m *Manager) rttRound(ctx context.Context, s *rttSocket) bool {
 }
 
 // rttOpen listens when s holds no socket, or holds one whose reader ended,
-// and starts a reader on the new socket. It reports whether s holds a socket.
-// A failed listen logs wireguard: rtt probe listen failed, at Warn the first
-// time and at Debug while it keeps failing; a success resets that.
+// sets the socket handle of m.rtt to the new socket, and starts a reader on
+// it. It reports whether s holds a socket. A failed listen logs wireguard:
+// rtt probe listen failed, at Warn the first time and at Debug while it keeps
+// failing; a success resets that. The handle is set before the reader starts,
+// so a reader that ends at once still finds its socket there to clear.
 func (m *Manager) rttOpen(s *rttSocket) bool {
 	if s.conn != nil {
 		select {
@@ -431,6 +465,9 @@ func (m *Manager) rttOpen(s *rttSocket) bool {
 	s.listenFailing = false
 	s.conn = conn
 	s.done = make(chan struct{})
+	m.rtt.mu.Lock()
+	m.rtt.conn = conn
+	m.rtt.mu.Unlock()
 	go m.rttRead(conn, s.done)
 	return true
 }
@@ -543,14 +580,19 @@ func rttDatagram(kind byte, nonce [8]byte) []byte {
 // returns, until a read fails with net.ErrClosed. Any other read error logs
 // wireguard: rtt probe read failed at Debug and the reader reads on; after
 // rttMaxReadErrors in a row, which a good read resets, it closes conn and
-// ends. It closes done when it ends.
+// ends. When it ends it clears the socket handle of m.rtt if that is still
+// conn (see rttTable.forget), and then closes done, so whoever waits for done
+// finds no handle to a socket that is closed.
 //
 // An ICMP port unreachable for an earlier send is no read error: Linux and
 // macOS report none to a socket that is not connected, and on Windows Go
 // turns SIO_UDP_CONNRESET and SIO_UDP_NETRESET off on every UDP socket it
 // creates (net/fd_windows.go), so no WSAECONNRESET reaches this loop.
 func (m *Manager) rttRead(conn net.PacketConn, done chan<- struct{}) {
-	defer close(done)
+	defer func() {
+		m.rtt.forget(conn)
+		close(done)
+	}()
 	buf := make([]byte, rttReadBufferLen)
 	failed := 0
 	for {
