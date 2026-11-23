@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -39,6 +40,22 @@ type Manager struct {
 	// usable CIDR. It is zero until Setup succeeds.
 	meshPrefix netip.Prefix
 
+	// meshIP is the node's own mesh IP as Setup parsed it from the identity,
+	// the zero address when it does not parse or before Setup succeeds. The
+	// round-trip probe listens on it and sends no probe to it.
+	meshIP netip.Addr
+
+	// rttListen opens the round-trip probe's socket (see RunRTTProbe), and
+	// rttAddr returns the address a probe to a peer's mesh IP goes to. They
+	// default to listenRTT and rttProbeAddr, UDP port RTTProbePort of the
+	// mesh IPs; tests replace them to run managers on loopback.
+	rttListen func() (net.PacketConn, error)
+	rttAddr   func(meshIP netip.Addr) net.Addr
+
+	// rtt is the round-trip probe's state per peer, which MeshPeerStats
+	// reports as MeshPeerStat.RTT. It has a mutex of its own.
+	rtt rttTable
+
 	// localPrefixes returns the prefixes of this host's interface addresses
 	// that a candidate may be on-link with. The reconcile handler reads it to
 	// order a peer's on-link candidates first, and endpoint selection reads it
@@ -57,7 +74,9 @@ type Manager struct {
 	localKnown   bool
 	localFailing bool
 
-	// now is endpoint selection's clock; tests replace it.
+	// now is the clock of endpoint selection and of the round-trip probe,
+	// which reads a probe's send and receive instants from it; tests replace
+	// it.
 	now func() time.Time
 
 	// sendProbe sends the relay liveness probe to a relayed peer's mesh IP
@@ -110,7 +129,7 @@ type PeerRouter interface {
 // NewManager creates a new Manager. Config defaults are applied automatically.
 func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 	cfg.ApplyDefaults()
-	return &Manager{
+	m := &Manager{
 		ctrl:          ctrl,
 		cfg:           cfg,
 		logger:        logger,
@@ -118,8 +137,11 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 		dial:          make(map[string]*dialState),
 		localPrefixes: func() ([]netip.Prefix, error) { return nil, nil },
 		now:           time.Now,
+		rttAddr:       rttProbeAddr,
 		routes:        make(map[string]struct{}),
 	}
+	m.rttListen = m.listenRTT
+	return m
 }
 
 // Setup creates and configures the WireGuard interface using the node identity.
@@ -161,6 +183,9 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 	// fails only for an unparseable mesh IP, which leaves the prefix zero.
 	if prefix, err := netip.ParsePrefix(address); err == nil {
 		m.meshPrefix = prefix.Masked()
+	}
+	if ip, err := netip.ParseAddr(identity.MeshIP); err == nil {
+		m.meshIP = ip
 	}
 	m.mtu = mtu
 
@@ -404,6 +429,7 @@ type MeshPeerStat struct {
 	Endpoint         netip.AddrPort // invalid when the device knows no endpoint
 	LastHandshake    time.Time      // zero when no handshake has completed
 	RxBytes, TxBytes uint64
+	RTT              time.Duration // zero when the peer holds no value
 }
 
 // ErrPeerStatsUnsupported is returned by MeshPeerStats when the controller
@@ -419,6 +445,10 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 // is kept, because the tunnel metrics report it; the handshake reporter drops it
 // itself. Endpoint passes through as the device reports it, and the consumers
 // apply their own wire rules.
+//
+// RTT is the latest round-trip time the round-trip probe measured to the peer
+// (see RunRTTProbe), zero when the peer holds no value. The tunnel metrics and
+// endpoint selection ignore it.
 func (m *Manager) MeshPeerStats() ([]MeshPeerStat, error) {
 	// A nil m.ctrl fails the assertion as well, which is the case plexd up
 	// builds where no controller exists for the platform.
@@ -434,6 +464,7 @@ func (m *Manager) MeshPeerStats() ([]MeshPeerStat, error) {
 
 	nodeIDs := m.peers.NodeIDsByPublicKey()
 	mesh := make([]MeshPeerStat, 0, len(stats))
+	m.rtt.mu.Lock()
 	for _, s := range stats {
 		nodeID, ok := nodeIDs[s.PublicKey]
 		if !ok {
@@ -445,8 +476,10 @@ func (m *Manager) MeshPeerStats() ([]MeshPeerStat, error) {
 			LastHandshake: s.LastHandshake,
 			RxBytes:       s.RxBytes,
 			TxBytes:       s.TxBytes,
+			RTT:           m.rtt.value(nodeID),
 		})
 	}
+	m.rtt.mu.Unlock()
 	slices.SortFunc(mesh, func(a, b MeshPeerStat) int {
 		return strings.Compare(a.NodeID, b.NodeID)
 	})

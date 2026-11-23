@@ -55,7 +55,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Creating network namespaces and loading nftables rules need root, so
-      # the five Linux tests against the real kernel skip in the unprivileged
+      # the six Linux tests against the real kernel skip in the unprivileged
       # run above. They build their namespaces, links and TUN devices
       # themselves and leave the runner's own links and ruleset alone. The
       # traffic test TestNftablesController_RealTraffic runs the same checks
@@ -72,10 +72,13 @@ jobs:
       # ipsec and openvpn tunnels as the measurement did. The route test
       # TestNetlinkRouteController_RealRoutes shares that gate and proves that
       # RemoveRoute deletes the route AddRoute added, which a peer's routed
-      # subnet on the mesh interface depends on.
+      # subnet on the mesh interface depends on. The round-trip probe test
+      # TestRTTProbe_RealAnswersOnlyTheMeshInterface shares it too and proves
+      # that the probe socket answers only what arrives on the mesh
+      # interface, not a mesh source spoofed from another network.
       # The absolute go path is resolved before sudo resets PATH, and the two
       # cache variables let root reuse what the step above downloaded and
-      # built. The step fails unless all five tests passed: a skip would pass
+      # built. The step fails unless all six tests passed: a skip would pass
       # as well otherwise, so it greps the -v output for each PASS line. The
       # space after each name keeps one test's line from matching another's.
       - name: Run privileged Linux tests
@@ -89,10 +92,11 @@ jobs:
           grep -q -- '--- PASS: TestNftablesController_RealTraffic ' "$RUNNER_TEMP/real-nftables.txt"
           grep -q -- '--- PASS: TestNftablesController_RealConnLog ' "$RUNNER_TEMP/real-nftables.txt"
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_LINKS=1 \
-            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes)$' ./internal/bridge/ \
+            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface)$' ./internal/bridge/ ./internal/wireguard/ \
             | tee "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkVPNController_RealLinks ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkRouteController_RealRoutes ' "$RUNNER_TEMP/real-links.txt"
+          grep -q -- '--- PASS: TestRTTProbe_RealAnswersOnlyTheMeshInterface ' "$RUNNER_TEMP/real-links.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
       # and the forwarding sysctl, so the eight macOS tests against the real

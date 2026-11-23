@@ -791,6 +791,17 @@ func TestDarwinController_RealUTUN(t *testing.T) {
 		t.Errorf("%s does not carry 10.255.254.1", osName)
 	}
 
+	// The round-trip probe's default listen binds UDP port RTTProbePort of
+	// the mesh IP and sets IP_BOUND_IF to the utun, which only the kernel can
+	// accept or refuse.
+	mgr := NewManager(c, Config{InterfaceName: name}, discardLogger())
+	mgr.meshIP = netip.MustParseAddr("10.255.254.1")
+	if conn, err := mgr.listenRTT(); err != nil {
+		t.Errorf("listenRTT on %s: %v, want the probe socket bound to the utun", osName, err)
+	} else {
+		_ = conn.Close()
+	}
+
 	// netstat abbreviates a prefix (10.255.254/30), so match the interface and
 	// the prefix length rather than the CIDR string.
 	if !routeLine(t, osName, "/30") {

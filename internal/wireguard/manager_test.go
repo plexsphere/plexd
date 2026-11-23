@@ -968,16 +968,21 @@ func TestManager_MeshPeerStats_MapsIndexedPeers(t *testing.T) {
 		{PublicKey: rotatedOut, Endpoint: netip.MustParseAddrPort("203.0.113.9:51820"), LastHandshake: handshake, RxBytes: 1, TxBytes: 2},
 		{PublicKey: keyA, Endpoint: netip.MustParseAddrPort("198.51.100.7:51820"), LastHandshake: handshake, RxBytes: 2048, TxBytes: 1024},
 	}
+	// node-a holds a round-trip time; node-gone holds one too, but the device
+	// read does not list it.
+	holdRTT(mgr, "node-a", 23400*time.Microsecond)
+	holdRTT(mgr, "node-gone", time.Millisecond)
 
 	got, err := mgr.MeshPeerStats()
 	if err != nil {
 		t.Fatalf("MeshPeerStats: %v", err)
 	}
 
-	// Sorted by NodeID, the rotated-out key dropped, and node-b kept although
-	// it never completed a handshake.
+	// Sorted by NodeID, the rotated-out key dropped, node-b kept although it
+	// never completed a handshake, and RTT zero for node-b, which holds no
+	// value.
 	want := []MeshPeerStat{
-		{NodeID: "node-a", Endpoint: netip.MustParseAddrPort("198.51.100.7:51820"), LastHandshake: handshake, RxBytes: 2048, TxBytes: 1024},
+		{NodeID: "node-a", Endpoint: netip.MustParseAddrPort("198.51.100.7:51820"), LastHandshake: handshake, RxBytes: 2048, TxBytes: 1024, RTT: 23400 * time.Microsecond},
 		{NodeID: "node-b", Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"), RxBytes: 10, TxBytes: 20},
 	}
 	assertMeshPeerStats(t, got, want)
@@ -1001,6 +1006,7 @@ func TestManager_MeshPeerStats_NothingMaps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := &statsController{stats: tc.stats}
 			mgr := NewManager(ctrl, Config{}, discardLogger())
+			holdRTT(mgr, "node-a", time.Millisecond)
 
 			got, err := mgr.MeshPeerStats()
 			if err != nil {
@@ -1025,6 +1031,7 @@ func TestManager_MeshPeerStats_Unsupported(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mgr := NewManager(tc.ctrl, Config{}, discardLogger())
+			holdRTT(mgr, "node-a", time.Millisecond)
 
 			got, err := mgr.MeshPeerStats()
 			if !errors.Is(err, ErrPeerStatsUnsupported) {
@@ -1041,6 +1048,7 @@ func TestManager_MeshPeerStats_ReadError(t *testing.T) {
 	readErr := errors.New("netlink: boom")
 	ctrl := &statsController{err: readErr}
 	mgr := NewManager(ctrl, Config{}, discardLogger())
+	holdRTT(mgr, "node-a", time.Millisecond)
 
 	_, err := mgr.MeshPeerStats()
 	if !errors.Is(err, readErr) {
@@ -1061,10 +1069,19 @@ func assertMeshPeerStats(t *testing.T, got, want []MeshPeerStat) {
 	for i := range want {
 		g, w := got[i], want[i]
 		if g.NodeID != w.NodeID || g.Endpoint != w.Endpoint ||
-			!g.LastHandshake.Equal(w.LastHandshake) || g.RxBytes != w.RxBytes || g.TxBytes != w.TxBytes {
+			!g.LastHandshake.Equal(w.LastHandshake) || g.RxBytes != w.RxBytes || g.TxBytes != w.TxBytes ||
+			g.RTT != w.RTT {
 			t.Errorf("mesh peer stat %d:\ngot  %+v\nwant %+v", i, g, w)
 		}
 	}
+}
+
+// holdRTT makes the round-trip probe's table of m hold d as the value of
+// nodeID, as an answered probe leaves it.
+func holdRTT(m *Manager, nodeID string, d time.Duration) {
+	m.rtt.mu.Lock()
+	defer m.rtt.mu.Unlock()
+	m.rtt.entry(nodeID).value = d
 }
 
 // ---------------------------------------------------------------------------
