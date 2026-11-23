@@ -75,6 +75,7 @@ Represents an active tunnel session with a local TCP listener that forwards conn
 | `TargetHost` | `string`          | Target host to forward connections to    |
 | `TargetPort` | `int`             | Target port                              |
 | `MeshIP`     | `string`          | Mesh IP to bind the listener to          |
+| `MeshInterface` | `string`       | Interface the listener is bound to, set before `Start`. Empty binds the mesh IP alone |
 
 ### Constructor
 
@@ -86,14 +87,14 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 
 | Method       | Signature                                  | Description                                              |
 |--------------|--------------------------------------------|----------------------------------------------------------|
-| `Start`      | `(ctx context.Context) (string, error)`    | Opens TCP listener on meshIP:0, starts accept loop and, when an idle window is armed, the idle monitor and, when an activity reporter is wired, the activity report |
+| `Start`      | `(ctx context.Context) (string, error)`    | Opens TCP listener on meshIP:0, bound to `MeshInterface` when that is set, starts accept loop and, when an idle window is armed, the idle monitor and, when an activity reporter is wired, the activity report |
 | `Close`      | `() error`                                 | Idempotent shutdown: cancels context, closes listener and connection, then waits (bounded) for the forwarding goroutines so the byte counters are complete |
 | `IdleFor`    | `() time.Duration`                         | How long the session has gone without observed byte flow, measured monotonically |
 | `ListenAddr` | `() string`                                | Returns listener address or empty string if not started  |
 
 ### Connection Lifecycle
 
-1. `Start` binds a TCP listener to `meshIP:0` (ephemeral port, mesh-only interface) and derives the child context every goroutine it starts runs on, so `Close` cancels all of them
+1. `Start` binds a TCP listener to `meshIP:0` (ephemeral port) and, when `MeshInterface` is set, to the mesh interface (`SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` on macOS, through `ifbind.Control`, which sets no option on Windows), and derives the child context every goroutine it starts runs on, so `Close` cancels all of them
 2. `acceptLoop` runs in a goroutine, accepting one connection at a time
 3. Single-connection enforcement: if a connection is already active, new connections are rejected
 4. `forward` dials the target, sets the active connection under mutex, and runs bidirectional `io.Copy` with `sync.Once` cleanup and `sync.WaitGroup` for completion
@@ -102,9 +103,10 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 ### Security
 
 - Listener binds to mesh IP only, never `0.0.0.0` or `localhost`. `SessionManager.CreateSession` parses the mesh IP and refuses to provision a tcp session at all unless it is a bindable unicast address, because `net.Listen` on an empty or unspecified host binds every unicast address the host has. The check runs on the address `net.Listen` would actually bind — zone stripped and IPv4-mapped form unwrapped — so `::ffff:0.0.0.0` and `::%eth0` are refused as the wildcards they bind to, not accepted as the distinct addresses they parse to
+- Listener is also bound to the mesh interface, which `SessionManager` sets on every tcp session. On Linux the kernel refuses a connection that arrives on another interface with a reset, so the client gets `ECONNREFUSED`, from its own address and from a mesh source alike. On Linux a local client that dials the mesh IP from its default source still connects: the kernel picks the mesh IP as the source and attributes the packet to the mesh interface, the device that owns that address. On Linux a local client that sends from `127.0.0.1` or another address of the node does not connect, because the answer leaves through the mesh interface. A Mac that does not forward, with `net.inet.ip.check_interface=1`, the value measured on macOS 26, drops a segment for the mesh IP that arrives on another interface in the kernel already, and a process on a Mac cannot reach its own mesh IP at all. On a forwarding Mac, such as a macOS bridge, `IP_BOUND_IF` confines only what the listener sends, so a client on another network gets no answer. One case remains: a client that forges a mesh source completes the handshake only if it can read the SYN-ACK the node sends into the mesh to the forged address. plexd accepts that case and does not close it. Windows binds nothing, because it receives on the strong host model by default. Whether an adapter with forwarding on still does is not measured
 - At most one active forwarded connection per session
 - Context cancellation propagates to listener and active connection
-- The forward itself is **not** authenticated: whichever client reaches the listener first takes the single connection slot. Reachability to the node's mesh IP is the only control (see [WireGuard Mesh](#wireguard-mesh-internal-wireguard))
+- The forward itself is **not** authenticated: whichever client reaches the listener first takes the single connection slot. Reaching the node's mesh IP over the mesh interface is the only control (see [WireGuard Mesh](#wireguard-mesh-internal-wireguard)). The bind address enforces the address. On Linux the interface binding enforces the interface. On macOS a Mac that does not forward enforces it in the kernel, and on a forwarding Mac the binding keeps the listener's answers in the mesh, which leaves the case above. On Windows the strong host model enforces it by default
 
 ## SessionManager
 
@@ -113,11 +115,12 @@ Central coordinator for tunnel session lifecycle.
 ### Constructor
 
 ```go
-func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionManager
+func NewSessionManager(cfg Config, meshIP, meshIface string, logger *slog.Logger) *SessionManager
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
 - Logger is tagged with `component=tunnel`
+- `meshIface` is the operating system's name of the mesh interface, which every tcp session listener is bound to. Empty binds the mesh IP alone
 
 ### Methods
 
@@ -155,12 +158,18 @@ them together.
 | Capacity               | `len(sessions) >= MaxSessions`              | `tunnel: max sessions reached ({n})`                |
 | Invalid idle window    | `IdleTimeoutSeconds` negative or above 86400 | `tunnel: invalid idle_timeout_seconds: {n}`        |
 | Unbindable mesh IP (`tcp`) | `meshIP` empty, not an IP address, multicast, or unspecified once the zone is stripped and the IPv4-mapped form unwrapped (`0.0.0.0`, `::`, `::ffff:0.0.0.0`, `::%eth0`) | `tunnel: mesh IP {ip} is not a bindable unicast address; refusing to bind a session listener` |
+| Unbindable mesh interface (`tcp`) | The kernel does not know the mesh interface, or refuses `SO_BINDTODEVICE`: a Linux kernel before 5.7 asks for `CAP_NET_RAW`, which `plexd.service` and the DaemonSet grant | `tunnel: listen on {ip}:0: listen tcp {ip}:0: bind to interface {name}: {error}`; on Linux `{error}` is `operation not permitted` for a refused option and `no such device` for an unknown interface |
 
 The mesh-IP check runs for `tcp` entries only. An `ssh` session binds no
 listener, so an `ssh` entry never reads the mesh IP, and a manager built with an
 empty or unbindable one still serves ssh sessions. That is what lets a node
 whose WireGuard setup failed or never ran serve them (see
 [Deployment notes](#deployment-notes)).
+
+The interface binding fails in `Start`, once every check above has passed, and
+`CreateSession` then registers no session. The dispatcher warns
+`session listener setup failed` with the error, and the next pull tries again,
+as for any other failed setup (see [Provision Pass](#provision-pass)).
 
 `ErrTunnelingDisabled` and `ErrSSHSessionsDisabled` are sentinels: the dispatcher
 matches them with `errors.Is` to settle an entry permanently instead of retrying it
@@ -237,7 +246,7 @@ already.
 ```go
 logger := slog.Default()
 
-mgr := tunnel.NewSessionManager(tunnel.Config{}, "10.0.0.1", logger)
+mgr := tunnel.NewSessionManager(tunnel.Config{}, "10.0.0.1", "plexd0", logger)
 
 // Create a session from one entry of the pull's sessions block
 addr, err := mgr.CreateSession(ctx, api.NodeStateSession{
@@ -364,7 +373,7 @@ still outstanding.
 ### Registration
 
 ```go
-mgr := tunnel.NewSessionManager(tunnel.Config{}, meshIP, logger)
+mgr := tunnel.NewSessionManager(tunnel.Config{}, meshIP, meshIface, logger)
 
 sessionDispatcher := tunnel.NewDispatcher(mgr, reporter, logger)
 reconciler.RegisterDispatchHandler(sessionDispatcher.Handle)
@@ -662,20 +671,64 @@ sessions, via two methods of `api.ControlPlane`:
 
 ### WireGuard Mesh (`internal/wireguard`)
 
-The listeners of tcp sessions bind to the mesh IP assigned by the WireGuard interface. Connections arrive through the encrypted mesh — no ports are exposed on the public network. The `meshIP` parameter in `NewSessionManager` comes from `registration.NodeIdentity.MeshIP`, threaded through `NewMeshServer(cfg, meshIP, hostKey, verifier, logger)`. An ssh session binds nothing on the mesh: its connections are the ones plexd opens to the control plane (see [Listener](#listener)).
+The listeners of tcp sessions bind to the mesh IP assigned by the WireGuard interface, and, on Linux and macOS, to that interface. Connections arrive through the encrypted mesh — no ports are exposed on the public network. The `meshIP` parameter in `NewSessionManager` comes from `registration.NodeIdentity.MeshIP`, threaded through `NewMeshServer(cfg, meshIP, meshIface, hostKey, verifier, logger)`. For `meshIface`, `plexd up` passes `wgMgr.OSInterfaceName()`: `plexd0` by default on Linux, the kernel's `utunN` on macOS. An ssh session binds nothing on the mesh: its connections are the ones plexd opens to the control plane (see [Listener](#listener)).
 
-That bind address is the whole of a tcp listener's reachability boundary:
-the forward itself performs no authentication, accepting the first connection
-that arrives. The address is copied verbatim from the control plane's
-registration response into `identity.json`, so `CreateSession` parses it rather
-than trusting it and refuses to provision a tcp session unless it is a bindable
-unicast address — on an empty, unparseable, or unspecified value (`0.0.0.0`,
-`::`) `net.Listen` would bind every unicast address on the host and publish a
-forward to an internal service on the node's public and LAN interfaces.
+The mesh address and the mesh interface together are a tcp listener's
+reachability boundary: the forward itself performs no authentication, accepting
+the first connection that arrives. The address is copied verbatim from the
+control plane's registration response into `identity.json`, so `CreateSession`
+parses it rather than trusting it and refuses to provision a tcp session unless
+it is a bindable unicast address — on an empty, unparseable, or unspecified
+value (`0.0.0.0`, `::`) `net.Listen` would bind every unicast address on the
+host and publish a forward to an internal service on the node's public and LAN
+interfaces.
+
+The address alone does not keep other networks out. Linux delivers a segment
+for the mesh IP on whichever interface it arrives, so a listener bound to the
+mesh IP alone accepts a host on a LAN that routes the mesh IP through the node,
+from the host's own address and from a mesh source address that the node routes
+back to it. Bound to the mesh interface with `SO_BINDTODEVICE`, the listener
+takes a mesh peer as before, and the kernel refuses that host with a reset, from
+both sources. A Mac with `net.inet.ip.forwarding=0`, the default, and
+`net.inet.ip.check_interface=1`, the value measured on macOS 26, drops every
+segment for the mesh IP that arrives on another interface, with and without the
+binding. A Mac that forwards, as a macOS bridge does, delivers it, and a
+listener bound to the mesh IP alone completes a handshake with a client on
+another network, from the client's own address and from a mesh source.
+`IP_BOUND_IF` does not filter what the listener receives there. It confines what
+the listener sends to the mesh utun: a SYN from the other network's own address
+draws no answer on either interface, and a SYN with a mesh source that arrives
+on the other interface draws a SYN-ACK that leaves through the mesh utun only.
+Such a client completes the handshake only if it can read what the node sends
+into the mesh to the forged address.
+
+On Linux the binding therefore refuses every client whose packets arrive on an
+interface other than the mesh interface: a host on a LAN, a container or Pod on
+a bridge of the node, and a client behind a bridge's own user access or
+site-to-site interface that dials a session the bridge itself hosts. Each gets a
+reset. A forwarding Mac sends such a client no answer on its own network, apart
+from the forged mesh source case above. A session on another node that such a
+client reaches through the bridge arrives there over the mesh interface and is
+not affected. On Linux a client on the node itself connects when it dials the
+mesh IP from its default source (see [Security](#security)). A Mac cannot reach
+its own mesh IP at all, so no local client exists there.
+
+`TestSession_RealAcceptsOnlyMeshAndLocal` proves the Linux half in network
+namespaces on a real kernel. A listener bound to the mesh IP alone hands a LAN
+host's connection to the forward, which is the control. Bound to the mesh link,
+the listener forwards for the mesh peer and for a client on the node that dials
+the mesh IP, and the LAN host's dials from its own address and from a mesh
+source both fail with `ECONNREFUSED`. `TestSession_RealUTUN` proves the macOS
+half with two utuns and forwarding on. A listener bound to the mesh IP alone
+answers a SYN from the other network out of the other utun, which is the
+control. Bound to the mesh utun, the listener answers a peer's SYN there, sends
+no segment out of either utun for a SYN from the other network's own address,
+and answers a SYN with a mesh source that arrives on the other utun out of the
+mesh utun only.
 
 ::: warning Trust boundary
-Reaching a tcp session's listener means being routable to the node's mesh IP, which
-every peer in the mesh is by construction. Nothing binds a forwarded connection
+Every peer in the mesh reaches a tcp session's listener by construction, because it
+reaches the node's mesh IP over the mesh interface. Nothing binds a forwarded connection
 to the operator the control plane authorized: the session JWT is carried in the
 block as an opaque value and is never presented on the forwarded connection.
 Treat a live session as reachable by any mesh peer for its duration.
