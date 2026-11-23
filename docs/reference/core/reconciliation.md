@@ -10,7 +10,7 @@ The `internal/reconcile` package implements the core convergence loop that keeps
 
 The pull is one-way: plexd does not report drift corrections back to the control plane, except for the policy block, whose outcome (the ruleset plexd applied, the one it rejected and why, and what its default deny dropped) it sends as its [policy status report](../networking/network-policy.md#policy-status-report). `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility for the other blocks will return as node-authored state reports (issue #23).
 
-The envelope carries thirteen always-present blocks: `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, `signing_key`, `hooks`, `dns`, and `failure_detection`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
+The envelope carries fourteen always-present blocks: `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, `signing_key`, `hooks`, `dns`, `failure_detection`, and `shared_subnets`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence. `shared_subnets` is the exception: the control plane never sends it `null`, and the differ reads a `null`, an absent key and `[]` alike as no shared subnet.
 
 `executions` and `sessions` are the exceptions: both are consumed by the dispatch stage on every successful pull and neither is stored in the local snapshot nor diffed. `executions` is a delivery queue rather than desired state; `sessions` is desired state, but state the tunnel dispatcher converges on itself rather than through the differ.
 
@@ -178,14 +178,14 @@ All log entries use structured keys with `component=reconcile`:
 | `component`      | Always `"reconcile"`                 |
 | `node_id`        | Node identifier                      |
 | `interval`       | Configured reconciliation interval   |
-| `drift`          | Compact `diff.Summary()`, e.g. `"peers+1-0~2 policy bridge state reports"` (or `"none"`) |
+| `drift`          | Compact `diff.Summary()`, e.g. `"peers+1-0~2 policy bridge state reports shared_subnets"` (or `"none"`) |
 | `duration`       | Cycle execution time                 |
 | `handler_failed` | Whether any handler returned error   |
 | `error`          | Error details (on warn/error levels, and on the debug-level `FetchState failed` for a refused credential) |
 
 ## StateDiff
 
-Describes the drift between the desired and current `NodeStateSnapshot`. Peer changes are enumerated; the four block flags are presence-aware, so a `null` block and a populated block are distinct.
+Describes the drift between the desired and current `NodeStateSnapshot`. Peer changes are enumerated; the four block flags of the pointer blocks are presence-aware, so a `null` block and a populated block are distinct. `SharedSubnetsChanged` is not: a nil and an empty `shared_subnets` list both mean no shared subnet.
 
 ```go
 type StateDiff struct {
@@ -197,6 +197,8 @@ type StateDiff struct {
     BridgeChanged  bool
     StateChanged   bool
     ReportsChanged bool
+
+    SharedSubnetsChanged bool
 }
 ```
 
@@ -215,6 +217,7 @@ Comparison logic by block:
 | Bridge  | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | State   | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | Reports | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
+| Shared subnets | —          | Not presence-aware: changed when the lists differ in length, in a `Subnet`, or in a `Bridges` list compared in order, because the order is the failover order. A nil and an empty list compare equal, as do a nil and an empty `Bridges`, so a pull that drops the key and one that carries `[]` read the same. A pull whose only change is the block still runs the WireGuard reconcile handler, which takes the block from the desired snapshot (see [Shared subnets](../networking/wireguard.md#shared-subnets)) |
 
 The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change. The policy dispatch handler does not read the diff: `Enforcer.Sync` compares the fingerprint with the installed ruleset's the same way, so such a pull does not rebuild the ruleset either. `reachability` is the control plane's verdict about this node, not desired state, so it is never diffed or stored — the reachability observer decodes it on every successful pull and logs the verdict when it changes, and that is the whole of what plexd does with it. `executions` is a delivery queue whose entries are consumed once by the dispatch stage and settled through the execution callback, not converged on, so it too is never diffed or stored — there is no `ExecutionsChanged` flag, and a pull carrying only new executions still reports an empty diff. `signing_key` is not desired state either, so it is never diffed or stored: there is no `SigningKeyChanged` flag, the signing-key dispatch handler installs the key on every successful pull, and a pull whose only change is a new key reports an empty diff. `secrets` is never diffed either, because its dispatch handlers consume it on every successful pull, the node API's secret-index dispatch handler and, on a bridge with public ingress, `bridge.IngressSecretInventoryHandler`: there is no `SecretsChanged` flag, and a pull whose only change is the `secrets` block reports an empty diff.
 
@@ -224,7 +227,7 @@ The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes ov
 func (d StateDiff) Summary() string
 ```
 
-Returns a compact description of the diff for the cycle log, e.g. `"peers+1-0~2 policy bridge state reports"`. Only changed parts are mentioned; an empty diff returns `"none"`. It is logged under the `drift` key.
+Returns a compact description of the diff for the cycle log, e.g. `"peers+1-0~2 policy bridge state reports shared_subnets"`. Only changed parts are mentioned; an empty diff returns `"none"`. It is logged under the `drift` key.
 
 ### IsEmpty
 
@@ -232,7 +235,7 @@ Returns a compact description of the diff for the cycle log, e.g. `"peers+1-0~2 
 func (d StateDiff) IsEmpty() bool
 ```
 
-Returns `true` when all peer slices are empty and all four block flags are `false`.
+Returns `true` when all peer slices are empty and all five flags, the four block flags and `SharedSubnetsChanged`, are `false`.
 
 ## StateSnapshot
 
@@ -244,7 +247,7 @@ In-memory cache of the last known desired state, protected by `sync.RWMutex`.
 | `Get() api.NodeStateSnapshot`                  | Returns a deep copy of the current snapshot     |
 | `Update(desired *api.NodeStateSnapshot)`       | Atomically replaces all blocks (deep copy)      |
 
-All methods deep-copy data to prevent aliasing between snapshot and caller. `reachability` is not desired state, so `Get` always returns it as `nil` and `Update` never stores it; the reachability observer has already read and logged the block on the dispatch seam by the time `Update` runs. The same holds for `executions`: the dispatch stage has already consumed the block by the time `Update` runs, and storing it would make a redelivered entry look like drift. `signing_key` is not desired state either: `Get` always returns it as `nil` and `Update` never stores it, because the signing-key dispatch handler has already consumed the block by the time `Update` runs and the differ has nothing to converge on. `secrets` is never stored either: `Get` always returns it as `nil` and `Update` never stores it, because the node API's secret-index dispatch handler has already handed the block to the secret index, and `bridge.IngressSecretInventoryHandler` to the ingress manager, by the time `Update` runs. Nor is `dns`: `Get` always returns it as `nil` and `Update` never stores it, because the mesh resolver's dispatch handler takes the block on the dispatch seam. Nor is `failure_detection`: `Get` always returns it as `nil` and `Update` never stores it, because the WireGuard manager's dispatch handler takes the block on the dispatch seam.
+All methods deep-copy data to prevent aliasing between snapshot and caller. The snapshot stores the blocks `ComputeDiff` compares: `peers`, `policy`, `bridge`, `state`, `reports` and `shared_subnets`, each entry's `bridges` cloned on `Update` and on `Get`, so the next pull compares against what the handlers applied and a caller that changes a copy changes nothing stored. `reachability` is not desired state, so `Get` always returns it as `nil` and `Update` never stores it; the reachability observer has already read and logged the block on the dispatch seam by the time `Update` runs. The same holds for `executions`: the dispatch stage has already consumed the block by the time `Update` runs, and storing it would make a redelivered entry look like drift. `signing_key` is not desired state either: `Get` always returns it as `nil` and `Update` never stores it, because the signing-key dispatch handler has already consumed the block by the time `Update` runs and the differ has nothing to converge on. `secrets` is never stored either: `Get` always returns it as `nil` and `Update` never stores it, because the node API's secret-index dispatch handler has already handed the block to the secret index, and `bridge.IngressSecretInventoryHandler` to the ingress manager, by the time `Update` runs. Nor is `dns`: `Get` always returns it as `nil` and `Update` never stores it, because the mesh resolver's dispatch handler takes the block on the dispatch seam. Nor is `failure_detection`: `Get` always returns it as `nil` and `Update` never stores it, because the WireGuard manager's dispatch handler takes the block on the dispatch seam.
 
 > Drift reporting has been removed. There is no `BuildDriftReport`, `DriftReport`, or `DriftCorrection`, and `POST /v1/nodes/{node_id}/drift` does not exist upstream. Node-authored state reports (issue #23) will carry applied-correction visibility instead.
 
@@ -277,7 +280,7 @@ The agent registers these handlers (in `cmd/plexd/cmd/up.go`):
 | Handler                          | Responsibility                                                        |
 |----------------------------------|----------------------------------------------------------------------|
 | `nodeapi` cache handler          | Feed the local state cache from the snapshot `state` block           |
-| `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block, with each peer's [dial order](../networking/wireguard.md#dial-order) (on-link `endpoint_candidates`, the usable direct `endpoint`, off-link candidates, then the relays from `fallback_endpoints`, or from `fallback_endpoint` on a control plane that predates the set) and the edge PSK held for its current public key, and route the [routed subnets](../networking/wireguard.md#routed-subnets) the node accepts of each peer's `routed_subnets` through the mesh interface, removing the routes no peer lists any more (registered only when the WireGuard interface came up) |
+| `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block, with each peer's [dial order](../networking/wireguard.md#dial-order) (on-link `endpoint_candidates`, the usable direct `endpoint`, off-link candidates, then the relays from `fallback_endpoints`, or from `fallback_endpoint` on a control plane that predates the set) and the edge PSK held for its current public key, and route the [routed subnets](../networking/wireguard.md#routed-subnets) the node accepts of each peer's `routed_subnets` through the mesh interface, removing the routes no peer lists any more. It takes the `shared_subnets` block and keeps each [shared subnet](../networking/wireguard.md#shared-subnets) on the allowed IPs of one bridge (registered only when the WireGuard interface came up) |
 | bridge sub-handlers              | Reconcile relay, user-access, ingress, and site-to-site subtrees      |
 
 Signing-key rotation is no longer a reconcile handler. Key material comes from registration, from the pull's `signing_key` block through the signing-key dispatch handler below, and from the `signing_key_rotated` SSE event.

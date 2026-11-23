@@ -152,7 +152,7 @@ Every heartbeat line carries `component=heartbeat`.
 
 ## Handshake Reporter
 
-`HandshakeReporter` (`internal/agent/handshakes.go`) reports, for every mesh peer, the age of the latest completed WireGuard handshake and the endpoint WireGuard used for it to `POST /v1/nodes/{node_id}/handshakes`. The control plane derives each mesh edge's status, mode, handshake age and endpoint from these reports, and turns an endpoint at least two nodes report for the same peer into a peer-observed endpoint on the pulls of every node of the Domain except that peer (see [Peer-observed endpoints](../networking/peer-endpoint-exchange.md#peer-observed-endpoints)). An entry also carries `rtt_microseconds`, the round-trip time to the peer through the tunnel, when the [round-trip probe](../networking/wireguard.md#round-trip-probe) holds a value for the peer. The control plane ranks a pair's relays by it and shows it on the mesh edge. See [Control Plane API Endpoints](api-endpoints.md#mesh-edge-health) for the wire format and status codes.
+`HandshakeReporter` (`internal/agent/handshakes.go`) reports, for every mesh peer, the age of the latest completed WireGuard handshake and the endpoint WireGuard used for it to `POST /v1/nodes/{node_id}/handshakes`. The control plane derives each mesh edge's status, mode, handshake age and endpoint from these reports, and turns an endpoint at least two nodes report for the same peer into a peer-observed endpoint on the pulls of every node of the Domain except that peer (see [Peer-observed endpoints](../networking/peer-endpoint-exchange.md#peer-observed-endpoints)). An entry also carries `rtt_microseconds`, the round-trip time to the peer through the tunnel, when the [round-trip probe](../networking/wireguard.md#round-trip-probe) holds a value for the peer. The control plane ranks a pair's relays by it and shows it on the mesh edge. The entry of a bridge that holds a [shared subnet](../networking/wireguard.md#shared-subnets) carries `shared_subnets`, the subnets of the pull's `shared_subnets` block the node routes through that bridge, so an operator can tell a node that failed over from one that did not. See [Control Plane API Endpoints](api-endpoints.md#mesh-edge-health) for the wire format and status codes.
 
 ```go
 func NewHandshakeReporter(interval time.Duration, nodeID string, client HandshakeReportClient, source MeshPeerStatsSource, logger *slog.Logger) *HandshakeReporter
@@ -180,7 +180,7 @@ Each tick runs these steps in order:
 
 ### Build rules
 
-`buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) (req api.HandshakeReportRequest, skipped, truncated int)` turns the device read into the request body. `req.Peers` is never nil. One bad entry gets the whole report refused with a `400`, so the builder applies the contract's rules before anything is sent:
+`buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) (req api.HandshakeReportRequest, skipped, truncated, sharedCut int)` turns the device read into the request body. `req.Peers` is never nil. One bad entry gets the whole report refused with a `400`, so the builder applies the contract's rules before anything is sent:
 
 | Peer | Result |
 |------|--------|
@@ -189,15 +189,20 @@ Each tick runs these steps in order:
 | Endpoint is invalid, has port 0, or an unspecified address | Left out and counted in `skipped` |
 | Endpoint is an IPv4-mapped IPv6 address (`[::ffff:198.51.100.7]:51820`) | Unmapped to `198.51.100.7:51820`; otherwise the control plane's `mode: relayed` comparison against each of the peer's plain-IPv4 relays never matches |
 | Endpoint carries an IPv6 zone (`[fe80::1%eth0]:51820`) | Zone stripped to `[fe80::1]:51820`. The control plane refuses a zoned endpoint with `400 handshake_endpoint_unparseable` for the whole report, and leaving the peer out instead would make a working link-local edge read `never_reported` |
-| `NodeID` appears twice | The entry with the smaller age is kept, with its own `rtt_microseconds` or without one, as that entry has it |
+| `NodeID` appears twice | The entry with the smaller age is kept, with its own `rtt_microseconds` and `shared_subnets` or without them, as that entry has them |
 | `RTT` is above zero | The entry carries `rtt_microseconds`, rendered by `rttMicroseconds` |
-| `RTT` is zero or negative | The entry carries no `rtt_microseconds`, so it holds the three required members alone |
+| `RTT` is zero or negative | The entry carries no `rtt_microseconds`, so it holds the three required members alone, or beside `shared_subnets` |
+| `SharedSubnets` holds entries | The entry carries `shared_subnets`, the list in the stat's order: the shared subnets whose holder the peer is, sorted by address and then by prefix length |
+| `SharedSubnets` holds more than `api.MaxHandshakeSharedSubnets` (256) entries | The list is cut after its 256th entry, and the entries left out are counted in `sharedCut` |
+| `SharedSubnets` is nil or empty | The entry carries no `shared_subnets`, which the control plane reads as none and clears what it stored for the edge |
 
 The endpoint is rendered with `netip.AddrPort.String()`, which puts an IPv6 host in brackets. The age is `observedAt` minus `LastHandshake`, floored to whole seconds, so 4.9s reports as 4. A negative age, from a wall clock stepped back, reports as 0, and an age above `math.MaxInt32` reports as 2147483647.
 
 `rtt_microseconds` comes from `MeshPeerStat.RTT`, the latest value of the [round-trip probe](../networking/wireguard.md#round-trip-probe), through `rttMicroseconds(d time.Duration) *int32`. It returns nil for `d <= 0`, which the device read uses for a peer without a value, and the member then stays off the wire. Otherwise it returns `d` in whole microseconds, truncated, raised to 1 when below, since a time under a microsecond is still a measurement and the contract refuses 0, and capped at 2147483647 (`math.MaxInt32`), the contract's ceiling. So 23.4 ms reports as 23400, 300 ns as 1 and 3000 s as 2147483647.
 
 Entries are sorted by age ascending, then by `peer_node_id`. Beyond `api.MaxHandshakeReportPeers` (4096) the oldest entries are cut and counted in `truncated`, so the report keeps the most recent handshakes.
+
+`shared_subnets` comes from `MeshPeerStat.SharedSubnets`, which the WireGuard manager fills for the bridge that holds each [shared subnet](../networking/wireguard.md#shared-subnets) when the device is read. The manager accepted each subnet as an IPv4 prefix without host bits and keeps it once, in canonical form, so the builder copies the list onto the entry in its order. A peer without a completed handshake has no entry, so a subnet held by a bridge that never connected is not reported. The member travels only for a subnet a pull named in `shared_subnets`: against a control plane that predates the block no entry carries it.
 
 ### Not-served behavior
 
@@ -209,6 +214,8 @@ No plexd release through v0.38.0 sends `rtt_microseconds`. The control plane dec
 
 A pair measures each other only when both nodes run a plexd with the probe. A peer on an older plexd, a plain WireGuard peer and a node whose host firewall drops UDP port 7911 answer no probe, so the node reports them with their handshake age and endpoint and without `rtt_microseconds`. The control plane takes either end's value for a node and a relay bridge: when the node reports no time for the bridge, the time the bridge reports for the node counts. One answering side is therefore enough for the ranking, and a pair whose nodes report no round-trip time dials its relays in the Domain order.
 
+No plexd release through v0.38.0 sends `shared_subnets` either, and a control plane that predates the member refuses a report that carries it with `400 malformed_handshake_report`, as an unknown member, and records nothing of that report. The reporter has no fallback for it either, as it has none for `rtt_microseconds`, and needs none: it sends the member only for a subnet a pull named in `shared_subnets`, which such a control plane never does. During a rolling deploy of a control plane that gains the member, a report with the member can reach a replica that refuses it. The reporter logs `agent: handshake report: send failed` for that tick, and the next tick builds a fresh report. A node on v0.38.0 or older beside upgraded nodes reports no `shared_subnets` and routes each shared subnet through its carrier.
+
 ### Logging
 
 | Level | Message | When |
@@ -217,12 +224,13 @@ A pair measures each other only when both nodes run a plexd with the probe. A pe
 | Warn  | `agent: handshake report: read peer stats failed` | The device read failed; carries `error`. Nothing is sent that tick |
 | Debug | `agent: handshake report: skipped peers` | `skipped > 0`; carries `count` |
 | Warn  | `agent: handshake report: more peers than the contract allows, reporting the most recent` | `truncated > 0`; carries `peers` and `max` |
+| Warn  | `agent: handshake report: more shared subnets than the contract allows` | `sharedCut > 0`; carries `count`, the number of shared subnets left out over all entries, and `max` (256) |
 | Info  | `agent: handshake report: control plane does not accept handshake reports, retrying every interval` | The first not-served answer; carries `status` and `code` |
 | Error | `agent: handshake report: rejected for clock skew, synchronize the system clock via NTP` | `400 handshake_clock_skew`: `observed_at` is more than 60s from the control plane's time |
 | Debug | `agent: handshake report: send failed` | `api.ErrCredentialRefused`: the heartbeat is parked and no request was sent; carries `error` |
 | Warn  | `agent: handshake report: send failed` | Any other failure except a refused credential; carries `error` |
 | Info  | `agent: handshake report: control plane accepts handshake reports` | The first accepted report after a not-served answer |
-| Debug | `agent: handshake report: accepted` | Every accepted report; carries `sent`, `with_rtt` (the number of sent entries that carry `rtt_microseconds`), `recorded`, `ignored` and `accepted_at` |
+| Debug | `agent: handshake report: accepted` | Every accepted report; carries `sent`, `with_rtt` (the number of sent entries that carry `rtt_microseconds`), `with_shared_subnets` (the number of sent entries that carry `shared_subnets`), `recorded`, `ignored` and `accepted_at` |
 
 ## Integration Wiring
 
