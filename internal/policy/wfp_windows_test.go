@@ -123,50 +123,114 @@ func relayProbeConds(luid uint64) []wf.Match {
 	}
 }
 
-// checkRelayProbes fails unless filters open with the relay probe permits of
-// the interfaces with the given LUIDs, in that order, each pair at both
-// connect layers and above the weight of rule 0 of n. It returns the filters
-// that follow the permits.
-func checkRelayProbes(t *testing.T, filters []*wf.Rule, chain string, epoch uint32, n int, luids ...uint64) []*wf.Rule {
+// rttProbeConds is the condition list of a round-trip probe permit on the
+// interface with the given LUID: UDP to port 7911, to and from any address,
+// with port the field the port is read from, the remote port at a connect
+// layer and the local port at a receive-accept layer.
+func rttProbeConds(luid uint64, port wf.FieldID) []wf.Match {
+	return []wf.Match{
+		{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: luid},
+		{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoUDP},
+		{Field: port, Op: wf.MatchTypeEqual, Value: uint16(7911)},
+	}
+}
+
+// wantProbe is a probe permit a test expects at the front of a filter list.
+type wantProbe struct {
+	name  string
+	layer wf.LayerID
+	conds []wf.Match
+}
+
+// checkProbePermits fails unless filters open with the wanted probe permits,
+// each a permit in plexd's sublayer above the weight of rule 0 of n, and
+// returns the filters that follow them.
+func checkProbePermits(t *testing.T, filters []*wf.Rule, epoch uint32, n int, want []wantProbe) []*wf.Rule {
 	t.Helper()
 
-	if len(filters) < 2*len(luids) {
-		t.Fatalf("buildFilters() built %d filters, want at least the %d relay probe permits", len(filters), 2*len(luids))
+	if len(filters) < len(want) {
+		t.Fatalf("buildFilters() left %d filters, want at least the %d probe permits %v", len(filters), len(want), want)
 	}
 	weight := wfpWeight(epoch, n, -1)
 	if weight <= wfpWeight(epoch, n, 0) {
-		t.Fatalf("relay probe weight %#x does not outweigh rule 0's %#x", weight, wfpWeight(epoch, n, 0))
+		t.Fatalf("probe weight %#x does not outweigh rule 0's %#x", weight, wfpWeight(epoch, n, 0))
 	}
-	for i, luid := range luids {
-		for j, want := range []struct {
-			name  string
-			layer wf.LayerID
-		}{
-			{name: "plexd " + chain + " relay probe", layer: wf.LayerALEAuthConnectV4},
-			{name: "plexd " + chain + " relay probe v6", layer: wf.LayerALEAuthConnectV6},
-		} {
-			got := filters[2*i+j]
-			if got.Name != want.name {
-				t.Errorf("filter %d name = %q, want %q", 2*i+j, got.Name, want.name)
-			}
-			if got.Layer != want.layer {
-				t.Errorf("filter %q layer = %v, want %v", got.Name, got.Layer, want.layer)
-			}
-			if got.Sublayer != plexdSublayerID {
-				t.Errorf("filter %q sublayer = %v, want %v", got.Name, got.Sublayer, plexdSublayerID)
-			}
-			if got.Action != wf.ActionPermit {
-				t.Errorf("filter %q action = %v, want %v", got.Name, got.Action, wf.ActionPermit)
-			}
-			if got.Weight != weight {
-				t.Errorf("filter %q weight = %#x, want %#x", got.Name, got.Weight, weight)
-			}
-			if c := conds(t, got); !reflect.DeepEqual(c, relayProbeConds(luid)) {
-				t.Errorf("filter %q conditions =\n%v\nwant\n%v", got.Name, c, relayProbeConds(luid))
-			}
+	for i, w := range want {
+		got := filters[i]
+		if got.Name != w.name {
+			t.Errorf("filter %d name = %q, want %q", i, got.Name, w.name)
+		}
+		if got.Layer != w.layer {
+			t.Errorf("filter %q layer = %v, want %v", got.Name, got.Layer, w.layer)
+		}
+		if got.Sublayer != plexdSublayerID {
+			t.Errorf("filter %q sublayer = %v, want %v", got.Name, got.Sublayer, plexdSublayerID)
+		}
+		if got.Action != wf.ActionPermit {
+			t.Errorf("filter %q action = %v, want %v", got.Name, got.Action, wf.ActionPermit)
+		}
+		if got.Weight != weight {
+			t.Errorf("filter %q weight = %#x, want %#x", got.Name, got.Weight, weight)
+		}
+		if c := conds(t, got); !reflect.DeepEqual(c, w.conds) {
+			t.Errorf("filter %q conditions =\n%v\nwant\n%v", got.Name, c, w.conds)
 		}
 	}
-	return filters[2*len(luids):]
+	return filters[len(want):]
+}
+
+// checkRelayProbes fails unless filters open with the two relay probe
+// permits of the interface with the given LUID, one at each connect layer and
+// above the weight of rule 0 of n. It returns the filters that follow them.
+func checkRelayProbes(t *testing.T, filters []*wf.Rule, chain string, epoch uint32, n int, luid uint64) []*wf.Rule {
+	t.Helper()
+
+	return checkProbePermits(t, filters, epoch, n, []wantProbe{
+		{name: "plexd " + chain + " relay probe", layer: wf.LayerALEAuthConnectV4, conds: relayProbeConds(luid)},
+		{name: "plexd " + chain + " relay probe v6", layer: wf.LayerALEAuthConnectV6, conds: relayProbeConds(luid)},
+	})
+}
+
+// checkRTTProbes fails unless filters open with the four round-trip probe
+// permits of the interface with the given LUID, above the weight of rule 0 of
+// n: per family the connect layer, with the port as the remote port, and then
+// the receive-accept layer, with the port as the local port. None sits at a
+// forward layer. It returns the filters that follow them.
+func checkRTTProbes(t *testing.T, filters []*wf.Rule, chain string, epoch uint32, n int, luid uint64) []*wf.Rule {
+	t.Helper()
+
+	want := []wantProbe{
+		{name: "plexd " + chain + " rtt probe", layer: wf.LayerALEAuthConnectV4, conds: rttProbeConds(luid, wf.FieldIPRemotePort)},
+		{name: "plexd " + chain + " rtt probe inbound", layer: wf.LayerALEAuthRecvAcceptV4, conds: rttProbeConds(luid, wf.FieldIPLocalPort)},
+		{name: "plexd " + chain + " rtt probe v6", layer: wf.LayerALEAuthConnectV6, conds: rttProbeConds(luid, wf.FieldIPRemotePort)},
+		{name: "plexd " + chain + " rtt probe inbound v6", layer: wf.LayerALEAuthRecvAcceptV6, conds: rttProbeConds(luid, wf.FieldIPLocalPort)},
+	}
+	for _, f := range filters[:min(len(want), len(filters))] {
+		if f.Layer == wf.LayerIPForwardV4 || f.Layer == wf.LayerIPForwardV6 {
+			t.Errorf("filter %q sits at forward layer %v, want no round-trip probe permit there", f.Name, f.Layer)
+		}
+	}
+	return checkProbePermits(t, filters, epoch, n, want)
+}
+
+// checkProbes fails unless filters open with the probe permits of the
+// interfaces with the given LUIDs, in that order: per interface its relay
+// probe permits and then its round-trip probe permits. It fails as well for a
+// probe permit among the filters that follow, which it returns.
+func checkProbes(t *testing.T, filters []*wf.Rule, chain string, epoch uint32, n int, luids ...uint64) []*wf.Rule {
+	t.Helper()
+
+	rest := filters
+	for _, luid := range luids {
+		rest = checkRelayProbes(t, rest, chain, epoch, n, luid)
+		rest = checkRTTProbes(t, rest, chain, epoch, n, luid)
+	}
+	for _, f := range rest {
+		if strings.Contains(f.Name, " relay probe") || strings.Contains(f.Name, " rtt probe") {
+			t.Errorf("buildFilters() built %q among the rule filters, want the probe permits once per interface ahead of them", f.Name)
+		}
+	}
+	return rest
 }
 
 // v6AddrMatch is the condition buildFilters installs for an IPv6 address:
@@ -566,10 +630,11 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 	if err := ctrl.ApplyRules("plexd-mesh", sixRules); err != nil {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
-	// Two relay probe permits, an inbound and an outbound filter per rule,
-	// and a forward filter for each of the last three rules.
-	if got := len(engine.order); got != 17 {
-		t.Fatalf("installed %d filters, want 17", got)
+	// Two relay probe permits, four round-trip probe permits, an inbound and
+	// an outbound filter per rule, and a forward filter for each of the last
+	// three rules.
+	if got := len(engine.order); got != 21 {
+		t.Fatalf("installed %d filters, want 21", got)
 	}
 
 	// The inbound filters match the rule's source as the remote address and
@@ -606,6 +671,26 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 			name: "plexd plexd-mesh relay probe v6", layer: wf.LayerALEAuthConnectV6,
 			action: wf.ActionPermit, weight: uint64(1)<<32 | 7,
 			conds: relayProbeConds(42),
+		},
+		{
+			name: "plexd plexd-mesh rtt probe", layer: wf.LayerALEAuthConnectV4,
+			action: wf.ActionPermit, weight: uint64(1)<<32 | 7,
+			conds: rttProbeConds(42, wf.FieldIPRemotePort),
+		},
+		{
+			name: "plexd plexd-mesh rtt probe inbound", layer: wf.LayerALEAuthRecvAcceptV4,
+			action: wf.ActionPermit, weight: uint64(1)<<32 | 7,
+			conds: rttProbeConds(42, wf.FieldIPLocalPort),
+		},
+		{
+			name: "plexd plexd-mesh rtt probe v6", layer: wf.LayerALEAuthConnectV6,
+			action: wf.ActionPermit, weight: uint64(1)<<32 | 7,
+			conds: rttProbeConds(42, wf.FieldIPRemotePort),
+		},
+		{
+			name: "plexd plexd-mesh rtt probe inbound v6", layer: wf.LayerALEAuthRecvAcceptV6,
+			action: wf.ActionPermit, weight: uint64(1)<<32 | 7,
+			conds: rttProbeConds(42, wf.FieldIPLocalPort),
 		},
 		{
 			name: "plexd plexd-mesh #0 inbound", layer: wf.LayerALEAuthRecvAcceptV4,
@@ -738,15 +823,23 @@ func TestWFPController_ApplyRules_Translation(t *testing.T) {
 		}
 	}
 
-	// The relay probe permits go in ahead of the rule filters.
-	for i, name := range []string{"plexd plexd-mesh relay probe", "plexd plexd-mesh relay probe v6"} {
+	// The relay probe permits and then the round-trip probe permits go in
+	// ahead of the rule filters.
+	for i, name := range []string{
+		"plexd plexd-mesh relay probe",
+		"plexd plexd-mesh relay probe v6",
+		"plexd plexd-mesh rtt probe",
+		"plexd plexd-mesh rtt probe inbound",
+		"plexd plexd-mesh rtt probe v6",
+		"plexd plexd-mesh rtt probe inbound v6",
+	} {
 		if got := engine.rules[engine.order[i]].Name; got != name {
 			t.Errorf("filter %d installed = %q, want %q", i, got, name)
 		}
 	}
 
 	if got := ctrl.chains["plexd-mesh"]; !slices.Equal(got, engine.order) {
-		t.Errorf("chain plexd-mesh = %v, want the seventeen installed filters %v", got, engine.order)
+		t.Errorf("chain plexd-mesh = %v, want the twenty-one installed filters %v", got, engine.order)
 	}
 	if ctrl.epoch != 1 {
 		t.Errorf("epoch = %d, want 1", ctrl.epoch)
@@ -831,8 +924,9 @@ func TestWFPController_ApplyRules_ForwardFiltersCarryNoProtocol(t *testing.T) {
 		return wf.Match{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: p}
 	}
 
-	// The relay probe permits come first. The three allows yield inbound and
-	// outbound filters alone, each with its protocol, since the connect
+	// The relay probe permits and then the round-trip probe permits come
+	// first, none of them at a forward layer. The three allows yield inbound
+	// and outbound filters alone, each with its protocol, since the connect
 	// layers carry one. The tcp deny and the default deny name no address,
 	// so each yields a filter at all six layers, and the forward ones carry
 	// the interface index and nothing else.
@@ -843,6 +937,10 @@ func TestWFPController_ApplyRules_ForwardFiltersCarryNoProtocol(t *testing.T) {
 	}{
 		{name: "plexd plexd-mesh relay probe", layer: wf.LayerALEAuthConnectV4, conds: relayProbeConds(42)},
 		{name: "plexd plexd-mesh relay probe v6", layer: wf.LayerALEAuthConnectV6, conds: relayProbeConds(42)},
+		{name: "plexd plexd-mesh rtt probe", layer: wf.LayerALEAuthConnectV4, conds: rttProbeConds(42, wf.FieldIPRemotePort)},
+		{name: "plexd plexd-mesh rtt probe inbound", layer: wf.LayerALEAuthRecvAcceptV4, conds: rttProbeConds(42, wf.FieldIPLocalPort)},
+		{name: "plexd plexd-mesh rtt probe v6", layer: wf.LayerALEAuthConnectV6, conds: rttProbeConds(42, wf.FieldIPRemotePort)},
+		{name: "plexd plexd-mesh rtt probe inbound v6", layer: wf.LayerALEAuthRecvAcceptV6, conds: rttProbeConds(42, wf.FieldIPLocalPort)},
 		{
 			name: "plexd plexd-mesh #0 inbound", layer: wf.LayerALEAuthRecvAcceptV4,
 			conds: []wf.Match{
@@ -956,8 +1054,8 @@ func TestFakeEngine_RefusesFieldTheLayerLacks(t *testing.T) {
 // layer sees one family only. An allow that names a protocol gets the inbound
 // and the outbound filter of its family alone, because the forward layers
 // have no protocol field. Every filter of a rule carries the rule's weight.
-// The relay probe permits ahead of the rule filters sit at both connect layers
-// whatever the rule's family.
+// The probe permits ahead of the rule filters sit at the layers of both
+// families whatever the rule's family.
 func TestWFPController_BuildFilters_Families(t *testing.T) {
 	type filter struct {
 		name  string
@@ -1165,7 +1263,7 @@ func TestWFPController_BuildFilters_Families(t *testing.T) {
 				t.Fatalf("buildFilters() error = %v, want nil", err)
 			}
 			checkEngineTakes(t, all)
-			filters := checkRelayProbes(t, all, "plexd-mesh", 1, 1, 42)
+			filters := checkProbes(t, all, "plexd-mesh", 1, 1, 42)
 			if len(filters) != len(tt.want) {
 				names := make([]string, 0, len(filters))
 				for _, f := range filters {
@@ -1233,6 +1331,10 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 	want := []string{
 		"plexd plexd-mesh relay probe",
 		"plexd plexd-mesh relay probe v6",
+		"plexd plexd-mesh rtt probe",
+		"plexd plexd-mesh rtt probe inbound",
+		"plexd plexd-mesh rtt probe v6",
+		"plexd plexd-mesh rtt probe inbound v6",
 		"plexd plexd-mesh #0 inbound",
 		"plexd plexd-mesh #0 outbound",
 		"plexd plexd-mesh #0 forward",
@@ -1279,9 +1381,10 @@ func TestWFPController_BuildFilters_CountsRulesNotFilters(t *testing.T) {
 	}
 }
 
-// The relay probe permits come once per interface the rules name, in the order
-// the interfaces first appear, and ahead of every rule filter. They outweigh
-// rule 0, so a rule that denies UDP to port 9 still leaves the probe alone.
+// The relay probe permits and the round-trip probe permits come once per
+// interface the rules name, in the order the interfaces first appear, and
+// ahead of every rule filter. They outweigh rule 0, so a rule that denies UDP
+// to port 9 or to port 7911 still leaves the probes alone.
 func TestWFPController_BuildFilters_RelayProbe(t *testing.T) {
 	ctrl, _, _ := newTestWFPController(t)
 
@@ -1297,24 +1400,27 @@ func TestWFPController_BuildFilters_RelayProbe(t *testing.T) {
 	checkEngineTakes(t, filters)
 
 	// plexd0 has LUID 42 and Ethernet LUID 7 in the fake lookup.
-	rest := checkRelayProbes(t, filters, "plexd-mesh", 3, len(rules), 42, 7)
+	rest := checkProbes(t, filters, "plexd-mesh", 3, len(rules), 42, 7)
 	if len(rest) == 0 {
-		t.Fatal("buildFilters() built the relay probe permits alone, want the rule filters after them")
+		t.Fatal("buildFilters() built the probe permits alone, want the rule filters after them")
 	}
 	if rest[0].Name != "plexd plexd-mesh #0 inbound" {
-		t.Errorf("the relay probe permits are followed by %q, want rule 0's inbound filter", rest[0].Name)
+		t.Errorf("the probe permits are followed by %q, want rule 0's inbound filter", rest[0].Name)
 	}
 	for _, f := range rest {
-		if strings.Contains(f.Name, "relay probe") {
+		if strings.Contains(f.Name, "relay probe") || strings.Contains(f.Name, "rtt probe") {
 			t.Errorf("buildFilters() built %q among the rule filters, want the permits once per interface ahead of them", f.Name)
 		}
 	}
 	if probe, deny := filters[0].Weight, wfpWeight(3, len(rules), 0); probe <= deny {
 		t.Errorf("relay probe weight = %#x, want more than rule 0's %#x", probe, deny)
 	}
+	if probe, deny := filters[2].Weight, wfpWeight(3, len(rules), 0); probe <= deny {
+		t.Errorf("round-trip probe weight = %#x, want more than rule 0's %#x", probe, deny)
+	}
 }
 
-// A chain without rules names no interface, so it gets no relay probe permit
+// A chain without rules names no interface, so it gets no probe permit
 // either, and an apply of it leaves the chain without a filter.
 func TestWFPController_BuildFilters_NoRules(t *testing.T) {
 	for _, rules := range [][]FirewallRule{nil, {}} {
@@ -1351,21 +1457,22 @@ func TestWFPController_ApplyRules_ReplacesWithHigherEpoch(t *testing.T) {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
 	first := slices.Clone(ctrl.chains["plexd-mesh"])
-	// The first three rules yield eight filters: the two relay probe permits
-	// and an inbound and an outbound filter per rule. Each is an allow that
-	// names a protocol, so none of them gets a forward filter.
-	if len(first) != 8 {
-		t.Fatalf("the first apply installed %d filters, want 8", len(first))
+	// The first three rules yield twelve filters: the two relay probe
+	// permits, the four round-trip probe permits and an inbound and an
+	// outbound filter per rule. Each is an allow that names a protocol, so
+	// none of them gets a forward filter.
+	if len(first) != 12 {
+		t.Fatalf("the first apply installed %d filters, want 12", len(first))
 	}
 
-	// The last three yield eleven: the two permits and an inbound, an
+	// The last three yield fifteen: the six permits and an inbound, an
 	// outbound and a forward filter per rule.
 	if err := ctrl.ApplyRules("plexd-mesh", sixRules[3:]); err != nil {
 		t.Fatalf("ApplyRules() second error = %v, want nil", err)
 	}
 	second := ctrl.chains["plexd-mesh"]
-	if len(second) != 11 {
-		t.Fatalf("the second apply left %d filters, want 11", len(second))
+	if len(second) != 15 {
+		t.Fatalf("the second apply left %d filters, want 15", len(second))
 	}
 	for _, id := range second {
 		if got := engine.rules[id].Weight >> 32; got != 2 {
@@ -1376,14 +1483,14 @@ func TestWFPController_ApplyRules_ReplacesWithHigherEpoch(t *testing.T) {
 	if !slices.Equal(engine.deleted, first) {
 		t.Errorf("deleted = %v, want the filters of the first apply %v", engine.deleted, first)
 	}
-	if len(engine.order) != 19 {
-		t.Fatalf("added %d filters over both applies, want 19", len(engine.order))
+	if len(engine.order) != 27 {
+		t.Fatalf("added %d filters over both applies, want 27", len(engine.order))
 	}
 	// The chain is never unfiltered: every stale filter went after all
-	// nineteen filters had been added.
+	// twenty-seven filters had been added.
 	for i, added := range engine.deletedAfter {
-		if added != 19 {
-			t.Errorf("deletion %d ran after %d additions, want 19", i, added)
+		if added != 27 {
+			t.Errorf("deletion %d ran after %d additions, want 27", i, added)
 		}
 	}
 }
@@ -1454,15 +1561,15 @@ func TestWFPController_ApplyRules_UnknownInterface(t *testing.T) {
 
 // An IPv6 rule is installed at the IPv6 layers alone: a WFP layer sees one
 // family, and the IPv4 layers would never see a packet the rule names. Only
-// the relay probe permits of its interface sit at an IPv4 layer.
+// the probe permits of its interface sit at IPv4 layers.
 func TestWFPController_ApplyRules_IPv6Address(t *testing.T) {
 	ctrl, engine, _ := newTestWFPController(t)
 
 	if err := ctrl.ApplyRules("plexd-mesh", []FirewallRule{{Interface: "plexd0", SrcIP: "fd00::/64", Action: "allow"}}); err != nil {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
-	if got := len(engine.order); got != 5 {
-		t.Fatalf("installed %d filters, want 5: the two relay probe permits and three for the rule", got)
+	if got := len(engine.order); got != 9 {
+		t.Fatalf("installed %d filters, want 9: the two relay probe permits, the four round-trip probe permits and three for the rule", got)
 	}
 
 	src := netip.MustParsePrefix("fd00::/64")
@@ -1542,11 +1649,12 @@ func TestWFPController_ApplyRules_AddFails(t *testing.T) {
 	}
 	installed := slices.Clone(ctrl.chains["plexd-mesh"])
 
-	// The second apply installs the two relay probe permits and then rule 0's
-	// inbound filter, so its fourth AddRule is the first outbound filter of a
-	// rule, and three filters are already installed when it fails.
+	// The second apply installs the two relay probe permits, the four
+	// round-trip probe permits and then rule 0's inbound filter, so its
+	// eighth AddRule is the first outbound filter of a rule, and seven
+	// filters are already installed when it fails.
 	engine.addRuleErr = windows.ERROR_ACCESS_DENIED
-	engine.addRuleErrAt = 4
+	engine.addRuleErrAt = 8
 
 	err := ctrl.ApplyRules("plexd-mesh", sixRules[3:])
 	if err == nil || !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
@@ -1560,8 +1668,8 @@ func TestWFPController_ApplyRules_AddFails(t *testing.T) {
 		t.Errorf("ApplyRules() error = %v, want the Administrator hint", err)
 	}
 
-	if got := len(engine.order) - len(installed); got != 3 {
-		t.Errorf("the failed apply added %d filters before the failure, want 3", got)
+	if got := len(engine.order) - len(installed); got != 7 {
+		t.Errorf("the failed apply added %d filters before the failure, want 7", got)
 	}
 	if got := engine.deleted; !slices.Equal(got, engine.order[len(installed):]) {
 		t.Errorf("deleted = %v, want the filters the failed apply had added %v", got, engine.order[len(installed):])
@@ -1587,8 +1695,8 @@ func TestWFPController_ApplyRules_StaleDeleteNotFound(t *testing.T) {
 	if err := ctrl.ApplyRules("plexd-mesh", sixRules[3:]); err != nil {
 		t.Fatalf("ApplyRules() second error = %v, want nil: a filter that is already gone is the wanted state", err)
 	}
-	if got := len(ctrl.chains["plexd-mesh"]); got != 11 {
-		t.Errorf("chain plexd-mesh holds %d filters, want the 11 of the second apply", got)
+	if got := len(ctrl.chains["plexd-mesh"]); got != 15 {
+		t.Errorf("chain plexd-mesh holds %d filters, want the 15 of the second apply", got)
 	}
 }
 
@@ -1778,7 +1886,8 @@ func TestWFPController_Weight(t *testing.T) {
 	if got, want := wfpWeight(3, 6, 5), uint64(3)<<32|1; got != want {
 		t.Errorf("wfpWeight(3, 6, 5) = %#x, want %#x", got, want)
 	}
-	// Index -1, the relay probe permits, sits one above rule 0.
+	// Index -1, where the relay and round-trip probe permits sit, is one
+	// above rule 0.
 	if got, want := wfpWeight(3, 6, -1), uint64(3)<<32|7; got != want {
 		t.Errorf("wfpWeight(3, 6, -1) = %#x, want %#x", got, want)
 	}
@@ -1816,8 +1925,9 @@ func firstRoutableInterface(t *testing.T) string {
 // the default deny sits below an allow of everything on the same interface:
 // within plexd's sublayer the heaviest matching filter decides, so the deny
 // never does and the runner's own traffic, inbound and outbound, is
-// untouched. The relay probe permits pass UDP to port 9 alone. The dynamic
-// session drops every filter again when it closes.
+// untouched. The relay probe permits pass UDP to port 9 alone, and the
+// round-trip probe permits UDP to port 7911 alone. The dynamic session drops
+// every filter again when it closes.
 func TestWFPController_Real(t *testing.T) {
 	if os.Getenv("PLEXD_TEST_REAL_WFP") != "1" {
 		t.Skip("set PLEXD_TEST_REAL_WFP=1 in an elevated shell to program the filter engine")
@@ -1897,8 +2007,8 @@ func TestWFPController_Real(t *testing.T) {
 	// refuses them, so the unit tests catch such a filter first. The plan of
 	// #178 assumes the same of ALE_AUTH_CONNECT_V4 and _V6: the interface
 	// LUID, both addresses, the protocol and the remote port. An error that
-	// names an "outbound" or a "relay probe" filter means that assumption
-	// failed, and is reported the same way.
+	// names an "outbound", a "relay probe" or an "rtt probe" filter means
+	// that assumption failed, and is reported the same way.
 	if err := ctrl.ApplyRules("plexd-test", rules); err != nil {
 		t.Fatalf("ApplyRules() error = %v, want nil", err)
 	}
@@ -1941,28 +2051,34 @@ func TestWFPController_Real(t *testing.T) {
 	// production. Every rule has an outbound filter at the connect layer of
 	// its family, and the engine takes the protocol and the remote port
 	// there. The two rules without addresses have a filter at each of the six
-	// layers. The relay probe permits of the runner's interface come once.
+	// layers. The relay probe permits and the round-trip probe permits of
+	// the runner's interface come once, the latter at the connect and the
+	// receive-accept layer of each family.
 	withoutDeny := map[string]wf.LayerID{
-		"plexd plexd-test relay probe":    wf.LayerALEAuthConnectV4,
-		"plexd plexd-test relay probe v6": wf.LayerALEAuthConnectV6,
-		"plexd plexd-test #0 inbound":     wf.LayerALEAuthRecvAcceptV4,
-		"plexd plexd-test #0 outbound":    wf.LayerALEAuthConnectV4,
-		"plexd plexd-test #1 inbound":     wf.LayerALEAuthRecvAcceptV4,
-		"plexd plexd-test #1 outbound":    wf.LayerALEAuthConnectV4,
-		"plexd plexd-test #1 forward":     wf.LayerIPForwardV4,
-		"plexd plexd-test #2 inbound v6":  wf.LayerALEAuthRecvAcceptV6,
-		"plexd plexd-test #2 outbound v6": wf.LayerALEAuthConnectV6,
-		"plexd plexd-test #3 inbound v6":  wf.LayerALEAuthRecvAcceptV6,
-		"plexd plexd-test #3 outbound v6": wf.LayerALEAuthConnectV6,
-		"plexd plexd-test #4 inbound v6":  wf.LayerALEAuthRecvAcceptV6,
-		"plexd plexd-test #4 outbound v6": wf.LayerALEAuthConnectV6,
-		"plexd plexd-test #4 forward v6":  wf.LayerIPForwardV6,
-		"plexd plexd-test #5 inbound":     wf.LayerALEAuthRecvAcceptV4,
-		"plexd plexd-test #5 outbound":    wf.LayerALEAuthConnectV4,
-		"plexd plexd-test #5 forward":     wf.LayerIPForwardV4,
-		"plexd plexd-test #5 inbound v6":  wf.LayerALEAuthRecvAcceptV6,
-		"plexd plexd-test #5 outbound v6": wf.LayerALEAuthConnectV6,
-		"plexd plexd-test #5 forward v6":  wf.LayerIPForwardV6,
+		"plexd plexd-test relay probe":          wf.LayerALEAuthConnectV4,
+		"plexd plexd-test relay probe v6":       wf.LayerALEAuthConnectV6,
+		"plexd plexd-test rtt probe":            wf.LayerALEAuthConnectV4,
+		"plexd plexd-test rtt probe inbound":    wf.LayerALEAuthRecvAcceptV4,
+		"plexd plexd-test rtt probe v6":         wf.LayerALEAuthConnectV6,
+		"plexd plexd-test rtt probe inbound v6": wf.LayerALEAuthRecvAcceptV6,
+		"plexd plexd-test #0 inbound":           wf.LayerALEAuthRecvAcceptV4,
+		"plexd plexd-test #0 outbound":          wf.LayerALEAuthConnectV4,
+		"plexd plexd-test #1 inbound":           wf.LayerALEAuthRecvAcceptV4,
+		"plexd plexd-test #1 outbound":          wf.LayerALEAuthConnectV4,
+		"plexd plexd-test #1 forward":           wf.LayerIPForwardV4,
+		"plexd plexd-test #2 inbound v6":        wf.LayerALEAuthRecvAcceptV6,
+		"plexd plexd-test #2 outbound v6":       wf.LayerALEAuthConnectV6,
+		"plexd plexd-test #3 inbound v6":        wf.LayerALEAuthRecvAcceptV6,
+		"plexd plexd-test #3 outbound v6":       wf.LayerALEAuthConnectV6,
+		"plexd plexd-test #4 inbound v6":        wf.LayerALEAuthRecvAcceptV6,
+		"plexd plexd-test #4 outbound v6":       wf.LayerALEAuthConnectV6,
+		"plexd plexd-test #4 forward v6":        wf.LayerIPForwardV6,
+		"plexd plexd-test #5 inbound":           wf.LayerALEAuthRecvAcceptV4,
+		"plexd plexd-test #5 outbound":          wf.LayerALEAuthConnectV4,
+		"plexd plexd-test #5 forward":           wf.LayerIPForwardV4,
+		"plexd plexd-test #5 inbound v6":        wf.LayerALEAuthRecvAcceptV6,
+		"plexd plexd-test #5 outbound v6":       wf.LayerALEAuthConnectV6,
+		"plexd plexd-test #5 forward v6":        wf.LayerIPForwardV6,
 	}
 	withDeny := maps.Clone(withoutDeny)
 	withDeny["plexd plexd-test #6 inbound"] = wf.LayerALEAuthRecvAcceptV4
@@ -2043,7 +2159,7 @@ var taggedRules = []FirewallRule{
 
 // taggedLogFilters is what buildFilters logs of taggedRules, by filter name:
 // the inbound and the outbound filter of each logged rule in each of its
-// families, and no forward, relay probe or untagged filter.
+// families, and no forward, probe or untagged filter.
 var taggedLogFilters = map[string]wfpLogFilter{
 	"plexd plexd-mesh #0 inbound":     {tag: "1/0", dir: ConnIn},
 	"plexd plexd-mesh #0 outbound":    {tag: "1/0", dir: ConnOut},
@@ -2057,8 +2173,8 @@ var taggedLogFilters = map[string]wfpLogFilter{
 
 // buildFilters names the inbound filter of each logged rule as ConnIn and its
 // outbound filter as ConnOut, in each family the rule is installed in, and
-// leaves the forward filters, the relay probe permits and every filter of an
-// untagged rule out of the map. A ruleset without a tag yields an empty map
+// leaves the forward filters, the relay and round-trip probe permits and
+// every filter of an untagged rule out of the map. A ruleset without a tag yields an empty map
 // and the filters it yields untagged.
 func TestWFPController_BuildFilters_LoggedMap(t *testing.T) {
 	ctrl, _, _ := newTestWFPController(t)

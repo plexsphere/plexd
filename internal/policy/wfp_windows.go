@@ -242,9 +242,9 @@ func adminHint(err error) string {
 // sublayer WFP evaluates the heaviest filter first and the first terminating
 // action wins, so rule 0 has to be the heaviest, and the epoch in the high
 // half makes every filter of a newer apply outweigh every filter of an older
-// one. The relay probe permits sit at index -1, which outweighs rule 0. The
-// result stays below 2^60 for 2^28 applies, which is what a FWP_UINT64
-// weight accepts.
+// one. The relay probe and round-trip probe permits sit at index -1, which
+// outweighs rule 0. The result stays below 2^60 for 2^28 applies, which is
+// what a FWP_UINT64 weight accepts.
 func wfpWeight(epoch uint32, n, i int) uint64 {
 	return uint64(epoch)<<32 | uint64(n-i)
 }
@@ -444,6 +444,52 @@ func relayProbeFilters(chain string, ids ifaceIDs, epoch uint32, n int) ([]*wf.R
 	return filters, nil
 }
 
+// rttProbeFilters returns the permits that pass UDP to RTTProbePort over one
+// interface ahead of the rules, four of them: per family, in the order of
+// wfpFamilies, one at the connect layer for what the node sends to the port
+// and then one at the receive-accept layer for what arrives for the node on
+// it. None sits at a forward layer, so nothing the node forwards passes them.
+// They carry no address, since the probe runs to and from every connected
+// peer. Their weight is above rule 0's, so no rule of the chain decides the
+// probe. The exemption's DECISION is at RTTProbePort.
+//
+// The permits are soft, as every plexd allow is, so the Windows Defender
+// Firewall's own sublayer can still drop the inbound probe.
+func rttProbeFilters(chain string, ids ifaceIDs, epoch uint32, n int) ([]*wf.Rule, error) {
+	weight := wfpWeight(epoch, n, -1)
+
+	filters := make([]*wf.Rule, 0, 2*len(wfpFamilies))
+	for _, layers := range wfpFamilies {
+		for _, side := range []struct {
+			layer wf.LayerID
+			name  string
+			port  wf.FieldID
+		}{
+			{layer: layers.outbound, name: "rtt probe", port: wf.FieldIPRemotePort},
+			{layer: layers.inbound, name: "rtt probe inbound", port: wf.FieldIPLocalPort},
+		} {
+			id, err := newRuleID()
+			if err != nil {
+				return nil, err
+			}
+			filters = append(filters, &wf.Rule{
+				ID:       id,
+				Name:     fmt.Sprintf("plexd %s %s%s", chain, side.name, layers.suffix),
+				Layer:    side.layer,
+				Sublayer: plexdSublayerID,
+				Weight:   weight,
+				Conditions: []*wf.Match{
+					{Field: wf.FieldIPLocalInterface, Op: wf.MatchTypeEqual, Value: ids.luid},
+					{Field: wf.FieldIPProtocol, Op: wf.MatchTypeEqual, Value: wf.IPProtoUDP},
+					{Field: side.port, Op: wf.MatchTypeEqual, Value: uint16(RTTProbePort)},
+				},
+				Action: wf.ActionPermit,
+			})
+		}
+	}
+	return filters, nil
+}
+
 // buildFilters translates one chain's rules into filters, none of which is
 // installed yet: a rule the engine would reject has to fail before the first
 // AddRule, or an apply would leave half a ruleset in the kernel.
@@ -470,8 +516,9 @@ func relayProbeFilters(chain string, ids ifaceIDs, epoch uint32, n int) ([]*wf.R
 // Forwarded traffic never reaches ALE_AUTH_CONNECT, so what the node forwards
 // into the mesh is not filtered on its way out.
 //
-// Ahead of the rule filters, every interface the rules name gets the relay
-// probe permits of relayProbeFilters, once.
+// Ahead of the rule filters, every interface the rules name gets, once, the
+// relay probe permits of relayProbeFilters and then the round-trip probe
+// permits of rttProbeFilters.
 //
 // The ruleset is ordered and first-match-terminating, so a rule left out of
 // the forward layer is not narrowed to nothing: the traffic it covered is
@@ -524,6 +571,10 @@ func (c *WFPController) buildFilters(chain string, rules []FirewallRule, epoch u
 
 			p, err := relayProbeFilters(chain, ids, epoch, len(rules))
 			if err != nil {
+				return nil, nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
+			}
+			probes = append(probes, p...)
+			if p, err = rttProbeFilters(chain, ids, epoch, len(rules)); err != nil {
 				return nil, nil, fmt.Errorf("rule %d: generate filter id: %w", i, err)
 			}
 			probes = append(probes, p...)
