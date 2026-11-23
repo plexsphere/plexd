@@ -569,7 +569,7 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("plexd up: tunnel host key: %w", err)
 	}
 	jwtVerifier := tunnel.NewEd25519JWTVerifier(ed25519.PublicKey(sigKey))
-	meshServer := tunnel.NewMeshServer(cfg.Tunnel, identity.MeshIP, hostKey, jwtVerifier, logger)
+	meshServer := tunnel.NewMeshServer(cfg.Tunnel, identity.MeshIP, wgMgr.OSInterfaceName(), hostKey, jwtVerifier, logger)
 	sessionReporter := &controlPlaneSessionReporter{cp: client, nodeID: identity.NodeID}
 
 	// Report a session_ended row for every close reason (revoke, TTL expiry,

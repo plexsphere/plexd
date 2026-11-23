@@ -23,14 +23,16 @@ type MeshServer struct {
 // boundary of an otherwise unauthenticated forward, so it comes from the node
 // identity rather than being
 // guessed from the SSH listen address, which is empty in both documented
-// configurations and would bind every interface on the host.
+// configurations and would bind every interface on the host. meshIface is
+// the operating system's name of the mesh interface, which every tcp session
+// listener is bound to.
 // If cfg.SSHListenAddr is empty, the SSH server is not created.
-func NewMeshServer(cfg Config, meshIP string, hostKey ssh.Signer, verifier JWTVerifier, logger *slog.Logger) *MeshServer {
+func NewMeshServer(cfg Config, meshIP, meshIface string, hostKey ssh.Signer, verifier JWTVerifier, logger *slog.Logger) *MeshServer {
 	cfg.ApplyDefaults()
 
 	m := &MeshServer{
 		cfg:      cfg,
-		sessions: NewSessionManager(cfg, meshIP, logger),
+		sessions: NewSessionManager(cfg, meshIP, meshIface, logger),
 		logger:   logger.With("component", "tunnel"),
 	}
 

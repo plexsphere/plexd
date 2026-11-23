@@ -90,7 +90,7 @@ func startSSHHarness(t *testing.T, launcher *fakeLauncher, setup func(*api.NodeS
 	t.Helper()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	mgr := NewSessionManager(Config{}, "127.0.0.1", logger)
+	mgr := NewSessionManager(Config{}, "127.0.0.1", "", logger)
 	t.Cleanup(func() { mgr.Shutdown() })
 
 	reporter := &mockReporter{}
@@ -906,7 +906,7 @@ func TestSessionManager_SSHSessionNeedsNoMeshAddress(t *testing.T) {
 	echoAddr := startEchoServer(t)
 	for _, meshIP := range []string{"", "0.0.0.0"} {
 		t.Run(fmt.Sprintf("mesh ip %q", meshIP), func(t *testing.T) {
-			mgr := NewSessionManager(Config{}, meshIP, slog.Default())
+			mgr := NewSessionManager(Config{}, meshIP, "", slog.Default())
 			t.Cleanup(mgr.Shutdown)
 			deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
 			mgr.SetSSHSessionDeps(deps)
@@ -918,6 +918,26 @@ func TestSessionManager_SSHSessionNeedsNoMeshAddress(t *testing.T) {
 			_, err = mgr.CreateSession(context.Background(), echoSession(t, "sess-tcp", echoAddr))
 			if err == nil || !strings.Contains(err.Error(), "is not a bindable unicast address") {
 				t.Errorf("CreateSession(tcp) error = %v, want the mesh address refused", err)
+			}
+		})
+	}
+}
+
+// TestSessionManager_SSHSessionBindsNoInterface shows that an ssh session
+// binds nothing, so the name of the mesh interface never matters to it: a
+// manager creates one with the empty name and with a name no interface
+// carries.
+func TestSessionManager_SSHSessionBindsNoInterface(t *testing.T) {
+	for _, iface := range []string{"", "plexd-none0"} {
+		t.Run(fmt.Sprintf("mesh interface %q", iface), func(t *testing.T) {
+			mgr := NewSessionManager(Config{}, "127.0.0.1", iface, slog.Default())
+			t.Cleanup(mgr.Shutdown)
+			deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+			mgr.SetSSHSessionDeps(deps)
+
+			addr, err := mgr.CreateSession(context.Background(), sshEntry("sess-ssh", sshTestUser, time.Now().Add(5*time.Minute)))
+			if err != nil || addr != "" {
+				t.Fatalf("CreateSession(ssh) = %q, %v, want an empty address and no error", addr, err)
 			}
 		})
 	}
@@ -940,7 +960,7 @@ func TestSessionManager_ConnectSSHSessionRefusals(t *testing.T) {
 		{"tunneling disabled", Config{Enabled: false, MaxSessions: 10, DefaultTimeout: 5 * time.Minute}, "sess-ssh", ErrTunnelingDisabled},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			mgr := NewSessionManager(tt.cfg, "127.0.0.1", slog.Default())
+			mgr := NewSessionManager(tt.cfg, "127.0.0.1", "", slog.Default())
 			t.Cleanup(mgr.Shutdown)
 			deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
 			mgr.SetSSHSessionDeps(deps)
