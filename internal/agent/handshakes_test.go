@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -218,6 +219,34 @@ func meshPeer(nodeID, endpoint string, lastHandshake time.Time) wireguard.MeshPe
 	return wireguard.MeshPeerStat{NodeID: nodeID, Endpoint: ep, LastHandshake: lastHandshake}
 }
 
+// meshPeerRTT is meshPeer with the round-trip time the device read holds.
+func meshPeerRTT(nodeID, endpoint string, lastHandshake time.Time, rtt time.Duration) wireguard.MeshPeerStat {
+	s := meshPeer(nodeID, endpoint, lastHandshake)
+	s.RTT = rtt
+	return s
+}
+
+// entryJSON marshals one report entry as it goes on the wire.
+func entryJSON(t *testing.T, p api.HandshakeReportPeer) string {
+	t.Helper()
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	return string(data)
+}
+
+// entriesJSON marshals a report's entries, for failure messages that would
+// otherwise print the round-trip time as a pointer.
+func entriesJSON(t *testing.T, peers []api.HandshakeReportPeer) string {
+	t.Helper()
+	data, err := json.Marshal(peers)
+	if err != nil {
+		t.Fatalf("marshal entries: %v", err)
+	}
+	return string(data)
+}
+
 // ---------------------------------------------------------------------------
 // buildHandshakeReport
 // ---------------------------------------------------------------------------
@@ -274,6 +303,13 @@ func TestBuildHandshakeReport_NothingToReport(t *testing.T) {
 			}
 			if skipped != 0 || truncated != 0 {
 				t.Errorf("skipped, truncated = %d, %d, want 0, 0", skipped, truncated)
+			}
+			data, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal report: %v", err)
+			}
+			if !strings.Contains(string(data), `"peers":[]`) {
+				t.Errorf("report = %s, want \"peers\":[]", data)
 			}
 		})
 	}
@@ -450,6 +486,113 @@ func TestBuildHandshakeReport_TruncatesToTheMostRecent(t *testing.T) {
 		if p.LastHandshakeAgeSeconds != int32(i) {
 			t.Fatalf("Peers[%d] age = %d, want %d (the most recent handshakes, by age)", i, p.LastHandshakeAgeSeconds, i)
 		}
+	}
+}
+
+// The round-trip time goes on the wire in whole microseconds, truncated,
+// raised to 1 below a microsecond and capped at the contract's int32 ceiling.
+func TestBuildHandshakeReport_RTTInWholeMicroseconds(t *testing.T) {
+	tests := []struct {
+		name string
+		rtt  time.Duration
+		want string // the member's value on the wire
+	}{
+		{name: "23.4 ms", rtt: 23400 * time.Microsecond, want: "23400"},
+		{name: "truncated to whole microseconds", rtt: 23400*time.Microsecond + 999*time.Nanosecond, want: "23400"},
+		{name: "300 ns is raised to 1", rtt: 300 * time.Nanosecond, want: "1"},
+		{name: "the int32 ceiling itself", rtt: 2147483647 * time.Microsecond, want: "2147483647"},
+		{name: "3000 s is capped at the int32 ceiling", rtt: 3000 * time.Second, want: "2147483647"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stats := []wireguard.MeshPeerStat{
+				meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), tt.rtt),
+			}
+
+			req, skipped, truncated := buildHandshakeReport(testObservedAt, stats)
+
+			if len(req.Peers) != 1 {
+				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
+			}
+			want := `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":5,` +
+				`"endpoint":"198.51.100.7:51820","rtt_microseconds":` + tt.want + `}`
+			if got := entryJSON(t, req.Peers[0]); got != want {
+				t.Errorf("entry = %s, want %s", got, want)
+			}
+			if skipped != 0 || truncated != 0 {
+				t.Errorf("skipped, truncated = %d, %d, want 0, 0", skipped, truncated)
+			}
+		})
+	}
+}
+
+// Without a value the entry is what it was before the member existed: exactly
+// the three required keys and no rtt_microseconds.
+func TestBuildHandshakeReport_NoRTTLeavesTheMemberOff(t *testing.T) {
+	for _, rtt := range []time.Duration{0, -time.Millisecond} {
+		t.Run(rtt.String(), func(t *testing.T) {
+			stats := []wireguard.MeshPeerStat{
+				meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), rtt),
+			}
+
+			req, _, _ := buildHandshakeReport(testObservedAt, stats)
+
+			if len(req.Peers) != 1 {
+				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
+			}
+			if p := req.Peers[0].RTTMicroseconds; p != nil {
+				t.Errorf("RTTMicroseconds = %d, want nil", *p)
+			}
+			const want = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":5,"endpoint":"198.51.100.7:51820"}`
+			got := entryJSON(t, req.Peers[0])
+			if got != want {
+				t.Errorf("entry = %s, want %s", got, want)
+			}
+			var keys map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(got), &keys); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := keys["rtt_microseconds"]; ok || len(keys) != 3 {
+				t.Errorf("entry keys = %v, want exactly peer_node_id, last_handshake_age_seconds and endpoint", keys)
+			}
+		})
+	}
+}
+
+// A repeated NodeID keeps the whole entry with the smaller age, its round-trip
+// time or the lack of one included, and never mixes the two entries.
+func TestBuildHandshakeReport_RepeatedNodeIDKeepsTheRTTOfTheKeptEntry(t *testing.T) {
+	older := meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-30*time.Second), 40*time.Millisecond)
+	newer := meshPeerRTT(testPeerA, "203.0.113.9:51820", testObservedAt.Add(-10*time.Second), 12*time.Millisecond)
+	newerWithout := meshPeer(testPeerA, "203.0.113.9:51820", testObservedAt.Add(-10*time.Second))
+	const (
+		wantNewer        = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":10,"endpoint":"203.0.113.9:51820","rtt_microseconds":12000}`
+		wantNewerWithout = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":10,"endpoint":"203.0.113.9:51820"}`
+	)
+
+	tests := []struct {
+		name  string
+		stats []wireguard.MeshPeerStat
+		want  string
+	}{
+		{name: "older first", stats: []wireguard.MeshPeerStat{older, newer}, want: wantNewer},
+		{name: "newer first", stats: []wireguard.MeshPeerStat{newer, older}, want: wantNewer},
+		{name: "newer without a value, older first", stats: []wireguard.MeshPeerStat{older, newerWithout}, want: wantNewerWithout},
+		{name: "newer without a value, newer first", stats: []wireguard.MeshPeerStat{newerWithout, older}, want: wantNewerWithout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, skipped, truncated := buildHandshakeReport(testObservedAt, tt.stats)
+			if len(req.Peers) != 1 {
+				t.Fatalf("Peers = %s, want one entry", entriesJSON(t, req.Peers))
+			}
+			if got := entryJSON(t, req.Peers[0]); got != tt.want {
+				t.Errorf("entry = %s, want %s", got, tt.want)
+			}
+			if skipped != 0 || truncated != 0 {
+				t.Errorf("skipped, truncated = %d, %d, want 0, 0", skipped, truncated)
+			}
+		})
 	}
 }
 
@@ -830,7 +973,7 @@ func TestHandshakeReporter_AcceptedAndSkippedLoggedAtDebug(t *testing.T) {
 		}
 	}
 	acceptedLine := logLine(t, got, "agent: handshake report: accepted")
-	for _, want := range []string{"level=DEBUG", "sent=2", "recorded=1", "ignored=1", "accepted_at=2026-10-21T12:00:01"} {
+	for _, want := range []string{"level=DEBUG", "sent=2", "with_rtt=0", "recorded=1", "ignored=1", "accepted_at=2026-10-21T12:00:01"} {
 		if !strings.Contains(acceptedLine, want) {
 			t.Errorf("accepted log = %q, want it to contain %q", acceptedLine, want)
 		}
@@ -872,5 +1015,142 @@ func TestHandshakeReporter_TruncationLoggedAtWarn(t *testing.T) {
 	}
 	if n := countLogLines(got, "agent: handshake report: skipped peers"); n != 0 {
 		t.Errorf("skipped peers logged %d times with nothing skipped, want 0", n)
+	}
+}
+
+// A control plane older than plexsphere/plexsphere#1145 refuses a report that
+// carries rtt_microseconds as an unknown member. Per the author there is no
+// fallback: the refusal is an ordinary failed send, not retried within its
+// tick, and the next tick sends the member again.
+func TestHandshakeReporter_OldControlPlaneRefusalIsASendFailure(t *testing.T) {
+	const (
+		sendFailedMsg = "agent: handshake report: send failed"
+		acceptedMsg   = "agent: handshake report: accepted"
+	)
+	refusal := &api.APIError{StatusCode: 400, Code: "malformed_handshake_report", Message: "unknown member rtt_microseconds"}
+	client := &fakeHandshakeClient{errs: []error{refusal}}
+	source := &fakeStatsSource{stats: []wireguard.MeshPeerStat{
+		meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), 23400*time.Microsecond),
+	}}
+	logger, logs := newDebugLogger()
+	r := newFixedClockReporter(client, source, logger)
+	ctx := context.Background()
+
+	r.reportOnce(ctx)
+
+	if n := client.calls(); n != 1 {
+		t.Fatalf("reports = %d within the refused tick, want 1 (no retry)", n)
+	}
+	got := logs.String()
+	line := logLine(t, got, sendFailedMsg)
+	for _, want := range []string{
+		"level=WARN",
+		`error="api: HTTP 400 (malformed_handshake_report): unknown member rtt_microseconds"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("send failed log = %q, want it to contain %q", line, want)
+		}
+	}
+	if strings.Contains(got, "does not accept handshake reports") || r.notServed {
+		t.Errorf("the refusal was taken for a control plane that does not serve the operation:\n%s", got)
+	}
+	if n := countLogLines(got, acceptedMsg); n != 0 {
+		t.Errorf("accepted logged %d times for a refused report, want 0", n)
+	}
+
+	r.reportOnce(ctx)
+
+	_, reqs := client.recorded()
+	if len(reqs) != 2 {
+		t.Fatalf("reports = %d after two ticks, want 2", len(reqs))
+	}
+	const wantEntry = `{"peer_node_id":"` + testPeerA + `","last_handshake_age_seconds":5,"endpoint":"198.51.100.7:51820","rtt_microseconds":23400}`
+	for k, req := range reqs {
+		if len(req.Peers) != 1 || entryJSON(t, req.Peers[0]) != wantEntry {
+			t.Errorf("report %d Peers = %s, want [%s] (the member on every tick)", k, entriesJSON(t, req.Peers), wantEntry)
+		}
+	}
+	got = logs.String()
+	if n := countLogLines(got, sendFailedMsg); n != 1 {
+		t.Errorf("send failed logged %d times, want 1 (the refused tick only)", n)
+	}
+	logLine(t, got, acceptedMsg)
+}
+
+// with_rtt counts the sent entries that carry rtt_microseconds. A peer whose
+// read holds no value, a skipped peer, a peer without a handshake and a peer
+// the truncation cuts do not count, whatever round-trip time their read holds.
+func TestHandshakeReporter_AcceptedLogCountsEntriesWithRTT(t *testing.T) {
+	const testPeerD = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b4"
+	truncated := make([]wireguard.MeshPeerStat, 0, 4100)
+	for age := range 4100 {
+		// Only the newest entry, which is kept, and the four oldest, which
+		// the truncation cuts, hold a value.
+		var rtt time.Duration
+		if age == 0 || age >= api.MaxHandshakeReportPeers {
+			rtt = time.Millisecond
+		}
+		truncated = append(truncated, meshPeerRTT(
+			fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", age+1),
+			"198.51.100.7:51820",
+			testObservedAt.Add(-time.Duration(age)*time.Second),
+			rtt,
+		))
+	}
+
+	tests := []struct {
+		name        string
+		stats       []wireguard.MeshPeerStat
+		wantSent    int
+		wantWithRTT int
+	}{
+		{
+			name: "mixed",
+			stats: []wireguard.MeshPeerStat{
+				meshPeerRTT(testPeerA, "198.51.100.7:51820", testObservedAt.Add(-5*time.Second), 10*time.Millisecond),
+				meshPeerRTT(testPeerB, "198.51.100.8:51820", testObservedAt.Add(-6*time.Second), 0),
+				meshPeerRTT(testPeerC, "198.51.100.9:51820", testObservedAt.Add(-7*time.Second), 5*time.Millisecond),
+				meshPeerRTT(testPeerD, "198.51.100.10:51820", time.Time{}, 2*time.Millisecond),
+				meshPeerRTT("peer-1", "198.51.100.11:51820", testObservedAt.Add(-8*time.Second), time.Millisecond),
+			},
+			wantSent:    3,
+			wantWithRTT: 2,
+		},
+		{name: "truncated", stats: truncated, wantSent: api.MaxHandshakeReportPeers, wantWithRTT: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeHandshakeClient{}
+			logger, logs := newDebugLogger()
+			r := newFixedClockReporter(client, &fakeStatsSource{stats: tt.stats}, logger)
+
+			r.reportOnce(context.Background())
+
+			_, reqs := client.recorded()
+			if len(reqs) != 1 {
+				t.Fatalf("reports = %d, want 1", len(reqs))
+			}
+			carrying := 0
+			for _, p := range reqs[0].Peers {
+				if p.RTTMicroseconds != nil {
+					carrying++
+				}
+			}
+			if len(reqs[0].Peers) != tt.wantSent || carrying != tt.wantWithRTT {
+				t.Errorf("sent %d entries, %d with rtt_microseconds, want %d and %d",
+					len(reqs[0].Peers), carrying, tt.wantSent, tt.wantWithRTT)
+			}
+			// The trailing space keeps with_rtt=1 from matching with_rtt=10.
+			line := logLine(t, logs.String(), "agent: handshake report: accepted")
+			for _, want := range []string{
+				"level=DEBUG",
+				fmt.Sprintf("sent=%d ", tt.wantSent),
+				fmt.Sprintf("with_rtt=%d ", carrying),
+			} {
+				if !strings.Contains(line, want) {
+					t.Errorf("accepted log = %q, want it to contain %q", line, want)
+				}
+			}
+		})
 	}
 }

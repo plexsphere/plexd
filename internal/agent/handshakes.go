@@ -40,7 +40,16 @@ const nilUUID = "00000000-0000-0000-0000-000000000000"
 // HandshakeReporter posts, once per interval, the age of the latest completed
 // WireGuard handshake with each mesh peer and the endpoint WireGuard used for
 // it to POST /v1/nodes/{node_id}/handshakes. The control plane derives each
-// mesh edge's status, mode, handshake age and endpoint from these reports.
+// mesh edge's status, mode, handshake age and endpoint from these reports. An
+// entry also carries the round-trip time to the peer through the tunnel when
+// the device read holds one, which the control plane ranks a pair's relays by.
+//
+// DECISION (author, 2026-11-23, #218): the reporter sends rtt_microseconds
+// whenever it holds a value and has no fallback for a control plane that
+// predates the member. Such a control plane decodes without unknown fields and
+// answers 400 malformed_handshake_report, so nothing of that report is
+// recorded; logSendError reports it as any failed send, on every tick until
+// the control plane is upgraded. The control plane is therefore upgraded first.
 //
 // DECISION: the reporter runs its own loop at the heartbeat interval rather
 // than riding on HeartbeatService.sendHeartbeat. The contract asks for one
@@ -143,8 +152,15 @@ func (r *HandshakeReporter) reportOnce(ctx context.Context) {
 		r.logger.InfoContext(ctx, "agent: handshake report: control plane accepts handshake reports")
 		r.notServed = false
 	}
+	withRTT := 0
+	for _, p := range req.Peers {
+		if p.RTTMicroseconds != nil {
+			withRTT++
+		}
+	}
 	r.logger.DebugContext(ctx, "agent: handshake report: accepted",
 		"sent", len(req.Peers),
+		"with_rtt", withRTT,
 		"recorded", resp.Recorded,
 		"ignored", resp.Ignored,
 		"accepted_at", resp.AcceptedAt,
@@ -206,8 +222,12 @@ func (r *HandshakeReporter) logSendError(ctx context.Context, err error) {
 //
 // The age is observedAt minus the handshake, floored to whole seconds, clamped
 // to 0 when the handshake postdates observedAt (a wall clock stepped back) and
-// to math.MaxInt32, the contract's int32 ceiling, above it. A NodeID that
-// repeats keeps the entry with the smaller age; the contract refuses a repeated
+// to math.MaxInt32, the contract's int32 ceiling, above it. An entry carries
+// rtt_microseconds, rendered by rttMicroseconds, when the device read holds a
+// round-trip time for the peer, and leaves the member off when it holds none;
+// there is no fallback for a control plane that predates the member (see
+// HandshakeReporter). A NodeID that repeats keeps the entry with the smaller
+// age, its round-trip time included; the contract refuses a repeated
 // peer_node_id and the newer handshake is the truer one. The entries are
 // sorted by age and then PeerNodeID, and beyond api.MaxHandshakeReportPeers the
 // oldest are cut and counted in truncated, since the freshest handshakes are
@@ -236,6 +256,7 @@ func buildHandshakeReport(observedAt time.Time, stats []wireguard.MeshPeerStat) 
 			PeerNodeID:              s.NodeID,
 			LastHandshakeAgeSeconds: handshakeAgeSeconds(observedAt, s.LastHandshake),
 			Endpoint:                endpoint,
+			RTTMicroseconds:         rttMicroseconds(s.RTT),
 		}
 		if i, dup := seen[s.NodeID]; dup {
 			if peer.LastHandshakeAgeSeconds < req.Peers[i].LastHandshakeAgeSeconds {
@@ -289,4 +310,25 @@ func handshakeAgeSeconds(observedAt, last time.Time) int32 {
 		return math.MaxInt32
 	}
 	return int32(secs)
+}
+
+// rttMicroseconds renders a round-trip time as the contract's
+// rtt_microseconds. It returns nil for d <= 0, which the device read uses for
+// a peer without a value, so the member stays off the wire. Otherwise it
+// returns d in whole microseconds, truncated, raised to 1 when below, since a
+// time under a microsecond is still a measurement and the contract refuses 0,
+// and capped at math.MaxInt32, the contract's ceiling.
+func rttMicroseconds(d time.Duration) *int32 {
+	if d <= 0 {
+		return nil
+	}
+	us := d.Microseconds()
+	switch {
+	case us < 1:
+		us = 1
+	case us > math.MaxInt32:
+		us = math.MaxInt32
+	}
+	v := int32(us)
+	return &v
 }
