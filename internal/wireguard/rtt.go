@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/ifbind"
 )
 
 // RTTProbePort is the UDP port of the round-trip probe. Every plexd holds one
@@ -236,7 +238,7 @@ func (s *rttSocket) close() {
 
 // listenRTT is the default rttListen: it listens on UDP port RTTProbePort of
 // the node's mesh IP, as Setup stored it, on a socket bound to the mesh
-// interface (rttBindToInterface). A mesh IP that is not IPv4, the zero
+// interface (ifbind.Control). A mesh IP that is not IPv4, the zero
 // address included, is refused, so the socket is never bound to the wildcard
 // address.
 //
@@ -251,7 +253,7 @@ func (m *Manager) listenRTT() (net.PacketConn, error) {
 	if !m.meshIP.Is4() {
 		return nil, fmt.Errorf("wireguard: rtt probe: mesh ip %s is not IPv4", m.meshIP)
 	}
-	lc := net.ListenConfig{Control: rttBindToInterface(m.OSInterfaceName())}
+	lc := net.ListenConfig{Control: ifbind.Control(m.OSInterfaceName())}
 	return lc.ListenPacket(context.Background(), "udp4", netip.AddrPortFrom(m.meshIP, RTTProbePort).String())
 }
 
