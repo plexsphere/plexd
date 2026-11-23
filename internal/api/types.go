@@ -1168,7 +1168,8 @@ const MaxHandshakeReportPeers = 4096
 
 // HandshakeReportRequest is the body of POST /v1/nodes/{node_id}/handshakes:
 // for each mesh peer the node has completed a WireGuard handshake with, the age
-// of the latest handshake and the endpoint WireGuard used for it.
+// of the latest handshake, the endpoint WireGuard used for it and, when the node
+// holds one, the round-trip time through the tunnel.
 //
 // The control plane anchors every age on its own receive time, so a body is
 // only true for the attempt it was assembled for. The agent builds a fresh one,
@@ -1189,9 +1190,11 @@ type HandshakeReportRequest struct {
 
 // HandshakeReportPeer is one entry of a HandshakeReportRequest.
 //
-// No field is omitempty: all three are required, and an age of 0 (a handshake
-// within the last second) is as legitimate as any other, so it must reach the
-// wire rather than be dropped as a zero value and refused as missing.
+// The three required fields are not omitempty: an age of 0 (a handshake within
+// the last second) is as legitimate as any other, so it must reach the wire
+// rather than be dropped as a zero value and refused as missing. The optional
+// RTTMicroseconds is omitempty and a pointer, so it leaves the wire only when
+// the node holds no measurement, never for a value.
 type HandshakeReportPeer struct {
 	// PeerNodeID is the peer's node_id, a non-zero UUID that no other entry of
 	// the report repeats. An id the control plane does not know as a live peer
@@ -1205,6 +1208,12 @@ type HandshakeReportPeer struct {
 	// address or an IPv6 zone is refused with 400
 	// handshake_endpoint_unparseable, for the whole report.
 	Endpoint string `json:"endpoint"`
+	// RTTMicroseconds is the round-trip time to the peer through the tunnel in
+	// whole microseconds, in 1..2147483647, and nil when the node holds no
+	// measurement, which leaves the member off the wire. A control plane older
+	// than plexsphere/plexsphere#1145 decodes without unknown fields and refuses
+	// a report that carries it with 400 malformed_handshake_report.
+	RTTMicroseconds *int32 `json:"rtt_microseconds,omitempty"`
 }
 
 // HandshakeReportResponse is the 200 body of
