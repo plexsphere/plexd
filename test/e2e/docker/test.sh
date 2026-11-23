@@ -56,6 +56,13 @@
 #     nc -lu reads, and plexd answers meshpeer's request; and with rtt-echo.sh
 #     answering in meshpeer a report carries rtt_microseconds from 1 to
 #     5000000 for it (phase 12e)
+#   - Shared subnet failover: the subnet of a shared_subnets entry whose
+#     first bridge never connects moves to meshpeer within 30 s, carries
+#     traffic there and is named on meshpeer's handshake report entry; two
+#     more pulls keep it there; under a 5 s failure-detection time with
+#     rtt-echo.sh answering, meshpeer dropping plexd's peer draws "has no live
+#     bridge" with a 4 s window; and a pull without the entry releases the
+#     subnet (phase 12e step h1)
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -5426,6 +5433,17 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # reconcile that drops the member again logs the route as removed, the route is
 # gone, and the same connection fails.
 #
+# Step (h1) follows under F and runs the failover of a shared subnet. A
+# shared_subnets entry names 10.21.0.0/16 with the bridges ...a0b1, which
+# never connects, and ...a0b2, meshpeer, in that order. plexd assigns the
+# subnet to ...a0b1, moves it to meshpeer once the 14 s window of the 15 s
+# failure-detection time has passed without an answer from ...a0b1, names it
+# on meshpeer's entry of the handshake report, and keeps it there over two
+# more pulls. Under a spliced 5 s, with rtt-echo.sh answering, meshpeer is
+# judged against a 4 s window, and once plexd's peer leaves meshpeer's wg0
+# plexd warns that the subnet has no live bridge. A pull without the entry
+# releases the subnet to ...a0b1, whose routed_subnets still list it.
+#
 # Step (d1) follows the handshake at once and runs the direct retry on the
 # kernel device. meshpeer gains a second address on e2e-net, and the peer is
 # spliced to carry no endpoint and meshpeer's first address as its
@@ -6514,6 +6532,319 @@ probe_meshpeer_port "peer route" 7005 closed "${MESH_ROUTED_IP}" \
     "no route leads there through plexd's mesh interface, and the network is no longer one of peer ...a0b2's allowed IPs"
 MESH_ROUTED_OUT=$(dc exec -T meshpeer ip address del "${MESH_ROUTED_IP}/32" dev lo 2>&1) \
     || fail "[peer route] removing ${MESH_ROUTED_IP}/32 from meshpeer's loopback failed: ${MESH_ROUTED_OUT}"
+
+# (h1) The failover of a shared subnet, under policy F. meshpeer holds
+# 10.21.0.1 on its loopback again, and one splice serves the shared_subnets
+# entry 10.21.0.0/16 with the bridges ...a0b1 and ...a0b2, in that order, and
+# appends the subnet to the routed_subnets of ...a0b1, beside its
+# 10.50.0.0/16, as the contract lists a shared subnet on its carrier's entry.
+# plexd starts the subnet on the first bridge, ...a0b1, which never connects,
+# since no node holds its key. Under the 15 s failure-detection time the mock
+# serves, a pass runs every second, and a bridge that holds no round-trip
+# time is judged against the 15 s floor less one pass, a 14 s window, which
+# for ...a0b1 starts when the pull assigns it the subnet. The first pass 14 s
+# or more after that finds its path dead, and plexd moves the subnet to
+# meshpeer: its 5 s persistent keepalive alone moves plexd's RxBytes for it
+# inside the window, so its path is alive. The move comes about 15 s after
+# the assignment, and the step waits 30 s for it. plexd's container then
+# reaches meshpeer's listener at 10.21.0.1:7005 through the bridge that holds
+# the subnet.
+#
+# plexd names the subnet on the holder's entry of the handshake report it
+# sends every 30 s, and on no other entry. A report built before the move
+# names no shared subnet on meshpeer's entry, since ...a0b1 held the subnet
+# then and has no entry, so the first report that names it there was built
+# after the move. The step reads the last report every 2 s for up to 45 s
+# after the move, one report interval and 15 s for a slow send.
+#
+# A pull whose entry still lists the holder keeps it, whichever bridge it
+# lists first. The step serves two more pulls that change only the order of
+# the entry's bridges, so the differ reports shared_subnets drift and the
+# WireGuard handler applies each: the first lists meshpeer first, the second
+# lists ...a0b1, the old holder, first again, as the entry did when ...a0b1
+# held the subnet. A pull that changed nothing would reach no handler. For
+# each the step waits up to 75 s for plexd's reconciliation cycle completed
+# line with drift=shared_subnets, which plexd logs once the handlers ran.
+# Neither the pulls nor the passes in between may move the subnet again, and
+# the route stays.
+#
+# With rtt-echo.sh answering in meshpeer, as in step (g), plexd measures a
+# round-trip time for meshpeer, and a bridge with one is judged against the
+# failure-detection time less one pass alone. Step (g)'s value may still be
+# held when the responder starts, since plexd keeps a value for three
+# unanswered rounds, so the step waits, for up to 100 s as (g) does, for a
+# report the mock accepted after the responder started and whose meshpeer
+# entry carries rtt_microseconds: every round from then on is answered, so
+# the value holds. A spliced 5 s then gives meshpeer a 4 s window and a 1 s
+# pass, and plexd writes it one round-trip request on every pass, which
+# rtt-echo.sh answers at once, so its path stays alive inside 4 s, where its
+# 5 s keepalive alone would not keep it. The new value restarts every
+# bridge's window. Once plexd's peer leaves meshpeer's wg0, nothing comes
+# back through the tunnel, and the first pass 4 s after the last answer
+# finds meshpeer's path dead. ...a0b1 is not alive either, so the subnet
+# stays on meshpeer, and plexd warns that it has no live bridge, about 5 s
+# after the removal; the step waits 15 s. plexd keeps the round-trip time
+# for three unanswered rounds, up to 90 s, so the window stays 4 s. The
+# responder stops.
+#
+# The release needs the tunnel back, or the probe that fails after it would
+# fail for the missing peer alone. meshpeer takes plexd's peer back with the
+# PSK, the allowed IP and the keepalive of step (c), but with no endpoint:
+# it then answers plexd's next initiation, which goes to the direct endpoint
+# of step (d1) that plexd is on, from the address plexd sent it to. With the
+# endpoint of step (c), meshpeer would initiate from its first address, the
+# peer's relay, as step (d1) explains. plexd probes meshpeer on every pass,
+# and its WireGuard starts a new handshake once 15 s pass without an answer
+# and repeats it every 5 s, so the step waits up to 30 s for meshpeer's
+# handshake. 10.21.0.1:7005 then connects again, since meshpeer still holds
+# the subnet. A splice of an empty shared_subnets releases the entry. 10.21.0.0/16 stays in the routed_subnets of ...a0b1,
+# so plexd writes the subnet back on ...a0b1 and takes it off meshpeer: the
+# route through the mesh interface stays, and the probe fails while
+# meshpeer's listener waits. Every report before the release names the
+# subnet on meshpeer's entry, so the first one built after it is the first
+# whose meshpeer entry names none, and that report must name no shared
+# subnet on any entry. The failure-detection time goes back to 15 s, and the
+# address leaves meshpeer's loopback. Step (i) serves the saved peers, which
+# take the subnet off ...a0b1 and the route with it, and deletes wg0.
+MESH_SHARED_MSG_ASSIGNED="wireguard: shared subnet assigned"
+MESH_SHARED_MSG_MOVED="wireguard: shared subnet moved"
+MESH_SHARED_MSG_NO_LIVE="wireguard: shared subnet has no live bridge"
+MESH_SHARED_MSG_RELEASED="wireguard: shared subnet released"
+MESH_SHARED_MSG_FD_SET="wireguard: failure detection time set"
+
+# shared_log_lines <log> prints the lines of log that carry a "wireguard:
+# shared subnet" or a "wireguard: failure detection" message, joined by
+# " | ", or "none", for a failure message.
+shared_log_lines() {
+    local line out=
+    while IFS= read -r line; do
+        case "${line}" in
+            *'msg="wireguard: shared subnet'* | *'msg="wireguard: failure detection'*) out="${out:+${out} | }${line}" ;;
+        esac
+    done <<< "$1"
+    printf '%s' "${out:-none}"
+}
+
+# wait_shared_line <tag> <since> <timeout-s> <msg> <baseline> <key=value>...
+# reads the plexd log every 2 s until it holds more than baseline lines that
+# carry msg="<msg>" and every key=value, and leaves the last log it read in
+# MESH_SHARED_LOG. It fails <timeout-s> seconds after MESH_SHARED_START,
+# which the step sets at the event that since names.
+wait_shared_line() {
+    local tag=$1 since=$2 timeout=$3 msg=$4 base=$5 n
+    shift 5
+    while :; do
+        MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${MESH_SHARED_LOG}"
+        n=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${msg}\"" "$@")
+        if [ "${n}" -gt "${base}" ]; then
+            echo "  PASS: [${tag}] plexd logged '${msg}' with $* $((SECONDS - MESH_SHARED_START))s after ${since}"
+            return 0
+        fi
+        if [ $((SECONDS - MESH_SHARED_START)) -ge "${timeout}" ]; then
+            fail "[${tag}] ${timeout}s after ${since}, the plexd log holds ${n} '${msg}' line(s) with $*, want more than ${base}; its shared subnet and failure detection lines: $(shared_log_lines "${MESH_SHARED_LOG}")"
+        fi
+        sleep 2
+    done
+}
+
+# mock_counter <key> reads the counter key from GET /test/assertions into
+# MESH_SHARED_COUNT and returns 1 when the mock answers no number.
+mock_counter() {
+    MESH_SHARED_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "$1")
+    case "${MESH_SHARED_COUNT}" in
+        *[!0-9]* | '') return 1 ;;
+    esac
+}
+
+MESH_SHARED_WANT="[\"${MESH_ROUTED_SUBNET}\"]"
+MESH_SHARED_OUT=$(dc exec -T meshpeer ip address add "${MESH_ROUTED_IP}/32" dev lo 2>&1) \
+    || fail "[shared subnet] adding ${MESH_ROUTED_IP}/32 to meshpeer's loopback failed: ${MESH_SHARED_OUT}"
+
+# 1. The subnet starts on ...a0b1 and moves to meshpeer.
+MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_ASSIGNED_KEYS=("subnet=${MESH_ROUTED_SUBNET}" "bridge=${FIXTURE_PEER_B1}" bridges=2)
+MESH_SHARED_MOVED_KEYS=("subnet=${MESH_ROUTED_SUBNET}" "from=${FIXTURE_PEER_B1}" "to=${FIXTURE_PEER_B2}" reason=bridge_dead window=14s)
+MESH_SHARED_ASSIGNED_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_ASSIGNED}\"" "${MESH_SHARED_ASSIGNED_KEYS[@]}")
+MESH_SHARED_MOVED_DEAD_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_MOVED}\"" "${MESH_SHARED_MOVED_KEYS[@]}")
+MESH_SHARED_MOVED_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_MOVED}\"" "subnet=${MESH_ROUTED_SUBNET}")
+splice_state "shared-subnet-add" \
+    '.shared_subnets = [{subnet: $v.subnet, bridges: $v.bridges}] | .peers |= map(if .node_id == $v.carrier then .routed_subnets = ((.routed_subnets // []) + [$v.subnet]) else . end)' \
+    "$(jq -cn --arg subnet "${MESH_ROUTED_SUBNET}" --arg b1 "${FIXTURE_PEER_B1}" --arg b2 "${FIXTURE_PEER_B2}" \
+        '{subnet: $subnet, bridges: [$b1, $b2], carrier: $b1}')"
+MESH_SHARED_START=${SECONDS}
+wait_shared_line "shared subnet" "the splice" 30 "${MESH_SHARED_MSG_ASSIGNED}" "${MESH_SHARED_ASSIGNED_BASE}" "${MESH_SHARED_ASSIGNED_KEYS[@]}"
+MESH_SHARED_START=${SECONDS}
+wait_shared_line "shared subnet" "the step saw the assignment" 30 "${MESH_SHARED_MSG_MOVED}" "${MESH_SHARED_MOVED_DEAD_BASE}" "${MESH_SHARED_MOVED_KEYS[@]}"
+MESH_SHARED_MOVED_AT=${SECONDS}
+if ! mesh_route_names "${MESH_ROUTED_SUBNET}"; then
+    fail "[shared subnet] plexd moved ${MESH_ROUTED_SUBNET} to peer ...a0b2, but ip route show ${MESH_ROUTED_SUBNET} in the plexd container prints '${MESH_ROUTE_OUT}', want a route through ${MESH_IFACE}"
+fi
+echo "  PASS: [shared subnet] plexd's container routes ${MESH_ROUTED_SUBNET}, the shared subnet, through ${MESH_IFACE}"
+probe_meshpeer_port "shared subnet" 7005 open "${MESH_ROUTED_IP}"
+
+# 2. A handshake report names the subnet on meshpeer's entry alone.
+while :; do
+    mesh_handshake_entry "shared subnet"
+    MESH_SHARED_HELD=""
+    if [ -n "${MESH_HS_ENTRY}" ]; then
+        MESH_SHARED_HELD=$(printf '%s' "${MESH_HS_ENTRY}" | jq -c 'select(has("shared_subnets")) | .shared_subnets' 2>&1) \
+            || fail "[shared subnet] jq could not read peer ...a0b2's entry '${MESH_HS_ENTRY}' in the last handshake report: ${MESH_SHARED_HELD}"
+    fi
+    if [ "${MESH_SHARED_HELD}" = "${MESH_SHARED_WANT}" ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_SHARED_MOVED_AT)) -ge 45 ]; then
+        fail "[shared subnet] 45s after plexd moved ${MESH_ROUTED_SUBNET} to peer ...a0b2, the last handshake report the mock captured carries shared_subnets '${MESH_SHARED_HELD}' on the peer's entry, want ${MESH_SHARED_WANT} (curl exited ${MESH_HS_RC}; body: ${MESH_HS_BODY})"
+    fi
+    sleep 2
+done
+MESH_SHARED_OTHERS=$(printf '%s' "${MESH_HS_BODY}" | jq -c --arg id "${FIXTURE_PEER_B2}" '[.peers[]? | select(.peer_node_id != $id and has("shared_subnets")) | .peer_node_id]' 2>&1) \
+    || fail "[shared subnet] jq could not read the last handshake report the mock captured: ${MESH_SHARED_OTHERS} (body: ${MESH_HS_BODY})"
+if [ "${MESH_SHARED_OTHERS}" != "[]" ]; then
+    fail "[shared subnet] the handshake report that names ${MESH_ROUTED_SUBNET} on peer ...a0b2's entry carries shared_subnets on the entries of ${MESH_SHARED_OTHERS} too, want it on the holder's entry alone (body: ${MESH_HS_BODY})"
+fi
+echo "  PASS: [shared subnet] a handshake report carries shared_subnets=${MESH_SHARED_WANT} on peer ...a0b2's entry alone $((SECONDS - MESH_SHARED_MOVED_AT))s after the move"
+# As in step (g): the mock captures a body before it checks it, and a refused
+# report makes plexd log the problem's code.
+MESH_SHARED_LOG=$(dc logs --no-log-prefix plexd 2>&1) \
+    || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_REFUSED=$(count_log_lines "${MESH_SHARED_LOG}" "agent: handshake report: send failed" "malformed_handshake_report")
+if [ "${MESH_SHARED_REFUSED}" -ne 0 ]; then
+    fail "[shared subnet] plexd logged ${MESH_SHARED_REFUSED} handshake report(s) the mock refused as malformed_handshake_report, want none: the mock must accept shared_subnets"
+fi
+echo "  PASS: [shared subnet] plexd logged no handshake report the mock refused as malformed_handshake_report"
+
+# 3. Two more pulls keep the subnet on meshpeer.
+MESH_SHARED_MSG_CYCLE="reconciliation cycle completed"
+for MESH_SHARED_ORDER in "${FIXTURE_PEER_B2} ${FIXTURE_PEER_B1}" "${FIXTURE_PEER_B1} ${FIXTURE_PEER_B2}"; do
+    read -r MESH_SHARED_FIRST MESH_SHARED_SECOND <<< "${MESH_SHARED_ORDER}"
+    MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+    MESH_SHARED_CYCLE_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_CYCLE}\"" drift=shared_subnets)
+    splice_state "shared-subnet-order-${MESH_SHARED_FIRST}" '.shared_subnets[0].bridges = $v' \
+        "$(jq -cn --arg first "${MESH_SHARED_FIRST}" --arg second "${MESH_SHARED_SECOND}" '[$first, $second]')"
+    MESH_SHARED_START=${SECONDS}
+    wait_shared_line "shared subnet" "the splice that lists ${MESH_SHARED_FIRST} first" 75 \
+        "${MESH_SHARED_MSG_CYCLE}" "${MESH_SHARED_CYCLE_BASE}" drift=shared_subnets
+done
+MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_MOVED=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_MOVED}\"" "subnet=${MESH_ROUTED_SUBNET}")
+if [ "${MESH_SHARED_MOVED}" -ne $((MESH_SHARED_MOVED_BASE + 1)) ]; then
+    fail "[shared subnet] after two more pulls the plexd log holds ${MESH_SHARED_MOVED} '${MESH_SHARED_MSG_MOVED}' line(s) for ${MESH_ROUTED_SUBNET}, want $((MESH_SHARED_MOVED_BASE + 1)), the one move to peer ...a0b2 (${MESH_SHARED_MOVED_BASE} before the splice); its shared subnet and failure detection lines: $(shared_log_lines "${MESH_SHARED_LOG}")"
+fi
+if ! mesh_route_names "${MESH_ROUTED_SUBNET}"; then
+    fail "[shared subnet] after two more pulls ip route show ${MESH_ROUTED_SUBNET} in the plexd container prints '${MESH_ROUTE_OUT}', want a route through ${MESH_IFACE}"
+fi
+echo "  PASS: [shared subnet] after two more pulls plexd logged no further move of ${MESH_ROUTED_SUBNET} and still routes it through ${MESH_IFACE}"
+
+# 4. Under 5 s with a round-trip time, meshpeer's silence leaves the subnet
+# without a live bridge.
+dc exec -d -T meshpeer socat "UDP4-RECVFROM:7911,bind=${MESH_PEER_IP},fork" EXEC:/usr/local/bin/rtt-echo.sh \
+    || fail "[shared subnet] could not start the round-trip responder on UDP port 7911 in meshpeer"
+await_listening "shared subnet" meshpeer_udp_listening 7911 yes
+mock_counter handshake_report_count \
+    || fail "[shared subnet] could not read handshake_report_count from ${ASSERT_URL} (got '${MESH_SHARED_COUNT}')"
+MESH_SHARED_REPORT_BASE=${MESH_SHARED_COUNT}
+MESH_SHARED_RTT_START=${SECONDS}
+MESH_HS_RC="not read"
+MESH_HS_BODY=""
+while :; do
+    MESH_SHARED_RTT=""
+    if mock_counter handshake_report_count && [ "${MESH_SHARED_COUNT}" -gt "${MESH_SHARED_REPORT_BASE}" ]; then
+        mesh_handshake_entry "shared subnet"
+        if [ -n "${MESH_HS_ENTRY}" ]; then
+            MESH_SHARED_RTT=$(printf '%s' "${MESH_HS_ENTRY}" | jq -c 'select(has("rtt_microseconds")) | .rtt_microseconds' 2>&1) \
+                || fail "[shared subnet] jq could not read peer ...a0b2's entry '${MESH_HS_ENTRY}' in the last handshake report: ${MESH_SHARED_RTT}"
+        fi
+    fi
+    if [ -n "${MESH_SHARED_RTT}" ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_SHARED_RTT_START)) -ge 100 ]; then
+        fail "[shared subnet] 100s after the round-trip responder started in meshpeer, no handshake report the mock accepted since (handshake_report_count ${MESH_SHARED_REPORT_BASE} to ${MESH_SHARED_COUNT}) carries rtt_microseconds for peer ...a0b2 (curl exited ${MESH_HS_RC}; body: ${MESH_HS_BODY:-none})"
+    fi
+    sleep 2
+done
+echo "  PASS: [shared subnet] a handshake report accepted after meshpeer's responder started carries rtt_microseconds=${MESH_SHARED_RTT} for peer ...a0b2, $((SECONDS - MESH_SHARED_RTT_START))s after the start"
+
+MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_FD_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_FD_SET}\"" detect_after=5s previous=15s)
+splice_state "shared-subnet-fd-5" '.failure_detection = $v' '{"detect_after_seconds":5}'
+MESH_SHARED_START=${SECONDS}
+wait_shared_line "shared subnet" "the splice of 5s" 15 "${MESH_SHARED_MSG_FD_SET}" "${MESH_SHARED_FD_BASE}" detect_after=5s previous=15s
+
+MESH_SHARED_NO_LIVE_KEYS=("subnet=${MESH_ROUTED_SUBNET}" "bridge=${FIXTURE_PEER_B2}" window=4s)
+MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_NO_LIVE_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_NO_LIVE}\"" "${MESH_SHARED_NO_LIVE_KEYS[@]}")
+MESH_SHARED_OUT=$(dc exec -T meshpeer wg set wg0 peer "${PLEXD_PUBKEY}" remove 2>&1) \
+    || fail "[shared subnet] removing plexd's peer ${PLEXD_PUBKEY} from meshpeer's wg0 failed: ${MESH_SHARED_OUT}"
+MESH_SHARED_START=${SECONDS}
+wait_shared_line "shared subnet" "plexd's peer left meshpeer's wg0" 15 "${MESH_SHARED_MSG_NO_LIVE}" "${MESH_SHARED_NO_LIVE_BASE}" "${MESH_SHARED_NO_LIVE_KEYS[@]}"
+dc exec -T meshpeer pkill -f "socat UDP4-RECVFROM:7911,bind=${MESH_PEER_IP},fork EXEC:/usr/local/bin/rtt-echo.sh" >/dev/null 2>&1 || true
+await_listening "shared subnet" meshpeer_udp_bound 7911 no
+
+# 5. The tunnel comes back, and a pull without the entry releases the subnet
+# to ...a0b1.
+MESH_SHARED_OUT=$(dc exec -T meshpeer wg set wg0 peer "${PLEXD_PUBKEY}" preshared-key /tmp/wg0.psk \
+    allowed-ips "${MESH_NODE_IP}/32" persistent-keepalive 5 2>&1) \
+    || fail "[shared subnet] adding plexd's peer ${PLEXD_PUBKEY} to meshpeer's wg0 again failed: ${MESH_SHARED_OUT}"
+MESH_SHARED_HS_START=${SECONDS}
+while :; do
+    MESH_SHARED_HS=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+        || fail "[shared subnet] wg show wg0 latest-handshakes in meshpeer failed: ${MESH_SHARED_HS}"
+    MESH_SHARED_HS_TIME=${MESH_SHARED_HS##*[[:space:]]}
+    case "${MESH_SHARED_HS_TIME}" in
+        *[!0-9]* | '') MESH_SHARED_HS_TIME=0 ;;
+    esac
+    if [ "${MESH_SHARED_HS_TIME}" -gt 0 ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_SHARED_HS_START)) -ge 30 ]; then
+        fail "[shared subnet] 30s after meshpeer took plexd's peer back without an endpoint, it completed no handshake with plexd, which starts one 15s after its last unanswered packet and repeats it every 5s; wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
+    fi
+    sleep 2
+done
+echo "  PASS: [shared subnet] meshpeer completed a handshake with plexd $((SECONDS - MESH_SHARED_HS_START))s after it took plexd's peer back"
+probe_meshpeer_port "shared subnet" 7005 open "${MESH_ROUTED_IP}"
+
+MESH_SHARED_RELEASED_KEYS=("subnet=${MESH_ROUTED_SUBNET}" "bridge=${FIXTURE_PEER_B2}")
+MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_RELEASED_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_RELEASED}\"" "${MESH_SHARED_RELEASED_KEYS[@]}")
+splice_state "shared-subnet-release" '.shared_subnets = $v' '[]'
+MESH_SHARED_START=${SECONDS}
+wait_shared_line "shared subnet" "the splice" 30 "${MESH_SHARED_MSG_RELEASED}" "${MESH_SHARED_RELEASED_BASE}" "${MESH_SHARED_RELEASED_KEYS[@]}"
+MESH_SHARED_RELEASED_AT=${SECONDS}
+probe_meshpeer_port "shared subnet" 7005 closed "${MESH_ROUTED_IP}" \
+    "the network left peer ...a0b2's allowed IPs for those of peer ...a0b1, which never connects"
+
+while :; do
+    mesh_handshake_entry "shared subnet"
+    MESH_SHARED_HELD=""
+    if [ -n "${MESH_HS_ENTRY}" ]; then
+        MESH_SHARED_HELD=$(printf '%s' "${MESH_HS_ENTRY}" | jq -c 'if has("shared_subnets") then .shared_subnets else "none" end' 2>&1) \
+            || fail "[shared subnet] jq could not read peer ...a0b2's entry '${MESH_HS_ENTRY}' in the last handshake report: ${MESH_SHARED_HELD}"
+    fi
+    if [ "${MESH_SHARED_HELD}" = '"none"' ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_SHARED_RELEASED_AT)) -ge 45 ]; then
+        fail "[shared subnet] 45s after plexd released ${MESH_ROUTED_SUBNET}, peer ...a0b2's entry in the last handshake report the mock captured carries shared_subnets ${MESH_SHARED_HELD:-<no entry>}, want an entry without the member (curl exited ${MESH_HS_RC}; body: ${MESH_HS_BODY})"
+    fi
+    sleep 2
+done
+MESH_SHARED_OTHERS=$(printf '%s' "${MESH_HS_BODY}" | jq -c '[.peers[]? | select(has("shared_subnets")) | .peer_node_id]' 2>&1) \
+    || fail "[shared subnet] jq could not read the last handshake report the mock captured: ${MESH_SHARED_OTHERS} (body: ${MESH_HS_BODY})"
+if [ "${MESH_SHARED_OTHERS}" != "[]" ]; then
+    fail "[shared subnet] the first handshake report after the release carries shared_subnets on the entries of ${MESH_SHARED_OTHERS}, want no entry to carry it (body: ${MESH_HS_BODY})"
+fi
+echo "  PASS: [shared subnet] the first handshake report after the release carries no shared_subnets on any entry, $((SECONDS - MESH_SHARED_RELEASED_AT))s after the release"
+
+MESH_SHARED_LOG=$(dc logs plexd 2>&1) || fail "[shared subnet] dc logs plexd failed: ${MESH_SHARED_LOG}"
+MESH_SHARED_FD_BASE=$(count_log_lines "${MESH_SHARED_LOG}" "msg=\"${MESH_SHARED_MSG_FD_SET}\"" detect_after=15s previous=5s)
+splice_state "shared-subnet-fd-15" '.failure_detection = $v' '{"detect_after_seconds":15}'
+MESH_SHARED_START=${SECONDS}
+wait_shared_line "shared subnet" "the splice of 15s" 15 "${MESH_SHARED_MSG_FD_SET}" "${MESH_SHARED_FD_BASE}" detect_after=15s previous=5s
+MESH_SHARED_OUT=$(dc exec -T meshpeer ip address del "${MESH_ROUTED_IP}/32" dev lo 2>&1) \
+    || fail "[shared subnet] removing ${MESH_ROUTED_IP}/32 from meshpeer's loopback failed: ${MESH_SHARED_OUT}"
 
 # (i) The saved peers and policy are served again, plexd applies the fixture's
 # revision once more, and meshpeer's wg0 goes, so no later phase meets it.
