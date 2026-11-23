@@ -469,13 +469,18 @@ func networksOf(prefixes []netip.Prefix) []netip.Prefix {
 			nets = append(nets, p.Masked())
 		}
 	}
-	slices.SortFunc(nets, func(a, b netip.Prefix) int {
-		if c := a.Addr().Compare(b.Addr()); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.Bits(), b.Bits())
-	})
+	slices.SortFunc(nets, comparePrefixes)
 	return slices.Compact(nets)
+}
+
+// comparePrefixes orders two prefixes by address and then by length, the
+// order of networksOf and of the shared subnets a peer holds (see
+// Manager.sharedHeldLocked).
+func comparePrefixes(a, b netip.Prefix) int {
+	if c := a.Addr().Compare(b.Addr()); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Bits(), b.Bits())
 }
 
 // localNetworksChanged reads the local networks through localPrefixes, at

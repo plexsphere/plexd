@@ -35,6 +35,10 @@ type Manager struct {
 	// syncPeerRoutes routes the routed subnets of these peers.
 	dial map[string]*dialState
 
+	// shared is the shared subnets of the last pull, keyed by canonical CIDR.
+	// Guarded by mu.
+	shared map[string]*sharedSubnet
+
 	// meshPrefix is the prefix the interface address carries, masked: the
 	// Domain mesh CIDR, or the mesh IP's host /32 when the identity has no
 	// usable CIDR. It is zero until Setup succeeds.
@@ -135,6 +139,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 		logger:        logger,
 		peers:         NewPeerIndex(),
 		dial:          make(map[string]*dialState),
+		shared:        make(map[string]*sharedSubnet),
 		localPrefixes: func() ([]netip.Prefix, error) { return nil, nil },
 		now:           time.Now,
 		rttAddr:       rttProbeAddr,
@@ -287,7 +292,10 @@ func (m *Manager) Teardown() error {
 // removes the route of every programmed subnet no such peer lists any more,
 // then adds one for every listed subnet that has none, each through
 // OSInterfaceName, in subnet order. A subnet two peers list is routed once
-// and keeps its route until the last of them drops it.
+// and keeps its route until the last of them drops it. A shared subnet is the
+// routed subnet of one peer at a time, its holder (see setSharedSubnets), so
+// the union, and with it the routes, do not change when the subnet moves
+// from one bridge to another.
 //
 // A call that fails is logged at Error and leaves that subnet's state as it
 // was, so the next run tries it again; the failures are returned joined, so
@@ -430,6 +438,9 @@ type MeshPeerStat struct {
 	LastHandshake    time.Time      // zero when no handshake has completed
 	RxBytes, TxBytes uint64
 	RTT              time.Duration // zero when the peer holds no value
+	// SharedSubnets are the shared subnets whose holder is the peer, sorted
+	// by address and then by prefix length, nil when there are none.
+	SharedSubnets []string
 }
 
 // ErrPeerStatsUnsupported is returned by MeshPeerStats when the controller
@@ -449,6 +460,11 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 // RTT is the latest round-trip time the round-trip probe measured to the peer
 // (see RunRTTProbe), zero when the peer holds no value. The tunnel metrics and
 // endpoint selection ignore it.
+//
+// SharedSubnets are the shared subnets whose holder the peer is when the call
+// reads them (see setSharedSubnets), each list the caller's own. They are
+// copied under mu, which is released before the round-trip probe's mutex is
+// taken: the two are never held together, and no caller holds mu.
 func (m *Manager) MeshPeerStats() ([]MeshPeerStat, error) {
 	// A nil m.ctrl fails the assertion as well, which is the case plexd up
 	// builds where no controller exists for the platform.
@@ -463,6 +479,10 @@ func (m *Manager) MeshPeerStats() ([]MeshPeerStat, error) {
 	}
 
 	nodeIDs := m.peers.NodeIDsByPublicKey()
+	m.mu.Lock()
+	held := m.sharedHeldLocked()
+	m.mu.Unlock()
+
 	mesh := make([]MeshPeerStat, 0, len(stats))
 	m.rtt.mu.Lock()
 	for _, s := range stats {
@@ -477,6 +497,7 @@ func (m *Manager) MeshPeerStats() ([]MeshPeerStat, error) {
 			RxBytes:       s.RxBytes,
 			TxBytes:       s.TxBytes,
 			RTT:           m.rtt.value(nodeID),
+			SharedSubnets: slices.Clone(held[nodeID]),
 		})
 	}
 	m.rtt.mu.Unlock()
