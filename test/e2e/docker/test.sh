@@ -21,9 +21,10 @@
 #     moves relayed fixture peer ...a0b2, meshpeer, off its relay (phase 12e
 #     step d1)
 #   - The failure-detection time from the state pull: the served 15 s holds
-#     relayed meshpeer, a kernel WireGuard peer that sends nothing on its own
-#     (phase 12e step d1), and spliced values are set, kept across a null
-#     block and clamped (phase 12f)
+#     relayed meshpeer, a kernel WireGuard peer that sends nothing on its own,
+#     with sockets on its UDP ports 9 and 7911 taking plexd's probes (phase
+#     12e step d1), and spliced values are set, kept across a null block and
+#     clamped (phase 12f)
 #   - Mesh MTU sized from the uplink probe and held by the device (same
 #     skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
@@ -44,10 +45,17 @@
 #   - Policy enforcement on the mesh interface: a WireGuard peer in the meshpeer
 #     container reaches the ports the served policy allows and no other, plexd's
 #     container reaches meshpeer only where a rule allows it, UDP to the relay
-#     probe port aside, a revision with a legacy deny rule is rejected, mesh
-#     DNS inside the container still answers under an empty policy, and a
-#     network a peer's routed_subnets lists is routed through the mesh
-#     interface and reached under a rule until a pull drops it
+#     and round-trip probe ports aside, a revision with a legacy deny rule is
+#     rejected, mesh DNS inside the container still answers under an empty
+#     policy, and a network a peer's routed_subnets lists is routed through
+#     the mesh interface and reached under a rule until a pull drops it
+#   - The round-trip probe: meshpeer's entry in the handshake report carries
+#     no rtt_microseconds while nothing in meshpeer answers the probe; under an
+#     empty policy plexd's probe reaches meshpeer's UDP port 7911, waited for
+#     before the nc -lu probe of that port so that it cannot be the datagram
+#     nc -lu reads, and plexd answers meshpeer's request; and with rtt-echo.sh
+#     answering in meshpeer a report carries rtt_microseconds from 1 to
+#     5000000 for it (phase 12e)
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -5379,7 +5387,10 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # connections leave through the output chain too, which passes them as replies
 # to a connection the input chain let in. UDP to port 9, the relay probe port,
 # passes the output chain without a rule, so under E a datagram to meshpeer's
-# port 9 arrives and one to 7006 does not. A query from inside plexd's
+# port 9 arrives and one to 7006 does not. UDP to port 7911, the round-trip
+# probe port, passes both chains without a rule, so under E a datagram to
+# meshpeer's port 7911 arrives too, and a request meshpeer sends to plexd's
+# port 7911 comes back as plexd's reply. A query from inside plexd's
 # container reaches the mesh resolver over lo, which no chain matches, so mesh
 # DNS answers even under E. The mesh carries IPv4 only, so A's IPv6 rule proves
 # that plexd applies such a rule, not that it matches IPv6 traffic.
@@ -5421,11 +5432,30 @@ echo "=== Phase 12d PASSED: mesh DNS without systemd-resolved ==="
 # fallback_endpoint, so the next selection pass marks it relayed. For the next
 # 32 s plexd probes it on every pass and must not dial the relay again for
 # silence, which proves the 15 s failure-detection time the mock serves against
-# a peer that sends nothing on its own. A splice that adds the second address
-# as its endpoint then makes plexd log "wireguard: trying the direct endpoints
-# again" with reason=pull and "wireguard: endpoint selected" with
-# relayed=false for that address within 30 s, and meshpeer reports a later
-# handshake. The rest of the phase runs over that tunnel.
+# a peer that sends nothing on its own. Sockets on meshpeer's UDP ports 9 and
+# 7911 take plexd's relay and round-trip probes in that time. A splice that
+# adds the second address as its endpoint then makes plexd log "wireguard:
+# trying the direct endpoints again" with reason=pull and "wireguard: endpoint
+# selected" with relayed=false for that address within 30 s, and meshpeer
+# reports a later handshake. The rest of the phase runs over that tunnel.
+#
+# plexd probes each peer it has a fresh handshake with once per 30 s heartbeat
+# interval, from 10.99.0.1:7911 to the peer's UDP port 7911, and reports the
+# round-trip time as rtt_microseconds on the peer's entry in the handshake
+# report it also sends every 30 s. meshpeer runs no plexd, so nothing there
+# answers the probe until step (g) starts rtt-echo.sh under socat. Right after
+# step (d1) the phase wants the entry of peer ...a0b2 in the last report the
+# mock captured to have exactly the keys endpoint, last_handshake_age_seconds
+# and peer_node_id. Under E, with the responder running, a captured report
+# must carry an integer rtt_microseconds from 1 to 5000000 for the peer within
+# 100 s. Before that, step (g) probes meshpeer's UDP port 7911 from plexd's
+# container with probe_meshpeer_udp, whose nc -lu connects to the sender of
+# the first datagram it receives. plexd's own probe could be that sender and
+# take the place of the helper's datagram, so the step first waits for plexd's
+# probe in a receiver that never connects, which also shows the probe leaving
+# through the output chain under E, stops that receiver, and runs the helper
+# in the quiet part of the interval before plexd's next probe. That orders the
+# two senders and retries nothing.
 #
 # The phase runs before Phase 13, which replaces the fixture, and ends by
 # serving the saved peers and policy again. Like Phase 12d it needs kernel
@@ -5862,6 +5892,24 @@ probe_meshpeer_udp() {
     echo "  PASS: [${tag}] a UDP datagram from plexd's container to ${MESH_PEER_IP}:${port} does not arrive in meshpeer, whose listener still waits there"
 }
 
+# mesh_handshake_entry <tag> reads the last handshake report the mock captured
+# through GET /test/last-request/handshakes. It leaves the body in
+# MESH_HS_BODY, curl's exit status in MESH_HS_RC, and the entry of peer
+# ...a0b2 as compact JSON in MESH_HS_ENTRY, which is empty when curl failed or
+# the report lists no entry for the peer. A body jq cannot read fails the
+# step. The mock keeps only the last report, and plexd sends one every 30 s.
+mesh_handshake_entry() {
+    local tag=$1
+    MESH_HS_RC=0
+    MESH_HS_ENTRY=""
+    MESH_HS_BODY=$(curl -sf "http://localhost:18080/test/last-request/handshakes" 2>&1) || MESH_HS_RC=$?
+    if [ "${MESH_HS_RC}" -ne 0 ]; then
+        return 0
+    fi
+    MESH_HS_ENTRY=$(printf '%s' "${MESH_HS_BODY}" | jq -c --arg id "${FIXTURE_PEER_B2}" '.peers[]? | select(.peer_node_id == $id)' 2>&1) \
+        || fail "[${tag}] jq could not read the last handshake report the mock captured: ${MESH_HS_ENTRY} (body: ${MESH_HS_BODY})"
+}
+
 # wait_peer_route_line <tag> <needle> <baseline> reads the plexd log every 2 s
 # for up to 30 s until it holds more than baseline "wireguard: peer routes
 # changed" lines that carry needle, which the WireGuard handler logs in the
@@ -6059,16 +6107,23 @@ echo "  meshpeer's eth0 holds ${MESH_SECOND_IP}/${MESH_SECOND_LEN} beside ${MESH
 # 5 s persistent keepalive, which plexd's probes keep pushing out. A socket on
 # its UDP port 9, the relay probe port, takes the probes, so its kernel answers
 # none of them with an ICMP port unreachable, as it would for a closed port.
+# A second socket, on its UDP port 7911, takes the round-trip probe plexd sends
+# it once per 30 s heartbeat interval. Without it a probe of plexd's that falls
+# into the wait draws an ICMP port unreachable through the tunnel, which moves
+# plexd's RxBytes as an answer from meshpeer would, and the wait proves less.
 # meshpeer then sends nothing on its own and answers only through its 10 s
 # keepalive timer, up to 10 s plus one pass apart, inside the 14 s silence
 # window. The step waits 32 s, more than twice that window, and a silence
 # re-dial for the peer in the wait fails the step. That proves the 15 s
-# default against a peer that sends nothing on its own. The socket goes after
-# the wait, because step (g) listens on port 9 itself.
+# default against a peer that sends nothing on its own. The sockets go after
+# the wait, because step (g) listens on ports 9 and 7911 itself.
 MESH_SILENCE_MSG='msg="wireguard: relayed peer silent past the failure detection time, dialing the relay again"'
 dc exec -d -T meshpeer socat -u UDP4-RECV:9 /dev/null \
     || fail "[direct retry] could not start a socket on UDP port 9 in meshpeer"
 await_listening "direct retry" meshpeer_udp_listening 9 yes
+dc exec -d -T meshpeer socat -u UDP4-RECV:7911 /dev/null \
+    || fail "[direct retry] could not start a socket on UDP port 7911 in meshpeer"
+await_listening "direct retry" meshpeer_udp_listening 7911 yes
 MESH_SILENCE_LOG=$(dc logs plexd 2>&1) || fail "[direct retry] dc logs plexd failed: ${MESH_SILENCE_LOG}"
 MESH_SILENCE_BASE=$(count_log_lines "${MESH_SILENCE_LOG}" "${MESH_SILENCE_MSG}" "peer_id=${FIXTURE_PEER_B2}")
 splice_state "direct-retry-relay" \
@@ -6083,9 +6138,14 @@ fi
 if ! meshpeer_udp_listening 9; then
     fail "[direct retry] the socket on UDP port 9 in meshpeer no longer listened after the 32s wait, so meshpeer may have answered plexd's probes with an ICMP port unreachable, and the wait without a silence re-dial proves nothing about its keepalive timer"
 fi
+if ! meshpeer_udp_listening 7911; then
+    fail "[direct retry] the socket on UDP port 7911 in meshpeer no longer listened after the 32s wait, so meshpeer may have answered a round-trip probe of plexd's with an ICMP port unreachable through the tunnel, and the wait without a silence re-dial proves less about its keepalive timer"
+fi
 dc exec -T meshpeer pkill -f "socat -u UDP4-RECV:9" >/dev/null 2>&1 || true
 await_listening "direct retry" meshpeer_udp_bound 9 no
-echo "  PASS: [direct retry] plexd logged no silence re-dial for peer ...a0b2 in the 32s after the splice that made ${MESHPEER_IP}:51820 its relay, with a socket on meshpeer's UDP port 9 taking the probes"
+dc exec -T meshpeer pkill -f "socat -u UDP4-RECV:7911 /dev/null" >/dev/null 2>&1 || true
+await_listening "direct retry" meshpeer_udp_bound 7911 no
+echo "  PASS: [direct retry] plexd logged no silence re-dial for peer ...a0b2 in the 32s after the splice that made ${MESHPEER_IP}:51820 its relay, with sockets on meshpeer's UDP ports 9 and 7911 taking the probes"
 
 MESH_RETRY_KEYS=("peer_id=${FIXTURE_PEER_B2}" reason=pull "endpoint=${MESH_SECOND_ENDPOINT}")
 MESH_SELECTED_KEYS=("peer_id=${FIXTURE_PEER_B2}" "endpoint=${MESH_SECOND_ENDPOINT}" relayed=false)
@@ -6121,6 +6181,34 @@ while :; do
     sleep 2
 done
 echo "  PASS: [direct retry] meshpeer completed a handshake with plexd at ${MESH_HS_TIME}, later than ${MESH_HS_BEFORE} before the splice"
+
+# (d2) The round-trip probe without an answer. plexd probes peer ...a0b2 at
+# meshpeer's UDP port 7911 once per heartbeat interval, and nothing in meshpeer
+# answers before step (g) starts the responder, so plexd holds no round-trip
+# time for the peer. The handshake report lists the peer, which completed a
+# handshake in step (d), and its entry carries exactly the three members a
+# report carries for a peer without a measurement. A report sent before that
+# handshake lists no peer. The step reads the last report every 2 s for up to
+# 70 s, two 30 s report intervals and 10 s for a slow send, until one lists
+# the peer.
+MESH_RTT_KEYS_WANT='["endpoint","last_handshake_age_seconds","peer_node_id"]'
+MESH_RTT_START=${SECONDS}
+while :; do
+    mesh_handshake_entry "rtt probe"
+    if [ -n "${MESH_HS_ENTRY}" ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_RTT_START)) -ge 70 ]; then
+        fail "[rtt probe] 70s after step (d1), the last handshake report the mock captured lists no entry for peer ...a0b2, which completed a handshake in step (d) (curl exited ${MESH_HS_RC}; body: ${MESH_HS_BODY})"
+    fi
+    sleep 2
+done
+MESH_RTT_KEYS=$(printf '%s' "${MESH_HS_ENTRY}" | jq -c 'keys' 2>&1) \
+    || fail "[rtt probe] jq could not read the keys of peer ...a0b2's entry '${MESH_HS_ENTRY}': ${MESH_RTT_KEYS}"
+if [ "${MESH_RTT_KEYS}" != "${MESH_RTT_KEYS_WANT}" ]; then
+    fail "[rtt probe] peer ...a0b2's entry in the last handshake report has the keys ${MESH_RTT_KEYS}, want exactly ${MESH_RTT_KEYS_WANT}: nothing in meshpeer answers plexd's round-trip probe yet, so plexd holds no round-trip time for the peer (entry: ${MESH_HS_ENTRY})"
+fi
+echo "  PASS: [rtt probe] peer ...a0b2's entry in the last handshake report has exactly the keys ${MESH_RTT_KEYS} while nothing in meshpeer answers plexd's round-trip probe"
 
 # (e) Policy A: 7001 is open to meshpeer and 7002 is not, and plexd's answers
 # on 7001 leave through the output chain as replies. plexd's container connects
@@ -6240,7 +6328,11 @@ probe_plexd_port "mesh policy C" 7001 open
 # no rules, closes 7001 and 7003, while mesh DNS inside plexd's container still
 # answers. Under E a datagram from plexd's container to meshpeer's UDP port 9
 # still arrives, since the output chain passes the relay probe port without a
-# rule, and one to 7006 does not.
+# rule, and one to 7006 does not. The round-trip probe port passes both chains
+# under E: plexd's own probe and a datagram from plexd's container reach
+# meshpeer's port 7911, meshpeer's request to plexd's port 7911 comes back as
+# plexd's reply, and once meshpeer answers plexd's probes a report carries a
+# round-trip time for peer ...a0b2.
 MESH_REV_D="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c7"
 MESH_RULES_D=$(printf '%s' "${MESH_RULES_A}" | jq -c 'map(select(.ports.from != 7001))')
 serve_policy "mesh-policy-d" "${MESH_REV_D}" "${MESH_RULES_D}"
@@ -6265,6 +6357,119 @@ probe_plexd_port "mesh policy E" 7001 closed
 probe_meshpeer_port "mesh policy E" 7003 closed
 probe_meshpeer_udp "mesh policy E" 9 arrives
 probe_meshpeer_udp "mesh policy E" 7006 dropped
+
+# The round-trip probe port under E. probe_meshpeer_udp listens with nc -lu,
+# which connects its socket to the sender of the first datagram it receives.
+# plexd's own probe, sent from 10.99.0.1:7911 to meshpeer's port 7911 once per
+# 30 s heartbeat interval, can be that sender, and the helper would then read
+# the probe instead of "probe". So a receiver that never connects takes
+# plexd's probe first, which shows the probe leaving through the output chain
+# under E with no rule: its first 8 bytes are the magic PXRT, version 1, kind
+# 1 (a request) and two zero bytes. The step reads the receiver's file every
+# second for up to 40 s, one 30 s round interval and 10 s for a round that
+# starts late. It then stops the receiver, and the helper's probe of port 7911
+# falls in the quiet part of the interval before plexd's next probe. This
+# orders the two senders and retries nothing.
+MESH_RTT_SEEN_FILE=/tmp/rtt-seen.out
+dc exec -d -T meshpeer sh -c "socat -u UDP4-RECV:7911 STDOUT > ${MESH_RTT_SEEN_FILE}" \
+    || fail "[mesh policy E] could not start a receiver on UDP port 7911 in meshpeer"
+await_listening "mesh policy E" meshpeer_udp_listening 7911 yes
+MESH_RTT_START=${SECONDS}
+while :; do
+    MESH_RTT_SEEN=$(dc exec -T meshpeer sh -c "wc -c < ${MESH_RTT_SEEN_FILE}" 2>&1) \
+        || fail "[mesh policy E] reading the size of ${MESH_RTT_SEEN_FILE} in meshpeer failed: ${MESH_RTT_SEEN}"
+    MESH_RTT_SEEN=${MESH_RTT_SEEN//[[:space:]]/}
+    case "${MESH_RTT_SEEN}" in
+        *[!0-9]* | '') fail "[mesh policy E] wc -c < ${MESH_RTT_SEEN_FILE} in meshpeer printed '${MESH_RTT_SEEN}', want a byte count" ;;
+    esac
+    if [ "${MESH_RTT_SEEN}" -ge 16 ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_RTT_START)) -ge 40 ]; then
+        fail "[mesh policy E] 40s after meshpeer's receiver on UDP port 7911 started, it holds ${MESH_RTT_SEEN} byte(s), want plexd's 16-byte round-trip probe: plexd probes each peer it has a fresh handshake with every 30s, and the output chain on its mesh interface passes UDP to port 7911 without a rule"
+    fi
+    sleep 1
+done
+MESH_RTT_SEEN_AFTER=$((SECONDS - MESH_RTT_START))
+MESH_RTT_HEAD_WANT=" 50 58 52 54 01 01 00 00"
+MESH_RTT_HEAD=$(dc exec -T meshpeer sh -c "set -o pipefail; head -c 8 ${MESH_RTT_SEEN_FILE} | od -An -tx1" 2>&1) \
+    || fail "[mesh policy E] reading the first 8 bytes of ${MESH_RTT_SEEN_FILE} in meshpeer failed: ${MESH_RTT_HEAD}"
+dc exec -T meshpeer pkill -f "socat -u UDP4-RECV:7911 STDOUT" >/dev/null 2>&1 || true
+await_listening "mesh policy E" meshpeer_udp_bound 7911 no
+MESH_RTT_RM_OUT=$(dc exec -T meshpeer rm -f "${MESH_RTT_SEEN_FILE}" 2>&1) \
+    || fail "[mesh policy E] could not remove ${MESH_RTT_SEEN_FILE} in meshpeer: ${MESH_RTT_RM_OUT}"
+if [ "${MESH_RTT_HEAD}" != "${MESH_RTT_HEAD_WANT}" ]; then
+    fail "[mesh policy E] the first datagram meshpeer's receiver on UDP port 7911 took starts with the bytes '${MESH_RTT_HEAD}', want '${MESH_RTT_HEAD_WANT}', the head of a round-trip request: PXRT, version 1, kind 1, two zero bytes"
+fi
+echo "  PASS: [mesh policy E] plexd's round-trip request reached meshpeer's UDP port 7911 ${MESH_RTT_SEEN_AFTER}s after the receiver started, with no rule for the port"
+probe_meshpeer_udp "mesh policy E" 7911 arrives
+
+# meshpeer sends a round-trip request to plexd's port 7911 with nc -u, which
+# prints what comes back until 2 s pass without a datagram. The input chain
+# passes the request without a rule, plexd answers it with the same 16 bytes
+# and the kind, the sixth byte, set to 2, and its answer to the request's
+# source port leaves through the output chain as a reply to a datagram the
+# input chain let in. od prints the 16 bytes as one line.
+MESH_RTT_REQUEST='PXRT\001\001\000\000ABCDEFGH'
+MESH_RTT_REPLY_WANT=" 50 58 52 54 01 02 00 00 41 42 43 44 45 46 47 48"
+MESH_RTT_REPLY_RC=0
+MESH_RTT_REPLY=$(dc exec -T meshpeer sh -c 'set -o pipefail; printf "$1" | nc -n -u -w 2 "$2" 7911 | od -An -tx1' sh "${MESH_RTT_REQUEST}" "${MESH_NODE_IP}" 2>&1) \
+    || MESH_RTT_REPLY_RC=$?
+if [ "${MESH_RTT_REPLY_RC}" -ne 0 ] || [ "${MESH_RTT_REPLY}" != "${MESH_RTT_REPLY_WANT}" ]; then
+    fail "[mesh policy E] meshpeer sent the round-trip request ${MESH_RTT_REQUEST} to ${MESH_NODE_IP}:7911 and read back '${MESH_RTT_REPLY}' (exit ${MESH_RTT_REPLY_RC}), want exit 0 and '${MESH_RTT_REPLY_WANT}', the request with its kind set to 2"
+fi
+echo "  PASS: [mesh policy E] plexd answered meshpeer's round-trip request to ${MESH_NODE_IP}:7911 with the same 16 bytes and kind 2, with no rule for the port"
+
+# With rtt-echo.sh answering plexd's probes on meshpeer's port 7911, plexd's
+# next round measures a round-trip time for peer ...a0b2, and the report after
+# it carries the value as rtt_microseconds. A round and a report each run
+# every 30 s: the next round comes within 30 s of the responder's start and
+# the report after it within 30 s more, and 100 s covers that, one more round
+# in case the first answer is lost, and 10 s to spare. The value is the
+# time through the tunnel and socat's run of the script, a few milliseconds
+# here, and plexd counts no answer later than 5 s. The step reads the last
+# report every 2 s until the entry carries the member and then wants an
+# integer from 1 to 5000000.
+dc exec -d -T meshpeer socat "UDP4-RECVFROM:7911,bind=${MESH_PEER_IP},fork" EXEC:/usr/local/bin/rtt-echo.sh \
+    || fail "[rtt probe] could not start the round-trip responder on UDP port 7911 in meshpeer"
+await_listening "rtt probe" meshpeer_udp_listening 7911 yes
+MESH_RTT_START=${SECONDS}
+while :; do
+    mesh_handshake_entry "rtt probe"
+    MESH_RTT=""
+    if [ -n "${MESH_HS_ENTRY}" ]; then
+        MESH_RTT=$(printf '%s' "${MESH_HS_ENTRY}" | jq -c 'select(has("rtt_microseconds")) | .rtt_microseconds' 2>&1) \
+            || fail "[rtt probe] jq could not read peer ...a0b2's entry '${MESH_HS_ENTRY}' in the last handshake report: ${MESH_RTT}"
+    fi
+    if [ -n "${MESH_RTT}" ]; then
+        break
+    fi
+    if [ $((SECONDS - MESH_RTT_START)) -ge 100 ]; then
+        fail "[rtt probe] 100s after the round-trip responder started in meshpeer, the last handshake report the mock captured carries no rtt_microseconds for peer ...a0b2 (curl exited ${MESH_HS_RC}; body: ${MESH_HS_BODY})"
+    fi
+    sleep 2
+done
+MESH_RTT_AFTER=$((SECONDS - MESH_RTT_START))
+MESH_RTT_OK=$(printf '%s' "${MESH_HS_ENTRY}" | jq -r '.rtt_microseconds | type == "number" and . == floor and . >= 1 and . <= 5000000' 2>&1) \
+    || fail "[rtt probe] jq could not check rtt_microseconds of peer ...a0b2's entry '${MESH_HS_ENTRY}': ${MESH_RTT_OK}"
+if [ "${MESH_RTT_OK}" != true ]; then
+    fail "[rtt probe] peer ...a0b2's entry in the last handshake report carries rtt_microseconds ${MESH_RTT}, want an integer from 1 to 5000000 (entry: ${MESH_HS_ENTRY})"
+fi
+echo "  PASS: [rtt probe] a handshake report carries rtt_microseconds=${MESH_RTT} for peer ...a0b2 ${MESH_RTT_AFTER}s after meshpeer's responder started"
+# The mock captures a body before it checks it, so the captured member alone
+# does not show the mock took the report. A refused report makes plexd log
+# agent: handshake report: send failed with the problem's code, and no line
+# may name malformed_handshake_report.
+MESH_RTT_LOG=$(dc logs --no-log-prefix plexd 2>&1) \
+    || fail "[rtt probe] dc logs plexd failed: ${MESH_RTT_LOG}"
+MESH_RTT_REFUSED=$(count_log_lines "${MESH_RTT_LOG}" "agent: handshake report: send failed" "malformed_handshake_report")
+if [ "${MESH_RTT_REFUSED}" -ne 0 ]; then
+    fail "[rtt probe] plexd logged ${MESH_RTT_REFUSED} handshake report(s) the mock refused as malformed_handshake_report, want none: the mock must accept rtt_microseconds"
+fi
+echo "  PASS: [rtt probe] plexd logged no handshake report the mock refused as malformed_handshake_report"
+dc exec -T meshpeer pkill -f "socat UDP4-RECVFROM:7911,bind=${MESH_PEER_IP},fork EXEC:/usr/local/bin/rtt-echo.sh" >/dev/null 2>&1 || true
+await_listening "rtt probe" meshpeer_udp_bound 7911 no
+echo "  PASS: [rtt probe] meshpeer's round-trip responder stopped, and no socket in meshpeer holds UDP port 7911"
 
 # (h) Policy F allows plexd's mesh IP to reach 10.21.0.0/16 on port 7005, and
 # meshpeer holds 10.21.0.1 on its loopback. Peer ...a0b2 of the served
