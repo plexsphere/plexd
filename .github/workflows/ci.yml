@@ -55,7 +55,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Creating network namespaces and loading nftables rules need root, so
-      # the six Linux tests against the real kernel skip in the unprivileged
+      # the eight Linux tests against the real kernel skip in the unprivileged
       # run above. They build their namespaces, links and TUN devices
       # themselves and leave the runner's own links and ruleset alone. The
       # traffic test TestNftablesController_RealTraffic runs the same checks
@@ -76,9 +76,18 @@ jobs:
       # TestRTTProbe_RealAnswersOnlyTheMeshInterface shares it too and proves
       # that the probe socket answers only what arrives on the mesh
       # interface, not a mesh source spoofed from another network.
+      # The tcp session test TestSession_RealAcceptsOnlyMeshAndLocal shares
+      # the gate as well and proves that a session listener bound to the mesh
+      # interface refuses a host on another network and still accepts the
+      # mesh peer and a client on the node that dials the mesh IP from its
+      # default source. The resolver test
+      # TestServer_RealAnswersNoOtherNetwork shares it too and proves that the
+      # mesh DNS resolver answers no query from another network; it records
+      # that this protection rests on the source rule and on the kernel's
+      # martian check.
       # The absolute go path is resolved before sudo resets PATH, and the two
       # cache variables let root reuse what the step above downloaded and
-      # built. The step fails unless all six tests passed: a skip would pass
+      # built. The step fails unless all eight tests passed: a skip would pass
       # as well otherwise, so it greps the -v output for each PASS line. The
       # space after each name keeps one test's line from matching another's.
       - name: Run privileged Linux tests
@@ -92,14 +101,16 @@ jobs:
           grep -q -- '--- PASS: TestNftablesController_RealTraffic ' "$RUNNER_TEMP/real-nftables.txt"
           grep -q -- '--- PASS: TestNftablesController_RealConnLog ' "$RUNNER_TEMP/real-nftables.txt"
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_LINKS=1 \
-            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface)$' ./internal/bridge/ ./internal/wireguard/ \
+            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface|TestSession_RealAcceptsOnlyMeshAndLocal|TestServer_RealAnswersNoOtherNetwork)$' ./internal/bridge/ ./internal/wireguard/ ./internal/tunnel/ ./internal/meshdns/ \
             | tee "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkVPNController_RealLinks ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkRouteController_RealRoutes ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestRTTProbe_RealAnswersOnlyTheMeshInterface ' "$RUNNER_TEMP/real-links.txt"
+          grep -q -- '--- PASS: TestSession_RealAcceptsOnlyMeshAndLocal ' "$RUNNER_TEMP/real-links.txt"
+          grep -q -- '--- PASS: TestServer_RealAnswersNoOtherNetwork ' "$RUNNER_TEMP/real-links.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
-      # and the forwarding sysctl, so the eight macOS tests against the real
+      # and the forwarding sysctl, so the ten macOS tests against the real
       # kernel skip in the unprivileged run above. The bridge controller test
       # creates its utuns through the bridge controllers and routes over them.
       # The peer route test TestPeerRoutes_RealUTUN sets a WireGuard manager up
@@ -136,6 +147,20 @@ jobs:
       # reaches the nat line on the way out and that nat pass skips the
       # filter rules, so the step also fails unless all three PASS lines are
       # in the output: a skip would pass otherwise.
+      # The tcp session listener test TestSession_RealUTUN and the probe test
+      # TestRTTProbe_RealUTUN each create a mesh utun and a utun for another
+      # network, switch net.inet.ip.forwarding on and restore it, and write
+      # packets into the utuns. They prove that a listener bound with
+      # IP_BOUND_IF answers into the mesh only, and that the probe drops what
+      # did not arrive on the mesh utun. They ask for PLEXD_TEST_REAL_LINKS, so
+      # sudo go test ./... on a developer's Mac skips them. They
+      # run in a command of their own with -p 1, after the first command
+      # finished, because both switch the host's one forwarding knob and
+      # restore it, as TestDarwinRouteController_Real and
+      # TestPFController_RealMeshSourceRewrite in the first command also do.
+      # Two test processes that restore it at different times would switch it
+      # off under each other. The step fails unless both PASS lines are in
+      # that command's output.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
@@ -150,6 +175,11 @@ jobs:
           grep -q -- '--- PASS: TestPFController_RealConnLog ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealMeshSourceRewrite ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPeerRoutes_RealUTUN ' "$RUNNER_TEMP/real-darwin.txt"
+          sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_LINKS=1 \
+            "$(command -v go)" test -race -count=1 -v -p 1 -run '^(TestSession_RealUTUN|TestRTTProbe_RealUTUN)$' ./internal/tunnel/ ./internal/wireguard/ \
+            | tee "$RUNNER_TEMP/real-darwin-links.txt"
+          grep -q -- '--- PASS: TestSession_RealUTUN ' "$RUNNER_TEMP/real-darwin-links.txt"
+          grep -q -- '--- PASS: TestRTTProbe_RealUTUN ' "$RUNNER_TEMP/real-darwin-links.txt"
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
