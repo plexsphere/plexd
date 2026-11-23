@@ -8,22 +8,26 @@ import (
 )
 
 // stateSnapshot holds the last-known desired state received from the control
-// plane.  All access is protected by a sync.RWMutex so concurrent goroutines
-// can safely read while the reconcile loop writes. Reachability is the node's
-// own health projection, not desired state, so it is never stored. Neither is
-// the signing key: a dispatch handler installs it on every pull, and there is
-// nothing for the differ to converge on. Nor is the secret inventory: the node
-// API's dispatch handler hands it to the secret index on every pull. Nor are the
-// mesh DNS names of the dns block: the mesh resolver's dispatch handler takes
-// them on every pull. Nor is the failure-detection time: the WireGuard
-// manager's dispatch handler takes it on every pull.
+// plane: the peers, policy, bridge, state, reports and shared_subnets blocks,
+// the ones ComputeDiff compares. No other block is stored. All access is
+// protected by a sync.RWMutex so concurrent goroutines can safely read while
+// the reconcile loop writes. Reachability is the node's own health projection,
+// not desired state, so it is never stored. Neither is the signing key: a
+// dispatch handler installs it on every pull, and there is nothing for the
+// differ to converge on. Nor is the secret inventory: the node API's dispatch
+// handler hands it to the secret index on every pull. Nor are the mesh DNS
+// names of the dns block: the mesh resolver's dispatch handler takes them on
+// every pull. Nor is the failure-detection time: the WireGuard manager's
+// dispatch handler takes it on every pull. Nor are the executions, sessions
+// and hooks blocks: their dispatch handlers take them on every pull.
 type stateSnapshot struct {
-	mu      sync.RWMutex
-	peers   []api.SnapshotPeer
-	policy  *api.PolicySnapshot
-	bridge  *api.BridgeSnapshot
-	state   *api.NodeStateBlock
-	reports *api.NodeStateBlock
+	mu            sync.RWMutex
+	peers         []api.SnapshotPeer
+	policy        *api.PolicySnapshot
+	bridge        *api.BridgeSnapshot
+	state         *api.NodeStateBlock
+	reports       *api.NodeStateBlock
+	sharedSubnets []api.NodeStateSharedSubnet
 }
 
 // NewStateSnapshot returns a new, empty snapshot.
@@ -32,17 +36,19 @@ func NewStateSnapshot() *stateSnapshot {
 }
 
 // Get returns a deep copy of the current snapshot as an api.NodeStateSnapshot.
-// Reachability, SigningKey and Secrets are not stored, so they are always nil.
+// It carries the stored Peers, Policy, Bridge, State, Reports and
+// SharedSubnets; every other block is not stored, so it is always nil.
 func (s *stateSnapshot) Get() api.NodeStateSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return api.NodeStateSnapshot{
-		Peers:   copyPeers(s.peers),
-		Policy:  copyPolicy(s.policy),
-		Bridge:  copyBridge(s.bridge),
-		State:   copyBlock(s.state),
-		Reports: copyBlock(s.reports),
+		Peers:         copyPeers(s.peers),
+		Policy:        copyPolicy(s.policy),
+		Bridge:        copyBridge(s.bridge),
+		State:         copyBlock(s.state),
+		Reports:       copyBlock(s.reports),
+		SharedSubnets: copySharedSubnets(s.sharedSubnets),
 	}
 }
 
@@ -58,6 +64,7 @@ func (s *stateSnapshot) Update(desired *api.NodeStateSnapshot) {
 	s.bridge = copyBridge(desired.Bridge)
 	s.state = copyBlock(desired.State)
 	s.reports = copyBlock(desired.Reports)
+	s.sharedSubnets = copySharedSubnets(desired.SharedSubnets)
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +77,14 @@ func copyPeers(src []api.SnapshotPeer) []api.SnapshotPeer {
 		dst[i].FallbackEndpoints = slices.Clone(src[i].FallbackEndpoints)
 		dst[i].EndpointCandidates = slices.Clone(src[i].EndpointCandidates)
 		dst[i].RoutedSubnets = slices.Clone(src[i].RoutedSubnets)
+	}
+	return dst
+}
+
+func copySharedSubnets(src []api.NodeStateSharedSubnet) []api.NodeStateSharedSubnet {
+	dst := slices.Clone(src)
+	for i := range dst {
+		dst[i].Bridges = slices.Clone(src[i].Bridges)
 	}
 	return dst
 }

@@ -483,6 +483,79 @@ func TestComputeDiff_ReportsTransitions(t *testing.T) {
 	}
 }
 
+// TestComputeDiff_SharedSubnetsTransitions proves the differ's Acceptance
+// Criteria for the shared_subnets block: "compare nil with [] and read
+// SharedSubnetsChanged false and IsEmpty true", and "change a subnet, add an
+// entry, and swap two bridges of one entry, and read SharedSubnetsChanged
+// true and shared_subnets in Summary each time".
+func TestComputeDiff_SharedSubnetsTransitions(t *testing.T) {
+	// served returns a fresh list on every call, as every pull decodes one, so
+	// an unchanged block compares by value and not by identity.
+	served := func() []api.NodeStateSharedSubnet {
+		return []api.NodeStateSharedSubnet{
+			{Subnet: "10.20.0.0/16", Bridges: []string{"bridge-a", "bridge-b"}},
+		}
+	}
+
+	tests := []struct {
+		name             string
+		desired, current []api.NodeStateSharedSubnet
+		want             bool
+	}{
+		{"nil to empty", []api.NodeStateSharedSubnet{}, nil, false},
+		{"empty to nil", nil, []api.NodeStateSharedSubnet{}, false},
+		{
+			"nil and empty bridges",
+			[]api.NodeStateSharedSubnet{{Subnet: "10.20.0.0/16", Bridges: []string{}}},
+			[]api.NodeStateSharedSubnet{{Subnet: "10.20.0.0/16"}},
+			false,
+		},
+		{"populated no change", served(), served(), false},
+		{"nil to populated", served(), nil, true},
+		{"populated to empty", []api.NodeStateSharedSubnet{}, served(), true},
+		{
+			"subnet changed",
+			[]api.NodeStateSharedSubnet{{Subnet: "10.21.0.0/16", Bridges: []string{"bridge-a", "bridge-b"}}},
+			served(),
+			true,
+		},
+		{
+			"entry added",
+			append(served(), api.NodeStateSharedSubnet{Subnet: "10.21.0.0/16", Bridges: []string{"bridge-b", "bridge-a"}}),
+			served(),
+			true,
+		},
+		{
+			"bridges swapped",
+			[]api.NodeStateSharedSubnet{{Subnet: "10.20.0.0/16", Bridges: []string{"bridge-b", "bridge-a"}}},
+			served(),
+			true,
+		},
+		{
+			"standby dropped",
+			[]api.NodeStateSharedSubnet{{Subnet: "10.20.0.0/16", Bridges: []string{"bridge-a"}}},
+			served(),
+			true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{SharedSubnets: tt.desired}, &api.NodeStateSnapshot{SharedSubnets: tt.current})
+			if diff.SharedSubnetsChanged != tt.want {
+				t.Errorf("SharedSubnetsChanged = %v, want %v", diff.SharedSubnetsChanged, tt.want)
+			}
+			if tt.want {
+				if got := diff.Summary(); got != "shared_subnets" {
+					t.Errorf("Summary = %q, want %q", got, "shared_subnets")
+				}
+			} else if !diff.IsEmpty() {
+				t.Errorf("diff = %s, want none", diff.Summary())
+			}
+		})
+	}
+}
+
 // TestComputeDiff_SecretsNotDiffed proves the secret inventory never counts as
 // drift: the node API's dispatch handler consumes it on every pull, so a pull
 // whose only change is the secrets block reports an empty diff.
@@ -535,17 +608,18 @@ func TestStateDiff_IsEmpty(t *testing.T) {
 
 func TestStateDiff_Summary(t *testing.T) {
 	diff := StateDiff{
-		PeersToAdd:     []api.SnapshotPeer{{NodeID: "p1"}},
-		PeersToUpdate:  []api.SnapshotPeer{{NodeID: "p2"}, {NodeID: "p3"}},
-		PolicyChanged:  true,
-		BridgeChanged:  true,
-		StateChanged:   true,
-		ReportsChanged: true,
+		PeersToAdd:           []api.SnapshotPeer{{NodeID: "p1"}},
+		PeersToUpdate:        []api.SnapshotPeer{{NodeID: "p2"}, {NodeID: "p3"}},
+		PolicyChanged:        true,
+		BridgeChanged:        true,
+		StateChanged:         true,
+		ReportsChanged:       true,
+		SharedSubnetsChanged: true,
 	}
 	if diff.IsEmpty() {
 		t.Fatal("populated StateDiff should not be empty")
 	}
-	want := "peers+1-0~2 policy bridge state reports"
+	want := "peers+1-0~2 policy bridge state reports shared_subnets"
 	if got := diff.Summary(); got != want {
 		t.Errorf("Summary = %q, want %q", got, want)
 	}
