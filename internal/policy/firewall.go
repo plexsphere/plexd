@@ -88,6 +88,20 @@ func familyOf(prefix netip.Prefix) addrFamily {
 // once the handshake goes stale.
 const RelayProbePort = 9
 
+// RTTProbePort is the UDP port of plexd's round-trip probe (RTTProbePort in
+// internal/wireguard/rtt.go).
+//
+// DECISION: every backend passes UDP to this port over the mesh interface
+// ahead of the policy rules, both what the node sends and what arrives for
+// the node itself, and never what the node forwards (author, 2026-11-23,
+// #218). Any local process on a peer can therefore send UDP to port 7911 of
+// any node, where it reaches the socket that holds the port on the mesh
+// address, which is plexd's. One socket sends the probes and answers the
+// peers' probes, so a probe and its answer both travel from port 7911 to
+// port 7911, and one rule shape, UDP to port 7911 on the mesh interface,
+// covers both directions on a stateless backend too.
+const RTTProbePort = 7911
+
 // FirewallRule describes a single packet filter rule. An address field holds
 // a prefix or a single address of either family; both fields together name one
 // family, and a rule with both empty matches both.
