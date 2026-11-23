@@ -140,6 +140,28 @@ Common causes: the peer runs no plexd with the probe, a host firewall drops UDP 
 - `wireguard: rtt probe send failed`, with `peer_id`, `mesh_ip` and `error`, names a peer the node could not send its probe to. It comes at Warn the first time for that peer and at Debug while the sends to it keep failing, and each failed send counts as an unanswered probe.
 - A control plane older than plexsphere/plexsphere#1145 does not know the member. It decodes the report without unknown fields and refuses every report that carries the member with `400 malformed_handshake_report`, so it records nothing of that report, the handshake ages included. plexd logs `agent: handshake report: send failed` at Warn on every tick, with an `error` that starts `api: HTTP 400 (malformed_handshake_report):` and ends with the control plane's detail. plexd has no fallback: upgrade the control plane.
 
+## A site stays on a dead bridge
+
+```bash
+plexd logs | grep 'shared subnet'                         # Assignments, moves and the two Warn lines
+plexd logs | grep -E 'failure detection|endpoint selection'  # The time held, and whether endpoint selection runs
+sudo wg show plexd0 allowed-ips                           # Linux: the bridge peer that carries the subnet
+sudo wg show plexd0 latest-handshakes                     # Linux: the latest handshake with each bridge
+```
+
+When tunnels on several bridges of a Project list the same site subnet, the state pull names the bridges in `shared_subnets`, the carrier first, and plexd keeps the subnet on the allowed IPs of one bridge at a time. On a node that holds the Domain's failure-detection time, endpoint selection watches every bridge of the entry and moves the subnet to the next live bridge once the path to its bridge has been dead for that time, 14 to 15 s after the bridge's last packet at the default 15 s, and logs `wireguard: shared subnet moved` with `from`, `to` and `reason=bridge_dead`. `wg show plexd0 allowed-ips` lists the subnet beside exactly one peer, the bridge the node routes the site through. The node's handshake report names the subnet in the `shared_subnets` of that bridge's entry, which the control plane shows as the mesh edge's `shared_subnets`. See [Shared subnets](../reference/networking/wireguard.md#shared-subnets).
+
+Common causes: no bridge of the entry is alive, the move's write failed, the bridge is judged against the 15-second floor, the node holds no failure-detection time or does not run endpoint selection, the node took no entry for the subnet, or the site answers through the dead bridge.
+
+- `wireguard: shared subnet has no live bridge` at Warn, with `subnet`, `bridge`, `silent_for` and `window`, means the holder's path is dead and no other bridge of the entry answered within its window, so the subnet stays where it is. The line comes once until the holder changes or its path is alive again. Check the standbys' handshakes with `wg show`: a standby the node never completed a handshake with is never alive.
+- `wireguard: shared subnet move failed` at Warn, with `subnet`, `from`, `to` and `error`, names a device write that failed. A failed write of the new holder changes nothing, endpoint selection logs `wireguard: endpoint selection pass failed` with the same error, and the next pass tries the move again. A failed write of the old holder leaves the subnet on the new holder.
+- A bridge that answers no round-trip probe is judged against at least 15 seconds, whatever lower value the Domain sets: a bridge on a plexd release through v0.38.0, a plain WireGuard peer, and a bridge behind a host firewall that drops UDP port 7911. Its WireGuard answers the node's probe only within 10 seconds, so a shorter window would leave a healthy idle bridge, and the node waits 14 seconds on it. `rtt_microseconds` on the bridge's entry of the handshake report shows whether it answers; see [A mesh edge shows no round-trip time](#a-mesh-edge-shows-no-round-trip-time).
+- No `wireguard: failure detection time set` line since the start means the node holds no failure-detection time, and then it moves no subnet on its own: it keeps the subnet where the pulls put it and leaves a dead bridge only when the control plane drops it from the entry. A node also moves nothing on its own while endpoint selection does not run: `wireguard: endpoint selection disabled, persistent_keepalive is 0s` means `wireguard.persistent_keepalive` is `0s`, and `wireguard: endpoint selection unavailable, the controller cannot read peer stats` that the WireGuard controller cannot read the device's peers.
+- No `wireguard: shared subnet assigned` line for the subnet means the node took no entry for it. `wireguard: shared subnet not programmed` with `subnet` and `reason` names an entry it skipped: `no_bridge` when no bridge of the entry is a peer of the pull, and `invalid`, `overlaps_mesh`, `inside_local_network` or `duplicate` as for a routed subnet. A plexd release through v0.38.0 predates the block: it routes the subnet through its carrier and follows a carrier move with its next pull.
+- A subnet that moved while the site still does not answer points at the return path. The remote site has to answer a flow through the tunnel it arrived on, or route the Domain mesh CIDR into the carrier's tunnel; see [Routes and Policy](../reference/bridge/site-to-site-vpn.md#routes-and-policy).
+
+A restarted plexd starts every shared subnet on the first bridge of its entry again, since the holder lives in memory only, and moves it on once that bridge's window passes without an answer while a standby answers.
+
 ## A mesh name does not resolve
 
 ```bash
