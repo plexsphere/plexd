@@ -59,7 +59,8 @@ func detectPass(d time.Duration) time.Duration {
 // detectSilence returns how long a relayed peer may stay silent under the
 // failure-detection time d before watchRelay dials the next relay: d less one
 // pass, because a pass starts the silence window up to one pass after the
-// packet it counts arrived.
+// packet it counts arrived. The bridge watch of shared subnets judges the
+// path to a bridge against it too (see watchBridges).
 func detectSilence(d time.Duration) time.Duration {
 	return d - detectPass(d)
 }
@@ -114,6 +115,13 @@ const localNetworksInterval = 30 * time.Second
 // probe fields are the relay liveness probe's state (see checkRelay, and
 // watchRelay while a failure-detection time is held).
 //
+// aliveAt, watchRx and echoAt are the bridge watch's state for a bridge of a
+// shared subnet (see Manager.watchBridges): the last pass that saw the path
+// alive, the device's RxBytes for the peer at the last pass, and when the
+// last stimulus went out, zero when none went out since the window last
+// restarted (see restartWatch). They stay zero for a peer that was never a
+// bridge.
+//
 // The last three fields are the direct retry's state. retry holds the direct
 // entries a running retry tries after the one programmed, in order, and
 // retryRelay the relay it dials when no entry answers; retryRelay is
@@ -135,6 +143,10 @@ type dialState struct {
 	rxAt         time.Time // when the silence window started: rxBytes changed, the peer turned connected or came back on the relay, or a probe send failed
 	probedAt     time.Time // when the outstanding probe went out, zero when none is; while a failure-detection time is held, when the last probe was sent
 	probeFailing bool      // the last probe send failed
+
+	aliveAt time.Time // the bridge watch's last pass that saw the path alive
+	watchRx uint64    // the device's RxBytes for the peer at the bridge watch's last pass
+	echoAt  time.Time // when the bridge watch's last stimulus went out
 
 	retry      []string
 	retryRelay string
@@ -561,9 +573,17 @@ func (m *Manager) localNetworksChanged(now time.Time) (old, cur []netip.Prefix, 
 // in a retry, when the local networks changed so that a direct entry of the
 // peer that is not remembered became on-link (see retryOnLink).
 //
+// After the peers, the pass watches the bridges of the shared subnets, and
+// moves a subnet off a bridge whose path has been dead for the
+// failure-detection time to the next live bridge of its entry (see
+// watchBridges). A failed move is joined into the returned error.
+//
 // The device is read before mu is taken. A read error, ErrPeerStatsUnsupported
-// included, is returned unchanged with no state touched. The local networks
-// are read after the device and before mu is taken, at most once per
+// included, is returned unchanged with no state touched, no probe sent and no
+// subnet moved. The round-trip probe's socket, which the bridge watch writes
+// its requests on, is read under the probe's mutex right after the device and
+// before mu is taken, so the two mutexes are never held together. The local
+// networks are read after the device and before mu is taken, at most once per
 // localNetworksInterval (see localNetworksChanged). A failed switch of
 // the walk is logged, leaves the peer on the entry still programmed, and is
 // joined into the returned error; its next attempt waits that entry's full
@@ -579,6 +599,7 @@ func (m *Manager) selectEndpoints() error {
 	if err != nil {
 		return err
 	}
+	echo := m.rtt.socket()
 	old, cur, changed := m.localNetworksChanged(m.now())
 
 	m.mu.Lock()
@@ -586,8 +607,10 @@ func (m *Manager) selectEndpoints() error {
 
 	now := m.now()
 	timeout := m.cfg.KeepaliveInterval() + endpointTrialMargin
+	byID := make(map[string]MeshPeerStat, len(stats))
 	fresh := make(map[string]MeshPeerStat, len(stats))
 	for _, s := range stats {
+		byID[s.NodeID] = s
 		if !s.LastHandshake.IsZero() && now.Sub(s.LastHandshake) < connectedHandshakeAge {
 			fresh[s.NodeID] = s
 		}
@@ -771,6 +794,10 @@ func (m *Manager) selectEndpoints() error {
 			"of", len(walk),
 			"trial", st.trial(next, timeout),
 		)
+	}
+
+	if err := m.watchBridges(byID, echo, now); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -1079,25 +1106,33 @@ func (m *Manager) redialInPass(nodeID string, st *dialState, relay string, now t
 // plexd up passes SendRelayProbe. Call it before RunEndpointSelection, like
 // SetLocalPrefixes. Without it no probe goes out, and a relayed peer counts as
 // failed only once its handshake goes stale, whatever failure-detection time
-// is held.
+// is held. The bridge watch of shared subnets sends the same probe to a
+// bridge that answers no round-trip probe (see watchBridges); without a
+// sender, the path to such a bridge counts as dead only once its handshake
+// goes stale.
 func (m *Manager) SetRelayProbe(send func(meshIP netip.Addr) error) {
 	m.sendProbe = send
 }
 
 // SetFailureDetection sets the failure-detection time, how long a relayed
 // peer may stay silent before endpoint selection dials the next relay of its
-// set (see watchRelay), and returns the value in force and whether it changed.
-// A value of zero or less is ignored, and any other is clamped to
-// MinFailureDetection and MaxFailureDetection. While a value is held, each
-// pass watches relayed peers with watchRelay instead of checkRelay, and
+// set (see watchRelay), and how long the path to the bridge of a shared
+// subnet may stay dead before endpoint selection moves the subnet to the next
+// live bridge of its entry (see watchBridges). It returns the value in force
+// and whether it changed. A value of zero or less is ignored, and any other
+// is clamped to MinFailureDetection and MaxFailureDetection. While a value is
+// held, each pass watches relayed peers with watchRelay instead of
+// checkRelay, and the bridges of the shared subnets with watchBridges, and
 // RunEndpointSelection runs a pass every detectPass of the value, or at its
-// own interval when that is shorter (see passInterval).
+// own interval when that is shorter (see passInterval). While none is held,
+// no bridge is watched and no subnet moves on its own.
 //
-// A change restarts the silence window of every relayed peer, so no peer is
-// judged against a window it did not start under, and logs wireguard: failure
-// detection time set with the new value, the previous one (0s when none was
-// held) and the pass interval it gives. The value is not persisted: the first
-// pull after a start delivers it again.
+// A change restarts the silence window of every relayed peer and the window
+// of every bridge of a shared subnet, so no peer is judged against a window
+// it did not start under, and logs wireguard: failure detection time set with
+// the new value, the previous one (0s when none was held) and the pass
+// interval it gives. The value is not persisted: the first pull after a start
+// delivers it again.
 func (m *Manager) SetFailureDetection(detectAfter time.Duration) (time.Duration, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1116,6 +1151,11 @@ func (m *Manager) SetFailureDetection(detectAfter time.Duration) (time.Duration,
 			st.rxAt = now
 			st.probedAt = time.Time{}
 			st.probeFailing = false
+		}
+	}
+	for id := range m.watchedLocked() {
+		if st, ok := m.dial[id]; ok {
+			st.restartWatch(now)
 		}
 	}
 	m.logger.Info("wireguard: failure detection time set",

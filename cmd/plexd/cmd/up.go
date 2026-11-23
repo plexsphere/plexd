@@ -1274,9 +1274,10 @@ func runAgent(ctx context.Context) error {
 	// line accounts for all five.
 	if wgReady {
 		// The Domain's failure-detection time is taken on every pull, drift
-		// or not, and tunes endpoint selection's relay watch (step 17b). A
-		// pull without the block keeps the value the last one carried, and a
-		// node that never received one keeps the built-in timing.
+		// or not, and tunes endpoint selection's relay watch and its watch of
+		// the bridges of shared subnets (step 17b). A pull without the block
+		// keeps the value the last one carried, and a node that never
+		// received one keeps the built-in timing and watches no bridge.
 		reconciler.RegisterDispatchHandler(wireguard.FailureDetectionDispatchHandler(wgMgr))
 
 		// The typed lookup keeps the interface a true nil when edge PSKs are
@@ -1472,7 +1473,10 @@ func runAgent(ctx context.Context) error {
 	// A peer connected over its relay is probed with a datagram the host
 	// routes into the mesh interface, so a relay that stopped forwarding is
 	// dialed again within the Domain's failure-detection time, or within
-	// about a minute when the control plane sends none.
+	// about a minute when the control plane sends none. Under a
+	// failure-detection time it also watches the bridges of shared subnets,
+	// and moves a subnet off a bridge whose path stayed dead for that time
+	// to the next live bridge of its entry.
 	if wgReady {
 		wgMgr.SetRelayProbe(wireguard.SendRelayProbe)
 		wg.Add(1)
