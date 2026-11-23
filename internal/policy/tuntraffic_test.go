@@ -311,6 +311,11 @@ func fromNodeUDP(srcPort, dstPort uint16, payload []byte) func(tunPacket) bool {
 //	r4 tcp  N → P port 7006
 //	r5 the default deny
 //
+// No rule names the relay probe port or the round-trip probe port, which pass
+// all the same: N's relay probe to P, N's round-trip probe to P, and P's
+// round-trip probe from its port 7911 to an echo on N's, whose answer N sends
+// from port 7911 to P's.
+//
 // Every injected packet has a source port or ICMP id of its own, so an answer
 // to one check never satisfies another. On Linux and macOS the checks also
 // read DropCounts around a packet only r5 matches, and on Windows they check
@@ -346,6 +351,7 @@ func runTunTrafficChecks(t *testing.T, h tunHarness) {
 	h.listenTCP(t, 7001)
 	h.listenTCP(t, 7003)
 	h.echoUDP(t, 7002)
+	h.echoUDP(t, RTTProbePort)
 
 	t.Log("control: without plexd's filters N answers a SYN from P")
 	h.inject(t, buildIPv4TCPSyn(tunPeerAddr, tunNodeAddr, 40000, 7001, 1))
@@ -445,4 +451,18 @@ func runTunTrafficChecks(t *testing.T, h tunHarness) {
 	}
 	reader.expectPacket(t, tunAnswerWait, "relay probe from N to P:"+strconv.Itoa(RelayProbePort),
 		fromNodeUDP(0, RelayProbePort, []byte("plexd probe")))
+
+	t.Logf("no rule names it, but N's round-trip probe to P:%d leaves", RTTProbePort)
+	if err := h.sendToPeer(RTTProbePort, []byte("plexd rtt probe")); err != nil {
+		t.Errorf("send from N to P:%d: %v", RTTProbePort, err)
+	}
+	reader.expectPacket(t, tunAnswerWait, "round-trip probe from N to P:"+strconv.Itoa(RTTProbePort),
+		fromNodeUDP(0, RTTProbePort, []byte("plexd rtt probe")))
+
+	t.Logf("no rule names it, but P's round-trip probe from port %d reaches N:%d, and N's answer to P:%d leaves",
+		RTTProbePort, RTTProbePort, RTTProbePort)
+	h.inject(t, buildIPv4UDP(tunPeerAddr, tunNodeAddr, RTTProbePort, RTTProbePort, []byte("plexd rtt answer")))
+	reader.expectPacket(t, tunAnswerWait,
+		"round-trip probe answer from N:"+strconv.Itoa(RTTProbePort)+" to P:"+strconv.Itoa(RTTProbePort),
+		fromNodeUDP(RTTProbePort, RTTProbePort, []byte("plexd rtt answer")))
 }
