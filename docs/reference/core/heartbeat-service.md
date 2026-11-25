@@ -39,12 +39,29 @@ type HeartbeatRequest struct {
     BinaryChecksum string         `json:"binary_checksum"`
     BinaryVersion  string         `json:"binary_version"`
     NATSummary     map[string]any `json:"nat_summary"`
+    Features       []string       `json:"features,omitempty"`
 }
+
+const FeatureMeshReaddress = "mesh_readdress"
 ```
 
 `NATSummary` is always a non-nil map so it marshals as a JSON object: `{}`
 before NAT discovery has a result, otherwise `{"endpoint", "nat_type"}`. A
 `null` value is rejected by the control plane.
+
+`Features` lists the features the node declares. A nil or empty list leaves the
+member off, so a node that declares nothing sends the four members a control
+plane that predates `features` accepts. `plexd up`'s builder,
+`buildHeartbeatRequest(checksum, version, natInfo, features)`, declares
+`["mesh_readdress"]` (`api.FeatureMeshReaddress`) when the WireGuard interface
+came up and `wgMgr.CanReaddress()` is true, and nothing otherwise. The value is
+fixed for the run. The control plane moves a node to another mesh address only
+while its latest heartbeat declared `mesh_readdress`, and the node follows the
+`mesh_ip` of its next pull (see
+[Mesh address changes](../networking/wireguard.md#mesh-address-changes)). A
+node whose interface did not come up, whose controller cannot replace an
+address, or whose interface carries the host `/32` fallback declares nothing
+and is never moved.
 
 ## Response Handling
 
@@ -78,6 +95,10 @@ A refusal below `CredentialRefusedThreshold` (3) logs a Warn with the count. Thr
 ### Clock Skew
 
 When the heartbeat is rejected with the `clock_skew` problem code — the control plane found `client_now` more than 60s from its own time — the service logs at **error** level, instructing the operator to synchronize the system clock via NTP. There is no extra retry; the next attempt is the next 30s tick, or the next probe while parked.
+
+### A Control Plane That Predates features
+
+A control plane that predates the `features` member decodes the heartbeat with unknown members refused, and answers `400 malformed_heartbeat_request` for every heartbeat that carries it. When a heartbeat that carried `Features` is rejected with that code, the service logs `agent: heartbeat: rejected as malformed, a control plane that predates the features member refuses it; upgrade the control plane` at **error** level, with `error`. The next heartbeat is sent unchanged, `features` included: there is no fallback that leaves the member off (see [Upgrade order](#upgrade-order)). The same code for a heartbeat without `Features` is logged as any other failed send.
 
 ### Other Errors
 
@@ -140,6 +161,9 @@ Every heartbeat line carries `component=heartbeat`.
 | Error | `agent: heartbeat: node credential refused, the Node was removed from the control plane or its credential revoked; control-plane calls suspended` | The service parks; carries `node_id`, `code` (the problem code, empty when the answer carries none), `consecutive`, `next_probe` and `enrol_again` (`run 'plexd deregister', provide a fresh bootstrap token, and restart plexd`) |
 | Debug | `agent: heartbeat: probe refused` | A probe is refused while parked; carries `error` and `next_probe` |
 | Info  | `agent: heartbeat: node credential accepted again, control-plane calls resumed` | A probe is accepted and the service unparks |
+| Error | `agent: heartbeat: rejected for clock skew, synchronize the system clock via NTP` | `400 clock_skew`; carries `error` |
+| Error | `agent: heartbeat: rejected as malformed, a control plane that predates the features member refuses it; upgrade the control plane` | `400 malformed_heartbeat_request` for a heartbeat that carried `features`; carries `error` |
+| Error | `agent: heartbeat: send failed` | Any other failed send but a `401`; carries `error` |
 
 ## Callbacks
 
@@ -215,6 +239,8 @@ No plexd release through v0.38.0 sends `rtt_microseconds`. The control plane dec
 A pair measures each other only when both nodes run a plexd with the probe. A peer on an older plexd, a plain WireGuard peer and a node whose host firewall drops UDP port 7911 answer no probe, so the node reports them with their handshake age and endpoint and without `rtt_microseconds`. The control plane takes either end's value for a node and a relay bridge: when the node reports no time for the bridge, the time the bridge reports for the node counts. One answering side is therefore enough for the ranking, and a pair whose nodes report no round-trip time dials its relays in the Domain order.
 
 No plexd release through v0.38.0 sends `shared_subnets` either, and a control plane that predates the member refuses a report that carries it with `400 malformed_handshake_report`, as an unknown member, and records nothing of that report. The reporter has no fallback for it either, as it has none for `rtt_microseconds`, and needs none: it sends the member only for a subnet a pull named in `shared_subnets`, which such a control plane never does. During a rolling deploy of a control plane that gains the member, a report with the member can reach a replica that refuses it. The reporter logs `agent: handshake report: send failed` for that tick, and the next tick builds a fresh report. A node on v0.38.0 or older beside upgraded nodes reports no `shared_subnets` and routes each shared subnet through its carrier.
+
+The heartbeat follows the same rule. No plexd release through v0.39.0 sends the heartbeat's `features` member. The control plane decodes a heartbeat with unknown members refused, so a control plane that predates the member refuses every heartbeat of a plexd that declares `mesh_readdress` with `400 malformed_heartbeat_request` and records none of them. The node then reads as offline there, and it receives no `reconcile` or `rotate_keys` flag until the control plane is upgraded. The service logs the refusal at Error on every heartbeat (see [A Control Plane That Predates features](#a-control-plane-that-predates-features)) and sends the next one unchanged. Per the author there is no fallback: the service does not detect such a control plane and does not leave the member off for it. Upgrade the control plane first. A node that declares nothing, because it cannot follow a move, sends no `features` member and is not affected. A control plane that predates the pull's `mesh_ip` member leaves it out, and the node keeps its address.
 
 ### Logging
 

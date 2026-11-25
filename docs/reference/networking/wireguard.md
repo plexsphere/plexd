@@ -89,6 +89,20 @@ type PeerStatsReader interface {
 
 `NetlinkController`, `UserspaceBackend`, `DarwinController` and `WindowsController` implement it. `NetlinkController.PeerStats` opens a wgctrl client per call, as `AddPeer` does, reads the device with `client.Device(name)` and maps each `wgtypes.Peer`: the key bytes, `Endpoint.AddrPort()` when the peer has an endpoint, `LastHandshakeTime` (wgctrl already yields a zero time when no handshake has completed), the receive and transmit byte counters, and the allowed IPs as prefixes in the device's order, an IPv4-mapped address unmapped and an entry whose mask does not fit its address left out. Its errors are `wireguard: peer stats: open wgctrl: <cause>` and `wireguard: peer stats: read device: <cause>`; a missing interface wraps `os.ErrNotExist`. `DarwinController` and `WindowsController` delegate to the [userspace backend](#userspace-backend).
 
+### AddressReplacer
+
+Swapping the address of a live interface is a third optional interface, which callers type-assert on the controller as they do `PeerStatsReader`, so no test double of `WGController` has to grow.
+
+```go
+// AddressReplacer is implemented by controllers that can swap the address
+// of a live interface. oldAddress and newAddress are CIDRs of one length.
+type AddressReplacer interface {
+    ReplaceAddress(name, oldAddress, newAddress string) error
+}
+```
+
+`NetlinkController`, `DarwinController` and `WindowsController` implement it; the userspace backend does not, because addressing stays with the per-OS controller. A call that failed halfway succeeds when it is repeated with the same arguments: each implementation tolerates an address that is already there on an add, and one that is not there on a remove. Both CIDRs have to be IPv4 and of one length, or the call fails with `wireguard: replace address: <old> and <new> are not of one length`, `wireguard: replace address: <cidr> is not an IPv4 CIDR` or `wireguard: replace address: parse "<cidr>": <cause>`. A pair that names one address changes nothing, because removing the old address would remove the new one. The manager's [`Readdress`](#mesh-address-changes) is the only caller; see [Replacing the address on each platform](#replacing-the-address-on-each-platform) for the calls each controller makes.
+
 ## Userspace backend
 
 `UserspaceBackend` (`internal/wireguard/userspace.go`) runs wireguard-go devices inside the plexd process. It is the base of the macOS (utun) and Windows (Wintun) `WGController` implementations and, through those two controllers, of the bridge access and site-to-site controllers (`WGAccessController` and `WGVPNController` in `internal/bridge`), which wrap the platform's `WGController`. On Linux plexd stays on the kernel path through `NetlinkController`; the backend compiles and is tested there but is not wired in.
@@ -147,7 +161,7 @@ The pairing is logged once per interface, at `info`:
 utun device created  component=wireguard interface=plexd0 utun=utun4
 ```
 
-`address configured`, `mtu configured`, `interface brought up`, `route already exists` and `utun device released` carry the same `interface` and `utun` keys at `debug`.
+`address configured`, `mtu configured`, `interface brought up`, `route already exists` and `utun device released` carry the same `interface` and `utun` keys at `debug`, and so does `address replaced`, with `previous_address` and `address` beside them.
 
 ### Commands
 
@@ -155,6 +169,7 @@ utun device created  component=wireguard interface=plexd0 utun=utun4
 |---|---|
 | `ConfigureAddress` (IPv4) | `ifconfig utunN inet 10.0.0.5/16 10.0.0.5 alias`, then `route -n add -inet 10.0.0.0/16 -interface utunN` |
 | `ConfigureAddress` (IPv6) | `ifconfig utunN inet6 fd00::5/64 alias`, then `route -n add -inet6 fd00::/64 -interface utunN` |
+| `ReplaceAddress` | `ifconfig utunN inet 10.0.0.9/16 10.0.0.9 alias`, then `ifconfig utunN inet 10.0.0.5 -alias`, then `route -n add -inet 10.0.0.0/16 -interface utunN`, then for each route through the utun that names 10.0.0.5, such as the on-link one, `route -n change -inet 10.0.0.0/16 -interface utunN -ifa 10.0.0.9`, or `route -n delete -inet -host <destination>` for a host route the kernel cloned (see [Replacing the address on each platform](#replacing-the-address-on-each-platform)) |
 | `SetMTU` | `ifconfig utunN mtu 1380` |
 | `SetInterfaceUp` | `ifconfig utunN up` |
 | `DeleteInterface` | none |
@@ -196,6 +211,7 @@ The adapter is recorded before the wait starts, so the wait runs outside the con
 | Method | What it does |
 |---|---|
 | `ConfigureAddress` | `CreateUnicastIpAddressEntry` with the prefix length; no route call |
+| `ReplaceAddress` | `CreateUnicastIpAddressEntry` for the new address, then `DeleteUnicastIpAddressEntry` for the old one; no route call (see [Replacing the address on each platform](#replacing-the-address-on-each-platform)) |
 | `SetMTU` | `SetIpInterfaceEntry` for IPv4 and IPv6, then `ForceMTU` on the running device |
 | `SetInterfaceUp` | nothing |
 | `DeleteInterface` | nothing beyond closing the device |
@@ -243,9 +259,13 @@ func (r *MeshRewriter) Wrap(name string, dev tun.Device) tun.Device
 func (r *MeshRewriter) AddMeshSourceRewrite(fromIface, meshIface string) error
 func (r *MeshRewriter) RemoveMeshSourceRewrite(fromIface, meshIface string) error
 func (r *MeshRewriter) ResetMeshSourceRewrite() error
+
+// SetMeshAddress moves every rewrite into meshIface to addr, the address the
+// mesh interface carries since the node was moved.
+func (r *MeshRewriter) SetMeshAddress(meshIface string, addr netip.Addr)
 ```
 
-The three methods have the signatures of `bridge.MeshSourceRewriter`. `internal/wireguard` does not import `internal/bridge`, so the assertion `var _ bridge.MeshSourceRewriter = (*wireguard.MeshRewriter)(nil)` lives in `cmd/plexd/cmd/up_windows.go`. There `newMeshSourceRewriter` returns the rewriter to the user access and site-to-site managers, and an untyped nil for a nil one.
+The three methods before `SetMeshAddress` have the signatures of `bridge.MeshSourceRewriter`. `internal/wireguard` does not import `internal/bridge`, so the assertion `var _ bridge.MeshSourceRewriter = (*wireguard.MeshRewriter)(nil)` lives in `cmd/plexd/cmd/up_windows.go`. There `newMeshSourceRewriter` returns the rewriter to the user access and site-to-site managers, and an untyped nil for a nil one.
 
 A connection belongs to the side that opened it. What a far end opens is translated in process. What the host or a mesh node opens through a provider's interface or a tunnel's link goes through Windows, and its replies are handed to Windows untouched. Linux gets the same split from connection tracking, which masquerades new connections only. What a mesh node sends to a site stays in Windows forwarding, because that is where the bridge's policy filters it (see [Routes and Policy](../bridge/site-to-site-vpn.md#routes-and-policy)).
 
@@ -268,6 +288,10 @@ A connection belongs to the side that opened it. What a far end opens is transla
 - Otherwise it reads the IPv4 prefixes of both interfaces through the seam `addrs func(iface string) ([]netip.Prefix, error)`, in production `net.InterfaceByName` and its `Addrs`, the mesh interface's first. The first IPv4 address of the mesh interface is the mesh address. A failed read of either interface, or a mesh interface without an IPv4 address, returns `bridge: add mesh source rewrite from "<from>" to "<mesh>": address of the mesh interface: <cause>`: a failed read of the source interface's addresses carries the same suffix, and a mesh interface without one the cause `no IPv4 address`. None of these leaves a rewrite behind. The source interface may carry no address.
 
 `RemoveMeshSourceRewrite` forgets the rewrite of `fromIface` and its flows, and returns nil for an interface without one. `ResetMeshSourceRewrite` forgets every rewrite and returns nil: nothing of a rewrite outlives the process, so a start has nothing to remove. `plexd up` calls it through `CleanupUserAccess` at start, as on Linux and macOS.
+
+### Following a new mesh address
+
+A rewrite reads the mesh address once, when it is added, and every translated flow keeps the address it was opened with. When a state pull moves the node to another mesh address, `plexd up` calls `SetMeshAddress(wgMgr.OSInterfaceName(), addr)` once the mesh interface carries the new address, as the `mesh-rewriter` follower of the [mesh address handler](#the-dispatch-handler). It unmaps `addr`, and then, under the rewriter's mutex, gives every rewrite whose mesh interface is `meshIface` the new address and removes every flow of that interface that was translated to another address. The far end's next packet of a removed flow opens a flow on the new address (A9). Without the removal a running conversation would keep its old source until the flow idles out, up to five days for an established TCP connection. A reply a mesh peer still sends to the old address finds no flow and goes to Windows (B4). The call logs `mesh source rewrite moved to a new mesh address` at Debug. An `addr` that is no IPv4 address changes nothing, since the rules rewrite IPv4 alone, and logs `mesh source rewrite kept its address, the new one is no IPv4 address` at Warn.
 
 ### What the rewriter does with a packet
 
@@ -349,6 +373,8 @@ The rewriter logs with `component=bridge`, in the wording of the Linux controlle
 | `Debug` | `mesh source rewrite removed`, `mesh source rewrite not found, idempotent success` | `from_iface`, `mesh_iface` |
 | `Debug` | `mesh source rewrites reset` | (none) |
 | `Info` | `mesh source rewrite not needed, the interface is no device of this process` | `from_iface`, `mesh_iface` |
+| `Debug` | `mesh source rewrite moved to a new mesh address` | `mesh_iface`, `mesh_addr`, `rewrites` (the number of rewrites moved), `flows_removed` |
+| `Warn` | `mesh source rewrite kept its address, the new one is no IPv4 address` | `mesh_iface`, `mesh_addr` |
 | `Warn` | `mesh source rewrite dropped packets` | `reason`, `count` |
 
 ### Tests
@@ -437,6 +463,9 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `PeerIndex`     | `() *PeerIndex`                                                              | Returns the peer index                                         |
 | `MeshPeerStats` | `() ([]MeshPeerStat, error)`                                                 | Reads the mesh interface's peers and maps them to node IDs; see [Mesh peer stats](#mesh-peer-stats) |
 | `MeshPrefix`    | `() netip.Prefix`                                                            | The Domain mesh prefix the interface was set up with; see [Mesh prefix](#mesh-prefix) |
+| `MeshIP`        | `() netip.Addr`                                                              | The mesh IP the interface carries: the one `Setup` parsed from the identity, or the one `Readdress` last replaced it with; the zero address before `Setup` succeeds and when the identity's mesh IP does not parse |
+| `CanReaddress`  | `() bool`                                                                    | Whether `Readdress` can replace the mesh IP while plexd runs; see [Mesh address changes](#mesh-address-changes) |
+| `Readdress`     | `(addr netip.Addr) error`                                                    | Replaces the mesh IP on the live interface inside `MeshPrefix`, and moves the round-trip probe and the peer routes with it; see [Mesh address changes](#mesh-address-changes) |
 | `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the stored peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
 | `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first and to skip a routed subnet inside a local network. Endpoint selection reads it too, at most once per 30 s, to start a [direct retry](#direct-retry) when a local network makes a relayed peer's direct entry on-link. Call it before the handler and `RunEndpointSelection` run. See [Dial order](#dial-order) |
 | `SetPeerRouter` | `(r PeerRouter)`                                                             | Sets the router the reconcile handler programs the routes of the peers' routed subnets with. Call it before the handler runs. Without one the manager programs the routed subnets as allowed IPs and adds no route. See [Routed subnets](#routed-subnets) |
@@ -456,7 +485,7 @@ The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the po
 
 ### Mesh prefix
 
-`Setup` records the prefix of the address it assigns, masked: the Domain mesh CIDR (`10.99.0.0/24` for mesh IP `10.99.0.5` and `domain_mesh_cidr` `10.99.0.0/24`), or the mesh IP's host `/32` when the identity carries no usable `domain_mesh_cidr`. `MeshPrefix` returns it, and returns the zero prefix before `Setup` succeeds. The [dial order](#dial-order) refuses a direct endpoint or candidate inside it, and `plexd up` publishes no [local endpoint candidate](./nat-traversal.md#local-endpoint-candidates) inside it.
+`Setup` records the prefix of the address it assigns, masked: the Domain mesh CIDR (`10.99.0.0/24` for mesh IP `10.99.0.5` and `domain_mesh_cidr` `10.99.0.0/24`), or the mesh IP's host `/32` when the identity carries no usable `domain_mesh_cidr`. `MeshPrefix` returns it, and returns the zero prefix before `Setup` succeeds. [`Readdress`](#mesh-address-changes) moves the mesh IP only inside this prefix and never changes it, so every part that copied the prefix at startup stays correct. The [dial order](#dial-order) refuses a direct endpoint or candidate inside it, and `plexd up` publishes no [local endpoint candidate](./nat-traversal.md#local-endpoint-candidates) inside it.
 
 ### Mesh peer stats
 
@@ -624,7 +653,7 @@ const rttMaxUnanswered = 3                  // unanswered probes in a row that d
 func (m *Manager) RunRTTProbe(ctx context.Context, interval time.Duration) error
 ```
 
-Every plexd holds one UDP socket on port 7911, `RTTProbePort`, of its mesh address. The socket sends the node's probes and answers the peers' probes, so a probe and its answer both travel from port 7911 to port 7911. The [bridge watch](#the-bridge-watch) writes its requests to a bridge that answers the probe on the same socket. IANA lists 7904 to 7912 as unassigned. The port lies above 1023, so plexd binds it without `CAP_NET_BIND_SERVICE`, and below 32768, so it lies outside Linux's ephemeral range and outside the mesh ports 32768 to 49151 of the in-process mesh source rewrite (see [Flows and mesh ports](#flows-and-mesh-ports)). The socket is bound to the node's mesh IP, which `Setup` stores from the identity, and never to the wildcard address. It is also bound to the mesh interface, with `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` on macOS (`ifbind.Control`). Linux delivers a datagram for any address of the host on whichever interface it arrives, and macOS, with `net.inet.ip.check_interface=1`, the value measured on macOS 26, does so only while forwarding is on, as on a macOS bridge. On a socket bound to the mesh IP alone, a host on another network that routes the mesh IP through the node and spoofs a mesh source would therefore draw an answer into the tunnel, which the output chain passes as a reply to the datagram it saw arrive. On Linux `SO_BINDTODEVICE` confines what the socket receives and sends to the mesh interface. On macOS `IP_BOUND_IF` confines only what the socket sends: a Mac that does not forward drops such a datagram in the kernel already, but on a forwarding Mac it still reaches the bound socket, and the answer leaves through the mesh utun. On macOS `rttMeshOnly` therefore switches `FlagInterface` of `golang.org/x/net/ipv4` on, which sets `IP_RECVPKTINFO` there, reads the index of the arrival interface from the `IP_PKTINFO` control message of each datagram, and drops every datagram that did not arrive on the mesh utun, and one without that control message too. On Linux and Windows `rttMeshOnly` returns the socket as it is. Windows receives on the strong host model by default, which drops a datagram for the mesh IP that arrives on another adapter, so plexd sets no option there. A Linux kernel before 5.7 allows the binding only with `CAP_NET_RAW`, and the listen fails without it. `TestRTTProbe_RealAnswersOnlyTheMeshInterface` proves the binding in network namespaces on a real kernel: a socket bound to the mesh IP alone answers a spoofed request that arrives on another interface, and the probe's socket does not. On macOS, `TestDarwinController_RealUTUN` opens the probe's socket with `IP_BOUND_IF` on a real utun, and `TestRTTProbe_RealUTUN` proves the drop with two utuns and forwarding on: a socket with `IP_BOUND_IF` alone answers a request with a mesh source that arrives on the other utun, out of the mesh utun, and the probe's socket answers a peer's request on the mesh utun and draws no reply out of either utun for the request that arrives on the other utun. A mesh IP that is not IPv4, one that did not parse included, fails the listen with `wireguard: rtt probe: mesh ip <ip> is not IPv4`. The probe has no configuration key for its port or its interval: a Domain cannot use a per-node port, and the interval follows `heartbeat.interval`.
+Every plexd holds one UDP socket on port 7911, `RTTProbePort`, of its mesh address. The socket sends the node's probes and answers the peers' probes, so a probe and its answer both travel from port 7911 to port 7911. The [bridge watch](#the-bridge-watch) writes its requests to a bridge that answers the probe on the same socket. IANA lists 7904 to 7912 as unassigned. The port lies above 1023, so plexd binds it without `CAP_NET_BIND_SERVICE`, and below 32768, so it lies outside Linux's ephemeral range and outside the mesh ports 32768 to 49151 of the in-process mesh source rewrite (see [Flows and mesh ports](#flows-and-mesh-ports)). The socket is bound to the node's mesh IP, as `MeshIP` returns it: the address `Setup` stores from the identity, or the one [`Readdress`](#mesh-address-changes) last replaced it with. It is never bound to the wildcard address. It is also bound to the mesh interface, with `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` on macOS (`ifbind.Control`). Linux delivers a datagram for any address of the host on whichever interface it arrives, and macOS, with `net.inet.ip.check_interface=1`, the value measured on macOS 26, does so only while forwarding is on, as on a macOS bridge. On a socket bound to the mesh IP alone, a host on another network that routes the mesh IP through the node and spoofs a mesh source would therefore draw an answer into the tunnel, which the output chain passes as a reply to the datagram it saw arrive. On Linux `SO_BINDTODEVICE` confines what the socket receives and sends to the mesh interface. On macOS `IP_BOUND_IF` confines only what the socket sends: a Mac that does not forward drops such a datagram in the kernel already, but on a forwarding Mac it still reaches the bound socket, and the answer leaves through the mesh utun. On macOS `rttMeshOnly` therefore switches `FlagInterface` of `golang.org/x/net/ipv4` on, which sets `IP_RECVPKTINFO` there, reads the index of the arrival interface from the `IP_PKTINFO` control message of each datagram, and drops every datagram that did not arrive on the mesh utun, and one without that control message too. On Linux and Windows `rttMeshOnly` returns the socket as it is. Windows receives on the strong host model by default, which drops a datagram for the mesh IP that arrives on another adapter, so plexd sets no option there. A Linux kernel before 5.7 allows the binding only with `CAP_NET_RAW`, and the listen fails without it. `TestRTTProbe_RealAnswersOnlyTheMeshInterface` proves the binding in network namespaces on a real kernel: a socket bound to the mesh IP alone answers a spoofed request that arrives on another interface, and the probe's socket does not. On macOS, `TestDarwinController_RealUTUN` opens the probe's socket with `IP_BOUND_IF` on a real utun, and `TestRTTProbe_RealUTUN` proves the drop with two utuns and forwarding on: a socket with `IP_BOUND_IF` alone answers a request with a mesh source that arrives on the other utun, out of the mesh utun, and the probe's socket answers a peer's request on the mesh utun and draws no reply out of either utun for the request that arrives on the other utun. A mesh IP that is not IPv4, one that did not parse included, fails the listen with `wireguard: rtt probe: mesh ip <ip> is not IPv4`. The probe has no configuration key for its port or its interval: a Domain cannot use a per-node port, and the interval follows `heartbeat.interval`.
 
 The datagram is 16 bytes:
 
@@ -645,7 +674,7 @@ One reader goroutine handles what arrives on the socket. Its buffer holds 64 KiB
 
 `RunRTTProbe` replaces a non-positive `interval` with `DefaultRTTProbeInterval`, logs `wireguard: rtt probe started`, and runs its first round half an interval after it starts and one round per interval after that. At the heartbeat interval a round's answers are therefore in before the handshake report that follows it. A round runs these steps in order:
 
-1. It listens when it holds no socket, none yet or one whose reader ended. A failed listen logs `wireguard: rtt probe listen failed`, at Warn the first time and at Debug while the listens keep failing; a listen that succeeds ends the run. The round then sends nothing, counts one unanswered probe for every peer that holds a value, and ends. A probe still outstanding from a socket whose reader ended stays recorded, so the first round that sends again counts it as unanswered in step 4.
+1. It listens when it holds no socket, none yet or one whose reader ended. `Readdress` closes the socket, so the round after it listens on the new address (see [The round-trip probe after a move](#the-round-trip-probe-after-a-move)). A failed listen logs `wireguard: rtt probe listen failed`, at Warn the first time and at Debug while the listens keep failing; a listen that succeeds ends the run. The round then sends nothing, counts one unanswered probe for every peer that holds a value, and ends. A probe still outstanding from a socket whose reader ended stays recorded, so the first round that sends again counts it as unanswered in step 4.
 2. It reads `MeshPeerStats`. `ErrPeerStatsUnsupported` logs `wireguard: rtt probe unavailable, the controller cannot read peer stats`, closes the socket and ends the probe: `RunRTTProbe` returns nil. Any other error logs `wireguard: rtt probe round failed` and ends the round with every value as it was.
 3. It takes each peer whose `LastHandshake` is non-zero and younger than 180 s (`connectedHandshakeAge`), whose [dial state](#programmed-peers) exists, and whose `MeshIP` parses as an IPv4 address inside the mesh prefix other than the node's own. It copies the mesh IPs out of the dial states under the manager's mutex and releases it before it touches the probe's table, which has a mutex of its own. The entry of every other peer, a node ID the read no longer lists included, is deleted.
 4. For each taken peer, in node ID order, it counts the previous probe as unanswered when that probe is still outstanding, drops the value when the device endpoint (`MeshPeerStat.Endpoint`) differs from the one the value was measured over, and drops it when three probes in a row (`rttMaxUnanswered`) went unanswered. It then records a new probe and sends it to port 7911 of the peer's mesh IP. The record comes first, so a fast answer cannot beat it. A failed send clears the record, logs `wireguard: rtt probe send failed`, at Warn the first time for that peer and at Debug while its sends keep failing, and counts as an unanswered probe at once; a send that goes out ends the peer's run of failures. The round waits 5 ms (`rttProbeGap`) between two sends, and not after the last one.
@@ -1025,7 +1054,9 @@ if err := mgr.Teardown(); err != nil {
 3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, whose allowed IPs start with `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 4. `SetMTU(name, mtu)` — only if `Config.MTU > 0` or the chosen MTU is not 1420, the MTU every controller creates the device with
 5. `SetInterfaceUp(name)` — bring the interface up
-6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix), and the identity's mesh IP, which the [round-trip probe](#round-trip-probe) binds (the zero address when it does not parse)
+6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix), and the identity's mesh IP, which the [round-trip probe](#round-trip-probe) binds (the zero address when it does not parse). `Setup` records both once; afterwards only [`Readdress`](#mesh-address-changes) replaces the mesh IP, and nothing replaces the prefix
+
+The identity's mesh IP is the one `identity.json` holds: the address registration handed out, or the last one the [mesh address handler](#the-dispatch-handler) committed there after a state pull moved the node. A restart therefore brings the interface up with the last committed address, and a pull that carries another one moves the node again.
 
 ### Error Handling
 
@@ -1039,6 +1070,7 @@ if err := mgr.Teardown(); err != nil {
 | `RunEndpointSelection` | A failed switch or relay re-dial is logged at warn and the pass goes on; the next re-dial, one relay hold later, dials the relay after the one that failed. A failed move back is logged at warn too, and the next pass tries the same relay again. A failed write of a [direct retry](#direct-retry)'s entry is logged at warn: the next step, one window later, tries the entry after it, and a retry that a change of the local networks starts is not tried again for that change. A failed probe send is logged at warn, then at debug while it keeps failing, and takes no verdict: the next probe follows one trial later, or on the next pass under a [failure-detection time](#failure-detection-time). A failed read of the local networks is logged at warn, then at debug while it keeps failing, and the next read follows 30 s later. A failed move of a [shared subnet](#the-bridge-watch) is logged at warn and joined into the pass's error, and the next pass tries it again; a failed stimulus is logged at debug and takes no verdict | Returns nil |
 | `RunMTUProbe`     | A failed probe or `SetMTU` is logged at warn. The next round probes again and retries a failed lowering; a failed raise starts the two-round wait over | Returns nil |
 | `RunRTTProbe`     | A failed listen, device read or send is logged at warn, a repeated failed listen or send at debug, and the next round tries again. A failed read of the socket or a failed answer is logged at debug and the reader reads on; ten failed reads in a row close the socket, and the next round listens again. A controller that cannot read peer stats ends the probe, which returns nil. See [Round-trip probe](#round-trip-probe) | Returns nil |
+| `Readdress`       | A refused call returns an error wrapping `ErrReaddressUnsupported` or `ErrMeshAddressInvalid`, and a failed replace returns the controller's error behind `wireguard: readdress:`; each leaves the mesh IP as it was. A peer route that fails to come back is logged at warn and added again by the next run of the reconcile handler, which runs only for a pull that differs from the stored snapshot. See [Mesh address changes](#mesh-address-changes) | — |
 
 ### Logging
 
@@ -1047,6 +1079,7 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | Level   | Event                        | Keys                                  |
 |---------|------------------------------|---------------------------------------|
 | `Info`  | Interface configured         | `interface`, `listen_port`, `mesh_ip`, `mtu`, `mtu_source`, `path_mtu` (only with `mtu_source=probe`) |
+| `Info`  | The mesh IP was replaced (`wireguard: mesh address replaced`) | `interface`, `previous_mesh_ip`, `mesh_ip` |
 | `Warn`  | Linux only: a WireGuard link an earlier process left behind was replaced (`wireguard: replaced an interface an earlier process left behind`) | `interface` |
 | `Info`  | Peers configured (bulk)      | `count`                               |
 | `Debug` | Peer added/removed/updated   | `peer_id`                             |
@@ -1494,6 +1527,145 @@ The not-served line is logged when the store enters that state, not on every pul
 `wireguard.edge_psk` (`Config.EdgePSK`) defaults to true; see [Configuration Reference](../core/configuration.md#wireguard). WireGuard needs the same PSK on both ends of a tunnel, and the [NAT relay](../bridge/nat-relay.md#data-flow) forwards the WireGuard packets end to end. An edge between a plexd that installs edge PSKs and an older plexd therefore fails, direct and relayed, until both ends match.
 
 During a rolling upgrade, set `edge_psk: false` on the upgraded nodes, and turn it back on once every node of the Domain runs a plexd that installs edge PSKs. With the setting false and the interface up, `plexd up` logs `edge psk disabled by wireguard.edge_psk` at `info`, builds no store, registers no dispatch handler, passes a nil lookup to `ReconcileHandler`, and gives the key rotator the reconciler itself as its trigger. `plexd up` reads the setting once, when it starts.
+
+## Mesh address changes
+
+Registration hands out the node's mesh address, and every [state pull](../core/api-endpoints.md#get-v1-nodes-node-id-state) repeats it as `mesh_ip`. A Domain admin can move a node to another address, for example into an Area with an address range. The control plane moves a node only while the node's latest heartbeat declared the feature `mesh_readdress` (see [Request Payload](../core/heartbeat-service.md#request-payload)), and it publishes no event for a move: the node learns its new address with its next pull, at most one reconcile interval later (60 s by default), and its peers learn it with their own pulls. A pair has no connectivity until both of its nodes pulled.
+
+plexd applies the new address in place. The mesh interface, its peers and their tunnels stay up, and only what was bound to the old address ends: the listeners of tcp sessions, and connections that left from the old address, whose next write the kernel refuses. On Linux a write on a UDP socket bound to an address the link no longer holds fails with `ENETUNREACH`, measured on kernel 6.8.0-147. plexd does not drain and build the data plane again, which would end every tunnel, session, VPN client, public ingress connection and running action of the node.
+
+plexd declares `mesh_readdress` only when it can follow: when the WireGuard interface came up and [`CanReaddress`](#readdress) is true. A node that cannot follow, because its interface did not come up, its controller cannot replace an address, or its interface carries the host `/32` fallback, declares nothing and is never moved.
+
+### The dispatch handler
+
+```go
+// cmd/plexd/cmd/mesh_address.go
+type meshAddressFollower struct {
+    name  string
+    apply func(context.Context, netip.Addr) error
+}
+
+type meshAddressDeps struct {
+    Own       *ownMeshIP
+    DataDir   string
+    Persisted string
+    Interface func(netip.Addr) error
+    Followers []meshAddressFollower
+    Logger    *slog.Logger
+}
+
+func meshAddressDispatchHandler(deps meshAddressDeps) reconcile.DispatchHandler
+```
+
+`ownMeshIP` holds the address plexd currently uses and is safe for concurrent reads: `newOwnMeshIP(string)`, `String()`, `Addr() (netip.Addr, bool)` and `Set(netip.Addr)`. `runAgent` builds it from `identity.MeshIP` after registration. The agent info that the `system.info` action reports (`agentNodeInfo.MeshIP()`) and the public ingress dial policy read it on every call, so both follow a move without a follower of their own. `Persisted` starts as `identity.MeshIP`, `DataDir` is `data_dir`, and `Interface` is `wgMgr.Readdress`, or nil when WireGuard did not come up.
+
+`runAgent` registers the handler right after `signingKeyDispatchHandler`, ahead of the session dispatcher, the mesh DNS handler and the WireGuard reconcile handler, so the rest of the cycle already runs on the new address. It runs on every successful pull, drift or not (see [DispatchHandler](../core/reconciliation.md#dispatchhandler)), and does this:
+
+1. An empty `mesh_ip`, which a control plane that predates the member sends by leaving the key out, logs `state pull carried no mesh_ip; keeping the address` at Debug, and the handler ends.
+2. A value that does not parse as an IP address, or parses as an unspecified, loopback or multicast one, logs `mesh address from state pull refused` at Warn with `mesh_ip` and `error`, once per value, and the handler ends.
+3. When the value differs from `Own`, the handler calls `Interface` with it:
+   - A nil `Interface`, or an error wrapping `ErrReaddressUnsupported`: it commits the address (step 5), logs `mesh address cannot be applied while plexd runs; restart plexd to use it` at Error with `mesh_ip` and `error`, once per value, and ends. `Own` and the followers keep the old address, which is what the interface holds, and the next start brings the interface up with the committed one.
+   - An error wrapping `ErrMeshAddressInvalid`: it logs the line of step 2 and ends. Nothing is committed.
+   - Any other error: it logs `mesh address not applied; retrying on the next pull` with `step=interface`, `mesh_ip` and `error`, at Error the first time for a value and at Debug while it repeats, and ends. The next pull calls `Interface` again.
+   - No error: it sets `Own` to the new address and logs `mesh address changed from state pull` at Info with `previous_mesh_ip` and `mesh_ip`.
+4. It calls each follower whose last applied address differs from `Own`, in the order of the table below. A failure logs the `mesh address not applied; retrying on the next pull` line of step 3 with the follower's name as `step`, keeps that follower's applied address, so the next pull calls it again, and does not stop the followers after it. Each follower starts with the startup address as applied.
+5. When the address differs from `Persisted`, it calls [`registration.CommitMeshIP`](../core/registration.md#commitmeship). A failure logs `mesh address not persisted; retrying on the next pull` at Warn with `mesh_ip` and `error`, and keeps `Persisted`, so the next pull commits again.
+
+The reconcile goroutine is the only caller, so the handler keeps its state without a mutex. A crash between step 3 and step 5 starts from the old address, which `identity.json` still holds, and the first pull applies the new one again.
+
+`mesh_ip` is consumed on the dispatch seam, on every successful pull, as `signing_key` is, and the differ does not track it (see [ComputeDiff](../core/reconciliation.md#computediff)). A step that failed is therefore tried again on the next pull without holding back the snapshot.
+
+| Follower | Built when | What it does |
+|---|---|---|
+| `mesh-dns` | The mesh resolver listens | `dnsMgr.Rebind(ctx, meshDNSListenIP(addr, meshDNSListensOnLoopback))`. On Linux it moves the resolver to the new address; on macOS and Windows it passes `127.0.0.1` again, which changes nothing (see [Mesh DNS](./mesh-dns.md#following-a-new-mesh-address)) |
+| `sessions` | Always | `meshServer.SessionManager().SetMeshIP(addr.String())`, which ends every tcp session bound to the old address (see [Secure Access Tunneling](./secure-access-tunneling.md#wireguard-mesh-internal-wireguard)) |
+| `site-to-site` | macOS, in bridge mode | The function `newVPNReaddresser` returns: `WGVPNController.SetAddress` with the new address as a `/32`, then `SiteToSiteManager.Rebuild` when the manager exists (see [Site-to-Site VPN](../bridge/site-to-site-vpn.md#a-new-mesh-address)) |
+| `mesh-rewriter` | A mesh rewriter was built, on a Windows bridge | `meshRewriter.SetMeshAddress(wgMgr.OSInterfaceName(), addr)` (see [Following a new mesh address](#following-a-new-mesh-address)) |
+
+`newVPNReaddresser(vpn bridge.VPNController, s2s *bridge.SiteToSiteManager) func(context.Context, netip.Addr) error` lives in `cmd/plexd/cmd/up_darwin.go`. `up_linux.go`, `up_windows.go` and `up_other.go` return nil from it, and `runAgent` adds the `site-to-site` follower only for a function that is not nil.
+
+Some holders of the address follow without a follower. The source rewrite of user access and site-to-site tunnels takes the address the mesh interface carries: on Linux it is `masquerade` on the mesh interface (see [Mesh Source Rewrite](../bridge/netlink-route-controller.md#mesh-source-rewrite)), and on macOS pf's `-> (<mesh>)` form (see [Mesh source rewrite](./pf-wfp-firewall.md#mesh-source-rewrite)). The node's policy follows through the pull: the control plane compiles the node's address into the rules and compiles them again when it moves the node, and `policy.DispatchHandler` applies the block of every pull. Listen addresses an operator set to the mesh address by hand, such as `tunnel.ssh_listen_addr`, are configuration and do not follow.
+
+### Readdress
+
+```go
+var ErrReaddressUnsupported = errors.New("the mesh address cannot be replaced while plexd runs")
+var ErrMeshAddressInvalid = errors.New("invalid mesh address")
+
+func (m *Manager) CanReaddress() bool
+func (m *Manager) MeshIP() netip.Addr
+func (m *Manager) Readdress(addr netip.Addr) error
+```
+
+`CanReaddress` is true when `Setup` succeeded, the controller implements [`AddressReplacer`](#addressreplacer), the mesh IP is IPv4, and the [mesh prefix](#mesh-prefix) is shorter than `/32`. An interface that carries the host `/32` fallback has no prefix but its own address, so `Readdress` would refuse every move as outside it. `plexd up` declares `mesh_readdress` on the heartbeat from this test, so a node declares the feature only when it can follow, and it re-addresses only inside the prefix its interface was set up with: every part that copied `MeshPrefix()` at startup stays correct, and a pull cannot point the interface at a network of the host.
+
+`Readdress` replaces the mesh IP of the live interface in this order:
+
+1. It returns an error wrapping `ErrReaddressUnsupported` while `CanReaddress` is false: `wireguard: readdress: the mesh address cannot be replaced while plexd runs`.
+2. It returns an error wrapping `ErrMeshAddressInvalid` when `addr`, unmapped, is not IPv4, is unspecified, loopback, multicast or link-local, or lies outside the mesh prefix, such as `wireguard: readdress: invalid mesh address: 192.168.1.5 lies outside the mesh prefix 10.0.0.0/16`.
+3. It returns nil without a call when `addr` is the current mesh IP.
+4. It calls `ReplaceAddress(Config.InterfaceName, <old>/<bits>, <new>/<bits>)` on the controller, both with the prefix length of the mesh prefix, such as `ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")`. An error is returned as `wireguard: readdress: <cause>` and leaves the mesh IP as it was, so the next call for the same address repeats the replace with the same arguments, which succeeds after a call that failed halfway.
+5. It stores `addr` as the mesh IP.
+6. It closes the round-trip probe's socket when one is held, so the probe's reader ends and the next round listens on `addr` (see [The round-trip probe after a move](#the-round-trip-probe-after-a-move)).
+7. It adds the route of every [routed subnet](#routed-subnets) it holds again, through the `PeerRouter` on `OSInterfaceName()`. On macOS the removal of the old alias may take the routes through the utun with it, which only the CI runner can measure, and `AddRoute` is idempotent, so a route that survived costs one call. A subnet whose add fails logs `wireguard: peer route failed` at Warn with `subnet`, `op=add` and `error`, and leaves the manager's set of programmed routes, so the next run of the reconcile handler adds it. That handler runs only for a pull that differs from the stored snapshot, and a changed `mesh_ip` alone does not, so the subnet stays without a route until a pull changes the peers, the policy or another tracked block. Without a router the step does nothing.
+8. It logs `wireguard: mesh address replaced` at Info with `interface`, `previous_mesh_ip` and `mesh_ip`.
+
+The mesh prefix never changes, so `MeshPrefix` keeps its meaning. The mesh IP sits under a mutex of its own, because `Readdress` writes it while the round-trip probe reads it, and every read goes through `MeshIP`. The mutex is held for the read or the write alone, never together with another lock of the manager and never across a controller or router call. Calls of `Readdress` must not overlap: `plexd up` makes them from the mesh address handler alone, on the reconcile goroutine.
+
+### Replacing the address on each platform
+
+Each controller's `ReplaceAddress` keeps the interface, its peers and the routes through it. A call that failed halfway succeeds when it is repeated with the same arguments, and a successful call logs `address replaced` at Debug with `interface`, `previous_address` and `address`, on macOS with `utun` too.
+
+On Linux, `NetlinkController.ReplaceAddress` makes four netlink calls: it adds the new address as a `/32`, deletes the old address, adds the new address with its prefix length, and deletes the `/32`. The order was measured on kernel 6.8.0-147 with a dummy link that held `10.99.0.1/24` and a route `172.16.5.0/24` through it:
+
+- Deleting the only address of a link removes every route of the link, that route included.
+- Adding the new address and then deleting the old one removes both addresses and every route, because the new address is a secondary of the old one and `promote_secondaries` is 0.
+- The four calls keep the route and end with `10.99.0.0/24 proto kernel src 10.99.0.9`.
+
+Switching `promote_secondaries` on instead would write `/proc/sys`, which fails in a container that holds `NET_ADMIN` alone. A pair of `/32` addresses takes two calls, an add of the new one and a delete of the old one, because the four calls would delete the address they just added. The adds tolerate `EEXIST` and the deletes `EADDRNOTAVAIL`. A failed call returns `wireguard: replace address: add <cidr>: <cause>` or `wireguard: replace address: delete <cidr>: <cause>`.
+
+On macOS, `DarwinController.ReplaceAddress` runs `ifconfig <utunN> inet <new>/<bits> <new> alias`, then `ifconfig <utunN> inet <old> -alias`, then installs the on-link route of the new prefix as `ConfigureAddress` does (see [Commands](#commands)). A removal that `ifconfig` answers with `Can't assign requested address`, an alias the utun does not hold, counts as success, and an on-link route the utun already carries is a success too.
+
+The CI macOS runner measured that the on-link route and the routes through the utun survive the removal of the old alias but keep it as their interface address: a BSD route keeps the address it was added with, and a socket takes its source from it, so every socket would go on leaving from the removed address. A connect also clones a host route from the route it took, with that route's address. So the call then reads the IPv4 routing table and points every route through the utun that still names the old address at the new one. `route -n change -inet <destination> -interface <utunN> -ifa <new>`, with `-host` for a host route, changes a route in place, so no packet leaves through the default route meanwhile. A host route the kernel cloned is deleted with `route -n delete -inet -host <destination>` instead, and the next lookup clones it again from its parent, which by then names the new address. Changing a parent drops its clones, as the runner measured, so a call that `route` answers with `not in table` counts as success. A refused call returns `wireguard: replace address: <command>: <message>`, and a routing table that cannot be read returns `wireguard: replace address: read the routes via <utunN>: <cause>`. The manager adds the peer routes again after the call in any case (step 7 above).
+
+On Windows, `WindowsController.ReplaceAddress` adds the new address with `CreateUnicastIpAddressEntry` and then deletes the old one with `DeleteUnicastIpAddressEntry`, so the adapter is never without an address. The add tolerates `ERROR_OBJECT_ALREADY_EXISTS`, as `ConfigureAddress` does, and the delete `ERROR_INVALID_PARAMETER`, which the CI Windows runner measured as the answer for an address the adapter does not hold. The LUID was just resolved and the address is a parsed IPv4 prefix, so no other parameter of the call can be the one Windows refuses. The runner also measured that the on-link route of the prefix and the routes through the adapter stay when the old address goes.
+
+Three tests prove the calls on a real device, and each privileged CI step fails unless the `--- PASS:` line of its test is in the output, so a skip cannot pass (see [CI Workflow](../development/ci-workflow.md)):
+
+| Test | Gate | What it proves |
+|---|---|---|
+| `TestNetlinkController_RealReplaceAddress` | `PLEXD_TEST_REAL_LINKS=1` and root, in a network namespace of its own | After a replace from `10.98.0.1/24` to `10.98.0.9/24` the WireGuard link holds `10.98.0.9/24` alone, a route `172.16.5.0/24` added through the link before the call still exists, and the connected route names the new source. A second link proves the two calls of a pair of `/32` addresses. Every call is repeated with the same arguments and returns nil |
+| `TestDarwinController_RealReplaceAddress` | root | After the call the utun holds the new address alone, a host inside the prefix and one inside a route added through the utun before the call resolve through the utun, and a socket to either leaves from the new address, although a socket connected to each before the call left a clone of its route on the old address. The repeated call returns nil |
+| `TestWindowsController_RealReplaceAddress` | `PLEXD_TEST_REAL_WINTUN=1`, `PLEXD_TEST_REAL_ROUTES=1` and an elevated token | After the call the adapter holds the new address alone, and a route added through the adapter before the call still exists. The repeated call returns nil |
+
+### The round-trip probe after a move
+
+The probe's socket is bound to the mesh IP, so `Readdress` closes it (step 6). Its reader ends on `net.ErrClosed`, and the next round finds the reader ended and listens on the new address (see [Round-trip probe](#round-trip-probe)). A move between the probe's read of the mesh IP and the moment it records its new socket finds no socket to close, so the probe reads the mesh IP again once the socket is recorded: when it changed, the probe closes that socket and listens again. A move after the second read finds the socket and closes it. A probe still outstanding when the socket closed stays recorded, and the round that sends again counts it as unanswered, as after any socket whose reader ended.
+
+`TestRTTProbe_ListensAgainAfterReaddress` runs the probe on loopback, calls `Readdress` and reads the next round listening on the new address. `TestRTTProbe_ListensAgainWhenReaddressRacesTheListen` moves the address during the listen, and `TestRTTProbe_ReaddressConcurrentWithRounds` and `TestRTTProbe_DefaultListenConcurrentWithReaddress` run moves beside rounds and listens, which `go test -race` checks.
+
+### Limits
+
+- The address moves only inside the mesh prefix the interface was set up with. The pull does not carry `domain_mesh_cidr`, so a changed Domain mesh CIDR is not followed while plexd runs.
+- Only an IPv4 mesh address moves: `Readdress` refuses any other, and the round-trip probe binds IPv4 alone.
+- A tcp session bound to the old address ends and is not bound again; its operator opens a new one.
+- A downgraded plexd keeps the address `identity.json` holds, stops declaring `mesh_readdress` with its first heartbeat, and is never moved again.
+- A control plane that predates `mesh_ip` sends no member, and the node keeps its address. A control plane that predates `features` refuses every heartbeat of a plexd that declares the feature (see [Upgrade order](../core/heartbeat-service.md#upgrade-order)).
+
+### Mesh address log lines
+
+The mesh address handler logs these lines:
+
+| Level | Message | When |
+|---|---|---|
+| `Debug` | `state pull carried no mesh_ip; keeping the address` | A pull without `mesh_ip` |
+| `Warn` | `mesh address from state pull refused` | A value that is no usable IP address, or one `Readdress` refused as invalid; carries `mesh_ip` and `error`. Once per value |
+| `Error` | `mesh address cannot be applied while plexd runs; restart plexd to use it` | WireGuard did not come up, or `CanReaddress` is false. The address is committed for the next start. Once per value; carries `mesh_ip` and `error` |
+| `Error`, `Debug` | `mesh address not applied; retrying on the next pull` | The interface or a follower failed; carries `step` (`interface`, `mesh-dns`, `sessions`, `site-to-site` or `mesh-rewriter`), `mesh_ip` and `error`. `Error` the first time for a value, `Debug` while it repeats |
+| `Info` | `mesh address changed from state pull` | The interface carries the new address; carries `previous_mesh_ip` and `mesh_ip` |
+| `Warn` | `mesh address not persisted; retrying on the next pull` | `CommitMeshIP` failed; carries `mesh_ip` and `error` |
+
+The manager logs `wireguard: mesh address replaced` and `wireguard: peer route failed` with `component=wireguard` (see [Readdress](#readdress)), the mesh resolver `mesh dns listener moved` with `component=meshdns` (see [Mesh DNS](./mesh-dns.md#following-a-new-mesh-address)), and the mesh rewriter its two lines with `component=bridge` (see [Drops and log lines](#drops-and-log-lines)). After a restart the registrar logs `existing identity loaded` with `node_id` and `mesh_ip`, the address the interface comes up with.
 
 ## Integration Points
 
