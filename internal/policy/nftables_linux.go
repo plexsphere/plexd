@@ -3,11 +3,13 @@
 package policy
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 
 	"github.com/google/nftables"
@@ -27,11 +29,27 @@ const tableName = "plexd"
 // buffer of about 208 KiB overflows (ENOBUFS) once a batch adds about 110
 // rules, which three chains reach at fewer than 40 policy rules. A rule add
 // and its echo took about 2 KiB each on Linux 6.8; the allowance leaves
-// four times that.
+// four times that. netlinkBufferPerElement is the allowance for every set
+// element: a batch of 3 × 15,003 elements failed with EMSGSIZE on 1 MiB
+// buffers and passed with 1 MiB plus 256 bytes per element.
 const (
-	netlinkBufferBase    = 1 << 20
-	netlinkBufferPerRule = 8 << 10
+	netlinkBufferBase       = 1 << 20
+	netlinkBufferPerRule    = 8 << 10
+	netlinkBufferPerElement = 256
 )
+
+// setElemsPerMessage bounds the elements of one netlink message. AddSet and
+// SetAddElements put all elements of a call into one netlink attribute, whose
+// length field has 16 bits: 1,303 elements of the IPv4 port shape arrived as
+// 42 on Linux 6.8, and neither the call nor Flush returned an error. 256
+// elements per message arrive whole.
+const setElemsPerMessage = 256
+
+// regConcat is NFT_REG32_00, the first of the kernel's 4-byte registers,
+// which golang.org/x/sys/unix does not define. A set rule loads the fields
+// of its key into consecutive 4-byte registers from there, and its lookup
+// reads the concatenation back from the same register.
+const regConcat = 8
 
 // ctDirectionReply is IP_CT_DIR_REPLY, the value the kernel loads for
 // "ct direction" when a packet travels against its connection's first packet.
@@ -54,6 +72,8 @@ const nflogGroup uint16 = 28772
 // traffic on the policy's interfaces meets the rules. The input chain holds
 // them behind the round-trip probe exemption, and the output chain behind
 // the foreign-source rule and the relay and round-trip probe exemptions.
+// The unlogged allows that name an address are looked up in anonymous sets
+// rather than walked as a list.
 //
 // A rule with a LogTag gets a log rule in front of it, which sends the first
 // packet of each connection it admits to NFLOG group nflogGroup. The
@@ -312,10 +332,16 @@ func (c *NftablesController) EnsureChain(chain string) error {
 // interface's round-trip probe rule, and the output list with its
 // foreign-source rule, relay probe rule and round-trip probe rule; the
 // forward list adds none, so nothing the node forwards passes an exemption.
-// Then each list holds each FirewallRule as an nftables rule with its match
-// expressions and verdict, behind its log rule when it carries a LogTag. It
-// flushes the three chains and writes each list into its own chain in one
-// batch, so the three change together or not at all.
+// Then each list holds the rules in the order given (segmentRules): a rule
+// with a LogTag, a deny and a rule without an address as an nftables rule
+// with its match expressions and verdict, behind its log rule when it
+// carries a LogTag, and every run of consecutive unlogged allows with an
+// address and the same Interface as set rules, each of which looks the
+// packet up in an anonymous set of the run's addresses, protocols and ports.
+// A mesh packet so costs a fixed number of lookups instead of a walk of the
+// list. It flushes the three chains, which drops the sets of their old
+// rules, and writes each list and its sets into its own chain in one batch,
+// so the three change together or not at all.
 //
 // Before it builds the lists, prepareLogging opens the NFLOG reader a logged
 // rule needs, or takes the log tags off when it cannot. A host whose kernel
@@ -352,52 +378,24 @@ func (c *NftablesController) EnsureChain(chain string) error {
 // the filter chains of the output hook see the interface of the route the
 // connection started on, and the DNAT reroutes it only for postrouting.
 //
-// The batch's netlink socket gets buffers sized to the number of rules it
-// adds (applyBufferBytes), because the default ones cannot hold the echoes
-// of a ruleset of a few dozen policy rules written into three chains.
+// The batch's netlink socket gets buffers sized to the number of rules and
+// set elements it adds (applyBufferBytes), because the default ones cannot
+// hold the echoes of a ruleset of a few dozen policy rules written into
+// three chains.
 func (c *NftablesController) ApplyRules(chain string, rules []FirewallRule) error {
 	rules = c.prepareLogging(rules)
-	inList, err := chainRuleExprs(rules, hookInput)
+	segments, err := segmentRules(rules, true)
 	if err != nil {
 		return err
 	}
-	fwdList, err := chainRuleExprs(rules, hookForward)
-	if err != nil {
-		return err
-	}
-	outList, err := chainRuleExprs(rules, hookOutput)
-	if err != nil {
-		return err
-	}
-
-	conn, err := nftables.New(nftables.WithSockOptions(sizeSocketBuffers(applyBufferBytes(len(inList), len(fwdList), len(outList)))))
-	if err != nil {
-		return fmt.Errorf("policy: nftables: apply rules: %w", err)
-	}
-
-	table := c.ensureTable(conn)
-	input, forward, output := baseChains(table, chain)
-	for _, fill := range []struct {
-		nftChain *nftables.Chain
-		list     [][]expr.Any
-	}{
-		{input, inList},
-		{forward, fwdList},
-		{output, outList},
-	} {
-		conn.AddChain(fill.nftChain)
-		conn.FlushChain(fill.nftChain)
-		for _, exprs := range fill.list {
-			conn.AddRule(&nftables.Rule{
-				Table: table,
-				Chain: fill.nftChain,
-				Exprs: exprs,
-			})
+	var lists [3][]chainEntry
+	for i, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+		if lists[i], err = chainRuleExprs(segments, hook); err != nil {
+			return err
 		}
 	}
-
-	if err := conn.Flush(); err != nil {
-		return fmt.Errorf("policy: nftables: apply rules to chain %q: %w", chain, err)
+	if err := c.writeChains(chain, lists); err != nil {
+		return err
 	}
 
 	c.logger.Debug("nftables rules applied",
@@ -502,11 +500,12 @@ func (c *NftablesController) DeleteChain(chain string) error {
 // DropCounts returns the packets and bytes the drop rules in the three base
 // chains of the named chain dropped. It implements DropCounter. buildRuleExprs
 // ends every rule it builds in a counter and a verdict, the guard ends in
-// accept without a counter, and the default deny is the only rule the engine
-// gives a drop verdict, so the sum is what the default deny dropped. The
-// counters restart when ApplyRules replaces the chain: it flushes the three
-// chains and adds every rule again with a counter at zero. It reads the
-// counters with one rule dump per base chain.
+// accept without a counter, the set rules end in a counter and accept, and
+// the default deny is the only rule the engine gives a drop verdict, so the
+// sum is what the default deny dropped. The counters restart when ApplyRules
+// replaces the chain: it flushes the three chains and adds every rule again
+// with a counter at zero. It reads the counters with one rule dump per base
+// chain.
 func (c *NftablesController) DropCounts(chain string) (packets, bytes uint64, err error) {
 	conn, err := nftables.New()
 	if err != nil {
@@ -529,9 +528,9 @@ func (c *NftablesController) DropCounts(chain string) (packets, bytes uint64, er
 
 // sumDropCounters sums the counters of the rules whose last expression is a
 // drop verdict, and ignores every other rule: those that accept, the guard
-// among them, and the log rules, which end in their log expression. A rule's
-// counter is the first counter expression it holds; buildRuleExprs gives
-// every rule it builds exactly one.
+// and the set rules among them, and the log rules, which end in their log
+// expression. A rule's counter is the first counter expression it holds;
+// buildRuleExprs gives every rule it builds exactly one.
 func sumDropCounters(rules []*nftables.Rule) (packets, bytes uint64) {
 	for _, rule := range rules {
 		if len(rule.Exprs) == 0 {
@@ -553,10 +552,86 @@ func sumDropCounters(rules []*nftables.Rule) (packets, bytes uint64) {
 }
 
 // applyBufferBytes returns the netlink socket buffer size for an ApplyRules
-// batch that writes inRules into the input chain, fwdRules into the forward
-// chain and outRules into the output chain.
-func applyBufferBytes(inRules, fwdRules, outRules int) int {
-	return netlinkBufferBase + (inRules+fwdRules+outRules)*netlinkBufferPerRule
+// batch that adds rules rules and elements set elements across the three
+// chains.
+func applyBufferBytes(rules, elements int) int {
+	return netlinkBufferBase + rules*netlinkBufferPerRule + elements*netlinkBufferPerElement
+}
+
+// writeChains writes lists, the input, forward and output list in that
+// order, into the three base chains of the named chain in one batch: per
+// chain AddChain, FlushChain and one AddRule per entry, then one Flush.
+//
+// An entry with a set gets its own anonymous, constant, interval,
+// concatenated set first, so each chain holds its own copy. AddSet carries
+// the first setElemsPerMessage elements, and SetAddElements every further
+// chunk on a copy of the set that is not anonymous: the library refuses to
+// add to an anonymous set, and the copy keeps the name, ID and table that
+// address the same set inside the batch. The entry's rule gets a copy of its
+// lookup that names the set.
+func (c *NftablesController) writeChains(chain string, lists [3][]chainEntry) error {
+	rules, elements := 0, 0
+	for _, list := range lists {
+		rules += len(list)
+		for _, entry := range list {
+			if entry.set != nil {
+				elements += len(entry.set.elems)
+			}
+		}
+	}
+	conn, err := nftables.New(nftables.WithSockOptions(sizeSocketBuffers(applyBufferBytes(rules, elements))))
+	if err != nil {
+		return fmt.Errorf("policy: nftables: apply rules: %w", err)
+	}
+
+	table := c.ensureTable(conn)
+	input, forward, output := baseChains(table, chain)
+	for i, nftChain := range []*nftables.Chain{input, forward, output} {
+		conn.AddChain(nftChain)
+		conn.FlushChain(nftChain)
+		for _, entry := range lists[i] {
+			exprs := entry.exprs
+			if entry.set != nil {
+				set := &nftables.Set{
+					Table:         table,
+					Anonymous:     true,
+					Constant:      true,
+					Interval:      true,
+					Concatenation: true,
+					KeyType:       setKeyType(entry.set.family, entry.set.shape),
+				}
+				chunks := elementChunks(entry.set.elems)
+				var first []nftables.SetElement
+				if len(chunks) > 0 {
+					first, chunks = chunks[0], chunks[1:]
+				}
+				if err := conn.AddSet(set, first); err != nil {
+					return fmt.Errorf("policy: nftables: apply rules: add set: %w", err)
+				}
+				named := *set
+				named.Anonymous = false
+				for _, chunk := range chunks {
+					if err := conn.SetAddElements(&named, chunk); err != nil {
+						return fmt.Errorf("policy: nftables: apply rules: add set: %w", err)
+					}
+				}
+				exprs = slices.Clone(exprs)
+				for k, e := range exprs {
+					if lookup, ok := e.(*expr.Lookup); ok {
+						bound := *lookup
+						bound.SetName, bound.SetID = set.Name, set.ID
+						exprs[k] = &bound
+					}
+				}
+			}
+			conn.AddRule(&nftables.Rule{Table: table, Chain: nftChain, Exprs: exprs})
+		}
+	}
+
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("policy: nftables: apply rules to chain %q: %w", chain, err)
+	}
+	return nil
 }
 
 // sizeSocketBuffers returns a socket option that raises the netlink socket's
@@ -598,84 +673,376 @@ func (c *NftablesController) ensureTable(conn *nftables.Conn) *nftables.Table {
 	})
 }
 
-// chainRuleExprs translates rules into the list ApplyRules writes into the
-// base chain hook selects, with every interface match reading the interface
-// that chain matches (chainHook.dir).
+// setShape names the fields a set's key concatenates. A lookup loads only
+// the fields its shape holds, so an any-protocol rule keeps matching a packet
+// without a readable transport header, as its single rule does.
+type setShape int
+
+const (
+	// shapeAddrs is a rule without a protocol: source . destination.
+	shapeAddrs setShape = iota
+	// shapeProto is a rule with a protocol and no port: source . destination
+	// . protocol.
+	shapeProto
+	// shapePort is a rule with a destination port or port range: source .
+	// destination . protocol . destination port.
+	shapePort
+)
+
+// ruleSet is one set of a run: the elements of one layer of the run's rules
+// of one family and shape.
+type ruleSet struct {
+	family addrFamily
+	shape  setShape
+	elems  []nftables.SetElement
+}
+
+// segment is one piece of the ruleset as ApplyRules writes it: one rule
+// (sets is nil, iface its Interface) or a run of rules written as sets (sets
+// holds one ruleSet per layer, iface the run's Interface).
+type segment struct {
+	rule  FirewallRule
+	iface string
+	sets  []ruleSet
+}
+
+// segmentRules validates every rule, then cuts the rules into segments in
+// order. A rule joins a run when it is an allow, has no LogTag and names an
+// address family. A run is a maximal sequence of consecutive such rules with
+// the same Interface. Every other rule is a segment of its own and ends the
+// run before it: a log rule needs its rule's own match, and a deny or a rule
+// without an address has no place in an accept set. With sets false every
+// rule is a segment of its own.
 //
-// A list is guarded when the rules name at least one interface and no rule
-// has an empty Interface. A guarded list starts with the guard (guardExprs),
-// which names every interface of the rules in order of first appearance.
-// When it names exactly one, every other rule of the list is built without
-// an interface match (dirNone); with two or more each keeps the match of its
-// rule. An unguarded list has no guard, and every rule carries the interface
-// match of its rule, which is none for an empty Interface.
-//
-// The list goes on, for every interface the rules name, once per interface
-// in order of first appearance, with its two connection tracking rules. In
-// the input list its round-trip probe rule follows them, and in the output
-// list its foreign-source rule, its relay probe rule and its round-trip probe
-// rule; the forward list holds the pair alone. One rule per FirewallRule
-// follows, in the order given, with the log rule of a rule that carries a
-// LogTag directly in front of it.
-func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) {
-	var ifaces []string
-	seen := make(map[string]bool)
-	guarded := len(rules) > 0
+// Consecutive allows commute, so a run may be reordered and merged without
+// changing a verdict; nothing moves across a logged rule or a deny. A run's
+// rules are grouped by family and shape (boxOf), and each group is layered
+// (layerBoxes) into sets in the order IPv4 shapeAddrs, shapeProto, shapePort,
+// then IPv6 the same.
+func segmentRules(rules []FirewallRule, sets bool) ([]segment, error) {
 	for _, rule := range rules {
 		if err := rule.Validate(); err != nil {
 			return nil, fmt.Errorf("policy: nftables: apply rules: %w", err)
 		}
-		if rule.Interface == "" {
+	}
+	joins := func(rule FirewallRule) bool {
+		fam, err := rule.family()
+		return sets && err == nil && fam != familyAny && rule.Action == "allow" && rule.LogTag == ""
+	}
+
+	var segments []segment
+	for i := 0; i < len(rules); {
+		rule := rules[i]
+		if !joins(rule) {
+			segments = append(segments, segment{rule: rule, iface: rule.Interface})
+			i++
+			continue
+		}
+		end := i + 1
+		for end < len(rules) && joins(rules[end]) && rules[end].Interface == rule.Interface {
+			end++
+		}
+
+		// groups holds the run's boxes by family, IPv4 then IPv6, and shape.
+		var groups [2][3][]ruleBox
+		for _, r := range rules[i:end] {
+			box, fam, shape, err := boxOf(r)
+			if err != nil {
+				return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
+			}
+			f := 0
+			if fam == familyIPv6 {
+				f = 1
+			}
+			groups[f][shape] = append(groups[f][shape], box)
+		}
+		run := segment{iface: rule.Interface}
+		for f, fam := range []addrFamily{familyIPv4, familyIPv6} {
+			for shape, boxes := range groups[f] {
+				for _, layer := range layerBoxes(boxes) {
+					elems := make([]nftables.SetElement, len(layer))
+					for k, box := range layer {
+						elems[k] = box.element(setShape(shape))
+					}
+					run.sets = append(run.sets, ruleSet{family: fam, shape: setShape(shape), elems: elems})
+				}
+			}
+		}
+		segments = append(segments, run)
+		i = end
+	}
+	return segments, nil
+}
+
+// ruleBox is what an allow rule admits, as a box in the space of source,
+// destination, protocol and destination port: two prefixes, a protocol
+// number and an inclusive port range. A shape the box does not use leaves
+// its fields 0.
+type ruleBox struct {
+	src, dst   netip.Prefix
+	proto      byte
+	port, last uint16
+}
+
+// boxOf returns the box of a rule that names an address family, with that
+// family and the rule's shape. An absent address is the zero-length prefix
+// of the rule's family. last is PortTo when it is above Port, otherwise
+// Port.
+func boxOf(rule FirewallRule) (ruleBox, addrFamily, setShape, error) {
+	fam, err := rule.family()
+	if err != nil {
+		return ruleBox{}, familyAny, shapeAddrs, err
+	}
+	if fam == familyAny {
+		return ruleBox{}, familyAny, shapeAddrs, errors.New("a rule without an address has no box")
+	}
+	prefix := func(field string) (netip.Prefix, error) {
+		p, ok, err := parseRuleAddr(field)
+		if err != nil || ok {
+			return p, err
+		}
+		if fam == familyIPv4 {
+			return netip.PrefixFrom(netip.IPv4Unspecified(), 0), nil
+		}
+		return netip.PrefixFrom(netip.IPv6Unspecified(), 0), nil
+	}
+
+	var box ruleBox
+	if box.src, err = prefix(rule.SrcIP); err != nil {
+		return ruleBox{}, familyAny, shapeAddrs, fmt.Errorf("source IP: %w", err)
+	}
+	if box.dst, err = prefix(rule.DstIP); err != nil {
+		return ruleBox{}, familyAny, shapeAddrs, fmt.Errorf("destination IP: %w", err)
+	}
+	if rule.Protocol == "" {
+		return box, fam, shapeAddrs, nil
+	}
+	if box.proto, err = protocolNumber(rule.Protocol, fam); err != nil {
+		return ruleBox{}, familyAny, shapeAddrs, err
+	}
+	if rule.Port == 0 {
+		return box, fam, shapeProto, nil
+	}
+	box.port, box.last = uint16(rule.Port), uint16(rule.Port)
+	if rule.PortTo > rule.Port {
+		box.last = uint16(rule.PortTo)
+	}
+	return box, fam, shapePort, nil
+}
+
+// contains reports whether b holds every point of o: both prefixes of o
+// inside b's, the same protocol, and o's port range inside b's.
+func (b ruleBox) contains(o ruleBox) bool {
+	return b.src.Bits() <= o.src.Bits() && b.src.Contains(o.src.Addr()) &&
+		b.dst.Bits() <= o.dst.Bits() && b.dst.Contains(o.dst.Addr()) &&
+		b.proto == o.proto && b.port <= o.port && o.last <= b.last
+}
+
+// intersects reports whether b and o share a point: both address prefixes
+// overlap, the protocols are equal and the port ranges overlap.
+func (b ruleBox) intersects(o ruleBox) bool {
+	return b.src.Overlaps(o.src) && b.dst.Overlaps(o.dst) &&
+		b.proto == o.proto && b.port <= o.last && o.port <= b.last
+}
+
+// layerBoxes places the boxes of one family and shape into layers of
+// pairwise disjoint boxes, each of which becomes one set. The kernel refuses
+// an element whose first or last point lies inside an element its set
+// already holds, and fails the whole batch with EEXIST, which disjoint boxes
+// cannot do.
+//
+// It sorts the boxes stably by source prefix length ascending, destination
+// prefix length ascending and port range width descending, so a box that
+// contains another comes first. It drops a box that a box already placed
+// contains, which admits nothing more, and places every other box in the
+// first layer none of whose boxes it intersects, opening a new layer when
+// none fits. The comparison is pairwise and so quadratic in the boxes; a
+// ruleset of pairwise crossing boxes ends with one set per rule.
+func layerBoxes(boxes []ruleBox) [][]ruleBox {
+	sorted := slices.Clone(boxes)
+	slices.SortStableFunc(sorted, func(a, b ruleBox) int {
+		if c := cmp.Compare(a.src.Bits(), b.src.Bits()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.dst.Bits(), b.dst.Bits()); c != 0 {
+			return c
+		}
+		return cmp.Compare(b.last-b.port, a.last-a.port)
+	})
+
+	var layers [][]ruleBox
+	for _, box := range sorted {
+		contained := slices.ContainsFunc(layers, func(layer []ruleBox) bool {
+			return slices.ContainsFunc(layer, func(placed ruleBox) bool { return placed.contains(box) })
+		})
+		if contained {
+			continue
+		}
+		i := slices.IndexFunc(layers, func(layer []ruleBox) bool {
+			return !slices.ContainsFunc(layer, box.intersects)
+		})
+		if i < 0 {
+			layers = append(layers, nil)
+			i = len(layers) - 1
+		}
+		layers[i] = append(layers[i], box)
+	}
+	return layers
+}
+
+// element returns the set element of the box for shape. Key concatenates the
+// first source address, the first destination address, then for shapeProto
+// and shapePort the protocol padded to 4 bytes, then for shapePort the port
+// in network byte order padded to 4 bytes. KeyEnd is the same with the last
+// address of each prefix and last in place of port.
+func (b ruleBox) element(shape setShape) nftables.SetElement {
+	key := append(b.src.Addr().AsSlice(), b.dst.Addr().AsSlice()...)
+	end := append(lastAddr(b.src).AsSlice(), lastAddr(b.dst).AsSlice()...)
+	if shape != shapeAddrs {
+		key = append(key, b.proto, 0, 0, 0)
+		end = append(end, b.proto, 0, 0, 0)
+	}
+	if shape == shapePort {
+		key = append(key, byte(b.port>>8), byte(b.port), 0, 0)
+		end = append(end, byte(b.last>>8), byte(b.last), 0, 0)
+	}
+	return nftables.SetElement{Key: key, KeyEnd: end}
+}
+
+// lastAddr returns the last address of a masked prefix.
+func lastAddr(p netip.Prefix) netip.Addr {
+	b := p.Addr().AsSlice()
+	for i := range b {
+		switch rest := p.Bits() - 8*i; {
+		case rest <= 0:
+			b[i] = 0xff
+		case rest < 8:
+			b[i] |= 0xff >> rest
+		}
+	}
+	addr, _ := netip.AddrFromSlice(b)
+	return addr
+}
+
+// setKeyType returns the key type of a set of family and shape: the address
+// type twice, then the protocol and the service, as far as the shape goes.
+func setKeyType(family addrFamily, shape setShape) nftables.SetDatatype {
+	addr := nftables.TypeIPAddr
+	if family == familyIPv6 {
+		addr = nftables.TypeIP6Addr
+	}
+	types := []nftables.SetDatatype{addr, addr}
+	if shape != shapeAddrs {
+		types = append(types, nftables.TypeInetProto)
+	}
+	if shape == shapePort {
+		types = append(types, nftables.TypeInetService)
+	}
+	return nftables.MustConcatSetType(types...)
+}
+
+// setLookupExprs builds a set rule: the interface match iface and dir give,
+// the family match, the source address into regConcat, the destination
+// address into the register after it, for shapeProto and shapePort the
+// protocol into the next, for shapePort the destination port into the one
+// after, then the lookup, a counter and accept. nft lists it as ip saddr . ip
+// daddr . meta l4proto . th dport @set counter accept. The lookup names no
+// set yet: writeChains gives each chain's copy its own.
+func setLookupExprs(iface string, dir ifaceDir, family addrFamily, shape setShape) []expr.Any {
+	nfproto := byte(unix.NFPROTO_IPV4)
+	srcOffset, dstOffset, length := uint32(12), uint32(16), uint32(4)
+	if family == familyIPv6 {
+		nfproto = unix.NFPROTO_IPV6
+		srcOffset, dstOffset, length = 8, 24, 16
+	}
+	// words is the address length in 4-byte registers.
+	words := length / 4
+
+	exprs := ifaceMatchExprs(iface, dir)
+	exprs = append(exprs, nfprotoExprs(nfproto)...)
+	exprs = append(exprs,
+		&expr.Payload{DestRegister: regConcat, Base: expr.PayloadBaseNetworkHeader, Offset: srcOffset, Len: length},
+		&expr.Payload{DestRegister: regConcat + words, Base: expr.PayloadBaseNetworkHeader, Offset: dstOffset, Len: length},
+	)
+	if shape != shapeAddrs {
+		exprs = append(exprs, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: regConcat + 2*words})
+	}
+	if shape == shapePort {
+		exprs = append(exprs, &expr.Payload{DestRegister: regConcat + 2*words + 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2})
+	}
+	return append(exprs,
+		&expr.Lookup{SourceRegister: regConcat},
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	)
+}
+
+// elementChunks cuts elems into chunks of at most setElemsPerMessage, one
+// netlink message each.
+func elementChunks(elems []nftables.SetElement) [][]nftables.SetElement {
+	return slices.Collect(slices.Chunk(elems, setElemsPerMessage))
+}
+
+// chainEntry is one rule of a list: its expressions, and for a set rule the
+// set its lookup reads, which set is nil for every other rule.
+type chainEntry struct {
+	exprs []expr.Any
+	set   *ruleSet
+}
+
+// chainRuleExprs translates segments into the list ApplyRules writes into the
+// base chain hook selects, with every interface match reading the interface
+// that chain matches (chainHook.dir).
+//
+// A list is guarded when the segments name at least one interface and none
+// has an empty one. A guarded list starts with the guard (guardExprs), which
+// names every interface of the segments in order of first appearance. When
+// it names exactly one, every other rule of the list is built without an
+// interface match (dirNone); with two or more each keeps the match of its
+// rule or run. An unguarded list has no guard, and every rule carries the
+// interface match of its rule or run, which is none for an empty one.
+// Whether a list is guarded does not decide whether it holds sets.
+//
+// The list goes on, for every interface, once per interface in order of
+// first appearance, with its two connection tracking rules. In the input
+// list its round-trip probe rule follows them, and in the output list its
+// foreign-source rule, its relay probe rule and its round-trip probe rule;
+// the forward list holds the pair alone. Then per segment, in the order
+// given, either the rule, with the log rule of a rule that carries a LogTag
+// directly in front of it, or the set rules of the run, one per set.
+func chainRuleExprs(segments []segment, hook chainHook) ([]chainEntry, error) {
+	var ifaces []string
+	seen := make(map[string]bool)
+	guarded := len(segments) > 0
+	for _, s := range segments {
+		if s.iface == "" {
 			guarded = false
 		}
-		if !seen[rule.Interface] {
-			seen[rule.Interface] = true
-			ifaces = append(ifaces, rule.Interface)
+		if !seen[s.iface] {
+			seen[s.iface] = true
+			ifaces = append(ifaces, s.iface)
 		}
 	}
 
 	dir := hook.dir()
-	var guard [][]expr.Any
+	var list []chainEntry
 	if guarded {
-		guard = [][]expr.Any{guardExprs(ifaces, dir)}
+		list = append(list, chainEntry{exprs: guardExprs(ifaces, dir)})
 		if len(ifaces) == 1 {
 			dir = dirNone
 		}
 	}
 
-	ruleExprs := make([][]expr.Any, 0, len(rules))
-	for _, rule := range rules {
-		if rule.LogTag != "" {
-			logExprs, err := logRuleExprs(rule, dir)
-			if err != nil {
-				return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
-			}
-			ruleExprs = append(ruleExprs, logExprs)
-		}
-		exprs, err := buildRuleExprs(rule, dir)
-		if err != nil {
-			return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
-		}
-		ruleExprs = append(ruleExprs, exprs)
-	}
-
-	perIface := 2
-	switch hook {
-	case hookInput:
-		perIface = 3
-	case hookOutput:
-		perIface = 5
-	}
-	list := make([][]expr.Any, 0, len(guard)+perIface*len(ifaces)+len(ruleExprs))
-	list = append(list, guard...)
 	for _, iface := range ifaces {
-		list = append(list, connTrackExprs(iface, dir)...)
+		for _, exprs := range connTrackExprs(iface, dir) {
+			list = append(list, chainEntry{exprs: exprs})
+		}
 		var exempt []FirewallRule
 		switch hook {
 		case hookInput:
 			exempt = []FirewallRule{rttProbeRule(iface)}
 		case hookOutput:
-			list = append(list, foreignSourceExprs(iface, dir))
+			list = append(list, chainEntry{exprs: foreignSourceExprs(iface, dir)})
 			exempt = []FirewallRule{relayProbeRule(iface), rttProbeRule(iface)}
 		}
 		for _, rule := range exempt {
@@ -683,10 +1050,32 @@ func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) 
 			if err != nil {
 				return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
 			}
-			list = append(list, exprs)
+			list = append(list, chainEntry{exprs: exprs})
 		}
 	}
-	return append(list, ruleExprs...), nil
+
+	for _, s := range segments {
+		if s.sets != nil {
+			for i := range s.sets {
+				set := &s.sets[i]
+				list = append(list, chainEntry{exprs: setLookupExprs(s.iface, dir, set.family, set.shape), set: set})
+			}
+			continue
+		}
+		if s.rule.LogTag != "" {
+			logExprs, err := logRuleExprs(s.rule, dir)
+			if err != nil {
+				return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
+			}
+			list = append(list, chainEntry{exprs: logExprs})
+		}
+		exprs, err := buildRuleExprs(s.rule, dir)
+		if err != nil {
+			return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
+		}
+		list = append(list, chainEntry{exprs: exprs})
+	}
+	return list, nil
 }
 
 // guardExprs builds the guard that opens a list whose rules all name an

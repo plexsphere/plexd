@@ -373,6 +373,54 @@ func (n *realNetns) chainRules(t *testing.T, chain string) [3][]*nftables.Rule {
 	return lists
 }
 
+// sets returns the sets of table inet plexd inside the namespace.
+func (n *realNetns) sets(t *testing.T) []*nftables.Set {
+	t.Helper()
+	var sets []*nftables.Set
+	if err := n.do(func() error {
+		conn, err := nftables.New()
+		if err != nil {
+			return err
+		}
+		sets, err = conn.GetSets(&nftables.Table{Family: nftables.TableFamilyINet, Name: tableName})
+		return err
+	}); err != nil {
+		t.Fatalf("namespace %s: list the sets: %v", n.name, err)
+	}
+	return sets
+}
+
+// lookupElements returns, for each rule of rules that holds a lookup, the
+// number of elements of the set it reads, in the order of the rules.
+func (n *realNetns) lookupElements(t *testing.T, rules []*nftables.Rule) []int {
+	t.Helper()
+	var counts []int
+	if err := n.do(func() error {
+		conn, err := nftables.New()
+		if err != nil {
+			return err
+		}
+		table := &nftables.Table{Family: nftables.TableFamilyINet, Name: tableName}
+		for _, rule := range rules {
+			for _, e := range rule.Exprs {
+				lookup, ok := e.(*expr.Lookup)
+				if !ok {
+					continue
+				}
+				elems, err := conn.GetSetElements(&nftables.Set{Table: table, Name: lookup.SetName})
+				if err != nil {
+					return fmt.Errorf("set %s: %w", lookup.SetName, err)
+				}
+				counts = append(counts, len(elems))
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("namespace %s: read the set elements: %v", n.name, err)
+	}
+	return counts
+}
+
 // assertGuarded checks that each of the three chains opens with the guard
 // for iface alone, without a counter, and that no other rule loads an
 // interface name.
@@ -586,7 +634,24 @@ func TestNftablesController_Real(t *testing.T) {
 	apply(allow7001v4, allow7001v6, allow8001, allowOut9001, deny)
 
 	t.Log("each chain opens with the guard for plexd0, and no rule behind it matches an interface")
-	assertGuarded(t, n.chainRules(t, chain), "plexd0")
+	firstRules := n.chainRules(t, chain)
+	assertGuarded(t, firstRules, "plexd0")
+
+	t.Log("the unlogged allows are anonymous sets, and each chain holds a rule that looks them up")
+	firstSets := n.sets(t)
+	if len(firstSets) == 0 {
+		t.Errorf("table inet %s holds no set after the first apply", tableName)
+	}
+	for _, set := range firstSets {
+		if !set.Anonymous {
+			t.Errorf("set %s is not anonymous", set.Name)
+		}
+	}
+	for i, rules := range firstRules {
+		if len(n.lookupElements(t, rules)) == 0 {
+			t.Errorf("chain %d holds no rule with a lookup", i)
+		}
+	}
 
 	t.Log("P reaches what the rules allow on N over both families, and nothing else; N's replies leave through the output chain")
 	p.connects(t, "10.99.0.1:7001")
@@ -828,19 +893,96 @@ func TestNftablesController_Real(t *testing.T) {
 	e.timesOut(t, "192.0.2.1:7001")
 	p.timesOut(t, "10.99.0.1:7002")
 
-	// Every rule add is echoed back on the batch's netlink socket, which the
-	// default buffers cannot hold for a ruleset of a few dozen rules written
-	// into three chains (applyBufferBytes).
-	t.Log("a ruleset of 1000 policy rules applies in one batch and is enforced")
-	large := make([]FirewallRule, 0, 1002)
-	for i := range 1000 {
+	t.Log("a rule for any protocol, a set of the address shape, admits P's TCP connection")
+	apply(FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "10.99.0.1/32", Action: "allow"}, deny)
+	p.connects(t, "10.99.0.1:7002")
+
+	t.Log("a udp rule without a port, a set of the protocol shape, admits the datagram the default deny alone drops")
+	nUDP7050 := n.listenUDP(t, "10.99.0.1:7050")
+	pSendUDP := func(payload string) {
+		t.Helper()
+		if err := p.do(func() error {
+			c, err := net.Dial("udp", "10.99.0.1:7050")
+			if err != nil {
+				return err
+			}
+			defer func() { _ = c.Close() }()
+			_, err = c.Write([]byte(payload))
+			return err
+		}); err != nil {
+			t.Errorf("P send to udp 10.99.0.1:7050: %v", err)
+		}
+	}
+	apply(deny)
+	pSendUDP("d")
+	if err := nUDP7050.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, from, err := nUDP7050.ReadFrom(dgram); err == nil {
+		t.Errorf("N read %q from %s on udp port 7050 under the default deny alone, want nothing within 2 s", dgram[:nr], from)
+	} else {
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("N read on udp port 7050: %v, want a timeout", err)
+		}
+	}
+	apply(FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "10.99.0.1/32", Protocol: "udp", Action: "allow"}, deny)
+	pSendUDP("u")
+	if err := nUDP7050.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if nr, from, err := nUDP7050.ReadFrom(dgram); err != nil {
+		t.Errorf("N read on udp port 7050: %v, want P's datagram within 2 s", err)
+	} else if string(dgram[:nr]) != "u" {
+		t.Errorf("N read %q from %s on udp port 7050, want \"u\"", dgram[:nr], from)
+	}
+
+	// The kernel refuses an element whose first or last point lies inside an
+	// element its set holds already, and fails the whole batch: crossing
+	// port ranges must go into two sets, and a rule another one contains is
+	// dropped. 10.99.0.0/24 7010-7020 and 10.0.0.0/8 7030 share a layer,
+	// 7015-7025 crosses 7010-7020 and takes a second one, and 10.99.0.2/32
+	// 7030 lies inside 10.0.0.0/8 7030.
+	t.Log("crossing port ranges and a contained rule apply, are enforced, and take two sets of three elements")
+	for _, addr := range []string{":7012", ":7022", ":7026", ":7030"} {
+		n.listen(t, addr)
+	}
+	apply(
+		FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 7010, PortTo: 7020, Protocol: "tcp", Action: "allow"},
+		FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 7015, PortTo: 7025, Protocol: "tcp", Action: "allow"},
+		FirewallRule{Interface: "plexd0", SrcIP: "10.0.0.0/8", DstIP: "10.99.0.1/32", Port: 7030, Protocol: "tcp", Action: "allow"},
+		FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "10.99.0.1/32", Port: 7030, Protocol: "tcp", Action: "allow"},
+		deny,
+	)
+	p.connects(t, "10.99.0.1:7012")
+	p.connects(t, "10.99.0.1:7022")
+	p.connects(t, "10.99.0.1:7030")
+	p.timesOut(t, "10.99.0.1:7026")
+	if counts := n.lookupElements(t, n.chainRules(t, chain)[0]); len(counts) != 2 || counts[0]+counts[1] != 3 {
+		t.Errorf("the input chain's set rules read sets of %v elements, want two sets of three elements together", counts)
+	}
+
+	// Every rule add and every set element is echoed back on the batch's
+	// netlink socket, which the default buffers cannot hold for a ruleset of
+	// a few dozen rules written into three chains (applyBufferBytes).
+	t.Log("a ruleset of 3000 policy rules applies in one batch, as one set of 3002 elements per chain, and is enforced")
+	n.listen(t, ":7003")
+	large := make([]FirewallRule, 0, 3003)
+	for i := range 3000 {
 		large = append(large, FirewallRule{
 			Interface: "plexd0", SrcIP: fmt.Sprintf("10.98.%d.%d/32", i/250, i%250+1), DstIP: "10.99.0.1/32",
 			Port: 5432, Protocol: "tcp", Action: "allow",
 		})
 	}
-	apply(append(large, allow7001v4, deny)...)
+	allow7003 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "10.99.0.1/32", Port: 7003, Protocol: "tcp", Action: "allow"}
+	apply(append(large, allow7001v4, allow7003, deny)...)
+	for i, rules := range n.chainRules(t, chain) {
+		if counts := n.lookupElements(t, rules); len(counts) != 1 || counts[0] != 3002 {
+			t.Errorf("chain %d's set rules read sets of %v elements, want one set of 3002", i, counts)
+		}
+	}
 	p.connects(t, "10.99.0.1:7001")
+	p.connects(t, "10.99.0.1:7003")
 	p.timesOut(t, "10.99.0.1:7002")
 
 	t.Log("N reaches its own mesh address under the default deny alone")
@@ -850,6 +992,9 @@ func TestNftablesController_Real(t *testing.T) {
 	t.Log("FlushChain empties all three chains: input, forward and output traffic pass again")
 	if err := n.do(func() error { return ctrl.FlushChain(chain) }); err != nil {
 		t.Fatalf("FlushChain() error = %v, want nil", err)
+	}
+	if sets := n.sets(t); len(sets) != 0 {
+		t.Errorf("table inet %s holds %d sets after FlushChain, want none", tableName, len(sets))
 	}
 	p.connects(t, "10.99.0.1:7002")
 	p.connects(t, "192.0.2.2:8002")

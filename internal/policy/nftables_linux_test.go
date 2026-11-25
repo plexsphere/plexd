@@ -4,6 +4,7 @@ package policy
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -854,14 +855,41 @@ func oneIfaceRules() []FirewallRule {
 	}
 }
 
-// ruleLists returns the list chainRuleExprs builds from rules for hook.
-func ruleLists(t *testing.T, rules []FirewallRule, hook chainHook) [][]expr.Any {
+// ruleEntries returns the list chainRuleExprs builds for hook from the
+// segments segmentRules cuts from rules, with or without sets.
+func ruleEntries(t *testing.T, rules []FirewallRule, sets bool, hook chainHook) []chainEntry {
 	t.Helper()
-	got, err := chainRuleExprs(rules, hook)
+	segments, err := segmentRules(rules, sets)
+	if err != nil {
+		t.Fatalf("segmentRules(sets %v) returned error: %v", sets, err)
+	}
+	got, err := chainRuleExprs(segments, hook)
 	if err != nil {
 		t.Fatalf("chainRuleExprs(hook %d) returned error: %v", hook, err)
 	}
 	return got
+}
+
+// entryExprs returns the expressions of each entry.
+func entryExprs(entries []chainEntry) [][]expr.Any {
+	out := make([][]expr.Any, len(entries))
+	for i, entry := range entries {
+		out[i] = entry.exprs
+	}
+	return out
+}
+
+// ruleLists returns the list chainRuleExprs builds for hook from rules cut
+// into segments without sets, and fails on an entry that holds a set.
+func ruleLists(t *testing.T, rules []FirewallRule, hook chainHook) [][]expr.Any {
+	t.Helper()
+	entries := ruleEntries(t, rules, false, hook)
+	for i, entry := range entries {
+		if entry.set != nil {
+			t.Fatalf("hook %d: entry %d holds a set, want none without sets", hook, i)
+		}
+	}
+	return entryExprs(entries)
 }
 
 // builtRules returns buildRuleExprs of each rule with dir, in order.
@@ -990,26 +1018,425 @@ func TestChainRuleExprsWithoutInterface(t *testing.T) {
 	}
 }
 
-func TestChainRuleExprsEmpty(t *testing.T) {
-	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
-		got, err := chainRuleExprs(nil, hook)
-		if err != nil {
-			t.Fatalf("chainRuleExprs(nil, hook %d) returned error: %v", hook, err)
+// pinnedSetLookup writes out by hand the set rule of family and shape behind
+// the guard of a single interface: the family match, the fields of the key
+// into the 4-byte registers from 8 on, the lookup from register 8, a counter
+// and accept.
+func pinnedSetLookup(family addrFamily, shape setShape) []expr.Any {
+	network := func(reg, offset, length uint32) *expr.Payload {
+		return &expr.Payload{DestRegister: reg, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: length}
+	}
+	var exprs []expr.Any
+	var protoReg uint32
+	if family == familyIPv4 {
+		exprs = []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.NFPROTO_IPV4}},
+			network(8, 12, 4), // ip saddr
+			network(9, 16, 4), // ip daddr
 		}
-		if len(got) != 0 {
-			t.Errorf("chainRuleExprs(nil, hook %d) returned %d rules, want none", hook, len(got))
+		protoReg = 10
+	} else {
+		exprs = []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.NFPROTO_IPV6}},
+			network(8, 8, 16),   // ip6 saddr, registers 8 to 11
+			network(12, 24, 16), // ip6 daddr, registers 12 to 15
+		}
+		protoReg = 16
+	}
+	if shape != shapeAddrs {
+		exprs = append(exprs, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: protoReg})
+	}
+	if shape == shapePort {
+		exprs = append(exprs, &expr.Payload{DestRegister: protoReg + 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2})
+	}
+	return append(exprs,
+		&expr.Lookup{SourceRegister: 8},
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	)
+}
+
+// setElem returns the set element of a rule's box.
+func setElem(t *testing.T, rule FirewallRule) nftables.SetElement {
+	t.Helper()
+	box, _, shape, err := boxOf(rule)
+	if err != nil {
+		t.Fatalf("boxOf(%+v) returned error: %v", rule, err)
+	}
+	return box.element(shape)
+}
+
+func TestSegmentRules(t *testing.T) {
+	allowA := FirewallRule{Interface: "plexd0", SrcIP: "10.0.0.1/32", DstIP: "10.0.0.9/32", Port: 22, Protocol: "tcp", Action: "allow"}
+	allowB := FirewallRule{Interface: "plexd0", SrcIP: "10.0.0.2/32", DstIP: "10.0.0.9/32", Port: 22, Protocol: "tcp", Action: "allow"}
+	logged := FirewallRule{Interface: "plexd0", SrcIP: "10.0.0.3/32", DstIP: "10.0.0.9/32", Port: 80, Protocol: "tcp", Action: "allow", LogTag: "1/2"}
+	allowC := FirewallRule{Interface: "plexd0", DstIP: "fd00::9/128", Action: "allow"}
+	deny := FirewallRule{Interface: "plexd0", Action: "deny"}
+	noAddr := FirewallRule{Interface: "plexd0", Port: 53, Protocol: "udp", Action: "allow"}
+	rules := []FirewallRule{allowA, allowB, logged, allowC, deny, noAddr}
+
+	t.Log("allow, allow, logged allow, allow, deny, allow without an address: a run of two, a rule, a run of one, two rules")
+	got, err := segmentRules(rules, true)
+	if err != nil {
+		t.Fatalf("segmentRules() returned error: %v", err)
+	}
+	want := []segment{
+		{iface: "plexd0", sets: []ruleSet{{family: familyIPv4, shape: shapePort, elems: []nftables.SetElement{setElem(t, allowA), setElem(t, allowB)}}}},
+		{rule: logged, iface: "plexd0"},
+		{iface: "plexd0", sets: []ruleSet{{family: familyIPv6, shape: shapeAddrs, elems: []nftables.SetElement{setElem(t, allowC)}}}},
+		{rule: deny, iface: "plexd0"},
+		{rule: noAddr, iface: "plexd0"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("segmentRules() =\n%+v\nwant\n%+v", got, want)
+	}
+
+	t.Log("without sets every rule is a segment of its own")
+	got, err = segmentRules(rules, false)
+	if err != nil {
+		t.Fatalf("segmentRules(sets false) returned error: %v", err)
+	}
+	want = nil
+	for _, rule := range rules {
+		want = append(want, segment{rule: rule, iface: "plexd0"})
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("segmentRules(sets false) =\n%+v\nwant\n%+v", got, want)
+	}
+
+	t.Log("two consecutive allows on different interfaces are two runs")
+	onWG0, onWG1 := allowA, allowB
+	onWG0.Interface, onWG1.Interface = "wg0", "wg1"
+	got, err = segmentRules([]FirewallRule{onWG0, onWG1}, true)
+	if err != nil {
+		t.Fatalf("segmentRules(wg0, wg1) returned error: %v", err)
+	}
+	want = []segment{
+		{iface: "wg0", sets: []ruleSet{{family: familyIPv4, shape: shapePort, elems: []nftables.SetElement{setElem(t, onWG0)}}}},
+		{iface: "wg1", sets: []ruleSet{{family: familyIPv4, shape: shapePort, elems: []nftables.SetElement{setElem(t, onWG1)}}}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("segmentRules(wg0, wg1) =\n%+v\nwant\n%+v", got, want)
+	}
+
+	t.Log("a nil and an empty ruleset give no segment")
+	for _, rules := range [][]FirewallRule{nil, {}} {
+		if got, err := segmentRules(rules, true); err != nil || len(got) != 0 {
+			t.Errorf("segmentRules(%#v) = %+v, %v; want no segment and no error", rules, got, err)
 		}
 	}
 }
 
-func TestChainRuleExprsRejectsInvalidRule(t *testing.T) {
-	_, err := chainRuleExprs([]FirewallRule{
-		{Interface: "wg0", Action: "allow"},
-		{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
-	}, hookInput)
+func TestBoxOf(t *testing.T) {
+	prefix := netip.MustParsePrefix
+	for _, tc := range []struct {
+		name  string
+		rule  FirewallRule
+		fam   addrFamily
+		shape setShape
+		box   ruleBox
+	}{
+		{
+			name:  "tcp with a port",
+			rule:  FirewallRule{SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1", Port: 5201, Protocol: "tcp", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapePort,
+			box:   ruleBox{src: prefix("10.99.0.0/24"), dst: prefix("10.99.0.1/32"), proto: 6, port: 5201, last: 5201},
+		},
+		{
+			name:  "tcp with a port range",
+			rule:  FirewallRule{SrcIP: "10.0.0.1", DstIP: "10.0.0.2", Port: 1000, PortTo: 2000, Protocol: "tcp", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapePort,
+			box:   ruleBox{src: prefix("10.0.0.1/32"), dst: prefix("10.0.0.2/32"), proto: 6, port: 1000, last: 2000},
+		},
+		{
+			name:  "a port range ending at its start",
+			rule:  FirewallRule{SrcIP: "10.0.0.1", DstIP: "10.0.0.2", Port: 1000, PortTo: 1000, Protocol: "tcp", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapePort,
+			box:   ruleBox{src: prefix("10.0.0.1/32"), dst: prefix("10.0.0.2/32"), proto: 6, port: 1000, last: 1000},
+		},
+		{
+			name:  "udp without a port",
+			rule:  FirewallRule{SrcIP: "10.0.0.1", DstIP: "10.0.0.2", Protocol: "udp", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapeProto,
+			box:   ruleBox{src: prefix("10.0.0.1/32"), dst: prefix("10.0.0.2/32"), proto: 17},
+		},
+		{
+			name:  "icmp in IPv4",
+			rule:  FirewallRule{DstIP: "10.0.0.1", Protocol: "icmp", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapeProto,
+			box:   ruleBox{src: prefix("0.0.0.0/0"), dst: prefix("10.0.0.1/32"), proto: 1},
+		},
+		{
+			name:  "icmp in IPv6",
+			rule:  FirewallRule{DstIP: "fd00::1", Protocol: "icmp", Action: "allow"},
+			fam:   familyIPv6,
+			shape: shapeProto,
+			box:   ruleBox{src: prefix("::/0"), dst: prefix("fd00::1/128"), proto: 58},
+		},
+		{
+			name:  "any protocol",
+			rule:  FirewallRule{SrcIP: "fd00:99::/64", DstIP: "fd00:99::1/128", Action: "allow"},
+			fam:   familyIPv6,
+			shape: shapeAddrs,
+			box:   ruleBox{src: prefix("fd00:99::/64"), dst: prefix("fd00:99::1/128")},
+		},
+		{
+			name:  "only a source in IPv4",
+			rule:  FirewallRule{SrcIP: "10.0.0.1/32", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapeAddrs,
+			box:   ruleBox{src: prefix("10.0.0.1/32"), dst: prefix("0.0.0.0/0")},
+		},
+		{
+			name:  "only a source in IPv6",
+			rule:  FirewallRule{SrcIP: "fd00::/64", Action: "allow"},
+			fam:   familyIPv6,
+			shape: shapeAddrs,
+			box:   ruleBox{src: prefix("fd00::/64"), dst: prefix("::/0")},
+		},
+		{
+			name:  "a zero-length prefix",
+			rule:  FirewallRule{SrcIP: "0.0.0.0/0", DstIP: "10.0.0.1/32", Port: 22, Protocol: "tcp", Action: "allow"},
+			fam:   familyIPv4,
+			shape: shapePort,
+			box:   ruleBox{src: prefix("0.0.0.0/0"), dst: prefix("10.0.0.1/32"), proto: 6, port: 22, last: 22},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			box, fam, shape, err := boxOf(tc.rule)
+			if err != nil {
+				t.Fatalf("boxOf() returned error: %v", err)
+			}
+			if box != tc.box || fam != tc.fam || shape != tc.shape {
+				t.Errorf("boxOf() = %+v, family %d, shape %d; want %+v, family %d, shape %d", box, fam, shape, tc.box, tc.fam, tc.shape)
+			}
+		})
+	}
+
+	if _, _, _, err := boxOf(FirewallRule{Port: 22, Protocol: "tcp", Action: "allow"}); err == nil {
+		t.Error("boxOf() of a rule without an address returned no error")
+	}
+}
+
+func TestLayerBoxes(t *testing.T) {
+	box := func(src, dst string, proto byte, port, last uint16) ruleBox {
+		return ruleBox{src: netip.MustParsePrefix(src), dst: netip.MustParsePrefix(dst), proto: proto, port: port, last: last}
+	}
+	tcp80 := box("10.0.0.0/24", "10.0.1.1/32", 6, 80, 90)
+	tcp85 := box("10.0.0.0/24", "10.0.1.1/32", 6, 85, 95)
+	tcp100 := box("10.0.0.0/24", "10.0.1.1/32", 6, 100, 100)
+	udp80 := box("10.0.0.0/24", "10.0.1.1/32", 17, 80, 90)
+	other := box("10.0.2.0/24", "10.0.1.1/32", 6, 80, 90)
+	big := box("10.0.0.0/8", "10.0.1.0/24", 6, 80, 90)
+	small := box("10.0.5.0/24", "10.0.1.1/32", 6, 85, 85)
+
+	for _, tc := range []struct {
+		name  string
+		boxes []ruleBox
+		want  [][]ruleBox
+	}{
+		{"disjoint boxes share a layer", []ruleBox{tcp80, udp80, other, tcp100}, [][]ruleBox{{tcp80, udp80, other, tcp100}}},
+		{"a contained box after its container is dropped", []ruleBox{big, small}, [][]ruleBox{{big}}},
+		{"a contained box before its container is dropped", []ruleBox{small, big}, [][]ruleBox{{big}}},
+		{"identical boxes are kept once", []ruleBox{tcp80, tcp80}, [][]ruleBox{{tcp80}}},
+		{"crossing port ranges on equal addresses take two layers", []ruleBox{tcp80, tcp85}, [][]ruleBox{{tcp80}, {tcp85}}},
+		{"a box takes the first layer it fits", []ruleBox{tcp80, tcp85, tcp100}, [][]ruleBox{{tcp80, tcp100}, {tcp85}}},
+		{"no boxes", []ruleBox{}, nil},
+		{"nil", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := layerBoxes(tc.boxes); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("layerBoxes() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRuleBoxElement(t *testing.T) {
+	hexBytes := func(s string) []byte {
+		b, err := hex.DecodeString(strings.ReplaceAll(s, " ", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	box := func(src, dst string, proto byte, port, last uint16) ruleBox {
+		return ruleBox{src: netip.MustParsePrefix(src), dst: netip.MustParsePrefix(dst), proto: proto, port: port, last: last}
+	}
+	for _, tc := range []struct {
+		name     string
+		box      ruleBox
+		shape    setShape
+		key, end string
+	}{
+		{
+			name:  "IPv4 port: 10.99.0.0/24 to 10.99.0.1/32, tcp 5201",
+			box:   box("10.99.0.0/24", "10.99.0.1/32", 6, 5201, 5201),
+			shape: shapePort,
+			key:   "0a630000 0a630001 06000000 14510000",
+			end:   "0a6300ff 0a630001 06000000 14510000",
+		},
+		{
+			name:  "IPv6 port: fd00:99::/64 to fd00:99::1/128, tcp 7001-7003",
+			box:   box("fd00:99::/64", "fd00:99::1/128", 6, 7001, 7003),
+			shape: shapePort,
+			key:   "fd000099000000000000000000000000 fd000099000000000000000000000001 06000000 1b590000",
+			end:   "fd00009900000000ffffffffffffffff fd000099000000000000000000000001 06000000 1b5b0000",
+		},
+		{
+			name:  "proto: 10.0.0.1/32 to 10.0.0.0/30, udp",
+			box:   box("10.0.0.1/32", "10.0.0.0/30", 17, 0, 0),
+			shape: shapeProto,
+			key:   "0a000001 0a000000 11000000",
+			end:   "0a000001 0a000003 11000000",
+		},
+		{
+			name:  "addresses: 0.0.0.0/0 to 10.0.0.0/20",
+			box:   box("0.0.0.0/0", "10.0.0.0/20", 0, 0, 0),
+			shape: shapeAddrs,
+			key:   "00000000 0a000000",
+			end:   "ffffffff 0a000fff",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.box.element(tc.shape)
+			want := nftables.SetElement{Key: hexBytes(tc.key), KeyEnd: hexBytes(tc.end)}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("element() = key %x end %x, want key %x end %x", got.Key, got.KeyEnd, want.Key, want.KeyEnd)
+			}
+			if n := setKeyType(familyOf(tc.box.src), tc.shape).Bytes; int(n) != len(got.Key) {
+				t.Errorf("setKeyType() is %d bytes long, the key %d", n, len(got.Key))
+			}
+		})
+	}
+}
+
+// The lookup of each shape in both families loads the fields of its key into
+// the registers from 8 on, without an interface match behind a guard
+// (dirNone) or for an empty interface, and with one otherwise.
+func TestSetLookupExprs(t *testing.T) {
+	for _, fam := range []addrFamily{familyIPv4, familyIPv6} {
+		for _, shape := range []setShape{shapeAddrs, shapeProto, shapePort} {
+			want := pinnedSetLookup(fam, shape)
+			assertExprs(t, setLookupExprs("plexd0", dirNone, fam, shape), want)
+			assertExprs(t, setLookupExprs("", dirIn, fam, shape), want)
+			assertExprs(t, setLookupExprs("plexd0", dirIn, fam, shape), append(pinnedIfaceMatch("plexd0", expr.MetaKeyIIFNAME), want...))
+			assertExprs(t, setLookupExprs("plexd0", dirOut, fam, shape), append(pinnedIfaceMatch("plexd0", expr.MetaKeyOIFNAME), want...))
+		}
+	}
+}
+
+func TestElementChunks(t *testing.T) {
+	for _, tc := range []struct {
+		n    int
+		want []int
+	}{
+		{0, nil},
+		{256, []int{256}},
+		{257, []int{256, 1}},
+		{1000, []int{256, 256, 256, 232}},
+	} {
+		elems := make([]nftables.SetElement, tc.n)
+		for i := range elems {
+			elems[i].Key = []byte{byte(i >> 8), byte(i)}
+		}
+		var sizes []int
+		var joined []nftables.SetElement
+		for _, chunk := range elementChunks(elems) {
+			sizes = append(sizes, len(chunk))
+			joined = append(joined, chunk...)
+		}
+		if !reflect.DeepEqual(sizes, tc.want) {
+			t.Errorf("elementChunks(%d elements) gave chunks of %v, want %v", tc.n, sizes, tc.want)
+		}
+		if len(joined) != len(elems) || (len(elems) > 0 && !reflect.DeepEqual(joined, elems)) {
+			t.Errorf("elementChunks(%d elements) lost or reordered elements", tc.n)
+		}
+	}
+}
+
+// Behind the guard and the opening, a logged rule stays a rule behind its
+// log rule, the two IPv4 tcp allows become one set rule of the port shape
+// with two elements, the IPv6 any-protocol allow one set rule of the address
+// shape with one element, and the deny stays a rule.
+func TestChainRuleExprsSets(t *testing.T) {
+	logged := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.2/32", DstIP: "10.99.0.1/32", Port: 7001, Protocol: "tcp", Action: "allow", LogTag: "1/0"}
+	ssh := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 22, Protocol: "tcp", Action: "allow"}
+	https := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 443, Protocol: "tcp", Action: "allow"}
+	v6 := FirewallRule{Interface: "plexd0", SrcIP: "fd00:99::/64", DstIP: "fd00:99::1/128", Action: "allow"}
+	deny := FirewallRule{Interface: "plexd0", Action: "deny"}
+	rules := []FirewallRule{logged, ssh, https, v6, deny}
+
+	logExprs, err := logRuleExprs(logged, dirNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest := builtRules(t, []FirewallRule{logged, deny}, dirNone)
+	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+		got := ruleEntries(t, rules, true, hook)
+		want := [][]expr.Any{pinnedGuard(guardKey(hook), "plexd0")}
+		want = append(want, pinnedChainOpening(hook, "")...)
+		want = append(want, logExprs, rest[0], pinnedSetLookup(familyIPv4, shapePort), pinnedSetLookup(familyIPv6, shapeAddrs), rest[1])
+		assertNftRuleLists(t, entryExprs(got), want)
+
+		n := len(got)
+		wantSets := map[int]ruleSet{
+			n - 3: {family: familyIPv4, shape: shapePort, elems: []nftables.SetElement{setElem(t, ssh), setElem(t, https)}},
+			n - 2: {family: familyIPv6, shape: shapeAddrs, elems: []nftables.SetElement{setElem(t, v6)}},
+		}
+		for i, entry := range got {
+			wantSet, isSet := wantSets[i]
+			switch {
+			case !isSet && entry.set != nil:
+				t.Errorf("hook %d: entry %d holds a set, want none", hook, i)
+			case isSet && (entry.set == nil || !reflect.DeepEqual(*entry.set, wantSet)):
+				t.Errorf("hook %d: entry %d holds set %+v, want %+v", hook, i, entry.set, wantSet)
+			}
+		}
+	}
+}
+
+// A nil and an empty ruleset give an empty list for all three hooks: no
+// guard, no opening and no set.
+func TestChainRuleExprsEmpty(t *testing.T) {
+	for _, rules := range [][]FirewallRule{nil, {}} {
+		for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+			if got := ruleEntries(t, rules, true, hook); len(got) != 0 {
+				t.Errorf("rules %#v, hook %d: %d entries, want none", rules, hook, len(got))
+			}
+		}
+	}
+}
+
+// segmentRules validates every rule before it cuts the list, with or without
+// sets, and a logged rule as well: the error names the rule, behind the
+// prefix of ApplyRules.
+func TestSegmentRulesRejectsInvalidRule(t *testing.T) {
 	want := "policy: nftables: apply rules: policy: firewall rule:"
-	if err == nil || !strings.HasPrefix(err.Error(), want) {
-		t.Fatalf("chainRuleExprs error = %v, want one starting %q", err, want)
+	for _, tc := range []struct {
+		name  string
+		rules []FirewallRule
+	}{
+		{"unlogged", []FirewallRule{
+			{Interface: "wg0", Action: "allow"},
+			{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
+		}},
+		{"logged", []FirewallRule{
+			{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow", LogTag: "1/0"},
+		}},
+	} {
+		for _, sets := range []bool{true, false} {
+			if _, err := segmentRules(tc.rules, sets); err == nil || !strings.HasPrefix(err.Error(), want) {
+				t.Errorf("%s, sets %v: segmentRules error = %v, want one starting %q", tc.name, sets, err, want)
+			}
+		}
 	}
 }
 
@@ -1049,29 +1476,8 @@ func TestChainRuleExprsOut(t *testing.T) {
 
 func TestChainRuleExprsOutEmpty(t *testing.T) {
 	for _, rules := range [][]FirewallRule{nil, {}} {
-		got, err := chainRuleExprs(rules, hookOutput)
-		if err != nil {
-			t.Fatalf("chainRuleExprs(%#v, hookOutput) returned error: %v", rules, err)
-		}
-		if len(got) != 0 {
-			t.Errorf("chainRuleExprs(%#v, hookOutput) returned %d rules, want none", rules, len(got))
-		}
-	}
-}
-
-func TestChainRuleExprsOutRejectsInvalidRule(t *testing.T) {
-	rules := []FirewallRule{
-		{Interface: "wg0", Action: "allow"},
-		{Interface: "wg0", SrcIP: "not-an-ip", Action: "allow"},
-	}
-	_, err := chainRuleExprs(rules, hookOutput)
-	want := "policy: nftables: apply rules: policy: firewall rule:"
-	if err == nil || !strings.HasPrefix(err.Error(), want) {
-		t.Fatalf("chainRuleExprs error = %v, want one starting %q", err, want)
-	}
-	for _, hook := range []chainHook{hookInput, hookForward} {
-		if _, errOther := chainRuleExprs(rules, hook); errOther == nil || errOther.Error() != err.Error() {
-			t.Errorf("chainRuleExprs errors differ by chain: hook %d %v, hookOutput %v", hook, errOther, err)
+		if got := ruleEntries(t, rules, true, hookOutput); len(got) != 0 {
+			t.Errorf("rules %#v, hookOutput: %d entries, want none", rules, len(got))
 		}
 	}
 }
@@ -1151,18 +1557,19 @@ func TestRTTProbeRule(t *testing.T) {
 	}
 }
 
-// An ApplyRules batch writes each of the three lists into its own chain, and
-// every rule it adds gets the per-rule allowance on top of the base.
+// Every rule an ApplyRules batch adds gets the per-rule allowance on top of
+// the base, and every set element the per-element one.
 func TestApplyBufferBytes(t *testing.T) {
 	for _, tc := range []struct {
-		in, fwd, out, want int
+		rules, elements, want int
 	}{
-		{0, 0, 0, netlinkBufferBase},
-		{3, 2, 4, netlinkBufferBase + 9*netlinkBufferPerRule},
-		{1004, 1003, 1006, netlinkBufferBase + 3013*netlinkBufferPerRule},
+		{0, 0, netlinkBufferBase},
+		{9, 0, netlinkBufferBase + 9*netlinkBufferPerRule},
+		{0, 1000, netlinkBufferBase + 1000*netlinkBufferPerElement},
+		{39, 9006, netlinkBufferBase + 39*netlinkBufferPerRule + 9006*netlinkBufferPerElement},
 	} {
-		if got := applyBufferBytes(tc.in, tc.fwd, tc.out); got != tc.want {
-			t.Errorf("applyBufferBytes(%d, %d, %d) = %d, want %d", tc.in, tc.fwd, tc.out, got, tc.want)
+		if got := applyBufferBytes(tc.rules, tc.elements); got != tc.want {
+			t.Errorf("applyBufferBytes(%d, %d) = %d, want %d", tc.rules, tc.elements, got, tc.want)
 		}
 	}
 }
@@ -1369,12 +1776,36 @@ func assertNftRuleLists(t *testing.T, got, want [][]expr.Any) {
 // behind the guard and the chain's opening rules: the connection tracking
 // pair, then the round-trip probe rule in the input list, and the
 // foreign-source, relay probe and round-trip probe rules in the output list.
+// It stays a rule of its own, ahead of the set rule of the unlogged run that
+// follows it.
 func TestChainRuleExprsLogged(t *testing.T) {
+	allow443 := FirewallRule{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 443, Protocol: "tcp", Action: "allow"}
+	logged := nftLoggedRules()
+	rules := []FirewallRule{logged[0], allow443, logged[1]}
 	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
-		got := ruleLists(t, nftLoggedRules(), hook)
+		got := ruleEntries(t, rules, true, hook)
 		want := [][]expr.Any{pinnedGuard(guardKey(hook), "plexd0")}
 		want = append(want, pinnedChainOpening(hook, "")...)
-		assertNftRuleLists(t, got, append(want, pinnedLoggedRules()...))
+		pinned := pinnedLoggedRules()
+		want = append(want, pinned[0], pinned[1], pinnedSetLookup(familyIPv4, shapePort), pinned[2])
+		assertNftRuleLists(t, entryExprs(got), want)
+
+		set := got[len(got)-2].set
+		if set == nil {
+			t.Fatalf("hook %d: the entry behind the logged rule holds no set", hook)
+		}
+		box, _, _, err := boxOf(allow443)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := (ruleSet{family: familyIPv4, shape: shapePort, elems: []nftables.SetElement{box.element(shapePort)}}); !reflect.DeepEqual(*set, want) {
+			t.Errorf("hook %d: set = %+v, want %+v", hook, *set, want)
+		}
+		for i, entry := range got {
+			if entry.set != nil && i != len(got)-2 {
+				t.Errorf("hook %d: entry %d holds a set, want only the one behind the logged rule", hook, i)
+			}
+		}
 	}
 }
 
@@ -1382,7 +1813,7 @@ func TestChainRuleExprsLogged(t *testing.T) {
 // as they are without connection logging.
 func TestChainRuleExprsUntaggedUnchanged(t *testing.T) {
 	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
-		got := ruleLists(t, withoutLogTags(nftLoggedRules()), hook)
+		got := entryExprs(ruleEntries(t, withoutLogTags(nftLoggedRules()), true, hook))
 		want := [][]expr.Any{pinnedGuard(guardKey(hook), "plexd0")}
 		want = append(want, pinnedChainOpening(hook, "")...)
 		assertNftRuleLists(t, got, append(want, pinnedLoggedRules()[1:]...))
@@ -1403,17 +1834,11 @@ func TestLogRuleExprsRejectsInvalidRule(t *testing.T) {
 func assertNoNftLogRules(t *testing.T, rules []FirewallRule) {
 	t.Helper()
 	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
-		got, err := chainRuleExprs(rules, hook)
-		if err != nil {
-			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", hook, err)
-		}
+		got := entryExprs(ruleEntries(t, rules, true, hook))
 		if n := nftLogRuleCount(got); n != 0 {
 			t.Errorf("hook %d: %d log rules, want none", hook, n)
 		}
-		want, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), hook)
-		if err != nil {
-			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", hook, err)
-		}
+		want := entryExprs(ruleEntries(t, withoutLogTags(nftLoggedRules()), true, hook))
 		assertNftRuleLists(t, got, want)
 	}
 }
