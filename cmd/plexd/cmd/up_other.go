@@ -3,7 +3,9 @@
 package cmd
 
 import (
+	"context"
 	"log/slog"
+	"net/netip"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
@@ -99,6 +101,11 @@ const forwardingKnobIsShared = false
 
 // newVPNController returns nil on platforms without an implementation.
 func newVPNController(_ *slog.Logger, _ string, _ *wireguard.MeshRewriter) bridge.VPNController {
+	return nil
+}
+
+// newVPNReaddresser returns nil on platforms without an implementation.
+func newVPNReaddresser(_ bridge.VPNController, _ *bridge.SiteToSiteManager) func(context.Context, netip.Addr) error {
 	return nil
 }
 

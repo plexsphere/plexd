@@ -3,8 +3,10 @@
 package cmd
 
 import (
+	"context"
 	"crypto/ed25519"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 
@@ -134,6 +136,14 @@ const forwardingKnobIsShared = false
 // link does not run through it.
 func newVPNController(logger *slog.Logger, _ string, _ *wireguard.MeshRewriter) bridge.VPNController {
 	return bridge.NewNetlinkVPNController(logger)
+}
+
+// newVPNReaddresser returns nil on Linux: a tunnel link stays unnumbered
+// (newVPNController), and the source rewrite of what a tunnel forwards is a
+// masquerade on the mesh interface, so no site-to-site tunnel holds the mesh
+// address.
+func newVPNReaddresser(_ bridge.VPNController, _ *bridge.SiteToSiteManager) func(context.Context, netip.Addr) error {
+	return nil
 }
 
 // newSessionLauncher returns the launcher ssh sessions start their processes
