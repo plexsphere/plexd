@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -107,6 +108,52 @@ func TestWGVPNController_CreateTunnelInterfaceAddressed(t *testing.T) {
 			t.Errorf("log = %q, want it to contain %q", logged, want)
 		}
 	}
+}
+
+// After SetAddress the next tunnel interface carries the new /32 and the one
+// created before is not addressed again; an empty address leaves the next one
+// unnumbered. SetAddress and CreateTunnelInterface may run at once.
+func TestWGVPNController_SetAddress(t *testing.T) {
+	const moved = "10.0.0.9/32"
+	fake := &fakeWGController{}
+	c := NewWGVPNController(fake, testVPNAddress, discardLogger())
+	key := testPrivateKey(t)
+
+	if err := c.CreateTunnelInterface(testVPNIface, key, testVPNPort); err != nil {
+		t.Fatalf("CreateTunnelInterface(%s) error = %v", testVPNIface, err)
+	}
+	c.SetAddress(moved)
+	if err := c.CreateTunnelInterface("wg-s2s-1", key, testVPNPort+1); err != nil {
+		t.Fatalf("CreateTunnelInterface(wg-s2s-1) error = %v", err)
+	}
+	var got [][]any
+	for _, call := range fake.wgCallsFor("ConfigureAddress") {
+		got = append(got, call.Args)
+	}
+	if want := [][]any{{testVPNIface, testVPNAddress}, {"wg-s2s-1", moved}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ConfigureAddress calls = %v, want %v", got, want)
+	}
+
+	c.SetAddress("")
+	if err := c.CreateTunnelInterface("wg-s2s-2", key, testVPNPort+2); err != nil {
+		t.Fatalf("CreateTunnelInterface(wg-s2s-2) error = %v", err)
+	}
+	if calls := fake.wgCallsFor("ConfigureAddress"); len(calls) != 2 {
+		t.Errorf("ConfigureAddress calls = %d after an empty address, want still 2", len(calls))
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := range 20 {
+			c.SetAddress([]string{testVPNAddress, moved}[i%2])
+		}
+	})
+	for range 20 {
+		if err := c.CreateTunnelInterface("wg-s2s-3", key, testVPNPort+3); err != nil {
+			t.Errorf("CreateTunnelInterface during SetAddress error = %v", err)
+		}
+	}
+	wg.Wait()
 }
 
 // The caller owns the key, so a tunnel interface created again under the same

@@ -1960,6 +1960,108 @@ func TestSiteToSiteManager_SyncSecretInventoryRebuilds(t *testing.T) {
 	requireTunnelUp(t, fx.mgr, s2sID2)
 }
 
+// TestSiteToSiteManager_Rebuild checks that Rebuild stops the wireguard tunnel
+// that is up and brings it up again with its key, leaves the ipsec tunnel that
+// is up and the wireguard tunnel that is down alone, and signals
+// ReportChanged, and that it calls nothing on an inactive manager.
+func TestSiteToSiteManager_Rebuild(t *testing.T) {
+	fx := newS2SFixture(t, nil)
+	hamburg := api.SiteToSiteTunnel{
+		ID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e4", Slug: "branch-hamburg", Kind: api.SiteToSiteKindWireGuard,
+		RemoteHost: "198.51.100.40", RemotePort: 51820, AllowedSubnets: []string{"10.50.0.0/16"},
+		ListenPort: 51831, RemotePublicKey: deviceKey(0x44),
+	}
+	fx.vpn.createErrFor = map[string]error{"wg-s2s-a0a0a0e4": fmt.Errorf("bind: %w", ErrListenPortInUse)}
+	fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin, dcEast, hamburg))
+	requireTunnelUp(t, fx.mgr, s2sID1)
+	requireTunnelUp(t, fx.mgr, s2sID2)
+	requireTunnelDown(t, fx.mgr, hamburg.ID, SiteToSiteReasonBindFailed)
+	attempts := func() int {
+		fx.mgr.mu.Lock()
+		defer fx.mgr.mu.Unlock()
+		for _, tun := range fx.mgr.tunnels {
+			if tun.entry.ID == hamburg.ID {
+				return tun.attempts
+			}
+		}
+		return -1
+	}
+	hamburgAttempts := attempts()
+	key := fx.storedKey(t, s2sID1)
+	fetched := len(fx.secrets.fetches())
+	changed := fx.mgr.ReportChanged()
+	drain(changed)
+	fx.reset()
+
+	fx.mgr.Rebuild(t.Context())
+	requireSignal(t, changed, "a Rebuild")
+	requireNoSignal(t, changed, "a Rebuild, a second time")
+	if got, want := fx.vpn.vpnMethods(), []string{"RemoveTunnelInterface", "CreateTunnelInterface", "ConfigureTunnelPeer"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls = %q, want branch-berlin rebuilt: %q", got, want)
+	}
+	for _, m := range []string{"RemoveTunnelInterface", "CreateTunnelInterface", "ConfigureTunnelPeer"} {
+		if c := fx.vpn.vpnCallsFor(m); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+			t.Errorf("%s calls = %+v, want one on %s", m, c, s2sWGIface)
+		}
+	}
+	if c := fx.vpn.vpnCallsFor("CreateTunnelInterface"); len(c) != 1 || !slices.Equal(c[0].Args[1].([]byte), key) {
+		t.Error("the rebuilt interface has another key")
+	}
+	if got, want := fx.routes.methods(), []string{"RemoveRoute", "RemoveRoute", "EnableForwarding", "AddRoute", "AddRoute"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %q, want %q", got, want)
+	}
+	if got, want := fx.rewriter.methods(), []string{"RemoveMeshSourceRewrite", "AddMeshSourceRewrite"}; !slices.Equal(got, want) {
+		t.Errorf("rewriter calls = %q, want %q", got, want)
+	}
+	if got := fx.ipsec.calls(); len(got) != 0 {
+		t.Errorf("ipsec calls = %q, want dc-east left alone", got)
+	}
+	if got := fx.secrets.fetches()[fetched:]; !slices.Equal(got, []certVersion{{"branch-berlin-psk", 1}}) {
+		t.Errorf("fetches during Rebuild = %v, want branch-berlin's Secret alone", got)
+	}
+	if got := attempts(); got != hamburgAttempts {
+		t.Errorf("branch-hamburg attempts = %d after Rebuild, want %d", got, hamburgAttempts)
+	}
+	requireTunnelUp(t, fx.mgr, s2sID1)
+	requireTunnelUp(t, fx.mgr, s2sID2)
+	requireTunnelDown(t, fx.mgr, hamburg.ID, SiteToSiteReasonBindFailed)
+	if got := logLines(fx.logs, `msg="site-to-site tunnel up"`, "tunnel_id="+s2sID1); got != 2 {
+		t.Errorf("%d up lines for branch-berlin, want 2 (the first and the rebuild):\n%s", got, fx.logs.String())
+	}
+
+	if err := fx.mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	fx.reset()
+	fx.mgr.Rebuild(t.Context())
+	fx.requireNoCalls(t, "a Rebuild of the inactive manager")
+}
+
+// TestSiteToSiteManager_RebuildCarriesTheNewAddress runs Rebuild over a
+// WGVPNController, as plexd up does on macOS: after SetAddress the rebuilt
+// interface carries the new address.
+func TestSiteToSiteManager_RebuildCarriesTheNewAddress(t *testing.T) {
+	wg := &fakeWGController{}
+	vpn := NewWGVPNController(wg, "10.99.0.1/32", discardLogger())
+	fx := newS2SFixture(t, func(d *SiteToSiteDeps) { d.VPN = vpn })
+	fx.mgr.Apply(t.Context(), s2sBlock(branchBerlin))
+	requireTunnelUp(t, fx.mgr, s2sID1)
+
+	vpn.SetAddress("10.99.0.9/32")
+	fx.mgr.Rebuild(t.Context())
+	requireTunnelUp(t, fx.mgr, s2sID1)
+	var got []string
+	for _, c := range wg.wgCallsFor("ConfigureAddress") {
+		got = append(got, fmt.Sprintf("%s %s", c.Args[0], c.Args[1]))
+	}
+	if want := []string{s2sWGIface + " 10.99.0.1/32", s2sWGIface + " 10.99.0.9/32"}; !slices.Equal(got, want) {
+		t.Errorf("ConfigureAddress calls = %q, want %q", got, want)
+	}
+	if c := wg.wgCallsFor("DeleteInterface"); len(c) != 1 || c[0].Args[0] != s2sWGIface {
+		t.Errorf("DeleteInterface calls = %+v, want the old interface removed once", c)
+	}
+}
+
 // TestSiteToSiteManager_RetryDelays checks the delays between the attempts of
 // a tunnel that keeps failing: 5 s doubling to 60 s, and the Retry-After of
 // an API error when that is longer, and that the down line is logged once

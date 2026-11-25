@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/wireguard"
@@ -23,6 +24,9 @@ import (
 type WGVPNController struct {
 	wgOps
 
+	// mu guards address, which SetAddress changes while the site-to-site
+	// manager may create an interface.
+	mu      sync.Mutex
 	address string // CIDR assigned after creation; empty leaves the interface unnumbered
 }
 
@@ -52,9 +56,23 @@ func NewWGVPNController(wg wireguard.WGController, address string, logger *slog.
 
 // CreateTunnelInterface creates a WireGuard interface for a site-to-site
 // tunnel with the given private key and listen port, carrying the address the
-// controller was built with. The key is checked before anything is created.
+// controller was built with or the last SetAddress gave it. The key is checked
+// before anything is created.
 func (c *WGVPNController) CreateTunnelInterface(name string, privateKey []byte, listenPort int) error {
-	return c.create(name, privateKey, listenPort, c.address)
+	c.mu.Lock()
+	address := c.address
+	c.mu.Unlock()
+	return c.create(name, privateKey, listenPort, address)
+}
+
+// SetAddress sets the CIDR every tunnel interface created from now on
+// carries; empty leaves them unnumbered. An interface that exists keeps the
+// address it was created with: on macOS, where the address is the node's mesh
+// IP, SiteToSiteManager.Rebuild creates the tunnels again after a move.
+func (c *WGVPNController) SetAddress(address string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.address = address
 }
 
 // CreateXfrmInterface creates nothing and returns an error wrapping
