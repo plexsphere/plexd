@@ -175,6 +175,32 @@ func (r *MeshRewriter) ResetMeshSourceRewrite() error {
 	return nil
 }
 
+// SetMeshAddress moves every rewrite into meshIface to addr, the address the
+// mesh interface carries since the node was moved, and forgets the flows that
+// were translated to another address. A rewrite reads the address once, when
+// it is added, so without this call it would keep the address the interface
+// no longer holds. An addr that is no IPv4 address changes nothing, since the
+// rules rewrite IPv4 alone.
+func (r *MeshRewriter) SetMeshAddress(meshIface string, addr netip.Addr) {
+	addr = addr.Unmap()
+	if !addr.Is4() {
+		r.logger.Warn("mesh source rewrite kept its address, the new one is no IPv4 address",
+			"component", "bridge",
+			"mesh_iface", meshIface,
+			"mesh_addr", addr.String(),
+		)
+		return
+	}
+	rewrites, flows := r.nat.setMeshAddr(meshIface, addr)
+	r.logger.Debug("mesh source rewrite moved to a new mesh address",
+		"component", "bridge",
+		"mesh_iface", meshIface,
+		"mesh_addr", addr.String(),
+		"rewrites", rewrites,
+		"flows_removed", flows,
+	)
+}
+
 // meshAddress returns the first IPv4 address of the mesh interface.
 func (r *MeshRewriter) meshAddress(iface string) (netip.Addr, error) {
 	prefixes, err := r.ipv4Prefixes(iface)
