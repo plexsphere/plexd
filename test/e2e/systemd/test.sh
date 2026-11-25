@@ -60,7 +60,8 @@
 #     its own, with the pool's first address and a key file that survives a
 #     restart and a killed process, a device that reaches a mesh node only
 #     once the block admits it and arrives there with the bridge's mesh
-#     address, a second provider on the port plexd0 holds reported
+#     address, also after a pull moves that address and moves it back, a
+#     second provider on the port plexd0 holds reported
 #     bind_failed, a tailscale provider whose Secret is fetched once the
 #     inventory lists it and whose missing client is reported, a removed
 #     provider whose interface and key file go, and the opt-out with
@@ -4137,7 +4138,125 @@ esac
 wait_user_access_report device "field-team up with one connected device" \
     '.providers[0] | .id == $id and .health == "up" and .connected_devices == 1' --arg id "${UA_FIELD_ID}"
 
-# 5. A restart keeps the interface's key: the device connects again unchanged.
+# 5. A move of the bridge's mesh address. POST /test/readdress moves the node
+# to 10.99.0.9, and a node_state_updated event makes plexd pull now. plexd
+# replaces the address on plexd0 in place, so the tunnel to the mesh node and
+# the device's provider stay up, and the masquerade on plexd0 gives the
+# device's connections the new address. The mesh node runs no plexd, so its
+# allowed IPs for the bridge follow by hand, as its own pull would move them.
+# The device then reaches the mesh node through the bridge, and the mesh
+# node's listener names 10.99.0.9 as the peer. The move back to 10.99.0.1,
+# with the allowed IPs, leaves the bridge as the steps after this one and the
+# site-to-site phase expect it, and the listener names 10.99.0.1 again.
+#
+# ua_plexd0_inet leaves the IPv4 addresses plexd0 holds in UA_INET, as
+# <address>/<length> words joined by blanks, and what ip printed in
+# UA_INET_OUT. read -a splits the output into words without globbing them.
+ua_plexd0_inet() {
+    local -a words
+    local i
+    UA_INET=""
+    UA_INET_OUT=$(bridge_netns ip -4 -o address show dev plexd0 2>&1) \
+        || fail "[readdress] ip -4 -o address show dev plexd0 failed: ${UA_INET_OUT}"
+    read -r -d '' -a words <<< "${UA_INET_OUT}" || true
+    for ((i = 0; i + 1 < ${#words[@]}; i++)); do
+        if [ "${words[i]}" = inet ]; then
+            UA_INET="${UA_INET:+${UA_INET} }${words[i + 1]}"
+        fi
+    done
+}
+
+# ua_readdress <tag> <from> <to> moves the bridge from one mesh address to the
+# other. POST /test/readdress must answer 200 with mesh_ip <to> and
+# previous_mesh_ip <from>, and a node_state_updated event makes plexd pull
+# now. Within 60s the running plexd must log "mesh address changed from state
+# pull" with previous_mesh_ip=<from> and mesh_ip=<to>, and plexd0 must hold
+# <to>/24 alone. The mesh node's allowed IPs for the bridge then move to
+# <to>/32.
+ua_readdress() {
+    local tag=$1 from=$2 to=$3 pid answer status body rc=0 ok features logged start out
+    pid=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd 2>&1) \
+        || fail "[${tag}] systemctl show -p MainPID plexd failed: ${pid}"
+    answer=$(curl -s -w '\n%{http_code}' -X POST -H "Content-Type: application/json" \
+        -d "{\"mesh_ip\":\"${to}\"}" \
+        "http://localhost:18080/test/readdress" 2>&1) || rc=$?
+    status=${answer##*$'\n'}
+    body=${answer%$'\n'*}
+    if [ "${rc}" -ne 0 ] || [ "${status}" != "200" ]; then
+        features=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null | jq -c '.features' 2>&1 || true)
+        fail "[${tag}] POST /test/readdress {\"mesh_ip\":\"${to}\"} answered status ${status} with '${body}' (curl exited ${rc}), want 200; the last heartbeat the mock captured declares the features '${features}'"
+    fi
+    ok=$(printf '%s' "${body}" | jq -r --arg from "${from}" --arg to "${to}" '.mesh_ip == $to and .previous_mesh_ip == $from' 2>&1) \
+        || fail "[${tag}] jq could not read the answer '${body}' of POST /test/readdress: ${ok}"
+    if [ "${ok}" != true ]; then
+        fail "[${tag}] POST /test/readdress answered '${body}', want mesh_ip ${to} and previous_mesh_ip ${from}"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-readdress-nudge-${tag// /-}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] readdress nudge injection returned status ${status}, want 204"
+    fi
+    start=${SECONDS}
+    while :; do
+        ua_journal
+        logged=no
+        if journal_has "${UA_JOURNAL}" "plexd[${pid}]:" 'msg="mesh address changed from state pull"' "previous_mesh_ip=${from}" " mesh_ip=${to}"; then
+            logged=yes
+        fi
+        ua_plexd0_inet
+        if [ "${logged}" = yes ] && [ "${UA_INET}" = "${to}/24" ]; then
+            break
+        fi
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            fail "[${tag}] 60s after the nudge, plexd[${pid}] logged 'mesh address changed from state pull' with previous_mesh_ip=${from} mesh_ip=${to}: ${logged}, and plexd0 holds the IPv4 addresses '${UA_INET}', want ${to}/24 alone (ip printed: ${UA_INET_OUT})"
+        fi
+        sleep 2
+    done
+    echo "  PASS: [${tag}] plexd[${pid}] logged 'mesh address changed from state pull' with previous_mesh_ip=${from} mesh_ip=${to}, and plexd0 holds ${to}/24 alone"
+    out=$(docker exec "${UA_MESHNODE_CONTAINER}" wg set wg0 peer "${UA_PLEXD_PUBKEY}" allowed-ips "${to}/32" 2>&1) \
+        || fail "[${tag}] moving the allowed IPs of the bridge's peer on the mesh node's wg0 to ${to}/32 failed: ${out}"
+    echo "  the mesh node's allowed IPs for the bridge name ${to}/32"
+}
+
+# ua_listener_names <tag> <address> empties the mesh node's listener log,
+# waits for the device's probe to get through the bridge, and then for up to
+# 30s for the log to record a connection. The log must name the address as
+# the peer and no address of the device's pool.
+ua_listener_names() {
+    local tag=$1 addr=$2 start out
+    out=$(docker exec "${UA_MESHNODE_CONTAINER}" sh -c ': > /tmp/listen.log' 2>&1) \
+        || fail "[${tag}] could not empty the listener log of ${UA_MESHNODE_CONTAINER}: ${out}"
+    ua_wait_probe "${tag}"
+    start=${SECONDS}
+    while :; do
+        UA_LISTEN=$(docker exec "${UA_MESHNODE_CONTAINER}" cat /tmp/listen.log 2>&1) \
+            || fail "[${tag}] reading the mesh node's listener log failed: ${UA_LISTEN}"
+        case "${UA_LISTEN}" in
+            *"Connection received on "*) break ;;
+        esac
+        if [ $((SECONDS - start)) -ge 30 ]; then
+            fail "[${tag}] the mesh node's listener logged no connection within 30s of the probe: '${UA_LISTEN}'"
+        fi
+        sleep 2
+    done
+    case "${UA_LISTEN}" in
+        *"Connection received on ${addr} "*) ;;
+        *) fail "[${tag}] the mesh node's listener logged '${UA_LISTEN}', want a connection from ${addr}, the bridge's mesh address" ;;
+    esac
+    case "${UA_LISTEN}" in
+        *10.77.0.*) fail "[${tag}] the mesh node's listener logged '${UA_LISTEN}', which names the device's own address" ;;
+    esac
+    echo "  PASS: [${tag}] the mesh node's listener names the bridge's mesh address ${addr} as the peer"
+}
+
+ua_readdress readdress 10.99.0.1 10.99.0.9
+ua_listener_names readdress 10.99.0.9
+ua_readdress "readdress back" 10.99.0.9 10.99.0.1
+ua_listener_names "readdress back" 10.99.0.1
+
+# 6. A restart keeps the interface's key: the device connects again unchanged.
 docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
 UA_RESTART_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd)
 UA_START=${SECONDS}
@@ -4157,7 +4276,7 @@ wait_user_access_report restart "field-team up with the key of step 2" \
     --arg id "${UA_FIELD_ID}" --arg key "${UA_PUBKEY}"
 ua_wait_probe restart
 
-# 6. A killed process leaves its interface in the kernel. The process the unit
+# 7. A killed process leaves its interface in the kernel. The process the unit
 # starts next removes it and brings the provider up again with the same key.
 # The signal goes to the main process alone: in this container systemd cannot
 # signal the unit's other processes and would fail the command. systemd
@@ -4208,7 +4327,7 @@ wait_user_access_report kill "field-team up with the key of step 2" \
     --arg id "${UA_FIELD_ID}" --arg key "${UA_PUBKEY}"
 ua_wait_probe kill
 
-# 7. A second wireguard provider on the port plexd0 holds cannot bind, and
+# 8. A second wireguard provider on the port plexd0 holds cannot bind, and
 # field-team keeps serving.
 UA_CLASH=$(ua_provider "${UA_CLASH_ID}" clash 51820)
 UA_FIELD=$(ua_provider "${UA_FIELD_ID}" field-team 51900 "${UA_DEVICES}")
@@ -4220,7 +4339,7 @@ wait_user_access_report clash "clash down with bind_failed and field-team up" \
     --arg clash "${UA_CLASH_ID}" --arg field "${UA_FIELD_ID}"
 ua_wait_probe clash
 
-# 8. A tailscale provider whose Secret the inventory does not list is down
+# 9. A tailscale provider whose Secret the inventory does not list is down
 # with auth_secret_not_listed. Once the inventory lists it, the bridge fetches
 # it and starts the client, which the image does not carry: client_missing.
 UA_TS=$(jq -cn --arg id "${UA_TS_ID}" '{id: $id, slug: "tailnet", kind: "tailscale", auth_secret_name: "ts-join"}')
@@ -4239,7 +4358,7 @@ UA_REPORT_WAIT=90 wait_user_access_report tailnet-listed "tailnet down with clie
     '.providers[] | select(.id == $id) | .health == "down" and .reason == "client_missing"' \
     --arg id "${UA_TS_ID}"
 
-# 9. Removed from the block, field-team loses its interface and its key file,
+# 10. Removed from the block, field-team loses its interface and its key file,
 # and the device no longer reaches the mesh node.
 configure_user_access remove "[${UA_CLASH}, ${UA_TS}]" '[{"name": "ts-join", "version": 1}]'
 wait_user_access_report remove "no entry for field-team" \
@@ -4261,7 +4380,7 @@ if ua_probe; then
 fi
 echo "  PASS: [remove] the device no longer reaches 10.99.0.3:7101"
 
-# 10. bridge.user_access_enabled: false opts the bridge out. The restarted
+# 11. bridge.user_access_enabled: false opts the bridge out. The restarted
 # process serves no provider, removes the interfaces the last one left, keeps
 # their keys, reports opted_out and names the ignored local key.
 configure_user_access kept "[${UA_CLASH}, ${UA_TS}, $(ua_provider "${UA_KEPT_ID}" kept 51901)]" '[{"name": "ts-join", "version": 1}]'
