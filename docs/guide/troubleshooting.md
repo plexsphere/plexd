@@ -190,6 +190,8 @@ The control plane can move a node to another mesh address, and does so only whil
 
 A move ends the tcp sessions that listened on the old address, which report `terminated_by: plexd_close`; their operators open new ones. ssh sessions stay.
 
+A moved node on Linux whose mesh names, its own and its peers', stopped resolving through systemd-resolved while `resolvectl status plexd0` names the new server is covered under [A mesh name does not resolve](#a-mesh-name-does-not-resolve).
+
 Common causes: a step of the move failed, the interface cannot change its address while plexd runs, the write to `identity.json` failed, or the pull named an address plexd does not apply.
 
 - `mesh address not applied; retrying on the next pull` with `step`, `mesh_ip` and `error` names a step of the move that failed. It comes at Error the first time for an address and at Debug while the step keeps failing. plexd calls the failed step again on every pull, so once its cause is gone the next pull completes the move without a restart.
@@ -212,6 +214,8 @@ plexd logs | grep -E 'mesh dns|component=meshdns|dns block|PLEXD_DNS_ENABLED|con
 ```
 
 On Linux, plexd answers the mesh names of its Domain on the Node's own mesh IP, port 5354 by default, and registers the Domain's zones with systemd-resolved on the mesh interface (`wireguard.interface_name`, `plexd0` by default). `resolvectl status plexd0` should list the server `<mesh IP>:5354`, the search domain, each routing domain with a leading `~` (every other zone that no zone above it covers, every reverse zone, and every forward zone of the Node's forwarding setting), and `-DefaultRoute`. With a catch-all it shows `+DefaultRoute` instead, and the domains end in `~.`. A link without that server has no registration. `resolvectl query` names the link an answer came from, so a mesh name answered through the mesh interface shows `plexd0`. A bare host name resolves through the search domain, and a mesh IP resolves to its name when the Domain's reverse zones cover it.
+
+`resolvectl status plexd0` should also read `Current Scopes: DNS`. `Current Scopes: none` beside the listed server means systemd-resolved holds no address or no carrier for the link, so it sends the mesh names to its other servers, which answer `not found`. On plexd v0.40.0 this follows every move of the node to another mesh address: the move ends with the delete of a `/32` of the new address, which systemd-resolved takes as the removal of the address (see [Replacing the address on each platform](../reference/networking/wireguard.md#replacing-the-address-on-each-platform)). `systemctl restart plexd` brings the scope back, and so does `ip addr change <mesh IP>/<prefix length> dev plexd0`, run as root, without a restart. A release after v0.40.0 keeps the scope across a move.
 
 plexd also answers the records the Domain and its Projects define. `resolvectl query` asks for addresses unless `--type` names another type, such as `--type=SRV`, `--type=MX` or `--type=TXT`. With `--type` it prints each record as `<name> IN <type> <data>`, followed by `-- link: plexd0`. A name that exists without a record of the type prints `does not have any RR of the requested type`. A CNAME whose target lies outside the mesh zones is answered as the CNAME alone, for the system resolver to follow. systemd-resolved follows it through its other servers, so `resolvectl query` shows the address without the link `plexd0`, and the target in parentheses. See [Answer Table](../reference/networking/mesh-dns.md#answer-table).
 
