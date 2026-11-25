@@ -14,12 +14,14 @@ import (
 // the reconcile loop writes. Reachability is the node's own health projection,
 // not desired state, so it is never stored. Neither is the signing key: a
 // dispatch handler installs it on every pull, and there is nothing for the
-// differ to converge on. Nor is the secret inventory: the node API's dispatch
-// handler hands it to the secret index on every pull. Nor are the mesh DNS
-// names of the dns block: the mesh resolver's dispatch handler takes them on
-// every pull. Nor is the failure-detection time: the WireGuard manager's
-// dispatch handler takes it on every pull. Nor are the executions, sessions
-// and hooks blocks: their dispatch handlers take them on every pull.
+// differ to converge on. Nor is the mesh address: like the signing key, a
+// dispatch handler applies mesh_ip on every pull, so a step that failed is
+// tried again on the next one. Nor is the secret inventory: the node API's
+// dispatch handler hands it to the secret index on every pull. Nor are the
+// mesh DNS names of the dns block: the mesh resolver's dispatch handler takes
+// them on every pull. Nor is the failure-detection time: the WireGuard
+// manager's dispatch handler takes it on every pull. Nor are the executions,
+// sessions and hooks blocks: their dispatch handlers take them on every pull.
 type stateSnapshot struct {
 	mu            sync.RWMutex
 	peers         []api.SnapshotPeer
@@ -37,7 +39,8 @@ func NewStateSnapshot() *stateSnapshot {
 
 // Get returns a deep copy of the current snapshot as an api.NodeStateSnapshot.
 // It carries the stored Peers, Policy, Bridge, State, Reports and
-// SharedSubnets; every other block is not stored, so it is always nil.
+// SharedSubnets; every other block is not stored, so it is always nil, and
+// MeshIP is always empty.
 func (s *stateSnapshot) Get() api.NodeStateSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
