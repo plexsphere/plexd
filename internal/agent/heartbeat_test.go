@@ -330,6 +330,59 @@ func TestHeartbeatService_ClockSkew(t *testing.T) {
 	}
 }
 
+// TestHeartbeatService_RejectedAsMalformed answers heartbeats with 400
+// malformed_heartbeat_request, as a control plane that predates the features
+// member does. A heartbeat that carried features names that cause and the next
+// one carries the features again; one without features is an ordinary failed
+// send.
+func TestHeartbeatService_RejectedAsMalformed(t *testing.T) {
+	malformed := &api.APIError{StatusCode: 400, Code: "malformed_heartbeat_request", Message: "heartbeat body is malformed"}
+	tests := []struct {
+		name     string
+		features []string
+		wantMsg  string
+		notMsg   string
+	}{
+		{name: "with features", features: []string{api.FeatureMeshReaddress}, wantMsg: heartbeatMalformedMsg, notMsg: heartbeatSendFailedMsg},
+		{name: "without features", wantMsg: heartbeatSendFailedMsg, notMsg: heartbeatMalformedMsg},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockHeartbeatClient{errors: []error{malformed}}
+			logger, logs := newDebugLogger()
+			svc := NewHeartbeatService(HeartbeatConfig{NodeID: "node-1", Interval: time.Hour}, client, logger)
+			svc.SetBuildRequest(func() api.HeartbeatRequest {
+				return api.HeartbeatRequest{NATSummary: map[string]any{}, Features: tt.features}
+			})
+			ctx := context.Background()
+
+			svc.sendHeartbeat(ctx)
+
+			line := logLine(t, logs.String(), tt.wantMsg)
+			for _, want := range []string{"level=ERROR", `error="api: HTTP 400 (malformed_heartbeat_request): heartbeat body is malformed"`} {
+				if !strings.Contains(line, want) {
+					t.Errorf("failure record = %q, want it to contain %q", line, want)
+				}
+			}
+			if strings.Contains(logs.String(), `msg="`+tt.notMsg+`"`) {
+				t.Errorf("logs hold %q, want only %q:\n%s", tt.notMsg, tt.wantMsg, logs.String())
+			}
+
+			// No fallback: the next heartbeat is built and sent unchanged.
+			svc.sendHeartbeat(ctx)
+			reqs := client.getRequests()
+			if len(reqs) != 2 {
+				t.Fatalf("heartbeat calls = %d, want 2", len(reqs))
+			}
+			for i, req := range reqs {
+				if !slices.Equal(req.Features, tt.features) {
+					t.Errorf("heartbeat %d features = %v, want %v", i+1, req.Features, tt.features)
+				}
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Credential refusal tests
 // ---------------------------------------------------------------------------
@@ -341,6 +394,7 @@ const (
 	heartbeatResumedMsg      = "agent: heartbeat: node credential accepted again, control-plane calls resumed"
 	heartbeatClockSkewMsg    = "agent: heartbeat: rejected for clock skew, synchronize the system clock via NTP"
 	heartbeatSendFailedMsg   = "agent: heartbeat: send failed"
+	heartbeatMalformedMsg    = "agent: heartbeat: rejected as malformed, a control plane that predates the features member refuses it; upgrade the control plane"
 )
 
 // credentialCallback records every call of the credential-refused callback.
