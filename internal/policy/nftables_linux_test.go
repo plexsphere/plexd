@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1927,6 +1928,120 @@ func TestNftablesController_LoggingWithoutSink(t *testing.T) {
 	})
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("logged %q, want no Warn line", buf.String())
+	}
+}
+
+// recordingWrite stands in for writeChains: it records whether the lists of
+// each write held a set and answers with what fail returns for that.
+type recordingWrite struct {
+	held []bool
+	fail func(held bool) error
+}
+
+func (w *recordingWrite) write(_ string, lists [3][]chainEntry) error {
+	held := false
+	for _, list := range lists {
+		held = held || slices.ContainsFunc(list, func(e chainEntry) bool { return e.set != nil })
+	}
+	w.held = append(w.held, held)
+	return w.fail(held)
+}
+
+// setsRuleset is an allow that names addresses and the default deny on
+// plexd0: its lists hold a set.
+func setsRuleset() []FirewallRule {
+	return []FirewallRule{
+		{Interface: "plexd0", SrcIP: "10.99.0.0/24", DstIP: "10.99.0.1/32", Port: 7001, Protocol: "tcp", Action: "allow"},
+		{Interface: "plexd0", Action: "deny"},
+	}
+}
+
+// A kernel that refuses the sets gets the list: ApplyRules writes again
+// without a set, succeeds, says so once with the first error, and writes the
+// list alone from then on.
+func TestNftablesController_SetsUnavailable(t *testing.T) {
+	var buf bytes.Buffer
+	ctrl := NewNftablesController(captureLogger(&buf))
+	w := &recordingWrite{fail: func(held bool) error {
+		if held {
+			return unix.EOPNOTSUPP
+		}
+		return nil
+	}}
+	ctrl.write = w.write
+
+	if err := ctrl.ApplyRules("plexd-mesh", setsRuleset()); err != nil {
+		t.Fatalf("ApplyRules() error = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(w.held, []bool{true, false}) {
+		t.Errorf("writes held sets %v, want [true false]: the sets, then the list", w.held)
+	}
+	out := buf.String()
+	if n := strings.Count(out, ruleSetsUnavailable); n != 1 {
+		t.Errorf("logged %q %d times, want once:\n%s", ruleSetsUnavailable, n, out)
+	}
+	for _, want := range []string{
+		"level=WARN",
+		`msg="policy rule sets unavailable, rules are installed as a list"`,
+		"component=policy",
+		"chain=plexd-mesh",
+		`error="operation not supported"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log %q lacks %q", out, want)
+		}
+	}
+
+	t.Log("the next apply writes the list once, and logs no second Warn line")
+	buf.Reset()
+	if err := ctrl.ApplyRules("plexd-mesh", setsRuleset()); err != nil {
+		t.Fatalf("second ApplyRules() error = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(w.held, []bool{true, false, false}) {
+		t.Errorf("writes held sets %v, want [true false false]", w.held)
+	}
+	if strings.Contains(buf.String(), ruleSetsUnavailable) {
+		t.Errorf("second apply logged %q:\n%s", ruleSetsUnavailable, buf.String())
+	}
+}
+
+// When the list fails as well, ApplyRules returns the list's error, logs no
+// Warn line, and the next apply tries the sets again.
+func TestNftablesController_SetsAndListFail(t *testing.T) {
+	var buf bytes.Buffer
+	ctrl := NewNftablesController(captureLogger(&buf))
+	w := &recordingWrite{fail: func(bool) error { return unix.EPERM }}
+	ctrl.write = w.write
+
+	if err := ctrl.ApplyRules("plexd-mesh", setsRuleset()); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("ApplyRules() error = %v, want one wrapping EPERM", err)
+	}
+	if !reflect.DeepEqual(w.held, []bool{true, false}) {
+		t.Errorf("writes held sets %v, want [true false]: the sets, then the list", w.held)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("logged %q, want no Warn line", buf.String())
+	}
+
+	if err := ctrl.ApplyRules("plexd-mesh", setsRuleset()); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("second ApplyRules() error = %v, want one wrapping EPERM", err)
+	}
+	if !reflect.DeepEqual(w.held, []bool{true, false, true, false}) {
+		t.Errorf("writes held sets %v, want [true false true false]: the next apply tries the sets again", w.held)
+	}
+}
+
+// A failed write of lists without a set is not retried.
+func TestNftablesController_ListWriteNotRetried(t *testing.T) {
+	ctrl := NewNftablesController(discardLoggerNft())
+	w := &recordingWrite{fail: func(bool) error { return unix.EPERM }}
+	ctrl.write = w.write
+
+	if err := ctrl.ApplyRules("plexd-mesh", []FirewallRule{{Interface: "plexd0", Action: "deny"}}); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("ApplyRules() error = %v, want one wrapping EPERM", err)
+	}
+	if !reflect.DeepEqual(w.held, []bool{false}) {
+		t.Errorf("writes held sets %v, want one write without a set", w.held)
 	}
 }
 
