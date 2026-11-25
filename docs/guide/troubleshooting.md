@@ -68,6 +68,22 @@ To enrol the machine again:
 
 A fault on the control plane side refuses the credential the same way and parks the agent with the same line. The agent keeps probing with the heartbeat, after 1, 3, 7, 15, 31 and 63 minutes at the default interval and hourly after that, and resumes on its own on the next accepted probe. It then logs `agent: heartbeat: node credential accepted again, control-plane calls resumed`. If the Node still exists on the control plane, wait for that probe instead of enrolling again.
 
+## Every heartbeat refused after an agent upgrade
+
+```bash
+plexd logs | grep 'agent: heartbeat'   # The heartbeat's lines
+```
+
+A plexd release after v0.39.0 declares on its heartbeat what the node can do, in the member `features`. A control plane that predates the member decodes the heartbeat with unknown fields refused and answers every heartbeat that carries it with `400 malformed_heartbeat_request`. plexd logs one Error line per heartbeat:
+
+```
+agent: heartbeat: rejected as malformed, a control plane that predates the features member refuses it; upgrade the control plane
+```
+
+Its `error` starts with `api: HTTP 400 (malformed_heartbeat_request):`. The control plane records none of these heartbeats, so it shows the node as `unreachable` and then `offline` (see [Heartbeat Protocol](agent-lifecycle.md#heartbeat-protocol)), and the node receives no `reconcile` or `rotate_keys` hint from it. The refusal does not count toward the [credential park](#node-removed-from-the-control-plane), and plexd sends the next heartbeat unchanged.
+
+plexd has no fallback: it does not detect such a control plane and does not leave the member off for it. Upgrade the control plane first, then the agents. Only a node that declares a feature is refused. plexd declares `mesh_readdress` when the node can follow a move to another mesh address: its WireGuard interface came up with the Domain mesh CIDR and its controller can replace an address. A node that declares nothing sends no `features` and is accepted. The same code on a heartbeat without the member logs `agent: heartbeat: send failed` instead, and points at another cause. No plexd release through v0.39.0 sends the member, so rolling the agent back to one also ends the refusals: it keeps the mesh address its `identity.json` holds and is not moved again. See [Upgrade order](../reference/core/heartbeat-service.md#upgrade-order).
+
 ## No peers connected
 
 ```bash
@@ -162,6 +178,29 @@ Common causes: no bridge of the entry is alive, the move's write failed, the bri
 
 A restarted plexd starts every shared subnet on the first bridge of its entry again, since the holder lives in memory only, and moves it on once that bridge's window passes without an answer while a standby answers.
 
+## A moved node does not follow its new mesh address
+
+```bash
+plexd logs | grep 'mesh address'                     # The moves and the steps that failed
+ip -4 addr show plexd0                               # Linux: the address the mesh interface holds
+sudo grep '"mesh_ip"' /var/lib/plexd/identity.json   # Linux: the address a restart starts from
+```
+
+The control plane can move a node to another mesh address, and does so only while the node's latest heartbeat declared `mesh_readdress`. Every state pull carries the address as `mesh_ip`, so the node follows a move with its next pull, at most one reconcile interval (60 s by default) later. Its peers learn the address with their own pulls, and a pair has no connectivity until both sides have pulled. plexd replaces the address on the mesh interface in place and logs `wireguard: mesh address replaced` with `interface`, `previous_mesh_ip` and `mesh_ip`, then `mesh address changed from state pull` with `previous_mesh_ip` and `mesh_ip`. The parts that hold the address follow, and plexd writes the address to `identity.json`. A restart logs `existing identity loaded` with the `mesh_ip` it starts from. See [Mesh Address Changes](agent-lifecycle.md#mesh-address-changes).
+
+A move ends the tcp sessions that listened on the old address, which report `terminated_by: plexd_close`; their operators open new ones. ssh sessions stay.
+
+Common causes: a step of the move failed, the interface cannot change its address while plexd runs, the write to `identity.json` failed, or the pull named an address plexd does not apply.
+
+- `mesh address not applied; retrying on the next pull` with `step`, `mesh_ip` and `error` names a step of the move that failed. It comes at Error the first time for an address and at Debug while the step keeps failing. plexd calls the failed step again on every pull, so once its cause is gone the next pull completes the move without a restart.
+- With `step=interface` the replace on the mesh interface failed, and the `error` starts with `wireguard: readdress:`. plexd keeps using the old address, moves no other part and writes nothing to `identity.json`. The next pull repeats the replace with the same two addresses, which also completes a replace that stopped halfway.
+- With `step=mesh-dns` the resolver could not move its listener to the new address, and the `error` starts with `meshdns: rebind <address>:<port>:`. This happens on Linux only: on macOS and Windows the resolver listens on `127.0.0.1` and does not move. The resolver keeps its sockets on the old address, and its registration with systemd-resolved keeps naming that address, which the interface no longer holds. An `error` that ends in `bind: address already in use` means another program holds the resolver's port (`dns.listen_port`, 5354 by default) on the new address or on the wildcard address; free the port. A failed `mesh-dns` step does not stop the steps after it, and plexd writes the address to `identity.json` once the interface took it, whatever a later step does.
+- The steps `sessions`, `site-to-site` and `mesh-rewriter` report no error, so the line names only `step=interface` or `step=mesh-dns`. `sessions` ends the tcp sessions on the old address, and new ones listen on the new address. `site-to-site` builds the site-to-site tunnels of a macOS bridge again with the new address. `mesh-rewriter` moves the in-process source rewrite of a Windows bridge to it.
+- `mesh address cannot be applied while plexd runs; restart plexd to use it` at Error, once per address, means the pull carried a new address while the interface cannot change its address in place: the WireGuard interface did not come up (`wireguard setup failed, continuing without WireGuard` at start), its controller cannot replace an address, or it carries a host `/32` because the identity holds no usable Domain mesh CIDR. Such a node declares no `mesh_readdress`, so the control plane moved it while the latest heartbeat came from an earlier run of plexd that declared the feature. plexd writes the new address to `identity.json` and keeps the old one on the interface and in every other part, so peers that pulled the move cannot reach the node. Restart plexd, which brings the interface up with the address `identity.json` holds. When the interface did not come up, first remove the cause that the setup line's `error` names.
+- `mesh address not persisted; retrying on the next pull` at Warn means the write to `identity.json` failed. Its `error` starts with `registration: commit mesh ip:`, and plexd writes again on every pull. The node runs on the new address, or, when plexd also logged `mesh address cannot be applied while plexd runs` for the address, still on the old one. A restart before a write succeeds starts from the old address in both cases. A node that ran on the new address moves again with the first pull after the restart. For a node that could not apply the address, remove the cause of the failed write and check that `identity.json` holds the new address before you restart plexd.
+- `mesh address from state pull refused` at Warn, with `mesh_ip` and `error`, once per address, means plexd applies nothing of the pulled address and writes nothing: it is no IP address, or an unspecified, loopback or multicast one, or the interface refused it as IPv6, link-local or outside its mesh prefix. A node moves only inside the prefix its interface came up with, the Domain mesh CIDR of its registration.
+- No `mesh address changed from state pull` line after a move means the node did not see it yet, or the control plane sends no `mesh_ip`: one that predates the member never moves a node. With `PLEXD_LOG_LEVEL=debug`, plexd logs `state pull carried no mesh_ip; keeping the address` on every pull without the member.
+
 ## A mesh name does not resolve
 
 ```bash
@@ -251,4 +290,4 @@ plexd status   # Verify heartbeat is being sent
 plexd logs | grep heartbeat
 ```
 
-If plexd is running but the control plane shows the node as `unreachable`, the heartbeat POST may be failing. Common causes: DNS resolution failure for the control plane API, expired TLS certificate on an intermediate proxy, or network partition. Check that `PLEXD_API` is reachable with `curl -s -o /dev/null -w "%{http_code}" $PLEXD_API/health`.
+If plexd is running but the control plane shows the node as `unreachable`, the heartbeat POST may be failing. Common causes: DNS resolution failure for the control plane API, expired TLS certificate on an intermediate proxy, or network partition. Check that `PLEXD_API` is reachable with `curl -s -o /dev/null -w "%{http_code}" $PLEXD_API/health`. A control plane that predates the heartbeat's `features` member refuses every heartbeat that carries it; see [Every heartbeat refused after an agent upgrade](#every-heartbeat-refused-after-an-agent-upgrade).

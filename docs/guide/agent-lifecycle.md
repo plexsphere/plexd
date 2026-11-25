@@ -28,11 +28,12 @@ Heartbeat payload:
   "client_now": "2026-07-19T19:32:35Z",
   "binary_checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "binary_version": "1.2.3",
-  "nat_summary": { "endpoint": "203.0.113.10:51820", "nat_type": "full_cone" }
+  "nat_summary": { "endpoint": "203.0.113.10:51820", "nat_type": "full_cone" },
+  "features": ["mesh_readdress"]
 }
 ```
 
-`nat_summary` is always a JSON object — `{}` before NAT discovery has a result. The control plane responds with `accepted_at` (its receive time, used to estimate clock skew) plus the directive flags below:
+`nat_summary` is always a JSON object — `{}` before NAT discovery has a result. `features` names what the node declares it can do. Its one name today is `mesh_readdress`, which plexd sends when it can follow a move to another mesh address while it runs: the WireGuard interface came up with the Domain mesh CIDR, and its controller can replace an address (see [Mesh Address Changes](#mesh-address-changes)). The list is fixed for the run, and a node that declares nothing leaves the member off. A control plane that predates the member refuses every heartbeat that carries it, and plexd has no fallback, so upgrade the control plane before the agents. The control plane responds with `accepted_at` (its receive time, used to estimate clock skew) plus the directive flags below:
 
 | Response | Meaning |
 |---|---|
@@ -40,6 +41,7 @@ Heartbeat payload:
 | `200 OK` + `{ "reconcile": true }` | Trigger immediate reconciliation (out-of-band hint) |
 | `200 OK` + `{ "rotate_keys": true }` | Trigger the mesh-key rotation flow: generate, stage, submit, swap (redundant with SSE, serves as fallback) |
 | `400 Bad Request` + `{ "code": "clock_skew" }` | `client_now` drifted more than 60s from the control plane; sync the system clock via NTP |
+| `400 Bad Request` + `{ "code": "malformed_heartbeat_request" }` | The control plane cannot read the heartbeat. One that predates `features` answers this to every heartbeat that carries the member, so it records none of them; upgrade the control plane (see [Troubleshooting](/guide/troubleshooting#every-heartbeat-refused-after-an-agent-upgrade)) |
 | `401 Unauthorized` + `{ "code": "nsk_invalid" }` (or `nsk_revoked`, `unauthorized`) | The node's credential is refused. Three refused heartbeats with no accepted one between them park the agent: it stops calling the control plane and keeps probing with the heartbeat (see [Credential Park](../reference/core/heartbeat-service.md#credential-park)) |
 
 If a node misses **3 consecutive heartbeats** (i.e. no heartbeat received for `3 x heartbeat.interval`), the control plane marks the node as `unreachable` and notifies peer nodes. After **10 consecutive missed heartbeats**, the node is marked `offline` and its peers remove it from their active tunnel configuration. The node re-establishes tunnels automatically when it comes back online and resumes heartbeats.
@@ -117,13 +119,21 @@ Rollback is a new `service.upgrade` action pointing to a previous version (a ver
 
 ### Mesh IP Allocation
 
-Each node receives a unique mesh IP from the `10.100.0.0/16` range during registration. IPs are assigned by the control plane and are stable for the lifetime of the node's registration.
+Each node receives a unique mesh IP from the `10.100.0.0/16` range during registration. IPs are assigned by the control plane, which may later move a node to another address (see [Mesh Address Changes](#mesh-address-changes)).
 
 - **Format:** `10.100.x.y/32` (single host address per node)
 - **Uniqueness:** Guaranteed by the control plane within a tenant
-- **Persistence:** The mesh IP is stored in `data_dir` and reused across restarts
+- **Persistence:** The mesh IP is stored in `identity.json` in `data_dir` and reused across restarts. An address the node was moved to replaces it there
 - **Decommission:** When a node is removed from the platform (operator-driven), its mesh IP is returned to the pool after a cooldown period (to avoid conflicts with cached peer configurations on other nodes)
 - **Bridge nodes:** Typically assigned from a reserved range (e.g. `10.100.255.x`) by convention, but this is a control plane policy, not enforced by plexd
+
+### Mesh Address Changes
+
+The control plane may move a node to another mesh address, for example when a Domain admin moves it into an Area that has an address range. Every state pull carries the node's address as `mesh_ip`, and the node follows a changed value with its next pull, at most one reconcile interval later (60s by default). No event announces a move. The node's peers learn the new address with their own pulls, and until both sides of a pair have pulled, the pair has no connectivity.
+
+plexd replaces the address on the mesh interface in place, so the interface, its peers and their tunnels stay up. The parts of plexd that hold the address follow it: the mesh DNS resolver on Linux, the listeners of new tcp sessions, the round-trip probe, the dial policy of public ingress, and on a bridge the site-to-site tunnels on macOS, which plexd builds again with the new address, and the in-process source rewrite on Windows. Only what was bound to the old address ends. A tcp session ends with `terminated_by: plexd_close` and its operator opens a new one, while an ssh session stays. plexd writes the new address to `identity.json`, so a restart brings the interface up with it.
+
+The control plane moves a node only while its latest heartbeat declared `mesh_readdress` (see [Heartbeat Protocol](#heartbeat-protocol)). A node that cannot follow declares nothing and is never moved: its WireGuard interface did not come up, its identity carries no usable Domain mesh CIDR, or its platform has no WireGuard controller. A node moves only inside the mesh prefix its interface came up with, the Domain mesh CIDR of its registration. A control plane that predates `mesh_ip` sends no member, and the node keeps its address. See [Mesh address changes](/reference/networking/wireguard#mesh-address-changes) for how plexd applies a move, and [Troubleshooting](/guide/troubleshooting#a-moved-node-does-not-follow-its-new-mesh-address) for the log lines of a move that did not complete.
 
 ### Reconciliation
 
@@ -131,8 +141,8 @@ The reconciliation loop (`reconcile.interval`, default 60s) ensures that the loc
 
 Each reconciliation cycle:
 
-1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, `signing_key`, `hooks`, `dns`, `shared_subnets`). A `null` block means "not populated".
-2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted. The merged `policy` block is applied on this step too, by the [policy dispatch handler](/reference/networking/network-policy#dispatchhandler): plexd rebuilds the firewall rules when the block is not the ruleset it installed, so a block it could not apply is applied again on every pull.
+1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with the node's mesh address `mesh_ip`, which a control plane that predates the member leaves out, and its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, `secrets`, `signing_key`, `hooks`, `dns`, `shared_subnets`). A `null` block means "not populated".
+2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted. The merged `policy` block is applied on this step too, by the [policy dispatch handler](/reference/networking/network-policy#dispatchhandler): plexd rebuilds the firewall rules when the block is not the ruleset it installed, so a block it could not apply is applied again on every pull. A changed `mesh_ip` is applied on this step as well, right after the signing key and ahead of the other handlers, so the rest of the cycle runs on the new address, and a step of the move that failed is tried again on the next pull (see [Mesh Address Changes](#mesh-address-changes)).
 3. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, per-block change flags for policy, bridge, and the state/reports buckets, and a flag for a changed `shared_subnets` list. `executions` is a queue rather than desired state, so it is neither stored nor diffed.
 4. **Apply corrections** for any detected drift:
    - Add, update or remove WireGuard peers. Membership comes from the `peers` block, AllowedIPs are derived as `mesh_ip/32` followed by the peer's `routed_subnets` that plexd accepts, the networks behind a bridge's site-to-site tunnels, which plexd routes through the mesh interface (see [Routed subnets](/reference/networking/wireguard#routed-subnets)). A site subnet that the `shared_subnets` block names is on the allowed IPs of one of its bridges at a time, starting on the first; endpoint selection moves it to the next live bridge once the path to its bridge has been dead for the Domain's failure-detection time (see [Shared subnets](/reference/networking/wireguard#shared-subnets)). The endpoint is the first entry of the peer's dial order (its `endpoint_candidates` on a subnet this node is also on, its usable direct `endpoint`, its other candidates, then its relays from `fallback_endpoints`, or from `fallback_endpoint` on a control plane that predates the set), which endpoint selection moves along until a handshake completes. The PSK is the edge PSK plexd fetched for the peer's current public key; a peer gets none while plexd holds no PSK for it, for example with `wireguard.edge_psk: false`. plexd syncs the edge PSKs on every successful pull before the diff, so a new peer can get its PSK in the same cycle that adds it (see [Pre-Shared Keys](/guide/security#pre-shared-keys-psk))
