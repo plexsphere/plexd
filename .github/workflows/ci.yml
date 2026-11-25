@@ -88,8 +88,9 @@ jobs:
       # TestNetlinkController_RealReplaceAddress shares the gate too and
       # proves the order in which a changed mesh address replaces the old one
       # on a live WireGuard link: the link ends with the new address alone, a
-      # route through it survives, and the connected route names the new
-      # source.
+      # route through it survives, the connected route names the new
+      # source, and an observer that keeps addresses without their prefix
+      # length, as systemd-resolved does, ends with the new address.
       # The absolute go path is resolved before sudo resets PATH, and the two
       # cache variables let root reuse what the step above downloaded and
       # built. The step fails unless all nine tests passed: a skip would pass

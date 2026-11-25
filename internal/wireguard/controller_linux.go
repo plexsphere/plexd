@@ -199,22 +199,31 @@ func (c *NetlinkController) ConfigureAddress(name string, address string) error 
 // ReplaceAddress swaps oldAddress for newAddress on the named interface. The
 // link, its peers and the routes through it stay.
 //
-// It takes four netlink calls: add the new address as a /32, delete the old
-// address, add the new address with its prefix length, delete the /32. The
-// order is measured on kernel 6.8.0-147 with a dummy link that held
-// 10.99.0.1/24 and a route 172.16.5.0/24 through it. Deleting the only
-// address of a link removes every route of the link, that route included.
-// Adding the new address and then deleting the old one removes both
-// addresses and every route, because the new one is a secondary of the old
-// one and promote_secondaries is 0. The four calls keep the route and end
-// with 10.99.0.0/24 proto kernel src 10.99.0.9. Switching
-// promote_secondaries on would write /proc/sys, which fails in a container
-// that holds NET_ADMIN alone.
+// It takes five netlink calls: add the new address as a /32, delete the old
+// address, add the new address with its prefix length, delete the /32, and
+// replace the new address with itself. The order is measured on kernel
+// 6.8.0-147 with a dummy link that held 10.99.0.1/24 and a route
+// 172.16.5.0/24 through it. Deleting the only address of a link removes
+// every route of the link, that route included. Adding the new address and
+// then deleting the old one removes both addresses and every route, because
+// the new one is a secondary of the old one and promote_secondaries is 0.
+// The first four calls keep the route and end with 10.99.0.0/24 proto
+// kernel src 10.99.0.9. Switching promote_secondaries on would write
+// /proc/sys, which fails in a container that holds NET_ADMIN alone.
+//
+// systemd-resolved keeps the addresses of a link by family and address,
+// without the prefix length, so it takes the delete of the /32 as the
+// removal of the new address, holds no address for the link and drops the
+// link's DNS scope. The fifth call changes neither the address nor a route
+// and makes the kernel send RTM_NEWADDR for the address again, so a listener
+// that keeps addresses that way ends holding it. That was measured on the
+// same kernel with systemd-resolved 255.
 //
 // A pair of /32 addresses takes two calls, add the new one and delete the
-// old one, because the four calls would delete the address they just added.
-// The adds tolerate EEXIST and the deletes EADDRNOTAVAIL, so a call that
-// failed halfway succeeds when it is repeated with the same arguments.
+// old one, because the other calls would delete the address they just
+// added, and its last event for the new address is already its add. The
+// adds tolerate EEXIST and the deletes EADDRNOTAVAIL, so a call that failed
+// halfway succeeds when it is repeated with the same arguments.
 func (c *NetlinkController) ReplaceAddress(name, oldAddress, newAddress string) error {
 	oldPrefix, newPrefix, err := replacePrefixes(oldAddress, newAddress)
 	if err != nil {
@@ -236,19 +245,23 @@ func (c *NetlinkController) ReplaceAddress(name, oldAddress, newAddress string) 
 }
 
 // addrOps is the part of netlink that replaceAddress uses; tests substitute
-// it.
+// it. replace sends RTM_NEWADDR with NLM_F_CREATE|NLM_F_REPLACE, as
+// ip address replace does.
 type addrOps struct {
-	byName func(string) (netlink.Link, error)
-	add    func(netlink.Link, *netlink.Addr) error
-	del    func(netlink.Link, *netlink.Addr) error
+	byName  func(string) (netlink.Link, error)
+	add     func(netlink.Link, *netlink.Addr) error
+	del     func(netlink.Link, *netlink.Addr) error
+	replace func(netlink.Link, *netlink.Addr) error
 }
 
 // netlinkAddrOps is addrOps over the kernel.
-var netlinkAddrOps = addrOps{byName: netlink.LinkByName, add: netlink.AddrAdd, del: netlink.AddrDel}
+var netlinkAddrOps = addrOps{byName: netlink.LinkByName, add: netlink.AddrAdd, del: netlink.AddrDel, replace: netlink.AddrReplace}
 
 // replaceAddress makes the netlink calls of ReplaceAddress, in its order, on
 // the link of that name. A pair that names one address is left as it is,
-// because deleting the old address would delete the new one.
+// because deleting the old address would delete the new one. The
+// announcement that ends the swap of a prefix shorter than /32 tolerates no
+// errno: a link that holds the address answers a replace with success.
 func replaceAddress(ops addrOps, name string, oldPrefix, newPrefix netip.Prefix) error {
 	link, err := ops.byName(name)
 	if err != nil {
@@ -268,11 +281,14 @@ func replaceAddress(ops addrOps, name string, oldPrefix, newPrefix netip.Prefix)
 		steps = []step{{true, newPrefix}, {false, oldPrefix}}
 	}
 
-	for _, s := range steps {
-		addr := &netlink.Addr{IPNet: &net.IPNet{
-			IP:   s.prefix.Addr().AsSlice(),
-			Mask: net.CIDRMask(s.prefix.Bits(), s.prefix.Addr().BitLen()),
+	toAddr := func(p netip.Prefix) *netlink.Addr {
+		return &netlink.Addr{IPNet: &net.IPNet{
+			IP:   p.Addr().AsSlice(),
+			Mask: net.CIDRMask(p.Bits(), p.Addr().BitLen()),
 		}}
+	}
+	for _, s := range steps {
+		addr := toAddr(s.prefix)
 		if s.add {
 			if err := ops.add(link, addr); err != nil && !errors.Is(err, syscall.EEXIST) {
 				return fmt.Errorf("wireguard: replace address: add %s: %w", s.prefix, err)
@@ -283,7 +299,13 @@ func replaceAddress(ops addrOps, name string, oldPrefix, newPrefix netip.Prefix)
 			return fmt.Errorf("wireguard: replace address: delete %s: %w", s.prefix, err)
 		}
 	}
+	if newPrefix == host {
+		return nil
+	}
 
+	if err := ops.replace(link, toAddr(newPrefix)); err != nil {
+		return fmt.Errorf("wireguard: replace address: announce %s: %w", newPrefix, err)
+	}
 	return nil
 }
 
