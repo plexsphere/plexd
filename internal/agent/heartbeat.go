@@ -74,6 +74,14 @@ type ReconcileTrigger interface {
 // code at all; keeping the decision in the heartbeat gives it one owner. Any
 // other failure leaves the count unchanged, since it says nothing about the
 // credential, and only an accepted heartbeat resets it.
+//
+// DECISION (author, 2026-11-25, #248): a heartbeat carries the features the
+// request builder declares, and the service has no fallback for a control
+// plane that predates the member. Such a control plane decodes without unknown
+// fields and answers 400 malformed_heartbeat_request, so it records no
+// heartbeat of the node; sendHeartbeat names that cause on every refusal and
+// sends the next heartbeat unchanged until the control plane is upgraded. The
+// control plane is therefore upgraded first.
 type HeartbeatService struct {
 	cfg                 HeartbeatConfig
 	client              HeartbeatClient
@@ -176,11 +184,17 @@ func (s *HeartbeatService) sendHeartbeat(ctx context.Context) {
 			s.backOffProbe()
 		}
 		var apiErr *api.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "clock_skew" {
+		isAPIErr := errors.As(err, &apiErr)
+		switch {
+		case isAPIErr && apiErr.Code == "clock_skew":
 			s.logger.ErrorContext(ctx, "agent: heartbeat: rejected for clock skew, synchronize the system clock via NTP", "error", err)
-			return
+		case isAPIErr && apiErr.Code == "malformed_heartbeat_request" && len(req.Features) > 0:
+			// No fallback drops the member; see the DECISION on
+			// HeartbeatService.
+			s.logger.ErrorContext(ctx, "agent: heartbeat: rejected as malformed, a control plane that predates the features member refuses it; upgrade the control plane", "error", err)
+		default:
+			s.logger.ErrorContext(ctx, "agent: heartbeat: send failed", "error", err)
 		}
-		s.logger.ErrorContext(ctx, "agent: heartbeat: send failed", "error", err)
 		return
 	}
 
