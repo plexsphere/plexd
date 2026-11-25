@@ -22,7 +22,9 @@
 #     restart, a CNAME out of the mesh zones, a TXT answer over TCP, forward
 #     zones and a catch-all forwarded to the mock's DNS stub, a dead forward
 #     resolver that costs the mesh names nothing, answers while the control
-#     plane is paused
+#     plane is paused, a mesh address a pull moves and moves back, with the
+#     link's DNS scope kept and the node's own name answered at the new
+#     address
 #   - Start after a reboot cleared /run/plexd, with the registration gone
 #     while plexd is stopped and back after the start
 #   - Mesh DNS opt-out with dns.enabled: false
@@ -2143,6 +2145,105 @@ while :; do
 done
 echo "  PASS: plexd recovered after the unpause: heartbeat_count ${HB_AFTER_UNPAUSE} -> ${HB_NOW}, state_count ${STATE_AFTER_UNPAUSE} -> ${STATE_NOW} within $((SECONDS - RECOVER_START))s"
 
+# readdress_request <tag> <from> <to> moves the node from one mesh address to
+# the other. POST /test/readdress must answer 200 with mesh_ip <to> and
+# previous_mesh_ip <from>, and a node_state_updated event makes plexd pull
+# now. The event id is built from the tag, so each call needs a tag of its
+# own. Step 7 below and the user access phase use it.
+readdress_request() {
+    local tag=$1 from=$2 to=$3 answer status body rc=0 ok features
+    answer=$(curl -s -w '\n%{http_code}' -X POST -H "Content-Type: application/json" \
+        -d "{\"mesh_ip\":\"${to}\"}" \
+        "http://localhost:18080/test/readdress" 2>&1) || rc=$?
+    status=${answer##*$'\n'}
+    body=${answer%$'\n'*}
+    if [ "${rc}" -ne 0 ] || [ "${status}" != "200" ]; then
+        features=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null | jq -c '.features' 2>&1 || true)
+        fail "[${tag}] POST /test/readdress {\"mesh_ip\":\"${to}\"} answered status ${status} with '${body}' (curl exited ${rc}), want 200; the last heartbeat the mock captured declares the features '${features}'"
+    fi
+    ok=$(printf '%s' "${body}" | jq -r --arg from "${from}" --arg to "${to}" '.mesh_ip == $to and .previous_mesh_ip == $from' 2>&1) \
+        || fail "[${tag}] jq could not read the answer '${body}' of POST /test/readdress: ${ok}"
+    if [ "${ok}" != true ]; then
+        fail "[${tag}] POST /test/readdress answered '${body}', want mesh_ip ${to} and previous_mesh_ip ${from}"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-readdress-nudge-${tag// /-}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] readdress nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# Step 7: a moved mesh address. plexd replaces the address on plexd0 and ends
+# by announcing the new address, so systemd-resolved, which keeps a link's
+# addresses without their prefix length, keeps the link's DNS scope. The
+# mesh-dns follower registers the new server, and the mock serves the node's
+# own host entry, node-1.app.e2e.internal, at the node's current address. The
+# user access phase moves the node too, but the opt-out phase before it turns
+# the resolver off for good, so the scope is checked here. The move back
+# leaves the address, the registration and identity.json as the phases after
+# this one expect them.
+#
+# dns_follows_move <tag> <from> <to> moves the node, then polls every 2s for
+# up to 60s until the running plexd logged "mesh address changed from state
+# pull" with previous_mesh_ip=<from> and mesh_ip=<to>, resolvectl status
+# plexd0 lists exactly the server <to>:5354, and its Current Scopes line holds
+# DNS. With the cache flushed, the node's own name must then answer <to> and
+# db-1 its address, each on plexd0.
+dns_follows_move() {
+    local tag=$1 from=$2 to=$3 pid journal logged servers scopes line start
+    pid=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd 2>&1) \
+        || fail "[${tag}] systemctl show -p MainPID plexd failed: ${pid}"
+    readdress_request "${tag}" "${from}" "${to}"
+    start=${SECONDS}
+    while :; do
+        journal=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) \
+            || fail "[${tag}] journalctl -u plexd failed: ${journal}"
+        logged=no
+        if journal_has "${journal}" "plexd[${pid}]:" 'msg="mesh address changed from state pull"' "previous_mesh_ip=${from}" " mesh_ip=${to}"; then
+            logged=yes
+        fi
+        read_link_status
+        servers=""
+        scopes=""
+        while IFS= read -r line; do
+            case "${line}" in
+                *"DNS Servers: "*) servers=${line#*DNS Servers: } ;;
+                *"Current Scopes: "*) scopes=${line#*Current Scopes: } ;;
+            esac
+        done <<< "${LINK_STATUS}"
+        if [ "${logged}" = yes ] && [ "${LINK_STATUS_RC}" -eq 0 ] && [ "${servers}" = "${to}:5354" ] && has_word "${scopes}" DNS; then
+            break
+        fi
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            echo "${LINK_STATUS}"
+            fail "[${tag}] 60s after the nudge, plexd[${pid}] logged 'mesh address changed from state pull' with previous_mesh_ip=${from} mesh_ip=${to}: ${logged}, and resolvectl status ${MESH_IFACE} (exit ${LINK_STATUS_RC}) lists the DNS servers '${servers}' and the scopes '${scopes}', want '${to}:5354' and a DNS scope"
+        fi
+        sleep 2
+    done
+    echo "  PASS: [${tag}] ${MESH_IFACE} keeps its DNS scope with the server ${to}:5354"
+    FLUSH_OUT=$(docker exec "${SYSTEMD_CONTAINER}" resolvectl flush-caches 2>&1) \
+        || fail "[${tag}] resolvectl flush-caches inside the container failed: ${FLUSH_OUT}"
+    mesh_query node-1.app.e2e.internal
+    if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" node-1.app.e2e.internal "${to}"; then
+        echo "  PASS: [${tag}] resolvectl query node-1.app.e2e.internal answers ${to} on link ${MESH_IFACE}"
+    else
+        echo "${QUERY_OUT}"
+        fail "[${tag}] resolvectl query node-1.app.e2e.internal exited ${QUERY_RC}, want 0 and ${to} on link ${MESH_IFACE}"
+    fi
+    mesh_query db-1.app.e2e.internal
+    if [ "${QUERY_RC}" -eq 0 ] && answers_on_mesh "${QUERY_OUT}" db-1.app.e2e.internal 10.99.0.2; then
+        echo "  PASS: [${tag}] resolvectl query db-1.app.e2e.internal answers 10.99.0.2 on link ${MESH_IFACE}"
+    else
+        echo "${QUERY_OUT}"
+        fail "[${tag}] resolvectl query db-1.app.e2e.internal exited ${QUERY_RC}, want 0 and 10.99.0.2 on link ${MESH_IFACE}"
+    fi
+}
+
+dns_follows_move dns-move 10.99.0.1 10.99.0.9
+dns_follows_move dns-move-back 10.99.0.9 10.99.0.1
+
 echo "=== Mesh DNS through systemd-resolved PASSED ==="
 
 # --- Start after a reboot ---
@@ -4167,37 +4268,15 @@ ua_plexd0_inet() {
 }
 
 # ua_readdress <tag> <from> <to> moves the bridge from one mesh address to the
-# other. POST /test/readdress must answer 200 with mesh_ip <to> and
-# previous_mesh_ip <from>, and a node_state_updated event makes plexd pull
-# now. Within 60s the running plexd must log "mesh address changed from state
-# pull" with previous_mesh_ip=<from> and mesh_ip=<to>, and plexd0 must hold
-# <to>/24 alone. The mesh node's allowed IPs for the bridge then move to
-# <to>/32.
+# other with readdress_request, which the mesh DNS phase defines. Within 60s
+# the running plexd must log "mesh address changed from state pull" with
+# previous_mesh_ip=<from> and mesh_ip=<to>, and plexd0 must hold <to>/24
+# alone. The mesh node's allowed IPs for the bridge then move to <to>/32.
 ua_readdress() {
-    local tag=$1 from=$2 to=$3 pid answer status body rc=0 ok features logged start out
+    local tag=$1 from=$2 to=$3 pid logged start out
     pid=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd 2>&1) \
         || fail "[${tag}] systemctl show -p MainPID plexd failed: ${pid}"
-    answer=$(curl -s -w '\n%{http_code}' -X POST -H "Content-Type: application/json" \
-        -d "{\"mesh_ip\":\"${to}\"}" \
-        "http://localhost:18080/test/readdress" 2>&1) || rc=$?
-    status=${answer##*$'\n'}
-    body=${answer%$'\n'*}
-    if [ "${rc}" -ne 0 ] || [ "${status}" != "200" ]; then
-        features=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null | jq -c '.features' 2>&1 || true)
-        fail "[${tag}] POST /test/readdress {\"mesh_ip\":\"${to}\"} answered status ${status} with '${body}' (curl exited ${rc}), want 200; the last heartbeat the mock captured declares the features '${features}'"
-    fi
-    ok=$(printf '%s' "${body}" | jq -r --arg from "${from}" --arg to "${to}" '.mesh_ip == $to and .previous_mesh_ip == $from' 2>&1) \
-        || fail "[${tag}] jq could not read the answer '${body}' of POST /test/readdress: ${ok}"
-    if [ "${ok}" != true ]; then
-        fail "[${tag}] POST /test/readdress answered '${body}', want mesh_ip ${to} and previous_mesh_ip ${from}"
-    fi
-    status=$(curl -sf -o /dev/null -w "%{http_code}" \
-        -X POST -H "Content-Type: application/json" \
-        -d "{\"id\": \"evt-e2e-readdress-nudge-${tag// /-}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
-        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-    if [ "${status}" != "204" ]; then
-        fail "[${tag}] readdress nudge injection returned status ${status}, want 204"
-    fi
+    readdress_request "${tag}" "${from}" "${to}"
     start=${SECONDS}
     while :; do
         ua_journal
