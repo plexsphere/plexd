@@ -450,6 +450,31 @@ func (n *meshNAT) resetRewrites() {
 	}
 }
 
+// setMeshAddr gives every rewrite into mesh the source addr and removes every
+// flow of mesh that was translated to another address. It reports the number
+// of rewrites it moved and of flows it removed.
+//
+// The far end's next packet of a removed flow opens a flow on addr. Without
+// the removal a running conversation would keep its old source until the flow
+// idles out, up to five days for an established TCP connection.
+func (n *meshNAT) setMeshAddr(mesh string, addr netip.Addr) (rewrites, flows int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, rw := range n.rewrites {
+		if rw.mesh == mesh {
+			rw.meshAddr = addr
+			rewrites++
+		}
+	}
+	for _, f := range n.flows {
+		if f.mesh == mesh && f.meshAddr != addr {
+			n.removeFlow(f)
+			flows++
+		}
+	}
+	return rewrites, flows
+}
+
 func (n *meshNAT) removeRewriteLocked(from string) {
 	rw := n.rewrites[from]
 	if rw == nil {

@@ -1145,6 +1145,69 @@ func TestMeshRewriteRules_Rewrites(t *testing.T) {
 	}
 }
 
+// setMeshAddr moves both rewrites into the mesh interface to its new address:
+// a far end's next packet leaves from it, the flows translated to the old one
+// are gone, and a reply to the old address finds no flow. A rewrite into
+// another mesh interface keeps its address and its flow.
+func TestMeshRewriteRules_SetMeshAddr(t *testing.T) {
+	nt := newNATTest(t)
+	const otherMesh, otherFrom = "plexd1", "wg-ua-b0b0b0e1"
+	otherAddr := netip.MustParseAddr("10.255.243.1")
+	other, otherMeshDev := &fakeNATDevice{name: otherFrom, mtu: 1420}, &fakeNATDevice{name: otherMesh, mtu: 1420}
+	nt.n.register(otherMesh, otherMeshDev)
+	nt.n.register(otherFrom, other)
+	if o := nt.n.addRewrite(otherFrom, otherMesh, otherAddr, nil); o != addAdded {
+		t.Fatalf("addRewrite(%s) = %d, want added", otherFrom, o)
+	}
+	otherPort := pktSport(queued(t, nt.decide(t, otherFrom, udpPacket(rwDeviceD, rwNodeN, 5555, 7001, nil)), otherMeshDev))
+
+	oldPort := nt.translateUDP(t, rwAccess, rwDeviceD, 5555)
+	nt.translateUDP(t, rwTunnel, rwSiteS, 6000)
+
+	moved := netip.MustParseAddr("10.255.241.9")
+	if rewrites, flows := nt.n.setMeshAddr(rwMesh, moved); rewrites != 2 || flows != 2 {
+		t.Fatalf("setMeshAddr = %d rewrites, %d flows, want 2 and 2", rewrites, flows)
+	}
+	for _, from := range []string{rwAccess, rwTunnel} {
+		if got := nt.n.rewrites[from].meshAddr; got != moved {
+			t.Errorf("rewrite of %s translates to %s, want %s", from, got, moved)
+		}
+	}
+	if len(nt.n.flows) != 1 || len(nt.n.meshPorts) != 1 {
+		t.Errorf("%d flows and %d mesh ports after the move, want the other mesh interface's alone", len(nt.n.flows), len(nt.n.meshPorts))
+	}
+	passes(t, nt.fromMesh(t, udpPacket(rwNodeN, rwMeshAddr, 7001, oldPort, []byte("answer"))), "N's reply to the old address")
+
+	out := queued(t, nt.fromAccess(t, udpPacket(rwDeviceD, rwNodeN, 5555, 7001, []byte("query"))), nt.mesh)
+	if pktSrc(out) != moved || !pktMeshPort(pktSport(out)) || !transportSumOK(out) {
+		t.Fatalf("D's next datagram left from %s:%d, checksum ok = %t, want %s, a mesh port and a valid checksum",
+			pktSrc(out), pktSport(out), transportSumOK(out), moved)
+	}
+	answer := queued(t, nt.fromMesh(t, udpPacket(rwNodeN, moved, 7001, pktSport(out), []byte("answer"))), nt.access)
+	if pktDst(answer) != rwDeviceD || pktDport(answer) != 5555 {
+		t.Errorf("N's reply to the new address went to %s:%d, want %s:5555", pktDst(answer), pktDport(answer), rwDeviceD)
+	}
+	passes(t, nt.fromAccess(t, udpPacket(rwDeviceD, moved, 5353, 53, []byte("query"))), "D's datagram to the new address")
+	if res := nt.fromAccess(t, udpPacket(rwDeviceD, rwNodeN, 5556, 7001, nil, withTTL(1))); res.icmp == nil || pktSrc(res.icmp) != moved {
+		t.Errorf("ICMP error %x about an expiring datagram, want one from %s", res.icmp, moved)
+	}
+
+	// The same address again moves nothing and keeps the new flow.
+	if rewrites, flows := nt.n.setMeshAddr(rwMesh, moved); rewrites != 2 || flows != 0 {
+		t.Errorf("second setMeshAddr = %d rewrites, %d flows, want 2 and 0", rewrites, flows)
+	}
+	queued(t, nt.fromMesh(t, udpPacket(rwNodeN, moved, 7001, pktSport(out), []byte("answer"))), nt.access)
+
+	if got := nt.n.rewrites[otherFrom].meshAddr; got != otherAddr {
+		t.Errorf("rewrite into %s translates to %s, want %s", otherMesh, got, otherAddr)
+	}
+	queued(t, nt.decide(t, otherMesh, udpPacket(rwNodeN, otherAddr, 7001, otherPort, []byte("answer"))), other)
+
+	if rewrites, flows := nt.n.setMeshAddr("plexd9", moved); rewrites != 0 || flows != 0 {
+		t.Errorf("setMeshAddr of an interface without a rewrite = %d rewrites, %d flows, want none", rewrites, flows)
+	}
+}
+
 // RFC 1624's worked example: a header checksum of 0xdd2f with a word that
 // changes from 0x5555 to 0x3285 becomes 0x0000 by equation 3.
 func TestMeshRewriteRules_ChecksumUpdateRFC1624(t *testing.T) {

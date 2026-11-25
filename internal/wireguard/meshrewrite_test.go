@@ -339,6 +339,58 @@ func TestMeshRewriter_AddRemoveReset(t *testing.T) {
 	}
 }
 
+// SetMeshAddress moves the rewrite to the mesh interface's new address: a far
+// end's next datagram leaves from it and its reply comes back, while a reply
+// to the old address finds no flow and reaches the wrapped device as the
+// host's.
+func TestMeshRewriter_SetMeshAddress(t *testing.T) {
+	rt := newRewriterTest(t)
+	rt.add(t, rwAccess)
+	datagram := udpPacket(rwDeviceD, rwNodeN, 5555, 7001, []byte("query"))
+	writeTo(t, rt.accessDev, datagram)
+	oldPort := pktSport(readFrom(t, rt.meshDev))
+
+	moved := netip.MustParseAddr("10.255.241.9")
+	rt.r.SetMeshAddress(rwMesh, moved)
+	if !rwLogged(rt.logs.String(), "mesh source rewrite moved to a new mesh address", "level=DEBUG", "component=bridge",
+		"mesh_iface="+rwMesh, "mesh_addr=10.255.241.9", "rewrites=1", "flows_removed=1") {
+		t.Errorf("no moved line in the log:\n%s", rt.logs)
+	}
+
+	reply := udpPacket(rwNodeN, rwMeshAddr, 7001, oldPort, []byte("answer"))
+	writeTo(t, rt.meshDev, reply)
+	assertWritten(t, "N's reply to the old address", rt.mesh, reply)
+	if queuedFor(rt.accessDev) != 0 {
+		t.Errorf("%d packets queued for the provider's device after a reply to the old address, want none", queuedFor(rt.accessDev))
+	}
+
+	writeTo(t, rt.accessDev, datagram)
+	out := readFrom(t, rt.meshDev)
+	if pktSrc(out) != moved {
+		t.Fatalf("D's next datagram left from %s, want %s", pktSrc(out), moved)
+	}
+	writeTo(t, rt.meshDev, udpPacket(rwNodeN, moved, 7001, pktSport(out), []byte("answer")))
+	if got := readFrom(t, rt.accessDev); pktDst(got) != rwDeviceD || pktDport(got) != 5555 {
+		t.Errorf("N's reply to the new address went to %s:%d, want %s:5555", pktDst(got), pktDport(got), rwDeviceD)
+	}
+
+	// The rules take an IPv4-mapped address as IPv4 and refuse anything else.
+	mapped := netip.MustParseAddr("::ffff:10.255.241.10")
+	rt.r.SetMeshAddress(rwMesh, mapped)
+	if got := rt.r.nat.rewrites[rwAccess].meshAddr; got != mapped.Unmap() {
+		t.Errorf("rewrite translates to %s after a mapped address, want %s", got, mapped.Unmap())
+	}
+	for _, addr := range []netip.Addr{{}, netip.MustParseAddr("fd00::9")} {
+		rt.r.SetMeshAddress(rwMesh, addr)
+		if got := rt.r.nat.rewrites[rwAccess].meshAddr; got != mapped.Unmap() {
+			t.Errorf("rewrite translates to %s after SetMeshAddress(%s), want it kept at %s", got, addr, mapped.Unmap())
+		}
+	}
+	if n := rwLogLines(rt.logs.String(), "mesh source rewrite kept its address, the new one is no IPv4 address", "level=WARN", "mesh_iface="+rwMesh); n != 2 {
+		t.Errorf("%d kept lines in the log, want 2:\n%s", n, rt.logs)
+	}
+}
+
 func TestMeshRewriter_AddUnknownInterfaces(t *testing.T) {
 	rt := newRewriterTest(t)
 	if err := rt.r.AddMeshSourceRewrite("tailscale0", rwMesh); err != nil {
