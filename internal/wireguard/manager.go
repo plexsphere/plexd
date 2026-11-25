@@ -41,11 +41,18 @@ type Manager struct {
 
 	// meshPrefix is the prefix the interface address carries, masked: the
 	// Domain mesh CIDR, or the mesh IP's host /32 when the identity has no
-	// usable CIDR. It is zero until Setup succeeds.
+	// usable CIDR. It is zero until Setup succeeds, and Readdress does not
+	// change it.
 	meshPrefix netip.Prefix
 
+	// addrMu guards meshIP, which Readdress writes while the round-trip probe
+	// reads it. It is held for the read or the write alone, never together
+	// with another lock of the manager and never across a controller or
+	// router call.
+	addrMu sync.Mutex
 	// meshIP is the node's own mesh IP as Setup parsed it from the identity,
-	// the zero address when it does not parse or before Setup succeeds. The
+	// or the address Readdress last replaced it with, the zero address when
+	// it does not parse or before Setup succeeds. Read it through MeshIP. The
 	// round-trip probe listens on it and sends no probe to it.
 	meshIP netip.Addr
 
@@ -192,7 +199,9 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 		m.meshPrefix = prefix.Masked()
 	}
 	if ip, err := netip.ParseAddr(identity.MeshIP); err == nil {
+		m.addrMu.Lock()
 		m.meshIP = ip
+		m.addrMu.Unlock()
 	}
 	m.mtu = mtu
 
@@ -257,6 +266,151 @@ func (m *Manager) interfaceAddress(identity *registration.NodeIdentity) string {
 // its own tunnel; endpoint selection refuses such an endpoint.
 func (m *Manager) MeshPrefix() netip.Prefix {
 	return m.meshPrefix
+}
+
+// MeshIP returns the node's mesh IP the interface carries: the one Setup
+// parsed from the identity, or the one Readdress last replaced it with. It is
+// the zero address before Setup succeeds and when the identity's mesh IP does
+// not parse.
+func (m *Manager) MeshIP() netip.Addr {
+	m.addrMu.Lock()
+	defer m.addrMu.Unlock()
+	return m.meshIP
+}
+
+// ErrReaddressUnsupported is returned by Readdress while CanReaddress is
+// false.
+var ErrReaddressUnsupported = errors.New("the mesh address cannot be replaced while plexd runs")
+
+// ErrMeshAddressInvalid is returned by Readdress for an address the mesh
+// interface does not take.
+var ErrMeshAddressInvalid = errors.New("invalid mesh address")
+
+// CanReaddress reports whether Readdress can replace the mesh IP while plexd
+// runs: Setup succeeded, the controller implements AddressReplacer, the mesh
+// IP is IPv4, and the interface carries a prefix shorter than /32. Setup
+// leaves meshPrefix zero until it succeeds.
+//
+// DECISION: plexd declares mesh_readdress only when it can follow, and this
+// is the test. An interface that carries the host /32 fallback of
+// interfaceAddress has no prefix but its own address, so Readdress would
+// refuse every move as outside it.
+func (m *Manager) CanReaddress() bool {
+	if _, ok := m.ctrl.(AddressReplacer); !ok {
+		return false
+	}
+	return m.meshPrefix.IsValid() && m.meshPrefix.Bits() < 32 && m.MeshIP().Is4()
+}
+
+// Readdress replaces the mesh IP the interface carries with addr, in place:
+// the interface, its peers and their tunnels stay up. In order:
+//  1. It returns an error wrapping ErrReaddressUnsupported while CanReaddress
+//     is false.
+//  2. It returns an error wrapping ErrMeshAddressInvalid when addr, unmapped,
+//     is not IPv4, is unspecified, loopback, multicast or link-local, or lies
+//     outside MeshPrefix.
+//  3. It returns nil without a call when addr is the current mesh IP.
+//  4. It replaces the address through the controller (AddressReplacer),
+//     both with the prefix length of MeshPrefix. An error is returned wrapped
+//     as "wireguard: readdress:" and leaves the mesh IP as it was, so the
+//     next call for addr repeats the replace with the same arguments, which
+//     succeeds after a call that failed halfway.
+//  5. It stores addr as the mesh IP.
+//  6. It closes the round-trip probe's socket when one is held, so its reader
+//     ends and the next round listens on addr.
+//  7. It adds the route of every routed subnet it holds again (see
+//     addPeerRoutesAgain).
+//  8. It logs wireguard: mesh address replaced at Info.
+//
+// MeshPrefix does not change. Calls must not overlap: plexd up makes them
+// from the dispatch handler of the reconcile loop alone.
+//
+// DECISION: a node re-addresses only inside the mesh prefix its interface
+// was set up with. Every part that copied MeshPrefix at startup stays
+// correct, and a pull cannot point the interface at a network of the host.
+func (m *Manager) Readdress(addr netip.Addr) error {
+	if !m.CanReaddress() {
+		return fmt.Errorf("wireguard: readdress: %w", ErrReaddressUnsupported)
+	}
+	addr = addr.Unmap()
+	if fault := meshAddressFault(addr, m.meshPrefix); fault != "" {
+		return fmt.Errorf("wireguard: readdress: %w: %s %s", ErrMeshAddressInvalid, addr, fault)
+	}
+	old := m.MeshIP()
+	if addr == old {
+		return nil
+	}
+
+	bits := m.meshPrefix.Bits()
+	replacer := m.ctrl.(AddressReplacer)
+	if err := replacer.ReplaceAddress(m.cfg.InterfaceName, netip.PrefixFrom(old, bits).String(), netip.PrefixFrom(addr, bits).String()); err != nil {
+		return fmt.Errorf("wireguard: readdress: %w", err)
+	}
+
+	m.addrMu.Lock()
+	m.meshIP = addr
+	m.addrMu.Unlock()
+
+	if conn := m.rtt.socket(); conn != nil {
+		_ = conn.Close()
+	}
+
+	m.addPeerRoutesAgain()
+
+	m.logger.Info("wireguard: mesh address replaced",
+		"component", "wireguard",
+		"interface", m.cfg.InterfaceName,
+		"previous_mesh_ip", old.String(),
+		"mesh_ip", addr.String(),
+	)
+	return nil
+}
+
+// meshAddressFault returns why addr cannot be the mesh IP of an interface
+// set up with prefix, or "" when it can.
+func meshAddressFault(addr netip.Addr, prefix netip.Prefix) string {
+	switch {
+	case !addr.Is4():
+		return "is not an IPv4 address"
+	case addr.IsUnspecified():
+		return "is unspecified"
+	case addr.IsLoopback():
+		return "is a loopback address"
+	case addr.IsMulticast():
+		return "is a multicast address"
+	case addr.IsLinkLocalUnicast():
+		return "is a link-local address"
+	case !prefix.Contains(addr):
+		return "lies outside the mesh prefix " + prefix.String()
+	}
+	return ""
+}
+
+// addPeerRoutesAgain adds the route of every subnet in routes again through
+// OSInterfaceName, for Readdress. On macOS the removal of the old address may
+// take the routes through the utun with it, which only the CI runner can
+// measure, and AddRoute is idempotent, so a route that survived costs one
+// call. A subnet whose add fails is logged at Warn and dropped from routes,
+// so the next syncPeerRoutes adds it. Without a router it does nothing.
+func (m *Manager) addPeerRoutesAgain() {
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	if m.router == nil {
+		return
+	}
+
+	iface := m.OSInterfaceName()
+	for _, subnet := range slices.Sorted(maps.Keys(m.routes)) {
+		if err := m.router.AddRoute(subnet, iface); err != nil {
+			m.logger.Warn("wireguard: peer route failed",
+				"component", "wireguard",
+				"subnet", subnet,
+				"op", "add",
+				"error", err,
+			)
+			delete(m.routes, subnet)
+		}
+	}
 }
 
 // SetLocalPrefixes sets the function the reconcile handler reads this host's
