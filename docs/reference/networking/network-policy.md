@@ -443,7 +443,7 @@ After `BuildFirewallRules` succeeds, `Enforcer.ApplyFirewallRules`:
 
 With enforcement disabled or no backend it returns before step 1. The generation changes with every apply, so a tag from one ruleset never names a rule of another. The backend hands the tag back with each event, and the `ConnLogger` turns it into the line's `revision_id` and `rule`, so the line never shows it.
 
-DECISION: the logged rules go ahead of the unlogged ones. Every rule is an allow and rule order carries no verdict, so the move changes nothing that passes or drops. It makes every backend's first match a logged rule whenever one allows the connection, so a narrow logged rule still logs behind a Project's allow-all policy. A connection that several logged rules allow is named after the first of them in the policy's order. The backends get the reordered list, so a pf line's position follows it, while a connection line's `rule` stays the index in the policy.
+DECISION: the logged rules go ahead of the unlogged ones. Every rule is an allow and rule order carries no verdict, so the move changes nothing that passes or drops. It makes every backend's first match a logged rule whenever one allows the connection, so a narrow logged rule still logs behind a Project's allow-all policy. A connection that several logged rules allow is named after the first of them in the policy's order. The backends get the reordered list, so a pf line's position follows it, while a connection line's `rule` stays the index in the policy. On Linux plexd writes the unlogged rules behind the logged ones as [nftables sets](./nftables-firewall.md#rule-sets) when they name an address, and each logged rule stays a rule of its own.
 
 ### Per platform
 
