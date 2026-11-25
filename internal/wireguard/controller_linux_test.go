@@ -322,8 +322,8 @@ func TestReplaceAddressNonExistent(t *testing.T) {
 }
 
 // fakeAddrOps records what replaceAddress asks of netlink, each call as
-// "add <cidr>" or "del <cidr>". errs holds the error the call at that index
-// returns.
+// "add <cidr>", "del <cidr>" or "replace <cidr>". errs holds the error the
+// call at that index returns.
 type fakeAddrOps struct {
 	errs   map[int]error
 	looked []string
@@ -340,8 +340,9 @@ func (f *fakeAddrOps) ops() addrOps {
 			f.looked = append(f.looked, name)
 			return wireGuardLink(name), nil
 		},
-		add: func(_ netlink.Link, addr *netlink.Addr) error { return record("add", addr) },
-		del: func(_ netlink.Link, addr *netlink.Addr) error { return record("del", addr) },
+		add:     func(_ netlink.Link, addr *netlink.Addr) error { return record("add", addr) },
+		del:     func(_ netlink.Link, addr *netlink.Addr) error { return record("del", addr) },
+		replace: func(_ netlink.Link, addr *netlink.Addr) error { return record("replace", addr) },
 	}
 }
 
@@ -353,10 +354,13 @@ func TestReplaceAddress_Order(t *testing.T) {
 	}{
 		{
 			// The /32 keeps the link addressed while the old address goes,
-			// and the new address brings the connected route back.
+			// and the new address brings the connected route back. The
+			// replace announces the new address after the delete of the /32,
+			// which a listener that keeps addresses without their prefix
+			// length takes as the removal of the new address.
 			name:    "prefix shorter than /32",
 			oldCIDR: "10.0.0.1/24", newCIDR: "10.0.0.9/24",
-			want: []string{"add 10.0.0.9/32", "del 10.0.0.1/24", "add 10.0.0.9/24", "del 10.0.0.9/32"},
+			want: []string{"add 10.0.0.9/32", "del 10.0.0.1/24", "add 10.0.0.9/24", "del 10.0.0.9/32", "replace 10.0.0.9/24"},
 		},
 		{
 			name:    "pair of /32 addresses",
@@ -392,8 +396,8 @@ func TestReplaceAddress_ToleratesARepeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replaceAddress = %v, want nil when every step is already done", err)
 	}
-	if len(f.calls) != 4 {
-		t.Errorf("calls = %q, want all four", f.calls)
+	if len(f.calls) != 5 {
+		t.Errorf("calls = %q, want all five", f.calls)
 	}
 }
 
@@ -434,6 +438,15 @@ func TestReplaceAddress_StepFails(t *testing.T) {
 			wantErr:   syscall.EBUSY,
 			wantText:  "wireguard: replace address: delete 10.0.0.9/32: device or resource busy",
 			wantCalls: 4,
+		},
+		{
+			// The announcement tolerates no errno: a link that holds the
+			// address answers a replace with success.
+			name:      "announcement of the address",
+			errs:      map[int]error{4: syscall.ENODEV},
+			wantErr:   syscall.ENODEV,
+			wantText:  "wireguard: replace address: announce 10.0.0.9/24: no such device",
+			wantCalls: 5,
 		},
 	}
 	for _, tt := range tests {
