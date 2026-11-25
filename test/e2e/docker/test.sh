@@ -63,6 +63,11 @@
 #     rtt-echo.sh answering, meshpeer dropping plexd's peer draws "has no live
 #     bridge" with a 4 s window; and a pull without the entry releases the
 #     subnet (phase 12e step h1)
+#   - A mesh address the state pull moves: plexd declares mesh_readdress on
+#     its heartbeat, replaces the address on wg-plexd and keeps its routes,
+#     writes it to identity.json, answers mesh DNS on it, ends the tcp session
+#     bound to the old address, reports it in system.info, is reached at it by
+#     meshpeer, starts from it after a restart, and moves back (phase 12g)
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -5023,15 +5028,24 @@ echo "=== Phase 12c PASSED: secret index from the inventory ==="
 # answers no address here.
 echo "=== Testing mesh DNS without systemd-resolved ==="
 
-MESH_DNS_LISTEN="10.99.0.1:5354"
+# MESH_NODE_IP is plexd's mesh IP, where mesh_nslookup asks the resolver and
+# probe_plexd_port of Phase 12e reaches plexd. Phase 12g moves plexd to
+# another address and back and sets it to each, so every phase before and
+# after it reaches plexd at 10.99.0.1. MESH_DNS_LISTEN is the address the
+# resolver listened on at each start up to this phase, which this phase finds
+# in the log.
+MESH_NODE_IP="10.99.0.1"
+MESH_DNS_PORT=5354
+MESH_DNS_LISTEN="${MESH_NODE_IP}:${MESH_DNS_PORT}"
 
-# mesh_nslookup <name> [<type>] asks the resolver for the records of type
-# (a when left out) of name from inside the plexd container, and leaves the
-# output, stderr included, in NSLOOKUP_OUT and the exit status in NSLOOKUP_RC.
-# busybox 1.37 takes the port on the server argument.
+# mesh_nslookup <name> [<type> [<address>]] asks the resolver at address,
+# MESH_NODE_IP when left out, on port 5354 for the records of type (a when
+# left out) of name from inside the plexd container, and leaves the output,
+# stderr included, in NSLOOKUP_OUT and the exit status in NSLOOKUP_RC. busybox
+# 1.37 takes the port on the server argument.
 mesh_nslookup() {
     NSLOOKUP_RC=0
-    NSLOOKUP_OUT=$(dc exec -T plexd /bin/busybox nslookup -type="${2:-a}" "$1" "${MESH_DNS_LISTEN}" 2>&1) || NSLOOKUP_RC=$?
+    NSLOOKUP_OUT=$(dc exec -T plexd /bin/busybox nslookup -type="${2:-a}" "$1" "${3:-${MESH_NODE_IP}}:${MESH_DNS_PORT}" 2>&1) || NSLOOKUP_RC=$?
 }
 
 # nslookup_answers <output> <name> <address> succeeds when an nslookup output
@@ -5484,7 +5498,6 @@ if [ "${WG_CONFIGURED}" -eq 0 ]; then
     fail "[mesh policy] WireGuard did not come up in the plexd container: this phase needs kernel WireGuard to carry meshpeer's traffic to plexd's mesh interface"
 fi
 
-MESH_NODE_IP="10.99.0.1"
 MESH_PEER_IP="10.99.0.3"
 FIXTURE_POLICY_REVISION="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
 # MESH_POLICY_ID is the policy every block the phase serves names in its
@@ -5791,12 +5804,13 @@ await_listening() {
 }
 
 # probe_plexd_port <tag> <port> <open|closed> starts a one-connection listener
-# on port in plexd's container, probes it from meshpeer over the mesh with
-# nc -z, and stops the listener again, so each probe meets a listener of its
-# own. A connection the input chain drops times out after 3 s, while one that
-# reached a port without a listener would be refused, so closed wants the
-# time-out. open also needs plexd's answers to leave through the output chain,
-# which passes them as replies to a connection the input chain let in.
+# on port in plexd's container, probes it from meshpeer over the mesh at
+# MESH_NODE_IP with nc -z, and stops the listener again, so each probe meets a
+# listener of its own. A connection the input chain drops times out after 3 s,
+# while one that reached a port without a listener would be refused, so closed
+# wants the time-out. open also needs plexd's answers to leave through the
+# output chain, which passes them as replies to a connection the input chain
+# let in.
 probe_plexd_port() {
     local tag=$1 port=$2 want=$3 rc=0 out
     dc exec -d -T plexd /bin/busybox nc -l -p "${port}" \
@@ -7026,6 +7040,567 @@ FD_SPLICE_START=${SECONDS}
 wait_fd_line "failure detection 15" "${FD_SET_MSG}" "${FD_BASE}" "${FD_SET_KEYS[@]}"
 
 echo "=== Phase 12f PASSED: failure-detection time from the state pull ==="
+
+# ===================================================================
+# Phase 12g: the state pull changes the mesh address
+# ===================================================================
+# The control plane moves a node to another mesh address only while the
+# node's latest heartbeat declares mesh_readdress, and the node learns the new
+# address from the mesh_ip member of its next pull: no event announces a move.
+# The mock owns the node's address, 10.99.0.1 at start, and POST
+# /test/readdress moves it under the same rule. The phase moves plexd to
+# 10.99.0.9, restarts it there, and moves it back to 10.99.0.1, so the phases
+# after it meet the fixture they expect:
+#
+#   (a) WireGuard came up, the mock serves mesh_ip 10.99.0.1 and an empty
+#       sessions block, and wg-plexd holds 10.99.0.1/24 alone beside the
+#       route of Phase 2a; the phase saves the address, peers, policy and
+#       sessions the mock serves
+#   (b) meshpeer's wg0 comes back as in Phase 12e, whose step (i) deleted it,
+#       and peer ...a0b2 becomes meshpeer again
+#   (c) the last heartbeat body carries features ["mesh_readdress"]
+#   (d) a tcp session opened before the move listens on 10.99.0.1
+#   (e) after POST /test/readdress to 10.99.0.9 and a node_state_updated
+#       event, plexd logs "mesh address changed from state pull"
+#   (f) wg-plexd holds 10.99.0.9/24 alone, the route of Phase 2a stays,
+#       identity.json reads "mesh_ip": "10.99.0.9", the resolver answers
+#       node-1.app.e2e.internal with 10.99.0.9 on 10.99.0.9:5354, and nothing
+#       answers on 10.99.0.1:5354
+#   (g) the session of (d) reports session_ended with terminated_by
+#       plexd_close, and a session opened after the move reports a
+#       listener_endpoint on 10.99.0.9
+#   (h) system.info reports mesh_ip 10.99.0.9
+#   (i) with its allowed IPs for plexd moved to 10.99.0.9/32 and a policy
+#       that names 10.99.0.9, as the control plane compiles it for the moved
+#       node, meshpeer reaches port 7001 of plexd at 10.99.0.9
+#   (j) a restart logs "existing identity loaded" with mesh_ip=10.99.0.9,
+#       registers nothing, and brings wg-plexd up with 10.99.0.9/24
+#   (k) the move back to 10.99.0.1 passes the checks of (f)
+#   (l) meshpeer's wg0 goes, and the mock serves what (a) saved
+#
+# The mock answers every heartbeat with reconcile: true, and a window shorter
+# than the heartbeat's ~30 s cadence does not keep a heartbeat-driven pull out
+# of it. Each move therefore switches that hint off, as Phase 12c does, so the
+# event brings the pull that carries the move, and switches it on again once
+# plexd logged the move. The phase sets MESH_NODE_IP to the address plexd
+# holds, so mesh_nslookup and probe_plexd_port reach plexd there. Like Phase
+# 12e it needs kernel WireGuard and fails without it, and every check fails
+# the suite.
+echo "=== Testing a mesh address the state pull changes ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    fail "[readdress] WireGuard did not come up in the plexd container: plexd declares mesh_readdress and replaces its mesh address only on an interface that came up"
+fi
+
+READDR_OLD_IP="10.99.0.1"
+READDR_NEW_IP="10.99.0.9"
+READDR_MOVED_MSG='msg="mesh address changed from state pull"'
+READDR_REV="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0ca"
+
+# readdr_log_count <log> <token>... prints how many lines of log hold every
+# token as a whole blank-separated token, the way conn_lines matches its
+# key=value pairs, so mesh_ip=10.99.0.9 matches neither
+# previous_mesh_ip=10.99.0.9 nor mesh_ip=10.99.0.99. A token may hold blanks,
+# as msg="<message>" does.
+readdr_log_count() {
+    local log=$1 line token n=0
+    shift
+    while IFS= read -r line; do
+        for token in "$@"; do
+            case " ${line} " in
+                *" ${token} "*) ;;
+                *) continue 2 ;;
+            esac
+        done
+        n=$((n + 1))
+    done <<< "${log}"
+    echo "${n}"
+}
+
+# readdr_log_lines <log> prints the lines of log whose message starts with
+# "mesh address", joined by " | ", or "none", for a failure message.
+readdr_log_lines() {
+    local line out=
+    while IFS= read -r line; do
+        case "${line}" in
+            *'msg="mesh address'*) out="${out:+${out} | }${line}" ;;
+        esac
+    done <<< "$1"
+    printf '%s' "${out:-none}"
+}
+
+# readdr_inet reads the IPv4 addresses of plexd's mesh interface with busybox
+# ip into READDR_INET, as <address>/<length> words joined by blanks in the
+# order ip prints them, and leaves what ip printed in READDR_INET_OUT and its
+# exit status in READDR_INET_RC. ip prints each IPv4 address after the word
+# inet. read -a splits the output into words without globbing them.
+readdr_inet() {
+    local -a words
+    local i
+    READDR_INET=""
+    READDR_INET_RC=0
+    READDR_INET_OUT=$(dc exec -T plexd /bin/busybox ip addr show dev "${MESH_IFACE}" 2>&1) || READDR_INET_RC=$?
+    read -r -d '' -a words <<< "${READDR_INET_OUT}" || true
+    for ((i = 0; i + 1 < ${#words[@]}; i++)); do
+        if [ "${words[i]}" = inet ]; then
+            READDR_INET="${READDR_INET:+${READDR_INET} }${words[i + 1]}"
+        fi
+    done
+}
+
+# readdr_inet_is <cidr> succeeds when plexd's mesh interface holds that IPv4
+# address and no other.
+readdr_inet_is() {
+    readdr_inet
+    [ "${READDR_INET_RC}" -eq 0 ] && [ "${READDR_INET}" = "$1" ]
+}
+
+# readdr_identity_has <address> reads identity.json from plexd's container
+# with head into READDR_IDENTITY and succeeds when it holds
+# "mesh_ip": "<address>", the way json.MarshalIndent writes the member. A
+# failed read fails the phase with its output.
+readdr_identity_has() {
+    READDR_IDENTITY=$(dc exec -T plexd head -c 8192 /var/lib/plexd/identity.json 2>&1) \
+        || fail "[readdress] reading /var/lib/plexd/identity.json in the plexd container failed: ${READDR_IDENTITY}"
+    case "${READDR_IDENTITY}" in
+        *"\"mesh_ip\": \"$1\""*) return 0 ;;
+    esac
+    return 1
+}
+
+# readdr_dns_answers <address> succeeds when the resolver at address answers
+# node-1.app.e2e.internal, the fixture's name of this node, with address.
+readdr_dns_answers() {
+    mesh_nslookup node-1.app.e2e.internal a "$1"
+    [ "${NSLOOKUP_RC}" -eq 0 ] && nslookup_answers "${NSLOOKUP_OUT}" node-1.app.e2e.internal "$1"
+}
+
+# readdr_until <timeout-s> <command>... runs the command every second until it
+# succeeds, and returns 1 once timeout-s seconds pass without that.
+readdr_until() {
+    local timeout=$1 start=${SECONDS}
+    shift
+    until "$@"; do
+        if [ $((SECONDS - start)) -ge "${timeout}" ]; then
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# readdr_heartbeat_hint <tag> <true|false> sets the reconcile hint of the
+# mock's heartbeat answer and leaves rotate_keys false.
+readdr_heartbeat_hint() {
+    curl -sf -X POST -H "Content-Type: application/json" \
+        -d "{\"reconcile\":$2,\"rotate_keys\":false}" \
+        "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 \
+        || fail "[$1] configure-heartbeat with reconcile $2 failed"
+}
+
+# readdr_move <tag> <from> <to> moves plexd from one mesh address to the other
+# the way the control plane does. With the heartbeat's reconcile hint off it
+# posts {"mesh_ip": "<to>"} to /test/readdress, which must answer 200 with
+# mesh_ip <to> and previous_mesh_ip <from>, and injects a node_state_updated
+# event the way Phase 7c does. Within 20 s plexd must log "mesh address
+# changed from state pull" with previous_mesh_ip=<from> and mesh_ip=<to>. The
+# hint goes on again, and MESH_NODE_IP becomes <to>.
+readdr_move() {
+    local tag=$1 from=$2 to=$3 log base answer status body rc=0 ok features start n
+    local event="evt-e2e-${tag// /-}"
+    log=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${log}"
+    base=$(readdr_log_count "${log}" "${READDR_MOVED_MSG}" "previous_mesh_ip=${from}" "mesh_ip=${to}")
+    readdr_heartbeat_hint "${tag}" false
+    answer=$(curl -s -w '\n%{http_code}' -X POST -H "Content-Type: application/json" \
+        -d "{\"mesh_ip\":\"${to}\"}" \
+        "http://localhost:18080/test/readdress" 2>&1) || rc=$?
+    status=${answer##*$'\n'}
+    body=${answer%$'\n'*}
+    if [ "${rc}" -ne 0 ] || [ "${status}" != "200" ]; then
+        features=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null | jq -c '.features' 2>&1 || true)
+        fail "[${tag}] POST /test/readdress {\"mesh_ip\":\"${to}\"} answered status ${status} with '${body}' (curl exited ${rc}), want 200; the last heartbeat the mock captured declares the features '${features}'"
+    fi
+    ok=$(printf '%s' "${body}" | jq -r --arg from "${from}" --arg to "${to}" '.mesh_ip == $to and .previous_mesh_ip == $from' 2>&1) \
+        || fail "[${tag}] jq could not read the answer '${body}' of POST /test/readdress: ${ok}"
+    if [ "${ok}" != true ]; then
+        fail "[${tag}] POST /test/readdress answered '${body}', want mesh_ip ${to} and previous_mesh_ip ${from}"
+    fi
+    echo "  the mock moved the node from ${from} to ${to}"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\":\"${event}\",\"type\":\"node_state_updated\",\"scope\":\"node\",\"payload\":{}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] injecting ${event} returned status ${status}, want 204"
+    fi
+    start=${SECONDS}
+    while :; do
+        log=$(dc logs plexd 2>&1) || fail "[${tag}] dc logs plexd failed: ${log}"
+        n=$(readdr_log_count "${log}" "${READDR_MOVED_MSG}" "previous_mesh_ip=${from}" "mesh_ip=${to}")
+        if [ "${n}" -gt "${base}" ]; then
+            break
+        fi
+        if [ $((SECONDS - start)) -ge 20 ]; then
+            fail "[${tag}] 20s after ${event}, the plexd log holds ${n} 'mesh address changed from state pull' line(s) with previous_mesh_ip=${from} mesh_ip=${to}, want more than ${base}; its mesh address lines: $(readdr_log_lines "${log}")"
+        fi
+        sleep 1
+    done
+    echo "  PASS: [${tag}] plexd logged 'mesh address changed from state pull' with previous_mesh_ip=${from} mesh_ip=${to} $((SECONDS - start))s after ${event}"
+    readdr_heartbeat_hint "${tag}" true
+    MESH_NODE_IP=${to}
+}
+
+# readdr_check_address <tag> <address> <previous> runs the checks a move to
+# address passes: wg-plexd holds <address>/24 alone, the route of Phase 2a
+# still runs through it, identity.json holds the address, the resolver
+# answers node-1.app.e2e.internal with the address on <address>:5354, and
+# nothing answers on <previous>:5354. plexd logs the move once the interface
+# holds the new address, and then moves the resolver and commits the address
+# to identity.json; its mesh DNS handler takes the dns block of the same pull
+# after that. So the identity and resolver checks wait up to 15 s. A query to
+# the previous address is routed into wg-plexd, where no peer holds that
+# address, so busybox nslookup must fail without an answer and without a
+# server's refusal.
+readdr_check_address() {
+    local tag=$1 addr=$2 prev=$3 line
+    readdr_inet
+    if [ "${READDR_INET_RC}" -ne 0 ] || [ "${READDR_INET}" != "${addr}/24" ]; then
+        fail "[${tag}] ip addr show dev ${MESH_IFACE} in the plexd container exited ${READDR_INET_RC} and lists the IPv4 addresses '${READDR_INET}', want ${addr}/24 alone (output: ${READDR_INET_OUT})"
+    fi
+    echo "  PASS: [${tag}] ${MESH_IFACE} holds ${addr}/24 and no other IPv4 address"
+    if ! mesh_route_names "${FIXTURE_ROUTED_SUBNET}"; then
+        fail "[${tag}] ip route show ${FIXTURE_ROUTED_SUBNET} in the plexd container prints '${MESH_ROUTE_OUT}', want the route of Phase 2a through ${MESH_IFACE}, which the address change must keep"
+    fi
+    echo "  PASS: [${tag}] the route to ${FIXTURE_ROUTED_SUBNET} of Phase 2a still runs through ${MESH_IFACE}"
+    if ! readdr_until 15 readdr_identity_has "${addr}"; then
+        fail "[${tag}] 15s after plexd logged the move, /var/lib/plexd/identity.json reads '${READDR_IDENTITY}', want \"mesh_ip\": \"${addr}\""
+    fi
+    echo "  PASS: [${tag}] identity.json reads \"mesh_ip\": \"${addr}\""
+    if ! readdr_until 15 readdr_dns_answers "${addr}"; then
+        fail "[${tag}] 15s after plexd logged the move, nslookup -type=a node-1.app.e2e.internal ${addr}:${MESH_DNS_PORT} exited ${NSLOOKUP_RC}, want 0 and ${addr} (output: ${NSLOOKUP_OUT})"
+    fi
+    echo "  PASS: [${tag}] nslookup -type=a node-1.app.e2e.internal ${addr}:${MESH_DNS_PORT} answers ${addr}"
+    mesh_nslookup node-1.app.e2e.internal a "${prev}"
+    if [ "${NSLOOKUP_RC}" -eq 0 ]; then
+        fail "[${tag}] nslookup -type=a node-1.app.e2e.internal ${prev}:${MESH_DNS_PORT} exited 0, want no answer on the address plexd left (output: ${NSLOOKUP_OUT})"
+    fi
+    while IFS= read -r line; do
+        case "${line}" in
+            "Name:"* | *"server can't find"*) fail "[${tag}] nslookup -type=a node-1.app.e2e.internal ${prev}:${MESH_DNS_PORT} exited ${NSLOOKUP_RC} with the line '${line}', want no answer on the address plexd left (output: ${NSLOOKUP_OUT})" ;;
+        esac
+    done <<< "${NSLOOKUP_OUT}"
+    echo "  PASS: [${tag}] nothing answers nslookup -type=a node-1.app.e2e.internal on ${prev}:${MESH_DNS_PORT} (exit ${NSLOOKUP_RC})"
+}
+
+# readdr_session_row <tag> <baseline> <what> waits up to 30 s for
+# session_activity_count to pass the baseline and requires it at exactly one
+# more, since what names one row. It leaves the last session activity body the
+# mock captured in READDR_ROW, that body's tcp.phase, tcp.listener_endpoint
+# and tcp.terminated_by in READDR_ROW_PHASE, READDR_ROW_ENDPOINT and
+# READDR_ROW_TERM, and the count in READDR_SESS_COUNT. No other session lives
+# in the phase and no byte crosses a tunnel, so the last body is that row.
+readdr_session_row() {
+    local tag=$1 base=$2 what=$3 start=${SECONDS} n rc=0
+    while :; do
+        n=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" session_activity_count)
+        case "${n}" in
+            *[!0-9]* | '') ;;
+            *) if [ "${n}" -gt "${base}" ]; then break; fi ;;
+        esac
+        if [ $((SECONDS - start)) -ge 30 ]; then
+            fail "[${tag}] session_activity_count is '${n}' 30s on, want $((base + 1)): ${what}"
+        fi
+        sleep 1
+    done
+    if [ "${n}" -ne $((base + 1)) ]; then
+        fail "[${tag}] session_activity_count went from ${base} to ${n}, want exactly one row: ${what}"
+    fi
+    READDR_SESS_COUNT=${n}
+    READDR_ROW=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>&1) || rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        fail "[${tag}] reading the last session activity body failed: curl exited ${rc} (${READDR_ROW})"
+    fi
+    READDR_ROW_PHASE=$(printf '%s' "${READDR_ROW}" | jq -r '.tcp.phase // empty' 2>&1) \
+        || fail "[${tag}] jq could not read the session activity body '${READDR_ROW}': ${READDR_ROW_PHASE}"
+    READDR_ROW_ENDPOINT=$(printf '%s' "${READDR_ROW}" | jq -r '.tcp.listener_endpoint // empty' 2>&1) \
+        || fail "[${tag}] jq could not read the session activity body '${READDR_ROW}': ${READDR_ROW_ENDPOINT}"
+    READDR_ROW_TERM=$(printf '%s' "${READDR_ROW}" | jq -r '.tcp.terminated_by // empty' 2>&1) \
+        || fail "[${tag}] jq could not read the session activity body '${READDR_ROW}': ${READDR_ROW_TERM}"
+}
+
+# (a) The node as the mock and wg-plexd hold it, and what (l) restores. Reading
+# the snapshot is a real GET on the state endpoint and counts on state_count.
+READDR_STATE=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>&1) \
+    || fail "[readdress] reading the live node state snapshot failed: ${READDR_STATE}"
+READDR_SAVED=$(printf '%s' "${READDR_STATE}" | jq -c '{mesh_ip: .mesh_ip, peers: .peers, policy: .policy, sessions: .sessions}' 2>&1) \
+    || fail "[readdress] jq could not read the live node state snapshot: ${READDR_SAVED}"
+READDR_CHECK=$(printf '%s' "${READDR_SAVED}" | jq -r --arg ip "${READDR_OLD_IP}" --arg rev "${FIXTURE_POLICY_REVISION}" --arg id "${FIXTURE_PEER_B2}" \
+    '.mesh_ip == $ip and .sessions == [] and .policy.revision_id == $rev and ([.peers[]? | select(.node_id == $id)] | length) == 1' 2>&1) \
+    || fail "[readdress] jq could not check the saved snapshot '${READDR_SAVED}': ${READDR_CHECK}"
+if [ "${READDR_CHECK}" != true ]; then
+    fail "[readdress] the mock serves '${READDR_SAVED}', want mesh_ip ${READDR_OLD_IP}, an empty sessions block, the fixture's policy revision ${FIXTURE_POLICY_REVISION} and one peer ${FIXTURE_PEER_B2}"
+fi
+READDR_SAVED_RULES=$(printf '%s' "${READDR_SAVED}" | jq -r '.policy.rules | length' 2>&1) \
+    || fail "[readdress] jq could not count the rules of the saved policy: ${READDR_SAVED_RULES}"
+echo "  saved mesh_ip ${READDR_OLD_IP}, the peers, policy revision ${FIXTURE_POLICY_REVISION} with ${READDR_SAVED_RULES} rule(s) and the empty sessions block"
+readdr_inet
+if [ "${READDR_INET_RC}" -ne 0 ] || [ "${READDR_INET}" != "${READDR_OLD_IP}/24" ]; then
+    fail "[readdress] ip addr show dev ${MESH_IFACE} in the plexd container exited ${READDR_INET_RC} and lists the IPv4 addresses '${READDR_INET}', want ${READDR_OLD_IP}/24 alone before the move (output: ${READDR_INET_OUT})"
+fi
+if ! mesh_route_names "${FIXTURE_ROUTED_SUBNET}"; then
+    fail "[readdress] ip route show ${FIXTURE_ROUTED_SUBNET} in the plexd container prints '${MESH_ROUTE_OUT}', want the route of Phase 2a through ${MESH_IFACE} before the move"
+fi
+echo "  PASS: [readdress] ${MESH_IFACE} holds ${READDR_OLD_IP}/24 alone and routes ${FIXTURE_ROUTED_SUBNET} before the move"
+READDR_HB_BASE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" heartbeat_count)
+case "${READDR_HB_BASE}" in
+    *[!0-9]* | '') fail "[readdress] could not read heartbeat_count from ${ASSERT_URL} (got '${READDR_HB_BASE}')" ;;
+esac
+
+# (b) meshpeer's wg0 as Phase 12e steps (c) and (d) set it up: a fresh key
+# pair, the edge PSK of peer ...a0b2, and plexd as its one peer at plexd:51820
+# with the allowed IP 10.99.0.1/32 and a 5 s keepalive. PLEXD_PUBKEY is the
+# key Phase 12e read, which no phase since rotated. Peer ...a0b2 of the served
+# snapshot becomes meshpeer again, and the two complete a handshake.
+READDR_SETUP_OUT=$(dc exec -T meshpeer sh -euc "${MESH_SETUP}" sh "${PLEXD_PUBKEY}" "${FIXTURE_PEER_B2}" "${MESH_NODE_IP}" "${MESH_PEER_IP}" 2>&1) \
+    || fail "[readdress peer] setting up wg0 in meshpeer failed: ${READDR_SETUP_OUT}"
+READDR_MESHPEER_PUBKEY=${READDR_SETUP_OUT##*$'\n'}
+case "${READDR_MESHPEER_PUBKEY}" in
+    *[!A-Za-z0-9+/=]* | '') fail "[readdress peer] meshpeer's wg0 setup printed '${READDR_SETUP_OUT}', want its public key on the last line" ;;
+esac
+if [ "${#READDR_MESHPEER_PUBKEY}" -ne 44 ]; then
+    fail "[readdress peer] meshpeer's wg0 setup printed '${READDR_SETUP_OUT}', want its 44-character public key on the last line"
+fi
+splice_state "readdress-peer" \
+    '.peers |= map(if .node_id == $v.id then .public_key = $v.key | .endpoint = $v.endpoint else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg key "${READDR_MESHPEER_PUBKEY}" --arg endpoint "${MESHPEER_IP}:51820" \
+        '{id: $id, key: $key, endpoint: $endpoint}')"
+READDR_HS_START=${SECONDS}
+while :; do
+    READDR_HS=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+        || fail "[readdress peer] wg show wg0 latest-handshakes in meshpeer failed: ${READDR_HS}"
+    READDR_HS_TIME=${READDR_HS##*[[:space:]]}
+    case "${READDR_HS_TIME}" in
+        *[!0-9]* | '') READDR_HS_TIME=0 ;;
+    esac
+    if [ "${READDR_HS_TIME}" -gt 0 ]; then
+        break
+    fi
+    if [ $((SECONDS - READDR_HS_START)) -ge 60 ]; then
+        fail "[readdress peer] meshpeer completed no handshake with plexd within 60s of the splice; wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
+    fi
+    sleep 2
+done
+echo "  PASS: [readdress peer] meshpeer completed a handshake with plexd $((SECONDS - READDR_HS_START))s after the splice"
+
+# (c) plexd declares mesh_readdress on every heartbeat, since its interface
+# came up with the Domain's mesh prefix and its controller replaces an address
+# in place. The mock captures a heartbeat body before it checks it, so the step
+# waits for a heartbeat the mock accepted after (a), one 30 s interval and
+# 15 s to spare, and reads the body captured last.
+READDR_HB_START=${SECONDS}
+while :; do
+    READDR_HB=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" heartbeat_count)
+    case "${READDR_HB}" in
+        *[!0-9]* | '') ;;
+        *) if [ "${READDR_HB}" -gt "${READDR_HB_BASE}" ]; then break; fi ;;
+    esac
+    if [ $((SECONDS - READDR_HB_START)) -ge 45 ]; then
+        fail "[readdress heartbeat] heartbeat_count is '${READDR_HB}' 45s on, want more than ${READDR_HB_BASE}"
+    fi
+    sleep 2
+done
+READDR_HB_BODY=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>&1) \
+    || fail "[readdress heartbeat] reading the last heartbeat body failed: ${READDR_HB_BODY}"
+READDR_FEATURES=$(printf '%s' "${READDR_HB_BODY}" | jq -c '.features' 2>&1) \
+    || fail "[readdress heartbeat] jq could not read the last heartbeat body '${READDR_HB_BODY}': ${READDR_FEATURES}"
+if [ "${READDR_FEATURES}" != '["mesh_readdress"]' ]; then
+    fail "[readdress heartbeat] the last heartbeat body carries the features ${READDR_FEATURES}, want [\"mesh_readdress\"] (body: ${READDR_HB_BODY})"
+fi
+echo "  PASS: [readdress heartbeat] the last heartbeat body carries features ${READDR_FEATURES}"
+
+# (d) A tcp session opened before the move binds its listener to 10.99.0.1.
+READDR_EXPIRES_AT=$(date -u -d "+10 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+10M +%Y-%m-%dT%H:%M:%SZ)
+READDR_SESS_BASE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" session_activity_count)
+case "${READDR_SESS_BASE}" in
+    *[!0-9]* | '') fail "[readdress session] could not read session_activity_count from ${ASSERT_URL} (got '${READDR_SESS_BASE}')" ;;
+esac
+configure_sessions "readdress-before" \
+    "$(session_entry "sess-e2e-readdress-before" "127.0.0.1" 8080 "${READDR_EXPIRES_AT}")"
+readdr_session_row "readdress session" "${READDR_SESS_BASE}" "the session_started row of sess-e2e-readdress-before"
+case "${READDR_ROW_PHASE}|${READDR_ROW_ENDPOINT}" in
+    "session_started|${READDR_OLD_IP}:"[0-9]*) ;;
+    *) fail "[readdress session] the row of sess-e2e-readdress-before is '${READDR_ROW}', want tcp.phase session_started and a tcp.listener_endpoint on ${READDR_OLD_IP}" ;;
+esac
+echo "  PASS: [readdress session] sess-e2e-readdress-before listens on ${READDR_ROW_ENDPOINT} before the move"
+
+# (e) The move.
+readdr_move "readdress move" "${READDR_OLD_IP}" "${READDR_NEW_IP}"
+
+# (f) The interface, the route, the identity and the resolver.
+readdr_check_address "readdress move" "${READDR_NEW_IP}" "${READDR_OLD_IP}"
+
+# (g) The session bound to the old address ended with the move. Its entry
+# still stands in the block, and the dispatcher never provisions a settled
+# session again, so the move draws exactly one row. A session opened after the
+# move binds the new address, and its drain keeps it out of the restart in
+# (j).
+readdr_session_row "readdress session" "${READDR_SESS_COUNT}" "the session_ended row of sess-e2e-readdress-before"
+if [ "${READDR_ROW_PHASE}" != session_ended ] || [ "${READDR_ROW_TERM}" != plexd_close ]; then
+    fail "[readdress session] the row the move drew for sess-e2e-readdress-before is '${READDR_ROW}', want tcp.phase session_ended with tcp.terminated_by plexd_close"
+fi
+echo "  PASS: [readdress session] sess-e2e-readdress-before reported session_ended with terminated_by plexd_close"
+configure_sessions "readdress-after" \
+    "$(session_entry "sess-e2e-readdress-after" "127.0.0.1" 8080 "${READDR_EXPIRES_AT}")"
+readdr_session_row "readdress session" "${READDR_SESS_COUNT}" "the session_started row of sess-e2e-readdress-after"
+case "${READDR_ROW_PHASE}|${READDR_ROW_ENDPOINT}" in
+    "session_started|${READDR_NEW_IP}:"[0-9]*) ;;
+    *) fail "[readdress session] the row of sess-e2e-readdress-after is '${READDR_ROW}', want tcp.phase session_started and a tcp.listener_endpoint on ${READDR_NEW_IP}" ;;
+esac
+echo "  PASS: [readdress session] sess-e2e-readdress-after reports the listener_endpoint ${READDR_ROW_ENDPOINT}"
+configure_sessions "readdress-drain" "[]"
+readdr_session_row "readdress session" "${READDR_SESS_COUNT}" "the session_ended row the drain of sess-e2e-readdress-after draws"
+if [ "${READDR_ROW_PHASE}" != session_ended ]; then
+    fail "[readdress session] the row the drain of sess-e2e-readdress-after drew is '${READDR_ROW}', want tcp.phase session_ended"
+fi
+
+# (h) system.info reports the address plexd now uses.
+READDR_CB_BEFORE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" execution_callback_count)
+case "${READDR_CB_BEFORE}" in
+    *[!0-9]* | '') fail "[readdress info] could not read execution_callback_count from ${ASSERT_URL} (got '${READDR_CB_BEFORE}')" ;;
+esac
+configure_executions "readdress-info" \
+    "$(exec_entry "exec-e2e-readdress-info" "system.info" "builtin" "pending" "null")"
+READDR_CB_START=${SECONDS}
+while :; do
+    READDR_CB=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" execution_callback_count)
+    case "${READDR_CB}" in
+        *[!0-9]* | '') ;;
+        *) if [ "${READDR_CB}" -ge $((READDR_CB_BEFORE + 3)) ]; then break; fi ;;
+    esac
+    if [ $((SECONDS - READDR_CB_START)) -ge 30 ]; then
+        fail "[readdress info] execution_callback_count is '${READDR_CB}' 30s after the system.info dispatch, want at least $((READDR_CB_BEFORE + 3))"
+    fi
+    sleep 2
+done
+READDR_CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>&1) \
+    || fail "[readdress info] reading the last execution callback body failed: ${READDR_CB_BODY}"
+READDR_CB_STATUS=$(printf '%s' "${READDR_CB_BODY}" | jq -r '.status // empty' 2>&1) \
+    || fail "[readdress info] jq could not read the execution callback body '${READDR_CB_BODY}': ${READDR_CB_STATUS}"
+READDR_CB_INLINE=$(printf '%s' "${READDR_CB_BODY}" | jq -r '.output.inline // empty' 2>&1) \
+    || fail "[readdress info] jq could not read the execution callback body '${READDR_CB_BODY}': ${READDR_CB_INLINE}"
+if [ "${READDR_CB_STATUS}" != succeeded ] || [ -z "${READDR_CB_INLINE}" ]; then
+    fail "[readdress info] the terminal callback of system.info is '${READDR_CB_BODY}', want status succeeded with output.inline"
+fi
+READDR_INFO=$(printf '%s' "${READDR_CB_INLINE}" | b64_decode 2>&1) \
+    || fail "[readdress info] could not decode output.inline '${READDR_CB_INLINE}': ${READDR_INFO}"
+READDR_INFO_IP=$(printf '%s' "${READDR_INFO}" | jq -r '.mesh_ip // empty' 2>&1) \
+    || fail "[readdress info] jq could not read the system.info output '${READDR_INFO}': ${READDR_INFO_IP}"
+if [ "${READDR_INFO_IP}" != "${READDR_NEW_IP}" ]; then
+    fail "[readdress info] system.info reports mesh_ip '${READDR_INFO_IP}', want ${READDR_NEW_IP} (output: ${READDR_INFO})"
+fi
+echo "  PASS: [readdress info] system.info reports mesh_ip ${READDR_INFO_IP}"
+
+# (i) meshpeer follows the move as its own pull would make it follow: plexd's
+# peer on its wg0 takes 10.99.0.9/32 as allowed IP. The control plane
+# compiles the moved node's address into the rules it serves, so the policy
+# that admits meshpeer to port 7001 names 10.99.0.9. probe_plexd_port then
+# connects to plexd at MESH_NODE_IP, now 10.99.0.9, over the tunnel of (b),
+# which the move kept up.
+READDR_RULES=$(jq -cn --arg src "${MESH_PEER_IP}/32" --arg dst "${MESH_NODE_IP}/32" \
+    '[{protocol: "tcp", source_cidr: $src, destination_cidr: $dst, ports: {from: 7001, to: 7001}}]' 2>&1) \
+    || fail "[readdress reach] could not build the rules of the policy: ${READDR_RULES}"
+serve_policy "readdress-policy" "${READDR_REV}" "${READDR_RULES}"
+expect_policy_applied "readdress reach" "${READDR_REV}" 1
+READDR_WG_OUT=$(dc exec -T meshpeer wg set wg0 peer "${PLEXD_PUBKEY}" allowed-ips "${MESH_NODE_IP}/32" 2>&1) \
+    || fail "[readdress reach] moving the allowed IPs of plexd's peer on meshpeer's wg0 to ${MESH_NODE_IP}/32 failed: ${READDR_WG_OUT}"
+probe_plexd_port "readdress reach" 7001 open
+
+# (j) A restart starts from the address plexd persisted. The data dir is a
+# volume, so the restarted agent loads its identity instead of registering
+# again, and brings wg-plexd up with the address it holds. As in Phase 7c, the
+# step waits until the restarted agent opened its event stream and a pull
+# followed, so the event of (k) has a stream to arrive on.
+READDR_RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+READDR_EVREQ_BEFORE=$(get_counter "${READDR_RESPONSE}" events_request_count)
+READDR_REG_BEFORE=$(get_counter "${READDR_RESPONSE}" registration_count)
+for READDR_COUNT in "${READDR_EVREQ_BEFORE}" "${READDR_REG_BEFORE}"; do
+    case "${READDR_COUNT}" in
+        *[!0-9]* | '') fail "[readdress restart] could not read events_request_count and registration_count from ${ASSERT_URL} (got '${READDR_EVREQ_BEFORE}' and '${READDR_REG_BEFORE}')" ;;
+    esac
+done
+READDR_LOG=$(dc logs plexd 2>&1) || fail "[readdress restart] dc logs plexd failed: ${READDR_LOG}"
+READDR_LOADED_BASE=$(readdr_log_count "${READDR_LOG}" 'msg="existing identity loaded"' "mesh_ip=${READDR_NEW_IP}")
+READDR_RESTART_OUT=$(dc restart plexd 2>&1) || fail "[readdress restart] dc restart plexd failed: ${READDR_RESTART_OUT}"
+READDR_RESTART_START=${SECONDS}
+READDR_STATE_AT_STREAM=""
+while :; do
+    sleep 2
+    READDR_RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    READDR_EVREQ=$(get_counter "${READDR_RESPONSE}" events_request_count)
+    READDR_PULLS=$(get_counter "${READDR_RESPONSE}" state_count)
+    case "${READDR_EVREQ}" in
+        *[!0-9]* | '') READDR_EVREQ=0 ;;
+    esac
+    case "${READDR_PULLS}" in
+        *[!0-9]* | '') READDR_PULLS=0 ;;
+    esac
+    if [ -z "${READDR_STATE_AT_STREAM}" ]; then
+        if [ "${READDR_EVREQ}" -gt "${READDR_EVREQ_BEFORE}" ]; then
+            READDR_STATE_AT_STREAM=${READDR_PULLS}
+        fi
+    elif [ "${READDR_PULLS}" -gt "${READDR_STATE_AT_STREAM}" ]; then
+        break
+    fi
+    if [ $((SECONDS - READDR_RESTART_START)) -ge 60 ]; then
+        fail "[readdress restart] the restarted plexd did not reopen its event stream and pull within 60s (events_request_count ${READDR_EVREQ_BEFORE} -> ${READDR_EVREQ}, state_count at the stream '${READDR_STATE_AT_STREAM}', now ${READDR_PULLS})"
+    fi
+done
+READDR_REG_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" registration_count)
+if [ "${READDR_REG_AFTER}" != "${READDR_REG_BEFORE}" ]; then
+    fail "[readdress restart] the restarted plexd registered again (registration_count ${READDR_REG_BEFORE} -> ${READDR_REG_AFTER}) instead of loading its persisted identity"
+fi
+echo "  PASS: [readdress restart] registration_count stayed at ${READDR_REG_AFTER}"
+READDR_LOG=$(dc logs plexd 2>&1) || fail "[readdress restart] dc logs plexd failed: ${READDR_LOG}"
+READDR_LOADED=$(readdr_log_count "${READDR_LOG}" 'msg="existing identity loaded"' "mesh_ip=${READDR_NEW_IP}")
+if [ "${READDR_LOADED}" -le "${READDR_LOADED_BASE}" ]; then
+    READDR_LAST_LOADED="none"
+    while IFS= read -r READDR_LINE; do
+        case "${READDR_LINE}" in
+            *'msg="existing identity loaded"'*) READDR_LAST_LOADED=${READDR_LINE} ;;
+        esac
+    done <<< "${READDR_LOG}"
+    fail "[readdress restart] the plexd log holds ${READDR_LOADED} 'existing identity loaded' line(s) with mesh_ip=${READDR_NEW_IP}, want more than ${READDR_LOADED_BASE}; the last such line is '${READDR_LAST_LOADED}'"
+fi
+echo "  PASS: [readdress restart] the restarted plexd logged 'existing identity loaded' with mesh_ip=${READDR_NEW_IP}"
+if ! readdr_until 30 readdr_inet_is "${READDR_NEW_IP}/24"; then
+    fail "[readdress restart] 30s after the restarted plexd pulled, ip addr show dev ${MESH_IFACE} in the plexd container exited ${READDR_INET_RC} and lists the IPv4 addresses '${READDR_INET}', want ${READDR_NEW_IP}/24 alone (output: ${READDR_INET_OUT})"
+fi
+echo "  PASS: [readdress restart] the restarted plexd brought ${MESH_IFACE} up with ${READDR_NEW_IP}/24"
+
+# (k) The move back, with the checks of (f).
+readdr_move "readdress back" "${READDR_NEW_IP}" "${READDR_OLD_IP}"
+readdr_check_address "readdress back" "${READDR_OLD_IP}" "${READDR_NEW_IP}"
+
+# (l) meshpeer's wg0 goes, as at the end of Phase 12e, and the saved peers and
+# policy are served again, so plexd applies the fixture's revision once more.
+# The mock then serves what (a) saved: mesh_ip 10.99.0.1, the peers, the
+# policy and the empty sessions block. readdr_move switched the heartbeat's
+# reconcile hint on again after each move.
+READDR_DEL_OUT=$(dc exec -T meshpeer ip link del wg0 2>&1) \
+    || fail "[readdress restore] deleting wg0 in meshpeer failed: ${READDR_DEL_OUT}"
+READDR_LOG=$(dc logs plexd 2>&1) || fail "[readdress restore] dc logs plexd failed: ${READDR_LOG}"
+READDR_FIXTURE_APPLIED=$(count_log_lines "${READDR_LOG}" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_POLICY_REVISION}")
+splice_state "readdress-restore" '.peers = $v.peers | .policy = $v.policy' "${READDR_SAVED}"
+expect_policy_applied "readdress restore" "${FIXTURE_POLICY_REVISION}" "${READDR_SAVED_RULES}" "${READDR_FIXTURE_APPLIED}"
+READDR_STATE=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>&1) \
+    || fail "[readdress restore] reading the live node state snapshot failed: ${READDR_STATE}"
+READDR_SERVED=$(printf '%s' "${READDR_STATE}" | jq -c '{mesh_ip: .mesh_ip, peers: .peers, policy: .policy, sessions: .sessions}' 2>&1) \
+    || fail "[readdress restore] jq could not read the live node state snapshot: ${READDR_SERVED}"
+if [ "$(jq -n --argjson a "${READDR_SERVED}" --argjson b "${READDR_SAVED}" '$a == $b' 2>&1)" != "true" ]; then
+    fail "[readdress restore] the mock serves '${READDR_SERVED}' after the restore, want the saved '${READDR_SAVED}'"
+fi
+echo "  PASS: [readdress restore] the mock serves mesh_ip ${READDR_OLD_IP}, the saved peers and policy, and an empty sessions block again"
+
+echo "=== Phase 12g PASSED: the state pull changes the mesh address ==="
 
 # ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
