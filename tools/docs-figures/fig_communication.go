@@ -77,13 +77,13 @@ func communicationChannels() *Figure {
 	done()
 
 	done = commPhase(f, s, x0, x1, "3", "Heartbeat (every 30s)")
-	s.msg(call, 0, 1, code("POST /v1/nodes/{id}/heartbeat"), code("{client_now, binary_checksum,"), code("binary_version, nat_summary}"))
+	s.msg(call, 0, 1, code("POST /v1/nodes/{id}/heartbeat"), code("{client_now, binary_checksum,"), code("binary_version, nat_summary,"), code("features}"))
 	s.msg(reply, 1, 0, code("200 OK"), body("accepted_at; optional reconcile,"), body("rotate_keys flags"))
 	done()
 
 	done = commPhase(f, s, x0, x1, "4", "Reconciliation (every 60s)")
 	s.msg(call, 0, 1, code("GET /v1/nodes/{id}/state"))
-	s.msg(reply, 1, 0, code("{peers, reachability, policy, bridge,"), code("state, reports, executions, sessions,"), code("secrets, signing_key, hooks, dns}"))
+	s.msg(reply, 1, 0, code("{mesh_ip, peers, reachability,"), code("policy, bridge, state, reports,"), code("executions, sessions, secrets,"), code("signing_key, hooks, dns}"))
 	s.self(0, body("Diff by presence and apply corrections"))
 	done()
 
