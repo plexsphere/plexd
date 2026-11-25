@@ -114,9 +114,9 @@ const (
 // routes to the resolvers the table names. It answers the node itself only: a
 // query from any source other than the listen address or a loopback address
 // is dropped, because plexd's firewall filters forwarded traffic only and
-// nothing else keeps other hosts from using the resolver.
+// nothing else keeps other hosts from using the resolver. Rebind moves it to
+// another address.
 type Server struct {
-	addr   netip.AddrPort
 	logger *slog.Logger
 
 	// records holds the names the server answers from. A pull swaps it
@@ -137,7 +137,12 @@ type Server struct {
 	// take to write, defaulted from tcpIdleTimeout. Tests shorten it.
 	tcpIdle time.Duration
 
-	mu    sync.Mutex
+	mu sync.Mutex
+	// addr is the address NewServer or the latest Rebind named. Rebind
+	// moves it while queries run, so allowedSource reads it under mu too.
+	addr netip.AddrPort
+	// udp and tcp are the pair Listen bound, or a Rebind before Serve,
+	// until Serve takes them.
 	udp   *net.UDPConn
 	tcp   *net.TCPListener
 	bound netip.AddrPort
@@ -145,6 +150,61 @@ type Server struct {
 	// takes the sockets out of udp and tcp, so a guard on those would let a
 	// Listen during Serve bind a pair nothing serves and move Addr to it.
 	listened bool
+	// run is the state of the running Serve, which a Rebind hands its new
+	// pair to. It is nil before Serve takes the pair and after it stops.
+	run *serveRun
+	// stopped is set once Serve stops. A Rebind after it binds nothing,
+	// because no Serve would answer on the pair.
+	stopped bool
+}
+
+// serveRun is what one Serve call shares with a Rebind while it runs: its
+// forwards, which outlive a Rebind, the channel its loops report a failure
+// on, the pair it answers on, and the pairs a Rebind replaced, whose
+// connections Serve still waits for when it returns.
+type serveRun struct {
+	fw      *forwards
+	errs    chan error
+	current *pair
+	retired []*pair
+}
+
+// fail hands err to Serve. A loop returns nil when Serve or a Rebind closed
+// its pair, which is no failure, and Serve returns the first error only.
+func (r *serveRun) fail(err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case r.errs <- err:
+	default:
+	}
+}
+
+// pair is one UDP socket and TCP listener while Serve answers on them, with
+// the loops that read them and the TCP connections accepted on the listener.
+type pair struct {
+	udp *net.UDPConn
+	tcp *net.TCPListener
+	// stop is closed before the sockets are, so a loop whose read fails
+	// tells the close that Serve or Rebind caused from a failure of the
+	// socket.
+	stop      chan struct{}
+	closeOnce sync.Once
+	loops     sync.WaitGroup
+	conns     connSet
+}
+
+// halt closes stop and then both sockets, once, and waits for the loops of
+// p. Once they have returned, the accept loop adds no connection to conns.
+// Serve and Rebind may both halt a pair.
+func (p *pair) halt() {
+	p.closeOnce.Do(func() {
+		close(p.stop)
+		_ = p.udp.Close()
+		_ = p.tcp.Close()
+	})
+	p.loops.Wait()
 }
 
 // NewServer returns a server for addr. It binds nothing until Listen, so the
@@ -186,7 +246,8 @@ func (s *Server) SetForwarding(f *Forwarding) {
 
 // Addr returns the address the server is bound to. Before Listen, and when
 // addr named a port other than 0, it is addr itself; after Listen on port 0
-// it carries the port Listen found, which is the same for UDP and TCP.
+// it carries the port Listen found, which is the same for UDP and TCP. A
+// Rebind that succeeded moves it to the address Rebind bound.
 func (s *Server) Addr() netip.AddrPort {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,11 +266,8 @@ func (s *Server) Listen() error {
 	if s.listened {
 		return fmt.Errorf("meshdns: listen %s: %w", s.addr, errors.New("already listening"))
 	}
-	if a := s.addr.Addr(); !a.IsValid() || a.Unmap().IsUnspecified() {
-		// The zero address would bind every interface of the host, and so
-		// would an unspecified one, 0.0.0.0 or ::. An IPv4-mapped 0.0.0.0
-		// binds as 0.0.0.0, so it is unmapped first.
-		return fmt.Errorf("meshdns: listen %s: %w", s.addr, errors.New("no address to listen on"))
+	if !listenable(s.addr) {
+		return fmt.Errorf("meshdns: listen %s: %w", s.addr, errNoAddress)
 	}
 
 	udp, tcp, bound, err := listenPair(s.addr)
@@ -218,6 +276,75 @@ func (s *Server) Listen() error {
 	}
 	s.udp, s.tcp, s.bound, s.listened = udp, tcp, bound, true
 	return nil
+}
+
+// errNoAddress is the error of a Listen or Rebind on an address that
+// listenable refuses.
+var errNoAddress = errors.New("no address to listen on")
+
+// listenable reports whether the server may bind addr. The zero address would
+// bind every interface of the host, and so would an unspecified one, 0.0.0.0
+// or ::. An IPv4-mapped 0.0.0.0 binds as 0.0.0.0, so it is unmapped first.
+func listenable(addr netip.AddrPort) bool {
+	a := addr.Addr()
+	return a.IsValid() && !a.Unmap().IsUnspecified()
+}
+
+// Rebind moves the server to addr. It binds UDP and TCP there through
+// listenPair, so port 0 finds a port as Listen does, and then closes the pair
+// it answered on before, with every TCP connection accepted on that pair. A
+// running Serve goes on with the new pair and keeps its forwards, and a Serve
+// that has not started yet takes the new pair. Addr and allowedSource follow
+// addr. A Rebind to the address Addr returns changes nothing. A failed bind
+// is returned, and the old pair keeps answering. Before Listen and once Serve
+// stopped, Rebind binds nothing and fails, because no Serve would take the
+// pair.
+func (s *Server) Rebind(addr netip.AddrPort) error {
+	s.mu.Lock()
+	old, err := s.rebindLocked(addr)
+	s.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("meshdns: rebind %s: %w", addr, err)
+	}
+	if old != nil {
+		// The loops of the old pair read the listen address under s.mu, so
+		// the wait for them runs outside it.
+		old.halt()
+		old.conns.close()
+	}
+	return nil
+}
+
+// rebindLocked binds the new pair of Rebind and swaps it in. It returns the
+// pair a running Serve answered on until now, for Rebind to close, or nil.
+// The caller holds s.mu.
+func (s *Server) rebindLocked(addr netip.AddrPort) (*pair, error) {
+	switch {
+	case addr == s.bound:
+		return nil, nil
+	case !s.listened:
+		return nil, errors.New("not listening")
+	case s.stopped:
+		return nil, errors.New("server stopped")
+	case !listenable(addr):
+		return nil, errNoAddress
+	}
+	udp, tcp, bound, err := listenPair(addr)
+	if err != nil {
+		return nil, err
+	}
+	s.addr, s.bound = addr, bound
+	if s.run == nil {
+		// Serve has not started, so it takes the new pair.
+		_ = s.udp.Close()
+		_ = s.tcp.Close()
+		s.udp, s.tcp = udp, tcp
+		return nil, nil
+	}
+	old := s.run.current
+	s.run.current = s.servePair(s.run, udp, tcp)
+	s.run.retired = append(s.run.retired, old)
+	return old, nil
 }
 
 // listenPair binds UDP and TCP on addr and returns both sockets and the
@@ -273,62 +400,74 @@ func listenPair(addr netip.AddrPort) (*net.UDPConn, *net.TCPListener, netip.Addr
 // Serve answers queries on the sockets Listen bound until ctx ends, then
 // ends the forwarded queries in flight, over UDP and TCP, closes both sockets
 // and every open TCP connection, waits for the goroutine of each connection
-// and each forward to finish, and returns nil. A forwarded query that Serve
-// ends gets no reply, as one that arrives after the close does. A failed UDP
-// read, or a TCP listener closed by anything but Serve, while ctx is live
-// stops serving the same way and is returned, so the caller can log that the
-// resolver stopped. Any other failed accept, such as EMFILE while the process
-// is out of file descriptors, is retried after a wait, so a passing shortage
-// stops neither TCP nor UDP. Serve without a successful Listen returns an
-// error.
+// and each forward to finish, and returns nil. A Rebind while Serve runs
+// moves it to the new pair, and Serve goes on until ctx ends. A forwarded
+// query that Serve ends gets no reply, as one that arrives after the close
+// does. A failed UDP read, or a TCP listener closed by anything but Serve or
+// Rebind, while ctx is live stops serving the same way and is returned, so
+// the caller can log that the resolver stopped. Any other failed accept, such
+// as EMFILE while the process is out of file descriptors, is retried after a
+// wait, so a passing shortage stops neither TCP nor UDP. Serve without a
+// successful Listen returns an error.
 func (s *Server) Serve(ctx context.Context) error {
+	// The forwards' context ends with Serve, so a query waiting for a
+	// resolver does not hold up the return.
+	fctx, cancelForwards := context.WithCancel(ctx)
+	defer cancelForwards()
+	run := &serveRun{fw: newForwards(fctx, s.forwardLimit), errs: make(chan error, 1)}
+
 	s.mu.Lock()
 	udp, tcp := s.udp, s.tcp
 	s.udp, s.tcp = nil, nil
+	if udp != nil {
+		run.current = s.servePair(run, udp, tcp)
+		s.run = run
+	}
 	s.mu.Unlock()
 	if udp == nil {
 		return errors.New("meshdns: serve: not listening")
 	}
 
-	// stop is closed before the sockets are, so a loop whose read fails
-	// tells the close that Serve caused from a failure of the socket.
-	stop := make(chan struct{})
-	// The forwards' context ends with Serve, so a query waiting for a
-	// resolver does not hold up the return.
-	fctx, cancelForwards := context.WithCancel(ctx)
-	defer cancelForwards()
-	fw := newForwards(fctx, s.forwardLimit)
-	var conns connSet
-	var loops sync.WaitGroup
-	errs := make(chan error, 2)
-	loops.Add(2)
-	go func() {
-		defer loops.Done()
-		errs <- s.serveUDP(udp, stop, fw)
-	}()
-	go func() {
-		defer loops.Done()
-		errs <- s.serveTCP(fw, tcp, &conns, stop)
-	}()
-
 	var err error
 	select {
 	case <-ctx.Done():
-	case err = <-errs:
+	case err = <-run.errs:
 	}
-	close(stop)
+	s.mu.Lock()
+	s.run, s.stopped = nil, true
+	pairs := append([]*pair{run.current}, run.retired...)
+	s.mu.Unlock()
 	cancelForwards()
-	_ = udp.Close()
-	_ = tcp.Close()
-	// The accept loop has returned once loops.Wait does, so no connection
-	// joins the set while closeAll closes it, and the UDP read loop has
-	// returned. closeAll waits for the goroutine of every connection, which
-	// waits for the forwards it started, so no forward joins fw while Serve
-	// waits for them.
-	loops.Wait()
-	conns.closeAll()
-	fw.wg.Wait()
+	// The accept loop of a pair has returned once halt does, so no
+	// connection joins its set while closeAll closes it, and its UDP read
+	// loop has returned. closeAll waits for the goroutine of every
+	// connection, which waits for the forwards it started, so no forward
+	// joins fw while Serve waits for them.
+	for _, p := range pairs {
+		p.halt()
+	}
+	for _, p := range pairs {
+		p.conns.closeAll()
+	}
+	run.fw.wg.Wait()
 	return err
+}
+
+// servePair starts the UDP read loop and the TCP accept loop of udp and tcp
+// for run and returns their pair. The caller holds s.mu, so a Serve that
+// stops meanwhile finds the pair in run and halts it.
+func (s *Server) servePair(run *serveRun, udp *net.UDPConn, tcp *net.TCPListener) *pair {
+	p := &pair{udp: udp, tcp: tcp, stop: make(chan struct{})}
+	p.loops.Add(2)
+	go func() {
+		defer p.loops.Done()
+		run.fail(s.serveUDP(udp, p.stop, run.fw))
+	}()
+	go func() {
+		defer p.loops.Done()
+		run.fail(s.serveTCP(run.fw, tcp, &p.conns, p.stop))
+	}()
+	return p
 }
 
 // forwards holds the forwarded queries of one Serve call, over UDP and TCP:
@@ -365,15 +504,21 @@ func (s *Server) takeSlot(slots chan struct{}) bool {
 // node itself, which reaches the listen address from that address or from
 // loopback. A mesh peer cannot send from the node's own address, because
 // WireGuard drops a packet whose source is outside the sending peer's allowed
-// IPs.
+// IPs. A Rebind moves the listen address while queries run, so it is read
+// under s.mu.
 func (s *Server) allowedSource(src netip.Addr) bool {
 	src = src.Unmap()
-	return src == s.addr.Addr().Unmap() || src.IsLoopback()
+	if src.IsLoopback() {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return src == s.addr.Addr().Unmap()
 }
 
 // serveUDP answers the datagrams of conn one after the other until a read
 // fails, and hands the forwarded queries to fw. It returns nil when the
-// failure is the close Serve caused.
+// failure is the close Serve or Rebind caused.
 func (s *Server) serveUDP(conn *net.UDPConn, stop <-chan struct{}, fw *forwards) error {
 	buf := make([]byte, maxMessageSize)
 	for {
@@ -463,10 +608,10 @@ const (
 
 // serveTCP accepts the connections of ln until ln is closed, and serves them
 // with their forwarded queries in fw. It returns nil when that is the close
-// Serve caused, and the accept error when it is not. Any other accept error
-// is taken to pass, as EMFILE does once the process has a file descriptor
-// free again, so serveTCP logs it at Debug, waits and accepts again rather
-// than stop the resolver for the rest of the run.
+// Serve or Rebind caused, and the accept error when it is not. Any other
+// accept error is taken to pass, as EMFILE does once the process has a file
+// descriptor free again, so serveTCP logs it at Debug, waits and accepts
+// again rather than stop the resolver for the rest of the run.
 func (s *Server) serveTCP(fw *forwards, ln acceptor, conns *connSet, stop <-chan struct{}) error {
 	var delay time.Duration
 	for {
@@ -701,8 +846,9 @@ func (c *tcpConn) writeLocked(resp []byte) bool {
 	return true
 }
 
-// connSet tracks the open TCP connections of one Serve call, so the cap
-// counts them and Serve can close every one and wait for its goroutine.
+// connSet tracks the open TCP connections of one pair a Serve call answers
+// on, so the cap counts them, Rebind can close every one, and Serve can close
+// every one and wait for its goroutine.
 type connSet struct {
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
@@ -733,15 +879,20 @@ func (c *connSet) remove(conn net.Conn) {
 	c.wg.Done()
 }
 
-// closeAll closes every open connection, which ends the read its goroutine
-// waits in, and waits for all of them to finish.
+// closeAll closes every open connection and waits for all of them to finish.
 func (c *connSet) closeAll() {
+	c.close()
+	c.wg.Wait()
+}
+
+// close closes every open connection, which ends the read its goroutine
+// waits in.
+func (c *connSet) close() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	for conn := range c.conns {
 		_ = conn.Close()
 	}
-	c.mu.Unlock()
-	c.wg.Wait()
 }
 
 // respond returns the response to the query msg appended to dst, or nil when

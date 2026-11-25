@@ -1304,6 +1304,252 @@ func TestServer_ServeReturnsSocketError(t *testing.T) {
 	}
 }
 
+// secondLoopback returns 127.0.0.2, a loopback address beside 127.0.0.1 that
+// a test moves a resolver to. It skips the test on darwin, whose loopback
+// interface carries 127.0.0.1 alone.
+func secondLoopback(t *testing.T) netip.Addr {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("the loopback interface of macOS carries 127.0.0.1 alone, so nothing binds 127.0.0.2")
+	}
+	return netip.MustParseAddr("127.0.0.2")
+}
+
+// wantAnswered fails the test unless s answers a query for a host of
+// serverBlock on Addr over UDP and over TCP.
+func wantAnswered(t *testing.T, s *Server) {
+	t.Helper()
+	msg := newQuery(t, 1, "db-1.openstack.lab.internal.", dnsmessage.TypeA)
+	for _, network := range []string{"udp", "tcp"} {
+		resp := exchangeOver(network)(t, dial(t, network, s), msg)
+		if addr, err := firstA(resp); err != nil || addr != netip.MustParseAddr("10.42.0.3") {
+			t.Errorf("reply over %s from %s = %v, %v, want 10.42.0.3", network, s.Addr(), addr, err)
+		}
+	}
+}
+
+// wantReleased fails the test unless no socket holds addr over UDP or TCP:
+// a TCP dial is refused and a UDP socket binds it. Nothing of the server can
+// answer a query there then.
+func wantReleased(t *testing.T, addr netip.AddrPort) {
+	t.Helper()
+	if conn, err := net.DialTimeout("tcp", addr.String(), ioTimeout); err == nil {
+		_ = conn.Close()
+		t.Errorf("dial tcp %s = nil, want an error: a listener is still open there", addr)
+	}
+	pc, err := net.ListenPacket("udp", addr.String())
+	if err != nil {
+		t.Errorf("ListenPacket(udp, %s) = %v, want nil: a UDP socket is still open there", addr, err)
+		return
+	}
+	_ = pc.Close()
+}
+
+func TestServer_RebindWhileServing(t *testing.T) {
+	moved := secondLoopback(t)
+	s := newTestServer()
+	s.SetRecords(mustBuild(t, serverBlock()))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	old := s.Addr()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+
+	msg := newQuery(t, 1, "db-1.openstack.lab.internal.", dnsmessage.TypeA)
+	// A reply proves the server accepted the connection on the old pair.
+	held := dial(t, "tcp", s)
+	exchangeTCP(t, held, msg)
+
+	// The queries of this test come from loopback, which allowedSource
+	// allows before it reads the listen address. A probe from another
+	// source reads the address while Rebind writes it, so the race detector
+	// sees a read that skips the mutex.
+	foreign := netip.MustParseAddr("192.0.2.7")
+	stopProbe := make(chan struct{})
+	probed := make(chan bool, 1)
+	go func() {
+		allowed := false
+		for {
+			if s.allowedSource(foreign) {
+				allowed = true
+			}
+			select {
+			case <-stopProbe:
+				probed <- allowed
+				return
+			default:
+			}
+		}
+	}()
+	err := s.Rebind(netip.AddrPortFrom(moved, 0))
+	close(stopProbe)
+	if <-probed {
+		t.Errorf("allowedSource(%s) = true while Rebind moved the server, want false", foreign)
+	}
+	if err != nil {
+		t.Fatalf("Rebind(%s:0) = %v, want nil", moved, err)
+	}
+
+	addr := s.Addr()
+	if addr.Addr() != moved || addr.Port() == 0 {
+		t.Fatalf("Addr() after Rebind = %v, want %s with the port Rebind found", addr, moved)
+	}
+	// allowedSource passes a loopback source before it reads the listen
+	// address, so no query of this test can show the source rule moved. On
+	// Linux the node's own queries come from the mesh IP, which is no
+	// loopback address, so the address the rule compares with is read here.
+	s.mu.Lock()
+	ruled := s.addr.Addr()
+	s.mu.Unlock()
+	if ruled != moved {
+		t.Errorf("source rule address after Rebind = %v, want %v", ruled, moved)
+	}
+	wantAnswered(t, s)
+	waitClosed(t, held)
+	wantReleased(t, old)
+
+	// A query from the new listen address itself is answered.
+	d := net.Dialer{Timeout: ioTimeout, LocalAddr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(moved, 0))}
+	conn, err := d.Dial("udp", addr.String())
+	if err != nil {
+		t.Fatalf("dial udp %s from %s: %v", addr, moved, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if src := conn.LocalAddr().(*net.UDPAddr).AddrPort().Addr(); src != moved {
+		t.Fatalf("query source = %v, want %v", src, moved)
+	}
+	if a, err := firstA(exchangeUDP(t, conn, msg)); err != nil || a != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("reply to a query from %s = %v, %v, want 10.42.0.3", moved, a, err)
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("Serve() = %v after Rebind, want it to serve until its context ends", err)
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve() = %v, want nil after the cancel", err)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatalf("Serve did not return within %v of the cancel", ioTimeout)
+	}
+	wantReleased(t, addr)
+	goleak.VerifyNone(t)
+}
+
+func TestServer_RebindAddressInUse(t *testing.T) {
+	s := startServer(t, mustBuild(t, serverBlock()))
+	old := s.Addr()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy a UDP port: %v", err)
+	}
+	defer func() { _ = pc.Close() }()
+	taken := pc.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	err = s.Rebind(taken)
+
+	if !errors.Is(err, errAddrInUse) {
+		t.Errorf("Rebind(%s) = %v, want an error wrapping %v", taken, err, errAddrInUse)
+	}
+	if prefix := "meshdns: rebind " + taken.String() + ": "; err == nil || !strings.HasPrefix(err.Error(), prefix) {
+		t.Errorf("Rebind(%s) = %v, want an error starting with %q", taken, err, prefix)
+	}
+	if got := s.Addr(); got != old {
+		t.Errorf("Addr() after the failed Rebind = %v, want %v", got, old)
+	}
+	wantAnswered(t, s)
+}
+
+func TestServer_RebindToBoundAddress(t *testing.T) {
+	s := newTestServer()
+	s.SetRecords(mustBuild(t, serverBlock()))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	addr := s.Addr()
+	udp, tcp := s.udp, s.tcp
+
+	// The pair holds the address, so a bind there would fail: nil means
+	// Rebind bound nothing.
+	if err := s.Rebind(addr); err != nil {
+		t.Fatalf("Rebind(%s) before Serve = %v, want nil", addr, err)
+	}
+	if s.udp != udp || s.tcp != tcp || s.Addr() != addr {
+		t.Fatalf("Rebind to the bound address replaced the pair or moved Addr to %v", s.Addr())
+	}
+
+	defer serve(t, s)()
+	msg := newQuery(t, 1, "db-1.openstack.lab.internal.", dnsmessage.TypeA)
+	held := dial(t, "tcp", s)
+	exchangeTCP(t, held, msg)
+	if err := s.Rebind(addr); err != nil {
+		t.Fatalf("Rebind(%s) while serving = %v, want nil", addr, err)
+	}
+	// The connection accepted before is still served on the same pair.
+	if a, err := firstA(exchangeTCP(t, held, msg)); err != nil || a != netip.MustParseAddr("10.42.0.3") {
+		t.Errorf("reply on the held connection = %v, %v, want 10.42.0.3", a, err)
+	}
+	wantAnswered(t, s)
+}
+
+// Between Listen and Serve, Rebind replaces the pair Serve takes. The test
+// moves to another port of 127.0.0.1, so it runs on darwin too.
+func TestServer_RebindBeforeServe(t *testing.T) {
+	s := newTestServer()
+	s.SetRecords(mustBuild(t, serverBlock()))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	old := s.Addr()
+
+	if err := s.Rebind(netip.MustParseAddrPort("127.0.0.1:0")); err != nil {
+		t.Fatalf("Rebind(127.0.0.1:0) = %v, want nil", err)
+	}
+
+	addr := s.Addr()
+	if addr.Addr() != old.Addr() || addr.Port() == 0 || addr == old {
+		t.Fatalf("Addr() after Rebind = %v, want 127.0.0.1 with a port other than %d", addr, old.Port())
+	}
+	wantReleased(t, old)
+	defer serve(t, s)()
+	wantAnswered(t, s)
+}
+
+// Before Listen and after Serve no Serve would take a new pair, and an
+// unspecified address would bind every interface, so Rebind binds nothing.
+func TestServer_RebindRefuses(t *testing.T) {
+	to := netip.MustParseAddrPort("127.0.0.1:5354")
+	s := newTestServer()
+	if err := s.Rebind(to); err == nil || err.Error() != "meshdns: rebind 127.0.0.1:5354: not listening" {
+		t.Errorf("Rebind(%s) before Listen = %v, want it refused as not listening", to, err)
+	}
+
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen() = %v, want nil", err)
+	}
+	addr := s.Addr()
+	stop := serve(t, s)
+	unspecified := netip.MustParseAddrPort("0.0.0.0:0")
+	if err := s.Rebind(unspecified); err == nil || err.Error() != "meshdns: rebind 0.0.0.0:0: no address to listen on" {
+		t.Errorf("Rebind(%s) = %v, want it refused with no address to listen on", unspecified, err)
+	}
+	stop()
+
+	if err := s.Rebind(to); err == nil || err.Error() != "meshdns: rebind 127.0.0.1:5354: server stopped" {
+		t.Errorf("Rebind(%s) after Serve = %v, want it refused as stopped", to, err)
+	}
+	if got := s.Addr(); got != addr {
+		t.Errorf("Addr() after the refused Rebinds = %v, want %v", got, addr)
+	}
+}
+
 // acceptResult is what one Accept of a fakeAcceptor returns.
 type acceptResult struct {
 	conn net.Conn
