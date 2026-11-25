@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -961,6 +962,32 @@ func TestNftablesController_Real(t *testing.T) {
 	if counts := n.lookupElements(t, n.chainRules(t, chain)[0]); len(counts) != 2 || counts[0]+counts[1] != 3 {
 		t.Errorf("the input chain's set rules read sets of %v elements, want two sets of three elements together", counts)
 	}
+
+	t.Log("a controller whose kernel refused the sets writes the first ruleset as a list behind the guard, and enforces it")
+	listCtrl := NewNftablesController(testLogger())
+	listCtrl.listOnly = true
+	if err := n.do(func() error {
+		return listCtrl.ApplyRules(chain, []FirewallRule{allow7001v4, allow7001v6, allow8001, allowOut9001, deny})
+	}); err != nil {
+		t.Fatalf("ApplyRules() of the list-only controller error = %v, want nil", err)
+	}
+	listRules := n.chainRules(t, chain)
+	assertGuarded(t, listRules, "plexd0")
+	for i, rules := range listRules {
+		for j, rule := range rules {
+			if slices.ContainsFunc(rule.Exprs, func(e expr.Any) bool { _, ok := e.(*expr.Lookup); return ok }) {
+				t.Errorf("chain %d rule %d = %s, want no lookup in the list", i, j, formatExprs(rule.Exprs))
+			}
+		}
+	}
+	p.connects(t, "10.99.0.1:7001")
+	p.connects(t, "[fd00:99::1]:7001")
+	p.timesOut(t, "10.99.0.1:7002")
+	p.timesOut(t, "[fd00:99::1]:7002")
+	p.connects(t, "192.0.2.2:8001")
+	p.timesOut(t, "192.0.2.2:8002")
+	n.connects(t, "10.99.0.2:9001")
+	n.blocked(t, "10.99.0.2:9003")
 
 	// Every rule add and every set element is echoed back on the batch's
 	// netlink socket, which the default buffers cannot hold for a ruleset of

@@ -73,7 +73,8 @@ const nflogGroup uint16 = 28772
 // them behind the round-trip probe exemption, and the output chain behind
 // the foreign-source rule and the relay and round-trip probe exemptions.
 // The unlogged allows that name an address are looked up in anonymous sets
-// rather than walked as a list.
+// rather than walked as a list, unless the kernel refused the sets once
+// (listOnly).
 //
 // A rule with a LogTag gets a log rule in front of it, which sends the first
 // packet of each connection it admits to NFLOG group nflogGroup. The
@@ -86,10 +87,22 @@ type NftablesController struct {
 	// tests replace.
 	openLog func(group uint16, sink ConnSink, logger *slog.Logger) (*nflogReader, error)
 
-	mu     sync.Mutex // guards sink and reader
+	// write writes the three lists of an apply into the kernel in one
+	// batch. It is writeChains, which tests replace.
+	write func(chain string, lists [3][]chainEntry) error
+
+	mu     sync.Mutex // guards sink, reader and listOnly
 	sink   ConnSink
 	reader *nflogReader
+	// listOnly is set once the kernel refused a ruleset with sets and took
+	// it as a list. Every later apply writes the list until the process
+	// ends.
+	listOnly bool
 }
+
+// ruleSetsUnavailable is the Warn line ApplyRules logs when the kernel
+// refused the rule sets and took the rules as a list.
+const ruleSetsUnavailable = "policy rule sets unavailable, rules are installed as a list"
 
 var (
 	_ ConnReporter = (*NftablesController)(nil)
@@ -98,7 +111,9 @@ var (
 
 // NewNftablesController returns a new NftablesController.
 func NewNftablesController(logger *slog.Logger) *NftablesController {
-	return &NftablesController{logger: logger, openLog: openNflog}
+	c := &NftablesController{logger: logger, openLog: openNflog}
+	c.write = c.writeChains
+	return c
 }
 
 // SetConnSink sets the sink the NFLOG reader hands the connections of logged
@@ -382,20 +397,59 @@ func (c *NftablesController) EnsureChain(chain string) error {
 // set elements it adds (applyBufferBytes), because the default ones cannot
 // hold the echoes of a ruleset of a few dozen policy rules written into
 // three chains.
+//
+// A kernel that refuses the sets gets the rule list behind the same guard.
+// When a write whose lists hold a set fails, ApplyRules builds the lists
+// again without sets and writes once more. When that succeeds, it sets
+// listOnly, logs ruleSetsUnavailable at Warn with the first write's error,
+// and returns nil; every later apply writes the list. When it fails too,
+// ApplyRules returns its error, and the next apply tries the sets again. A
+// failed write of lists without a set is not retried. Every write is one
+// atomic batch, so a failed one leaves the chains as they were. The retry
+// is not tied to an errno: interval concatenations entered mainline in
+// Linux 5.6, and what an older kernel answers was not measured.
 func (c *NftablesController) ApplyRules(chain string, rules []FirewallRule) error {
 	rules = c.prepareLogging(rules)
-	segments, err := segmentRules(rules, true)
+	// build returns the three lists and whether they hold a set.
+	build := func(sets bool) (lists [3][]chainEntry, held bool, err error) {
+		segments, err := segmentRules(rules, sets)
+		if err != nil {
+			return lists, false, err
+		}
+		for i, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+			if lists[i], err = chainRuleExprs(segments, hook); err != nil {
+				return lists, false, err
+			}
+		}
+		return lists, slices.ContainsFunc(segments, func(s segment) bool { return s.sets != nil }), nil
+	}
+
+	c.mu.Lock()
+	sets := !c.listOnly
+	c.mu.Unlock()
+	lists, held, err := build(sets)
 	if err != nil {
 		return err
 	}
-	var lists [3][]chainEntry
-	for i, hook := range []chainHook{hookInput, hookForward, hookOutput} {
-		if lists[i], err = chainRuleExprs(segments, hook); err != nil {
+	if err := c.write(chain, lists); err != nil {
+		if !held {
 			return err
 		}
-	}
-	if err := c.writeChains(chain, lists); err != nil {
-		return err
+		lists, _, buildErr := build(false)
+		if buildErr != nil {
+			return buildErr
+		}
+		if listErr := c.write(chain, lists); listErr != nil {
+			return listErr
+		}
+		c.mu.Lock()
+		c.listOnly = true
+		c.mu.Unlock()
+		c.logger.Warn(ruleSetsUnavailable,
+			"component", "policy",
+			"chain", chain,
+			"error", err,
+		)
 	}
 
 	c.logger.Debug("nftables rules applied",
