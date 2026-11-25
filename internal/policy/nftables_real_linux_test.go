@@ -349,6 +349,59 @@ func (n *realNetns) listenUDP(t *testing.T, addr string) net.PacketConn {
 	return pc
 }
 
+// chainRules reads the rules of the input, forward and output chain of the
+// named chain in table inet plexd inside the namespace, in that order.
+func (n *realNetns) chainRules(t *testing.T, chain string) [3][]*nftables.Rule {
+	t.Helper()
+	var lists [3][]*nftables.Rule
+	table := &nftables.Table{Family: nftables.TableFamilyINet, Name: tableName}
+	inputName, forwardName, outputName := chainNames(chain)
+	if err := n.do(func() error {
+		conn, err := nftables.New()
+		if err != nil {
+			return err
+		}
+		for i, name := range []string{inputName, forwardName, outputName} {
+			if lists[i], err = conn.GetRules(table, &nftables.Chain{Name: name, Table: table}); err != nil {
+				return fmt.Errorf("chain %s: %w", name, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("namespace %s: read the rules: %v", n.name, err)
+	}
+	return lists
+}
+
+// assertGuarded checks that each of the three chains opens with the guard
+// for iface alone, without a counter, and that no other rule loads an
+// interface name.
+func assertGuarded(t *testing.T, lists [3][]*nftables.Rule, iface string) {
+	t.Helper()
+	for i, rules := range lists {
+		key := expr.MetaKeyIIFNAME
+		if i == 2 {
+			key = expr.MetaKeyOIFNAME
+		}
+		if len(rules) == 0 {
+			t.Errorf("chain %d holds no rule, want the guard first", i)
+			continue
+		}
+		assertExprs(t, rules[0].Exprs, []expr.Any{
+			&expr.Meta{Key: key, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte(iface + "\x00")},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		})
+		for j, rule := range rules[1:] {
+			for _, e := range rule.Exprs {
+				if meta, ok := e.(*expr.Meta); ok && (meta.Key == expr.MetaKeyIIFNAME || meta.Key == expr.MetaKeyOIFNAME) {
+					t.Errorf("chain %d rule %d = %s, want no interface match behind the guard", i, j+1, formatExprs(rule.Exprs))
+				}
+			}
+		}
+	}
+}
+
 // TestNftablesController_Real drives the kernel's nf_tables and connection
 // tracking. It builds three network namespaces: a peer P whose eth0 is joined
 // to the node N's plexd0 by a veth pair, as a mesh peer is joined over
@@ -531,6 +584,9 @@ func TestNftablesController_Real(t *testing.T) {
 		}
 	}
 	apply(allow7001v4, allow7001v6, allow8001, allowOut9001, deny)
+
+	t.Log("each chain opens with the guard for plexd0, and no rule behind it matches an interface")
+	assertGuarded(t, n.chainRules(t, chain), "plexd0")
 
 	t.Log("P reaches what the rules allow on N over both families, and nothing else; N's replies leave through the output chain")
 	p.connects(t, "10.99.0.1:7001")
@@ -745,6 +801,32 @@ func TestNftablesController_Real(t *testing.T) {
 			t.Errorf("P read after the revoke: %v, want a timeout", err)
 		}
 	}
+
+	t.Log("a ruleset for plexd9, which N does not have, lets P's connection pass at the guards: no counter moves")
+	apply(
+		FirewallRule{Interface: "plexd9", SrcIP: "10.99.0.2/32", DstIP: "10.99.0.1/32", Port: 7002, Protocol: "tcp", Action: "allow"},
+		FirewallRule{Interface: "plexd9", Action: "deny"},
+	)
+	p.connects(t, "10.99.0.1:7002")
+	for i, rules := range n.chainRules(t, chain) {
+		for j, rule := range rules {
+			for _, e := range rule.Exprs {
+				if c, ok := e.(*expr.Counter); ok && c.Packets != 0 {
+					t.Errorf("chain %d rule %d counted %d packets, want 0: %s", i, j, c.Packets, formatExprs(rule.Exprs))
+				}
+			}
+		}
+	}
+
+	t.Log("with rules on plexd0 and lan0 the guard names both, and each rule keeps its interface")
+	apply(
+		deny,
+		FirewallRule{Interface: "lan0", SrcIP: "192.0.2.0/24", DstIP: "192.0.2.1/32", Port: 7002, Protocol: "tcp", Action: "allow"},
+		FirewallRule{Interface: "lan0", Action: "deny"},
+	)
+	e.connects(t, "192.0.2.1:7002")
+	e.timesOut(t, "192.0.2.1:7001")
+	p.timesOut(t, "10.99.0.1:7002")
 
 	// Every rule add is echoed back on the batch's netlink socket, which the
 	// default buffers cannot hold for a ruleset of a few dozen rules written
