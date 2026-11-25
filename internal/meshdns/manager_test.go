@@ -954,6 +954,64 @@ func TestManager_StartAddressInUse(t *testing.T) {
 	}
 }
 
+// msgMoved is the manager's line for a rebind, spelled out as the others are.
+const msgMoved = "mesh dns listener moved"
+
+func TestManager_RebindReappliesRegistration(t *testing.T) {
+	moved := secondLoopback(t)
+	reg := &fakeRegistrar{}
+	m, logs := startManager(t, reg)
+	ctx := context.Background()
+	m.Handle(ctx, snapshot(exampleBlock()))
+	wantMethods(t, reg, "Apply")
+	previous := m.Addr()
+
+	if err := m.Rebind(ctx, moved); err != nil {
+		t.Fatalf("Rebind(%s) = %v, want nil", moved, err)
+	}
+
+	listen := netip.AddrPortFrom(moved, previous.Port())
+	if got := m.Addr(); got != listen {
+		t.Errorf("Addr() after Rebind = %v, want %v, the new address on the same port", got, listen)
+	}
+	wantMethods(t, reg, "Apply", "Apply")
+	calls := reg.recorded()
+	want := calls[0].reg
+	want.Server = listen
+	if got := calls[1].reg; !got.Equal(want) {
+		t.Errorf("Apply(%+v) after Rebind, want Apply(%+v)", got, want)
+	}
+	checkBounded(t, calls[1])
+	wantLine(t, logs, slog.LevelInfo, msgMoved, map[string]string{
+		"listen":   listen.String(),
+		"previous": previous.String(),
+	})
+	wantLastLine(t, logs, msgRegistered, map[string]string{"server": listen.String()})
+	wantAddr(t, m, "db-1.openstack.lab.internal", "10.42.0.3")
+}
+
+func TestManager_RebindAfterShutdown(t *testing.T) {
+	reg := &fakeRegistrar{}
+	m, logs := startManager(t, reg)
+	ctx := context.Background()
+	m.Handle(ctx, snapshot(exampleBlock()))
+	addr := m.Addr()
+	if err := m.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() = %v, want nil", err)
+	}
+
+	// After Shutdown nothing binds, so the address need not exist here.
+	if err := m.Rebind(ctx, netip.MustParseAddr("127.0.0.2")); err != nil {
+		t.Errorf("Rebind() after Shutdown = %v, want nil", err)
+	}
+
+	wantMethods(t, reg, "Apply", "Revert")
+	if got := m.Addr(); got != addr {
+		t.Errorf("Addr() after Rebind = %v, want %v", got, addr)
+	}
+	wantCount(t, logs, msgMoved, 0)
+}
+
 func TestManager_HandleChangedRecord(t *testing.T) {
 	reg := &fakeRegistrar{}
 	m, logs := startManager(t, reg)

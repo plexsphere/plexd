@@ -27,8 +27,8 @@ const maxSkippedLogged = 5
 // Manager follows the dns block of the state pull: it builds the records and
 // the forwarding table of each block, swaps them into its server, and keeps
 // the registration with the system resolver in step with them. A mutex guards
-// the state Handle and Shutdown share, so a pull racing the drain either
-// finishes before the revert or does nothing at all. The manager never
+// the state Handle, Rebind and Shutdown share, so a pull racing the drain
+// either finishes before the revert or does nothing at all. The manager never
 // touches health or readiness: a node whose resolver cannot register still
 // serves its mesh, and the log lines are the operator's view of it.
 type Manager struct {
@@ -73,8 +73,9 @@ type Manager struct {
 	// failureLogged is the text of the registration failure logged last, or
 	// empty, so a failure that repeats on every pull warns once.
 	failureLogged string
-	// closed is set by Shutdown. Every later Handle is a no-op, so a pull that
-	// waited for the mutex cannot register again after the revert.
+	// closed is set by Shutdown. Every later Handle and Rebind is a no-op, so
+	// a pull that waited for the mutex cannot register again after the
+	// revert.
 	closed bool
 }
 
@@ -124,6 +125,40 @@ func (m *Manager) Addr() netip.AddrPort {
 // resolver stopped while ctx was live, and no mesh name is answered after it.
 func (m *Manager) Run(ctx context.Context) error {
 	return m.server.Serve(ctx)
+}
+
+// Rebind moves the resolver to listenIP when the node's mesh address changed.
+// It keeps the port the resolver is bound to, which is the configured port,
+// or the one the kernel picked when that was 0, so a listenIP equal to the
+// current one changes nothing. When a registration counts as applied, the
+// system resolver gets it again with the new server, so the link names the
+// new address in the same cycle even when the pull carries no dns block. The
+// forwarding table, which skips a resolver at the listen address, is built
+// against the new address with the next dns block. A failed bind is
+// returned, and the resolver keeps answering on its old address. After
+// Shutdown, Rebind does nothing and returns nil.
+func (m *Manager) Rebind(ctx context.Context, listenIP netip.Addr) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	previous := m.server.Addr()
+	listen := netip.AddrPortFrom(listenIP, previous.Port())
+	if listen == previous {
+		return nil
+	}
+	if err := m.server.Rebind(listen); err != nil {
+		return err
+	}
+	m.logger.Info("mesh dns listener moved",
+		"listen", m.server.Addr().String(),
+		"previous", previous.String(),
+	)
+	if m.applied != nil {
+		m.register(ctx, m.records.Registration(m.iface, m.server.Addr(), m.forwarding))
+	}
+	return nil
 }
 
 // Handle takes the dns block of one state pull. It has the signature of
