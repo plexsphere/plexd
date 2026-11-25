@@ -981,6 +981,86 @@ func TestHeartbeat_DenialTaxonomy(t *testing.T) {
 	}
 }
 
+// heartbeatBodyWithFeatures builds a contract-valid heartbeat body that
+// carries features, or no features key at all when features is nil.
+func heartbeatBodyWithFeatures(t *testing.T, features []string) string {
+	t.Helper()
+	m := map[string]any{
+		"client_now":      time.Now().UTC().Format(time.RFC3339),
+		"binary_checksum": validHexChecksum,
+		"binary_version":  "1.2.3",
+		"nat_summary":     map[string]any{},
+	}
+	if features != nil {
+		m["features"] = features
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal heartbeat: %v", err)
+	}
+	return string(body)
+}
+
+// declareFeatures sends a heartbeat that carries features, or none when
+// features is nil, and fails the test unless the mock accepts it.
+func declareFeatures(t *testing.T, baseURL string, features []string) {
+	t.Helper()
+	status, code := answerStatusAndCode(t, http.MethodPost, baseURL+"/v1/nodes/node-1/heartbeat", heartbeatBodyWithFeatures(t, features))
+	if status != http.StatusOK {
+		t.Fatalf("heartbeat with features %q: status = %d (code %q), want %d", features, status, code, http.StatusOK)
+	}
+}
+
+// answerStatusAndCode sends a request and returns the answer's status and the
+// code member of its JSON body, empty when the body carries none.
+func answerStatusAndCode(t *testing.T, method, url, body string) (int, string) {
+	t.Helper()
+	resp := doRequest(t, method, url, body)
+	defer resp.Body.Close()
+	var answer struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("%s %s: decode answer: %v", method, url, err)
+	}
+	return resp.StatusCode, answer.Code
+}
+
+// TestHeartbeat_RefusesInvalidFeatures pins that a heartbeat whose features
+// list holds more than 16 names, or a name outside the contract's grammar, is
+// refused with 400 invalid_features and changes nothing: it does not count,
+// and the declaration of the heartbeat before it stays.
+func TestHeartbeat_RefusesInvalidFeatures(t *testing.T) {
+	_, ts := newTestServer(t)
+	declareFeatures(t, ts.URL, []string{api.FeatureMeshReaddress})
+
+	seventeen := make([]string, 17)
+	for i := range seventeen {
+		seventeen[i] = fmt.Sprintf("feature_%d", i)
+	}
+	for _, tt := range []struct {
+		name     string
+		features []string
+	}{
+		{"seventeen names", seventeen},
+		{"upper-case name", []string{"Mesh"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			status, code := answerStatusAndCode(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBodyWithFeatures(t, tt.features))
+			if status != http.StatusBadRequest || code != "invalid_features" {
+				t.Errorf("answer = %d %q, want %d %q", status, code, http.StatusBadRequest, "invalid_features")
+			}
+		})
+	}
+
+	if got := getAssertions(t, ts.URL).HeartbeatCount; got != 1 {
+		t.Errorf("heartbeat_count = %d, want 1 (the refused heartbeats do not count)", got)
+	}
+	if status, code := answerStatusAndCode(t, http.MethodPost, ts.URL+"/test/readdress", `{"mesh_ip":"10.99.0.9"}`); status != http.StatusOK {
+		t.Errorf("readdress after the refused heartbeats = %d %q, want %d (mesh_readdress still declared)", status, code, http.StatusOK)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // GET /v1/nodes/{id}/state
 // ---------------------------------------------------------------------------
@@ -1718,6 +1798,129 @@ func TestRotateSigningKey_ConcurrentWithInject(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// TestReaddress_FollowsTheDeclaredFeatures pins that the mock moves the node
+// only while its latest accepted heartbeat declared mesh_readdress: a list with
+// a duplicate and another name declares it, and a heartbeat without the list
+// withdraws it, after which a move is refused and changes nothing.
+func TestReaddress_FollowsTheDeclaredFeatures(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	declareFeatures(t, ts.URL, []string{api.FeatureMeshReaddress, api.FeatureMeshReaddress, "zz"})
+	if status, code := answerStatusAndCode(t, http.MethodPost, ts.URL+"/test/readdress", `{"mesh_ip":"10.99.0.9"}`); status != http.StatusOK {
+		t.Fatalf("readdress after declaring mesh_readdress = %d %q, want %d", status, code, http.StatusOK)
+	}
+
+	declareFeatures(t, ts.URL, nil)
+	status, code := answerStatusAndCode(t, http.MethodPost, ts.URL+"/test/readdress", `{"mesh_ip":"10.99.0.1"}`)
+	if status != http.StatusConflict || code != "node_cannot_readdress" {
+		t.Errorf("readdress after a heartbeat without features = %d %q, want %d %q", status, code, http.StatusConflict, "node_cannot_readdress")
+	}
+	if got := getState(t, ts.URL).MeshIP; got != "10.99.0.9" {
+		t.Errorf("mesh_ip after the refused move = %q, want %q", got, "10.99.0.9")
+	}
+}
+
+// TestReaddress_RefusesInvalidBodies pins that an address outside the Domain's
+// mesh, a value that is no address and a body with an unknown key are each
+// refused with 400 and leave the node's address alone, while the node has
+// declared mesh_readdress.
+func TestReaddress_RefusesInvalidBodies(t *testing.T) {
+	_, ts := newTestServer(t)
+	declareFeatures(t, ts.URL, []string{api.FeatureMeshReaddress})
+
+	for _, tt := range []struct {
+		name, body, wantCode string
+	}{
+		{"outside the mesh", `{"mesh_ip":"192.168.0.5"}`, "invalid_mesh_ip"},
+		{"no address", `{"mesh_ip":"x"}`, "invalid_mesh_ip"},
+		{"unknown key", `{"mesh_ip":"10.99.0.9","previous_mesh_ip":"10.99.0.1"}`, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			status, code := answerStatusAndCode(t, http.MethodPost, ts.URL+"/test/readdress", tt.body)
+			if status != http.StatusBadRequest || code != tt.wantCode {
+				t.Errorf("answer = %d %q, want %d %q", status, code, http.StatusBadRequest, tt.wantCode)
+			}
+		})
+	}
+	if got := getState(t, ts.URL).MeshIP; got != "10.99.0.1" {
+		t.Errorf("mesh_ip after the refused bodies = %q, want %q", got, "10.99.0.1")
+	}
+
+	resp := doRequest(t, http.MethodGet, ts.URL+"/test/readdress", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestReaddress_MovesTheNodeAddress pins that a move answers both addresses
+// and that the next pull carries the new one in mesh_ip and in the node's
+// dns.hosts entry, whatever the configured snapshot holds, as does the answer
+// of the next registration.
+func TestReaddress_MovesTheNodeAddress(t *testing.T) {
+	srv, ts := newTestServer(t)
+	declareFeatures(t, ts.URL, []string{api.FeatureMeshReaddress})
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/readdress", `{"mesh_ip":"10.99.0.9"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("readdress status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var answer map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("decode readdress: %v", err)
+	}
+	if want := map[string]string{"mesh_ip": "10.99.0.9", "previous_mesh_ip": "10.99.0.1"}; !reflect.DeepEqual(answer, want) {
+		t.Errorf("readdress answer = %v, want %v", answer, want)
+	}
+
+	// The pull right after the move carries the new address.
+	configured := getState(t, ts.URL)
+	if configured.DNS == nil || len(configured.DNS.Hosts) == 0 || configured.DNS.Hosts[0].NodeID != testMockNodeID {
+		t.Fatalf("dns = %+v, want the fixture's block with the node's entry first", configured.DNS)
+	}
+	if configured.MeshIP != "10.99.0.9" || configured.DNS.Hosts[0].MeshIP != "10.99.0.9" {
+		t.Errorf("first pull = mesh_ip %q, node host %q; want both %q", configured.MeshIP, configured.DNS.Hosts[0].MeshIP, "10.99.0.9")
+	}
+
+	// The configured snapshot names the node at another address, which the
+	// pull overrides without rewriting the fixture.
+	configured.MeshIP = "10.99.0.77"
+	configured.DNS.Hosts[0].MeshIP = "10.99.0.77"
+	body, err := json.Marshal(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configure := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	configure.Body.Close()
+	if configure.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", configure.StatusCode, http.StatusNoContent)
+	}
+
+	state := getState(t, ts.URL)
+	if state.MeshIP != "10.99.0.9" {
+		t.Errorf("mesh_ip = %q, want %q", state.MeshIP, "10.99.0.9")
+	}
+	if state.DNS == nil {
+		t.Fatal("dns = null, want the fixture's block")
+	}
+	wantHosts := []api.NodeStateDNSHost{
+		{NodeID: testMockNodeID, FQDN: "node-1.app.e2e.internal", MeshIP: "10.99.0.9"},
+		{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FQDN: "peer-1.app.e2e.internal", MeshIP: "10.99.0.2"},
+		{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", FQDN: "peer-2.app.e2e.internal", MeshIP: "10.99.0.3"},
+	}
+	if !reflect.DeepEqual(state.DNS.Hosts, wantHosts) {
+		t.Errorf("dns hosts = %+v, want %+v", state.DNS.Hosts, wantHosts)
+	}
+	if fixture := srv.GetState(); fixture.MeshIP != "10.99.0.77" || fixture.DNS.Hosts[0].MeshIP != "10.99.0.77" {
+		t.Errorf("configured fixture = mesh_ip %q, node host %q; want both left at %q", fixture.MeshIP, fixture.DNS.Hosts[0].MeshIP, "10.99.0.77")
+	}
+
+	if got := registerMock(t, ts.URL).MeshIP; got != "10.99.0.9" {
+		t.Errorf("register mesh_ip = %q, want %q", got, "10.99.0.9")
+	}
 }
 
 // TestInjectEvent_UncanonicalPayload_Returns400 pins that a payload the

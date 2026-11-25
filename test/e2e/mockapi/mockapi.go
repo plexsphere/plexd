@@ -241,6 +241,15 @@ type Server struct {
 	signingPublicKeyB64 string
 	signingKeyID        string
 
+	// The node's mesh address and the features its latest accepted heartbeat
+	// declared, sorted and without duplicates, both guarded by meshMu.
+	// Register and every pull hand out meshIP. POST /test/readdress moves it
+	// only while features holds mesh_readdress, as the control plane moves a
+	// node only then.
+	meshMu   sync.RWMutex
+	meshIP   string
+	features []string
+
 	nsk                 []byte // 32-byte AES-256-GCM key for secret encryption
 	expectedBearerToken string // plaintext bearer token for local endpoint auth
 
@@ -302,6 +311,7 @@ func New() *Server {
 		signingPrivateKey:   priv,
 		signingPublicKeyB64: pubB64,
 		signingKeyID:        mockSigningKeyID,
+		meshIP:              mockMeshIP,
 		// A deterministic 32-byte key that is deliberately not valid UTF-8, so
 		// the suite cannot pass by accident if nsk ever regresses to being
 		// emitted as a raw string instead of base64.
@@ -572,7 +582,7 @@ func newStateFixture() api.NodeStateSnapshot {
 			SearchDomain: "app.e2e.internal",
 			Zones:        []string{"app.e2e.internal", "e2e.internal"},
 			Hosts: []api.NodeStateDNSHost{
-				{NodeID: mockNodeID, FQDN: "node-1.app.e2e.internal", MeshIP: "10.99.0.1"},
+				{NodeID: mockNodeID, FQDN: "node-1.app.e2e.internal", MeshIP: mockMeshIP},
 				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FQDN: "peer-1.app.e2e.internal", MeshIP: "10.99.0.2"},
 				{NodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", FQDN: "peer-2.app.e2e.internal", MeshIP: "10.99.0.3"},
 			},
@@ -613,6 +623,16 @@ func policyFingerprint(rules []api.PolicyRule) string {
 const (
 	mockProjectID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0"
 	mockNodeID    = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+	// mockMeshIP is the mesh address the mock's node starts with. Register
+	// hands it out and every pull carries it until POST /test/readdress moves
+	// the node.
+	mockMeshIP = "10.99.0.1"
+	// mockDomainMeshCIDR is the mesh prefix of the mock's Domain. Register
+	// hands it out, and POST /test/readdress moves the node only inside it.
+	mockDomainMeshCIDR = "10.99.0.0/24"
+	// maxHeartbeatFeatures is how many names a heartbeat's features list may
+	// hold, as the contract bounds it.
+	maxHeartbeatFeatures = 16
 	// mockSigningKeyID is the id of the key the mock starts with: it stamps it on
 	// every signed envelope and returns it from register and on every pull until
 	// POST /test/rotate-signing-key replaces the key. The agent's verifier selects
@@ -659,6 +679,11 @@ var (
 	// copy rather than share the agent's, so it checks the contract, not the
 	// agent's reading of it.
 	imageDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	// featureNameRe matches one name of a heartbeat's features list, the
+	// grammar the contract gives it.
+	featureNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	// mockMeshPrefix is mockDomainMeshCIDR parsed.
+	mockMeshPrefix = netip.MustParsePrefix(mockDomainMeshCIDR)
 )
 
 // releaseFixtures holds the plexd release binary and its Sigstore bundle served
@@ -754,6 +779,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/session-token", s.handleSessionToken)
 	s.mux.HandleFunc("POST /test/session-connect", s.handleSessionConnect)
 	s.mux.HandleFunc("POST /test/rotate-signing-key", s.handleRotateSigningKey)
+	s.mux.HandleFunc("POST /test/readdress", s.handleReaddress)
 
 	// Method-not-allowed fallbacks.
 	s.mux.HandleFunc("/v1/health", methodNotAllowed)
@@ -794,6 +820,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/session-token", methodNotAllowed)
 	s.mux.HandleFunc("/test/session-connect", methodNotAllowed)
 	s.mux.HandleFunc("/test/rotate-signing-key", methodNotAllowed)
+	s.mux.HandleFunc("/test/readdress", methodNotAllowed)
 }
 
 // maxCapturedBody bounds how many bytes captureBody keeps per request. The
@@ -1047,22 +1074,26 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	signingKeyID, _, signingPublicKey := s.currentSigningKey()
 	resp := api.RegisterResponse{
 		NodeID:           mockNodeID,
-		MeshIP:           "10.99.0.1",
+		MeshIP:           s.currentMeshIP(),
 		SigningPublicKey: signingPublicKey,
 		SigningKeyID:     signingKeyID,
 		// NSK is standard-padded base64 per the register contract; plexd
 		// decodes it back into the 32-byte AES-256-GCM key.
 		NSK:            base64.StdEncoding.EncodeToString(s.nsk),
 		PeerSnapshot:   fixtureRegisterPeers,
-		DomainMeshCIDR: "10.99.0.0/24",
+		DomainMeshCIDR: mockDomainMeshCIDR,
 	}
 	writeJSON(w, http.StatusCreated, resp)
 }
 
 // handleHeartbeat handles POST /v1/nodes/{id}/heartbeat. It enforces
 // the v1 heartbeat contract: strict decoding, a required nat_summary object,
-// clock-skew tolerance, and checksum/version shape. The counter increments only
-// when every check passes, so invalid requests do not count.
+// a features list of at most maxHeartbeatFeatures names in the grammar of
+// featureNameRe, refused as 400 invalid_features, clock-skew tolerance, and
+// checksum/version shape. The counter increments only when every check passes,
+// so invalid requests do not count and change nothing. An accepted heartbeat
+// replaces the declared features, sorted and without duplicates, so one
+// without the list declares none.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	data, err := s.captureBody("heartbeat", r)
 	if err != nil {
@@ -1091,6 +1122,20 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The control plane parses features right after the body and before the
+	// clock-skew gate, so a body wrong in both answers invalid_features. The
+	// detail states the rule, never the refused name.
+	if len(req.Features) > maxHeartbeatFeatures {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_features", fmt.Sprintf("features holds more than %d names", maxHeartbeatFeatures))
+		return
+	}
+	for _, name := range req.Features {
+		if !featureNameRe.MatchString(name) {
+			writeProblem(w, r, http.StatusBadRequest, "invalid_features", "every name in features must match "+featureNameRe.String())
+			return
+		}
+	}
+
 	// Clock skew: client_now must be within 60s of server time either way.
 	if skew := time.Since(req.ClientNow); skew > 60*time.Second || skew < -60*time.Second {
 		writeProblem(w, r, http.StatusBadRequest, "clock_skew", "client_now is outside the accepted tolerance")
@@ -1105,6 +1150,13 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, r, http.StatusBadRequest, "binary_version_empty", "binary_version is required")
 		return
 	}
+
+	// The declaration is stored before the count rises, so a suite that waits
+	// for a fresh heartbeat sees what that heartbeat declared.
+	declared := slices.Compact(slices.Sorted(slices.Values(req.Features)))
+	s.meshMu.Lock()
+	s.features = declared
+	s.meshMu.Unlock()
 
 	s.heartbeatCount.Add(1)
 
@@ -1130,16 +1182,39 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // through projectSessions, so every pull redelivers the sessions that are still
 // live. The signing_key block always carries the mock's current signing key,
 // whatever the configured snapshot holds, so a pull after
-// POST /test/rotate-signing-key hands the node the new key.
+// POST /test/rotate-signing-key hands the node the new key. In the same way
+// mesh_ip and the node's dns.hosts entry always carry the node's current mesh
+// address, so a pull after POST /test/readdress moves the node.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.stateCount.Add(1)
 	state := s.GetState()
 	state.Executions = s.projectExecutions(state.Executions)
 	signingKeyID, _, signingPublicKey := s.currentSigningKey()
 	state.SigningKey = &api.NodeStateSigningKey{KeyID: signingKeyID, PublicKey: signingPublicKey}
+	meshIP := s.currentMeshIP()
+	state.MeshIP = meshIP
+	state.DNS = servedDNS(state.DNS, meshIP)
 	served := s.projectSessions(*state.Sessions)
 	state.Sessions = &served
 	writeJSON(w, http.StatusOK, state)
+}
+
+// servedDNS returns the dns block as served: a copy of the configured one
+// whose host entry for mockNodeID names meshIP. The configured block is never
+// rewritten in place, because GetState hands out a shallow copy of the
+// fixture. A nil block stays nil, so a fixture without one still serves null.
+func servedDNS(configured *api.NodeStateDNS, meshIP string) *api.NodeStateDNS {
+	if configured == nil {
+		return nil
+	}
+	served := *configured
+	served.Hosts = slices.Clone(configured.Hosts)
+	for i := range served.Hosts {
+		if served.Hosts[i].NodeID == mockNodeID {
+			served.Hosts[i].MeshIP = meshIP
+		}
+	}
+	return &served
 }
 
 // projectExecutions returns the executions block as served: a freshly allocated
@@ -4956,7 +5031,7 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 // GetState returns the current state fixture with the peers, executions,
 // sessions, secrets, and shared_subnets slices normalized to non-nil so they
 // always serialize as [] rather than null; the contract never sends null for
-// shared_subnets. The fourteen envelope blocks carry no omitempty, so
+// shared_subnets. The fifteen envelope members carry no omitempty, so
 // all keys are emitted (null for unpopulated blocks). The hooks block is left as
 // configured: a fixture without one serves null, which keeps every hook a
 // rollout installed. The dns block is left as configured too: a fixture
@@ -5283,6 +5358,59 @@ func (s *Server) currentSigningKey() (keyID string, priv ed25519.PrivateKey, pub
 	s.signingMu.RLock()
 	defer s.signingMu.RUnlock()
 	return s.signingKeyID, s.signingPrivateKey, s.signingPublicKeyB64
+}
+
+// handleReaddress handles POST /test/readdress, the mock's stand-in for a
+// Domain admin who moves the node to another mesh address. The body is
+// {"mesh_ip"}, decoded strictly, so an unknown field or a malformed body is a
+// 400. A mesh_ip that is no IPv4 address inside mockDomainMeshCIDR is a 400
+// invalid_mesh_ip, and while the node's latest accepted heartbeat did not
+// declare mesh_readdress the move is a 409 node_cannot_readdress, as the
+// control plane refuses it for an agent that cannot follow. Otherwise it
+// answers 200 {"mesh_ip","previous_mesh_ip"}, and from then on register and
+// every pull hand out the new address. Like the control plane, the mock
+// publishes no event for a move, so the node learns it with its next pull.
+func (s *Server) handleReaddress(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("readdress", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var body struct {
+		MeshIP string `json:"mesh_ip"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	addr, err := netip.ParseAddr(body.MeshIP)
+	if err != nil || !addr.Is4() || !mockMeshPrefix.Contains(addr) {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_mesh_ip", "mesh_ip must be an IPv4 address inside "+mockDomainMeshCIDR)
+		return
+	}
+
+	// The declaration is read and the address replaced under one lock, so a
+	// heartbeat that withdraws mesh_readdress cannot slip in between.
+	s.meshMu.Lock()
+	if !slices.Contains(s.features, api.FeatureMeshReaddress) {
+		s.meshMu.Unlock()
+		writeProblem(w, r, http.StatusConflict, "node_cannot_readdress", "the node's latest heartbeat did not declare "+api.FeatureMeshReaddress)
+		return
+	}
+	previous := s.meshIP
+	s.meshIP = addr.String()
+	s.meshMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]string{"mesh_ip": addr.String(), "previous_mesh_ip": previous})
+}
+
+// currentMeshIP returns the node's mesh address, read under meshMu.
+func (s *Server) currentMeshIP() string {
+	s.meshMu.RLock()
+	defer s.meshMu.RUnlock()
+	return s.meshIP
 }
 
 // SetEndpointTTL updates the stale_after TTL applied by the endpoint handler.
