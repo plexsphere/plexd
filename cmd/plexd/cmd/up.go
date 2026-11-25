@@ -936,8 +936,21 @@ func runAgent(ctx context.Context) error {
 		}()
 	})
 
+	// The heartbeat declares mesh_readdress when the node can follow a
+	// changed mesh address while it runs: the interface came up and the
+	// WireGuard manager can replace its address (wgMgr.CanReaddress). The
+	// control plane moves a node only once it declared the feature, and the
+	// value is fixed for the run.
+	//
+	// DECISION: no configuration key is added. The Domain admin consents to
+	// each move with allow_readdress, and the declaration follows from what
+	// the node can do.
+	var heartbeatFeatures []string
+	if wgReady && wgMgr.CanReaddress() {
+		heartbeatFeatures = []string{api.FeatureMeshReaddress}
+	}
 	heartbeat.SetBuildRequest(func() api.HeartbeatRequest {
-		return buildHeartbeatRequest(wireChecksum, buildVersion, exchanger.LastResult())
+		return buildHeartbeatRequest(wireChecksum, buildVersion, exchanger.LastResult(), heartbeatFeatures)
 	})
 
 	// 9. Create the integrity verifier. The executor uses it for hook
@@ -2443,8 +2456,9 @@ func (c *controlPlaneSessionConnector) OpenSessionConnection(ctx context.Context
 // buildHeartbeatRequest assembles the v1 heartbeat request. NATSummary is
 // an empty non-nil map when NAT discovery has not produced a result yet:
 // the contract requires nat_summary as an object, and a nil map marshals
-// to null, which the server rejects as malformed.
-func buildHeartbeatRequest(checksum, version string, natInfo *nat.DiscoveryResult) api.HeartbeatRequest {
+// to null, which the server rejects as malformed. features are the abilities
+// the node declares; nil or empty leaves the features member off.
+func buildHeartbeatRequest(checksum, version string, natInfo *nat.DiscoveryResult, features []string) api.HeartbeatRequest {
 	summary := map[string]any{}
 	if natInfo != nil {
 		summary["endpoint"] = natInfo.Endpoint
@@ -2455,6 +2469,7 @@ func buildHeartbeatRequest(checksum, version string, natInfo *nat.DiscoveryResul
 		BinaryChecksum: checksum,
 		BinaryVersion:  version,
 		NATSummary:     summary,
+		Features:       features,
 	}
 }
 
