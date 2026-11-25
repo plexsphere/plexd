@@ -26,11 +26,13 @@ func discardLoggerLinux() *slog.Logger {
 	return slog.New(slog.NewTextHandler(nopWriterLinux{}, nil))
 }
 
-// Compile-time checks that NetlinkController implements WGController and that
-// the handshake report and tunnel metrics can read peer state from it.
+// Compile-time checks that NetlinkController implements WGController, that
+// the handshake report and tunnel metrics can read peer state from it, and
+// that the manager can swap the mesh address through it.
 var (
 	_ WGController    = (*NetlinkController)(nil)
 	_ PeerStatsReader = (*NetlinkController)(nil)
+	_ AddressReplacer = (*NetlinkController)(nil)
 )
 
 func TestNewNetlinkController(t *testing.T) {
@@ -283,6 +285,198 @@ func TestConfigureAddressNonExistent(t *testing.T) {
 	expected := "wireguard: configure address:"
 	if len(err.Error()) < len(expected) || err.Error()[:len(expected)] != expected {
 		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+	}
+}
+
+// The arguments are checked before netlink is asked anything, so a name no
+// link holds still gets the argument's error.
+func TestReplaceAddress_InvalidArguments(t *testing.T) {
+	ctrl := NewNetlinkController(discardLoggerLinux())
+
+	tests := []struct {
+		name             string
+		oldCIDR, newCIDR string
+		want             string
+	}{
+		{"old not a CIDR", "not-a-cidr", "10.0.0.9/24", `wireguard: replace address: parse "not-a-cidr":`},
+		{"new without a length", "10.0.0.1/24", "10.0.0.9", `wireguard: replace address: parse "10.0.0.9":`},
+		{"lengths differ", "10.0.0.1/24", "10.0.0.9/16", "wireguard: replace address: 10.0.0.1/24 and 10.0.0.9/16 are not of one length"},
+		{"IPv6 pair", "fd00::1/64", "fd00::9/64", "wireguard: replace address: fd00::1/64 is not an IPv4 CIDR"},
+		{"IPv6 new", "10.0.0.1/24", "fd00::9/24", "wireguard: replace address: fd00::9/24 is not an IPv4 CIDR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ctrl.ReplaceAddress("wg-nonexistent-test", tt.oldCIDR, tt.newCIDR)
+			if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+				t.Errorf("ReplaceAddress(%q, %q) error = %v, want prefix %q", tt.oldCIDR, tt.newCIDR, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestReplaceAddressNonExistent(t *testing.T) {
+	ctrl := NewNetlinkController(discardLoggerLinux())
+
+	err := ctrl.ReplaceAddress("wg-nonexistent-test", "10.0.0.1/24", "10.0.0.9/24")
+	assertPrefix(t, err, "wireguard: replace address:")
+}
+
+// fakeAddrOps records what replaceAddress asks of netlink, each call as
+// "add <cidr>" or "del <cidr>". errs holds the error the call at that index
+// returns.
+type fakeAddrOps struct {
+	errs   map[int]error
+	looked []string
+	calls  []string
+}
+
+func (f *fakeAddrOps) ops() addrOps {
+	record := func(verb string, addr *netlink.Addr) error {
+		f.calls = append(f.calls, verb+" "+addr.IPNet.String())
+		return f.errs[len(f.calls)-1]
+	}
+	return addrOps{
+		byName: func(name string) (netlink.Link, error) {
+			f.looked = append(f.looked, name)
+			return wireGuardLink(name), nil
+		},
+		add: func(_ netlink.Link, addr *netlink.Addr) error { return record("add", addr) },
+		del: func(_ netlink.Link, addr *netlink.Addr) error { return record("del", addr) },
+	}
+}
+
+func TestReplaceAddress_Order(t *testing.T) {
+	tests := []struct {
+		name             string
+		oldCIDR, newCIDR string
+		want             []string
+	}{
+		{
+			// The /32 keeps the link addressed while the old address goes,
+			// and the new address brings the connected route back.
+			name:    "prefix shorter than /32",
+			oldCIDR: "10.0.0.1/24", newCIDR: "10.0.0.9/24",
+			want: []string{"add 10.0.0.9/32", "del 10.0.0.1/24", "add 10.0.0.9/24", "del 10.0.0.9/32"},
+		},
+		{
+			name:    "pair of /32 addresses",
+			oldCIDR: "10.0.0.1/32", newCIDR: "10.0.0.9/32",
+			want: []string{"add 10.0.0.9/32", "del 10.0.0.1/32"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeAddrOps{}
+			err := replaceAddress(f.ops(), "plexd0", netip.MustParsePrefix(tt.oldCIDR), netip.MustParsePrefix(tt.newCIDR))
+			if err != nil {
+				t.Fatalf("replaceAddress: %v", err)
+			}
+			if !slices.Equal(f.calls, tt.want) {
+				t.Errorf("calls = %q, want %q", f.calls, tt.want)
+			}
+			if !slices.Equal(f.looked, []string{"plexd0"}) {
+				t.Errorf("looked up %q, want the link plexd0 once", f.looked)
+			}
+		})
+	}
+}
+
+// A repeat of a call that failed halfway finds the new addresses there and
+// the old one gone, and netlink answers that the way it annotates an errno.
+func TestReplaceAddress_ToleratesARepeat(t *testing.T) {
+	exists := fmt.Errorf("%w: address already exists", syscall.EEXIST)
+	gone := fmt.Errorf("%w: cannot assign requested address", syscall.EADDRNOTAVAIL)
+	f := &fakeAddrOps{errs: map[int]error{0: exists, 1: gone, 2: exists, 3: gone}}
+
+	err := replaceAddress(f.ops(), "plexd0", netip.MustParsePrefix("10.0.0.1/24"), netip.MustParsePrefix("10.0.0.9/24"))
+	if err != nil {
+		t.Fatalf("replaceAddress = %v, want nil when every step is already done", err)
+	}
+	if len(f.calls) != 4 {
+		t.Errorf("calls = %q, want all four", f.calls)
+	}
+}
+
+func TestReplaceAddress_StepFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		errs      map[int]error
+		wantErr   error
+		wantText  string
+		wantCalls int
+	}{
+		{
+			name:      "first add",
+			errs:      map[int]error{0: syscall.EPERM},
+			wantErr:   syscall.EPERM,
+			wantText:  "wireguard: replace address: add 10.0.0.9/32: operation not permitted",
+			wantCalls: 1,
+		},
+		{
+			// EEXIST is no answer a delete tolerates.
+			name:      "delete of the old address",
+			errs:      map[int]error{1: syscall.EEXIST},
+			wantErr:   syscall.EEXIST,
+			wantText:  "wireguard: replace address: delete 10.0.0.1/24: file exists",
+			wantCalls: 2,
+		},
+		{
+			// EADDRNOTAVAIL is no answer an add tolerates.
+			name:      "add with the prefix length",
+			errs:      map[int]error{2: syscall.EADDRNOTAVAIL},
+			wantErr:   syscall.EADDRNOTAVAIL,
+			wantText:  "wireguard: replace address: add 10.0.0.9/24: cannot assign requested address",
+			wantCalls: 3,
+		},
+		{
+			name:      "delete of the /32",
+			errs:      map[int]error{3: syscall.EBUSY},
+			wantErr:   syscall.EBUSY,
+			wantText:  "wireguard: replace address: delete 10.0.0.9/32: device or resource busy",
+			wantCalls: 4,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeAddrOps{errs: tt.errs}
+			err := replaceAddress(f.ops(), "plexd0", netip.MustParsePrefix("10.0.0.1/24"), netip.MustParsePrefix("10.0.0.9/24"))
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want it to wrap %v", err, tt.wantErr)
+			}
+			if err.Error() != tt.wantText {
+				t.Errorf("err = %q, want %q", err, tt.wantText)
+			}
+			if len(f.calls) != tt.wantCalls {
+				t.Errorf("calls = %q, want the first %d", f.calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// Deleting the old address of a pair that names one address would delete the
+// new one, so nothing is asked of netlink beyond the lookup.
+func TestReplaceAddress_SameAddress(t *testing.T) {
+	for _, cidr := range []string{"10.0.0.1/24", "10.0.0.1/32"} {
+		f := &fakeAddrOps{}
+		p := netip.MustParsePrefix(cidr)
+		if err := replaceAddress(f.ops(), "plexd0", p, p); err != nil {
+			t.Errorf("replaceAddress(%s, %s) = %v, want nil", p, p, err)
+		}
+		if len(f.calls) != 0 {
+			t.Errorf("calls for %s = %q, want none", p, f.calls)
+		}
+	}
+}
+
+func TestReplaceAddress_LookupFails(t *testing.T) {
+	f := &fakeAddrOps{}
+	ops := f.ops()
+	ops.byName = func(string) (netlink.Link, error) { return nil, netlink.LinkNotFoundError{} }
+
+	err := replaceAddress(ops, "plexd0", netip.MustParsePrefix("10.0.0.1/24"), netip.MustParsePrefix("10.0.0.9/24"))
+	assertPrefix(t, err, "wireguard: replace address:")
+	if len(f.calls) != 0 {
+		t.Errorf("calls = %q, want none without a link", f.calls)
 	}
 }
 

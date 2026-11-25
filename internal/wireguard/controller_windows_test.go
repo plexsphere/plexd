@@ -16,16 +16,18 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/ipc/namedpipe"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 // Compile-time checks that WindowsController is a controller the manager can
-// drive and that the handshake report and tunnel metrics can read peer state
-// from. It deliberately does not implement OSInterfaceNamer: the Wintun
-// adapter carries the configured name, which TestWindowsController_
-// NoOSInterfaceNamer pins.
+// drive and swap the mesh address through, and that the handshake report and
+// tunnel metrics can read peer state from. It deliberately does not implement
+// OSInterfaceNamer: the Wintun adapter carries the configured name, which
+// TestWindowsController_NoOSInterfaceNamer pins.
 var (
 	_ WGController    = (*WindowsController)(nil)
 	_ PeerStatsReader = (*WindowsController)(nil)
+	_ AddressReplacer = (*WindowsController)(nil)
 )
 
 // winTUN is a trackedTUN that also answers the two methods the controller needs
@@ -119,12 +121,16 @@ type mtuCall struct {
 
 // fakeIPConfig records what the controller programmed and returns stubbed
 // errors, so the LUID and prefix reaching the IP Helper API are asserted
-// without touching the host.
+// without touching the host. sequence holds every address call in the order
+// it ran, as "add <prefix>" or "delete <prefix>".
 type fakeIPConfig struct {
 	mu        sync.Mutex
 	addresses []addressCall
+	deletes   []addressCall
+	sequence  []string
 	mtus      []mtuCall
 	addErr    error
+	deleteErr error
 	mtuErr    error
 }
 
@@ -132,7 +138,34 @@ func (f *fakeIPConfig) AddIPAddress(luid uint64, prefix netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.addresses = append(f.addresses, addressCall{luid: luid, prefix: prefix})
+	f.sequence = append(f.sequence, "add "+prefix.String())
 	return f.addErr
+}
+
+func (f *fakeIPConfig) DeleteIPAddress(luid uint64, prefix netip.Prefix) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deletes = append(f.deletes, addressCall{luid: luid, prefix: prefix})
+	f.sequence = append(f.sequence, "delete "+prefix.String())
+	return f.deleteErr
+}
+
+func (f *fakeIPConfig) stubDelete(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteErr = err
+}
+
+func (f *fakeIPConfig) deleteCalls() []addressCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]addressCall(nil), f.deletes...)
+}
+
+func (f *fakeIPConfig) addressSequence() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sequence...)
 }
 
 func (f *fakeIPConfig) SetMTU(luid uint64, mtu int) error {
@@ -571,6 +604,127 @@ func TestWindowsController_ConfigureAddress_InvalidPrefix(t *testing.T) {
 	}
 }
 
+func TestWindowsController_ReplaceAddress(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16"); err != nil {
+		t.Fatalf("ReplaceAddress: %v", err)
+	}
+
+	// The new address goes on before the old one comes off, so the adapter
+	// is never without an address.
+	want := []string{"add 10.0.0.9/16", "delete 10.0.0.1/16"}
+	if got := ipcfg.addressSequence(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("address calls = %v, want %v", got, want)
+	}
+	if got := ipcfg.addressCalls(); len(got) != 1 || got[0].luid != testLUID {
+		t.Errorf("add calls = %v, want one on LUID %d", got, testLUID)
+	}
+	if got := ipcfg.deleteCalls(); len(got) != 1 || got[0].luid != testLUID {
+		t.Errorf("delete calls = %v, want one on LUID %d", got, testLUID)
+	}
+}
+
+// A repeat of a call that failed halfway finds the new address there and the
+// old one gone, which a delete answers with ERROR_INVALID_PARAMETER on the
+// Windows runner.
+func TestWindowsController_ReplaceAddress_ToleratesARepeat(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+	ipcfg.stubAdd(windows.ERROR_OBJECT_ALREADY_EXISTS)
+	ipcfg.stubDelete(windows.ERROR_INVALID_PARAMETER)
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16"); err != nil {
+		t.Errorf("ReplaceAddress = %v, want nil when both steps are already done", err)
+	}
+	want := []string{"add 10.0.0.9/16", "delete 10.0.0.1/16"}
+	if got := ipcfg.addressSequence(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("address calls = %v, want %v", got, want)
+	}
+}
+
+func TestWindowsController_ReplaceAddress_AddError(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+	// ERROR_NOT_FOUND is no answer an add tolerates.
+	ipcfg.stubAdd(windows.ERROR_NOT_FOUND)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	if !errors.Is(err, windows.ERROR_NOT_FOUND) || !strings.HasPrefix(err.Error(), "wireguard: replace address: add 10.0.0.9/16:") {
+		t.Errorf("ReplaceAddress = %v, want the add error", err)
+	}
+	// The old address stays when the new one could not go on.
+	if got := ipcfg.deleteCalls(); len(got) != 0 {
+		t.Errorf("delete calls = %v, want none after a failed add", got)
+	}
+}
+
+func TestWindowsController_ReplaceAddress_DeleteError(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+	// ERROR_OBJECT_ALREADY_EXISTS is no answer a delete tolerates.
+	ipcfg.stubDelete(windows.ERROR_OBJECT_ALREADY_EXISTS)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	if !errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) || !strings.HasPrefix(err.Error(), "wireguard: replace address: delete 10.0.0.1/16:") {
+		t.Errorf("ReplaceAddress = %v, want the delete error", err)
+	}
+}
+
+func TestWindowsController_ReplaceAddress_Unknown(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ReplaceAddress = %v, want os.ErrNotExist", err)
+	}
+	if !strings.HasPrefix(err.Error(), "wireguard: replace address:") {
+		t.Errorf("error = %q, want the replace address prefix", err)
+	}
+	if got := ipcfg.addressSequence(); len(got) != 0 {
+		t.Errorf("address calls = %v, want none for an unknown interface", got)
+	}
+}
+
+func TestWindowsController_ReplaceAddress_InvalidArguments(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+
+	tests := []struct {
+		oldCIDR, newCIDR string
+		want             string
+	}{
+		{"not-a-cidr", "10.0.0.9/16", `wireguard: replace address: parse "not-a-cidr":`},
+		{"10.0.0.1/16", "10.0.0.9", `wireguard: replace address: parse "10.0.0.9":`},
+		{"10.0.0.1/16", "10.0.0.9/24", "wireguard: replace address: 10.0.0.1/16 and 10.0.0.9/24 are not of one length"},
+		{"fd00::1/64", "fd00::9/64", "wireguard: replace address: fd00::1/64 is not an IPv4 CIDR"},
+	}
+	for _, tt := range tests {
+		err := c.ReplaceAddress("plexd0", tt.oldCIDR, tt.newCIDR)
+		if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+			t.Errorf("ReplaceAddress(%q, %q) = %v, want the prefix %q", tt.oldCIDR, tt.newCIDR, err, tt.want)
+		}
+	}
+	if got := ipcfg.addressSequence(); len(got) != 0 {
+		t.Errorf("address calls = %v, want none for refused arguments", got)
+	}
+}
+
+// Deleting the old address of a pair that names one address would delete the
+// new one, so nothing is programmed.
+func TestWindowsController_ReplaceAddress_SameAddress(t *testing.T) {
+	c, _, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.1/16"); err != nil {
+		t.Errorf("ReplaceAddress = %v, want nil", err)
+	}
+	if got := ipcfg.addressSequence(); len(got) != 0 {
+		t.Errorf("address calls = %v, want none", got)
+	}
+}
+
 func TestWindowsController_SetMTU(t *testing.T) {
 	c, tuns, ipcfg := newTestWindowsController(t)
 	createTestInterface(t, c, "plexd0")
@@ -903,6 +1057,114 @@ func TestWindowsController_RealWintun(t *testing.T) {
 	if _, err := (&namedpipe.DialConfig{}).DialTimeout(pipe, time.Second); err == nil {
 		t.Errorf("the UAPI pipe for %s still answers after DeleteInterface", name)
 	}
+}
+
+// TestWindowsController_RealReplaceAddress swaps the address of a real Wintun
+// adapter through the production seams. It is the only proof of what
+// ReplaceAddress relies on about Windows: that the on-link route of the
+// prefix and a route through the adapter stay when the old address goes, and
+// that deleting an address the adapter does not hold answers
+// ERROR_INVALID_PARAMETER, which the repeated call meets.
+//
+// It adds a route, so it asks for PLEXD_TEST_REAL_ROUTES besides
+// PLEXD_TEST_REAL_WINTUN, as TestPeerRoutes_RealWintun does. CI runs it in the
+// step "Run real Wintun tests" beside the bridge package's tests, so its
+// prefixes are ones no other test of the step uses.
+func TestWindowsController_RealReplaceAddress(t *testing.T) {
+	if os.Getenv("PLEXD_TEST_REAL_WINTUN") != "1" || os.Getenv("PLEXD_TEST_REAL_ROUTES") != "1" {
+		t.Skip("set PLEXD_TEST_REAL_WINTUN=1 and PLEXD_TEST_REAL_ROUTES=1 to create a real Wintun adapter and route over it")
+	}
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("creating a Wintun adapter needs Administrator")
+	}
+
+	const (
+		name       = "plexd-readdress"
+		oldAddress = "10.255.248.1/24"
+		newAddress = "10.255.248.9/24"
+	)
+	var (
+		onLink = netip.MustParsePrefix("10.255.248.0/24")
+		// routed stands for a peer's routed subnet.
+		routed = netip.MustParsePrefix("10.255.238.0/24")
+	)
+
+	c := NewWindowsController(discardLogger())
+	key := mustKey(t)
+
+	if err := c.CreateInterface(name, key[:], 0); err != nil {
+		t.Fatalf("CreateInterface: %v", err)
+	}
+	// Windows removes the adapter with its addresses and routes.
+	t.Cleanup(func() { _ = c.DeleteInterface(name) })
+
+	if err := c.ConfigureAddress(name, oldAddress); err != nil {
+		t.Fatalf("ConfigureAddress: %v", err)
+	}
+	waitForInterface(t, name, func(link *net.Interface) error {
+		if !hasAddr(t, link, "10.255.248.1") {
+			return errors.New("address not assigned yet")
+		}
+		return nil
+	})
+
+	ad, err := c.adapter(name, "replace address test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	luid := winipcfg.LUID(ad.luid)
+	if err := luid.AddRoute(routed, netip.IPv4Unspecified(), 0); err != nil {
+		t.Fatalf("route %s through %s: %v", routed, name, err)
+	}
+
+	// Windows settles an adapter a moment after the call that changed it
+	// returns, so the check polls, as the other checks of this file do.
+	check := func(when string) {
+		t.Helper()
+		waitForInterface(t, name, func(*net.Interface) error {
+			addrs, err := adapterIPv4(luid)
+			if err != nil {
+				return err
+			}
+			if fmt.Sprint(addrs) != "[10.255.248.9/24]" {
+				return fmt.Errorf("%s: %s holds %v, want 10.255.248.9/24 alone", when, name, addrs)
+			}
+			for _, p := range []netip.Prefix{onLink, routed} {
+				if _, err := luid.Route(p, netip.IPv4Unspecified()); err != nil {
+					return fmt.Errorf("%s: route %s through %s: %w, want it kept", when, p, name, err)
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := c.ReplaceAddress(name, oldAddress, newAddress); err != nil {
+		t.Fatalf("ReplaceAddress: %v", err)
+	}
+	check("after the call")
+
+	if err := c.ReplaceAddress(name, oldAddress, newAddress); err != nil {
+		t.Errorf("repeated ReplaceAddress = %v, want nil", err)
+	}
+	check("after the repeated call")
+}
+
+// adapterIPv4 returns the IPv4 addresses of the adapter with their on-link
+// prefix lengths, read from the host's unicast table. An autoconfiguration
+// address, which Windows may give the adapter meanwhile, is left out.
+func adapterIPv4(luid winipcfg.LUID) ([]string, error) {
+	rows, err := winipcfg.GetUnicastIPAddressTable(windows.AF_INET)
+	if err != nil {
+		return nil, err
+	}
+	var addrs []string
+	for i := range rows {
+		addr := rows[i].Address.Addr()
+		if rows[i].InterfaceLUID == luid && !addr.IsLinkLocalUnicast() {
+			addrs = append(addrs, netip.PrefixFrom(addr, int(rows[i].OnLinkPrefixLength)).String())
+		}
+	}
+	return addrs, nil
 }
 
 // waitForInterface polls the named interface until check passes, because

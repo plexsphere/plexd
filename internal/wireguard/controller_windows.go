@@ -56,6 +56,7 @@ type wintunDevice interface {
 // calls, which is what makes the controller testable without Administrator.
 type ipConfigurator interface {
 	AddIPAddress(luid uint64, prefix netip.Prefix) error
+	DeleteIPAddress(luid uint64, prefix netip.Prefix) error
 	SetMTU(luid uint64, mtu int) error
 }
 
@@ -162,6 +163,12 @@ type winipcfgConfigurator struct{}
 // address's own prefix with it.
 func (winipcfgConfigurator) AddIPAddress(luid uint64, prefix netip.Prefix) error {
 	return winipcfg.LUID(luid).AddIPAddress(prefix)
+}
+
+// DeleteIPAddress removes a unicast address from the interface, which is
+// DeleteUnicastIpAddressEntry.
+func (winipcfgConfigurator) DeleteIPAddress(luid uint64, prefix netip.Prefix) error {
+	return winipcfg.LUID(luid).DeleteIPAddress(prefix)
 }
 
 // SetMTU sets the interface MTU for both address families, which is
@@ -391,6 +398,52 @@ func (c *WindowsController) ConfigureAddress(name string, address string) error 
 		"component", "wireguard",
 		"interface", name,
 		"address", address,
+	)
+
+	return nil
+}
+
+// ReplaceAddress swaps oldAddress for newAddress on the adapter: it adds the
+// new address, then deletes the old one, so the adapter is never without an
+// address.
+//
+// The add tolerates ERROR_OBJECT_ALREADY_EXISTS, as ConfigureAddress does,
+// and the delete ERROR_INVALID_PARAMETER, so a call that failed halfway
+// succeeds when it is repeated with the same arguments. Measured on the CI
+// Windows runner, DeleteUnicastIpAddressEntry answers ERROR_INVALID_PARAMETER
+// for an address the adapter does not hold. The LUID was just resolved and
+// the address is a parsed IPv4 prefix, so no other parameter of the call can
+// be the one it refuses. TestWindowsController_RealReplaceAddress proves that
+// on the runner with a repeated call, and that the on-link route of the
+// prefix and the routes through the adapter stay when the old address goes.
+func (c *WindowsController) ReplaceAddress(name, oldAddress, newAddress string) error {
+	oldPrefix, newPrefix, err := replacePrefixes(oldAddress, newAddress)
+	if err != nil {
+		return err
+	}
+
+	ad, err := c.adapter(name, "replace address")
+	if err != nil {
+		return err
+	}
+
+	// Deleting the old address would delete the new one.
+	if oldPrefix == newPrefix {
+		return nil
+	}
+
+	if err := c.ipcfg.AddIPAddress(ad.luid, newPrefix); err != nil && !errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+		return fmt.Errorf("wireguard: replace address: add %s: %w", newAddress, err)
+	}
+	if err := c.ipcfg.DeleteIPAddress(ad.luid, oldPrefix); err != nil && !errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return fmt.Errorf("wireguard: replace address: delete %s: %w", oldAddress, err)
+	}
+
+	c.logger.Debug("address replaced",
+		"component", "wireguard",
+		"interface", name,
+		"previous_address", oldAddress,
+		"address", newAddress,
 	)
 
 	return nil
