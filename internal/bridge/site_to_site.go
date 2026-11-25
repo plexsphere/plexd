@@ -139,12 +139,12 @@ type SiteToSiteDeps struct {
 // routed into it. Each tunnel is served on its own, so one that is down leaves
 // the others up. SiteToSiteManager is concurrent-safe via mu.
 //
-// Apply, SyncSecretInventory and Retry are called from the reconciler's
-// goroutine alone. They resolve a tunnel's remote host and fetch its Secret
-// outside mu, so Teardown and the status readers do not wait for either. The
-// status readers, TunnelReports and SiteToSiteStatus, read whether a remote
-// site answers outside mu as well, so neither the reconciler nor Teardown
-// waits for a device read or a provider's command.
+// Apply, SyncSecretInventory, Retry and Rebuild are called from the
+// reconciler's goroutine alone. They resolve a tunnel's remote host and fetch
+// its Secret outside mu, so Teardown and the status readers do not wait for
+// either. The status readers, TunnelReports and SiteToSiteStatus, read whether
+// a remote site answers outside mu as well, so neither the reconciler nor
+// Teardown waits for a device read or a provider's command.
 type SiteToSiteManager struct {
 	vpn       VPNController
 	routes    RouteController
@@ -493,19 +493,7 @@ func (m *SiteToSiteManager) SyncSecretInventory(ctx context.Context, inventory [
 		if !listed || version == t.version {
 			continue
 		}
-		iface := t.iface
-		if err := m.stopTunnel(t); err != nil {
-			m.logger.Error("bridge: site-to-site: tear down tunnel failed",
-				"component", "bridge",
-				"tunnel_id", t.entry.ID,
-				"interface", iface,
-				"error", err,
-			)
-		}
-		// Unsettled, the tunnel is left out of the reports until the
-		// rebuild has an outcome, rather than read down without a reason.
-		t.settled = false
-		if a := m.attemptLocked(t); a != nil {
+		if a := m.rebuildLocked(t); a != nil {
 			attempts = append(attempts, a)
 		}
 	}
@@ -513,6 +501,52 @@ func (m *SiteToSiteManager) SyncSecretInventory(ctx context.Context, inventory [
 
 	m.runAttempts(ctx, attempts)
 	m.Retry(ctx)
+}
+
+// Rebuild stops every wireguard tunnel that is up and brings it up again, as
+// SyncSecretInventory does for a tunnel whose Secret moved. On macOS the utun
+// of such a tunnel carries the node's mesh IP, so a node moved to a new one
+// calls it once WGVPNController.SetAddress gave the controller that address.
+// Tunnels of other kinds and tunnels that are down are left alone. It does
+// nothing while the manager is not active. It signals ReportChanged when it
+// returns.
+func (m *SiteToSiteManager) Rebuild(ctx context.Context) {
+	defer m.signalReport()
+	m.mu.Lock()
+	if !m.active {
+		m.mu.Unlock()
+		return
+	}
+	var attempts []*siteToSiteAttempt
+	for _, t := range m.tunnels {
+		if !t.up || t.entry.Kind != api.SiteToSiteKindWireGuard {
+			continue
+		}
+		if a := m.rebuildLocked(t); a != nil {
+			attempts = append(attempts, a)
+		}
+	}
+	m.mu.Unlock()
+
+	m.runAttempts(ctx, attempts)
+}
+
+// rebuildLocked stops t, a tunnel that is up, and returns the attempt that
+// brings it up again, or nil when a check put it down. The caller holds mu.
+func (m *SiteToSiteManager) rebuildLocked(t *siteToSiteTunnel) *siteToSiteAttempt {
+	iface := t.iface
+	if err := m.stopTunnel(t); err != nil {
+		m.logger.Error("bridge: site-to-site: tear down tunnel failed",
+			"component", "bridge",
+			"tunnel_id", t.entry.ID,
+			"interface", iface,
+			"error", err,
+		)
+	}
+	// Unsettled, the tunnel is left out of the reports until the rebuild
+	// has an outcome, rather than read down without a reason.
+	t.settled = false
+	return m.attemptLocked(t)
 }
 
 // Retry brings up again every tunnel that is down for bind_failed,
@@ -594,10 +628,10 @@ func (m *SiteToSiteManager) TunnelReports() []SiteToSiteTunnelReport {
 
 // ReportChanged returns the channel the manager signals, without blocking,
 // when what TunnelReports returns may have changed: at the end of every
-// Apply, every Retry, and so every SyncSecretInventory, and Teardown. Several
-// signals before the reader wakes collapse into one. The signals are liberal;
-// the reader compares before it acts. A change of whether a remote site
-// answers signals nothing.
+// Apply, every Retry, and so every SyncSecretInventory, every Rebuild, and
+// Teardown. Several signals before the reader wakes collapse into one. The
+// signals are liberal; the reader compares before it acts. A change of
+// whether a remote site answers signals nothing.
 func (m *SiteToSiteManager) ReportChanged() <-chan struct{} {
 	return m.changed
 }
