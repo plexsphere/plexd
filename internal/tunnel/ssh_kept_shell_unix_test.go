@@ -151,7 +151,13 @@ func (l *fakeShellLauncher) serve(ctx context.Context, req LaunchRequest, files 
 	l.mu.Unlock()
 	defer close(r.returned)
 	stopWatch := context.AfterFunc(ctx, func() { close(r.cancelled) })
-	defer stopWatch()
+	defer func() {
+		// A cancel closes ctx.Done() before it starts the AfterFunc, so a
+		// return on ctx.Done() can stop the watch before it ran.
+		if stopWatch() && ctx.Err() != nil {
+			close(r.cancelled)
+		}
+	}()
 	if fail != nil {
 		return 0, fail
 	}
