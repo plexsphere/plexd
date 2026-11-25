@@ -73,15 +73,17 @@ type managedSession interface {
 
 // SessionManager manages the lifecycle of tunnel sessions.
 type SessionManager struct {
-	cfg    Config
-	meshIP string
+	cfg Config
 	// meshIface is the operating system's name of the mesh interface, which
 	// the manager binds every tcp session listener to. Empty binds the mesh
 	// IP alone.
 	meshIface string
 	logger    *slog.Logger
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// meshIP is the address every tcp session listener binds. SetMeshIP
+	// replaces it when the node is moved to a new mesh address.
+	meshIP   string
 	sessions map[string]managedSession
 	onClosed func(sessionID, reason string, info *ClosedSessionInfo)
 	sshDeps  SSHSessionDeps
@@ -178,34 +180,6 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		return "", fmt.Errorf("tunnel: invalid idle_timeout_seconds: %d", sess.IdleTimeoutSeconds)
 	}
 
-	// A tcp session listener carries no authentication of its own, so the mesh
-	// address it binds and the mesh interface it is bound to (see
-	// Session.Start) are the whole of its reachability boundary. The address is
-	// copied verbatim from the control plane's registration response into
-	// identity.json, so it is parsed here rather than trusted: an empty value,
-	// something that is not an address at all, or an unspecified one (0.0.0.0,
-	// ::) would each have net.Listen bind every unicast address on the host and
-	// publish an unauthenticated forward to an internal service on the node's
-	// public and LAN interfaces. A multicast one binds a group address instead
-	// of the node's own, which is not a reachability boundary either. An ssh
-	// session binds nothing, so it never reads the mesh address, and a node
-	// without a usable one still serves it.
-	//
-	// The guard runs on the address net.Listen would actually bind, not on the
-	// parsed one: netip.Addr.IsUnspecified matches exactly 0.0.0.0 and ::, while
-	// the net package normalises 4-byte and 16-byte forms and splits the zone
-	// off, so it binds the same dual-stack wildcard for "::ffff:0.0.0.0" and
-	// "::%eth0". Validating the parsed form would classify those two differently
-	// from the bind they produce. WithZone must precede Unmap — a zoned address
-	// is never Is4In6, so Unmap alone is a no-op on "::ffff:0.0.0.0%eth0".
-	if sess.Kind == api.SessionKindTCP {
-		meshAddr, err := netip.ParseAddr(m.meshIP)
-		bindAddr := meshAddr.WithZone("").Unmap()
-		if err != nil || bindAddr.IsUnspecified() || bindAddr.IsMulticast() {
-			return "", fmt.Errorf("tunnel: mesh IP %q is not a bindable unicast address; refusing to bind a session listener", m.meshIP)
-		}
-	}
-
 	now := time.Now()
 	if sess.ExpiresAt.Before(now) {
 		return "", fmt.Errorf("tunnel: session already expired")
@@ -227,7 +201,41 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		expiresAt = maxExpiry
 	}
 
+	// The lock is held from here until the session is in the map, so the mesh
+	// address is read once: SetMeshIP either runs before, and the listener binds
+	// the new address, or after, and closes the session with the others.
 	m.mu.Lock()
+	meshIP := m.meshIP
+
+	// A tcp session listener carries no authentication of its own, so the mesh
+	// address it binds and the mesh interface it is bound to (see
+	// Session.Start) are the whole of its reachability boundary. The address is
+	// copied verbatim from the control plane's registration response into
+	// identity.json, so it is parsed here rather than trusted: an empty value,
+	// something that is not an address at all, or an unspecified one (0.0.0.0,
+	// ::) would each have net.Listen bind every unicast address on the host and
+	// publish an unauthenticated forward to an internal service on the node's
+	// public and LAN interfaces. A multicast one binds a group address instead
+	// of the node's own, which is not a reachability boundary either. An ssh
+	// session binds nothing, so it never reads the mesh address, and a node
+	// without a usable one still serves it.
+	//
+	// The guard runs on the address net.Listen would actually bind, not on the
+	// parsed one: netip.Addr.IsUnspecified matches exactly 0.0.0.0 and ::, while
+	// the net package normalises 4-byte and 16-byte forms and splits the zone
+	// off, so it binds the same dual-stack wildcard for "::ffff:0.0.0.0" and
+	// "::%eth0". Validating the parsed form would classify those two differently
+	// from the bind they produce. WithZone must precede Unmap — a zoned address
+	// is never Is4In6, so Unmap alone is a no-op on "::ffff:0.0.0.0%eth0".
+	if sess.Kind == api.SessionKindTCP {
+		meshAddr, err := netip.ParseAddr(meshIP)
+		bindAddr := meshAddr.WithZone("").Unmap()
+		if err != nil || bindAddr.IsUnspecified() || bindAddr.IsMulticast() {
+			m.mu.Unlock()
+			return "", fmt.Errorf("tunnel: mesh IP %q is not a bindable unicast address; refusing to bind a session listener", meshIP)
+		}
+	}
+
 	if _, exists := m.sessions[sess.SessionID]; exists {
 		m.mu.Unlock()
 		return "", fmt.Errorf("tunnel: duplicate session ID: %s", sess.SessionID)
@@ -251,7 +259,7 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 			return "", err
 		}
 	} else {
-		tcp := NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+		tcp := NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, meshIP, expiresAt, m.logger)
 		tcp.MeshInterface = m.meshIface
 		// Only a tcp tunnel reports its traffic: the control plane counts an
 		// ssh session's at its attach gateway. Like the idle window, the report
@@ -432,6 +440,45 @@ func (m *SessionManager) Shutdown() {
 	wg.Wait()
 
 	m.logger.Info("all tunnel sessions closed")
+}
+
+// SetMeshIP makes meshIP the address tcp session listeners bind and closes
+// every live tcp session with the reason "readdressed". The same address does
+// nothing. The closes run concurrently, as in the dispatcher's teardown pass,
+// because each one blocks on a bounded session_ended report.
+//
+// DECISION: a tcp session bound to the old address ends with terminated_by
+// plexd_close and is not bound again (#248). The contract validates a
+// reported listener against the node's address, and the dispatcher never
+// provisions a settled session twice. A session whose started row is still
+// outstanding is not settled, so the next pull binds it on the new address.
+// An ssh session binds nothing and stays.
+func (m *SessionManager) SetMeshIP(meshIP string) {
+	m.mu.Lock()
+	if meshIP == m.meshIP {
+		m.mu.Unlock()
+		return
+	}
+	m.meshIP = meshIP
+	bound := make(map[string]managedSession)
+	for id, session := range m.sessions {
+		if _, ok := session.(*Session); ok {
+			bound[id] = session
+		}
+	}
+	m.mu.Unlock()
+
+	// Each close names the session it read here, so a session that took over
+	// the id on the new address in the meantime stays.
+	var wg sync.WaitGroup
+	for id, session := range bound {
+		wg.Add(1)
+		go func(id string, session managedSession) {
+			defer wg.Done()
+			m.closeSession(id, reasonReaddressed, session)
+		}(id, session)
+	}
+	wg.Wait()
 }
 
 // removeSession removes and returns the session for the given ID, or nil if not

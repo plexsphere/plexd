@@ -1131,3 +1131,93 @@ func TestSessionManager_SSHClosesWithKind(t *testing.T) {
 		})
 	}
 }
+
+// secondLoopback returns a loopback address other than 127.0.0.1 that a
+// listener on this host can bind: 127.0.0.2 on Linux and Windows, whose
+// loopback answers for all of 127.0.0.0/8, and ::1 on macOS, whose loopback
+// holds 127.0.0.1 alone.
+func secondLoopback(t *testing.T) string {
+	t.Helper()
+	for _, ip := range []string{"127.0.0.2", "::1"} {
+		ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+		if err == nil {
+			_ = ln.Close()
+			return ip
+		}
+	}
+	t.Fatal("the host binds neither 127.0.0.2 nor ::1; a new mesh address needs one of them")
+	return ""
+}
+
+// TestSessionManager_SetMeshIPClosesTCPSessions moves the manager to a new
+// mesh address while a tcp session and, where the platform serves them, an
+// ssh session are live. The tcp listener is bound to the old address, so it
+// ends and reports plexd_close; the ssh session binds nothing and stays. A tcp
+// session created afterwards binds the new address.
+func TestSessionManager_SetMeshIPClosesTCPSessions(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	newIP := secondLoopback(t)
+	mgr := newTestManager(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	if _, err := mgr.CreateSession(context.Background(), echoSession(t, "readdr-tcp", echoAddr)); err != nil {
+		t.Fatalf("CreateSession(tcp) error: %v", err)
+	}
+	// Off Linux and macOS there is no ssh session to keep; the tcp half below
+	// runs everywhere.
+	if sshSessionsSupported {
+		deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+		mgr.SetSSHSessionDeps(deps)
+		if _, err := mgr.CreateSession(context.Background(), sshEntry("readdr-ssh", "ops", time.Now().Add(5*time.Minute))); err != nil {
+			t.Fatalf("CreateSession(ssh) error: %v", err)
+		}
+	}
+
+	mgr.SetMeshIP(newIP)
+
+	// SetMeshIP returns once every close it started has reported.
+	mu.Lock()
+	closed := append([]closedRecord(nil), (*records)...)
+	mu.Unlock()
+	if len(closed) != 1 {
+		t.Fatalf("on-closed fired %d times, want 1 for the tcp session", len(closed))
+	}
+	rec := closed[0]
+	if rec.sessionID != "readdr-tcp" || rec.reason != reasonReaddressed {
+		t.Errorf("closed %q with reason %q, want %q with %q", rec.sessionID, rec.reason, "readdr-tcp", reasonReaddressed)
+	}
+	if rec.info.Kind != api.SessionKindTCP {
+		t.Errorf("info.Kind = %q, want %q", rec.info.Kind, api.SessionKindTCP)
+	}
+	if got := TerminatedByFromReason(rec.reason); got != api.TerminatedByPlexdClose {
+		t.Errorf("terminated_by = %q, want %q", got, api.TerminatedByPlexdClose)
+	}
+
+	active := mgr.ActiveSessions()
+	if _, ok := active["readdr-tcp"]; ok {
+		t.Error("the tcp session is still live after SetMeshIP")
+	}
+	if _, ok := active["readdr-ssh"]; sshSessionsSupported && !ok {
+		t.Error("SetMeshIP closed the ssh session, want it live")
+	}
+
+	addr, err := mgr.CreateSession(context.Background(), echoSession(t, "readdr-after", echoAddr))
+	if err != nil {
+		t.Fatalf("CreateSession(tcp) after SetMeshIP error: %v", err)
+	}
+	if host, _, err := net.SplitHostPort(addr); err != nil || host != newIP {
+		t.Fatalf("tcp session created after SetMeshIP listens on %q, want a port on %s", addr, newIP)
+	}
+	echoByte(t, addr)
+
+	// The address the manager already holds closes nothing.
+	mgr.SetMeshIP(newIP)
+	if _, ok := mgr.ActiveSessions()["readdr-after"]; !ok {
+		t.Error("SetMeshIP with the same address closed the tcp session on it")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 {
+		t.Errorf("on-closed fired %d times in all, want 1", len(*records))
+	}
+}
