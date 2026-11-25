@@ -173,6 +173,40 @@ func TestTypesHeartbeatRequest(t *testing.T) {
 		}
 	}
 
+	// A declared feature adds the features member as a fifth key.
+	declared := orig
+	declared.Features = []string{FeatureMeshReaddress}
+	data, gotDeclared := roundTrip(t, declared)
+	requireEqual(t, declared, gotDeclared)
+	raw = nil
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 5 {
+		t.Errorf("with features: expected exactly 5 JSON keys, got %d: %v", len(raw), raw)
+	}
+	if got := string(raw["features"]); got != `["mesh_readdress"]` {
+		t.Errorf("features = %s, want [\"mesh_readdress\"]", got)
+	}
+
+	// A nil or empty list leaves the member off, so a node that declares
+	// nothing sends the four keys a control plane predating it accepts.
+	for name, features := range map[string][]string{"nil": nil, "empty": {}} {
+		undeclared := orig
+		undeclared.Features = features
+		out, err := json.Marshal(undeclared)
+		if err != nil {
+			t.Fatalf("%s features: marshal: %v", name, err)
+		}
+		raw = nil
+		if err := json.Unmarshal(out, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := raw["features"]; ok || len(raw) != 4 {
+			t.Errorf("%s features: got %d JSON keys %v, want the 4 without features", name, len(raw), raw)
+		}
+	}
+
 	// A nil NATSummary marshals as JSON null, while an empty non-nil map
 	// marshals as {}. The contract requires nat_summary to be an object, so
 	// builders must pass a non-nil map to avoid emitting null.
@@ -503,6 +537,7 @@ func TestTypesKeyRotateResponse(t *testing.T) {
 func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := NodeStateSnapshot{
+		MeshIP: "10.42.0.9",
 		Peers: []SnapshotPeer{
 			{NodeID: "n-002", MeshIP: "10.42.0.2", PublicKey: "pk", FallbackEndpoint: "1.2.3.4:51820"},
 		},
@@ -579,13 +614,16 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the fourteen contract keys must appear.
+	// Exactly the fifteen contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 14 {
-		t.Errorf("expected exactly 14 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 15 {
+		t.Errorf("expected exactly 15 JSON keys, got %d: %v", len(raw), raw)
+	}
+	if got := string(raw["mesh_ip"]); got != `"10.42.0.9"` {
+		t.Errorf("mesh_ip = %s, want \"10.42.0.9\"", got)
 	}
 	if got := string(raw["failure_detection"]); got != `{"detect_after_seconds":15}` {
 		t.Errorf("failure_detection = %s, want the block byte for byte", got)
@@ -593,7 +631,7 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	if got, want := string(raw["shared_subnets"]), `[{"subnet":"10.20.0.0/16","bridges":["n-002","n-003"]}]`; got != want {
 		t.Errorf("shared_subnets = %s, want %s", got, want)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
+	for _, key := range []string{"mesh_ip", "peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -619,6 +657,11 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if snap.Sessions == nil || len(*snap.Sessions) != 0 {
 		t.Errorf("sessions = %v, want a non-nil pointer to an empty slice", snap.Sessions)
 	}
+	// A control plane that predates mesh_ip leaves the key out, which decodes
+	// to the empty string: the node keeps its address.
+	if snap.MeshIP != "" {
+		t.Errorf("mesh_ip from a pull without the key = %q, want empty", snap.MeshIP)
+	}
 
 	// A populated zero-value block decodes to a NON-nil pointer — distinct from
 	// a null block.
@@ -631,7 +674,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all fourteen keys PRESENT.
+	// Marshalling nil blocks emits literal null with all fifteen keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -640,10 +683,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 14 {
-		t.Errorf("expected exactly 14 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 15 {
+		t.Errorf("expected exactly 15 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
+	for _, key := range []string{"mesh_ip", "peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -652,9 +695,42 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		if key == "peers" || key == "executions" {
 			continue // nil slice marshals as null; presence is what matters
 		}
+		if key == "mesh_ip" {
+			// A string member has no null; the empty string is its zero value.
+			if string(v) != `""` {
+				t.Errorf("key %q = %s, want \"\"", key, v)
+			}
+			continue
+		}
 		if string(v) != "null" {
 			t.Errorf("key %q = %s, want null", key, v)
 		}
+	}
+}
+
+// TestNodeStateSnapshot_MeshIP pins the shapes the mesh_ip member arrives in.
+// An absent key decodes to the empty string, which the node reads as "keep
+// your address". The member is typed, so a value of another JSON type fails
+// the decode, as a malformed peers does.
+func TestNodeStateSnapshot_MeshIP(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"peers":[]}`:                       "",
+		`{"mesh_ip":"10.99.0.9","peers":[]}`: "10.99.0.9",
+	} {
+		var snap NodeStateSnapshot
+		if err := json.Unmarshal([]byte(body), &snap); err != nil {
+			t.Fatalf("unmarshal %s: %v, want nil", body, err)
+		}
+		if snap.MeshIP != want {
+			t.Errorf("MeshIP from %s = %q, want %q", body, snap.MeshIP, want)
+		}
+	}
+
+	var snap NodeStateSnapshot
+	err := json.Unmarshal([]byte(`{"mesh_ip":7,"peers":[]}`), &snap)
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) || typeErr.Field != "mesh_ip" {
+		t.Fatalf("unmarshal a numeric mesh_ip = %v, want a *json.UnmarshalTypeError on mesh_ip", err)
 	}
 }
 

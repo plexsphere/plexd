@@ -686,3 +686,25 @@ func TestComputeDiff_FailureDetectionIsNoDrift(t *testing.T) {
 		})
 	}
 }
+
+// mesh_ip is consumed on the dispatch seam, every pull, as the signing key is.
+// It is not desired state the differ converges on, so a pull that changes only
+// the node's own address is no drift and runs no reconcile handler.
+func TestComputeDiff_MeshIPIsNoDrift(t *testing.T) {
+	tests := []struct {
+		name             string
+		desired, current string
+	}{
+		{"empty to populated", "10.99.0.1", ""},
+		{"populated to empty", "", "10.99.0.1"},
+		{"changed address", "10.99.0.9", "10.99.0.1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{MeshIP: tt.desired}, &api.NodeStateSnapshot{MeshIP: tt.current})
+			if !diff.IsEmpty() {
+				t.Errorf("diff = %s, want none for a change of mesh_ip alone", diff.Summary())
+			}
+		})
+	}
+}

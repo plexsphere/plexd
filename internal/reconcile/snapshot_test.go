@@ -11,6 +11,7 @@ import (
 
 func sampleSnapshot() *api.NodeStateSnapshot {
 	return &api.NodeStateSnapshot{
+		MeshIP: "10.0.0.9",
 		Peers: []api.SnapshotPeer{
 			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820", FallbackEndpoints: []string{"1.2.3.4:51820", "5.6.7.8:51820"}, EndpointCandidates: []string{"10.0.0.5:51820"}, RoutedSubnets: []string{"10.20.0.0/16"}},
 		},
@@ -120,6 +121,10 @@ func TestStateSnapshot_Update(t *testing.T) {
 	// handler takes it on every pull.
 	if got.FailureDetection != nil {
 		t.Errorf("expected nil FailureDetection after update, got %s", got.FailureDetection)
+	}
+	// Nor is the mesh address: its dispatch handler applies it on every pull.
+	if got.MeshIP != "" {
+		t.Errorf("expected empty MeshIP after update, got %q", got.MeshIP)
 	}
 }
 

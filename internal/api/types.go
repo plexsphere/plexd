@@ -78,11 +78,22 @@ type Peer struct {
 // Heartbeat  POST /v1/nodes/{node_id}/heartbeat
 // ---------------------------------------------------------------------------
 
+// FeatureMeshReaddress is the feature a node declares in
+// HeartbeatRequest.Features when it applies a changed NodeStateSnapshot.MeshIP
+// while it runs. The control plane moves a node to another mesh address only
+// while the node's latest heartbeat declared it.
+const FeatureMeshReaddress = "mesh_readdress"
+
 type HeartbeatRequest struct {
 	ClientNow      time.Time      `json:"client_now"`
 	BinaryChecksum string         `json:"binary_checksum"`
 	BinaryVersion  string         `json:"binary_version"`
 	NATSummary     map[string]any `json:"nat_summary"`
+	// Features are the features the node declares, such as
+	// FeatureMeshReaddress. A nil or empty list leaves the member off, so a
+	// node that declares nothing sends the four members a control plane
+	// predating the member accepts.
+	Features []string `json:"features,omitempty"`
 }
 
 type HeartbeatResponse struct {
@@ -99,8 +110,13 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// fourteen fields carry omitempty.
+// fifteen fields carry omitempty.
 type NodeStateSnapshot struct {
+	// MeshIP is the mesh address the node must use, read from the Node row on
+	// every pull. A control plane that predates the member leaves the key out,
+	// which decodes to the empty string, and the node keeps its address. A
+	// value of another JSON type fails the pull's decode, as it does for Peers.
+	MeshIP       string               `json:"mesh_ip"`
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
 	Policy       *PolicySnapshot      `json:"policy"`
