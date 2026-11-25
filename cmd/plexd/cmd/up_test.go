@@ -192,7 +192,7 @@ func TestMeshMTUProbe(t *testing.T) {
 
 func TestBuildHeartbeatRequest(t *testing.T) {
 	t.Run("nil NAT info yields empty non-nil summary", func(t *testing.T) {
-		req := buildHeartbeatRequest("checksum-abc", "1.2.3", nil)
+		req := buildHeartbeatRequest("checksum-abc", "1.2.3", nil, nil)
 
 		if req.NATSummary == nil {
 			t.Fatal("NATSummary = nil, want non-nil empty map")
@@ -230,7 +230,7 @@ func TestBuildHeartbeatRequest(t *testing.T) {
 		req := buildHeartbeatRequest("checksum-abc", "1.2.3", &nat.DiscoveryResult{
 			Endpoint: "203.0.113.9:51820",
 			NATType:  nat.NATNone,
-		})
+		}, nil)
 
 		if got := req.NATSummary["endpoint"]; got != "203.0.113.9:51820" {
 			t.Errorf("summary endpoint = %v, want %q", got, "203.0.113.9:51820")
@@ -238,6 +238,39 @@ func TestBuildHeartbeatRequest(t *testing.T) {
 		// NATNone maps through Wire() to the full_cone traversal posture.
 		if got := req.NATSummary["nat_type"]; got != "full_cone" {
 			t.Errorf("summary nat_type = %v, want %q", got, "full_cone")
+		}
+	})
+
+	// A node that declares a feature sends the list; one that declares none
+	// sends the four members a control plane that predates features accepts.
+	t.Run("features are declared, and nil leaves the member off", func(t *testing.T) {
+		declared := buildHeartbeatRequest("checksum-abc", "1.2.3", nil, []string{api.FeatureMeshReaddress})
+		data, err := json.Marshal(declared)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(data, &keys); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got := string(keys["features"]); got != `["mesh_readdress"]` {
+			t.Errorf("features = %s, want [\"mesh_readdress\"] (body: %s)", got, data)
+		}
+
+		none := buildHeartbeatRequest("checksum-abc", "1.2.3", nil, nil)
+		data, err = json.Marshal(none)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		keys = nil
+		if err := json.Unmarshal(data, &keys); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := keys["features"]; ok {
+			t.Errorf("a request without features carries the key: %s", data)
+		}
+		if len(keys) != 4 {
+			t.Errorf("a request without features has %d keys, want the four of a node that declares nothing: %s", len(keys), data)
 		}
 	})
 }
@@ -1946,6 +1979,19 @@ var _ wireguard.PeerStatsReader = statsReadingSetupRefusingWGController{}
 
 func (statsReadingSetupRefusingWGController) PeerStats(string) ([]wireguard.PeerStat, error) {
 	return nil, nil
+}
+
+// setupRefusingReplacerWGController refuses Setup exactly as
+// setupRefusingWGController does, yet can replace an address. A node over it
+// differs from one over statsWGController only in its failed setup, so a test
+// of the mesh_readdress declaration sees no features key for that reason
+// alone and not because the controller cannot replace an address.
+type setupRefusingReplacerWGController struct{ setupRefusingWGController }
+
+var _ wireguard.AddressReplacer = setupRefusingReplacerWGController{}
+
+func (setupRefusingReplacerWGController) ReplaceAddress(string, string, string) error {
+	return nil
 }
 
 func useWGController(t *testing.T, ctrl wireguard.WGController) {
@@ -7100,6 +7146,122 @@ func TestRunUp_ReaddressesFromTheStatePull(t *testing.T) {
 	}
 	if info.MeshIP != movedMeshIP {
 		t.Errorf("system.info mesh_ip = %q, want %q", info.MeshIP, movedMeshIP)
+	}
+}
+
+// heartbeatCapture is a control plane that keeps the body of every heartbeat
+// and answers every route with an empty JSON object.
+type heartbeatCapture struct {
+	mu     sync.Mutex
+	bodies [][]byte
+}
+
+func newHeartbeatCapture(t *testing.T) (*heartbeatCapture, string) {
+	t.Helper()
+	cp := &heartbeatCapture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			raw, _ := io.ReadAll(r.Body)
+			cp.mu.Lock()
+			cp.bodies = append(cp.bodies, raw)
+			cp.mu.Unlock()
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+// firstHeartbeat blocks until a heartbeat arrives and returns its body.
+func (cp *heartbeatCapture) firstHeartbeat(t *testing.T) []byte {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		var first []byte
+		if len(cp.bodies) > 0 {
+			first = cp.bodies[0]
+		}
+		cp.mu.Unlock()
+		if first != nil {
+			return first
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon sent no heartbeat within 30s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The heartbeat declares mesh_readdress when the node can follow a move:
+// WireGuard came up on a controller that replaces an address, and the
+// interface carries the Domain mesh CIDR. A node whose WireGuard setup failed
+// and one whose identity has no domain_mesh_cidr, so that its interface
+// carries the host /32, declare nothing and send no features key.
+func TestRunUp_DeclaresMeshReaddress(t *testing.T) {
+	tests := []struct {
+		name       string
+		ctrl       wireguard.WGController
+		domainCIDR string
+		want       string
+	}{
+		{
+			name:       "a controller that replaces an address and a Domain mesh CIDR",
+			ctrl:       &statsWGController{},
+			domainCIDR: "100.64.0.0/10",
+			want:       `["mesh_readdress"]`,
+		},
+		{
+			name:       "WireGuard setup fails",
+			ctrl:       setupRefusingReplacerWGController{},
+			domainCIDR: "100.64.0.0/10",
+		},
+		{
+			name: "an identity without domain_mesh_cidr",
+			ctrl: &statsWGController{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Outside a cluster no PlexdHook list runs; an ambient
+			// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+			cp, apiBase := newHeartbeatCapture(t)
+			useWGController(t, tt.ctrl)
+			dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t)+
+				"heartbeat:\n  interval: 1s\n"+
+				"wireguard:\n  interface_name: "+readdressTestInterface+"\n  mtu: 1420\n")
+			err := registration.SaveIdentity(dataDir, &registration.NodeIdentity{
+				NodeID:           upResumedNodeID,
+				MeshIP:           startMeshIP,
+				SigningPublicKey: upTestSigningKey,
+				SigningKeyID:     upTestSigningKID,
+				DomainMeshCIDR:   tt.domainCIDR,
+				PrivateKey:       bytes.Repeat([]byte{0x33}, 32),
+				NodeSecretKey:    upResumedNSK,
+			})
+			if err != nil {
+				t.Fatalf("seed identity: %v", err)
+			}
+
+			shutdown := startRunUp(t)
+			defer shutdown()
+
+			body := cp.firstHeartbeat(t)
+			var keys map[string]json.RawMessage
+			if err := json.Unmarshal(body, &keys); err != nil {
+				t.Fatalf("decode heartbeat: %v (body: %s)", err, body)
+			}
+			got, ok := keys["features"]
+			switch {
+			case tt.want == "" && ok:
+				t.Errorf("heartbeat carries features %s, want no features key (body: %s)", got, body)
+			case tt.want != "" && string(got) != tt.want:
+				t.Errorf("heartbeat features = %s, want %s (body: %s)", got, tt.want, body)
+			}
+		})
 	}
 }
 
