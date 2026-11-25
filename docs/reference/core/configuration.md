@@ -519,6 +519,22 @@ Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deploy
 > next start after a crash; see
 > [Logged rules on Windows](../networking/pf-wfp-firewall.md#logged-rules-on-windows).
 
+> **Migration:** On Linux `nft list table inet plexd` now prints a different ruleset, while
+> what the policy admits and drops stays the same. Each chain opens with a guard,
+> `iifname != "plexd0" accept` (`oifname` in the output chain), that lets traffic on every
+> other interface pass, and the rules behind it carry no `iifname` or `oifname` of their own.
+> plexd writes the unlogged allows that name an address as nftables sets, such as
+> `ip saddr . ip daddr . meta l4proto . th dport { 10.99.0.0/24 . 10.99.0.1 . tcp . 7010-7020 } counter accept`,
+> with one counter per set rule, so those rules no longer have counters of their own.
+> Logged rules and the default deny stay rules with their own counters. The sets need
+> interval concatenations, in mainline since Linux 5.6. A kernel that refuses them gets the
+> rules as a list behind the same guard: plexd logs
+> `policy rule sets unavailable, rules are installed as a list` at Warn and writes the list
+> until it restarts. There is nothing to configure. A rollback to an earlier binary that
+> knows the output chain is clean, after a crash too: it flushes and rewrites the three
+> chains when it applies its ruleset, the sets go with the flush, and nothing of this
+> release stays. See [Rule Sets](../networking/nftables-firewall.md#rule-sets).
+
 Source: `internal/policy/config.go`
 
 ---
