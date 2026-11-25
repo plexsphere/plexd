@@ -743,14 +743,37 @@ func TestBuildRuleExprsRejectsAddresses(t *testing.T) {
 	}
 }
 
-// pinnedConnTrackExprs writes out the two connection tracking rules for iface
-// by hand, with key as the interface match: MetaKeyIIFNAME for the input and
-// forward chains, MetaKeyOIFNAME for the output chain.
-func pinnedConnTrackExprs(iface string, key expr.MetaKey) [][]expr.Any {
-	ifaceMatch := []expr.Any{
+// pinnedIfaceMatch is the interface match of a rule on iface, with key
+// MetaKeyIIFNAME or MetaKeyOIFNAME, written out by hand. An empty iface
+// stands for a rule without a match of its own: one behind the guard of a
+// single interface, or one whose Interface is empty.
+func pinnedIfaceMatch(iface string, key expr.MetaKey) []expr.Any {
+	if iface == "" {
+		return nil
+	}
+	return []expr.Any{
 		&expr.Meta{Key: key, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
 	}
+}
+
+// pinnedGuard is the guard that opens a list for ifaces, with key as the
+// interface it reads: the name loaded once, one != per interface, then
+// accept, and no counter.
+func pinnedGuard(key expr.MetaKey, ifaces ...string) []expr.Any {
+	guard := []expr.Any{&expr.Meta{Key: key, Register: 1}}
+	for _, iface := range ifaces {
+		guard = append(guard, &expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte(iface + "\x00")})
+	}
+	return append(guard, &expr.Verdict{Kind: expr.VerdictAccept})
+}
+
+// pinnedConnTrackExprs writes out the two connection tracking rules for iface
+// by hand, with key as the interface match: MetaKeyIIFNAME for the input and
+// forward chains, MetaKeyOIFNAME for the output chain. An empty iface leaves
+// the match out.
+func pinnedConnTrackExprs(iface string, key expr.MetaKey) [][]expr.Any {
+	ifaceMatch := pinnedIfaceMatch(iface, key)
 	state := func(bit uint32) []expr.Any {
 		return []expr.Any{
 			&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
@@ -821,67 +844,150 @@ func TestConnTrackExprsWithoutInterface(t *testing.T) {
 	}
 }
 
-func TestChainRuleExprs(t *testing.T) {
-	rules := []FirewallRule{
+// oneIfaceRules is a ruleset on one interface, wg0: an IPv4 allow with a
+// port, an IPv6 allow and the default deny.
+func oneIfaceRules() []FirewallRule {
+	return []FirewallRule{
 		{Interface: "wg0", DstIP: "10.0.0.1/32", Protocol: "tcp", Port: 22, Action: "allow"},
-		{Interface: "wg1", DstIP: "fd00::1/128", Action: "allow"},
+		{Interface: "wg0", DstIP: "fd00::1/128", Action: "allow"},
 		{Interface: "wg0", Action: "deny"},
-	}
-
-	got, err := chainRuleExprs(rules, hookInput)
-	if err != nil {
-		t.Fatalf("chainRuleExprs returned error: %v", err)
-	}
-
-	// Per interface, in order of first appearance, the connection tracking
-	// pair and the round-trip probe rule, then the rules in the order given.
-	var want [][]expr.Any
-	for _, iface := range []string{"wg0", "wg1"} {
-		want = append(want, connTrackExprs(iface, dirIn)...)
-		want = append(want, pinnedRTTProbeExprs(iface, expr.MetaKeyIIFNAME))
-	}
-	for _, rule := range rules {
-		exprs, err := buildRuleExprs(rule, dirIn)
-		if err != nil {
-			t.Fatalf("buildRuleExprs returned error: %v", err)
-		}
-		want = append(want, exprs)
-	}
-	if len(got) != len(want) {
-		t.Fatalf("chainRuleExprs returned %d rules, want %d", len(got), len(want))
-	}
-	for i := range want {
-		assertExprs(t, got[i], want[i])
 	}
 }
 
-// The forward list opens with the connection tracking pair alone: nothing
-// the node forwards passes the round-trip probe exemption.
+// ruleLists returns the list chainRuleExprs builds from rules for hook.
+func ruleLists(t *testing.T, rules []FirewallRule, hook chainHook) [][]expr.Any {
+	t.Helper()
+	got, err := chainRuleExprs(rules, hook)
+	if err != nil {
+		t.Fatalf("chainRuleExprs(hook %d) returned error: %v", hook, err)
+	}
+	return got
+}
+
+// builtRules returns buildRuleExprs of each rule with dir, in order.
+func builtRules(t *testing.T, rules []FirewallRule, dir ifaceDir) [][]expr.Any {
+	t.Helper()
+	var out [][]expr.Any
+	for _, rule := range rules {
+		exprs, err := buildRuleExprs(rule, dir)
+		if err != nil {
+			t.Fatalf("buildRuleExprs(%+v) returned error: %v", rule, err)
+		}
+		out = append(out, exprs)
+	}
+	return out
+}
+
+// assertNoIfaceMatch checks that no rule of list loads an interface name.
+func assertNoIfaceMatch(t *testing.T, list [][]expr.Any) {
+	t.Helper()
+	for i, rule := range list {
+		for _, e := range rule {
+			if meta, ok := e.(*expr.Meta); ok && (meta.Key == expr.MetaKeyIIFNAME || meta.Key == expr.MetaKeyOIFNAME) {
+				t.Errorf("rule %d = %s, want no interface match", i, formatExprs(rule))
+			}
+		}
+	}
+}
+
+func TestGuardExprs(t *testing.T) {
+	assertExprs(t, guardExprs([]string{"plexd0"}, dirIn), []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte("plexd0\x00")},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	})
+	assertExprs(t, guardExprs([]string{"plexd0"}, dirOut), []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte("plexd0\x00")},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	})
+	// Two interfaces: one load, then one != per interface in the order given.
+	assertExprs(t, guardExprs([]string{"wg1", "wg0"}, dirIn), []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte("wg1\x00")},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte("wg0\x00")},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	})
+}
+
+// Behind the guard the input list opens with the connection tracking pair
+// and the round-trip probe rule, without their iifname matches, and holds
+// the rules without theirs.
+func TestChainRuleExprs(t *testing.T) {
+	rules := oneIfaceRules()
+	got := ruleLists(t, rules, hookInput)
+
+	want := [][]expr.Any{pinnedGuard(expr.MetaKeyIIFNAME, "wg0")}
+	want = append(want, pinnedChainOpening(hookInput, "")...)
+	want = append(want, builtRules(t, rules, dirNone)...)
+	assertNftRuleLists(t, got, want)
+	assertNoIfaceMatch(t, got[1:])
+}
+
+// The forward list opens with the guard and the connection tracking pair
+// alone: nothing the node forwards passes the round-trip probe exemption.
 func TestChainRuleExprsForward(t *testing.T) {
+	rules := oneIfaceRules()
+	got := ruleLists(t, rules, hookForward)
+
+	want := [][]expr.Any{pinnedGuard(expr.MetaKeyIIFNAME, "wg0")}
+	want = append(want, pinnedChainOpening(hookForward, "")...)
+	want = append(want, builtRules(t, rules, dirNone)...)
+	assertNftRuleLists(t, got, want)
+	assertNoIfaceMatch(t, got[1:])
+}
+
+// With two interfaces the guard names both, in order of first appearance,
+// and every other rule keeps its interface match: the opening per interface
+// as plexd wrote it before the guard, then the rules.
+func TestChainRuleExprsTwoInterfaces(t *testing.T) {
 	rules := []FirewallRule{
 		{Interface: "wg0", DstIP: "10.0.0.1/32", Protocol: "tcp", Port: 22, Action: "allow"},
 		{Interface: "wg1", DstIP: "fd00::1/128", Action: "allow"},
 		{Interface: "wg0", Action: "deny"},
 	}
-
-	got, err := chainRuleExprs(rules, hookForward)
-	if err != nil {
-		t.Fatalf("chainRuleExprs returned error: %v", err)
+	for _, tc := range []struct {
+		hook chainHook
+		key  expr.MetaKey
+		dir  ifaceDir
+	}{
+		{hookInput, expr.MetaKeyIIFNAME, dirIn},
+		{hookForward, expr.MetaKeyIIFNAME, dirIn},
+		{hookOutput, expr.MetaKeyOIFNAME, dirOut},
+	} {
+		got := ruleLists(t, rules, tc.hook)
+		want := [][]expr.Any{pinnedGuard(tc.key, "wg0", "wg1")}
+		want = append(want, pinnedChainOpening(tc.hook, "wg0")...)
+		want = append(want, pinnedChainOpening(tc.hook, "wg1")...)
+		want = append(want, builtRules(t, rules, tc.dir)...)
+		assertNftRuleLists(t, got, want)
 	}
+}
 
-	// One connection tracking pair per interface, in order of first
-	// appearance, then the rules in the order given.
-	var want [][]expr.Any
-	want = append(want, pinnedConnTrackExprs("wg0", expr.MetaKeyIIFNAME)...)
-	want = append(want, pinnedConnTrackExprs("wg1", expr.MetaKeyIIFNAME)...)
-	for _, rule := range rules {
-		exprs, err := buildRuleExprs(rule, dirIn)
-		if err != nil {
-			t.Fatalf("buildRuleExprs returned error: %v", err)
-		}
-		want = append(want, exprs)
+// A rule without an interface matches every interface, so no guard can
+// stand in front of the list: it is the list plexd wrote before the guard,
+// each opening and rule with the interface match of its rule, none for the
+// empty one.
+func TestChainRuleExprsWithoutInterface(t *testing.T) {
+	rules := []FirewallRule{
+		{Interface: "plexd0", DstIP: "10.0.0.1/32", Protocol: "tcp", Port: 22, Action: "allow"},
+		{Action: "deny"},
 	}
-	assertNftRuleLists(t, got, want)
+	for _, tc := range []struct {
+		hook chainHook
+		key  expr.MetaKey
+		dir  ifaceDir
+	}{
+		{hookInput, expr.MetaKeyIIFNAME, dirIn},
+		{hookForward, expr.MetaKeyIIFNAME, dirIn},
+		{hookOutput, expr.MetaKeyOIFNAME, dirOut},
+	} {
+		got := ruleLists(t, rules, tc.hook)
+		want := pinnedChainOpening(tc.hook, "plexd0")
+		want = append(want, pinnedChainOpening(tc.hook, "")...)
+		want = append(want, builtRules(t, rules, tc.dir)...)
+		assertNftRuleLists(t, got, want)
+	}
 }
 
 func TestChainRuleExprsEmpty(t *testing.T) {
@@ -910,85 +1016,35 @@ func TestChainRuleExprsRejectsInvalidRule(t *testing.T) {
 // pinnedForeignSourceExprs is the rule that lets a packet leave iface
 // unfiltered when its source is not an address of iface: oifname "<iface>"
 // fib saddr . oif type != local counter accept. RTN_LOCAL is 2, loaded in
-// host byte order.
+// host byte order. An empty iface leaves the oifname match out.
 func pinnedForeignSourceExprs(iface string) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+	return append(pinnedIfaceMatch(iface, expr.MetaKeyOIFNAME),
 		&expr.Fib{Register: 1, ResultADDRTYPE: true, FlagSADDR: true, FlagOIF: true},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(2)},
 		&expr.Counter{},
 		&expr.Verdict{Kind: expr.VerdictAccept},
-	}
+	)
 }
 
+// Behind the guard of a single interface the foreign-source rule carries no
+// oifname match: the fib lookup still reads the output interface.
 func TestForeignSourceExprs(t *testing.T) {
-	assertExprs(t, foreignSourceExprs("plexd0"), pinnedForeignSourceExprs("plexd0"))
+	assertExprs(t, foreignSourceExprs("plexd0", dirOut), pinnedForeignSourceExprs("plexd0"))
+	assertExprs(t, foreignSourceExprs("plexd0", dirNone), pinnedForeignSourceExprs(""))
 }
 
+// Behind the guard the output list opens with the connection tracking pair,
+// the foreign-source rule, the relay probe rule and the round-trip probe
+// rule, without their oifname matches, and holds the rules without theirs.
 func TestChainRuleExprsOut(t *testing.T) {
-	rules := []FirewallRule{
-		{Interface: "wg0", DstIP: "10.0.0.1/32", Protocol: "tcp", Port: 22, Action: "allow"},
-		{Interface: "wg1", DstIP: "fd00::1/128", Action: "allow"},
-		{Interface: "wg0", Action: "deny"},
-	}
+	rules := oneIfaceRules()
+	got := ruleLists(t, rules, hookOutput)
 
-	got, err := chainRuleExprs(rules, hookOutput)
-	if err != nil {
-		t.Fatalf("chainRuleExprs returned error: %v", err)
-	}
-
-	oifname := func(iface string) []expr.Any {
-		return []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
-		}
-	}
-	// The relay probe rule: UDP to port 9 leaving through iface, from and to
-	// any address of either family.
-	probe := func(iface string) []expr.Any {
-		return append(oifname(iface),
-			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{17}},
-			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x00, 0x09}},
-			&expr.Counter{},
-			&expr.Verdict{Kind: expr.VerdictAccept},
-		)
-	}
-
-	// Per interface, in order of first appearance, the connection tracking
-	// pair, the foreign-source rule, the relay probe rule and the round-trip
-	// probe rule, then the rules in the order given.
-	var want [][]expr.Any
-	for _, iface := range []string{"wg0", "wg1"} {
-		want = append(want, pinnedConnTrackExprs(iface, expr.MetaKeyOIFNAME)...)
-		want = append(want, pinnedForeignSourceExprs(iface))
-		want = append(want, probe(iface))
-		want = append(want, pinnedRTTProbeExprs(iface, expr.MetaKeyOIFNAME))
-	}
-	for _, rule := range rules {
-		exprs, err := buildRuleExprs(rule, dirOut)
-		if err != nil {
-			t.Fatalf("buildRuleExprs returned error: %v", err)
-		}
-		want = append(want, exprs)
-	}
-	if len(got) != len(want) {
-		t.Fatalf("chainRuleExprs returned %d rules, want %d", len(got), len(want))
-	}
-	for i := range want {
-		assertExprs(t, got[i], want[i])
-	}
-
-	// Every rule of the policy matches the interface it leaves through.
-	for i, rule := range rules {
-		exprs := got[len(got)-len(rules)+i]
-		if len(exprs) < 2 {
-			t.Fatalf("rule %d has %d expressions, want an interface match first", i, len(exprs))
-		}
-		assertExprs(t, exprs[:2], oifname(rule.Interface))
-	}
+	want := [][]expr.Any{pinnedGuard(expr.MetaKeyOIFNAME, "wg0")}
+	want = append(want, pinnedChainOpening(hookOutput, "")...)
+	want = append(want, builtRules(t, rules, dirNone)...)
+	assertNftRuleLists(t, got, want)
+	assertNoIfaceMatch(t, got[1:])
 }
 
 func TestChainRuleExprsOutEmpty(t *testing.T) {
@@ -1196,23 +1252,18 @@ func nftLoggedRules() []FirewallRule {
 }
 
 // pinnedLoggedRules writes out by hand the rules nftLoggedRules become behind a
-// chain's opening rules, with key as the interface match: the log rule, the
-// accept rule and the deny.
-func pinnedLoggedRules(key expr.MetaKey) [][]expr.Any {
-	iface := func() []expr.Any {
-		return []expr.Any{
-			&expr.Meta{Key: key, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("plexd0\x00")},
-		}
-	}
+// chain's guard and opening rules: the log rule, the accept rule and the
+// deny, without interface matches, which the guard of plexd0 makes
+// redundant.
+func pinnedLoggedRules() [][]expr.Any {
 	match := func() []expr.Any {
-		return append(iface(),
+		return []expr.Any{
 			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{6}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 			// 7001 in network byte order.
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x1b, 0x59}},
-		)
+		}
 	}
 	logRule := append(match(),
 		// ct state new, loaded in host byte order.
@@ -1229,33 +1280,31 @@ func pinnedLoggedRules(key expr.MetaKey) [][]expr.Any {
 		&expr.Log{Key: 1<<unix.NFTA_LOG_GROUP | 1<<unix.NFTA_LOG_PREFIX, Group: 28772, Data: []byte("1/0")},
 	)
 	accept := append(match(), &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictAccept})
-	deny := append(iface(), &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop})
+	deny := []expr.Any{&expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop}}
 	return [][]expr.Any{logRule, accept, deny}
 }
 
 // pinnedRelayProbeExprs is the relay probe rule of the output chain: UDP to
-// port 9 leaving through iface, from and to any address of either family.
+// port 9 leaving through iface, from and to any address of either family. An
+// empty iface leaves the oifname match out.
 func pinnedRelayProbeExprs(iface string) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+	return append(pinnedIfaceMatch(iface, expr.MetaKeyOIFNAME),
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{17}},
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x00, 0x09}},
 		&expr.Counter{},
 		&expr.Verdict{Kind: expr.VerdictAccept},
-	}
+	)
 }
 
 // pinnedRTTProbeExprs is the round-trip probe rule of the input and output
 // chains: UDP to port 7911 on iface, from and to any address of either
 // family, with key as the interface match: MetaKeyIIFNAME for the input
-// chain, MetaKeyOIFNAME for the output chain.
+// chain, MetaKeyOIFNAME for the output chain. An empty iface leaves the
+// match out.
 func pinnedRTTProbeExprs(iface string, key expr.MetaKey) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: key, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(iface + "\x00")},
+	return append(pinnedIfaceMatch(iface, key),
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{17}},
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
@@ -1263,23 +1312,33 @@ func pinnedRTTProbeExprs(iface string, key expr.MetaKey) []expr.Any {
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x1e, 0xe7}},
 		&expr.Counter{},
 		&expr.Verdict{Kind: expr.VerdictAccept},
-	}
+	)
 }
 
-// pinnedChainOpening is what opens the chain hook selects for plexd0: the
+// pinnedChainOpening is what opens the chain hook selects for iface: the
 // connection tracking pair, then the round-trip probe rule in the input
 // chain, and the foreign-source rule, the relay probe rule and the round-trip
-// probe rule in the output chain. The forward chain opens with the pair alone.
-func pinnedChainOpening(hook chainHook) [][]expr.Any {
+// probe rule in the output chain. The forward chain opens with the pair
+// alone. An empty iface gives the opening without interface matches, as it
+// stands behind the guard of a single interface.
+func pinnedChainOpening(hook chainHook, iface string) [][]expr.Any {
 	switch hook {
 	case hookInput:
-		opening := pinnedConnTrackExprs("plexd0", expr.MetaKeyIIFNAME)
-		return append(opening, pinnedRTTProbeExprs("plexd0", expr.MetaKeyIIFNAME))
+		opening := pinnedConnTrackExprs(iface, expr.MetaKeyIIFNAME)
+		return append(opening, pinnedRTTProbeExprs(iface, expr.MetaKeyIIFNAME))
 	case hookOutput:
-		opening := pinnedConnTrackExprs("plexd0", expr.MetaKeyOIFNAME)
-		return append(opening, pinnedForeignSourceExprs("plexd0"), pinnedRelayProbeExprs("plexd0"), pinnedRTTProbeExprs("plexd0", expr.MetaKeyOIFNAME))
+		opening := pinnedConnTrackExprs(iface, expr.MetaKeyOIFNAME)
+		return append(opening, pinnedForeignSourceExprs(iface), pinnedRelayProbeExprs(iface), pinnedRTTProbeExprs(iface, expr.MetaKeyOIFNAME))
 	}
-	return pinnedConnTrackExprs("plexd0", expr.MetaKeyIIFNAME)
+	return pinnedConnTrackExprs(iface, expr.MetaKeyIIFNAME)
+}
+
+// guardKey is the interface key the guard of the chain hook selects reads.
+func guardKey(hook chainHook) expr.MetaKey {
+	if hook == hookOutput {
+		return expr.MetaKeyOIFNAME
+	}
+	return expr.MetaKeyIIFNAME
 }
 
 // nftLogRuleCount counts the rules of list that hold a log expression.
@@ -1307,44 +1366,28 @@ func assertNftRuleLists(t *testing.T, got, want [][]expr.Any) {
 }
 
 // A logged rule gets its log rule directly in front of it, in every list
-// behind the chain's opening rules: the connection tracking pair, then the
-// round-trip probe rule in the input list, and the foreign-source, relay
-// probe and round-trip probe rules in the output list.
+// behind the guard and the chain's opening rules: the connection tracking
+// pair, then the round-trip probe rule in the input list, and the
+// foreign-source, relay probe and round-trip probe rules in the output list.
 func TestChainRuleExprsLogged(t *testing.T) {
-	for _, tc := range []struct {
-		hook chainHook
-		key  expr.MetaKey
-	}{
-		{hookInput, expr.MetaKeyIIFNAME},
-		{hookForward, expr.MetaKeyIIFNAME},
-		{hookOutput, expr.MetaKeyOIFNAME},
-	} {
-		got, err := chainRuleExprs(nftLoggedRules(), tc.hook)
-		if err != nil {
-			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", tc.hook, err)
-		}
-		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.hook), pinnedLoggedRules(tc.key)...))
+	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+		got := ruleLists(t, nftLoggedRules(), hook)
+		want := [][]expr.Any{pinnedGuard(guardKey(hook), "plexd0")}
+		want = append(want, pinnedChainOpening(hook, "")...)
+		assertNftRuleLists(t, got, append(want, pinnedLoggedRules()...))
 	}
 }
 
-// Without a log tag the lists are the ones plexd wrote before connection
-// logging: no log rule in any chain.
+// Without a log tag the lists hold no log rule in any chain, and the rules
+// as they are without connection logging.
 func TestChainRuleExprsUntaggedUnchanged(t *testing.T) {
-	for _, tc := range []struct {
-		hook chainHook
-		key  expr.MetaKey
-	}{
-		{hookInput, expr.MetaKeyIIFNAME},
-		{hookForward, expr.MetaKeyIIFNAME},
-		{hookOutput, expr.MetaKeyOIFNAME},
-	} {
-		got, err := chainRuleExprs(withoutLogTags(nftLoggedRules()), tc.hook)
-		if err != nil {
-			t.Fatalf("chainRuleExprs(hook %d) returned error: %v", tc.hook, err)
-		}
-		assertNftRuleLists(t, got, append(pinnedChainOpening(tc.hook), pinnedLoggedRules(tc.key)[1:]...))
+	for _, hook := range []chainHook{hookInput, hookForward, hookOutput} {
+		got := ruleLists(t, withoutLogTags(nftLoggedRules()), hook)
+		want := [][]expr.Any{pinnedGuard(guardKey(hook), "plexd0")}
+		want = append(want, pinnedChainOpening(hook, "")...)
+		assertNftRuleLists(t, got, append(want, pinnedLoggedRules()[1:]...))
 		if n := nftLogRuleCount(got); n != 0 {
-			t.Errorf("hook %d: %d log rules, want none", tc.hook, n)
+			t.Errorf("hook %d: %d log rules, want none", hook, n)
 		}
 	}
 }

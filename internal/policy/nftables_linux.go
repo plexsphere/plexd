@@ -49,9 +49,11 @@ const nflogGroup uint16 = 28772
 // one on the output hook for traffic the node's own sockets send. All three
 // hold the same rules. The input and forward chains match them against the
 // interface a packet arrives on, and the output chain against the interface
-// a packet leaves through. The input chain holds them behind the round-trip
-// probe exemption, and the output chain behind the foreign-source rule and
-// the relay and round-trip probe exemptions.
+// a packet leaves through. When every rule names an interface, each chain
+// opens with a guard that accepts a packet on any other interface, so only
+// traffic on the policy's interfaces meets the rules. The input chain holds
+// them behind the round-trip probe exemption, and the output chain behind
+// the foreign-source rule and the relay and round-trip probe exemptions.
 //
 // A rule with a LogTag gets a log rule in front of it, which sends the first
 // packet of each connection it admits to NFLOG group nflogGroup. The
@@ -156,6 +158,10 @@ const (
 	// dirOut matches the interface a packet leaves through (meta oifname), for
 	// the output chain.
 	dirOut
+	// dirNone matches no interface. A list whose guard names one interface
+	// builds every other rule with it: what reaches them is on that
+	// interface already.
+	dirNone
 )
 
 // chainHook selects the base chain a rule list is built for.
@@ -298,7 +304,10 @@ func (c *NftablesController) EnsureChain(chain string) error {
 // atomically. It builds one list from the rules for each base chain before it
 // touches the batch (chainRuleExprs): the input and forward lists match the
 // interface a packet arrives on, and the output list the interface a packet
-// leaves through. Each list opens with the connection tracking rules of every
+// leaves through. When every rule names an interface, each list opens with a
+// guard that accepts a packet on any interface no rule names (guardExprs),
+// so traffic outside the policy's interfaces passes one rule instead of all
+// of them. Each list goes on with the connection tracking rules of every
 // interface the rules name. The input list follows them with that
 // interface's round-trip probe rule, and the output list with its
 // foreign-source rule, relay probe rule and round-trip probe rule; the
@@ -492,11 +501,12 @@ func (c *NftablesController) DeleteChain(chain string) error {
 
 // DropCounts returns the packets and bytes the drop rules in the three base
 // chains of the named chain dropped. It implements DropCounter. buildRuleExprs
-// ends every rule in a counter and a verdict, and the default deny is the only
-// rule the engine gives a drop verdict, so the sum is what the default deny
-// dropped. The counters restart when ApplyRules replaces the chain: it
-// flushes the three chains and adds every rule again with a counter at zero.
-// It reads the counters with one rule dump per base chain.
+// ends every rule it builds in a counter and a verdict, the guard ends in
+// accept without a counter, and the default deny is the only rule the engine
+// gives a drop verdict, so the sum is what the default deny dropped. The
+// counters restart when ApplyRules replaces the chain: it flushes the three
+// chains and adds every rule again with a counter at zero. It reads the
+// counters with one rule dump per base chain.
 func (c *NftablesController) DropCounts(chain string) (packets, bytes uint64, err error) {
 	conn, err := nftables.New()
 	if err != nil {
@@ -518,9 +528,10 @@ func (c *NftablesController) DropCounts(chain string) (packets, bytes uint64, er
 }
 
 // sumDropCounters sums the counters of the rules whose last expression is a
-// drop verdict, and ignores every other rule: those that accept, and the log
-// rules, which end in their log expression. A rule's counter is the first
-// counter expression it holds; buildRuleExprs gives every rule exactly one.
+// drop verdict, and ignores every other rule: those that accept, the guard
+// among them, and the log rules, which end in their log expression. A rule's
+// counter is the first counter expression it holds; buildRuleExprs gives
+// every rule it builds exactly one.
 func sumDropCounters(rules []*nftables.Rule) (packets, bytes uint64) {
 	for _, rule := range rules {
 		if len(rule.Exprs) == 0 {
@@ -589,22 +600,51 @@ func (c *NftablesController) ensureTable(conn *nftables.Conn) *nftables.Table {
 
 // chainRuleExprs translates rules into the list ApplyRules writes into the
 // base chain hook selects, with every interface match reading the interface
-// that chain matches (chainHook.dir). The list opens, for every interface the
-// rules name, once per interface in order of first appearance, with its two
-// connection tracking rules. In the input list its round-trip probe rule
-// follows them, and in the output list its foreign-source rule, its relay
-// probe rule and its round-trip probe rule; the forward list holds the pair
-// alone. One rule per FirewallRule follows, in the order given, with the log
-// rule of a rule that carries a LogTag directly in front of it.
+// that chain matches (chainHook.dir).
+//
+// A list is guarded when the rules name at least one interface and no rule
+// has an empty Interface. A guarded list starts with the guard (guardExprs),
+// which names every interface of the rules in order of first appearance.
+// When it names exactly one, every other rule of the list is built without
+// an interface match (dirNone); with two or more each keeps the match of its
+// rule. An unguarded list has no guard, and every rule carries the interface
+// match of its rule, which is none for an empty Interface.
+//
+// The list goes on, for every interface the rules name, once per interface
+// in order of first appearance, with its two connection tracking rules. In
+// the input list its round-trip probe rule follows them, and in the output
+// list its foreign-source rule, its relay probe rule and its round-trip probe
+// rule; the forward list holds the pair alone. One rule per FirewallRule
+// follows, in the order given, with the log rule of a rule that carries a
+// LogTag directly in front of it.
 func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) {
-	dir := hook.dir()
 	var ifaces []string
 	seen := make(map[string]bool)
-	ruleExprs := make([][]expr.Any, 0, len(rules))
+	guarded := len(rules) > 0
 	for _, rule := range rules {
 		if err := rule.Validate(); err != nil {
 			return nil, fmt.Errorf("policy: nftables: apply rules: %w", err)
 		}
+		if rule.Interface == "" {
+			guarded = false
+		}
+		if !seen[rule.Interface] {
+			seen[rule.Interface] = true
+			ifaces = append(ifaces, rule.Interface)
+		}
+	}
+
+	dir := hook.dir()
+	var guard [][]expr.Any
+	if guarded {
+		guard = [][]expr.Any{guardExprs(ifaces, dir)}
+		if len(ifaces) == 1 {
+			dir = dirNone
+		}
+	}
+
+	ruleExprs := make([][]expr.Any, 0, len(rules))
+	for _, rule := range rules {
 		if rule.LogTag != "" {
 			logExprs, err := logRuleExprs(rule, dir)
 			if err != nil {
@@ -617,10 +657,6 @@ func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) 
 			return nil, fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
 		}
 		ruleExprs = append(ruleExprs, exprs)
-		if !seen[rule.Interface] {
-			seen[rule.Interface] = true
-			ifaces = append(ifaces, rule.Interface)
-		}
 	}
 
 	perIface := 2
@@ -630,7 +666,8 @@ func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) 
 	case hookOutput:
 		perIface = 5
 	}
-	list := make([][]expr.Any, 0, perIface*len(ifaces)+len(ruleExprs))
+	list := make([][]expr.Any, 0, len(guard)+perIface*len(ifaces)+len(ruleExprs))
+	list = append(list, guard...)
 	for _, iface := range ifaces {
 		list = append(list, connTrackExprs(iface, dir)...)
 		var exempt []FirewallRule
@@ -638,7 +675,7 @@ func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) 
 		case hookInput:
 			exempt = []FirewallRule{rttProbeRule(iface)}
 		case hookOutput:
-			list = append(list, foreignSourceExprs(iface))
+			list = append(list, foreignSourceExprs(iface, dir))
 			exempt = []FirewallRule{relayProbeRule(iface), rttProbeRule(iface)}
 		}
 		for _, rule := range exempt {
@@ -650,6 +687,31 @@ func chainRuleExprs(rules []FirewallRule, hook chainHook) ([][]expr.Any, error) 
 		}
 	}
 	return append(list, ruleExprs...), nil
+}
+
+// guardExprs builds the guard that opens a list whose rules all name an
+// interface: meta iifname (dirIn) or oifname (dirOut) != each of ifaces,
+// then accept. A packet on any other interface leaves the chain at the
+// guard, so the interface is tested once per packet instead of once per
+// rule. An accept in a base chain ends that chain only, exactly as falling
+// off its end under policy accept does, so the verdict of every packet is
+// unchanged: none of the rules behind the guard matches a packet on another
+// interface. The guard carries no counter, so traffic that leaves at it
+// writes nothing.
+func guardExprs(ifaces []string, dir ifaceDir) []expr.Any {
+	key := expr.MetaKeyIIFNAME
+	if dir == dirOut {
+		key = expr.MetaKeyOIFNAME
+	}
+	exprs := []expr.Any{&expr.Meta{Key: key, Register: 1}}
+	for _, iface := range ifaces {
+		exprs = append(exprs, &expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     ifaceNameBytes(iface),
+		})
+	}
+	return append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
 }
 
 // logRuleExprs builds the log rule of a rule that carries a LogTag: the
@@ -680,9 +742,10 @@ func logRuleExprs(rule FirewallRule, dir ifaceDir) ([]expr.Any, error) {
 // the routing table for the type of the source address on the outgoing
 // interface, which is local only for an address assigned to that interface,
 // so the node's mesh address is filtered and eth0's, a Pod's or a container's
-// is not. The scope DECISION is at ApplyRules.
-func foreignSourceExprs(iface string) []expr.Any {
-	return append(ifaceMatchExprs(iface, dirOut),
+// is not. dir is dirOut, or dirNone behind a guard that tested iface already.
+// The scope DECISION is at ApplyRules.
+func foreignSourceExprs(iface string, dir ifaceDir) []expr.Any {
+	return append(ifaceMatchExprs(iface, dir),
 		&expr.Fib{Register: 1, ResultADDRTYPE: true, FlagSADDR: true, FlagOIF: true},
 		&expr.Cmp{
 			Op:       expr.CmpOpNeq,
@@ -711,10 +774,10 @@ func rttProbeRule(iface string) FirewallRule {
 }
 
 // ifaceMatchExprs matches the name of the interface dir selects, the input
-// interface for dirIn and the output interface for dirOut, or returns nil for
-// an empty name, which matches every interface.
+// interface for dirIn and the output interface for dirOut. It returns nil for
+// an empty name, which matches every interface, and for dirNone.
 func ifaceMatchExprs(iface string, dir ifaceDir) []expr.Any {
-	if iface == "" {
+	if iface == "" || dir == dirNone {
 		return nil
 	}
 	key := expr.MetaKeyIIFNAME
