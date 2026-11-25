@@ -28,6 +28,7 @@ type mockController struct {
 	addPeerErr          error
 	removePeerErr       error
 	setPrivateKeyErr    error
+	replaceAddressErr   error
 }
 
 func (m *mockController) CreateInterface(name string, privateKey []byte, listenPort int) error {
@@ -90,6 +91,18 @@ func (m *mockController) SetPrivateKey(name string, privateKey []byte) error {
 	m.mu.Lock()
 	m.calls = append(m.calls, mockCall{Method: "SetPrivateKey", Args: []interface{}{name, privateKey}})
 	err := m.setPrivateKeyErr
+	m.mu.Unlock()
+	return err
+}
+
+var _ AddressReplacer = (*mockController)(nil)
+
+// ReplaceAddress makes the mock an AddressReplacer, the shape every
+// production controller has.
+func (m *mockController) ReplaceAddress(name, oldAddress, newAddress string) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "ReplaceAddress", Args: []interface{}{name, oldAddress, newAddress}})
+	err := m.replaceAddressErr
 	m.mu.Unlock()
 	return err
 }

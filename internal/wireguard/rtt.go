@@ -270,7 +270,7 @@ func (s *rttSocket) close() {
 }
 
 // listenRTT is the default rttListen: it listens on UDP port RTTProbePort of
-// the node's mesh IP, as Setup stored it, on a socket bound to the mesh
+// the node's mesh IP, as MeshIP returns it, on a socket bound to the mesh
 // interface (ifbind.Control), and returns the socket that rttMeshOnly makes
 // of it, which on macOS hands the reader only what arrived on the mesh
 // interface. A mesh IP that is not IPv4, the zero address included, is
@@ -293,12 +293,13 @@ func (s *rttSocket) close() {
 // datagram, whatever did not arrive on the mesh utun. Windows receives on
 // the strong host model and needs neither.
 func (m *Manager) listenRTT() (net.PacketConn, error) {
-	if !m.meshIP.Is4() {
-		return nil, fmt.Errorf("wireguard: rtt probe: mesh ip %s is not IPv4", m.meshIP)
+	ip := m.MeshIP()
+	if !ip.Is4() {
+		return nil, fmt.Errorf("wireguard: rtt probe: mesh ip %s is not IPv4", ip)
 	}
 	iface := m.OSInterfaceName()
 	lc := net.ListenConfig{Control: ifbind.Control(iface)}
-	conn, err := lc.ListenPacket(context.Background(), "udp4", netip.AddrPortFrom(m.meshIP, RTTProbePort).String())
+	conn, err := lc.ListenPacket(context.Background(), "udp4", netip.AddrPortFrom(ip, RTTProbePort).String())
 	if err != nil {
 		return nil, err
 	}
@@ -323,10 +324,11 @@ func rttProbeAddr(meshIP netip.Addr) net.Addr {
 //
 // A round, in order (see rttRound):
 //  1. Listens when it holds no socket, none yet or one whose reader ended (see
-//     rttRead). A failure logs wireguard: rtt probe listen failed, at Warn the
-//     first time and at Debug while it keeps failing. The round then sends
-//     nothing, counts one unanswered probe for every peer that holds a value,
-//     and ends.
+//     rttRead). Readdress closes the socket, so the round after it listens on
+//     the new address. A failure logs wireguard: rtt probe listen failed, at
+//     Warn the first time and at Debug while it keeps failing. The round then
+//     sends nothing, counts one unanswered probe for every peer that holds a
+//     value, and ends.
 //  2. Reads MeshPeerStats. ErrPeerStatsUnsupported logs wireguard: rtt probe
 //     unavailable, the controller cannot read peer stats at Info and ends the
 //     probe. Any other error logs wireguard: rtt probe round failed at Warn
@@ -443,38 +445,53 @@ func (m *Manager) rttRound(ctx context.Context, s *rttSocket) bool {
 // rtt probe listen failed, at Warn the first time and at Debug while it keeps
 // failing; a success resets that. The handle is set before the reader starts,
 // so a reader that ends at once still finds its socket there to clear.
+//
+// It reads the mesh IP before the listen and again after the handle is set.
+// A Readdress between the two reads may have found no handle to close, so a
+// changed address closes the new socket and listens again. A Readdress after
+// the second read finds the handle and closes the socket itself.
 func (m *Manager) rttOpen(s *rttSocket) bool {
 	if s.conn != nil {
 		select {
 		case <-s.done:
 			// The reader closed the socket after rttMaxReadErrors failed
-			// reads in a row.
+			// reads in a row, or Readdress closed it.
 			s.conn, s.done = nil, nil
 		default:
 			return true
 		}
 	}
 
-	conn, err := m.rttListen()
-	if err != nil {
-		level := slog.LevelWarn
-		if s.listenFailing {
-			level = slog.LevelDebug
+	var conn net.PacketConn
+	for {
+		ip := m.MeshIP()
+		var err error
+		conn, err = m.rttListen()
+		if err != nil {
+			level := slog.LevelWarn
+			if s.listenFailing {
+				level = slog.LevelDebug
+			}
+			m.logger.Log(context.Background(), level, "wireguard: rtt probe listen failed",
+				"component", "wireguard",
+				"address", netip.AddrPortFrom(ip, RTTProbePort).String(),
+				"error", err,
+			)
+			s.listenFailing = true
+			return false
 		}
-		m.logger.Log(context.Background(), level, "wireguard: rtt probe listen failed",
-			"component", "wireguard",
-			"address", netip.AddrPortFrom(m.meshIP, RTTProbePort).String(),
-			"error", err,
-		)
-		s.listenFailing = true
-		return false
+		m.rtt.mu.Lock()
+		m.rtt.conn = conn
+		m.rtt.mu.Unlock()
+		if m.MeshIP() == ip {
+			break
+		}
+		m.rtt.forget(conn)
+		_ = conn.Close()
 	}
 	s.listenFailing = false
 	s.conn = conn
 	s.done = make(chan struct{})
-	m.rtt.mu.Lock()
-	m.rtt.conn = conn
-	m.rtt.mu.Unlock()
 	go m.rttRead(conn, s.done)
 	return true
 }
@@ -483,10 +500,11 @@ func (m *Manager) rttOpen(s *rttSocket) bool {
 // stats: each whose LastHandshake is non-zero and younger than
 // connectedHandshakeAge, whose dial state exists, and whose dial state's
 // MeshIP parses as an IPv4 address inside the mesh prefix other than the
-// node's own mesh IP. It reads the dial states under m.mu and touches no
-// table.
+// node's own mesh IP. It reads the dial states under m.mu, and the mesh IP
+// before it takes m.mu, and touches no table.
 func (m *Manager) rttTargets(stats []MeshPeerStat) []rttTarget {
 	now := m.now()
+	self := m.MeshIP()
 	var targets []rttTarget
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -499,7 +517,7 @@ func (m *Manager) rttTargets(stats []MeshPeerStat) []rttTarget {
 			continue
 		}
 		ip, err := netip.ParseAddr(st.peer.MeshIP)
-		if err != nil || !ip.Is4() || !m.meshPrefix.Contains(ip) || ip == m.meshIP {
+		if err != nil || !ip.Is4() || !m.meshPrefix.Contains(ip) || ip == self {
 			continue
 		}
 		targets = append(targets, rttTarget{nodeID: s.NodeID, meshIP: ip, endpoint: s.Endpoint})

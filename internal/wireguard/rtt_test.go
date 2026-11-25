@@ -1293,8 +1293,269 @@ func TestManager_Setup_StoresTheMeshIP(t *testing.T) {
 		if err := mgr.Setup(context.Background(), identity); err != nil {
 			t.Fatalf("Setup(%s): %v", tc.meshIP, err)
 		}
-		if mgr.meshIP != tc.want {
-			t.Errorf("meshIP after Setup(%s) = %v, want %v", tc.meshIP, mgr.meshIP, tc.want)
+		if got := mgr.MeshIP(); got != tc.want {
+			t.Errorf("MeshIP() after Setup(%s) = %v, want %v", tc.meshIP, got, tc.want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Readdress
+// ---------------------------------------------------------------------------
+
+// rttListenRecord is one listen of a recordingListen: the mesh IP it read and
+// the socket it opened.
+type rttListenRecord struct {
+	meshIP netip.Addr
+	conn   *net.UDPConn
+}
+
+// recordingListen is an rttListen for m that reads the mesh IP through
+// MeshIP, as listenRTT does, and listens on 127.0.0.1 instead, which every CI
+// platform has. once, when set, runs between the read and the listen of the
+// next call only. Every socket it opened is closed when the test ends.
+type recordingListen struct {
+	m    *Manager
+	once func()
+
+	mu      sync.Mutex
+	records []rttListenRecord
+}
+
+func newRecordingListen(t *testing.T, m *Manager) *recordingListen {
+	t.Helper()
+	l := &recordingListen{m: m}
+	t.Cleanup(func() {
+		for _, r := range l.listens() {
+			_ = r.conn.Close()
+		}
+	})
+	return l
+}
+
+func (l *recordingListen) listen() (net.PacketConn, error) {
+	ip := l.m.MeshIP()
+	l.mu.Lock()
+	once := l.once
+	l.once = nil
+	l.mu.Unlock()
+	if once != nil {
+		once()
+	}
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.records = append(l.records, rttListenRecord{meshIP: ip, conn: conn})
+	return conn, nil
+}
+
+// listens returns the listens so far.
+func (l *recordingListen) listens() []rttListenRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.records)
+}
+
+// setupLoopbackReaddress returns a manager over a statsController set up
+// with mesh IP rttSelf in rttMesh, which holds node-a at 10.0.0.2 with a
+// handshake fresh on the real clock, sends node-a's probes to peer, and
+// listens through the recordingListen it returns.
+func setupLoopbackReaddress(t *testing.T, peer net.Addr) (*Manager, *recordingListen) {
+	t.Helper()
+	ctrl := &statsController{}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+	identity := testIdentity()
+	identity.MeshIP = rttSelf.String()
+	identity.DomainMeshCIDR = rttMesh.String()
+	if err := mgr.Setup(context.Background(), identity); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	key := addMeshPeer(t, mgr, "node-a", 0x0a, "10.0.0.2")
+	ctrl.stats = []PeerStat{{
+		PublicKey:     key,
+		Endpoint:      netip.MustParseAddrPort("198.51.100.9:51820"),
+		LastHandshake: time.Now(),
+	}}
+	l := newRecordingListen(t, mgr)
+	mgr.rttListen = l.listen
+	mgr.rttAddr = func(netip.Addr) net.Addr { return peer }
+	return mgr, l
+}
+
+// probeFrom reads conn until a probe request from the socket at from
+// arrives, and fails t when none does.
+func probeFrom(t *testing.T, conn *net.UDPConn, from net.Addr) {
+	t.Helper()
+	// The deadline bounds a test that would otherwise hang; it waits for
+	// nothing.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 64)
+	for {
+		n, src, err := conn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("no probe from %s: %v", from, err)
+		}
+		if src.String() == from.String() && n == rttDatagramLen && buf[5] == rttKindRequest {
+			return
+		}
+	}
+}
+
+// TestRTTProbe_ListensAgainAfterReaddress reads "the round-trip probe on
+// loopback, Readdress, and the next round listens on the new address". The
+// rounds run in RunRTTProbe while Readdress writes the address, so -race
+// sees the two together.
+func TestRTTProbe_ListensAgainAfterReaddress(t *testing.T) {
+	peer := listenLoopback(t)
+	mgr, l := setupLoopbackReaddress(t, peer.LocalAddr())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := mgr.RunRTTProbe(ctx, 5*time.Millisecond); err != nil {
+			t.Errorf("RunRTTProbe() = %v, want nil", err)
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitUntil(t, "the handle of the first listen's socket", func() bool {
+		ls := l.listens()
+		return len(ls) > 0 && mgr.rtt.socket() == ls[0].conn
+	})
+	first := l.listens()[0]
+	if first.meshIP != rttSelf {
+		t.Fatalf("the first listen read %v, want %v", first.meshIP, rttSelf)
+	}
+	probeFrom(t, peer, first.conn.LocalAddr())
+
+	moved := netip.MustParseAddr("10.0.0.9")
+	if err := mgr.Readdress(moved); err != nil {
+		t.Fatalf("Readdress: %v", err)
+	}
+
+	waitUntil(t, "a second listen", func() bool { return len(l.listens()) >= 2 })
+	ls := l.listens()
+	if len(ls) != 2 || ls[1].meshIP != moved {
+		t.Fatalf("listens read %v, want a second one that read %v", meshIPs(ls), moved)
+	}
+	if _, err := first.conn.WriteTo([]byte{0}, peer.LocalAddr()); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("a write on the first socket after Readdress = %v, want net.ErrClosed", err)
+	}
+	probeFrom(t, peer, ls[1].conn.LocalAddr())
+}
+
+// TestRTTProbe_ListensAgainWhenReaddressRacesTheListen runs a Readdress
+// between the round's read of the mesh IP and its listen, where Readdress
+// finds no socket handle to close. The round closes that socket and listens
+// again on the new address.
+func TestRTTProbe_ListensAgainWhenReaddressRacesTheListen(t *testing.T) {
+	peer := listenLoopback(t)
+	mgr, l := setupLoopbackReaddress(t, peer.LocalAddr())
+	moved := netip.MustParseAddr("10.0.0.9")
+	l.once = func() {
+		if err := mgr.Readdress(moved); err != nil {
+			t.Errorf("Readdress: %v", err)
+		}
+	}
+
+	var s rttSocket
+	t.Cleanup(s.close)
+	if !mgr.rttRound(context.Background(), &s) {
+		t.Fatal("rttRound stopped the probe")
+	}
+
+	ls := l.listens()
+	if len(ls) != 2 || ls[0].meshIP != rttSelf || ls[1].meshIP != moved {
+		t.Fatalf("listens read %v, want %v and then %v", meshIPs(ls), rttSelf, moved)
+	}
+	if _, err := ls[0].conn.WriteTo([]byte{0}, peer.LocalAddr()); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("a write on the first socket = %v, want net.ErrClosed", err)
+	}
+	if s.conn != ls[1].conn || mgr.rtt.socket() != ls[1].conn {
+		t.Errorf("the round holds %v with the handle %v, want the second socket %v", s.conn, mgr.rtt.socket(), ls[1].conn)
+	}
+	probeFrom(t, peer, ls[1].conn.LocalAddr())
+}
+
+// TestRTTProbe_ReaddressConcurrentWithRounds moves the address back and
+// forth while rounds run, so -race sees every read of the mesh IP a round
+// makes beside the write of Readdress.
+func TestRTTProbe_ReaddressConcurrentWithRounds(t *testing.T) {
+	peer := listenLoopback(t)
+	mgr, _ := setupLoopbackReaddress(t, peer.LocalAddr())
+	var s rttSocket
+	t.Cleanup(s.close)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			mgr.rttRound(context.Background(), &s)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := range 100 {
+			addr := netip.MustParseAddr("10.0.0.9")
+			if i%2 == 1 {
+				addr = rttSelf
+			}
+			if err := mgr.Readdress(addr); err != nil {
+				t.Errorf("Readdress(%s): %v", addr, err)
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+// TestRTTProbe_DefaultListenConcurrentWithReaddress runs listenRTT itself,
+// which the other Readdress tests replace, beside Readdress, so -race sees
+// its read of the mesh IP. The listen fails where neither address is local,
+// but it reads the mesh IP before it binds.
+func TestRTTProbe_DefaultListenConcurrentWithReaddress(t *testing.T) {
+	mgr, _ := setupLoopbackReaddress(t, listenLoopback(t).LocalAddr())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			if conn, err := mgr.listenRTT(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := range 100 {
+			addr := netip.MustParseAddr("10.0.0.9")
+			if i%2 == 1 {
+				addr = rttSelf
+			}
+			if err := mgr.Readdress(addr); err != nil {
+				t.Errorf("Readdress(%s): %v", addr, err)
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+// meshIPs returns the mesh IP each listen of ls read.
+func meshIPs(ls []rttListenRecord) []netip.Addr {
+	ips := make([]netip.Addr, 0, len(ls))
+	for _, r := range ls {
+		ips = append(ips, r.meshIP)
+	}
+	return ips
 }

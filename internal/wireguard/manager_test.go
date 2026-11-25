@@ -1196,3 +1196,283 @@ func TestManager_SetPeerPSK_ConcurrentWithUpdatePeer(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// Readdress
+// ---------------------------------------------------------------------------
+
+// plainController exposes only the WGController methods of the controller it
+// wraps, as a controller that cannot replace an address does.
+type plainController struct{ WGController }
+
+// subnetRouter is a mockRouter whose AddRoute fails with err for the subnet
+// failAdd names and records every call.
+type subnetRouter struct {
+	*mockRouter
+	failAdd string
+	err     error
+}
+
+func (r *subnetRouter) AddRoute(subnet, iface string) error {
+	if err := r.mockRouter.AddRoute(subnet, iface); err != nil {
+		return err
+	}
+	if subnet == r.failAdd {
+		return r.err
+	}
+	return nil
+}
+
+// setupReaddress returns a manager over ctrl set up with mesh IP 10.0.0.1 in
+// the Domain mesh CIDR 10.0.0.0/16, and the debug log it writes.
+func setupReaddress(t *testing.T, ctrl WGController) (*Manager, *bytes.Buffer) {
+	t.Helper()
+	logs := &bytes.Buffer{}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(logs))
+	identity := testIdentity()
+	identity.DomainMeshCIDR = "10.0.0.0/16"
+	if err := mgr.Setup(context.Background(), identity); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	return mgr, logs
+}
+
+// replaceCalls returns the ReplaceAddress calls ctrl recorded, as
+// "<name> <old> <new>".
+func replaceCalls(ctrl *mockController) []string {
+	var calls []string
+	for _, c := range ctrl.callsFor("ReplaceAddress") {
+		calls = append(calls, fmt.Sprintf("%s %s %s", c.Args...))
+	}
+	return calls
+}
+
+func TestManager_Readdress_ReplacesTheAddress(t *testing.T) {
+	ctrl := &mockController{}
+	mgr, logs := setupReaddress(t, ctrl)
+
+	if err := mgr.Readdress(netip.MustParseAddr("10.0.0.9")); err != nil {
+		t.Fatalf("Readdress: %v", err)
+	}
+	if got, want := replaceCalls(ctrl), []string{"plexd0 10.0.0.1/16 10.0.0.9/16"}; !slices.Equal(got, want) {
+		t.Errorf("ReplaceAddress calls = %v, want %v", got, want)
+	}
+	if got := mgr.MeshIP(); got != netip.MustParseAddr("10.0.0.9") {
+		t.Errorf("MeshIP() = %v, want 10.0.0.9", got)
+	}
+	if got := mgr.MeshPrefix(); got != netip.MustParsePrefix("10.0.0.0/16") {
+		t.Errorf("MeshPrefix() = %v, want 10.0.0.0/16 unchanged", got)
+	}
+	assertLogLine(t, logs.String(), "wireguard: mesh address replaced",
+		"level=INFO", "component=wireguard", "interface=plexd0", "previous_mesh_ip=10.0.0.1", " mesh_ip=10.0.0.9")
+
+	// An IPv4-mapped address is taken unmapped.
+	if err := mgr.Readdress(netip.MustParseAddr("::ffff:10.0.0.7")); err != nil {
+		t.Fatalf("Readdress(::ffff:10.0.0.7): %v", err)
+	}
+	if got := replaceCalls(ctrl); len(got) != 2 || got[1] != "plexd0 10.0.0.9/16 10.0.0.7/16" {
+		t.Errorf("ReplaceAddress calls = %v, want a second one from 10.0.0.9/16 to 10.0.0.7/16", got)
+	}
+	if got := mgr.MeshIP(); got != netip.MustParseAddr("10.0.0.7") {
+		t.Errorf("MeshIP() = %v, want 10.0.0.7", got)
+	}
+}
+
+func TestManager_Readdress_CurrentAddress(t *testing.T) {
+	ctrl := &mockController{}
+	mgr, logs := setupReaddress(t, ctrl)
+	before := len(callMethods(ctrl))
+
+	if err := mgr.Readdress(netip.MustParseAddr("10.0.0.1")); err != nil {
+		t.Fatalf("Readdress(the current address) = %v, want nil", err)
+	}
+	if got := callMethods(ctrl)[before:]; len(got) != 0 {
+		t.Errorf("controller calls = %v, want none for the current address", got)
+	}
+	if strings.Contains(logs.String(), "wireguard: mesh address replaced") {
+		t.Errorf("replaced line for the current address:\n%s", logs.String())
+	}
+}
+
+func TestManager_Readdress_RefusesAnInvalidAddress(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want string
+	}{
+		{"192.168.1.5", "192.168.1.5 lies outside the mesh prefix 10.0.0.0/16"},
+		{"0.0.0.0", "0.0.0.0 is unspecified"},
+		{"127.0.0.1", "127.0.0.1 is a loopback address"},
+		{"224.0.0.1", "224.0.0.1 is a multicast address"},
+		{"169.254.1.1", "169.254.1.1 is a link-local address"},
+		{"fd00::9", "fd00::9 is not an IPv4 address"},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			ctrl := &mockController{}
+			mgr, _ := setupReaddress(t, ctrl)
+			before := len(callMethods(ctrl))
+
+			err := mgr.Readdress(netip.MustParseAddr(tc.addr))
+			if !errors.Is(err, ErrMeshAddressInvalid) {
+				t.Fatalf("Readdress(%s) = %v, want an error wrapping ErrMeshAddressInvalid", tc.addr, err)
+			}
+			if want := "wireguard: readdress: invalid mesh address: " + tc.want; err.Error() != want {
+				t.Errorf("Readdress(%s) = %q, want %q", tc.addr, err, want)
+			}
+			if got := callMethods(ctrl)[before:]; len(got) != 0 {
+				t.Errorf("controller calls = %v, want none for an invalid address", got)
+			}
+			if got := mgr.MeshIP(); got != netip.MustParseAddr("10.0.0.1") {
+				t.Errorf("MeshIP() = %v, want 10.0.0.1 unchanged", got)
+			}
+		})
+	}
+}
+
+func TestManager_Readdress_Unsupported(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// manager returns a manager over ctrl in the state the case names.
+		manager func(t *testing.T, ctrl *mockController) *Manager
+		meshIP  netip.Addr
+	}{
+		{"before Setup", func(t *testing.T, ctrl *mockController) *Manager {
+			return NewManager(ctrl, Config{}, discardLogger())
+		}, netip.Addr{}},
+		{"controller without ReplaceAddress", func(t *testing.T, ctrl *mockController) *Manager {
+			mgr, _ := setupReaddress(t, plainController{ctrl})
+			return mgr
+		}, netip.MustParseAddr("10.0.0.1")},
+		{"host /32", func(t *testing.T, ctrl *mockController) *Manager {
+			mgr := NewManager(ctrl, Config{}, discardLogger())
+			if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+				t.Fatalf("Setup: %v", err)
+			}
+			if got := mgr.MeshPrefix(); got != netip.MustParsePrefix("10.0.0.1/32") {
+				t.Fatalf("MeshPrefix() = %v, want the host /32", got)
+			}
+			return mgr
+		}, netip.MustParseAddr("10.0.0.1")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := &mockController{}
+			mgr := tc.manager(t, ctrl)
+			before := len(callMethods(ctrl))
+
+			if mgr.CanReaddress() {
+				t.Error("CanReaddress() = true, want false")
+			}
+			err := mgr.Readdress(netip.MustParseAddr("10.0.0.9"))
+			if !errors.Is(err, ErrReaddressUnsupported) {
+				t.Errorf("Readdress = %v, want an error wrapping ErrReaddressUnsupported", err)
+			}
+			if got := callMethods(ctrl)[before:]; len(got) != 0 {
+				t.Errorf("controller calls = %v, want none while readdress is unsupported", got)
+			}
+			if got := mgr.MeshIP(); got != tc.meshIP {
+				t.Errorf("MeshIP() = %v, want %v unchanged", got, tc.meshIP)
+			}
+		})
+	}
+}
+
+func TestManager_CanReaddress(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+	if mgr.CanReaddress() {
+		t.Error("CanReaddress() before Setup = true, want false")
+	}
+
+	identity := testIdentity()
+	identity.DomainMeshCIDR = "10.0.0.0/16"
+	if err := mgr.Setup(context.Background(), identity); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if !mgr.CanReaddress() {
+		t.Error("CanReaddress() after a Setup with a Domain mesh CIDR = false, want true")
+	}
+}
+
+func TestManager_Readdress_ReplaceFails(t *testing.T) {
+	cause := errors.New("netlink: device busy")
+	ctrl := &mockController{replaceAddressErr: cause}
+	mgr, logs := setupReaddress(t, ctrl)
+
+	err := mgr.Readdress(netip.MustParseAddr("10.0.0.9"))
+	if !errors.Is(err, cause) {
+		t.Fatalf("Readdress = %v, want it to wrap %v", err, cause)
+	}
+	if want := "wireguard: readdress: netlink: device busy"; err.Error() != want {
+		t.Errorf("Readdress = %q, want %q", err, want)
+	}
+	if got := mgr.MeshIP(); got != netip.MustParseAddr("10.0.0.1") {
+		t.Errorf("MeshIP() after a failed replace = %v, want 10.0.0.1", got)
+	}
+	if strings.Contains(logs.String(), "wireguard: mesh address replaced") {
+		t.Errorf("replaced line after a failed replace:\n%s", logs.String())
+	}
+
+	// The next call repeats the replace with the same arguments.
+	ctrl.mu.Lock()
+	ctrl.replaceAddressErr = nil
+	ctrl.mu.Unlock()
+	if err := mgr.Readdress(netip.MustParseAddr("10.0.0.9")); err != nil {
+		t.Fatalf("Readdress once the controller succeeds: %v", err)
+	}
+	if got, want := replaceCalls(ctrl), []string{"plexd0 10.0.0.1/16 10.0.0.9/16", "plexd0 10.0.0.1/16 10.0.0.9/16"}; !slices.Equal(got, want) {
+		t.Errorf("ReplaceAddress calls = %v, want %v", got, want)
+	}
+	if got := mgr.MeshIP(); got != netip.MustParseAddr("10.0.0.9") {
+		t.Errorf("MeshIP() = %v, want 10.0.0.9", got)
+	}
+}
+
+func TestManager_Readdress_AddsThePeerRoutesAgain(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, discardLogger())
+	mgr.SetPeerRouter(&mockRouter{ctrl: ctrl})
+	programPeerRoutes(t, mgr, ctrl, "10.20.0.0/16", "10.30.0.0/16")
+
+	if err := mgr.Readdress(netip.MustParseAddr("10.99.0.9")); err != nil {
+		t.Fatalf("Readdress: %v", err)
+	}
+	if got, want := methodOrder(ctrl), []string{"ReplaceAddress", "AddRoute", "AddRoute"}; !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+	if got, want := routeCalls(ctrl), []string{"AddRoute 10.20.0.0/16 plexd0", "AddRoute 10.30.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+}
+
+func TestManager_Readdress_RouteAddFails(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := setupMeshManager(t, ctrl, slogTextLogger(&logs))
+	router := &subnetRouter{mockRouter: &mockRouter{ctrl: ctrl}}
+	mgr.SetPeerRouter(router)
+	programPeerRoutes(t, mgr, ctrl, "10.20.0.0/16", "10.30.0.0/16")
+
+	router.failAdd, router.err = "10.20.0.0/16", errors.New("route: not permitted")
+	if err := mgr.Readdress(netip.MustParseAddr("10.99.0.9")); err != nil {
+		t.Fatalf("Readdress = %v, want nil: a failed route add is left to the next syncPeerRoutes", err)
+	}
+	if got := mgr.MeshIP(); got != netip.MustParseAddr("10.99.0.9") {
+		t.Errorf("MeshIP() = %v, want 10.99.0.9", got)
+	}
+	if got, want := routeCalls(ctrl), []string{"AddRoute 10.20.0.0/16 plexd0", "AddRoute 10.30.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls = %v, want %v", got, want)
+	}
+	if out := logs.String(); !strings.Contains(out, `level=WARN msg="wireguard: peer route failed" component=wireguard subnet=10.20.0.0/16 op=add error="route: not permitted"`) {
+		t.Errorf("log does not carry the Warn for the route:\n%s", out)
+	}
+
+	ctrl.mu.Lock()
+	ctrl.calls = nil
+	ctrl.mu.Unlock()
+	router.failAdd = ""
+	if err := mgr.syncPeerRoutes(); err != nil {
+		t.Fatalf("syncPeerRoutes: %v", err)
+	}
+	if got, want := routeCalls(ctrl), []string{"AddRoute 10.20.0.0/16 plexd0"}; !slices.Equal(got, want) {
+		t.Errorf("route calls of the next syncPeerRoutes = %v, want %v, the route whose add failed", got, want)
+	}
+}
