@@ -132,6 +132,7 @@ func NewSessionManager(cfg Config, meshIP, meshIface string, logger *slog.Logger
 | `SetTCPActivityReporter` | `(r TCPActivityReporter)`                                  | Wires the reporter tcp sessions post their `session_active` rows through. Until it is called, tcp sessions post none, and a session keeps the reporter it was created with; `plexd up` calls it (see [Activity Reports](#activity-reports)) |
 | `CloseSession`   | `(sessionID string, reason string) *ClosedSessionInfo`             | Closes and removes a session by ID; returns session info |
 | `Shutdown`       | `()`                                                               | Closes all active sessions, reporting each through the on-closed callback |
+| `SetMeshIP`      | `(meshIP string)`                                                  | Makes `meshIP` the address tcp session listeners bind and closes every live tcp session with the reason `readdressed`; the same address does nothing (see [WireGuard Mesh](#wireguard-mesh-internal-wireguard)) |
 | `ActiveSessions` | `() map[string]time.Time`                                          | Snapshot of live session IDs and their **capped** local expiry; the dispatcher's teardown input |
 | `ActiveCount`    | `() int`                                                           | Returns number of active sessions                        |
 
@@ -540,6 +541,7 @@ type SSHActivity struct {
 | `revoked`      | `operator_revoke`            | A `session_revoked` event carried an operator-driven `revoke_reason`, or an empty or unrecognised one |
 | `drained`      | `plexd_close`                | The entry left the block while the session still had time on it     |
 | `shutdown`     | `plexd_close`                | The node is going down                                              |
+| `readdressed`  | `plexd_close`                | A state pull moved the node to another mesh address while the tcp session's listener was bound to the old one |
 
 The reasons are constants in `internal/tunnel`, not bare literals: they are the
 only input to this mapping, so producer and consumer share one vocabulary.
@@ -673,10 +675,34 @@ sessions, via two methods of `api.ControlPlane`:
 
 The listeners of tcp sessions bind to the mesh IP assigned by the WireGuard interface, and, on Linux and macOS, to that interface. Connections arrive through the encrypted mesh — no ports are exposed on the public network. The `meshIP` parameter in `NewSessionManager` comes from `registration.NodeIdentity.MeshIP`, threaded through `NewMeshServer(cfg, meshIP, meshIface, hostKey, verifier, logger)`. For `meshIface`, `plexd up` passes `wgMgr.OSInterfaceName()`: `plexd0` by default on Linux, the kernel's `utunN` on macOS. An ssh session binds nothing on the mesh: its connections are the ones plexd opens to the control plane (see [Listener](#listener)).
 
+A state pull can move the node to another mesh address (see
+[Mesh address changes](./wireguard.md#mesh-address-changes)). Once the mesh
+interface carries the new address, the `sessions` follower of `plexd up`'s mesh
+address handler calls `meshServer.SessionManager().SetMeshIP` with it. The same
+address does nothing. Otherwise `SetMeshIP` stores the address under the
+manager's mutex and closes every live tcp session with the reason
+`readdressed`, concurrently, as the dispatcher's [teardown pass](#teardown-pass)
+closes, and returns once their `session_ended` reports returned. Each row
+carries `terminated_by: plexd_close` (see
+[terminated_by mapping](#terminated-by-mapping)) and the session's byte
+counters. ssh sessions bind nothing and stay. `CreateSession` reads the address
+once, under the same mutex it holds until the session is in the map, so a
+session created afterwards binds the new address and its `session_started` row
+reports a `listener_endpoint` the control plane accepts, and a session created
+before is closed with the others.
+
+A tcp session bound to the old address ends and is not bound again. The
+control plane validates a reported listener against the node's address, and
+the dispatcher never provisions a settled session twice, so the unchanged block
+of the next pull leaves the closed session alone. Its operator opens a new one.
+A session whose `session_started` row is still outstanding is not settled, so
+the next pull binds it on the new address.
+
 The mesh address and the mesh interface together are a tcp listener's
 reachability boundary: the forward itself performs no authentication, accepting
-the first connection that arrives. The address is copied verbatim from the
-control plane's registration response into `identity.json`, so `CreateSession`
+the first connection that arrives. The address comes from the control plane,
+copied verbatim from its registration response into `identity.json` or taken
+from a state pull's `mesh_ip`, so `CreateSession`
 parses it rather than trusting it and refuses to provision a tcp session unless
 it is a bindable unicast address — on an empty, unparseable, or unspecified
 value (`0.0.0.0`, `::`) `net.Listen` would bind every unicast address on the
@@ -751,7 +777,7 @@ mgr.Shutdown()
 2. Control plane verifies RBAC permissions and issues the session, adding a `tcp` entry to the node's `sessions` block. It may also emit a `session_setup` event to pull the node's next reconcile forward.
 3. On its next pull, plexd sees the entry, opens a TCP listener on the mesh interface, and reports a `session_started` row carrying the bound `listener_endpoint`.
 4. Connections arriving on that listener are forwarded through the encrypted mesh to the target host and port. plexd reports the traffic as it flows, in `session_active` rows, at most one per interval, so the control plane does not revoke the session as idle while the tunnel is in use; a quiet tunnel posts nothing (see [Activity Reports](#activity-reports)).
-5. The session ends when the control plane drops the entry from the block (`plexd_close`), when a verified `session_revoked` event names it (`operator_revoke` for an operator-driven `revoke_reason`, `ttl_expired` or `idle_timeout` for the sweeper's), when its capped expiry fires (`ttl_expired`), when its idle window elapses (`idle_timeout`), or on node shutdown (`plexd_close`). The `session_ended` row carries the byte counters and the reason.
+5. The session ends when the control plane drops the entry from the block (`plexd_close`), when a verified `session_revoked` event names it (`operator_revoke` for an operator-driven `revoke_reason`, `ttl_expired` or `idle_timeout` for the sweeper's), when its capped expiry fires (`ttl_expired`), when its idle window elapses (`idle_timeout`), when a state pull moves the node to another mesh address (`plexd_close`), or on node shutdown (`plexd_close`). The `session_ended` row carries the byte counters and the reason.
 
 ### Kubernetes Sessions
 

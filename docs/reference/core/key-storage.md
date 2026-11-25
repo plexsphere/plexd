@@ -37,7 +37,7 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 | (in-memory, per peer) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, fetched per edge from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`, sealed under the NSK |
 | `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Source of the bearer envelope; opens secret values and edge PSK envelopes fetched from the control plane | Control plane, issued during registration |
 | `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration and carried by the state pull's `signing_key` block |
-| `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, `signing_key_id`, and `signing_public_key` | Control plane registration response; the two signing fields are rewritten from the state pull |
+| `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, `signing_key_id`, and `signing_public_key` | Control plane registration response; the two signing fields and `mesh_ip` are rewritten from the state pull (see [CommitSigningKey](registration.md#commitsigningkey) and [CommitMeshIP](registration.md#commitmeship)) |
 | (bootstrap token file) | Bootstrap token | N/A | Authentication for initial registration (validity set by its BootstrapToken policy) | Provisioned externally (file, env var, or metadata service) |
 
 ### Curve25519 Private Key

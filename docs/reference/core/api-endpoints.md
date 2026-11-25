@@ -145,7 +145,8 @@ Sent at `heartbeat.interval` (default 30s).
   "client_now": "2026-07-19T19:32:35Z",
   "binary_checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "binary_version": "1.2.3",
-  "nat_summary": { "endpoint": "203.0.113.7:51820", "nat_type": "full_cone" }
+  "nat_summary": { "endpoint": "203.0.113.7:51820", "nat_type": "full_cone" },
+  "features": ["mesh_readdress"]
 }
 ```
 
@@ -153,6 +154,7 @@ Sent at `heartbeat.interval` (default 30s).
 - `binary_checksum` — SHA-256 of the running binary, computed once at startup. Accepted as 64-char lowercase hex or 44-char standard base64 of 32 bytes.
 - `binary_version` — build version (`dev` when unset); never empty.
 - `nat_summary` — **always** a JSON object: `{}` before NAT discovery has produced a result, otherwise `{ "endpoint": <public endpoint>, "nat_type": <wire enum> }`. A `null` value is rejected.
+- `features`: the features the node declares, absent when it declares none. plexd declares `mesh_readdress` when the WireGuard interface came up and can replace its address in place, and the control plane moves a node to another mesh address only while its latest heartbeat declared it (see [Mesh address changes](../networking/wireguard.md#mesh-address-changes)). The list is fixed for the run. No plexd release through v0.39.0 sends the member, and a control plane that predates it refuses every heartbeat that carries it with `400 malformed_heartbeat_request`; plexd has no fallback, so the control plane is upgraded first (see [Upgrade order](heartbeat-service.md#upgrade-order)).
 
 **Response** (`200 OK`):
 
@@ -171,7 +173,8 @@ Sent at `heartbeat.interval` (default 30s).
 | Status | Problem `code` | Meaning |
 |---|---|---|
 | `200 OK` | — | Heartbeat acknowledged |
-| `400 Bad Request` | `malformed_heartbeat_request` | Strict-decode failure, or `nat_summary` absent, `null`, or not an object |
+| `400 Bad Request` | `malformed_heartbeat_request` | Strict-decode failure, or `nat_summary` absent, `null`, or not an object. A control plane that predates `features` answers it for every heartbeat that carries the member, and plexd logs `agent: heartbeat: rejected as malformed, a control plane that predates the features member refuses it; upgrade the control plane` (see [A Control Plane That Predates features](heartbeat-service.md#a-control-plane-that-predates-features)) |
+| `400 Bad Request` | `invalid_features` | `features` holds more than 16 names, or a name that does not match `^[a-z][a-z0-9_]{0,31}$` |
 | `400 Bad Request` | `clock_skew` | `client_now` more than 60s from server time |
 | `400 Bad Request` | `binary_checksum_empty` | `binary_checksum` missing or not a valid SHA-256 encoding |
 | `400 Bad Request` | `binary_version_empty` | `binary_version` missing |
@@ -1502,6 +1505,7 @@ absence.
 
 ```json
 {
+  "mesh_ip": "10.99.0.1",
   "peers": [
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
@@ -1637,6 +1641,25 @@ absence.
   ]
 }
 ```
+
+`mesh_ip` is the mesh address the node must use, read from the node's row on
+every pull, as the "Mesh address" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. It is the address `POST /v1/register` returned until a Domain
+admin moves the node, which the control plane does only while the node's
+latest heartbeat declared `mesh_readdress` (see
+[Heartbeat](#post-v1-nodes-node-id-heartbeat)). The control plane publishes no
+event for a move, so the node learns its new address with its next pull. A
+control plane that predates the member leaves the key out, which decodes to the
+empty string, and the node keeps its address; a value of another JSON type
+fails the pull's decode, as it does for `peers`. plexd reads the member on every
+successful pull, drift or not. An address it applies replaces the one on the
+mesh interface in place, moves the holders of the address with it and is
+written into `identity.json`, so a restart starts from it. plexd refuses a value
+that is no IP address or is unspecified, loopback or multicast, and the
+WireGuard manager refuses one that is not IPv4, is link-local, or lies outside
+the mesh prefix the interface was set up with. The member is not desired state: the differ neither stores nor
+compares it. See [Mesh address changes](../networking/wireguard.md#mesh-address-changes).
 
 A peer's `endpoint` is its direct WireGuard endpoint as `host:port` (an IPv6
 host in brackets), the address the peer last reported through

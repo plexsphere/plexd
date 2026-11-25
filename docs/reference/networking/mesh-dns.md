@@ -45,7 +45,7 @@ A disabled resolver binds nothing, so its port is not checked. The check runs on
 
 ## Listen Address
 
-On Linux the resolver listens on the Node's own mesh IP, the address registration assigned, and on macOS and Windows on `127.0.0.1`, on `dns.listen_port`, over UDP and TCP. systemd-resolved moves a server to TCP after repeated UDP losses, for example across a plexd restart, so a resolver that answered on UDP only would fail it then. `Start` binds both sockets and fails when either bind fails, closing the socket that did bind. It refuses an unspecified address, `0.0.0.0`, `::` or `::ffff:0.0.0.0`, which would bind every interface of the host, with `meshdns: listen <address>: no address to listen on`. A resolver binds once: every `Start` after one that succeeded fails with `meshdns: listen <address>: already listening`.
+On Linux the resolver listens on the Node's own mesh IP, the address registration assigned or a later state pull moved the Node to, and on macOS and Windows on `127.0.0.1`, on `dns.listen_port`, over UDP and TCP. When a pull moves the Node while plexd runs, the Linux resolver moves to the new address (see [Following a new mesh address](#following-a-new-mesh-address)). systemd-resolved moves a server to TCP after repeated UDP losses, for example across a plexd restart, so a resolver that answered on UDP only would fail it then. `Start` binds both sockets and fails when either bind fails, closing the socket that did bind. It refuses an unspecified address, `0.0.0.0`, `::` or `::ffff:0.0.0.0`, which would bind every interface of the host, with `meshdns: listen <address>: no address to listen on`. A resolver binds once: every `Start` after one that succeeded fails with `meshdns: listen <address>: already listening`.
 
 The address is the mesh IP and not loopback, because systemd-resolved sends a query for a per-link DNS server out through that link. A listener on `127.0.0.1` is never reached through the mesh interface. The Node's own mesh IP is a local address, so the kernel delivers the query locally, and every query systemd-resolved sends arrives with the mesh IP as its source address.
 
@@ -681,11 +681,12 @@ func NewManager(cfg Config, iface string, listenIP netip.Addr, registrar Registr
 func (m *Manager) Start() error
 func (m *Manager) Addr() netip.AddrPort
 func (m *Manager) Run(ctx context.Context) error
+func (m *Manager) Rebind(ctx context.Context, listenIP netip.Addr) error
 func (m *Manager) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 func (m *Manager) Shutdown(ctx context.Context) error
 ```
 
-`Start` binds the sockets on `listenIP` and `cfg.ListenPort`, where `plexd up` passes the mesh IP on Linux and `127.0.0.1` on macOS and Windows (see [Listen Address](#listen-address)), and `Run` serves them until its context ends. `Addr` is the listen address the log lines name. `Handle` has the signature of a [dispatch handler](../core/reconciliation.md#dispatchhandler) and runs on every successful pull, drift or not. A mutex guards the state `Handle` and `Shutdown` share.
+`Start` binds the sockets on `listenIP` and `cfg.ListenPort`, where `plexd up` passes the mesh IP on Linux and `127.0.0.1` on macOS and Windows (see [Listen Address](#listen-address)), and `Run` serves them until its context ends. `Addr` is the listen address the log lines name. `Rebind` moves the resolver when the Node's mesh address changes (see [Following a new mesh address](#following-a-new-mesh-address)). `Handle` has the signature of a [dispatch handler](../core/reconciliation.md#dispatchhandler) and runs on every successful pull, drift or not. A mutex guards the state `Handle`, `Rebind` and `Shutdown` share.
 
 1. A nil snapshot returns at once.
 2. A snapshot without a `dns` block, the wire's `null` or a pull from a control plane that predates the block, keeps the names, the forwarding and the registration. The first such pull logs `state pull carries no dns block, keeping the names held`. Later ones log nothing until a block arrived in between.
@@ -702,6 +703,21 @@ A pull whose context is already done, because plexd is stopping, still swaps the
 `NewManager` builds the two log lines that name the system resolver once, from the registrar's `Name`, so the registrar must not be nil. A successful `Apply` logs `mesh dns registered with systemd-resolved` on Linux, `mesh dns registered with configd` on macOS and `mesh dns registered with Dnscache` on Windows, whose `default_route` key says whether a catch-all made the link the host's default DNS route, on macOS wrote the default-resolver entry, or on Windows wrote the rule for every name. A revert from `Handle` logs nothing when it succeeds. An error wrapping `ErrUnavailable` logs `mesh dns not registered, systemd-resolved is not usable` on Linux, `mesh dns not registered, configd is not usable` on macOS and `mesh dns not registered, Dnscache is not usable` on Windows at Info, once per change into that state: a success or another failure in between makes it log again. Any other error, from `Apply` or from the revert, logs `mesh dns registration failed` at Warn, unless its text is the one this line logged last. A success or an unavailable answer in between makes the same text log again.
 
 A resolver failure never changes readiness. The health endpoints do not report the resolver, and the log lines are the operator's view of it.
+
+### Following a new mesh address
+
+The state pull carries the Node's mesh address as `mesh_ip`, and a Domain admin can move the Node to another one. `plexd up` then replaces the address on the mesh interface and calls the followers of its [mesh address handler](./wireguard.md#the-dispatch-handler) in turn. The first of them, `mesh-dns`, which `plexd up` builds only when the resolver listens, calls `Manager.Rebind(ctx, meshDNSListenIP(addr, meshDNSListensOnLoopback))`:
+
+```go
+func (s *Server) Rebind(addr netip.AddrPort) error
+func (m *Manager) Rebind(ctx context.Context, listenIP netip.Addr) error
+```
+
+`Manager.Rebind` keeps the port the resolver is bound to, `dns.listen_port`. On macOS and Windows `listenIP` is `127.0.0.1` again, so the address equals the bound one and the call changes nothing. On Linux it is the new mesh IP. Under the manager's mutex it calls `Server.Rebind` and logs `mesh dns listener moved` at Info with `listen` and `previous`. When a registration counts as applied, it applies the registration again with the new server, bounded by 5 seconds, so the link names the new address in the same cycle, even when the pull carries no `dns` block. The [forwarding table](#forward-zones-and-resolvers), which skips a resolver at the listen address, is built against the new address with the next block. After `Shutdown`, `Rebind` does nothing and returns nil.
+
+`Server.Rebind` binds a new UDP socket and TCP listener on the new address as `Start` binds them, then closes the pair it answered on before, together with every TCP connection accepted on that pair. A running `Run` goes on with the new pair and keeps its forwarded queries in flight, and it still returns only when plexd stops or a socket fails: the close of the old pair stops nothing. From then on `Addr` names the new address, and the [source rule](#source-rule) accepts the new address as a query's source. A rebind to the bound address changes nothing. A rebind between `Start` and `Run` replaces the pair `Run` takes. Before `Start`, and once `Run` stopped, it binds nothing and fails.
+
+A failed bind, such as one on an address whose port another socket holds, returns `meshdns: rebind <address>: <cause>` and leaves the old pair answering. The handler then logs `mesh address not applied; retrying on the next pull` with `step=mesh-dns`, and the next pull calls `Rebind` again. A failed registration is logged as on any pull (step 7 above), and the next pull that carries a `dns` block applies it again. The handler does not call `Rebind` again for the same address, so a pull whose `dns` is `null` leaves the link unregistered, as step 2 describes; the contract sends the block on every pull.
 
 ## Every Zone on Every Node
 
@@ -730,7 +746,7 @@ Every start that runs no resolver reverts the link, whatever the reason, and a s
 
 On Windows the adapter goes with the process too, but the rules stay in the registry until a reboot, bound to no interface, and the revert removes them whatever interface it is given. The adapter's search list stays in the registry under the adapter's GUID, which plexd derives from the interface name, so the next run's adapter inherits it, and the revert clears it once WireGuard has created that adapter. A Windows start whose resolver listens therefore reverts as a macOS start does, and for the same reason: with a catch-all, the killed run's rule for every name would send the control plane's own name to this run's resolver before its first pull.
 
-The sockets are bound before the dispatch handler is registered, so a Node that cannot answer never registers a server. Only a resolver that listens gets the dispatch handler, registered after the reachability observer, and a goroutine that serves its sockets. `Run` returns once plexd stops. Only a failed UDP read, or a TCP listener that something other than the stop closed, ends it before that. plexd then logs `mesh dns stopped`, and no mesh name is answered and nothing is forwarded for the rest of the run. It shuts the manager down at once, with a fresh context bounded by 5 seconds, as the drain does: `Shutdown` reverts the link and logs `mesh dns registration reverted`, or `mesh dns shutdown error` when the revert fails, and every later pull registers nothing. Otherwise the registration would keep sending the zones, and with a catch-all every other name, to a port nothing answers on for the rest of the run. A failed accept is retried and stops nothing (see [TCP](#tcp)). Nothing here stops startup: the mesh works without names.
+The mesh IP the table names is the one `identity.json` holds when plexd starts, which after a move is the address the [mesh address handler](./wireguard.md#the-dispatch-handler) committed there. The sockets are bound before the dispatch handler is registered, so a Node that cannot answer never registers a server. Only a resolver that listens gets the dispatch handler, registered after the reachability observer, the `mesh-dns` follower of the mesh address handler (see [Following a new mesh address](#following-a-new-mesh-address)), and a goroutine that serves its sockets. `Run` returns once plexd stops. Only a failed UDP read, or a TCP listener that something other than the stop closed, ends it before that. plexd then logs `mesh dns stopped`, and no mesh name is answered and nothing is forwarded for the rest of the run. It shuts the manager down at once, with a fresh context bounded by 5 seconds, as the drain does: `Shutdown` reverts the link and logs `mesh dns registration reverted`, or `mesh dns shutdown error` when the revert fails, and every later pull registers nothing. Otherwise the registration would keep sending the zones, and with a catch-all every other name, to a port nothing answers on for the rest of the run. A failed accept is retried and stops nothing (see [TCP](#tcp)). Nothing here stops startup: the mesh works without names.
 
 ## Stop, Crash and Opt-Out
 
@@ -782,7 +798,7 @@ server=10.99.0.1#5354
 The first line sends every name under `corp.example.com` to plexd, which passes it on to the zone's resolvers. The second makes plexd an upstream server for every other name, which plexd passes on to the catch-all resolvers. plexd answers `REFUSED` for a name outside the mesh zones that its forwarding table does not route, so point a line at it only for what the setting covers.
 
 - The resolver answers the Node itself only. dnsmasq on the Node sends its queries to the Node's own mesh IP, and the kernel sends a packet for a local address from that address, so the [source rule](#source-rule) accepts them. A resolver in a Pod or container network sends from an address of its own, so the resolver drops its queries, and it cannot use the names this way.
-- The zone list of such a hand-written rule follows the Domain's zones by hand. When the Domain gains a zone that the lines do not cover, such as a Project's zone override, or its mesh CIDR changes, change the lines yourself: nothing updates them. The same holds for the forward zones and the catch-all.
+- The zone list of such a hand-written rule follows the Domain's zones by hand. When the Domain gains a zone that the lines do not cover, such as a Project's zone override, its mesh CIDR changes, or a state pull moves the Node to another mesh address, change the lines yourself: nothing updates them. The same holds for the forward zones and the catch-all.
 - A CNAME whose target lies outside the mesh zones resolves only when the local resolver follows it, as systemd-resolved does. plexd answers such a name with the CNAME alone. A forwarder that passes the answer on as it is leaves the target to the program that asked.
 
 ## Log Lines
@@ -813,6 +829,7 @@ The manager, the server for the forward resolvers, and on Windows the registrar,
 | Level  | Message | Keys |
 |--------|---------|------|
 | `Info` | `state pull carries no dns block, keeping the names held` | none. Once, and again only after a block arrived in between |
+| `Info` | `mesh dns listener moved` | `listen`, `previous`. A state pull moved the Node to another mesh address and the resolver now listens there (see [Following a new mesh address](#following-a-new-mesh-address)) |
 | `Warn` | `mesh dns skipped invalid entries` | `count`, `skipped` (the first five sentences). On every pull whose block has skipped entries |
 | `Info` | `dns block carries no forwarding member, keeping the forwarding held` | none. Once while a member is held, and again only after a member arrived in between |
 | `Info` | `mesh dns records updated` | `hosts`, `records` (the number of accepted records), `zones`, `reverse_zones`, `search_domain` (empty when the Node has none) |

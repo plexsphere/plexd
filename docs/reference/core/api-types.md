@@ -87,10 +87,22 @@ SSE `peer_*` events.
 | `BinaryChecksum` | `string`         | `"binary_checksum"` | SHA-256 of the running binary (64-char hex or 44-char base64 of 32 bytes) |
 | `BinaryVersion`  | `string`         | `"binary_version"`  | Build version (`dev` when unset); never empty |
 | `NATSummary`     | `map[string]any` | `"nat_summary"`     | Always a JSON object: `{}` before discovery, else `{"endpoint", "nat_type"}` |
+| `Features`       | `[]string`       | `"features,omitempty"` | The features the node declares, such as `FeatureMeshReaddress`; a nil or empty list leaves the member off |
 
 `nat_summary` is a `map[string]any` rather than a nil-able pointer so it always
 marshals to an object: a nil map would emit `null`, which the control plane
 rejects with `malformed_heartbeat_request`.
+
+`features` is the only member with `omitempty`, so a node that declares nothing
+sends the four members a control plane that predates `features` accepts. Such a
+control plane refuses a heartbeat that carries the member with
+`malformed_heartbeat_request` (see
+[Upgrade order](heartbeat-service.md#upgrade-order)). The constant
+`FeatureMeshReaddress` is `"mesh_readdress"`: a node declares it when it
+applies a changed `NodeStateSnapshot.MeshIP` while it runs, and the control
+plane moves a node to another mesh address only while the node's latest
+heartbeat declared it (see
+[Mesh address changes](../networking/wireguard.md#mesh-address-changes)).
 
 The in-memory NAT discovery result that feeds `nat_summary` is
 [`nat.DiscoveryResult`](../networking/nat-traversal.md#discoveryresult); it is
@@ -112,11 +124,12 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the fourteen fields
+distinguishes a nil pointer from a populated block. None of the fifteen fields
 carry `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
 |----------------|------------------------|------------------|---------------------------------------------------------|
+| `MeshIP`       | `string`               | `"mesh_ip"`      | The mesh address the node must use, read from the node's row on every pull. A control plane that predates the member leaves the key out, which decodes to the empty string, and the node keeps its address. A value of another JSON type fails the pull's decode, as it does for `Peers` |
 | `Peers`        | `[]SnapshotPeer`       | `"peers"`        | Desired peers; `[]` when empty, node_id ascending, self excluded |
 | `Reachability` | `json.RawMessage`      | `"reachability"` | The control plane's verdict about this node, carried opaquely and decoded leniently by the reachability observer |
 | `Policy`       | `*PolicySnapshot`      | `"policy"`       | Merged network policy block                             |
@@ -132,7 +145,11 @@ carry `omitempty`.
 | `FailureDetection` | `json.RawMessage` | `"failure_detection"` | The Domain's failure-detection time, a `NodeStateFailureDetection`, carried raw like `Reachability` and decoded leniently by the WireGuard manager's dispatch handler, so a malformed block never fails the pull. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the value the node holds |
 | `SharedSubnets` | `[]NodeStateSharedSubnet` | `"shared_subnets"` | Per shared site subnet of the node's Project, the bridges it may be routed through, the carrier first; the control plane sends `[]` when there is none, never `null`. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) and `[]` both mean no shared subnet. Typed, as `Peers` is, so a value of another JSON type fails the pull's decode; the WireGuard manager validates the entries (see `NodeStateSharedSubnet` below) |
 
-Eight members are consumed on the dispatch seam rather than by the differ.
+Nine members are consumed on the dispatch seam rather than by the differ.
+`mesh_ip` is not desired state the differ converges on: the mesh address
+dispatch handler applies it to the mesh interface and its holders on every
+successful pull, and persists it into `identity.json` (see
+[Mesh address changes](../networking/wireguard.md#mesh-address-changes)).
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under

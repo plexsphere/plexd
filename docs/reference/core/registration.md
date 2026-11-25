@@ -158,6 +158,16 @@ run, so a helper that has not pinned yet pins the key plexd last persisted. A
 helper that already pinned keeps its pin (see
 [Trust anchor](../networking/secure-access-tunneling.md#trust-anchor)).
 
+`MeshIP` holds the address registration handed out until a state pull moves the
+node. Every pull carries the node's mesh address as `mesh_ip`; when it differs
+from the persisted one, `plexd up`'s mesh address handler writes it into
+`identity.json` with [`CommitMeshIP`](#commitmeship), once the mesh interface
+took it, or at once when plexd cannot apply it while it runs. plexd then
+starts from that address after a restart, and the registrar logs
+`existing identity loaded` with `node_id` and `mesh_ip`. An empty or absent
+member keeps the persisted address (see
+[Mesh address changes](../networking/wireguard.md#mesh-address-changes)).
+
 ### Data Directory Layout
 
 ```
@@ -172,13 +182,14 @@ helper that already pinned keeps its pin (see
 - All files written atomically (temp file + fsync + rename)
 - `PrivateKey` and `NodeSecretKey` use `json:"-"` tags to prevent accidental JSON serialization
 
-`SaveIdentity` writes the whole group at registration, and two functions
+`SaveIdentity` writes the whole group at registration, and three functions
 rewrite part of it later. `CommitRotatedKey` rewrites `private_key` and
 `identity.json`'s `last_rotation` after a mesh key rotation.
 `CommitSigningKey` rewrites the `signing_public_key` file and `identity.json`'s
 `signing_key_id` and `signing_public_key` when a state pull carries a new
-signing key. Both re-read the group first and write back every field they do
-not own as loaded.
+signing key. `CommitMeshIP` rewrites `identity.json`'s `mesh_ip` when a state
+pull moves the node to another mesh address. All three re-read the group first
+and write back every field they do not own as loaded.
 
 ### BearerToken
 
@@ -236,6 +247,35 @@ with `ErrNotRegistered` on an empty data directory, it returns an error that
 starts with `registration: commit signing key:` and wraps that failure, and it
 writes nothing. A crash between the two writes leaves a mismatched pair, which
 the next pull repairs.
+
+### CommitMeshIP
+
+```go
+func CommitMeshIP(dataDir, meshIP string) error
+```
+
+Persists a mesh address learned after registration, the `mesh_ip` a state pull
+carried, so a restart brings the mesh interface up with it rather than with the
+address registration handed out. `plexd up`'s mesh address handler calls it
+when the pulled address differs from the one it last persisted (see
+[Mesh address changes](../networking/wireguard.md#mesh-address-changes)). A
+failure logs `mesh address not persisted; retrying on the next pull` at Warn,
+and plexd retries the commit on every pull until it succeeds.
+
+Holding the lock that `SaveIdentity`, `CommitRotatedKey` and
+`CommitSigningKey` also take, it re-reads the identity group with
+`LoadIdentity`, sets `mesh_ip` and writes `identity.json` alone with
+`fsutil.WriteFileAtomic`, at mode `0600`. Every other field, `last_rotation`
+included, is written back as loaded, and the three key files are not written.
+Like `CommitRotatedKey` it skips the remove-first step of `SaveIdentity`, so a
+crash never leaves the node without an identity. Every error starts with
+`registration: commit mesh ip:`:
+
+| Condition | Result |
+|---|---|
+| `meshIP` is empty | `registration: commit mesh ip: mesh_ip is empty`, and nothing is written, because `LoadIdentity` refuses an identity without a mesh IP |
+| `LoadIdentity` fails, for example with `ErrNotRegistered` on an empty data directory | An error that wraps that failure, and nothing is written |
+| The write fails, for example on a data directory at mode `0500` | An error that wraps the write's failure; `identity.json` reads as before |
 
 ## ErrNotRegistered
 

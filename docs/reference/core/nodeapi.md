@@ -833,7 +833,8 @@ entries. The secret index is **not** fed here;
 ### SecretIndexDispatchHandler
 
 Register the dispatch handler before starting the reconciliation loop. `plexd up`
-registers it right after `signingKeyDispatchHandler`:
+registers it right after `meshAddressDispatchHandler`, which follows
+`signingKeyDispatchHandler`:
 
 ```go
 reconciler.RegisterDispatchHandler(srv.SecretIndexDispatchHandler())
