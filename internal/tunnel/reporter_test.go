@@ -153,6 +153,7 @@ func TestTerminatedByFromReason(t *testing.T) {
 		{"idle maps to idle_timeout", reasonIdle, api.TerminatedByIdleTimeout},
 		{"drained maps to plexd_close", reasonDrained, api.TerminatedByPlexdClose},
 		{"shutdown maps to plexd_close", reasonShutdown, api.TerminatedByPlexdClose},
+		{"readdressed maps to plexd_close", reasonReaddressed, api.TerminatedByPlexdClose},
 		{"empty maps to plexd_close", "", api.TerminatedByPlexdClose},
 		// Only the session_revoked handler passes reasonRevoked, so only a close
 		// caused by that signed event reports operator_revoke. A drained entry

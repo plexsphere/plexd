@@ -45,6 +45,9 @@ const (
 	// reasonRevoked is the control plane revoking the session and saying so in
 	// a verified session_revoked event.
 	reasonRevoked = "revoked"
+	// reasonReaddressed is the node moving to a new mesh address while a tcp
+	// session's listener is bound to the old one.
+	reasonReaddressed = "readdressed"
 )
 
 // TerminatedByFromReason maps an internal session close reason to the wire

@@ -566,6 +566,41 @@ func TestDispatcher_LocallyClosedSessionIsNotReprovisioned(t *testing.T) {
 	}
 }
 
+// TestDispatcher_DoesNotReprovisionSessionClosedByReaddress covers a tcp
+// session that SetMeshIP closed while its entry still stands in the block. Its
+// started row was delivered, so the entry is settled, and the unchanged block
+// of the next pull must not bind it again on the new address.
+func TestDispatcher_DoesNotReprovisionSessionClosedByReaddress(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	d, mgr, reporter, _ := newTestDispatcher(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	snapshot := sessionsSnapshot(echoSession(t, "sess-readdressed", echoAddr))
+	d.Handle(context.Background(), snapshot)
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected the listener to be up, ActiveCount()=%d", mgr.ActiveCount())
+	}
+
+	// The host can bind the new address, so a second provision would succeed
+	// and show below rather than fail on the bind.
+	mgr.SetMeshIP(secondLoopback(t))
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
+	}
+	reporter.mu.Lock()
+	if len(reporter.startedCalls) != 1 {
+		t.Errorf("started rows = %d, want 1: the readdressed entry must not be provisioned again", len(reporter.startedCalls))
+	}
+	reporter.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 || (*records)[0].reason != reasonReaddressed {
+		t.Errorf("closes = %+v, want one with reason %q", *records, reasonReaddressed)
+	}
+}
+
 // TestDispatcher_RevokedEntryIsNotReprovisioned covers the one entry the known
 // set does not settle: a session whose started row is still outstanding. A pull
 // rendered before the revocation committed can still carry its entry after the
