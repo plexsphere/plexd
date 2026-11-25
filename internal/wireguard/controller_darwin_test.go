@@ -10,22 +10,26 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
 // Compile-time checks that DarwinController is a controller the manager can
-// drive, that the readiness check can resolve a kernel name through, and that
-// the handshake report and tunnel metrics can read peer state from.
+// drive and swap the mesh address through, that the readiness check can
+// resolve a kernel name through, and that the handshake report and tunnel
+// metrics can read peer state from.
 var (
 	_ WGController     = (*DarwinController)(nil)
 	_ OSInterfaceNamer = (*DarwinController)(nil)
 	_ PeerStatsReader  = (*DarwinController)(nil)
+	_ AddressReplacer  = (*DarwinController)(nil)
 )
 
 // namedTUN is a trackedTUN that reports a fixed name, standing in for the
@@ -166,6 +170,7 @@ func newTestDarwinController(t *testing.T) (*DarwinController, *fakeRunner, *tun
 	c := NewDarwinController(discardLogger())
 	c.createTUN = tuns.create
 	c.run = runner.run
+	c.routes = func(string) ([]utunRoute, error) { return nil, nil }
 	c.backend.uapiListen = func(string) (net.Listener, error) {
 		return net.Listen("tcp", "127.0.0.1:0")
 	}
@@ -538,6 +543,400 @@ func TestDarwinController_ConfigureAddress_RouteExistsWithExitZero(t *testing.T)
 	}
 }
 
+func TestDarwinController_ReplaceAddress(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16"); err != nil {
+		t.Fatalf("ReplaceAddress: %v", err)
+	}
+
+	// The new alias goes on before the old one comes off, so the utun is
+	// never without an address.
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+	)
+	if !runner.allDeadlined() {
+		t.Error("a command ran without a context deadline")
+	}
+}
+
+func TestDarwinController_ReplaceAddress_HostPrefix(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	// The alias installs the host route itself, so no route command follows.
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/32", "10.0.0.9/32"); err != nil {
+		t.Fatalf("ReplaceAddress: %v", err)
+	}
+
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/32 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+	)
+}
+
+// A repeat of a call that failed after the removal finds the old alias gone,
+// which ifconfig(8) reports with exit status 1.
+func TestDarwinController_ReplaceAddress_AliasGone(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address",
+		errors.New("exit status 1"),
+	)
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: File exists",
+		errors.New("exit status 1"),
+	)
+	runner.stub("/sbin/route -n get -inet 10.0.0.0/16", routeGetOutput("utun9"), nil)
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16"); err != nil {
+		t.Fatalf("ReplaceAddress: %v, want a missing old alias to be success", err)
+	}
+
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"/sbin/route -n get -inet 10.0.0.0/16",
+	)
+}
+
+func TestDarwinController_ReplaceAddress_AddFails(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"ifconfig: ioctl (SIOCAIFADDR): permission denied",
+		errors.New("exit status 1"),
+	)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	want := "wireguard: replace address: /sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias: " +
+		"exit status 1: ifconfig: ioctl (SIOCAIFADDR): permission denied"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+
+	// The old alias stays when the new one could not go on.
+	assertArgv(t, runner, "/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias")
+}
+
+func TestDarwinController_ReplaceAddress_RemoveFails(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"ifconfig: ioctl (SIOCDIFADDR): Operation not permitted",
+		errors.New("exit status 1"),
+	)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	assertPrefix(t, err, "wireguard: replace address: /sbin/ifconfig utun9 inet 10.0.0.1 -alias: exit status 1:")
+
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+	)
+}
+
+func TestDarwinController_ReplaceAddress_RouteFails(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: Network is unreachable",
+		nil,
+	)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	want := "wireguard: replace address: /sbin/route -n add -inet 10.0.0.0/16 -interface utun9: Network is unreachable"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// The on-link route of the new prefix is held by another interface, which
+// the replace reports under its own name.
+func TestDarwinController_ReplaceAddress_RouteExistsOtherInterface(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: File exists",
+		errors.New("exit status 1"),
+	)
+	runner.stub("/sbin/route -n get -inet 10.0.0.0/16", routeGetOutput("en0"), nil)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	want := `wireguard: replace address: 10.0.0.0/16 is already routed via "en0", not via utun9`
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+func TestDarwinController_ReplaceAddress_Unknown(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v, want os.ErrNotExist", err)
+	}
+	assertPrefix(t, err, "wireguard: replace address:")
+	assertArgv(t, runner)
+}
+
+func TestDarwinController_ReplaceAddress_InvalidArguments(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	tests := []struct {
+		oldCIDR, newCIDR string
+		want             string
+	}{
+		{"not-a-cidr", "10.0.0.9/16", `wireguard: replace address: parse "not-a-cidr":`},
+		{"10.0.0.1/16", "10.0.0.9", `wireguard: replace address: parse "10.0.0.9":`},
+		{"10.0.0.1/16", "10.0.0.9/24", "wireguard: replace address: 10.0.0.1/16 and 10.0.0.9/24 are not of one length"},
+		{"fd00::1/64", "fd00::9/64", "wireguard: replace address: fd00::1/64 is not an IPv4 CIDR"},
+	}
+	for _, tt := range tests {
+		err := c.ReplaceAddress("plexd0", tt.oldCIDR, tt.newCIDR)
+		assertPrefix(t, err, tt.want)
+	}
+	assertArgv(t, runner)
+}
+
+// Every route through the utun that names the old address is pointed at the
+// new one: a route plexd added is changed in place, a host route the kernel
+// cloned is deleted, and a route on any other address is left alone.
+func TestDarwinController_ReplaceAddress_RepointsRoutes(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	old := netip.MustParseAddr("10.0.0.1")
+	var asked []string
+	c.routes = func(osName string) ([]utunRoute, error) {
+		asked = append(asked, osName)
+		return []utunRoute{
+			{dst: netip.MustParsePrefix("10.0.0.0/16"), ifa: old},
+			{dst: netip.MustParsePrefix("10.0.0.77/32"), host: true, cloned: true, ifa: old},
+			{dst: netip.MustParsePrefix("10.9.0.0/24"), ifa: old},
+			{dst: netip.MustParsePrefix("10.8.0.5/32"), host: true, ifa: old},
+			{dst: netip.MustParsePrefix("10.7.0.0/24"), ifa: netip.MustParseAddr("10.0.0.9")},
+			{dst: netip.MustParsePrefix("10.6.0.0/24"), ifa: netip.MustParseAddr("10.0.0.3")},
+		}, nil
+	}
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16"); err != nil {
+		t.Fatalf("ReplaceAddress: %v", err)
+	}
+
+	if !slices.Equal(asked, []string{"utun9"}) {
+		t.Errorf("routes read for %v, want [utun9]", asked)
+	}
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"/sbin/route -n change -inet 10.0.0.0/16 -interface utun9 -ifa 10.0.0.9",
+		"/sbin/route -n delete -inet -host 10.0.0.77",
+		"/sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9",
+		"/sbin/route -n change -inet -host 10.8.0.5 -interface utun9 -ifa 10.0.0.9",
+	)
+	if !runner.allDeadlined() {
+		t.Error("a command ran without a context deadline")
+	}
+}
+
+// A route that went away between the read and the call is done, whichever
+// exit status route(8) reports it with, and the next route still follows.
+func TestDarwinController_ReplaceAddress_RouteGoneMeanwhile(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	old := netip.MustParseAddr("10.0.0.1")
+	c.routes = func(string) ([]utunRoute, error) {
+		return []utunRoute{
+			{dst: netip.MustParsePrefix("10.0.0.77/32"), host: true, cloned: true, ifa: old},
+			{dst: netip.MustParsePrefix("10.8.0.5/32"), host: true, ifa: old},
+			{dst: netip.MustParsePrefix("10.9.0.0/24"), ifa: old},
+		}, nil
+	}
+	runner.stub(
+		"/sbin/route -n delete -inet -host 10.0.0.77",
+		"route: writing to routing socket: not in table",
+		errors.New("exit status 1"),
+	)
+	runner.stub(
+		"/sbin/route -n change -inet -host 10.8.0.5 -interface utun9 -ifa 10.0.0.9",
+		"route: writing to routing socket: not in table\nchange host 10.8.0.5: gateway utun9: not in table",
+		nil,
+	)
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16"); err != nil {
+		t.Fatalf("ReplaceAddress: %v, want a route gone meanwhile to be success", err)
+	}
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"/sbin/route -n delete -inet -host 10.0.0.77",
+		"/sbin/route -n change -inet -host 10.8.0.5 -interface utun9 -ifa 10.0.0.9",
+		"/sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9",
+	)
+}
+
+// route(8) exits 0 after a refused change, so the output reports it.
+func TestDarwinController_ReplaceAddress_RepointRefused(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	old := netip.MustParseAddr("10.0.0.1")
+	c.routes = func(string) ([]utunRoute, error) {
+		return []utunRoute{
+			{dst: netip.MustParsePrefix("10.9.0.0/24"), ifa: old},
+			{dst: netip.MustParsePrefix("10.8.0.0/24"), ifa: old},
+		}, nil
+	}
+	runner.stub(
+		"/sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9",
+		"route: writing to routing socket: Network is unreachable",
+		nil,
+	)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	want := "wireguard: replace address: /sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9: Network is unreachable"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+	// The refusal stops the call, so a repeat starts from the first route
+	// still on the old address.
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.9/16 10.0.0.9 alias",
+		"/sbin/ifconfig utun9 inet 10.0.0.1 -alias",
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"/sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9",
+	)
+}
+
+func TestDarwinController_ReplaceAddress_RepointFails(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	c.routes = func(string) ([]utunRoute, error) {
+		return []utunRoute{{dst: netip.MustParsePrefix("10.9.0.0/24"), ifa: netip.MustParseAddr("10.0.0.1")}}, nil
+	}
+	runner.stub(
+		"/sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9",
+		"route: must be root to alter routing table",
+		errors.New("exit status 1"),
+	)
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	want := "wireguard: replace address: /sbin/route -n change -inet 10.9.0.0/24 -interface utun9 -ifa 10.0.0.9: " +
+		"exit status 1: route: must be root to alter routing table"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+func TestDarwinController_ReplaceAddress_ReadRoutesFails(t *testing.T) {
+	c, _, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	c.routes = func(string) ([]utunRoute, error) {
+		return nil, errors.New("sysctl: operation not permitted")
+	}
+
+	err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.9/16")
+	want := "wireguard: replace address: read the routes via utun9: sysctl: operation not permitted"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+func TestParseUTUNRoute(t *testing.T) {
+	inet4 := func(s string) *route.Inet4Addr {
+		return &route.Inet4Addr{IP: netip.MustParseAddr(s).As4()}
+	}
+	link := &route.LinkAddr{Index: 9, Name: "utun9"}
+
+	tests := []struct {
+		name   string
+		flags  int
+		addrs  []route.Addr
+		want   utunRoute
+		wantOK bool
+	}{
+		{
+			name:   "network route",
+			flags:  unix.RTF_UP | unix.RTF_STATIC,
+			addrs:  []route.Addr{inet4("10.9.0.0"), link, inet4("255.255.255.0"), nil, link, inet4("10.0.0.1")},
+			want:   utunRoute{dst: netip.MustParsePrefix("10.9.0.0/24"), ifa: netip.MustParseAddr("10.0.0.1")},
+			wantOK: true,
+		},
+		{
+			name:   "host route",
+			flags:  unix.RTF_UP | unix.RTF_HOST | unix.RTF_STATIC,
+			addrs:  []route.Addr{inet4("10.8.0.5"), link, nil, nil, link, inet4("10.0.0.1")},
+			want:   utunRoute{dst: netip.MustParsePrefix("10.8.0.5/32"), host: true, ifa: netip.MustParseAddr("10.0.0.1")},
+			wantOK: true,
+		},
+		{
+			name:   "cloned host route",
+			flags:  unix.RTF_UP | unix.RTF_HOST | unix.RTF_WASCLONED,
+			addrs:  []route.Addr{inet4("10.0.0.77"), link, nil, nil, link, inet4("10.0.0.1")},
+			want:   utunRoute{dst: netip.MustParsePrefix("10.0.0.77/32"), host: true, cloned: true, ifa: netip.MustParseAddr("10.0.0.1")},
+			wantOK: true,
+		},
+		{
+			name:  "no interface address",
+			flags: unix.RTF_UP | unix.RTF_STATIC,
+			addrs: []route.Addr{inet4("10.9.0.0"), link, inet4("255.255.255.0")},
+		},
+		{
+			name:  "network route without a netmask",
+			flags: unix.RTF_UP | unix.RTF_STATIC,
+			addrs: []route.Addr{inet4("10.9.0.0"), link, nil, nil, link, inet4("10.0.0.1")},
+		},
+		{
+			name:  "netmask with a hole",
+			flags: unix.RTF_UP | unix.RTF_STATIC,
+			addrs: []route.Addr{inet4("10.9.0.0"), link, inet4("255.0.255.0"), nil, link, inet4("10.0.0.1")},
+		},
+		{
+			name:  "IPv6 destination",
+			flags: unix.RTF_UP | unix.RTF_HOST,
+			addrs: []route.Addr{&route.Inet6Addr{IP: netip.MustParseAddr("fd00::5").As16()}, link, nil, nil, link, inet4("10.0.0.1")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseUTUNRoute(&route.RouteMessage{Flags: tt.flags, Index: 9, Addrs: tt.addrs})
+			if ok != tt.wantOK || got != tt.want {
+				t.Errorf("parseUTUNRoute = %+v, %v, want %+v, %v", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+// Removing the old alias of a pair that names one address would remove the
+// new one, so nothing runs.
+func TestDarwinController_ReplaceAddress_SameAddress(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	if err := c.ReplaceAddress("plexd0", "10.0.0.1/16", "10.0.0.1/16"); err != nil {
+		t.Fatalf("ReplaceAddress = %v, want nil", err)
+	}
+	assertArgv(t, runner)
+}
+
 func TestRouteSocketError(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -831,6 +1230,152 @@ func TestDarwinController_RealUTUN(t *testing.T) {
 	if _, err := os.Stat(sock); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("stat %s = %v, want it removed", sock, err)
 	}
+}
+
+// TestDarwinController_RealReplaceAddress swaps the address of a real utun
+// through the production seams. It is the only proof of what ReplaceAddress
+// relies on about macOS: that ifconfig removes one IPv4 alias with -alias,
+// that adding an alias the utun already holds succeeds, that ifconfig reports
+// an alias the utun does not hold with the message ReplaceAddress tolerates,
+// and that once the routes through the utun are pointed at the new address,
+// the on-link route of the prefix, a route through the utun and the host
+// routes a connect cloned from them give a socket the new address as its
+// source. The repeated call meets the two middle cases.
+//
+// CI runs it beside TestDarwinController_RealUTUN in the privileged macOS
+// step, which runs packages side by side, so its prefixes are ones no other
+// test of the step uses.
+func TestDarwinController_RealReplaceAddress(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("creating a utun needs root; run with sudo")
+	}
+
+	const (
+		name       = "plexd-readdress"
+		oldAddress = "10.255.248.1/24"
+		newAddress = "10.255.248.9/24"
+		// routed stands for a peer's routed subnet.
+		routed = "10.255.238.0/24"
+	)
+
+	c := NewDarwinController(discardLogger())
+	key := mustKey(t)
+
+	if err := c.CreateInterface(name, key[:], 0); err != nil {
+		t.Fatalf("CreateInterface: %v", err)
+	}
+	// The kernel destroys the utun with its addresses and routes.
+	t.Cleanup(func() { _ = c.DeleteInterface(name) })
+
+	osName, ok := c.OSInterfaceName(name)
+	if !ok {
+		t.Fatal("no utun name recorded after CreateInterface")
+	}
+	if err := c.ConfigureAddress(name, oldAddress); err != nil {
+		t.Fatalf("ConfigureAddress: %v", err)
+	}
+	if err := c.SetInterfaceUp(name); err != nil {
+		t.Fatalf("SetInterfaceUp: %v", err)
+	}
+
+	out, err := exec.Command(routePath, "-n", "add", "-inet", routed, "-interface", osName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("route add %s via %s: %v: %s", routed, osName, err, out)
+	}
+	if msg, ok := routeSocketError(out); ok {
+		t.Fatalf("route add %s via %s: %s", routed, osName, msg)
+	}
+
+	check := func(when string) {
+		t.Helper()
+		link, err := net.InterfaceByName(osName)
+		if err != nil {
+			t.Fatalf("InterfaceByName(%q): %v", osName, err)
+		}
+		if got := ipv4Addrs(t, link); !slices.Equal(got, []string{"10.255.248.9"}) {
+			t.Errorf("%s: %s holds %v, want 10.255.248.9 alone", when, osName, got)
+		}
+		// A host inside each prefix resolves through the route that covers
+		// it, or through the default route when that route is gone.
+		for _, dst := range []string{"10.255.248.77", "10.255.238.77"} {
+			if got := routeGetInterface(t, dst); got != osName {
+				t.Errorf("%s: %s resolves through %q, want %s", when, dst, got, osName)
+			}
+			// A BSD route keeps the interface address it was added with, and
+			// a socket takes its source from it, so a route that still names
+			// the removed alias resolves through the utun all the same.
+			// Connecting a UDP socket picks the source and sends nothing.
+			conn, err := net.Dial("udp4", net.JoinHostPort(dst, "9"))
+			if err != nil {
+				t.Errorf("%s: dial udp4 %s: %v", when, dst, err)
+				continue
+			}
+			src := conn.LocalAddr().String()
+			_ = conn.Close()
+			if host, _, _ := net.SplitHostPort(src); host != "10.255.248.9" {
+				t.Errorf("%s: a socket to %s leaves from %s, want 10.255.248.9", when, dst, src)
+			}
+		}
+	}
+
+	// A node has sent to its peers before its address moves. Connecting a
+	// UDP socket looks its route up, and on macOS that clones a host route
+	// with the interface address of the route it came from, so the call
+	// meets such clones.
+	for _, dst := range []string{"10.255.248.77", "10.255.238.77"} {
+		conn, err := net.Dial("udp4", net.JoinHostPort(dst, "9"))
+		if err != nil {
+			t.Fatalf("dial udp4 %s before the call: %v", dst, err)
+		}
+		_ = conn.Close()
+	}
+
+	if err := c.ReplaceAddress(name, oldAddress, newAddress); err != nil {
+		t.Fatalf("ReplaceAddress: %v", err)
+	}
+	check("after the call")
+
+	if err := c.ReplaceAddress(name, oldAddress, newAddress); err != nil {
+		t.Errorf("repeated ReplaceAddress = %v, want nil", err)
+	}
+	check("after the repeated call")
+}
+
+// ipv4Addrs returns the IPv4 addresses the interface carries.
+func ipv4Addrs(t *testing.T, link *net.Interface) []string {
+	t.Helper()
+
+	addrs, err := link.Addrs()
+	if err != nil {
+		t.Fatalf("Addrs(): %v", err)
+	}
+	var got []string
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			got = append(got, ip4.String())
+		}
+	}
+	return got
+}
+
+// routeGetInterface returns the interface route(8) resolves dst through, or
+// "" when its answer names none.
+func routeGetInterface(t *testing.T, dst string) string {
+	t.Helper()
+
+	out, err := exec.Command(routePath, "-n", "get", "-inet", dst).CombinedOutput()
+	if err != nil {
+		t.Fatalf("route get %s: %v: %s", dst, err, out)
+	}
+	name, _ := routeInterface(out)
+	return name
 }
 
 // hasAddr reports whether the interface carries an address containing want.

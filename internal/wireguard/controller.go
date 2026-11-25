@@ -66,6 +66,40 @@ type PeerStatsReader interface {
 	PeerStats(name string) ([]PeerStat, error)
 }
 
+// AddressReplacer is implemented by controllers that can swap the address
+// of a live interface. oldAddress and newAddress are CIDRs of one length.
+//
+// It is optional, as OSInterfaceNamer and PeerStatsReader are, so no test
+// double has to grow. A call that failed halfway succeeds when it is repeated
+// with the same arguments: an implementation tolerates an address that is
+// already there on an add, and one that is not there on a remove.
+type AddressReplacer interface {
+	ReplaceAddress(name, oldAddress, newAddress string) error
+}
+
+// replacePrefixes parses the two CIDRs a ReplaceAddress swaps. Both have to
+// be IPv4 and of one length: the mesh address is IPv4 alone, and every
+// controller's swap is written for IPv4.
+func replacePrefixes(oldAddress, newAddress string) (netip.Prefix, netip.Prefix, error) {
+	oldPrefix, err := netip.ParsePrefix(oldAddress)
+	if err != nil {
+		return netip.Prefix{}, netip.Prefix{}, fmt.Errorf("wireguard: replace address: parse %q: %w", oldAddress, err)
+	}
+	newPrefix, err := netip.ParsePrefix(newAddress)
+	if err != nil {
+		return netip.Prefix{}, netip.Prefix{}, fmt.Errorf("wireguard: replace address: parse %q: %w", newAddress, err)
+	}
+	for _, p := range []netip.Prefix{oldPrefix, newPrefix} {
+		if !p.Addr().Is4() {
+			return netip.Prefix{}, netip.Prefix{}, fmt.Errorf("wireguard: replace address: %s is not an IPv4 CIDR", p)
+		}
+	}
+	if oldPrefix.Bits() != newPrefix.Bits() {
+		return netip.Prefix{}, netip.Prefix{}, fmt.Errorf("wireguard: replace address: %s and %s are not of one length", oldPrefix, newPrefix)
+	}
+	return oldPrefix, newPrefix, nil
+}
+
 // PeerConfig holds the WireGuard-native configuration for a single peer.
 type PeerConfig struct {
 	PublicKey           []byte

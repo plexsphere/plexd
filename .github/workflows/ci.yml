@@ -55,7 +55,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Creating network namespaces and loading nftables rules need root, so
-      # the eight Linux tests against the real kernel skip in the unprivileged
+      # the nine Linux tests against the real kernel skip in the unprivileged
       # run above. They build their namespaces, links and TUN devices
       # themselves and leave the runner's own links and ruleset alone. The
       # traffic test TestNftablesController_RealTraffic runs the same checks
@@ -84,10 +84,15 @@ jobs:
       # TestServer_RealAnswersNoOtherNetwork shares it too and proves that the
       # mesh DNS resolver answers no query from another network; it records
       # that this protection rests on the source rule and on the kernel's
-      # martian check.
+      # martian check. The address test
+      # TestNetlinkController_RealReplaceAddress shares the gate too and
+      # proves the order in which a changed mesh address replaces the old one
+      # on a live WireGuard link: the link ends with the new address alone, a
+      # route through it survives, and the connected route names the new
+      # source.
       # The absolute go path is resolved before sudo resets PATH, and the two
       # cache variables let root reuse what the step above downloaded and
-      # built. The step fails unless all eight tests passed: a skip would pass
+      # built. The step fails unless all nine tests passed: a skip would pass
       # as well otherwise, so it greps the -v output for each PASS line. The
       # space after each name keeps one test's line from matching another's.
       - name: Run privileged Linux tests
@@ -101,23 +106,29 @@ jobs:
           grep -q -- '--- PASS: TestNftablesController_RealTraffic ' "$RUNNER_TEMP/real-nftables.txt"
           grep -q -- '--- PASS: TestNftablesController_RealConnLog ' "$RUNNER_TEMP/real-nftables.txt"
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_LINKS=1 \
-            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface|TestSession_RealAcceptsOnlyMeshAndLocal|TestServer_RealAnswersNoOtherNetwork)$' ./internal/bridge/ ./internal/wireguard/ ./internal/tunnel/ ./internal/meshdns/ \
+            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface|TestSession_RealAcceptsOnlyMeshAndLocal|TestServer_RealAnswersNoOtherNetwork|TestNetlinkController_RealReplaceAddress)$' ./internal/bridge/ ./internal/wireguard/ ./internal/tunnel/ ./internal/meshdns/ \
             | tee "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkVPNController_RealLinks ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkRouteController_RealRoutes ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestRTTProbe_RealAnswersOnlyTheMeshInterface ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestSession_RealAcceptsOnlyMeshAndLocal ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestServer_RealAnswersNoOtherNetwork ' "$RUNNER_TEMP/real-links.txt"
+          grep -q -- '--- PASS: TestNetlinkController_RealReplaceAddress ' "$RUNNER_TEMP/real-links.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
-      # and the forwarding sysctl, so the ten macOS tests against the real
+      # and the forwarding sysctl, so the eleven macOS tests against the real
       # kernel skip in the unprivileged run above. The bridge controller test
       # creates its utuns through the bridge controllers and routes over them.
       # The peer route test TestPeerRoutes_RealUTUN sets a WireGuard manager up
       # on a utun of its own and reads back the allowed IPs and the route a
       # peer's routed subnet gets; it is the only proof that macOS accepts the
       # peer routes, so the step also fails unless its PASS line is in the
-      # output.
+      # output. The address test TestDarwinController_RealReplaceAddress
+      # replaces the address of a utun of its own and repeats the call; it is
+      # the only proof that ifconfig removes an alias with -alias and that the
+      # routes through the utun, which keep the removed alias, give a socket
+      # the new address once ReplaceAddress has pointed them at it, so the
+      # step also fails unless its PASS line is in the output.
       # Loading a pf anchor and taking a pf enable reference need root as well;
       # the four pf tests also ask for PLEXD_TEST_REAL_PF, so sudo go test
       # ./... on a developer's Mac leaves the host's pf alone. The pf traffic
@@ -168,13 +179,14 @@ jobs:
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
             PLEXD_TEST_REAL_PF=1 PLEXD_TEST_REAL_RESOLVER=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestPFController_RealConnLog|TestPFController_RealMeshSourceRewrite|TestWGControllers_RealUTUN|TestPeerRoutes_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
+            -run '^(TestDarwinController_RealUTUN|TestDarwinController_RealReplaceAddress|TestDarwinRouteController_Real|TestPFController_Real|TestPFController_RealTraffic|TestPFController_RealConnLog|TestPFController_RealMeshSourceRewrite|TestWGControllers_RealUTUN|TestPeerRoutes_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner|TestScutilRegistrar_Real)$' \
             ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/ ./internal/meshdns/ \
             | tee "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealTraffic ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealConnLog ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPFController_RealMeshSourceRewrite ' "$RUNNER_TEMP/real-darwin.txt"
           grep -q -- '--- PASS: TestPeerRoutes_RealUTUN ' "$RUNNER_TEMP/real-darwin.txt"
+          grep -q -- '--- PASS: TestDarwinController_RealReplaceAddress ' "$RUNNER_TEMP/real-darwin.txt"
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_LINKS=1 \
             "$(command -v go)" test -race -count=1 -v -p 1 -run '^(TestSession_RealUTUN|TestRTTProbe_RealUTUN)$' ./internal/tunnel/ ./internal/wireguard/ \
             | tee "$RUNNER_TEMP/real-darwin-links.txt"
@@ -183,15 +195,21 @@ jobs:
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
-      # than the privilege check: without one the three tests, the controller's
-      # own, the bridge controllers' and the peer route test, would also run
+      # than the privilege check: without one the four tests, the controller's
+      # two, the bridge controllers' and the peer route test, would also run
       # inside the ordinary step above and create real adapters there. The
       # tests write the embedded wintun.dll beside their own binaries, so
       # nothing has to be fetched. The peer route test TestPeerRoutes_RealWintun
       # also alters the routing table, so it asks for PLEXD_TEST_REAL_ROUTES as
       # well. It is the only proof that Windows accepts the peer routes, so the
       # step fails unless its PASS line is in the output: a skip would pass
-      # otherwise.
+      # otherwise. The address test TestWindowsController_RealReplaceAddress
+      # adds a route through its adapter and asks for both variables too. It
+      # replaces the adapter's address and repeats the call, and it is the
+      # only proof that the routes through the adapter stay when the old
+      # address goes and that Windows answers ERROR_INVALID_PARAMETER for an
+      # address the adapter does not hold, so the step also fails unless its
+      # PASS line is in the output.
       - name: Run real Wintun tests
         if: runner.os == 'Windows'
         env:
@@ -199,10 +217,14 @@ jobs:
           PLEXD_TEST_REAL_ROUTES: '1'
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'real-wintun.txt'
-          go test -race -count=1 -v -run '^(TestWindowsController_RealWintun|TestWGControllers_RealWintun|TestPeerRoutes_RealWintun)$' ./internal/wireguard/ ./internal/bridge/ | Tee-Object -FilePath $out
+          go test -race -count=1 -v -run '^(TestWindowsController_RealWintun|TestWindowsController_RealReplaceAddress|TestWGControllers_RealWintun|TestPeerRoutes_RealWintun)$' ./internal/wireguard/ ./internal/bridge/ | Tee-Object -FilePath $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestPeerRoutes_RealWintun ')) {
             Write-Error 'TestPeerRoutes_RealWintun did not pass'
+            exit 1
+          }
+          if (-not (Select-String -Path $out -SimpleMatch -Quiet -Pattern '--- PASS: TestWindowsController_RealReplaceAddress ')) {
+            Write-Error 'TestWindowsController_RealReplaceAddress did not pass'
             exit 1
           }
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
@@ -61,10 +63,12 @@ type DarwinController struct {
 	mu    sync.Mutex
 	utuns map[string]string // configured name -> kernel utunN name
 
-	// createTUN and run are seams: production wires them to tun.CreateTUN and
-	// execCommand, tests to a fake tun and a recording runner.
+	// createTUN, run and routes are seams: production wires them to
+	// tun.CreateTUN, execCommand and utunRoutes, tests to a fake tun, a
+	// recording runner and a fixed route list.
 	createTUN func(name string, mtu int) (tun.Device, error)
 	run       commandRunner
+	routes    func(osName string) ([]utunRoute, error)
 }
 
 // NewDarwinController returns a controller wired to the real utun device and
@@ -76,6 +80,7 @@ func NewDarwinController(logger *slog.Logger) *DarwinController {
 		utuns:     make(map[string]string),
 		createTUN: tun.CreateTUN,
 		run:       execCommand,
+		routes:    utunRoutes,
 	}
 }
 
@@ -193,7 +198,7 @@ func (c *DarwinController) ConfigureAddress(name string, address string) error {
 		return err
 	}
 
-	if err := c.addOnLinkRoute(osName, prefix); err != nil {
+	if err := c.addOnLinkRoute("configure address", osName, prefix); err != nil {
 		return err
 	}
 
@@ -207,15 +212,82 @@ func (c *DarwinController) ConfigureAddress(name string, address string) error {
 	return nil
 }
 
+// ifconfigAliasGone is what ifconfig(8) prints when -alias names an address
+// the interface does not hold: SIOCDIFADDR fails with EADDRNOTAVAIL.
+const ifconfigAliasGone = "Can't assign requested address"
+
+// ReplaceAddress swaps oldAddress for newAddress on the utun: it adds the new
+// address as an alias, removes the old one with -alias, installs the on-link
+// route of the new prefix and points every route through the utun that still
+// names the old address at the new one.
+//
+// The last step exists because a BSD route keeps the interface address it
+// was added with, and a socket takes its source from it: measured on the CI
+// macOS runner, the on-link route and a route through the utun survive the
+// removal of the old alias and go on giving sockets the removed address.
+// route(8) change with -ifa sets the address of such a route in place, so no
+// packet leaves through the default route meanwhile.
+//
+// Adding an alias the utun already holds succeeds, removing one it does not
+// hold counts as success, and a route already on the new address is left
+// alone, so a call that failed halfway succeeds when it is repeated with the
+// same arguments. TestDarwinController_RealReplaceAddress proves the steps on
+// the macOS runner, because no Mac is at hand.
+func (c *DarwinController) ReplaceAddress(name, oldAddress, newAddress string) error {
+	oldPrefix, newPrefix, err := replacePrefixes(oldAddress, newAddress)
+	if err != nil {
+		return err
+	}
+
+	osName, err := c.osName(name, "replace address")
+	if err != nil {
+		return err
+	}
+
+	// Removing the old alias would remove the new one.
+	if oldPrefix == newPrefix {
+		return nil
+	}
+
+	newIP := newPrefix.Addr().String()
+	if _, err := c.runTool("replace address", ifconfigPath, osName, "inet", newPrefix.String(), newIP, "alias"); err != nil {
+		return err
+	}
+
+	out, err := c.runTool("replace address", ifconfigPath, osName, "inet", oldPrefix.Addr().String(), "-alias")
+	if err != nil && !bytes.Contains(out, []byte(ifconfigAliasGone)) {
+		return err
+	}
+
+	if err := c.addOnLinkRoute("replace address", osName, newPrefix); err != nil {
+		return err
+	}
+
+	if err := c.repointRoutes(osName, oldPrefix.Addr(), newPrefix.Addr()); err != nil {
+		return err
+	}
+
+	c.logger.Debug("address replaced",
+		"component", "wireguard",
+		"interface", name,
+		"utun", osName,
+		"previous_address", oldAddress,
+		"address", newAddress,
+	)
+
+	return nil
+}
+
 // addOnLinkRoute installs the route for the address's own prefix. Adding an
 // address to a Linux WireGuard link gives that route for free, but a macOS
 // utun is point-to-point and the alias installs only a host route, so without
-// this every packet for the mesh would leave through the default route.
+// this every packet for the mesh would leave through the default route. op
+// names the operation for the error.
 //
 // A host prefix needs no route: the alias already installed it. Routes for
 // peer AllowedIPs beyond this prefix belong to the bridge controllers, as they
 // do on Linux.
-func (c *DarwinController) addOnLinkRoute(osName string, prefix netip.Prefix) error {
+func (c *DarwinController) addOnLinkRoute(op, osName string, prefix netip.Prefix) error {
 	if prefix.Bits() >= prefix.Addr().BitLen() {
 		return nil
 	}
@@ -227,7 +299,7 @@ func (c *DarwinController) addOnLinkRoute(osName string, prefix netip.Prefix) er
 	network := prefix.Masked().String()
 
 	argv := []string{routePath, "-n", "add", family, network, "-interface", osName}
-	out, err := c.runTool("configure address", argv...)
+	out, err := c.runTool(op, argv...)
 
 	// route(8) reports an existing route as "File exists". Re-adding the route
 	// this utun already carries is a success, the idempotency
@@ -235,7 +307,7 @@ func (c *DarwinController) addOnLinkRoute(osName string, prefix netip.Prefix) er
 	// decides, because the message names neither. It arrives with either exit
 	// status, so it is read first.
 	if bytes.Contains(out, []byte("File exists")) {
-		return c.confirmRouteOwner(osName, family, network)
+		return c.confirmRouteOwner(op, osName, family, network)
 	}
 	if err != nil {
 		return err
@@ -246,7 +318,7 @@ func (c *DarwinController) addOnLinkRoute(osName string, prefix netip.Prefix) er
 	// and trusting the exit status would leave every mesh packet on the
 	// default route with nothing recording why.
 	if msg, ok := routeSocketError(out); ok {
-		return fmt.Errorf("wireguard: configure address: %s: %s", strings.Join(argv, " "), msg)
+		return fmt.Errorf("wireguard: %s: %s: %s", op, strings.Join(argv, " "), msg)
 	}
 
 	return nil
@@ -258,21 +330,21 @@ func (c *DarwinController) addOnLinkRoute(osName string, prefix netip.Prefix) er
 // holding the identical mesh prefix; a mesh CIDR that is merely a subnet of a
 // prefix another interface holds — a corporate LAN, another VPN's utun —
 // is added without a refusal and is not covered here.
-func (c *DarwinController) confirmRouteOwner(osName, family, network string) error {
+func (c *DarwinController) confirmRouteOwner(op, osName, family, network string) error {
 	argv := []string{routePath, "-n", "get", family, network}
-	out, err := c.runTool("configure address", argv...)
+	out, err := c.runTool(op, argv...)
 	if err != nil {
 		return err
 	}
 	// The "get" is refused the same way an "add" is: with a message in the
 	// output and a zero exit status.
 	if msg, ok := routeSocketError(out); ok {
-		return fmt.Errorf("wireguard: configure address: %s: %s", strings.Join(argv, " "), msg)
+		return fmt.Errorf("wireguard: %s: %s: %s", op, strings.Join(argv, " "), msg)
 	}
 
 	owner, ok := routeInterface(out)
 	if !ok || owner != osName {
-		return fmt.Errorf("wireguard: configure address: %s is already routed via %q, not via %s", network, owner, osName)
+		return fmt.Errorf("wireguard: %s: %s is already routed via %q, not via %s", op, network, owner, osName)
 	}
 
 	c.logger.Debug("route already exists",
@@ -308,6 +380,136 @@ func routeSocketError(out []byte) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// utunRoute is one IPv4 route through a utun as repointRoutes reads it: the
+// destination, whether it is a host route and whether the kernel cloned it
+// from another route, and the interface address a socket that takes the
+// route gets as its source.
+type utunRoute struct {
+	dst    netip.Prefix
+	host   bool
+	cloned bool
+	ifa    netip.Addr
+}
+
+// repointRoutes points every IPv4 route through the utun whose interface
+// address is oldIP at newIP. A route plexd or an operator added is changed in
+// place with route(8) change -ifa. A host route the kernel cloned is deleted
+// instead: the next lookup clones it again from its parent, which by then
+// names newIP. A route that went away between the read and the call is
+// reported "not in table" and counts as done; measured on the CI macOS
+// runner, changing a route drops the clones the kernel made from it.
+func (c *DarwinController) repointRoutes(osName string, oldIP, newIP netip.Addr) error {
+	routes, err := c.routes(osName)
+	if err != nil {
+		return fmt.Errorf("wireguard: replace address: read the routes via %s: %w", osName, err)
+	}
+
+	for _, r := range routes {
+		if r.ifa != oldIP {
+			continue
+		}
+
+		var argv []string
+		switch {
+		case r.cloned:
+			argv = []string{routePath, "-n", "delete", "-inet", "-host", r.dst.Addr().String()}
+		case r.host:
+			argv = []string{routePath, "-n", "change", "-inet", "-host", r.dst.Addr().String(), "-interface", osName, "-ifa", newIP.String()}
+		default:
+			argv = []string{routePath, "-n", "change", "-inet", r.dst.String(), "-interface", osName, "-ifa", newIP.String()}
+		}
+
+		// route(8) reports both outcomes with either exit status, so the
+		// output is read first.
+		out, err := c.runTool("replace address", argv...)
+		if bytes.Contains(out, []byte("not in table")) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if msg, ok := routeSocketError(out); ok {
+			return fmt.Errorf("wireguard: replace address: %s: %s", strings.Join(argv, " "), msg)
+		}
+	}
+	return nil
+}
+
+// utunRoutes reads the IPv4 routing table and returns the routes through the
+// named interface that carry an IPv4 interface address.
+func utunRoutes(osName string) ([]utunRoute, error) {
+	link, err := net.InterfaceByName(osName)
+	if err != nil {
+		return nil, err
+	}
+	rib, err := route.FetchRIB(unix.AF_INET, route.RIBTypeRoute, 0)
+	if err != nil {
+		return nil, err
+	}
+	msgs, err := route.ParseRIB(route.RIBTypeRoute, rib)
+	if err != nil {
+		return nil, fmt.Errorf("parse the routing table: %w", err)
+	}
+
+	var routes []utunRoute
+	for _, msg := range msgs {
+		rm, ok := msg.(*route.RouteMessage)
+		if !ok || rm.Index != link.Index {
+			continue
+		}
+		if r, ok := parseUTUNRoute(rm); ok {
+			routes = append(routes, r)
+		}
+	}
+	return routes, nil
+}
+
+// parseUTUNRoute reads one route message of the routing table dump. It
+// reports false for a route without an IPv4 destination or interface
+// address, and for a network route whose netmask is missing or not
+// contiguous.
+func parseUTUNRoute(rm *route.RouteMessage) (utunRoute, bool) {
+	inet4 := func(i int) ([4]byte, bool) {
+		if i >= len(rm.Addrs) {
+			return [4]byte{}, false
+		}
+		a, ok := rm.Addrs[i].(*route.Inet4Addr)
+		if !ok {
+			return [4]byte{}, false
+		}
+		return a.IP, true
+	}
+
+	dst, ok := inet4(unix.RTAX_DST)
+	if !ok {
+		return utunRoute{}, false
+	}
+	ifa, ok := inet4(unix.RTAX_IFA)
+	if !ok {
+		return utunRoute{}, false
+	}
+
+	r := utunRoute{
+		host:   rm.Flags&unix.RTF_HOST != 0,
+		cloned: rm.Flags&unix.RTF_WASCLONED != 0,
+		ifa:    netip.AddrFrom4(ifa),
+	}
+	length := 32
+	if !r.host {
+		mask, ok := inet4(unix.RTAX_NETMASK)
+		if !ok {
+			return utunRoute{}, false
+		}
+		ones, size := net.IPMask(mask[:]).Size()
+		if size == 0 {
+			return utunRoute{}, false
+		}
+		length = ones
+	}
+	r.dst = netip.PrefixFrom(netip.AddrFrom4(dst), length).Masked()
+	return r, true
 }
 
 // SetInterfaceUp raises the interface flag on the utun. The kernel's route

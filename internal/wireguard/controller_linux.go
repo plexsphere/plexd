@@ -196,6 +196,97 @@ func (c *NetlinkController) ConfigureAddress(name string, address string) error 
 	return nil
 }
 
+// ReplaceAddress swaps oldAddress for newAddress on the named interface. The
+// link, its peers and the routes through it stay.
+//
+// It takes four netlink calls: add the new address as a /32, delete the old
+// address, add the new address with its prefix length, delete the /32. The
+// order is measured on kernel 6.8.0-147 with a dummy link that held
+// 10.99.0.1/24 and a route 172.16.5.0/24 through it. Deleting the only
+// address of a link removes every route of the link, that route included.
+// Adding the new address and then deleting the old one removes both
+// addresses and every route, because the new one is a secondary of the old
+// one and promote_secondaries is 0. The four calls keep the route and end
+// with 10.99.0.0/24 proto kernel src 10.99.0.9. Switching
+// promote_secondaries on would write /proc/sys, which fails in a container
+// that holds NET_ADMIN alone.
+//
+// A pair of /32 addresses takes two calls, add the new one and delete the
+// old one, because the four calls would delete the address they just added.
+// The adds tolerate EEXIST and the deletes EADDRNOTAVAIL, so a call that
+// failed halfway succeeds when it is repeated with the same arguments.
+func (c *NetlinkController) ReplaceAddress(name, oldAddress, newAddress string) error {
+	oldPrefix, newPrefix, err := replacePrefixes(oldAddress, newAddress)
+	if err != nil {
+		return err
+	}
+
+	if err := replaceAddress(netlinkAddrOps, name, oldPrefix, newPrefix); err != nil {
+		return err
+	}
+
+	c.logger.Debug("address replaced",
+		"component", "wireguard",
+		"interface", name,
+		"previous_address", oldAddress,
+		"address", newAddress,
+	)
+
+	return nil
+}
+
+// addrOps is the part of netlink that replaceAddress uses; tests substitute
+// it.
+type addrOps struct {
+	byName func(string) (netlink.Link, error)
+	add    func(netlink.Link, *netlink.Addr) error
+	del    func(netlink.Link, *netlink.Addr) error
+}
+
+// netlinkAddrOps is addrOps over the kernel.
+var netlinkAddrOps = addrOps{byName: netlink.LinkByName, add: netlink.AddrAdd, del: netlink.AddrDel}
+
+// replaceAddress makes the netlink calls of ReplaceAddress, in its order, on
+// the link of that name. A pair that names one address is left as it is,
+// because deleting the old address would delete the new one.
+func replaceAddress(ops addrOps, name string, oldPrefix, newPrefix netip.Prefix) error {
+	link, err := ops.byName(name)
+	if err != nil {
+		return fmt.Errorf("wireguard: replace address: %w", err)
+	}
+	if oldPrefix == newPrefix {
+		return nil
+	}
+
+	type step struct {
+		add    bool
+		prefix netip.Prefix
+	}
+	host := netip.PrefixFrom(newPrefix.Addr(), newPrefix.Addr().BitLen())
+	steps := []step{{true, host}, {false, oldPrefix}, {true, newPrefix}, {false, host}}
+	if newPrefix == host {
+		steps = []step{{true, newPrefix}, {false, oldPrefix}}
+	}
+
+	for _, s := range steps {
+		addr := &netlink.Addr{IPNet: &net.IPNet{
+			IP:   s.prefix.Addr().AsSlice(),
+			Mask: net.CIDRMask(s.prefix.Bits(), s.prefix.Addr().BitLen()),
+		}}
+		if s.add {
+			if err := ops.add(link, addr); err != nil && !errors.Is(err, syscall.EEXIST) {
+				return fmt.Errorf("wireguard: replace address: add %s: %w", s.prefix, err)
+			}
+			continue
+		}
+		if err := ops.del(link, addr); err != nil && !errors.Is(err, syscall.EADDRNOTAVAIL) {
+			return fmt.Errorf("wireguard: replace address: delete %s: %w", s.prefix, err)
+		}
+	}
+
+	return nil
+}
+
 // SetInterfaceUp brings the named interface up.
 func (c *NetlinkController) SetInterfaceUp(name string) error {
 	link, err := netlink.LinkByName(name)
