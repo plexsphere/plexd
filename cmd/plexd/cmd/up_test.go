@@ -1881,20 +1881,48 @@ func (setupRefusingWGController) AddPeer(string, wireguard.PeerConfig) error { r
 func (setupRefusingWGController) RemovePeer(string, []byte) error            { return nil }
 func (setupRefusingWGController) SetPrivateKey(string, []byte) error         { return nil }
 
-// statsWGController is a WGController that also reads peer stats. Every method
-// that would touch the operating system succeeds without doing so, so
-// Manager.Setup brings the interface "up" on any host, without privilege, and
-// runUp starts what it gates on wgReady. PeerStats answers with peers and err;
-// the zero value is a device with no peers.
+// statsWGController is a WGController that also reads peer stats and replaces
+// the interface's address. Every method that would touch the operating system
+// succeeds without doing so, so Manager.Setup brings the interface "up" on any
+// host, without privilege, and runUp starts what it gates on wgReady.
+// PeerStats answers with peers and err; the zero value is a device with no
+// peers. ReplaceAddress records each call.
 //
-// The fields are set before the controller is handed over and only read
-// afterwards, so the daemon's goroutines share it without a lock.
+// peers and err are set before the controller is handed over and only read
+// afterwards, so the daemon's goroutines share them without a lock. mu guards
+// replaced, which ReplaceAddress appends to on the reconcile goroutine while
+// the test reads it.
 type statsWGController struct {
 	peers []wireguard.PeerStat
 	err   error
+
+	mu       sync.Mutex
+	replaced []addressReplacement
 }
 
-var _ wireguard.PeerStatsReader = (*statsWGController)(nil)
+// addressReplacement is one ReplaceAddress call a statsWGController received.
+type addressReplacement struct {
+	name, oldAddress, newAddress string
+}
+
+var (
+	_ wireguard.PeerStatsReader = (*statsWGController)(nil)
+	_ wireguard.AddressReplacer = (*statsWGController)(nil)
+)
+
+func (c *statsWGController) ReplaceAddress(name, oldAddress, newAddress string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.replaced = append(c.replaced, addressReplacement{name: name, oldAddress: oldAddress, newAddress: newAddress})
+	return nil
+}
+
+// replacements returns the ReplaceAddress calls received so far.
+func (c *statsWGController) replacements() []addressReplacement {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]addressReplacement(nil), c.replaced...)
+}
 
 func (*statsWGController) CreateInterface(string, []byte, int) error        { return nil }
 func (*statsWGController) DeleteInterface(string) error                     { return nil }
@@ -6913,6 +6941,165 @@ func TestRunUp_MeshDNSListenAddress(t *testing.T) {
 	}
 	if got := applies[0].reg.Server.String(); got != listen {
 		t.Errorf("Apply server = %q, want %q", got, listen)
+	}
+}
+
+const (
+	// readdressTestInterface is the mesh name the re-addressing tests
+	// configure. Their controller creates nothing under it.
+	readdressTestInterface = "plexdtest1"
+	// readdressExecutionID is the system.info execution the moving pull
+	// dispatches.
+	readdressExecutionID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"
+)
+
+// readdressControlPlane answers the first state pull with the address
+// seedIdentity writes and every later one with movedMeshIP, the way a control
+// plane that moved the node does. While the system.info execution has no
+// terminal callback, a later pull also dispatches it. The control plane
+// accepts every execution callback and keeps the terminal one. Every other
+// route answers an empty JSON object.
+type readdressControlPlane struct {
+	first, moving, moved []byte
+
+	mu         sync.Mutex
+	statePulls int
+	terminal   *api.ExecutionCallbackRequest
+}
+
+func newReaddressControlPlane(t *testing.T) (*readdressControlPlane, string) {
+	t.Helper()
+	encode := func(snap api.NodeStateSnapshot) []byte {
+		t.Helper()
+		body, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatalf("encode the state pull: %v", err)
+		}
+		return body
+	}
+	now := time.Now().UTC()
+	cp := &readdressControlPlane{
+		first: encode(api.NodeStateSnapshot{MeshIP: startMeshIP}),
+		moving: encode(api.NodeStateSnapshot{MeshIP: movedMeshIP, Executions: []api.NodeStateExecution{{
+			ExecutionID: readdressExecutionID,
+			Action:      "system.info",
+			Type:        api.ActionKindBuiltin,
+			Status:      api.ExecutionStatusPending,
+			RequestedAt: now,
+			ExpiresAt:   now.Add(10 * time.Minute),
+		}}}),
+		moved: encode(api.NodeStateSnapshot{MeshIP: movedMeshIP}),
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/state"):
+			cp.mu.Lock()
+			cp.statePulls++
+			body := cp.moved
+			switch {
+			case cp.statePulls == 1:
+				body = cp.first
+			case cp.terminal == nil:
+				body = cp.moving
+			}
+			cp.mu.Unlock()
+			_, _ = w.Write(body)
+			return
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/executions/"+readdressExecutionID):
+			var cb api.ExecutionCallbackRequest
+			if err := json.NewDecoder(r.Body).Decode(&cb); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if cb.Status == api.ExecutionStatusSucceeded || cb.Status == api.ExecutionStatusFailed {
+				cp.mu.Lock()
+				cp.terminal = &cb
+				cp.mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(api.ExecutionCallbackResponse{Status: cb.Status})
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+// waitForTerminal blocks until the system.info execution's terminal callback
+// arrives and returns it.
+func (cp *readdressControlPlane) waitForTerminal(t *testing.T) api.ExecutionCallbackRequest {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		terminal, pulls := cp.terminal, cp.statePulls
+		cp.mu.Unlock()
+		if terminal != nil {
+			return *terminal
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no terminal callback of system.info within 30s, after %d state pulls", pulls)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A pull that carries another mesh_ip moves a running node: the WireGuard
+// controller replaces the interface's address, identity.json keeps the new
+// one for the next start, and the system.info action, which the same pull
+// dispatches after the mesh address handler ran, reports it.
+func TestRunUp_ReaddressesFromTheStatePull(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	cp, apiBase := newReaddressControlPlane(t)
+	ctrl := &statsWGController{}
+	useWGController(t, ctrl)
+	logs := useRecordingDaemonLog(t)
+	dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t)+
+		"reconcile:\n  interval: 1s\n"+
+		"heartbeat:\n  interval: 1s\n"+
+		"wireguard:\n  interface_name: "+readdressTestInterface+"\n  mtu: 1420\n")
+	seedIdentity(t, dataDir, upResumedNodeID, upResumedNSK)
+
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	terminal := cp.waitForTerminal(t)
+
+	want := []addressReplacement{{name: readdressTestInterface, oldAddress: startMeshIP + "/10", newAddress: movedMeshIP + "/10"}}
+	if got := ctrl.replacements(); !reflect.DeepEqual(got, want) {
+		t.Errorf("ReplaceAddress calls = %+v, want %+v", got, want)
+	}
+	id, err := registration.LoadIdentity(dataDir)
+	if err != nil {
+		t.Fatalf("LoadIdentity: %v", err)
+	}
+	if id.MeshIP != movedMeshIP {
+		t.Errorf("identity.json mesh_ip = %q, want %q", id.MeshIP, movedMeshIP)
+	}
+	attrs := logs.attrsOf(slog.LevelInfo, "mesh address changed from state pull")
+	if attrs == nil || attrs["previous_mesh_ip"] != startMeshIP || attrs["mesh_ip"] != movedMeshIP {
+		t.Errorf("Info %q attrs = %v, want previous_mesh_ip %s and mesh_ip %s", "mesh address changed from state pull", attrs, startMeshIP, movedMeshIP)
+	}
+
+	if terminal.Status != api.ExecutionStatusSucceeded || terminal.Output == nil {
+		t.Fatalf("system.info terminal callback = %+v, want succeeded with its output", terminal)
+	}
+	raw, err := base64.StdEncoding.DecodeString(terminal.Output.Inline)
+	if err != nil {
+		t.Fatalf("decode the inline output: %v", err)
+	}
+	var info struct {
+		MeshIP string `json:"mesh_ip"`
+	}
+	if err := json.Unmarshal(raw, &info); err != nil {
+		t.Fatalf("system.info output is not JSON: %v (%s)", err, raw)
+	}
+	if info.MeshIP != movedMeshIP {
+		t.Errorf("system.info mesh_ip = %q, want %q", info.MeshIP, movedMeshIP)
 	}
 }
 

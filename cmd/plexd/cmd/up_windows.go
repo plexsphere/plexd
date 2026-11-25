@@ -3,7 +3,9 @@
 package cmd
 
 import (
+	"context"
 	"log/slog"
+	"net/netip"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
@@ -226,6 +228,14 @@ const forwardingKnobIsShared = false
 // own before forwarding is switched on.
 func newVPNController(logger *slog.Logger, _ string, rewriter *wireguard.MeshRewriter) bridge.VPNController {
 	return bridge.NewWGVPNController(newRewritingWindowsController(logger, rewriter), "", logger)
+}
+
+// newVPNReaddresser returns nil on Windows: a tunnel adapter stays
+// unnumbered (newVPNController), and the in-process rewriter, which gives
+// what a tunnel forwards the mesh address as its source, follows a changed
+// address through a follower of its own.
+func newVPNReaddresser(_ bridge.VPNController, _ *bridge.SiteToSiteManager) func(context.Context, netip.Addr) error {
+	return nil
 }
 
 // newSessionLauncher returns nil: mediated ssh sessions are served on Linux

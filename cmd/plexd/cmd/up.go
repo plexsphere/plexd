@@ -273,6 +273,13 @@ func runAgent(ctx context.Context) error {
 		"mesh_ip", identity.MeshIP,
 	)
 
+	// ownIP is the mesh address plexd uses. It starts as the identity's, and
+	// the mesh address dispatch handler, registered beside the signing key's,
+	// moves it when a state pull carries another one. The system.info action
+	// and the ingress dial policy read it on every call. The parts below that
+	// copy the address at startup follow a move through the same handler.
+	ownIP := newOwnMeshIP(identity.MeshIP)
+
 	// The health listener reports ready only once the node holds a registered
 	// identity. Register returns a persisted identity without a network
 	// round-trip on restart, so this also covers the restart case.
@@ -611,6 +618,9 @@ func runAgent(ctx context.Context) error {
 		userAccessMgr *bridge.UserAccessManager
 		s2sMgr        *bridge.SiteToSiteManager
 		acmeMgr       *bridge.ACMEManager
+		// vpnReaddress moves the site-to-site tunnels to a new mesh address
+		// where a tunnel carries it, and is nil everywhere else.
+		vpnReaddress func(context.Context, netip.Addr) error
 	)
 	if cfg.Mode == "bridge" && cfg.Bridge.Enabled {
 		bridgeMgr = bridge.NewManager(routeCtrl, cfg.Bridge, logger)
@@ -666,14 +676,17 @@ func runAgent(ctx context.Context) error {
 			acmeMgr = bridge.NewACMEManager(bridge.ACMEConfig{CacheDir: acmeDir}, logger)
 			ingressCtrl := bridge.NewStdIngressController(logger)
 			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr, secrets)
-			if dialPolicy, err := newIngressDialPolicy(enforcer, identity.MeshIP); err != nil {
+			if _, err := netip.ParseAddr(identity.MeshIP); err != nil {
 				logger.Warn("ingress: mesh ip is not an address, a policy-blocked dial is reported by its network error",
 					"component", "bridge",
 					"mesh_ip", identity.MeshIP,
 					"error", err,
 				)
 			} else {
-				ingressMgr.SetDialPolicy(dialPolicy)
+				ingressMgr.SetDialPolicy(newIngressDialPolicy(enforcer, func() netip.Addr {
+					addr, _ := ownIP.Addr()
+					return addr
+				}))
 			}
 			if err := ingressMgr.Setup(); err != nil {
 				return fmt.Errorf("plexd up: ingress setup: %w", err)
@@ -791,6 +804,7 @@ func runAgent(ctx context.Context) error {
 				"component", "bridge",
 			)
 		}
+		vpnReaddress = newVPNReaddresser(vpnCtrl, s2sMgr)
 
 		logger.Info("bridge subsystem initialized",
 			"relay", cfg.Bridge.RelayEnabled,
@@ -966,7 +980,7 @@ func runAgent(ctx context.Context) error {
 	// 10. Create action executor and register built-in actions.
 	executor := actions.NewExecutor(cfg.Actions, client, integrityVerifier, logger)
 
-	nodeInfo := &agentNodeInfo{nodeID: identity.NodeID, meshIP: identity.MeshIP}
+	nodeInfo := &agentNodeInfo{nodeID: identity.NodeID, meshIP: ownIP}
 	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics (CPU, memory, disk, network)",
 		[]api.ActionParam{
 			{Name: "include_network", Type: "bool", Required: false, Default: "true", Description: "Include network interface info"},
@@ -1198,6 +1212,55 @@ func runAgent(ctx context.Context) error {
 		KeyID:     identity.SigningKeyID,
 		PublicKey: identity.SigningPublicKey,
 	}, logger))
+
+	// The pull carries the node's mesh address on every successful cycle as
+	// well. A changed one is replaced on the mesh interface in place, then
+	// every part that holds a copy follows, and the identity files keep it.
+	// It runs right after the signing key, ahead of the session dispatcher,
+	// the mesh DNS handler and the WireGuard reconcile handler, so the rest of
+	// the cycle already runs on the new address. Without WireGuard the
+	// interface cannot follow, and the handler only commits the address for
+	// the next start.
+	var meshInterface func(netip.Addr) error
+	if wgReady {
+		meshInterface = wgMgr.Readdress
+	}
+	var meshAddressFollowers []meshAddressFollower
+	if dnsMgr != nil {
+		meshAddressFollowers = append(meshAddressFollowers, meshAddressFollower{
+			name: "mesh-dns",
+			apply: func(ctx context.Context, addr netip.Addr) error {
+				return dnsMgr.Rebind(ctx, meshDNSListenIP(addr, meshDNSListensOnLoopback))
+			},
+		})
+	}
+	meshAddressFollowers = append(meshAddressFollowers, meshAddressFollower{
+		name: "sessions",
+		apply: func(_ context.Context, addr netip.Addr) error {
+			meshServer.SessionManager().SetMeshIP(addr.String())
+			return nil
+		},
+	})
+	if vpnReaddress != nil {
+		meshAddressFollowers = append(meshAddressFollowers, meshAddressFollower{name: "site-to-site", apply: vpnReaddress})
+	}
+	if meshRewriter != nil {
+		meshAddressFollowers = append(meshAddressFollowers, meshAddressFollower{
+			name: "mesh-rewriter",
+			apply: func(_ context.Context, addr netip.Addr) error {
+				meshRewriter.SetMeshAddress(wgMgr.OSInterfaceName(), addr)
+				return nil
+			},
+		})
+	}
+	reconciler.RegisterDispatchHandler(meshAddressDispatchHandler(meshAddressDeps{
+		Own:       ownIP,
+		DataDir:   cfg.DataDir,
+		Persisted: identity.MeshIP,
+		Interface: meshInterface,
+		Followers: meshAddressFollowers,
+		Logger:    logger,
+	}))
 
 	// The pull's secrets block is the node's secret inventory, names and
 	// versions only. It replaces the node API's secret index on every
@@ -1985,15 +2048,17 @@ func serveMeshDNS(ctx context.Context, mgr *meshdns.Manager, logger *slog.Logger
 	}
 }
 
-// agentNodeInfo adapts agent identity to actions.NodeInfoProvider.
+// agentNodeInfo adapts agent identity to actions.NodeInfoProvider. MeshIP
+// reads the address plexd uses on every call, so it reports the one a state
+// pull moved the node to.
 type agentNodeInfo struct {
 	nodeID    string
-	meshIP    string
+	meshIP    *ownMeshIP
 	peerCount int
 }
 
 func (a *agentNodeInfo) NodeID() string { return a.nodeID }
-func (a *agentNodeInfo) MeshIP() string { return a.meshIP }
+func (a *agentNodeInfo) MeshIP() string { return a.meshIP.String() }
 func (a *agentNodeInfo) PeerCount() int { return a.peerCount }
 
 // agentHealthProvider adapts agent state to actions.HealthProvider.

@@ -3,8 +3,13 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"net/netip"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -201,6 +206,83 @@ func TestTunnelAddress_Darwin(t *testing.T) {
 			}
 		})
 	}
+}
+
+// addressRecordingWGController brings an interface "up" as statsWGController
+// does and records the address each ConfigureAddress call assigns.
+type addressRecordingWGController struct {
+	statsWGController
+
+	addrMu    sync.Mutex
+	addresses []string
+}
+
+func (c *addressRecordingWGController) ConfigureAddress(_, address string) error {
+	c.addrMu.Lock()
+	defer c.addrMu.Unlock()
+	c.addresses = append(c.addresses, address)
+	return nil
+}
+
+func (c *addressRecordingWGController) configured() []string {
+	c.addrMu.Lock()
+	defer c.addrMu.Unlock()
+	return append([]string(nil), c.addresses...)
+}
+
+// A move of a macOS bridge gives the site-to-site controller the new mesh
+// address as the host prefix every tunnel utun carries, and has the manager
+// build its tunnels again, so the next utun carries the new address. A
+// controller that cannot change its address gets no follower.
+func TestNewVPNReaddresser_Darwin(t *testing.T) {
+	moved := netip.MustParseAddr("10.42.0.9")
+	key := bytes.Repeat([]byte{0x44}, 32)
+
+	t.Run("the next tunnel utun carries the new address", func(t *testing.T) {
+		wg := &addressRecordingWGController{}
+		vpn := bridge.NewWGVPNController(wg, tunnelAddress("10.42.0.5"), discardLogger())
+		move := newVPNReaddresser(vpn, nil)
+		if move == nil {
+			t.Fatal("newVPNReaddresser(WGVPNController, nil) = nil, want the site-to-site follower")
+		}
+		if err := move(context.Background(), moved); err != nil {
+			t.Fatalf("move: %v", err)
+		}
+		if err := vpn.CreateTunnelInterface("s2s-test0", key, 0); err != nil {
+			t.Fatalf("CreateTunnelInterface: %v", err)
+		}
+		if got, want := wg.configured(), []string{"10.42.0.9/32"}; !slices.Equal(got, want) {
+			t.Errorf("addresses configured = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the manager builds its tunnels again", func(t *testing.T) {
+		vpn := bridge.NewWGVPNController(&addressRecordingWGController{}, tunnelAddress("10.42.0.5"), discardLogger())
+		s2s := bridge.NewSiteToSiteManager(bridge.SiteToSiteDeps{VPN: vpn, Logger: discardLogger()})
+		move := newVPNReaddresser(vpn, s2s)
+		if move == nil {
+			t.Fatal("newVPNReaddresser(WGVPNController, manager) = nil, want the site-to-site follower")
+		}
+		if err := move(context.Background(), moved); err != nil {
+			t.Fatalf("move: %v", err)
+		}
+		// Rebuild signals ReportChanged whether or not a tunnel is up.
+		select {
+		case <-s2s.ReportChanged():
+		default:
+			t.Error("ReportChanged did not signal, want the move to call Rebuild")
+		}
+	})
+
+	t.Run("a controller without SetAddress gets no follower", func(t *testing.T) {
+		vpn := bridge.NewWGVPNController(&addressRecordingWGController{}, "", discardLogger())
+		if move := newVPNReaddresser(struct{ bridge.VPNController }{vpn}, nil); move != nil {
+			t.Error("newVPNReaddresser(a controller without SetAddress) != nil, want nil")
+		}
+		if move := newVPNReaddresser(nil, nil); move != nil {
+			t.Error("newVPNReaddresser(nil) != nil, want nil")
+		}
+	})
 }
 
 // macOS serves ssh sessions through the child session helper, so plexd up

@@ -3,8 +3,10 @@
 package cmd
 
 import (
+	"context"
 	"crypto/ed25519"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -177,6 +179,32 @@ const forwardingKnobIsShared = true
 // in-process rewriter is unused: pf rewrites what leaves the utun.
 func newVPNController(logger *slog.Logger, meshIP string, _ *wireguard.MeshRewriter) bridge.VPNController {
 	return bridge.NewWGVPNController(wireguard.NewDarwinController(logger), tunnelAddress(meshIP), logger)
+}
+
+// newVPNReaddresser returns the site-to-site follower of a changed mesh
+// address on macOS. It gives vpn the new address as the host prefix every
+// tunnel utun carries, then has s2s build every wireguard tunnel that is up
+// again on it, when the manager exists. A bridge that opts out of
+// site-to-site has no manager and creates no tunnel, so only the address
+// moves. It returns nil for a controller that cannot change its address.
+//
+// DECISION: on macOS a site-to-site tunnel is built again, because its utun
+// carries the mesh address (newVPNController). Swapping the alias on the
+// live utun was rejected: it needs facts about routes over a utun that only
+// the CI runner can measure, for a path the stop-and-attempt code of
+// SiteToSiteManager already covers.
+func newVPNReaddresser(vpn bridge.VPNController, s2s *bridge.SiteToSiteManager) func(context.Context, netip.Addr) error {
+	addressed, ok := vpn.(interface{ SetAddress(address string) })
+	if !ok {
+		return nil
+	}
+	return func(ctx context.Context, addr netip.Addr) error {
+		addressed.SetAddress(tunnelAddress(addr.String()))
+		if s2s != nil {
+			s2s.Rebuild(ctx)
+		}
+		return nil
+	}
 }
 
 // tunnelAddress returns the CIDR a site-to-site tunnel utun carries: the
