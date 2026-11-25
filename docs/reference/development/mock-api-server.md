@@ -326,6 +326,12 @@ generated per server start, until `POST /test/rotate-signing-key` replaces
 them. A registration after a rotation answers with the new key, and every state
 pull carries the same key in its `signing_key` block.
 
+`mesh_ip` is the node's current mesh address, a value the mock owns:
+`10.99.0.1` until [`POST /test/readdress`](#post-test-readdress) moves the
+node inside `domain_mesh_cidr`, `10.99.0.0/24`. A registration after a move
+answers with the new address, and every state pull carries the same address in
+`mesh_ip`.
+
 **Content-Type:** `application/json`
 
 **Counter:** Increments `registration_count` on each call.
@@ -340,19 +346,32 @@ the server restarts.
 ### `POST /v1/nodes/{id}/heartbeat`
 
 Enforces the v1 heartbeat contract: strict JSON decoding (unknown fields
-rejected), a required `nat_summary` **object**, clock-skew tolerance, and
-checksum/version shape. `heartbeat_count` increments only when every check
-passes, so invalid requests are not counted. The success response is the
-configurable `HeartbeatResponse` fixture (defaults to `reconcile: true`,
-`rotate_keys: false`) with a fresh `accepted_at` stamped per call.
+rejected), a required `nat_summary` **object**, a bounded `features` list,
+clock-skew tolerance, and checksum/version shape. `heartbeat_count` increments
+only when every check passes, so invalid requests are not counted. The success
+response is the configurable `HeartbeatResponse` fixture (defaults to
+`reconcile: true`, `rotate_keys: false`) with a fresh `accepted_at` stamped per
+call.
 
 **Validation order.** The handler returns at the first failure:
 
 1. **Body decode** → `400` `malformed_heartbeat_request` if the body is unreadable or strict decoding fails.
 2. **`nat_summary` object** → `400` `malformed_heartbeat_request` if `nat_summary` is absent, `null`, or not a JSON object. This is what proves the agent sends `{}` — not `null` — before NAT discovery has a result.
-3. **Clock skew** → `400` `clock_skew` if `client_now` is more than 60s from server time in either direction.
-4. **Binary checksum** → `400` `binary_checksum_empty` unless `binary_checksum` is a 64-char lowercase hex digest or the 44-char standard base64 of 32 bytes.
-5. **Binary version** → `400` `binary_version_empty` if `binary_version` is empty.
+3. **Features** → `400` `invalid_features` if `features` holds more than 16 names, or a name that does not match `^[a-z][a-z0-9_]{0,31}$`. The `detail` states the rule and never names the refused name. The control plane checks the list at the same place, so a body that also fails the clock-skew check answers `invalid_features`.
+4. **Clock skew** → `400` `clock_skew` if `client_now` is more than 60s from server time in either direction.
+5. **Binary checksum** → `400` `binary_checksum_empty` unless `binary_checksum` is a 64-char lowercase hex digest or the 44-char standard base64 of 32 bytes.
+6. **Binary version** → `400` `binary_version_empty` if `binary_version` is empty.
+
+**Declared features.** An accepted heartbeat replaces the set of features the
+node declared with the names of its `features` list, sorted and without
+duplicates. A heartbeat without the list, or with an empty one, declares none.
+A refused heartbeat changes nothing, so the set of the last accepted heartbeat
+stays. The set is stored before `heartbeat_count` rises, so a suite that waits
+for the counter to move sees what that heartbeat declared. It lives in memory
+and is empty when the mock starts. [`POST /test/readdress`](#post-test-readdress)
+moves the node only while the set holds `mesh_readdress`. The body of the last
+heartbeat, a refused one included, is retrievable via
+`GET /test/last-request/heartbeat`.
 
 **Response:** `200 OK`
 
@@ -948,11 +967,21 @@ The `signing_key` block is not read from the fixture: every response sets it to
 the mock's current signing key, the key `POST /v1/register` hands out, whatever
 the configured fixture holds. A pull after `POST /test/rotate-signing-key`
 therefore hands the node the new key.
+`mesh_ip` is not read from the fixture either: every response sets it to the
+node's current mesh address, the one `POST /v1/register` hands out, and writes
+the same address into the `dns.hosts` entry whose `node_id` is the registered
+node, whatever the configured fixture holds. The served `dns` block is a copy,
+so the configured fixture is never rewritten. A configured fixture without a
+`dns` block still serves `"dns": null`, and one whose `hosts` hold no entry for
+the node gets none added. A pull after
+[`POST /test/readdress`](#post-test-readdress) therefore hands the node its new
+address.
 
 **Default fixture blocks:**
 
 | Block | Default Value |
 |-------|---------------|
+| `mesh_ip` | the node's current mesh address (`10.99.0.1` until `POST /test/readdress`), set on every response rather than read from the fixture |
 | `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint`, one `endpoint_candidates` entry (`192.0.2.10:51820`) and `routed_subnets` `["10.50.0.0/16"]` but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 3 allow rules without `action`, the second with `log: true` and the third IPv6, `fingerprint` from `policyFingerprint`, and one `revisions` pair (`policy_id` `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1`, the block's `revision_id`) |
@@ -966,12 +995,13 @@ therefore hands the node the new key.
 | `secrets` | `[]` (no inventory; phases configure entries explicitly) |
 | `hooks` | `null`, which keeps every hook a rollout installed and lets the [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serve nothing; phases configure entries explicitly |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
-| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, `10.99.0.1`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa`; `forwarding` with `forward_zones` `[]` and `catch_all` `[]` |
+| `dns` | `search_domain` `app.e2e.internal`; `zones` `app.e2e.internal` and `e2e.internal`; `hosts` `node-1.app.e2e.internal` (the registered node, at its current mesh address, `10.99.0.1` until `POST /test/readdress`), `peer-1.app.e2e.internal` (`...a0b1`, `10.99.0.2`) and `peer-2.app.e2e.internal` (`...a0b2`, `10.99.0.3`), ordered by `fqdn`; `records` `_db._tcp.app.e2e.internal` `SRV` (priority 0, weight 5, port 5432, target `db.e2e.internal`), `alias.app.e2e.internal` `CNAME` (`peer-2.app.e2e.internal`), `db.e2e.internal` `A` (`192.0.2.10`), `A` (`192.0.2.11`) and `AAAA` (`2001:db8::10`), `e2e.internal` `MX` (priority 10, `mail.example.com`) and `TXT` (`v=e2e`, `owner=plexd`), and `ext.e2e.internal` `CNAME` (`ext.example.com`), ordered by `fqdn`, then `type`; `reverse_zones` `0.99.10.in-addr.arpa`; `forwarding` with `forward_zones` `[]` and `catch_all` `[]` |
 | `failure_detection` | `{"detect_after_seconds": 15}`, what the control plane serves for a Domain that never set the value, so every suite runs the timing production runs: the node probes its relayed peers on every pass, 1 s apart, and dials the next relay of a silent peer's set 14 to 15 s after its last packet. See [Failure detection time](../networking/wireguard.md#failure-detection-time) |
 | `shared_subnets` | `[]`: the fixture has no shared subnet. `GET /v1/nodes/{id}/state` serves a nil list as `[]`, never `null`, as the contract never sends `null` for the block. The Docker suite's phase `12e` splices an entry in its step `(h1)`. See [Shared subnets](../networking/wireguard.md#shared-subnets) |
 
-The `dns` block names the node at the mesh IP `POST /v1/register` assigns it and
-each peer at the mesh IP of its `peers` entry, so every name a suite resolves
+The `dns` block names the node at its current mesh address, the one
+`POST /v1/register` assigns it and `mesh_ip` carries, and each peer at the mesh
+IP of its `peers` entry, so every name a suite resolves
 points at an address of the agent's mesh. `app.e2e.internal` is the node's
 Project zone and `e2e.internal` its Domain's default domain above it, so the
 agent registers `app.e2e.internal` as its search domain and routes
@@ -1047,6 +1077,7 @@ answers `applied`.
 
 ```json
 {
+  "mesh_ip": "10.99.0.1",
   "peers": [
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
@@ -1812,6 +1843,7 @@ after each.
 - Decoding is **strict**: a misspelled or renamed key anywhere in the envelope is a `400`, not a `204` that silently stores a zero-valued block
 - Each configured execution seeds the callback state machine (see below)
 - A configured `signing_key` is stored (and `GetState()` returns it) but never served: `GET /v1/nodes/{id}/state` replaces it with the mock's current signing key
+- A configured `mesh_ip`, and the address of the node's own entry in a configured `dns.hosts`, are stored (and `GetState()` returns them) but never served: `GET /v1/nodes/{id}/state` replaces both with the node's current mesh address. Only [`POST /test/readdress`](#post-test-readdress) moves the node
 - Request body is captured and retrievable via `GET /test/last-request/configure_state`
 
 **Execution seeding:** the configured `status` of each entry tells the mock what the
@@ -2140,6 +2172,43 @@ The answer has the shape of `api.NodeStateSigningKey`. `key_id` is
 **Content-Type:** `application/json`
 
 **Error:** Returns `500` if generating the key pair fails. Returns `405` if the HTTP method is not `POST`.
+
+### `POST /test/readdress`
+
+The mock's stand-in for a Domain admin who moves the node to another mesh
+address. The node's address is a value the mock owns, `10.99.0.1` when it
+starts. After a move, `POST /v1/register` hands out the new address, and every
+state pull carries it in `mesh_ip` and in the `dns.hosts` entry of the node.
+Like the control plane, the mock moves the node only while its latest accepted
+heartbeat declared `mesh_readdress`. The [Docker e2e run](docker-e2e-test.md)
+and the [systemd e2e run](systemd-e2e-test.md) use it to prove that plexd
+follows a move while it runs, and the Docker run also proves that the node
+keeps the new address across a restart.
+
+**Request body:** strict-decoded: an unknown field is a `400`.
+
+```json
+{ "mesh_ip": "10.99.0.9" }
+```
+
+**Response:** `200 OK`
+
+```json
+{ "mesh_ip": "10.99.0.9", "previous_mesh_ip": "10.99.0.1" }
+```
+
+**Behavior:**
+
+- The handler checks the body first. A `mesh_ip` that is no IPv4 address inside the Domain's mesh, `10.99.0.0/24`, the `domain_mesh_cidr` that `POST /v1/register` hands out, answers `400` `invalid_mesh_ip` as `application/problem+json`, with the `detail` `mesh_ip must be an IPv4 address inside 10.99.0.0/24`. A missing or empty `mesh_ip` is refused the same way. A script reads the code from the body's `code` member.
+- While the latest heartbeat the mock accepted did not declare `mesh_readdress`, the call answers `409` `node_cannot_readdress` as `application/problem+json`, as the control plane refuses to move a node whose agent cannot follow. That holds from the mock's start until the first accepted heartbeat that declares it, and again after an accepted heartbeat without it. See [the heartbeat](#post-v1-nodes-id-heartbeat).
+- A refused call changes nothing. A move to the current address answers `200` with the same address in both members.
+- The mock publishes no event for a move, as the control plane publishes none, so the node learns its new address with its next pull. A suite sends a `node_state_updated` event through [`POST /test/inject-event`](#post-test-inject-event) to make the node pull at once.
+- The address and the declared features live in memory under one `sync.RWMutex`, and the handler reads the declaration and replaces the address under one lock, so a heartbeat that withdraws `mesh_readdress` cannot land between the two. A restarted mock starts at `10.99.0.1` again, with no feature declared.
+- No counter moves. The request body is captured and retrievable via `GET /test/last-request/readdress`.
+
+**Content-Type:** `application/json` (the `invalid_mesh_ip` and `node_cannot_readdress` errors use `application/problem+json`).
+
+**Error:** Returns `400` with `{"error": "invalid request body"}` if the body is empty, is not valid JSON, or contains an unknown field. Returns `400` `invalid_mesh_ip` and `409` `node_cannot_readdress` as described above. Returns `405` if the HTTP method is not `POST`.
 
 ### `GET /test/last-request/{endpoint}`
 
