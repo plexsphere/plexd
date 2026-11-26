@@ -35,7 +35,7 @@ Under plexd's systemd unit that user is root, held to the unit's limits:
 
 | Unit setting | What it means for a hook |
 |---|---|
-| `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` | Root keeps these three capabilities and no other, so a hook can also bind a port below 1024 |
+| `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_BPF` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_BPF` | Root keeps these four capabilities and no other, so a hook can also bind a port below 1024, and it holds `CAP_BPF`, which the relay's [kernel forwarding](../bridge/nat-relay.md#kernel-forwarding) needs, too: with `CAP_NET_ADMIN` beside it, a hook can load and attach networking eBPF programs such as a tc program |
 | `ProtectSystem=full` | `/usr`, the boot loader directories, and `/etc` are read-only, apart from the paths the unit lists in `ReadWritePaths` |
 | `ProtectHome=true` | `/home`, `/root`, and `/run/user` are empty and cannot be reached |
 

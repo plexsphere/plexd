@@ -64,8 +64,8 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 |             | `RestartSec`             | `5s`                                     | Delay between restarts                       |
 |             | `LimitNOFILE`            | `65536`                                  | File descriptor limit for WireGuard tunnels  |
 |             | `EnvironmentFile`        | `-{ConfigDir}/environment`               | Optional environment file (dash = optional)  |
-|             | `AmbientCapabilities`    | `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` | Network capabilities for WireGuard, ICMP and public ingress ports below 1024 |
-|             | `CapabilityBoundingSet`  | `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` | Limit capabilities to required set   |
+|             | `AmbientCapabilities`    | `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_BPF` | Network capabilities for WireGuard, ICMP and public ingress ports below 1024, and `CAP_BPF` for the maps of the relay's kernel forwarding |
+|             | `CapabilityBoundingSet`  | `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_BPF` | Limit capabilities to required set   |
 |             | `ProtectSystem`          | `full`                                   | Make /usr, /boot, /efi and /etc read-only    |
 |             | `ProtectHome`            | `true`                                   | Make /home, /root, /run/user inaccessible    |
 |             | `ReadWritePaths`         | `-{DataDir} -{RunDir} -{ConfigDir}/bootstrap-token` | Allow writes to the data and runtime dirs and the bootstrap token file |
@@ -87,6 +87,26 @@ capability lines:
 [Service]
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+Run `systemctl daemon-reload` and `systemctl restart plexd` after adding it.
+
+`CAP_BPF` lets a bridge whose relay runs on Linux 6.6 or newer create the maps
+of the eBPF program that forwards the relayed pairs' transport datagrams in the
+kernel, which `CAP_NET_ADMIN` then loads and attaches (see
+[Kernel Forwarding](../bridge/nat-relay.md#kernel-forwarding)). A node that is
+no relaying bridge never loads the program. A self-upgrade replaces the binary
+alone and keeps the unit an earlier release wrote, so such a bridge logs
+`relay: kernel forwarding unavailable, forwarding in the process` with an
+`error` that contains `operation not permitted`, and relays in the process as
+before, until `plexd install` writes the unit again. Until then, a drop-in adds
+the capability:
+
+```ini
+# /etc/systemd/system/plexd.service.d/bpf.conf
+[Service]
+AmbientCapabilities=CAP_BPF
+CapabilityBoundingSet=CAP_BPF
 ```
 
 Run `systemctl daemon-reload` and `systemctl restart plexd` after adding it.

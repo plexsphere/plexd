@@ -1,53 +1,72 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="660" viewBox="0 0 1180 660" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge relays WireGuard between two peers behind NAT">
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="810" viewBox="0 0 1180 810" font-family="'IBM Plex Sans', Arial, Helvetica, sans-serif" role="img" aria-label="How a bridge relays WireGuard between two peers behind NAT">
 <title>How a bridge relays WireGuard between two peers behind NAT</title>
-<rect width="1180" height="660" fill="#F6F5F1"/>
+<rect width="1180" height="810" fill="#F6F5F1"/>
 <rect x="140" y="40" width="240" height="76" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="260" y="74.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Peer A</text>
 <text x="260" y="95.95" font-size="17" fill="#55606E" text-anchor="middle">behind NAT</text>
 <rect x="860" y="40" width="240" height="76" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
 <text x="980" y="74.8" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">Peer B</text>
 <text x="980" y="95.95" font-size="17" fill="#55606E" text-anchor="middle">behind NAT</text>
-<rect x="40" y="190" width="1100" height="430" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<rect x="40" y="190" width="1100" height="580" rx="12" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
 <text x="56" y="223.2" font-size="22" font-weight="700" fill="#2B3440">Bridge node</text>
 <text x="225" y="221.45" font-size="17" fill="#55606E">relay</text>
-<rect x="80" y="290" width="300" height="110" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="230" y="332.2" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">UDP socket</text>
-<text x="230" y="353.35" font-size="17" fill="#55606E" text-anchor="middle">on the pulled</text>
-<text x="230" y="372.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">listen_port</text>
-<rect x="450" y="290" width="260" height="110" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="580" y="330.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">parseWGMessage</text>
-<text x="580" y="350.95" font-size="17" fill="#55606E" text-anchor="middle">type, sender and</text>
-<text x="580" y="371.35" font-size="17" fill="#55606E" text-anchor="middle">receiver index</text>
-<rect x="780" y="290" width="320" height="110" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="940" y="320.35" font-size="17" font-weight="700" fill="#1E6B40" text-anchor="middle">handshake:</text>
-<text x="940" y="340.75" font-size="17" fill="#55606E" text-anchor="middle">CheckMAC1 per listed peer</text>
-<text x="940" y="361.15" font-size="17" font-weight="700" fill="#1E6B40" text-anchor="middle">every message:</text>
-<text x="940" y="381.55" font-size="17" fill="#55606E" text-anchor="middle">indices table</text>
-<polyline points="380,345 441,345" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="450,345 437,351 437,339" fill="#3A4452"/>
-<polyline points="710,345 771,345" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="780,345 767,351 767,339" fill="#3A4452"/>
-<polyline points="940,400 940,450 230,450 230,409" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="230,400 236,413 224,413" fill="#3A4452"/>
-<text x="580" y="439.45" font-size="17" fill="#55606E" text-anchor="middle">dispatch loop</text>
-<polyline points="290,125 290,281" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
-<polygon points="290,290 284,277 296,277" fill="#2F8A57"/>
+<rect x="440" y="240" width="260" height="110" rx="8" fill="#FDFCF9" stroke="#C9620F" stroke-width="2"/>
+<text x="570" y="280.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">relay_forward</text>
+<text x="570" y="300.95" font-size="17" fill="#55606E" text-anchor="middle">at tcx ingress</text>
+<text x="570" y="321.35" font-size="17" fill="#55606E" text-anchor="middle">Linux 6.6+</text>
+<path d="M760 248C760 237.33 980 237.33 980 248V342C980 352.67 760 352.67 760 342Z" fill="#FBEFE3" stroke="#C9620F" stroke-width="2"/>
+<path d="M760 248C760 256 980 256 980 248" fill="none" stroke="#C9620F" stroke-width="2"/>
+<text x="870" y="296.75" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#A44E07" text-anchor="middle">relay_sessions</text>
+<text x="870" y="317.15" font-size="17" fill="#55606E" text-anchor="middle">placed sessions</text>
+<polyline points="700,295 760,295" fill="none" stroke="#7D8794" stroke-width="2.5"/>
+<polyline points="389,78 490,78 490,231" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="490,240 484,227 496,227" fill="#2F8A57"/>
+<polygon points="380,78 393,72 393,84" fill="#2F8A57"/>
+<polyline points="851,78 650,78 650,231" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="650,240 644,227 656,227" fill="#2F8A57"/>
+<polygon points="860,78 847,84 847,72" fill="#2F8A57"/>
+<text x="570" y="67.45" font-size="17" fill="#55606E" text-anchor="middle">transport datagrams of placed sessions</text>
+<rect x="80" y="440" width="300" height="110" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="230" y="482.2" font-size="20" font-weight="700" fill="#1E6B40" text-anchor="middle">UDP socket</text>
+<text x="230" y="503.35" font-size="17" fill="#55606E" text-anchor="middle">on the pulled</text>
+<text x="230" y="522.8" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">listen_port</text>
+<rect x="450" y="440" width="260" height="110" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="580" y="480.55" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">parseWGMessage</text>
+<text x="580" y="500.95" font-size="17" fill="#55606E" text-anchor="middle">type, sender and</text>
+<text x="580" y="521.35" font-size="17" fill="#55606E" text-anchor="middle">receiver index</text>
+<rect x="780" y="440" width="320" height="110" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="940" y="470.35" font-size="17" font-weight="700" fill="#1E6B40" text-anchor="middle">handshake:</text>
+<text x="940" y="490.75" font-size="17" fill="#55606E" text-anchor="middle">CheckMAC1 per listed peer</text>
+<text x="940" y="511.15" font-size="17" font-weight="700" fill="#1E6B40" text-anchor="middle">every message:</text>
+<text x="940" y="531.55" font-size="17" fill="#55606E" text-anchor="middle">indices table</text>
+<polyline points="380,495 441,495" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="450,495 437,501 437,489" fill="#3A4452"/>
+<polyline points="710,495 771,495" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="780,495 767,501 767,489" fill="#3A4452"/>
+<polyline points="940,550 940,600 230,600 230,559" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="230,550 236,563 224,563" fill="#3A4452"/>
+<text x="580" y="589.45" font-size="17" fill="#55606E" text-anchor="middle">dispatch loop</text>
+<polyline points="290,125 290,431" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="290,440 284,427 296,427" fill="#2F8A57"/>
 <polygon points="290,116 296,129 284,129" fill="#2F8A57"/>
 <text x="280" y="155.95" font-size="17" fill="#55606E" text-anchor="end">WireGuard datagram</text>
-<polyline points="980,125 980,150 350,150 350,281" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
-<polygon points="350,290 344,277 356,277" fill="#2F8A57"/>
-<polygon points="980,116 986,129 974,129" fill="#2F8A57"/>
-<text x="665" y="139.45" font-size="17" fill="#55606E" text-anchor="middle">WireGuard datagram</text>
-<path d="M80 510H366L380 524V590H80Z" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
-<path d="M366 510V524H380" fill="none" stroke="#2457C5" stroke-width="2"/>
-<text x="230" y="547.4" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">state pull</text>
-<text x="230" y="567.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">bridge.relay, peers</text>
-<rect x="450" y="510" width="320" height="80" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="610" y="555.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">RelayReconcileHandler</text>
-<rect x="840" y="510" width="260" height="80" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
-<text x="970" y="555.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">Configure / Stop</text>
-<polyline points="380,550 441,550" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="450,550 437,556 437,544" fill="#3A4452"/>
-<polyline points="770,550 831,550" fill="none" stroke="#3A4452" stroke-width="2.5"/>
-<polygon points="840,550 827,556 827,544" fill="#3A4452"/>
+<polyline points="1040,125 1040,390 350,390 350,431" fill="none" stroke="#2F8A57" stroke-width="2.5"/>
+<polygon points="350,440 344,427 356,427" fill="#2F8A57"/>
+<polygon points="1040,116 1046,129 1034,129" fill="#2F8A57"/>
+<text x="695" y="379.45" font-size="17" fill="#55606E" text-anchor="middle">WireGuard datagram</text>
+<polyline points="870,440 870,359" fill="none" stroke="#2457C5" stroke-width="2.5"/>
+<polygon points="870,350 876,363 864,363" fill="#2457C5"/>
+<text x="880" y="420.95" font-size="17" fill="#55606E">install, forget</text>
+<path d="M80 660H366L380 674V740H80Z" fill="#FDFCF9" stroke="#2457C5" stroke-width="2"/>
+<path d="M366 660V674H380" fill="none" stroke="#2457C5" stroke-width="2"/>
+<text x="230" y="697.4" font-size="20" font-weight="700" fill="#1D47A6" text-anchor="middle">state pull</text>
+<text x="230" y="717.6" font-size="16" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#55606E" text-anchor="middle">bridge.relay, peers</text>
+<rect x="450" y="660" width="320" height="80" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="610" y="705.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">RelayReconcileHandler</text>
+<rect x="840" y="660" width="260" height="80" rx="8" fill="#FDFCF9" stroke="#2F8A57" stroke-width="2"/>
+<text x="970" y="705.95" font-size="17" font-weight="700" font-family="'IBM Plex Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" fill="#1E6B40" text-anchor="middle">Configure / Stop</text>
+<polyline points="380,700 441,700" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="450,700 437,706 437,694" fill="#3A4452"/>
+<polyline points="770,700 831,700" fill="none" stroke="#3A4452" stroke-width="2.5"/>
+<polygon points="840,700 827,706 827,694" fill="#3A4452"/>
 </svg>

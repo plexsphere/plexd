@@ -191,6 +191,28 @@ Common causes: no bridge of the entry is alive, the move's write failed, the bri
 
 A restarted plexd starts every shared subnet on the first bridge of its entry again, since the holder lives in memory only, and moves it on once that bridge's window passes without an answer while a standby answers.
 
+## A Linux relay forwards in the process
+
+```bash
+plexd logs | grep 'relay: kernel forwarding'          # Started, unavailable, attached, passes to the process, stopped
+plexd logs | grep 'relay: kernel session'              # Debug: sessions the kernel took or refused
+uname -r                                               # Linux 6.6 or newer is needed
+systemctl show plexd -p CapabilityBoundingSet          # Linux: whether the unit grants CAP_BPF
+sysctl net.ipv4.conf.plexd0.forwarding                 # The mesh interface's IPv4 forwarding flag
+```
+
+On Linux 6.6 or newer a relaying bridge forwards the transport datagrams of the sessions its relay placed in the kernel, through the eBPF program `relay_forward` at tcx ingress, and logs `relay: kernel forwarding started` with `listen_port` and `mesh_interface` each time the relay starts. Without that line, or after one of the lines below, the relay forwards every datagram in the plexd process. It relays as before, only slower and at a higher CPU cost: in the lab of 2026-11-26 a relayed pair got about 1.1 Gbit/s at 1.3 to 1.5 cores in the process, and 1.9 Gbit/s through the kernel. See [Kernel Forwarding](../reference/bridge/nat-relay.md#kernel-forwarding).
+
+Common causes: plexd lacks `CAP_BPF`, the mesh interface did not exist when the relay started, the kernel is older than 6.6 or lacks tcx, forwarding is off on the mesh interface, or a read of the kernel's table failed.
+
+- `relay: kernel forwarding unavailable, forwarding in the process` at Info, once per start of the relay, names in its `error` why the kernel path did not start. The relay tries again only when it starts again: when a pull disables and enables it, moves it to another `listen_port`, or plexd restarts.
+- An `error` of that line that contains `map create: operation not permitted`, such as `bridge: relay: kernel forwarding: relaybpf: load: map relay_sessions: map create: operation not permitted (MEMLOCK may be too low, consider rlimit.RemoveMemlock)`, means plexd lacks `CAP_BPF`. The MEMLOCK hint comes from the eBPF library and does not apply on the 6.6 or newer kernels the kernel path needs, so raising `RLIMIT_MEMLOCK` changes nothing. A self-upgrade replaces the binary alone and keeps the unit an earlier release wrote, which lacks the capability. Run `plexd install` to write the unit again, or add the `bpf.conf` drop-in from [Unit file directives](../reference/deployment/bare-metal-packaging.md#unit-file-directives), then run `systemctl daemon-reload` and `systemctl restart plexd`. A Kubernetes pod needs `BPF` added to its capabilities, which the shipped DaemonSet does not add (see [Kubernetes Deployment](../reference/deployment/kubernetes-deployment.md#daemonset-configuration)).
+- An `error` that starts with `bridge: relay: kernel forwarding: mesh interface "plexd0":` means that, when the relay started, the host had no interface of the name it gives, the `wireguard.interface_name` bridge setup ran with. The mesh interface was removed or renamed after plexd started; `ip link show plexd0` shows whether it exists. Restart plexd, which creates the interface again before the relay starts.
+- An `error` that contains `relaybpf: tcx attach probe:` means the kernel has no tcx: it is older than Linux 6.6, which `uname -r` shows, or lacks tcx. Such a bridge relays in the process until it runs a kernel with tcx.
+- `relay: kernel forwarding passes datagrams to the process, forwarding is off on the mesh interface` at Warn, with `mesh_interface`, at most once a minute, means the program's route lookups through the mesh interface fail, so every transport datagram passes to the process. Something wrote 0 to `net.ipv4.ip_forward` or `net.ipv4.conf.all.forwarding`, which writes the flag of every interface, and with it reset the mesh interface's flag that bridge setup turned on: `sysctl net.ipv4.conf.plexd0.forwarding` reads 0. Restart plexd, whose bridge setup writes the flag again, or set it back with `sudo sysctl -w net.ipv4.conf.plexd0.forwarding=1`. The line stops once the counter `fib_fwd_disabled` stops growing. For IPv6 the kernel path sets `net.ipv6.conf.plexd0.forwarding` itself, and `relay: ipv6 forwarding flag not set on the mesh interface` at Debug names a read or write of that flag that failed.
+- `relay: kernel forwarding stopped, forwarding in the process` at Warn, with `error`, means a read of the kernel's table, or taking a session out of it, failed, and the relay closed the kernel path. The `error` names the call, such as `relaybpf: read sessions:`. The relay goes on in the process until it starts again, which a restart of plexd brings about.
+- With the kernel path started, a pair whose datagrams still pass through the process shows up at Debug (`PLEXD_LOG_LEVEL=debug`). `relay: kernel session not installed` names why the kernel refused the pair's sessions: `address families differ` when the two peers reach the relay over IPv4 and IPv6, `link-local address`, or `is not Ethernet` for a route through a PPP, tun or WireGuard interface. Such a pair stays in the process by design. `relay: kernel forwarding counters` after every sweep counts where the datagrams went.
+
 ## A moved node does not follow its new mesh address
 
 ```bash

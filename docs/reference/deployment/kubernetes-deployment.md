@@ -474,7 +474,7 @@ Consumer RBAC roles:
 | `priorityClassName`   | `system-node-critical`         | Ensures scheduling on resource pressure |
 | `tolerations`         | `operator: Exists`             | Run on all nodes including control plane |
 | `readOnlyRootFilesystem` | `true`                      | Security hardening                    |
-| Capabilities          | `NET_ADMIN`, `NET_RAW`         | WireGuard interface management and the nftables policy chain. Without `NET_ADMIN`, `plexd up` fails its firewall pre-flight and exits before registering |
+| Capabilities          | `NET_ADMIN`, `NET_RAW`         | WireGuard interface management and the nftables policy chain. Without `NET_ADMIN`, `plexd up` fails its firewall pre-flight and exits before registering. The shipped DaemonSet does not add `BPF`: a relaying bridge pod forwards in the kernel only with `BPF` added to its capabilities, and without it the relay forwards in the process (see [Kernel Forwarding](../bridge/nat-relay.md#kernel-forwarding)) |
 
 ### Environment variables
 
