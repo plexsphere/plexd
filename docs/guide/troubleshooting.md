@@ -100,6 +100,7 @@ A node behind a router that translates ports peers with every publicly reachable
 ```bash
 plexd policies        # Check active policies
 plexd logs | grep mtu # Check the mesh MTU
+sudo nft list table ip plexd-mss # Linux: the MSS clamp of forwarded TCP
 ```
 
 Network policies may be blocking traffic. Verify that the desired communication is allowed by the policies configured in the control plane.
@@ -134,6 +135,18 @@ level=INFO msg="wireguard interface configured" component=wireguard interface=pl
 - A later change logs `wireguard: mesh mtu lowered` or `wireguard: mesh mtu raised` with `old_mtu`, `mtu` and `path_mtu`. A round without an answer logs `wireguard: mtu probe inconclusive, keeping the current mtu`, and an uplink too small even for the 1280-byte floor logs `wireguard: uplink carries less than the mesh minimum mtu`.
 
 The probe measures only the outbound IPv4 path to the STUN servers. It cannot see a bottleneck on a path to a peer that the STUN traffic does not cross, and it gets no answer where UDP to the STUN servers is blocked. In those cases set `wireguard.mtu` to the path MTU minus 80, for example `1372` for a 1452-byte path, and restart plexd. A positive value pins the MTU and turns detection off. See [MTU detection](../reference/networking/wireguard.md#mtu-detection).
+
+If TCP between hosts behind two nodes stalls or runs slow in one direction while the nodes themselves connect fine, look at the clamp of forwarded TCP. The end hosts negotiate their MSS between their own LANs, so every node lowers the MSS of the TCP SYNs it forwards across its mesh interface to its mesh MTU minus 40, in both directions. Just before the `wireguard interface configured` line, and whenever the MTU changes, plexd logs the value:
+
+```text
+level=INFO msg="wireguard: forwarded tcp mss clamped" component=wireguard interface=plexd0 mss=1332 mtu=1372
+```
+
+A line for a changed value also carries `old_mss`. On Linux `sudo nft list table ip plexd-mss` shows the clamp itself: one rule for `iifname "plexd0"` and one for `oifname "plexd0"`, each ending in `tcp option maxseg size set <mss>`. The `counter packets` value of each rule counts the SYNs it lowered, since a rule matches only a SYN that announces more than the clamp. The rules sit on the forward hook, so the node's own connections never count. On macOS and Windows plexd clamps inside its own process and has no table to list.
+
+`wireguard: forwarded tcp mss clamp failed` at Warn means the clamp is missing and the mesh carries TCP as it did without one. A node without `CAP_NET_ADMIN` logs it with `error="wireguard: clamp mss on \"plexd0\": netlink receive: operation not permitted"`. The next MTU probe round tries again; with `wireguard.mtu` pinned or MTU detection off no round runs, and a restart tries again.
+
+Each node clamps only to its own size, so a connection fits both uplinks only when the node behind the smaller one clamps. A far node that runs an older plexd, without the clamp, leaves forwarded TCP towards it unclamped: uploads towards a site behind a smaller uplink slow down where the path fragments, and stall where it drops fragments, while the other direction works. Upgrade plexd on that node. The clamp covers TCP alone, and a connection keeps the MSS it opened with, so reopen connections that were open before the MTU went down. See [Forwarded TCP](../reference/networking/wireguard.md#forwarded-tcp).
 
 ## A mesh edge shows no round-trip time
 

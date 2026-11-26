@@ -103,6 +103,26 @@ type AddressReplacer interface {
 
 `NetlinkController`, `DarwinController` and `WindowsController` implement it; the userspace backend does not, because addressing stays with the per-OS controller. A call that failed halfway succeeds when it is repeated with the same arguments: each implementation tolerates an address that is already there on an add, and one that is not there on a remove. Both CIDRs have to be IPv4 and of one length, or the call fails with `wireguard: replace address: <old> and <new> are not of one length`, `wireguard: replace address: <cidr> is not an IPv4 CIDR` or `wireguard: replace address: parse "<cidr>": <cause>`. A pair that names one address changes nothing, because removing the old address would remove the new one. The manager's [`Readdress`](#mesh-address-changes) is the only caller; see [Replacing the address on each platform](#replacing-the-address-on-each-platform) for the calls each controller makes.
 
+### MSSClamper
+
+Lowering the MSS of the TCP connections that cross an interface is a fourth optional interface, which the manager type-asserts on the controller as it does `AddressReplacer`, so no test double of `WGController` has to grow.
+
+```go
+// MSSClamper is implemented by controllers that can lower the MSS option of
+// the IPv4 TCP SYN packets that cross the interface, in both directions.
+// It is optional, as AddressReplacer is. Both methods are idempotent.
+type MSSClamper interface {
+    // ClampMSS lowers every such MSS above mss to mss. A second call replaces
+    // the value of the first.
+    ClampMSS(name string, mss int) error
+    // UnclampMSS removes the clamp. An interface that has none, or does not
+    // exist, returns nil.
+    UnclampMSS(name string) error
+}
+```
+
+`NetlinkController`, `DarwinController` and `WindowsController` implement it; the userspace backend does not. `NetlinkController` writes two nftables rules, and the macOS and Windows controllers set the value of a wrapper around the device wireguard-go reads and writes. Each `ClampMSS` refuses an `mss` outside 1 to 65535 with `wireguard: clamp mss: invalid mss <n>` before it changes anything. Both methods are idempotent: a second `ClampMSS` replaces the value of the first instead of adding a second clamp, and `UnclampMSS` returns nil for an interface without a clamp. The manager is the only caller: `Setup` and every round of the MTU re-probe call `ClampMSS` with `ForwardMSS` of the mesh MTU, and `Teardown` calls `UnclampMSS`. See [Forwarded TCP](#forwarded-tcp) for the rule, the calls each controller makes and when the manager makes them.
+
 ## Userspace backend
 
 `UserspaceBackend` (`internal/wireguard/userspace.go`) runs wireguard-go devices inside the plexd process. It is the base of the macOS (utun) and Windows (Wintun) `WGController` implementations and, through those two controllers, of the bridge access and site-to-site controllers (`WGAccessController` and `WGVPNController` in `internal/bridge`), which wrap the platform's `WGController`. On Linux plexd stays on the kernel path through `NetlinkController`; the backend compiles and is tested there but is not wired in.
@@ -172,6 +192,7 @@ utun device created  component=wireguard interface=plexd0 utun=utun4
 | `ReplaceAddress` | `ifconfig utunN inet 10.0.0.9/16 10.0.0.9 alias`, then `ifconfig utunN inet 10.0.0.5 -alias`, then `route -n add -inet 10.0.0.0/16 -interface utunN`, then for each route through the utun that names 10.0.0.5, such as the on-link one, `route -n change -inet 10.0.0.0/16 -interface utunN -ifa 10.0.0.9`, or `route -n delete -inet -host <destination>` for a host route the kernel cloned (see [Replacing the address on each platform](#replacing-the-address-on-each-platform)) |
 | `SetMTU` | `ifconfig utunN mtu 1380` |
 | `SetInterfaceUp` | `ifconfig utunN up` |
+| `ClampMSS`, `UnclampMSS` | none; they set the value of the in-process MSS clamp |
 | `DeleteInterface` | none |
 
 A utun is point-to-point, so the `inet` form takes the destination address after the local one, and the alias installs a host route only. Linux gets the route for the whole prefix implicitly when the address is added, so `ConfigureAddress` adds it here explicitly; otherwise every packet for a mesh peer would leave through the default route. A `/32` or `/128` needs no route, since the alias already installed it. A peer's allowed IPs beyond the address prefix, its accepted [routed subnets](#routed-subnets), get their routes from the manager through its `PeerRouter`, the platform's route controller, as they do on Linux.
@@ -181,6 +202,8 @@ A utun is point-to-point, so the `inet` form takes the destination address after
 `DeleteInterface` runs no command: closing the device closes the tun, and the kernel then destroys the `utunN` with its addresses and routes.
 
 The device starts at wireguard-go's `device.DefaultMTU` of 1420, the same value the Linux kernel gives a WireGuard link. With a `Config.MTU` of `0`, 1420 is the starting value on both platforms, and [MTU detection](#mtu-detection) can lower it through the `SetMTU` command above.
+
+wireguard-go reads and writes the utun through an MSS clamp, an `mssClampTUN` that `CreateInterface` wraps around the device before `UserspaceBackend.CreateDevice` and records under the configured name, and that `DeleteInterface` forgets. It clamps nothing until `ClampMSS` sets a value, and `UnclampMSS` sets it back to 0. `ClampMSS` for a name the controller does not know returns `wireguard: clamp mss: file does not exist`, which wraps `os.ErrNotExist`, and `UnclampMSS` returns nil for it. The bridge's user access and site-to-site controllers are `DarwinController`s too, so their devices get a clamp as well, which stays at 0, because only the mesh manager calls `ClampMSS`. `ClampMSS` logs `mss clamp configured` at `debug` with `interface` and `mss`, without `utun`. See [Forwarded TCP](#forwarded-tcp).
 
 ## Windows controller
 
@@ -214,6 +237,7 @@ The adapter is recorded before the wait starts, so the wait runs outside the con
 | `ReplaceAddress` | `CreateUnicastIpAddressEntry` for the new address, then `DeleteUnicastIpAddressEntry` for the old one; no route call (see [Replacing the address on each platform](#replacing-the-address-on-each-platform)) |
 | `SetMTU` | `SetIpInterfaceEntry` for IPv4 and IPv6, then `ForceMTU` on the running device |
 | `SetInterfaceUp` | nothing |
+| `ClampMSS`, `UnclampMSS` | set the value of the in-process MSS clamp; no API call (see [The mesh rewriter](#the-mesh-rewriter)) |
 | `DeleteInterface` | nothing beyond closing the device |
 
 The address carries its own prefix length, and Windows installs the on-link route for that prefix itself, the way Linux does when an address is added. macOS is the exception that needs the route added by hand. A peer's allowed IPs beyond the address prefix, its accepted [routed subnets](#routed-subnets), get their routes from the manager through its `PeerRouter`, the platform's route controller, as they do everywhere else. An address already on the adapter is reported as `ERROR_OBJECT_ALREADY_EXISTS`, which the controller treats as success.
@@ -232,9 +256,11 @@ Windows Defender Firewall may drop unsolicited inbound handshakes on the listen 
 func (c *WindowsController) SetMeshRewriter(r *MeshRewriter)
 ```
 
-`SetMeshRewriter` hands the controller a [mesh rewriter](#in-process-mesh-source-rewrite) and is called before `CreateInterface`. With a rewriter, `createAdapter` hands wireguard-go `r.Wrap(name, tdev)` in place of the Wintun tun: it wraps after it has taken the adapter's LUID and set the default MTU, and before `UserspaceBackend.CreateDevice`, so the LUID and `ForceMTU` stay the raw device's. Without a rewriter nothing changes.
+`SetMeshRewriter` hands the controller a [mesh rewriter](#in-process-mesh-source-rewrite) and is called before `CreateInterface`. With a rewriter, `createAdapter` puts `r.Wrap(name, tdev)` in place of the Wintun tun: it wraps after it has taken the adapter's LUID and set the default MTU, and before `UserspaceBackend.CreateDevice`, so the LUID and `ForceMTU` stay the raw device's. Without a rewriter nothing changes.
 
-`plexd up` builds the rewriter with `newMeshRewriter` only on a Windows node in bridge mode that does not opt out of both user access and site-to-site tunnels, and sets it on all three `WindowsController`s: the mesh controller's, before the mesh device is created, the user access controller's and the site-to-site controller's. Every other node hands wireguard-go the raw tun, so it pays no copy per packet.
+`plexd up` builds the rewriter with `newMeshRewriter` only on a Windows node in bridge mode that does not opt out of both user access and site-to-site tunnels, and sets it on all three `WindowsController`s: the mesh controller's, before the mesh device is created, the user access controller's and the site-to-site controller's. Every other node leaves the rewriter's wrapper out, so it pays no copy per packet.
+
+`createAdapter` then wraps what wireguard-go is to run over, the rewriter's wrapper or the raw tun, in an MSS clamp, an `mssClampTUN`, and hands that to `UserspaceBackend.CreateDevice`; the clamp rewrites in place and copies nothing. The clamp sits between wireguard-go and the rewriter, not inside it: what the rewriter translates from a bridge device into the mesh reaches the mesh device's wireguard-go through the rewriter's queue, and a mesh peer's reply goes from the mesh device's `Write` into another device's queue, so neither passes the Wintun device, and the mesh device's clamp sees both. `wintunAdapter` records the clamp beside the LUID and the MTU hook. `ClampMSS` sets its value and `UnclampMSS` sets it back to 0. `ClampMSS` for a name the controller does not know returns `wireguard: clamp mss: file does not exist`, which wraps `os.ErrNotExist`, and `UnclampMSS` returns nil for it. The devices of the user access and site-to-site controllers get a clamp too, which stays at 0, because only the mesh manager calls `ClampMSS`. `ClampMSS` logs `mss clamp configured` at `debug` with `interface` and `mss`. See [Forwarded TCP](#forwarded-tcp).
 
 `controller_windows_test.go` checks that `AddMeshSourceRewrite` between two interfaces of a controller with `SetMeshRewriter` returns nil, that the LUID and the MTU hook stay the raw adapter's, and that deleting an interface closes its wrapper and the rewriter forgets it; for the interfaces of a controller without a rewriter it returns `the mesh interface is no device of this process`.
 
@@ -452,8 +478,8 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 
 | Method          | Signature                                                                    | Description                                                    |
 |-----------------|------------------------------------------------------------------------------|----------------------------------------------------------------|
-| `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Chooses the MTU, probing the uplink when no MTU is pinned, then creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU when it is pinned or not 1420, brings up. See [Setup Sequence](#setup-sequence) |
-| `Teardown`      | `() error`                                                                   | Removes the routes of the [routed subnets](#routed-subnets) it programmed, then deletes the WireGuard interface |
+| `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Chooses the MTU, probing the uplink when no MTU is pinned, then creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU when it is pinned or not 1420, clamps the MSS of [forwarded TCP](#forwarded-tcp), brings up. See [Setup Sequence](#setup-sequence) |
+| `Teardown`      | `() error`                                                                   | Removes the [clamp of forwarded TCP](#forwarded-tcp) when one is programmed, then the routes of the [routed subnets](#routed-subnets) it programmed, then deletes the WireGuard interface |
 | `OSInterfaceName` | `() string`                                                                | The name the OS knows the interface by (`utunN` on macOS), else `Config.InterfaceName` |
 | `AddPeer`       | `(peer api.Peer) error`                                                      | Writes the peer with the first entry of its dial order and starts its endpoint selection; updates index |
 | `RemovePeer`    | `(publicKey []byte) error`                                                   | Removes peer by raw public key                                 |
@@ -474,7 +500,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `FailureDetection` | `() (time.Duration, bool)`                                                | The failure-detection time held, and `0, false` while none is. See [Failure detection time](#failure-detection-time) |
 | `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, or per pass of the [failure-detection time](#failure-detection-time) when that is shorter, until `ctx` is done. While a failure-detection time is held, each pass also watches the bridges of the [shared subnets](#the-bridge-watch) and moves a subnet off a dead bridge; see [Endpoint selection](#endpoint-selection) |
 | `SetPathMTUProbe` | `(probe func(context.Context) (int, error))`                              | Sets the function `Setup` and `RunMTUProbe` measure the uplink's path MTU with. Call it before `Setup`. See [MTU detection](#mtu-detection) |
-| `RunMTUProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the uplink again once per `interval` and lowers or raises the MTU to fit, until `ctx` is done; see [Probing again](#probing-again) |
+| `RunMTUProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the uplink again once per `interval` and lowers or raises the MTU to fit, and the [clamp of forwarded TCP](#forwarded-tcp) with it, until `ctx` is done; see [Probing again](#probing-again) |
 | `RunRTTProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the round-trip time to each connected peer once per `interval` and answers the peers' probes on UDP port 7911 of the mesh address, until `ctx` is done; `MeshPeerStats` reports the values, and the [bridge watch](#the-bridge-watch) writes its requests on the same socket. See [Round-trip probe](#round-trip-probe) |
 
 The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order). The package function `SendRelayProbe` (`dial.go`) is the sender `plexd up` passes to `SetRelayProbe`; see [Relay liveness probe](#relay-liveness-probe). The package function `FailureDetectionDispatchHandler` (`handler.go`) is the [dispatch handler](../core/reconciliation.md#dispatchhandler) `plexd up` registers to hand each pull's `failure_detection` block to `SetFailureDetection`; see [Failure detection time](#failure-detection-time).
@@ -934,7 +960,7 @@ The cap keeps a node on a jumbo-frame uplink at the 1420 every node had before d
 | A probe is set and returns an error | 1420. Logs `wireguard: mtu probe inconclusive, using the default mtu` with the error | `default` |
 | No probe is set | 1420 | `default` |
 
-`SetMTU` keeps its place between `ConfigureAddress` and `SetInterfaceUp`. It runs when `Config.MTU > 0` or when the chosen MTU is not 1420. All three controllers create the device at 1420, so a 1420 result needs no call, and a node without a pinned MTU on a 1500-byte uplink makes the same controller calls it made before detection. A `SetMTU` error fails `Setup` with `wireguard: setup: <cause>`. The `wireguard interface configured` line carries `mtu`, `mtu_source` and, with `mtu_source=probe`, the measured `path_mtu`.
+`SetMTU` keeps its place between `ConfigureAddress` and `SetInterfaceUp`. It runs when `Config.MTU > 0` or when the chosen MTU is not 1420. All three controllers create the device at 1420, so a 1420 result needs no call, and a node without a pinned MTU on a 1500-byte uplink makes the same controller calls it made before detection, apart from the [clamp of forwarded TCP](#forwarded-tcp) that follows the MTU. A `SetMTU` error fails `Setup` with `wireguard: setup: <cause>`. The `wireguard interface configured` line carries `mtu`, `mtu_source` and, with `mtu_source=probe`, the measured `path_mtu`.
 
 Startup waits for the probe round. On a healthy uplink that is one round trip to the STUN servers. It takes up to 2 s only while some probe goes unanswered: on a black-holed uplink, or when no STUN server is reachable.
 
@@ -963,7 +989,101 @@ A lower MTU applies at once, because the uplink already loses packets at the cur
 
 A failed `SetMTU` logs `wireguard: mesh mtu change failed`, keeps the MTU last programmed, and clears the pending raise. The next round retries a failed lowering, because a target below the MTU applies at once. A failed raise starts the two-round wait over: the next round records the raise again, and the one after writes it. A successful `SetMTU` records the new MTU and clears the pending raise.
 
-Only `Setup` touches the MTU last programmed and the pending raise, and after it returns only the one `RunMTUProbe` goroutine does, so they need no lock. `SetMTU` does not take the mutex that serializes peer writes.
+Every round whose probe measured, and that ended before `ctx` was done, ends with the [clamp of forwarded TCP](#forwarded-tcp): it clamps to `ForwardMSS` of the MTU it leaves recorded, after `SetMTU` on a change. That holds also when the MTU stays, when a raise is pending and when `SetMTU` failed. A round calls `ClampMSS` only when the clamp is not yet at that value, so it costs no call while the clamp is current and tries a clamp that failed before again. The last two rows of the table make no clamp call.
+
+Only `Setup` touches the MTU last programmed and the pending raise, and after it returns only the one `RunMTUProbe` goroutine does, so they need no lock. The MSS last clamped is an atomic value, because `Teardown` reads it while that goroutine can still run. `SetMTU` does not take the mutex that serializes peer writes.
+
+#### Forwarded TCP
+
+The mesh MTU fits the node's own uplink, and TCP between two nodes fits both of them, because each node announces the MSS of its own interface. TCP a node forwards does not: the end hosts negotiate their MSS between their own LANs, usually 1460 on 1500-byte links. A host behind a node with a mesh MTU of 1420 then sends 1380-byte segments towards a host behind a node whose mesh MTU is 1372, the encrypted datagrams exceed that node's 1452-byte uplink, and the path fragments or drops them. The sending node's path MTU discovery teaches its host only the sending node's MTU, not the smaller one of the far node. Every node therefore clamps the MSS of the TCP it forwards across its mesh interface ([#250](https://github.com/plexsphere/plexd/issues/250)).
+
+```go
+// tcpIPv4Overhead is the IPv4 header (20) plus the TCP header (20).
+const tcpIPv4Overhead = 40
+
+// minForwardMSS is the MSS a host assumes when a SYN carries none (RFC 9293, 3.7.1).
+const minForwardMSS = 536
+
+func ForwardMSS(mtu int) int
+```
+
+A node lowers the MSS option of every IPv4 TCP SYN it forwards across its mesh interface, a SYN-ACK included, to `ForwardMSS` of its own mesh MTU when the SYN announces more. It does so in both directions, for what enters the mesh and for what leaves it. `ForwardMSS` is the MTU minus 40, the IPv4 and the TCP header, and never less than 536:
+
+| Mesh MTU | Clamp |
+|---|---|
+| 1420 | 1380 |
+| 1412 (PPPoE) | 1372 |
+| 1372 (DS-Lite over PPPoE) | 1332 |
+| 1280, the floor of detection | 1240 |
+| 576 and below | 536 |
+
+Detection never programs less than 1280, so the floor of 536 applies only to a `wireguard.mtu` pinned at 576 or less. Only IPv4 is clamped, because the mesh carries no IPv6: a peer's mesh IP and its [routed subnets](#routed-subnets) must be IPv4, so its allowed IPs hold no IPv6 network. There is no config key. The clamp only ever lowers an MSS, and an MSS above the mesh MTU minus 40 cannot cross the mesh interface unfragmented anyway. It follows `wireguard.mtu` when that pins the MTU, and the MTU detection rounds when they change it.
+
+No node knows the far node's mesh MTU, and none needs to. A forwarded connection passes the node behind the smaller uplink at least once in each direction: the SYN leaves the mesh at one node and enters it at the other, and so does the SYN-ACK. Each node lowers what crosses it to its own clamp, and a rule never raises an MSS another node lowered, so both end hosts learn the smaller of the two nodes' sizes. The same holds when one node is itself an end of the connection, such as a node that talks to a host behind a bridge with a smaller uplink: the bridge lowers the node's SYN and the SYN-ACK of its host.
+
+Every node clamps, not only a bridge. A node forwards into the mesh for a bridged subnet, a user access provider, a site-to-site tunnel, and for containers on a Docker or Kubernetes host. On a node that forwards nothing the clamp never matches.
+
+On Linux, `NetlinkController.ClampMSS` writes the table `ip plexd-mss` with the chain `forward`, in one batch: the table, the chain, a flush of the chain and two rules, one for each direction. For `plexd0` at a mesh MTU of 1372, `sudo nft list table ip plexd-mss` prints:
+
+```
+table ip plexd-mss {
+	chain forward {
+		type filter hook forward priority mangle; policy accept;
+		iifname "plexd0" tcp flags & (syn | rst) == syn tcp option maxseg size > 1332 counter packets 0 bytes 0 tcp option maxseg size set 1332
+		oifname "plexd0" tcp flags & (syn | rst) == syn tcp option maxseg size > 1332 counter packets 0 bytes 0 tcp option maxseg size set 1332
+	}
+}
+```
+
+- The rules sit in a table of their own, as the bridge NAT and the mesh source rewrite do (see [Table Separation](../bridge/netlink-route-controller.md#table-separation)). The policy table cannot hold them: a node with `policy.enabled: false` has none, and every node clamps.
+- The chain hooks forward, so the rules leave the node's own connections alone: their MSS already comes from the interface MTU. A forwarded packet on another interface fails the first comparison of each rule, and one on the mesh interface pays the protocol and flag comparisons; only a SYN reads its options.
+- A rule matches only a SYN whose MSS is above the clamp, so its counter counts the SYNs it lowered. A SYN without the option is left alone and keeps the 536 a host assumes then, and a SYN with RST set is left alone too. The kernel updates the TCP checksum when it writes the option.
+- The rules need no kernel module beyond the one the policy table needs: `nft_exthdr`, which reads and writes the TCP option, is part of `nf_tables`.
+- The flush makes a second call replace the two rules of the first instead of adding two more, and makes the call rewrite a table that a killed process left behind. The table holds the clamp of one interface, the mesh interface, because only the mesh manager clamps.
+- `UnclampMSS` lists the IPv4 tables and deletes `plexd-mss` when it is there, as `RemoveNATMasquerade` deletes `plexd-nat`. A missing table returns nil.
+
+Its errors are `wireguard: clamp mss: invalid mss <n>`, before any netlink call, `wireguard: clamp mss: <cause>` when no netlink connection opens, `wireguard: clamp mss on "<name>": <cause>` when the kernel refuses the batch, and for the removal `wireguard: unclamp mss: <cause>`, `wireguard: unclamp mss: list tables: <cause>` and `wireguard: unclamp mss on "<name>": <cause>`. A process without `CAP_NET_ADMIN` gets `wireguard: clamp mss on "plexd0": netlink receive: operation not permitted`. A successful call logs `mss clamp configured` at `debug` with `interface` and `mss`, and a removal that deleted the table `mss clamp removed` with `interface`.
+
+On macOS and Windows every mesh packet passes through plexd's wireguard-go device, and plexd clamps there. The controller wraps the `tun.Device` it hands wireguard-go in an `mssClampTUN` (`internal/wireguard/mssclamp.go`), which lowers the MSS option of the IPv4 TCP SYNs that pass it in both directions: `Read` clamps each packet wireguard-go reads from the device, what the host sends into the mesh, and `Write` each packet wireguard-go writes to it, what arrives from a mesh peer. On macOS the wrapper sits between wireguard-go and the utun. On Windows it sits between wireguard-go and the [mesh rewriter](#the-mesh-rewriter) when there is one, so it also sees the packets the rewriter translates from and to the user access and site-to-site devices, which never pass the Wintun device. The wrapper sees every SYN that crosses the interface, those of the node's own connections included, which the Linux rule on the forward hook leaves alone. Every other method is the wrapped device's, so wireguard-go sees the device's MTU, name, events and batch size.
+
+- `ClampMSS` stores the value in the wrapper, and the next SYN that passes uses it. `UnclampMSS` stores 0, and at 0 the wrapper passes every packet unread. `Read` and `Write` load the value once per batch.
+- A packet is changed only when all of these hold: at least 20 bytes, IP version 4, a header length of 20 bytes or more that lies inside the packet, protocol 6, a fragment offset of 0, a TCP header of at least 20 bytes inside the packet, SYN set and RST clear, a data offset of 5 or more whose end lies inside the packet, and an option of kind 2 and length 4 whose value is above the clamp. The option walk stops at kind 0, steps over kind 1, skips any other kind by its length byte, an MSS option of another length included, and gives up without a change at a length below 2 or one that runs past the header.
+- The TCP checksum is updated incrementally (RFC 1624) over the 16-bit words the two bytes of the value fall in. A NOP in front of the option puts the value at an odd offset, where its bytes belong to two words, and both are updated. The wrapper allocates nothing and never changes a packet's length.
+
+Linux does not use the wrapper. A Linux tun can hand wireguard-go packets with a partial checksum, which covers only the pseudo header and which an incremental update would corrupt, and Linux runs the kernel rule above.
+
+The manager writes the clamp at these points, through `MSSClamper` (see [MSSClamper](#mssclamper)):
+
+- `Setup` clamps to `ForwardMSS` of the MTU it chose after `ConfigureAddress` and any `SetMTU`, and before `SetInterfaceUp`, so no SYN crosses the interface unclamped. This holds for an MTU from the config, from the probe and from the default.
+- Every [probe round](#probing-again) that measured and ended before `ctx` was done clamps to `ForwardMSS` of the MTU it leaves recorded, after `SetMTU` on a change. It calls `ClampMSS` only when the clamp does not hold that value yet, and a failed call leaves the recorded value as it was, so the next round tries again.
+- `Teardown` calls `UnclampMSS` first, before it removes the peer routes and deletes the interface, and only when a clamp is programmed. A manager whose `Setup` failed before the clamp, or whose every `ClampMSS` failed, makes no call.
+
+A clamp that cannot be programmed does not fail `Setup` or a round. The manager logs `wireguard: forwarded tcp mss clamp failed` at `warn`, keeps the MSS it recorded, and the mesh carries TCP as it did without a clamp. With a pinned `wireguard.mtu`, or without a probe, `RunMTUProbe` returns at once, so no round tries again, and the next start does. A failed `UnclampMSS` logs `wireguard: forwarded tcp mss clamp removal failed` at `warn` and stops nothing: `Teardown` still removes the peer routes, deletes the interface and returns the result of the delete. A controller without `MSSClamper` makes the manager skip all of this and log no clamp line.
+
+Measured on 2026-11-26 at commit 1147178 in a lab of five network namespaces (a host, node A, a router, node B and a host) in a Docker container started with `--privileged --network none`, Alpine 3.22 with `iperf3`, `wireguard-tools` and `nftables`, on Linux 6.8 with kernel WireGuard. Node A had a 1500-byte uplink and mesh MTU 1420, node B sat behind a 1452-byte link with mesh MTU 1372, and one host behind each had a 1500-byte LAN. Each run was one iperf3 TCP stream over 8 s, with the route caches flushed before it, and the path that drops fragments dropped them in B at `prerouting priority -450`. "Up" is towards the host behind B. The clamp was the nftables rule above, A at 1380 and B at 1332.
+
+| Clamp | Path | Up | Down | Fragments reassembled on B |
+|---|---|---|---|---|
+| none | fragments | 1.31 Gbit/s | 2.11 Gbit/s | 962,683 up, 0 down |
+| none | drops fragments | 0 bit/s | 2.10 Gbit/s | 0 |
+| A and B, each to its own | drops fragments | 2.00 Gbit/s | 2.03 Gbit/s | 0 |
+| only B | drops fragments | 1.99 Gbit/s | 2.06 Gbit/s | 0 |
+| only A | drops fragments | 0 bit/s | not run | 0 |
+| only B, A is the TCP endpoint | drops fragments | 1.79 Gbit/s | 2.07 Gbit/s | 0 |
+| none, A is the TCP endpoint | drops fragments | 0 bit/s | not run | 0 |
+
+With both clamps the host behind A saw `mss 1332` in the SYN-ACK: A's rule for 1380 did not raise what B had lowered. The row "only A" shows the one dependency: the node behind the smaller uplink has to run a plexd that clamps.
+
+The clamp has these limits:
+
+- Forwarded packets other than TCP are not covered. No node knows the far node's size, so a UDP or ICMP packet above the far mesh MTU is still fragmented or lost on the far uplink.
+- The clamp rewrites SYNs only, so a connection opened before a mesh MTU went down keeps its MSS until it is opened again.
+- A far node that runs a plexd without the clamp leaves forwarded TCP towards it as it was before, until it is upgraded (the row "only A"). Nothing on the sending side can make up for it.
+- A relay whose uplink is smaller than both peers' is not covered: the relay forwards encrypted datagrams and takes no part in the TCP handshake.
+- The MTU of the bridge's access and site-to-site interfaces stays unsized (see the [limits of MTU detection](#limits)). TCP from those interfaces into the mesh is clamped like any other forwarded TCP.
+- A `plexd-mss` table that a killed process left behind stays until the next start, whose `ClampMSS` rewrites it; nothing else removes it. A probe round that passed its check of `ctx` just before shutdown can write the table again after `Teardown` removed it, in the same window in which it can still call `SetMTU`. That table names an interface that no longer exists, matches nothing, and the next start replaces it.
+
+`TestForwardMSS` and the manager tests in `mtu_test.go` cover the rule and when the manager clamps. `mssclamp_test.go` covers the wrapper, the packet checks and the checksum, with `FuzzClampSYN`, on Linux, macOS and Windows. `mss_linux_test.go` compares the rule's expressions and covers the range check and the unprivileged errors, `controller_darwin_test.go` and `controller_windows_test.go` the wrapper's wiring, and on Windows that the clamp wraps the rewriter's wrapper. `TestNetlinkController_RealClampMSS` proves on a real kernel that the rules lower the MSS of forwarded SYNs in both directions; it runs in the privileged Linux step of the [CI Workflow](../development/ci-workflow.md). The Docker and systemd e2e suites check the log line, and the systemd suite the table and its counter (see [Systemd E2E Test](../development/systemd-e2e-test.md#_17-user-access-through-a-bridge)).
 
 #### Turning detection off
 
@@ -974,7 +1094,7 @@ Only `Setup` touches the MTU last programmed and the pending raise, and after it
 
 - WireGuard has one MTU per interface, so peers on the same LAN get the reduced MTU too.
 - The probe measures the path to the STUN servers over IPv4, in the outbound direction. An IPv6-only node gets an inconclusive probe and keeps 1420. A bottleneck on a path the STUN traffic does not cross stays unseen; pin the MTU with `wireguard.mtu` there.
-- A peer keeps its own MTU. TCP over the mesh fits in both directions, because the lowered side announces the smaller MSS. Non-TCP packets above the reduced size that the far side sends can still be lost.
+- A peer keeps its own MTU. TCP between two nodes fits in both directions, because the lowered side announces the smaller MSS, and TCP a node forwards fits because every node [clamps the MSS of forwarded TCP](#forwarded-tcp) to its own mesh MTU, as long as the far node runs a plexd that clamps too. A forwarded connection opened before the MTU went down keeps its MSS. Non-TCP packets above the reduced size that the far side sends or forwards can still be lost.
 - Only the mesh interface is sized. The bridge access and site-to-site interfaces do not carry mesh traffic over the uplink the probe measures.
 
 #### MTU detection log lines
@@ -992,6 +1112,11 @@ All carry `component=wireguard`.
 | `Debug` | `wireguard: higher mesh mtu seen, raising when the next probe agrees` | `mtu`, `raise_to`, `path_mtu` | A round asked for a raise |
 | `Warn` | `wireguard: mtu probe inconclusive, keeping the current mtu` | `mtu`, `error` | A round's probe failed |
 | `Warn` | `wireguard: mesh mtu change failed` | `old_mtu`, `mtu`, `error` | A round's `SetMTU` failed |
+| `Info` | `wireguard: forwarded tcp mss clamped` | `interface`, `mss`, `mtu`, `old_mss` (only when a clamp was replaced) | `Setup` or a round programmed the [clamp of forwarded TCP](#forwarded-tcp), or changed its value |
+| `Warn` | `wireguard: forwarded tcp mss clamp failed` | `interface`, `mss`, `mtu`, `error` | `ClampMSS` failed in `Setup` or a round; the next round tries again |
+| `Warn` | `wireguard: forwarded tcp mss clamp removal failed` | `interface`, `error` | `UnclampMSS` failed in `Teardown` |
+
+The controllers log `mss clamp configured` at `debug` with `interface` and `mss`, and `NetlinkController` logs `mss clamp removed` at `debug` with `interface` when it deleted the table.
 
 `plexd up` itself logs `mesh mtu detection disabled by nat.enabled` at `info` when `nat.enabled` is false and `wireguard.mtu` is 0.
 
@@ -1053,8 +1178,9 @@ if err := mgr.Teardown(); err != nil {
 2. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key. On Linux the kernel keeps a WireGuard link when the process that made it ends without its teardown, as a killed or crashed plexd does. `NetlinkController` therefore deletes a WireGuard link that already holds the name, with its addresses, routes and peers, creates the interface afresh and logs it at `warn`. A link of another type that holds the name fails the create with `wireguard: create interface: file exists: a <type> link holds the name <name>`
 3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, whose allowed IPs start with `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 4. `SetMTU(name, mtu)` — only if `Config.MTU > 0` or the chosen MTU is not 1420, the MTU every controller creates the device with
-5. `SetInterfaceUp(name)` — bring the interface up
-6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix), and the identity's mesh IP, which the [round-trip probe](#round-trip-probe) binds (the zero address when it does not parse). `Setup` records both once; afterwards only [`Readdress`](#mesh-address-changes) replaces the mesh IP, and nothing replaces the prefix
+5. `ClampMSS(name, ForwardMSS(mtu))` — only when the controller implements [`MSSClamper`](#mssclamper): clamp the MSS of forwarded TCP to the chosen MTU minus 40, so no SYN crosses the interface unclamped. A failed call is logged at `warn` and `Setup` goes on (see [Forwarded TCP](#forwarded-tcp))
+6. `SetInterfaceUp(name)` — bring the interface up
+7. Record the address's masked prefix as the [mesh prefix](#mesh-prefix), and the identity's mesh IP, which the [round-trip probe](#round-trip-probe) binds (the zero address when it does not parse). `Setup` records both once; afterwards only [`Readdress`](#mesh-address-changes) replaces the mesh IP, and nothing replaces the prefix
 
 The identity's mesh IP is the one `identity.json` holds: the address registration handed out, or the last one the [mesh address handler](#the-dispatch-handler) committed there after a state pull moved the node. A restart therefore brings the interface up with the last committed address, and a pull that carries another one moves the node again.
 
@@ -1068,7 +1194,7 @@ The identity's mesh IP is the one `identity.json` holds: the address registratio
 | `ConfigurePeers`  | Logged at error, continues       | Returns context error      |
 | `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
 | `RunEndpointSelection` | A failed switch or relay re-dial is logged at warn and the pass goes on; the next re-dial, one relay hold later, dials the relay after the one that failed. A failed move back is logged at warn too, and the next pass tries the same relay again. A failed write of a [direct retry](#direct-retry)'s entry is logged at warn: the next step, one window later, tries the entry after it, and a retry that a change of the local networks starts is not tried again for that change. A failed probe send is logged at warn, then at debug while it keeps failing, and takes no verdict: the next probe follows one trial later, or on the next pass under a [failure-detection time](#failure-detection-time). A failed read of the local networks is logged at warn, then at debug while it keeps failing, and the next read follows 30 s later. A failed move of a [shared subnet](#the-bridge-watch) is logged at warn and joined into the pass's error, and the next pass tries it again; a failed stimulus is logged at debug and takes no verdict | Returns nil |
-| `RunMTUProbe`     | A failed probe or `SetMTU` is logged at warn. The next round probes again and retries a failed lowering; a failed raise starts the two-round wait over | Returns nil |
+| `RunMTUProbe`     | A failed probe, `SetMTU` or `ClampMSS` is logged at warn. The next round probes again and retries a failed lowering and a failed clamp; a failed raise starts the two-round wait over | Returns nil |
 | `RunRTTProbe`     | A failed listen, device read or send is logged at warn, a repeated failed listen or send at debug, and the next round tries again. A failed read of the socket or a failed answer is logged at debug and the reader reads on; ten failed reads in a row close the socket, and the next round listens again. A controller that cannot read peer stats ends the probe, which returns nil. See [Round-trip probe](#round-trip-probe) | Returns nil |
 | `Readdress`       | A refused call returns an error wrapping `ErrReaddressUnsupported` or `ErrMeshAddressInvalid`, and a failed replace returns the controller's error behind `wireguard: readdress:`; each leaves the mesh IP as it was. A peer route that fails to come back is logged at warn and added again by the next run of the reconcile handler, which runs only for a pull that differs from the stored snapshot. See [Mesh address changes](#mesh-address-changes) | — |
 
@@ -1711,7 +1837,7 @@ endpoint on the device.
 
 ### Graceful Shutdown
 
-Call `Teardown()` on context cancellation to remove the peer routes and the WireGuard interface:
+Call `Teardown()` on context cancellation to remove the [clamp of forwarded TCP](#forwarded-tcp) when one is programmed, then the peer routes and the WireGuard interface:
 
 ```go
 <-ctx.Done()
