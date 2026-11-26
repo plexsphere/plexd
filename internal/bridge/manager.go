@@ -204,6 +204,21 @@ func (m *Manager) Relay() *Relay {
 	return m.relay
 }
 
+// EnableRelayKernelForwarding lets the relay forward the transport datagrams
+// of the sessions it placed in the kernel, through the mesh interface Setup
+// recorded, where the platform has a kernel path. Without local relay consent
+// there is no relay and it does nothing. plexd up calls it after Setup and
+// before the reconcile loop starts, so the first Configure already tries the
+// kernel path. Setup does not call it, so the manager tests that set
+// RelayEnabled never load a program into the kernel of a developer who runs
+// them as root.
+func (m *Manager) EnableRelayKernelForwarding() {
+	if m.relay == nil {
+		return
+	}
+	m.relay.useKernel(m.meshIface)
+}
+
 // RelayStatusTracker returns the tracker RelayReconcileHandler records the
 // relay's state on and the RelayStatusReporter reads. It is never nil, with or
 // without local consent, and Teardown leaves it as it is: the reporter sends
