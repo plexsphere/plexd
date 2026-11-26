@@ -71,7 +71,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Creating network namespaces and loading nftables rules need root, so
-      # ten of the eleven Linux tests against the real kernel skip in the
+      # eleven of the twelve Linux tests against the real kernel skip in the
       # unprivileged run above. They build their namespaces, links and TUN
       # devices themselves and leave the runner's own links and ruleset alone.
       # The traffic test TestNftablesController_RealTraffic runs the same
@@ -118,9 +118,20 @@ jobs:
       # wmem_max cap. It shares the command to run as root, which proves that
       # SO_RCVBUFFORCE and SO_SNDBUFFORCE give the relay socket 7 MiB each way
       # past net.core.rmem_max and wmem_max.
+      # The relay kernel test TestRelayKernel_Real shares the gate. It builds
+      # two nodes with kernel WireGuard links and, between them, a relay
+      # namespace with forwarding off, and loads the relay's eBPF program
+      # there. It proves that the program forwards the datagrams of a session
+      # the relay placed, follows a node that moved to another port, passes
+      # an oversize datagram and every datagram of a mesh interface with
+      # forwarding off to the process, forwards over IPv6, and detaches on
+      # Stop. Transmit checksum offload is off on the relay's links, so the
+      # nodes verify every UDP checksum the program rewrote, and a last phase
+      # forwards for a partner on a VLAN interface whose parent the program
+      # is attached to for another, untagged partner.
       # The absolute go path is resolved before sudo resets PATH, and the two
       # cache variables let root reuse what the step above downloaded and
-      # built. The step fails unless all eleven tests passed: a skip would
+      # built. The step fails unless all twelve tests passed: a skip would
       # pass as well otherwise, so it greps the -v output for each PASS line.
       # The space after each name keeps one test's line from matching
       # another's.
@@ -135,7 +146,7 @@ jobs:
           grep -q -- '--- PASS: TestNftablesController_RealTraffic ' "$RUNNER_TEMP/real-nftables.txt"
           grep -q -- '--- PASS: TestNftablesController_RealConnLog ' "$RUNNER_TEMP/real-nftables.txt"
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" PLEXD_TEST_REAL_LINKS=1 \
-            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface|TestSession_RealAcceptsOnlyMeshAndLocal|TestServer_RealAnswersNoOtherNetwork|TestNetlinkController_RealReplaceAddress|TestNetlinkController_RealClampMSS|TestRelay_SocketBuffers)$' ./internal/bridge/ ./internal/wireguard/ ./internal/tunnel/ ./internal/meshdns/ \
+            "$(command -v go)" test -race -count=1 -v -run '^(TestNetlinkVPNController_RealLinks|TestNetlinkRouteController_RealRoutes|TestRTTProbe_RealAnswersOnlyTheMeshInterface|TestSession_RealAcceptsOnlyMeshAndLocal|TestServer_RealAnswersNoOtherNetwork|TestNetlinkController_RealReplaceAddress|TestNetlinkController_RealClampMSS|TestRelay_SocketBuffers|TestRelayKernel_Real)$' ./internal/bridge/ ./internal/wireguard/ ./internal/tunnel/ ./internal/meshdns/ \
             | tee "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkVPNController_RealLinks ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkRouteController_RealRoutes ' "$RUNNER_TEMP/real-links.txt"
@@ -145,6 +156,7 @@ jobs:
           grep -q -- '--- PASS: TestNetlinkController_RealReplaceAddress ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestNetlinkController_RealClampMSS ' "$RUNNER_TEMP/real-links.txt"
           grep -q -- '--- PASS: TestRelay_SocketBuffers ' "$RUNNER_TEMP/real-links.txt"
+          grep -q -- '--- PASS: TestRelayKernel_Real ' "$RUNNER_TEMP/real-links.txt"
 
       # Creating a utun device needs root, and so do altering the routing table
       # and the forwarding sysctl, so the eleven macOS tests against the real
