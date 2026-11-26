@@ -95,8 +95,8 @@ func SetSocketPermissions(socketPath string, logger *slog.Logger) error {
 // Denied is the ordinary case rather than an exotic one: chown(2) lets a caller
 // without CAP_CHOWN set a file's group only to a group it belongs to itself,
 // the systemd unit `plexd install` writes bounds the daemon to CAP_NET_ADMIN,
-// CAP_NET_RAW and CAP_NET_BIND_SERVICE, and `groupadd --system plexd` creates
-// the group empty.
+// CAP_NET_RAW, CAP_NET_BIND_SERVICE and CAP_BPF, and `groupadd --system plexd`
+// creates the group empty.
 // Aborting there would take the local API down on every systemd install, so
 // this falls back to the owner-only mode a missing group produces.
 func setSocketGroup(socketPath string, gid int, logger *slog.Logger) error {
