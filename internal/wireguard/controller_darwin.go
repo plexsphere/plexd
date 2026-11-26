@@ -48,20 +48,25 @@ var utunNameRE = regexp.MustCompile(`^utun[0-9]+$`)
 type commandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 // DarwinController implements WGController on macOS. It creates a utun device
-// with wireguard-go's tun.CreateTUN, runs it through UserspaceBackend, and
-// programs the address, the on-link route, the MTU and the interface flag with
-// ifconfig(8) and route(8).
+// with wireguard-go's tun.CreateTUN, runs it through UserspaceBackend behind
+// an MSS clamp, and programs the address, the on-link route, the MTU and the
+// interface flag with ifconfig(8) and route(8).
 //
 // The kernel names the device utunN and refuses any other name. Everything the
 // manager and the backend see is keyed by the configured name, so wg show
 // plexd0 works; the utunN name is used only for the host tooling and for the
 // readiness check, which reaches it through OSInterfaceName.
+//
+// The bridge's access and site-to-site controllers are DarwinController
+// instances too (cmd/plexd/cmd/up_darwin.go). Their devices get a clamp as
+// well, which stays at 0, because only the mesh manager calls ClampMSS.
 type DarwinController struct {
 	backend *UserspaceBackend
 	logger  *slog.Logger
 
-	mu    sync.Mutex
-	utuns map[string]string // configured name -> kernel utunN name
+	mu     sync.Mutex
+	utuns  map[string]string       // configured name -> kernel utunN name
+	clamps map[string]*mssClampTUN // configured name -> the device's MSS clamp
 
 	// createTUN, run and routes are seams: production wires them to
 	// tun.CreateTUN, execCommand and utunRoutes, tests to a fake tun, a
@@ -78,6 +83,7 @@ func NewDarwinController(logger *slog.Logger) *DarwinController {
 		backend:   NewUserspaceBackend(logger),
 		logger:    logger,
 		utuns:     make(map[string]string),
+		clamps:    make(map[string]*mssClampTUN),
 		createTUN: tun.CreateTUN,
 		run:       execCommand,
 		routes:    utunRoutes,
@@ -91,7 +97,8 @@ func execCommand(ctx context.Context, name string, args ...string) ([]byte, erro
 
 // CreateInterface creates a utun device, starts a wireguard-go device on it
 // with the given private key and listen port, and records the kernel's name
-// for the interface.
+// for the interface. wireguard-go reads and writes the utun through an MSS
+// clamp, which clamps nothing until ClampMSS sets a value.
 //
 // Creating a utun requires root. The lock is held for the whole call so two
 // concurrent creations of one name cannot both pass the duplicate check.
@@ -129,13 +136,19 @@ func (c *DarwinController) CreateInterface(name string, privateKey []byte, liste
 		return fmt.Errorf("wireguard: create interface: utun name: %w", err)
 	}
 
-	// The backend takes ownership of tdev here: it closes the tun on every
-	// error it returns, and its errors already carry this method's prefix.
-	if err := c.backend.CreateDevice(name, tdev, privateKey, listenPort); err != nil {
+	// The clamp sits between wireguard-go and the utun, so it sees what
+	// enters the mesh through this interface and what leaves it.
+	clamp := newMSSClampTUN(tdev)
+
+	// The backend takes ownership of the clamp and with it of tdev here: it
+	// closes the tun on every error it returns, and its errors already carry
+	// this method's prefix.
+	if err := c.backend.CreateDevice(name, clamp, privateKey, listenPort); err != nil {
 		return err
 	}
 
 	c.utuns[name] = osName
+	c.clamps[name] = clamp
 
 	c.logger.Info("utun device created",
 		"component", "wireguard",
@@ -163,6 +176,7 @@ func (c *DarwinController) DeleteInterface(name string) error {
 		return nil
 	}
 	delete(c.utuns, name)
+	delete(c.clamps, name)
 
 	c.logger.Debug("utun device released",
 		"component", "wireguard",
@@ -553,6 +567,48 @@ func (c *DarwinController) SetMTU(name string, mtu int) error {
 		"mtu", mtu,
 	)
 
+	return nil
+}
+
+// The manager finds the clamp by asserting MSSClamper, so a signature that
+// drifted would leave the mesh unclamped without an error.
+var _ MSSClamper = (*DarwinController)(nil)
+
+// ClampMSS makes the interface's clamp lower every MSS above mss to mss, in
+// the SYNs that pass the interface in either direction. A second call
+// replaces the value; the next SYN that passes uses it.
+func (c *DarwinController) ClampMSS(name string, mss int) error {
+	if mss < 1 || mss > 65535 {
+		return fmt.Errorf("wireguard: clamp mss: invalid mss %d", mss)
+	}
+
+	c.mu.Lock()
+	clamp, ok := c.clamps[name]
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("wireguard: clamp mss: %w", os.ErrNotExist)
+	}
+
+	clamp.setMSS(mss)
+
+	c.logger.Debug("mss clamp configured",
+		"component", "wireguard",
+		"interface", name,
+		"mss", mss,
+	)
+
+	return nil
+}
+
+// UnclampMSS turns the interface's clamp off. An interface that does not
+// exist has no clamp to turn off, so it returns nil either way.
+func (c *DarwinController) UnclampMSS(name string) error {
+	c.mu.Lock()
+	clamp, ok := c.clamps[name]
+	c.mu.Unlock()
+	if ok {
+		clamp.setMSS(0)
+	}
 	return nil
 }
 

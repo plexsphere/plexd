@@ -955,6 +955,157 @@ func TestWindowsController_WithoutMeshRewriter(t *testing.T) {
 	}
 }
 
+// windowsClamp returns the MSS clamp of the adapter the controller recorded
+// for name, and whether it recorded one.
+func windowsClamp(c *WindowsController, name string) (*mssClampTUN, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ad, ok := c.adapters[name]
+	if !ok || ad.clamp == nil {
+		return nil, false
+	}
+	return ad.clamp, true
+}
+
+func TestWindowsController_ClampMSS(t *testing.T) {
+	c, tuns, ipcfg := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+
+	clamp, ok := windowsClamp(c, "plexd0")
+	if !ok {
+		t.Fatal("CreateInterface recorded no MSS clamp")
+	}
+	// Without a rewriter the clamp wraps the adapter's tun itself.
+	if clamp.Device != tun.Device(tuns.only(t)) {
+		t.Errorf("the clamp wraps %T, want the device createTUN returned", clamp.Device)
+	}
+	if got := clamp.mss.Load(); got != 0 {
+		t.Errorf("mss after CreateInterface = %d, want 0", got)
+	}
+
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS(1332) = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 1332 {
+		t.Errorf("mss after ClampMSS(1332) = %d, want 1332", got)
+	}
+	if err := c.ClampMSS("plexd0", 1380); err != nil {
+		t.Fatalf("ClampMSS(1380) = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 1380 {
+		t.Errorf("mss after a second ClampMSS(1380) = %d, want 1380", got)
+	}
+
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Fatalf("UnclampMSS = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 0 {
+		t.Errorf("mss after UnclampMSS = %d, want 0", got)
+	}
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Errorf("second UnclampMSS = %v, want nil", err)
+	}
+
+	// The clamp is in process, so the IP Helper API sees only the
+	// create-time MTU.
+	if got := ipcfg.mtuCalls(); len(got) != 1 {
+		t.Errorf("MTU calls = %v, want only the create-time one", got)
+	}
+	if got := ipcfg.addressCalls(); len(got) != 0 {
+		t.Errorf("address calls = %v, want none", got)
+	}
+}
+
+func TestWindowsController_ClampMSS_Unknown(t *testing.T) {
+	c, _, _ := newTestWindowsController(t)
+
+	err := c.ClampMSS("plexd0", 1332)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ClampMSS = %v, want os.ErrNotExist", err)
+	}
+	if err == nil || !strings.HasPrefix(err.Error(), "wireguard: clamp mss: ") {
+		t.Errorf("error = %v, want the clamp mss prefix", err)
+	}
+
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Errorf("UnclampMSS of an unknown name = %v, want nil", err)
+	}
+}
+
+func TestWindowsController_ClampMSS_Invalid(t *testing.T) {
+	c, _, _ := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS(1332) = %v, want nil", err)
+	}
+	clamp, _ := windowsClamp(c, "plexd0")
+
+	for _, mss := range []int{0, -1, 65536} {
+		err := c.ClampMSS("plexd0", mss)
+		if want := fmt.Sprintf("wireguard: clamp mss: invalid mss %d", mss); err == nil || err.Error() != want {
+			t.Errorf("ClampMSS(%d) = %v, want %q", mss, err, want)
+		}
+		if got := clamp.mss.Load(); got != 1332 {
+			t.Errorf("mss after ClampMSS(%d) = %d, want 1332 kept", mss, got)
+		}
+	}
+
+	// The value is checked before the name.
+	if err := c.ClampMSS("plexd9", 0); err == nil || err.Error() != "wireguard: clamp mss: invalid mss 0" {
+		t.Errorf("ClampMSS of an unknown name with 0 = %v, want the invalid mss error", err)
+	}
+}
+
+func TestWindowsController_DeleteInterface_ForgetsClamp(t *testing.T) {
+	c, _, _ := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS = %v, want nil", err)
+	}
+
+	if err := c.DeleteInterface("plexd0"); err != nil {
+		t.Fatalf("DeleteInterface: %v", err)
+	}
+	if _, ok := windowsClamp(c, "plexd0"); ok {
+		t.Error("the MSS clamp is still recorded after DeleteInterface")
+	}
+	if err := c.ClampMSS("plexd0", 1332); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ClampMSS after DeleteInterface = %v, want os.ErrNotExist", err)
+	}
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Errorf("UnclampMSS after DeleteInterface = %v, want nil", err)
+	}
+}
+
+// With a rewriter the clamp wraps the rewriter's wrapper, so it also sees the
+// packets the rewriter translates, which never pass the adapter's tun.
+func TestWindowsController_ClampWrapsMeshRewriter(t *testing.T) {
+	r := NewMeshRewriter(discardLogger())
+	r.addrs = meshRewriterAddrs()
+	c, tuns, _ := newTestWindowsController(t)
+	c.SetMeshRewriter(r)
+	createTestInterface(t, c, "plexd0")
+
+	clamp, ok := windowsClamp(c, "plexd0")
+	if !ok {
+		t.Fatal("CreateInterface recorded no MSS clamp")
+	}
+	rewriter, ok := clamp.Device.(*meshTUN)
+	if !ok {
+		t.Fatalf("the clamp wraps %T, want the rewriter's *meshTUN", clamp.Device)
+	}
+	if rewriter.dev != tun.Device(tuns.only(t)) {
+		t.Errorf("the rewriter's wrapper wraps %T, want the device createTUN returned", rewriter.dev)
+	}
+
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 1332 {
+		t.Errorf("mss after ClampMSS(1332) = %d, want 1332", got)
+	}
+}
+
 func TestAdapterGUID_Deterministic(t *testing.T) {
 	first := adapterGUID("plexd0")
 	if second := adapterGUID("plexd0"); *first != *second {

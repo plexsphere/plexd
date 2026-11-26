@@ -61,8 +61,9 @@ type ipConfigurator interface {
 }
 
 // WindowsController implements WGController on Windows. It creates a Wintun
-// adapter with wireguard-go's tun.CreateTUN, runs it through UserspaceBackend,
-// and programs the address and the MTU through the IP Helper API.
+// adapter with wireguard-go's tun.CreateTUN, runs it through UserspaceBackend
+// behind an MSS clamp, and programs the address and the MTU through the IP
+// Helper API.
 //
 // Unlike macOS, the adapter carries the configured interface name, so there is
 // no kernel name to map and the controller does not implement OSInterfaceNamer:
@@ -74,6 +75,10 @@ type ipConfigurator interface {
 // Windows does. The mesh device and the devices of the user access providers
 // and site-to-site tunnels on a bridge come from three controllers of this
 // type that share one rewriter.
+//
+// The MSS clamp wraps the device wireguard-go runs over, outside the
+// rewriter's wrapper when there is one. Only the mesh manager calls
+// ClampMSS, so the clamps of the bridge's devices stay at 0.
 type WindowsController struct {
 	backend *UserspaceBackend
 	logger  *slog.Logger
@@ -97,10 +102,12 @@ type WindowsController struct {
 }
 
 // wintunAdapter is one live adapter: the LUID the IP Helper API addresses it
-// by, and the running device's MTU hook.
+// by, the running device's MTU hook, and the MSS clamp wireguard-go reads and
+// writes the device through.
 type wintunAdapter struct {
 	luid     uint64
 	forceMTU func(int)
+	clamp    *mssClampTUN
 }
 
 // NewWindowsController returns a controller wired to the real Wintun adapter,
@@ -196,6 +203,8 @@ func (winipcfgConfigurator) SetMTU(luid uint64, mtu int) error {
 
 // CreateInterface provisions the driver, creates a Wintun adapter, and starts a
 // wireguard-go device on it with the given private key and listen port.
+// wireguard-go reads and writes the adapter through an MSS clamp, which
+// clamps nothing until ClampMSS sets a value.
 //
 // Creating an adapter requires Administrator. It returns once the IP stack
 // resolves the adapter by name, because what follows Manager.Setup resolves
@@ -287,13 +296,22 @@ func (c *WindowsController) createAdapter(name string, privateKey []byte, listen
 		tdev = c.rewriter.Wrap(name, tdev)
 	}
 
-	// The backend takes ownership of tdev here: it closes the tun on every error
-	// it returns, and its errors already carry this method's prefix.
-	if err := c.backend.CreateDevice(name, tdev, privateKey, listenPort); err != nil {
+	// The clamp wraps what wireguard-go runs over, the rewriter's wrapper
+	// when there is one. What the rewriter translates from a bridge device
+	// into the mesh reaches the mesh device's wireguard-go through the
+	// rewriter's queue, and a mesh peer's reply goes from the mesh device's
+	// Write into another device's queue, so neither passes the Wintun device:
+	// a clamp inside the rewriter would miss both.
+	clamp := newMSSClampTUN(tdev)
+
+	// The backend takes ownership of the clamp and with it of tdev here: it
+	// closes the tun on every error it returns, and its errors already carry
+	// this method's prefix.
+	if err := c.backend.CreateDevice(name, clamp, privateKey, listenPort); err != nil {
 		return err
 	}
 
-	c.adapters[name] = &wintunAdapter{luid: luid, forceMTU: wd.ForceMTU}
+	c.adapters[name] = &wintunAdapter{luid: luid, forceMTU: wd.ForceMTU, clamp: clamp}
 
 	c.logger.Info("wintun adapter created",
 		"component", "wireguard",
@@ -470,6 +488,46 @@ func (c *WindowsController) SetMTU(name string, mtu int) error {
 		"mtu", mtu,
 	)
 
+	return nil
+}
+
+// The manager finds the clamp by asserting MSSClamper, so a signature that
+// drifted would leave the mesh unclamped without an error.
+var _ MSSClamper = (*WindowsController)(nil)
+
+// ClampMSS makes the interface's clamp lower every MSS above mss to mss, in
+// the SYNs that pass the interface in either direction. A second call
+// replaces the value; the next SYN that passes uses it.
+func (c *WindowsController) ClampMSS(name string, mss int) error {
+	if mss < 1 || mss > 65535 {
+		return fmt.Errorf("wireguard: clamp mss: invalid mss %d", mss)
+	}
+
+	ad, err := c.adapter(name, "clamp mss")
+	if err != nil {
+		return err
+	}
+
+	ad.clamp.setMSS(mss)
+
+	c.logger.Debug("mss clamp configured",
+		"component", "wireguard",
+		"interface", name,
+		"mss", mss,
+	)
+
+	return nil
+}
+
+// UnclampMSS turns the interface's clamp off. An interface that does not
+// exist has no clamp to turn off, so it returns nil either way.
+func (c *WindowsController) UnclampMSS(name string) error {
+	c.mu.Lock()
+	ad, ok := c.adapters[name]
+	c.mu.Unlock()
+	if ok {
+		ad.clamp.setMSS(0)
+	}
 	return nil
 }
 
