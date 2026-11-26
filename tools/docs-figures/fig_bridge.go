@@ -50,14 +50,32 @@ func bridgeModeDataFlow() *Figure {
 
 // bridgeNATRelay draws how the relay of a bridge forwards a WireGuard
 // datagram between two peers behind NAT, and how the state pull drives
-// it, for docs/reference/bridge/nat-relay.md.
+// it, for docs/reference/bridge/nat-relay.md. On Linux 6.6 or newer the
+// transport datagrams of a placed session take the kernel path at the
+// top instead: the program at tcx ingress forwards them by the session
+// table, which the dispatch loop installs and forgets entries in.
 func bridgeNATRelay() *Figure {
 	f := &Figure{Name: "bridge-nat-relay", Title: "How a bridge relays WireGuard between two peers behind NAT"}
-	const rowY, rowH = 250.0, 110.0
+	const kY, rowH = 200.0, 110.0
 	peerA := f.box(roleAgent, spec{x: 100, y: 0, w: 240, h: 76, lines: []Line{name("Peer A"), body("behind NAT")}})
 	peerB := f.box(roleAgent, spec{x: 820, y: 0, w: 240, h: 76, lines: []Line{name("Peer B"), body("behind NAT")}})
 	fr := f.frame(roleSubstrate, 0, 150, 1100, 0, "", "Bridge node", "relay")
 
+	// The kernel path: the program forwards a placed session's
+	// transport datagrams from one peer to the other by its table.
+	prog := f.box(roleSubstrate, spec{x: 400, y: kY, w: 260, h: rowH, lines: []Line{
+		codeName("relay_forward"), body("at tcx ingress"), body("Linux 6.6+"),
+	}})
+	table := f.store(roleSubstrate, spec{x: 720, y: kY, w: 220, h: rowH, lines: []Line{
+		codeName("relay_sessions"), body("placed sessions"),
+	}})
+	f.arrow(relation, prog.right(), table.left())
+	f.arrow(both, peerA.right(), pt{450, peerA.cy()}, prog.topAt(450))
+	f.arrow(both, peerB.left(), pt{610, peerB.cy()}, prog.topAt(610))
+	f.label(pt{530, peerA.cy()}, body("transport datagrams of placed sessions"))
+
+	busY := kY + rowH + 40
+	rowY := busY + 50
 	sock := f.box(roleAgent, spec{x: 40, y: rowY, w: 300, h: rowH, lines: []Line{
 		name("UDP socket"), body("on the pulled"), code("listen_port"),
 	}})
@@ -73,11 +91,15 @@ func bridgeNATRelay() *Figure {
 	f.arrow(flow, dest.bottom(), pt{dest.cx(), loopY}, pt{sock.cx(), loopY}, sock.bottom())
 	f.label(pt{parse.cx(), loopY}, body("dispatch loop"))
 
-	busY := 110.0
+	// Every other datagram reaches the socket, and the dispatch loop
+	// writes a placed session into the kernel's table when it routes the
+	// session's first transport datagram itself.
 	f.arrow(both, peerA.bottomAt(250), sock.topAt(250))
-	f.labelLeft(pt{250, busY}, body("WireGuard datagram"))
-	f.arrow(both, peerB.bottom(), pt{peerB.cx(), busY}, pt{310, busY}, sock.topAt(310))
-	f.label(pt{(peerB.cx() + 310) / 2, busY}, body("WireGuard datagram"))
+	f.labelLeft(pt{250, 110}, body("WireGuard datagram"))
+	f.arrow(both, peerB.bottomAt(1000), pt{1000, busY}, pt{310, busY}, sock.topAt(310))
+	f.label(pt{(1000 + 310) / 2, busY}, body("WireGuard datagram"))
+	f.arrow(call, dest.topAt(table.cx()), table.bottom())
+	f.labelRight(pt{table.cx(), (busY + rowY) / 2}, body("install, forget"))
 
 	ctlY := loopY + 60
 	pull := f.sheet(roleCore, spec{x: 40, y: ctlY, w: 300, h: 80, lines: []Line{name("state pull"), code("bridge.relay, peers")}})

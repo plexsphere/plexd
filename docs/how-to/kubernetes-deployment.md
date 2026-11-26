@@ -121,6 +121,8 @@ The DaemonSet runs one plexd pod on every node, including control plane nodes.
 
 Its `securityContext` drops all capabilities and adds back `NET_ADMIN` and `NET_RAW`. Both are required: `NET_ADMIN` for the WireGuard interface and for the nftables chain that carries the deny-by-default policy baseline, `NET_RAW` for the ICMP probes behind `diagnostics.ping_peer`. A PodSecurityPolicy, admission webhook, or Pod Security Standard that removes `NET_ADMIN` makes plexd exit at startup rather than join the mesh unfiltered — see [Missing NET_ADMIN](#missing-net-admin).
 
+The DaemonSet does not add `BPF`. A pod that runs a relaying bridge on Linux 6.6 or newer forwards the relayed pairs' transport datagrams in the kernel only with `BPF` added to its capabilities; without it, it logs `relay: kernel forwarding unavailable, forwarding in the process` and relays in the process. The manifest runs one pod on every node, and a relaying bridge is the exception: a manifest that runs one adds `BPF` to the `capabilities` of its `securityContext` itself (see [Kernel Forwarding](../reference/bridge/nat-relay.md#kernel-forwarding)).
+
 Verify rollout:
 
 ```sh

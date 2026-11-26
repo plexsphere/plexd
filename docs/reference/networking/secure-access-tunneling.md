@@ -958,7 +958,7 @@ stderr line with exit status 1.
 
 ### Session helper
 
-On Linux, plexd's unit bounds it to `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` and hides `/home`, so a shell
+On Linux, plexd's unit bounds it to `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_BPF` and hides `/home`, so a shell
 plexd forked could not become the login user. Every process therefore starts in
 the session helper, `plexd session-helper`:
 
