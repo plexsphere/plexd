@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -114,6 +115,11 @@ type Manager struct {
 	// serializes peer writes only.
 	mtu     int
 	raiseTo int
+	// mss is the MSS last programmed through MSSClamper (see clampMSS), 0
+	// while none is. Setup and afterwards the RunMTUProbe goroutine write it,
+	// like mtu. It is atomic because Teardown reads it, and clears it, while
+	// that goroutine can still run.
+	mss atomic.Int32
 
 	// routeMu guards router and routes, and serializes the route calls of
 	// syncPeerRoutes and Teardown. It is taken before mu, never while mu is
@@ -165,6 +171,11 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 // or when the round fails, it is DefaultMTU. The round runs before
 // CreateInterface, so a round that waits out its timeout holds up startup
 // without a half-configured interface on the host meanwhile.
+//
+// After the MTU, and before SetInterfaceUp, it clamps the MSS of forwarded
+// TCP to that MTU (see clampMSS), so no SYN crosses the interface unclamped.
+// The clamp does not decide Setup's result: one that fails is logged at Warn,
+// and the mesh then carries TCP as it would without a clamp.
 func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity) error {
 	mtu, source, pathMTU := m.chooseMTU(ctx)
 
@@ -188,6 +199,8 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 			m.warnBelowMinimum(pathMTU)
 		}
 	}
+
+	m.clampMSS(mtu)
 
 	if err := m.ctrl.SetInterfaceUp(m.cfg.InterfaceName); err != nil {
 		return fmt.Errorf("wireguard: setup: %w", err)
@@ -432,10 +445,26 @@ func (m *Manager) SetPeerRouter(r PeerRouter) {
 	m.router = r
 }
 
-// Teardown removes the routes syncPeerRoutes programmed and then deletes the
-// WireGuard interface. A route it cannot remove is logged at Warn and stops
-// nothing: the delete takes the interface's routes with it.
+// Teardown removes the forwarded TCP MSS clamp first, when Setup or a probe
+// round programmed one, then the routes syncPeerRoutes programmed, and then
+// deletes the WireGuard interface. A clamp or a route it cannot remove is
+// logged at Warn and stops nothing: the delete takes the interface's routes
+// with it, and a clamp left behind names an interface that no longer exists,
+// which the next start's clamp replaces. A manager that programmed no clamp,
+// because its Setup failed before the clamp or every ClampMSS call failed,
+// makes no UnclampMSS call.
 func (m *Manager) Teardown() error {
+	if clamper, ok := m.ctrl.(MSSClamper); ok && m.mss.Load() != 0 {
+		if err := clamper.UnclampMSS(m.cfg.InterfaceName); err != nil {
+			m.logger.Warn("wireguard: forwarded tcp mss clamp removal failed",
+				"component", "wireguard",
+				"interface", m.cfg.InterfaceName,
+				"error", err,
+			)
+		} else {
+			m.mss.Store(0)
+		}
+	}
 	m.removePeerRoutes()
 	if err := m.ctrl.DeleteInterface(m.cfg.InterfaceName); err != nil {
 		return fmt.Errorf("wireguard: teardown: %w", err)

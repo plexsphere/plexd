@@ -29,6 +29,8 @@ type mockController struct {
 	removePeerErr       error
 	setPrivateKeyErr    error
 	replaceAddressErr   error
+	clampMSSErr         error
+	unclampMSSErr       error
 }
 
 func (m *mockController) CreateInterface(name string, privateKey []byte, listenPort int) error {
@@ -103,6 +105,27 @@ func (m *mockController) ReplaceAddress(name, oldAddress, newAddress string) err
 	m.mu.Lock()
 	m.calls = append(m.calls, mockCall{Method: "ReplaceAddress", Args: []interface{}{name, oldAddress, newAddress}})
 	err := m.replaceAddressErr
+	m.mu.Unlock()
+	return err
+}
+
+var _ MSSClamper = (*mockController)(nil)
+
+// ClampMSS makes the mock an MSSClamper, the shape every production
+// controller has.
+func (m *mockController) ClampMSS(name string, mss int) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "ClampMSS", Args: []interface{}{name, mss}})
+	err := m.clampMSSErr
+	m.mu.Unlock()
+	return err
+}
+
+// UnclampMSS completes the mock's MSSClamper.
+func (m *mockController) UnclampMSS(name string) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "UnclampMSS", Args: []interface{}{name}})
+	err := m.unclampMSSErr
 	m.mu.Unlock()
 	return err
 }

@@ -38,6 +38,62 @@ func MeshMTU(pathMTU int) int {
 	return min(DefaultMTU, max(MinMTU, pathMTU-encapsulationOverhead))
 }
 
+// tcpIPv4Overhead is the IPv4 header (20) plus the TCP header (20).
+const tcpIPv4Overhead = 40
+
+// minForwardMSS is the MSS a host assumes when a SYN carries none (RFC 9293, 3.7.1).
+const minForwardMSS = 536
+
+// ForwardMSS returns the largest MSS a TCP connection may announce across a
+// mesh interface of mtu bytes: mtu minus tcpIPv4Overhead, floored at
+// minForwardMSS. Only IPv4 counts, because the mesh carries no IPv6.
+func ForwardMSS(mtu int) int {
+	return max(minForwardMSS, mtu-tcpIPv4Overhead)
+}
+
+// clampMSS clamps the MSS of the TCP connections the node forwards across the
+// mesh interface to ForwardMSS(mtu), through the controller's MSSClamper. It
+// does nothing for a controller without one, or when that MSS is the one
+// programmed already, so a round that changed no MTU costs no call while the
+// clamp is current, and retries one that failed before.
+//
+// A failed call leaves the recorded MSS as it was and is logged at Warn: the
+// mesh then carries TCP as it would without a clamp, which is no reason to
+// fail Setup or a probe round.
+func (m *Manager) clampMSS(mtu int) {
+	clamper, ok := m.ctrl.(MSSClamper)
+	if !ok {
+		return
+	}
+	mss := ForwardMSS(mtu)
+	old := m.mss.Load()
+	if int32(mss) == old {
+		return
+	}
+	if err := clamper.ClampMSS(m.cfg.InterfaceName, mss); err != nil {
+		m.logger.Warn("wireguard: forwarded tcp mss clamp failed",
+			"component", "wireguard",
+			"interface", m.cfg.InterfaceName,
+			"mss", mss,
+			"mtu", mtu,
+			"error", err,
+		)
+		return
+	}
+	m.mss.Store(int32(mss))
+
+	attrs := []any{
+		"component", "wireguard",
+		"interface", m.cfg.InterfaceName,
+		"mss", mss,
+		"mtu", mtu,
+	}
+	if old != 0 {
+		attrs = append(attrs, "old_mss", old)
+	}
+	m.logger.Info("wireguard: forwarded tcp mss clamped", attrs...)
+}
+
 // SetPathMTUProbe sets the function Setup and RunMTUProbe measure the uplink
 // with. It returns the largest IPv4 packet size, in bytes, that reached a STUN
 // server. Call it before Setup, like SetLocalPrefixes; without it the
@@ -86,11 +142,12 @@ func (m *Manager) warnBelowMinimum(pathMTU int) {
 }
 
 // RunMTUProbe measures the uplink every interval until ctx is done, then
-// returns nil, and fits the mesh MTU to each round (see adjustMTU). The probe
-// in Setup counts as the first round, so the first one here comes an interval
-// after the call.
+// returns nil, and fits the mesh MTU, and the forwarded TCP MSS clamp with
+// it, to each round (see adjustMTU). The probe in Setup counts as the first
+// round, so the first one here comes an interval after the call.
 //
-// It returns nil at once when no probe is set or Config.MTU pins the MTU.
+// It returns nil at once when no probe is set or Config.MTU pins the MTU. A
+// clamp that failed in Setup is then not tried again until the next start.
 func (m *Manager) RunMTUProbe(ctx context.Context, interval time.Duration) error {
 	if m.probe == nil || m.cfg.MTU > 0 {
 		return nil
@@ -124,6 +181,12 @@ func (m *Manager) RunMTUProbe(ctx context.Context, interval time.Duration) error
 // A failed SetMTU leaves the MTU recorded as it was and drops a pending raise.
 // The next round that measures the same uplink tries a lowering again, while a
 // raise waits for two agreeing rounds again.
+//
+// Every round whose probe measured, and that ended before ctx was done, ends
+// by clamping the forwarded TCP MSS to the MTU it leaves recorded (see
+// clampMSS): after SetMTU on a change, and also when the MTU stays, a raise
+// is pending or SetMTU failed. Such a round programs nothing while the clamp
+// is current, and tries a clamp that failed before again.
 func (m *Manager) adjustMTU(ctx context.Context) {
 	pathMTU, err := m.probe(ctx)
 	if err != nil {
@@ -145,6 +208,9 @@ func (m *Manager) adjustMTU(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	// Deferred so that it follows SetMTU on every path below, and reads the
+	// MTU the round leaves rather than the one it found.
+	defer func() { m.clampMSS(m.mtu) }()
 
 	target := MeshMTU(pathMTU)
 	switch {

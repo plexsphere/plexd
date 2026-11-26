@@ -105,6 +105,65 @@ func assertLogLine(t *testing.T, out, msg string, attrs ...string) {
 	}
 }
 
+// clampMSSes returns the MSS of every ClampMSS call ctrl recorded, in order,
+// and fails the test for a call on another interface than plexd0.
+func clampMSSes(t *testing.T, ctrl *mockController) []int {
+	t.Helper()
+	var mss []int
+	for _, call := range ctrl.callsFor("ClampMSS") {
+		if call.Args[0] != "plexd0" {
+			t.Errorf("ClampMSS iface = %v, want plexd0", call.Args[0])
+		}
+		v, ok := call.Args[1].(int)
+		if !ok {
+			t.Fatalf("ClampMSS arg = %T, want int", call.Args[1])
+		}
+		mss = append(mss, v)
+	}
+	return mss
+}
+
+// clearCalls drops the calls ctrl recorded, so a test sees only the calls
+// of what it does next.
+func clearCalls(ctrl *mockController) {
+	ctrl.mu.Lock()
+	ctrl.calls = nil
+	ctrl.mu.Unlock()
+}
+
+// programClamp records the clamp for mgr's MTU through a successful
+// clampMSS, the state Setup leaves when its ClampMSS call succeeds, which a
+// manager from newAdjustManager does not have. It drops the call and its log
+// line, so the test sees only what its own rounds do.
+func programClamp(t *testing.T, mgr *Manager, ctrl *mockController) {
+	t.Helper()
+	logger := mgr.logger
+	mgr.logger = discardLogger()
+	mgr.clampMSS(mgr.mtu)
+	mgr.logger = logger
+	if got, want := mgr.mss.Load(), int32(ForwardMSS(mgr.mtu)); got != want {
+		t.Fatalf("mss after clampMSS(%d) = %d, want %d", mgr.mtu, got, want)
+	}
+	clearCalls(ctrl)
+}
+
+// setupWithProbe returns a manager over ctrl that Setup sized with a probe
+// measuring pathMTU, and that probe for the test's rounds. It fails the test
+// when Setup fails, and drops the calls and log lines of Setup, so the test
+// sees only what it does next.
+func setupWithProbe(t *testing.T, ctrl *mockController, pathMTU int, logs *bytes.Buffer) (*Manager, *stubProbe) {
+	t.Helper()
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(logs))
+	p := &stubProbe{pathMTU: pathMTU}
+	mgr.SetPathMTUProbe(p.probe)
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	clearCalls(ctrl)
+	logs.Reset()
+	return mgr, p
+}
+
 // ---------------------------------------------------------------------------
 // MeshMTU
 // ---------------------------------------------------------------------------
@@ -126,6 +185,31 @@ func TestMeshMTU(t *testing.T) {
 	for _, tt := range tests {
 		if got := MeshMTU(tt.pathMTU); got != tt.want {
 			t.Errorf("MeshMTU(%d) = %d, want %d", tt.pathMTU, got, tt.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ForwardMSS
+// ---------------------------------------------------------------------------
+
+func TestForwardMSS(t *testing.T) {
+	tests := []struct {
+		mtu  int
+		want int
+	}{
+		{1420, 1380},
+		{1372, 1332},
+		{1280, 1240},
+		{577, 537},
+		{576, 536},
+		{500, 536},
+		{0, 536},
+		{-1, 536},
+	}
+	for _, tt := range tests {
+		if got := ForwardMSS(tt.mtu); got != tt.want {
+			t.Errorf("ForwardMSS(%d) = %d, want %d", tt.mtu, got, tt.want)
 		}
 	}
 }
@@ -447,6 +531,9 @@ func TestAdjustMTU_RaiseResetBySetMTUFailure(t *testing.T) {
 func TestAdjustMTU_Unchanged(t *testing.T) {
 	var logs bytes.Buffer
 	mgr, ctrl, p := newAdjustManager(1372, &logs)
+	// The clamp Setup programs for MTU 1372 is current, so the round has no
+	// clamp to retry either.
+	programClamp(t, mgr, ctrl)
 
 	adjustAt(mgr, p, 1452)
 
@@ -553,5 +640,453 @@ func TestAdjustMTU_CanceledContextProbeError(t *testing.T) {
 	}
 	if mgr.mtu != 1372 || mgr.raiseTo != 1420 {
 		t.Errorf("mtu, raiseTo = %d, %d, want 1372, 1420 kept", mgr.mtu, mgr.raiseTo)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Forwarded TCP MSS clamp
+// ---------------------------------------------------------------------------
+
+// errClampDenied is the error the tests' controller returns for a clamp it
+// cannot program or remove.
+var errClampDenied = errors.New("nftables: operation not permitted")
+
+func TestManager_Setup_ClampsMSSBeforeInterfaceUp(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfgMTU  int
+		pathMTU int // 0: no probe
+		mtu     int
+		mss     int
+		calls   []string
+	}{
+		{
+			name:   "mtu from the config",
+			cfgMTU: 1400,
+			mtu:    1400,
+			mss:    1360,
+			calls:  []string{"CreateInterface", "ConfigureAddress", "SetMTU", "ClampMSS", "SetInterfaceUp"},
+		},
+		{
+			name:    "mtu from the probe",
+			pathMTU: 1452,
+			mtu:     1372,
+			mss:     1332,
+			calls:   []string{"CreateInterface", "ConfigureAddress", "SetMTU", "ClampMSS", "SetInterfaceUp"},
+		},
+		{
+			name:  "default mtu",
+			mtu:   1420,
+			mss:   1380,
+			calls: []string{"CreateInterface", "ConfigureAddress", "ClampMSS", "SetInterfaceUp"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ctrl := &mockController{}
+			mgr := NewManager(ctrl, Config{MTU: tt.cfgMTU}, slogTextLogger(&logs))
+			if tt.pathMTU != 0 {
+				mgr.SetPathMTUProbe((&stubProbe{pathMTU: tt.pathMTU}).probe)
+			}
+
+			if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+				t.Fatalf("Setup() returned error: %v", err)
+			}
+
+			if got := callMethods(ctrl); !slices.Equal(got, tt.calls) {
+				t.Errorf("controller calls = %v, want %v", got, tt.calls)
+			}
+			if got := clampMSSes(t, ctrl); !slices.Equal(got, []int{tt.mss}) {
+				t.Errorf("ClampMSS calls = %v, want [%d]", got, tt.mss)
+			}
+			if got := mgr.mss.Load(); got != int32(tt.mss) {
+				t.Errorf("mss = %d, want %d", got, tt.mss)
+			}
+			out := logs.String()
+			assertLogLine(t, out, "wireguard: forwarded tcp mss clamped",
+				"level=INFO", "component=wireguard", "interface=plexd0",
+				fmt.Sprintf("mss=%d mtu=%d", tt.mss, tt.mtu))
+			if line := logLine(out, "wireguard: forwarded tcp mss clamped"); strings.Contains(line, "old_mss=") {
+				t.Errorf("clamped line carries old_mss for the first clamp:\n%s", line)
+			}
+		})
+	}
+}
+
+func TestManager_Setup_ClampFailureFailsNothing(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{clampMSSErr: errClampDenied}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() = %v, want nil when only the clamp fails", err)
+	}
+
+	want := []string{"CreateInterface", "ConfigureAddress", "ClampMSS", "SetInterfaceUp"}
+	if got := callMethods(ctrl); !slices.Equal(got, want) {
+		t.Errorf("controller calls = %v, want %v", got, want)
+	}
+	if got := mgr.mss.Load(); got != 0 {
+		t.Errorf("mss after a failed ClampMSS = %d, want 0", got)
+	}
+	out := logs.String()
+	assertLogLine(t, out, "wireguard: forwarded tcp mss clamp failed",
+		"level=WARN", "component=wireguard", "interface=plexd0", "mss=1380 mtu=1420",
+		`error="nftables: operation not permitted"`)
+	if strings.Contains(out, "wireguard: forwarded tcp mss clamped") {
+		t.Errorf("clamped line for a failed ClampMSS:\n%s", out)
+	}
+	assertLogLine(t, out, "wireguard interface configured", "level=INFO", "mtu=1420")
+}
+
+func TestManager_NoClampWithoutMSSClamper(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := NewManager(plainController{ctrl}, Config{}, slogTextLogger(&logs))
+	p := &stubProbe{pathMTU: 1452}
+	mgr.SetPathMTUProbe(p.probe)
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v", err)
+	}
+	adjustAt(mgr, p, 1400) // lowers the MTU to 1320
+	adjustAt(mgr, p, 1400) // keeps it
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown() returned error: %v", err)
+	}
+
+	want := []string{"CreateInterface", "ConfigureAddress", "SetMTU", "SetInterfaceUp", "SetMTU", "DeleteInterface"}
+	if got := callMethods(ctrl); !slices.Equal(got, want) {
+		t.Errorf("controller calls = %v, want %v", got, want)
+	}
+	if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1372, 1320}) {
+		t.Errorf("SetMTU calls = %v, want [1372 1320]", got)
+	}
+	if got := mgr.mss.Load(); got != 0 {
+		t.Errorf("mss = %d, want 0 without an MSSClamper", got)
+	}
+	if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+		t.Errorf("clamp line without an MSSClamper:\n%s", out)
+	}
+}
+
+func TestAdjustMTU_LowerClampsAfterSetMTU(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	// Setup on a full-size uplink leaves MTU 1420 and the clamp at 1380.
+	mgr, p := setupWithProbe(t, ctrl, 1500, &logs)
+
+	adjustAt(mgr, p, 1452)
+
+	if got, want := callMethods(ctrl), []string{"SetMTU", "ClampMSS"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls = %v, want %v", got, want)
+	}
+	if got := clampMSSes(t, ctrl); !slices.Equal(got, []int{1332}) {
+		t.Errorf("ClampMSS calls = %v, want [1332]", got)
+	}
+	if got := mgr.mss.Load(); got != 1332 {
+		t.Errorf("mss = %d, want 1332", got)
+	}
+	assertLogLine(t, logs.String(), "wireguard: forwarded tcp mss clamped",
+		"level=INFO", "component=wireguard", "interface=plexd0", "mss=1332 mtu=1372 old_mss=1380")
+}
+
+func TestAdjustMTU_RaiseClampsOnlyInTheSecondRound(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	// Setup on a 1452-byte uplink leaves MTU 1372 and the clamp at 1332.
+	mgr, p := setupWithProbe(t, ctrl, 1452, &logs)
+
+	adjustAt(mgr, p, 1500)
+	if mgr.raiseTo != 1420 {
+		t.Fatalf("raiseTo after the first round = %d, want 1420 pending", mgr.raiseTo)
+	}
+	if got := callMethods(ctrl); len(got) != 0 {
+		t.Errorf("controller calls of the round that records the raise = %v, want none", got)
+	}
+	if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+		t.Errorf("clamp line in the round that records the raise:\n%s", out)
+	}
+
+	adjustAt(mgr, p, 1500)
+	if got, want := callMethods(ctrl), []string{"SetMTU", "ClampMSS"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls of the second round = %v, want %v", got, want)
+	}
+	if got := clampMSSes(t, ctrl); !slices.Equal(got, []int{1380}) {
+		t.Errorf("ClampMSS calls = %v, want [1380]", got)
+	}
+	assertLogLine(t, logs.String(), "wireguard: forwarded tcp mss clamped",
+		"level=INFO", "component=wireguard", "interface=plexd0", "mss=1380 mtu=1420 old_mss=1332")
+}
+
+func TestAdjustMTU_FailedSetMTUMakesNoClampCall(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	// Setup on a full-size uplink leaves MTU 1420 and the clamp at 1380, which
+	// stays current for the MTU a failed SetMTU keeps.
+	mgr, p := setupWithProbe(t, ctrl, 1500, &logs)
+	ctrl.setMTUErr = errors.New("netlink: device busy")
+
+	adjustAt(mgr, p, 1452)
+
+	if got, want := callMethods(ctrl), []string{"SetMTU"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls = %v, want %v", got, want)
+	}
+	if got := mgr.mss.Load(); got != 1380 {
+		t.Errorf("mss after a failed SetMTU = %d, want 1380 kept", got)
+	}
+	if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+		t.Errorf("clamp line after a failed SetMTU:\n%s", out)
+	}
+}
+
+func TestAdjustMTU_UnchangedMakesNoClampCallWhileCurrent(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	// Setup on a 1452-byte uplink leaves MTU 1372 and the clamp at 1332.
+	mgr, p := setupWithProbe(t, ctrl, 1452, &logs)
+
+	adjustAt(mgr, p, 1452)
+
+	if got := callMethods(ctrl); len(got) != 0 {
+		t.Errorf("controller calls = %v, want none while the clamp is current", got)
+	}
+	if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+		t.Errorf("clamp line while the clamp is current:\n%s", out)
+	}
+}
+
+func TestAdjustMTU_UnchangedRetriesAFailedClamp(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{clampMSSErr: errClampDenied}
+	// Setup on a 1452-byte uplink programs MTU 1372, and its ClampMSS call
+	// fails, so no clamp is recorded.
+	mgr, p := setupWithProbe(t, ctrl, 1452, &logs)
+	if got := mgr.mss.Load(); got != 0 {
+		t.Fatalf("mss after Setup's failed ClampMSS = %d, want 0", got)
+	}
+
+	adjustAt(mgr, p, 1452)
+	if got, want := callMethods(ctrl), []string{"ClampMSS"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls of the first round = %v, want %v", got, want)
+	}
+	if got := clampMSSes(t, ctrl); !slices.Equal(got, []int{1332}) {
+		t.Errorf("ClampMSS calls of the first round = %v, want [1332]", got)
+	}
+	assertLogLine(t, logs.String(), "wireguard: forwarded tcp mss clamp failed",
+		"level=WARN", "component=wireguard", "interface=plexd0", "mss=1332 mtu=1372",
+		`error="nftables: operation not permitted"`)
+	if got := mgr.mss.Load(); got != 0 {
+		t.Fatalf("mss after a second failed ClampMSS = %d, want 0", got)
+	}
+
+	// The second failure recorded nothing, so the next round tries again.
+	clearCalls(ctrl)
+	logs.Reset()
+	ctrl.clampMSSErr = nil
+	adjustAt(mgr, p, 1452)
+	if got := clampMSSes(t, ctrl); !slices.Equal(got, []int{1332}) {
+		t.Errorf("ClampMSS calls of the second round = %v, want [1332]", got)
+	}
+	if got := mgr.mss.Load(); got != 1332 {
+		t.Errorf("mss after the retry = %d, want 1332", got)
+	}
+	out := logs.String()
+	assertLogLine(t, out, "wireguard: forwarded tcp mss clamped",
+		"level=INFO", "component=wireguard", "interface=plexd0", "mss=1332 mtu=1372")
+	if line := logLine(out, "wireguard: forwarded tcp mss clamped"); strings.Contains(line, "old_mss=") {
+		t.Errorf("clamped line carries old_mss though no clamp was replaced:\n%s", line)
+	}
+
+	// Now the clamp is current, and a round makes no call.
+	clearCalls(ctrl)
+	adjustAt(mgr, p, 1452)
+	if got := callMethods(ctrl); len(got) != 0 {
+		t.Errorf("controller calls of the third round = %v, want none", got)
+	}
+}
+
+func TestAdjustMTU_RoundCutShortMakesNoClampCall(t *testing.T) {
+	tests := []struct {
+		name  string
+		probe func(cancel context.CancelFunc) (int, error)
+	}{
+		{
+			name: "probe error",
+			probe: func(context.CancelFunc) (int, error) {
+				return 0, errors.New("nat: mtu probe: no STUN server answered")
+			},
+		},
+		{
+			name: "ctx done after the probe measured",
+			probe: func(cancel context.CancelFunc) (int, error) {
+				cancel()
+				return 1400, nil
+			},
+		},
+		{
+			name: "ctx done and the probe failed with it",
+			probe: func(cancel context.CancelFunc) (int, error) {
+				cancel()
+				return 0, fmt.Errorf("nat: mtu probe: %w", context.Canceled)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ctrl := &mockController{clampMSSErr: errClampDenied}
+			// Setup's ClampMSS call fails, so no clamp is recorded and a round
+			// that got past the probe and ctx would call ClampMSS, which the
+			// controller now accepts. A round cut short must not.
+			mgr, _ := setupWithProbe(t, ctrl, 1452, &logs)
+			ctrl.clampMSSErr = nil
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ran := false
+			mgr.SetPathMTUProbe(func(context.Context) (int, error) {
+				ran = true
+				return tt.probe(cancel)
+			})
+
+			mgr.adjustMTU(ctx)
+
+			if !ran {
+				t.Fatal("the round did not call the probe")
+			}
+			if got := callMethods(ctrl); len(got) != 0 {
+				t.Errorf("controller calls = %v, want none", got)
+			}
+			if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+				t.Errorf("clamp line in a round cut short:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestManager_Teardown_UnclampsMSSFirst(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	// Setup on a 1452-byte uplink leaves the clamp at 1332.
+	mgr, _ := setupWithProbe(t, ctrl, 1452, &logs)
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown() returned error: %v", err)
+	}
+
+	if got, want := callMethods(ctrl), []string{"UnclampMSS", "DeleteInterface"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls = %v, want %v", got, want)
+	}
+	if uc := ctrl.callsFor("UnclampMSS"); len(uc) == 1 && uc[0].Args[0] != "plexd0" {
+		t.Errorf("UnclampMSS iface = %v, want plexd0", uc[0].Args[0])
+	}
+	if got := mgr.mss.Load(); got != 0 {
+		t.Errorf("mss after UnclampMSS = %d, want 0", got)
+	}
+	if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+		t.Errorf("clamp line for a removal that succeeded:\n%s", out)
+	}
+
+	// The clamp is gone, so a second Teardown has none to remove.
+	clearCalls(ctrl)
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("second Teardown() returned error: %v", err)
+	}
+	if got, want := callMethods(ctrl), []string{"DeleteInterface"}; !slices.Equal(got, want) {
+		t.Errorf("controller calls of a second Teardown = %v, want %v", got, want)
+	}
+}
+
+func TestManager_Teardown_UnclampFailureStopsNothing(t *testing.T) {
+	deleteErr := errors.New("netlink: no such device")
+	tests := []struct {
+		name      string
+		deleteErr error
+	}{
+		{name: "delete succeeds", deleteErr: nil},
+		{name: "delete fails", deleteErr: deleteErr},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ctrl := &mockController{}
+			// Setup on a 1452-byte uplink leaves the clamp at 1332.
+			mgr, _ := setupWithProbe(t, ctrl, 1452, &logs)
+			ctrl.unclampMSSErr = errClampDenied
+			ctrl.deleteInterfaceErr = tt.deleteErr
+
+			err := mgr.Teardown()
+
+			if tt.deleteErr == nil && err != nil {
+				t.Errorf("Teardown() = %v, want nil, the result of DeleteInterface", err)
+			}
+			if tt.deleteErr != nil && !errors.Is(err, tt.deleteErr) {
+				t.Errorf("Teardown() = %v, want the error of DeleteInterface", err)
+			}
+			if errors.Is(err, errClampDenied) {
+				t.Errorf("Teardown() = %v carries the UnclampMSS error, want DeleteInterface's result alone", err)
+			}
+			if got, want := callMethods(ctrl), []string{"UnclampMSS", "DeleteInterface"}; !slices.Equal(got, want) {
+				t.Errorf("controller calls = %v, want %v", got, want)
+			}
+			assertLogLine(t, logs.String(), "wireguard: forwarded tcp mss clamp removal failed",
+				"level=WARN", "component=wireguard", "interface=plexd0",
+				`error="nftables: operation not permitted"`)
+		})
+	}
+}
+
+func TestManager_Teardown_NoUnclampWithoutAClamp(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, ctrl *mockController, logs *bytes.Buffer) *Manager
+	}{
+		{
+			name: "Setup never ran",
+			setup: func(_ *testing.T, ctrl *mockController, logs *bytes.Buffer) *Manager {
+				return NewManager(ctrl, Config{}, slogTextLogger(logs))
+			},
+		},
+		{
+			name: "Setup failed before the clamp",
+			setup: func(t *testing.T, ctrl *mockController, logs *bytes.Buffer) *Manager {
+				ctrl.configureAddressErr = errors.New("netlink: permission denied")
+				mgr := NewManager(ctrl, Config{}, slogTextLogger(logs))
+				if err := mgr.Setup(context.Background(), testIdentity()); err == nil {
+					t.Fatal("Setup() = nil, want the ConfigureAddress error")
+				}
+				clearCalls(ctrl)
+				logs.Reset()
+				return mgr
+			},
+		},
+		{
+			name: "the only ClampMSS call failed",
+			setup: func(t *testing.T, ctrl *mockController, logs *bytes.Buffer) *Manager {
+				ctrl.clampMSSErr = errClampDenied
+				mgr, _ := setupWithProbe(t, ctrl, 1452, logs)
+				return mgr
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ctrl := &mockController{}
+			mgr := tt.setup(t, ctrl, &logs)
+
+			if err := mgr.Teardown(); err != nil {
+				t.Fatalf("Teardown() returned error: %v", err)
+			}
+
+			if got, want := callMethods(ctrl), []string{"DeleteInterface"}; !slices.Equal(got, want) {
+				t.Errorf("controller calls = %v, want %v", got, want)
+			}
+			if out := logs.String(); strings.Contains(out, "forwarded tcp mss") {
+				t.Errorf("clamp line without a clamp:\n%s", out)
+			}
+		})
 	}
 }
