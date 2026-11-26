@@ -215,7 +215,7 @@ func TestManager_Setup_ProbeLowers(t *testing.T) {
 	if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1372}) {
 		t.Errorf("SetMTU calls = %v, want [1372]", got)
 	}
-	want := []string{"CreateInterface", "ConfigureAddress", "SetMTU", "SetInterfaceUp"}
+	want := []string{"CreateInterface", "ConfigureAddress", "SetMTU", "ClampMSS", "SetInterfaceUp"}
 	if got := callMethods(ctrl); !slices.Equal(got, want) {
 		t.Errorf("controller calls = %v, want %v", got, want)
 	}
@@ -520,7 +520,7 @@ func TestManager_Teardown_RemovesPeerRoutesFirst(t *testing.T) {
 	if err := mgr.Teardown(); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
-	if got, want := methodOrder(ctrl), []string{"RemoveRoute", "RemoveRoute", "DeleteInterface"}; !slices.Equal(got, want) {
+	if got, want := methodOrder(ctrl), []string{"UnclampMSS", "RemoveRoute", "RemoveRoute", "DeleteInterface"}; !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
 	}
 	if got, want := routeCalls(ctrl), []string{"RemoveRoute 10.20.0.0/16 plexd0", "RemoveRoute 10.30.0.0/16 plexd0"}; !slices.Equal(got, want) {
@@ -551,7 +551,7 @@ func TestManager_Teardown_PeerRouteFailure(t *testing.T) {
 	if err := mgr.Teardown(); err != nil {
 		t.Fatalf("Teardown = %v, want nil: a route the delete takes along fails nothing", err)
 	}
-	if got, want := methodOrder(ctrl), []string{"RemoveRoute", "DeleteInterface"}; !slices.Equal(got, want) {
+	if got, want := methodOrder(ctrl), []string{"UnclampMSS", "RemoveRoute", "DeleteInterface"}; !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
 	}
 	if out := logs.String(); !strings.Contains(out, `level=WARN msg="wireguard: peer route failed" component=wireguard subnet=10.20.0.0/16 op=remove error="route: not permitted"`) {
@@ -1202,7 +1202,8 @@ func TestManager_SetPeerPSK_ConcurrentWithUpdatePeer(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // plainController exposes only the WGController methods of the controller it
-// wraps, as a controller that cannot replace an address does.
+// wraps, as a controller that implements none of the optional interfaces
+// does: it cannot replace an address, nor clamp an MSS.
 type plainController struct{ WGController }
 
 // subnetRouter is a mockRouter whose AddRoute fails with err for the subnet

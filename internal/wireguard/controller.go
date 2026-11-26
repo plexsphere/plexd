@@ -77,6 +77,18 @@ type AddressReplacer interface {
 	ReplaceAddress(name, oldAddress, newAddress string) error
 }
 
+// MSSClamper is implemented by controllers that can lower the MSS option of
+// the IPv4 TCP SYN packets that cross the interface, in both directions.
+// It is optional, as AddressReplacer is. Both methods are idempotent.
+type MSSClamper interface {
+	// ClampMSS lowers every such MSS above mss to mss. A second call replaces
+	// the value of the first.
+	ClampMSS(name string, mss int) error
+	// UnclampMSS removes the clamp. An interface that has none, or does not
+	// exist, returns nil.
+	UnclampMSS(name string) error
+}
+
 // replacePrefixes parses the two CIDRs a ReplaceAddress swaps. Both have to
 // be IPv4 and of one length: the mesh address is IPv4 alone, and every
 // controller's swap is written for IPv4.
