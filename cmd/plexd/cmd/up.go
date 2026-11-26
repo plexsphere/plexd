@@ -627,6 +627,8 @@ func runAgent(ctx context.Context) error {
 		if err := bridgeMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
 			return fmt.Errorf("plexd up: bridge setup: %w", err)
 		}
+		// Before the reconcile loop, so the relay's first start tries the kernel path.
+		bridgeMgr.EnableRelayKernelForwarding()
 
 		// The control plane delivers every user access provider; the keys
 		// of the local model still parse and are ignored, so a configuration

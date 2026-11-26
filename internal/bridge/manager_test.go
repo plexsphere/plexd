@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"fmt"
+	"runtime"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -402,6 +403,44 @@ func TestManager_NewManager_WithRelay(t *testing.T) {
 
 	if mgr.Relay() == nil {
 		t.Fatal("Relay() should not be nil when RelayEnabled is true")
+	}
+}
+
+func TestManager_EnableRelayKernelForwarding(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    true,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+	if err := mgr.Setup("plexd0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	relay := mgr.Relay()
+	if relay.newKernel != nil {
+		t.Fatal("newKernel is set after Setup, want nil until EnableRelayKernelForwarding")
+	}
+
+	// Configure is not called, so nothing is loaded into the kernel.
+	mgr.EnableRelayKernelForwarding()
+	if relay.meshIface != "plexd0" {
+		t.Errorf("meshIface = %q, want %q", relay.meshIface, "plexd0")
+	}
+	if wantKernel := runtime.GOOS == "linux"; (relay.newKernel != nil) != wantKernel {
+		t.Errorf("newKernel set = %t on %s, want %t", relay.newKernel != nil, runtime.GOOS, wantKernel)
+	}
+
+	// Without local relay consent there is no relay to enable.
+	cfg.RelayEnabled = false
+	noRelay := NewManager(ctrl, cfg, discardLogger())
+	if err := noRelay.Setup("plexd0"); err != nil {
+		t.Fatalf("Setup without relay consent: %v", err)
+	}
+	noRelay.EnableRelayKernelForwarding()
+	if noRelay.Relay() != nil {
+		t.Error("Relay() is set after EnableRelayKernelForwarding without relay consent, want nil")
 	}
 }
 
