@@ -102,6 +102,12 @@ type relayPeer struct {
 // as receiver go to owner, and partner is the other side. carried records that
 // a transport message named it, which is what shows the handshake completed: a
 // device that re-dialed in the meantime drops the response the relay forwarded.
+//
+// kernel is the flow the kernel holds a copy of for a session index, zero
+// while it holds none, and kernelRetryAt the time before which the relay does
+// not offer the index to the kernel again after the kernel refused it. The
+// table stays the original: the kernel copy is written from it and its ages
+// read back into used.
 type relayIndex struct {
 	pending bool
 	owner   *relayPeer
@@ -109,6 +115,9 @@ type relayIndex struct {
 	src     netip.AddrPort
 	used    time.Time
 	carried bool
+
+	kernel        relayKernelFlow
+	kernelRetryAt time.Time
 }
 
 // relayPair is two peers the relay forwarded a handshake for: the session
@@ -121,12 +130,16 @@ type relayPair struct {
 	heldAt  time.Time
 }
 
-// relayRun is one bound socket and the goroutines serving it.
+// relayRun is one bound socket and the goroutines serving it. kernel is the
+// path that forwards the transport datagrams of the run's placed sessions,
+// nil while the run forwards in the process; it is read and written under
+// Relay.mu.
 type relayRun struct {
 	conn    relayConn
 	port    int
 	limiter handshakeLimiter
 	boundAt time.Time // when the socket was bound, from Relay.now
+	kernel  relayKernel
 
 	stop       chan struct{} // closed to end the sweeper
 	dispatched chan struct{} // closed when the dispatch loop returns
@@ -140,6 +153,11 @@ type relayRun struct {
 // that hold a session waits for its retry, so a backlog that queued while the
 // relay was frozen cannot move them to it (see holdInitiation). It holds no
 // private or preshared key, decrypts nothing, and never answers a datagram.
+//
+// Where a kernel path runs, the relay hands it the transport datagrams of
+// the sessions it placed: it writes a copy of those session indices into the
+// kernel and reads back when the kernel last forwarded each. Every decision
+// stays here, and the kernel holds only what this table tells it.
 type Relay struct {
 	logger *slog.Logger
 
@@ -148,18 +166,32 @@ type Relay struct {
 	newLimiter func() handshakeLimiter
 	now        func() time.Time
 	maxIndices int
+	// newKernel starts the kernel path of a run on port. It is nil while the
+	// relay forwards in the process alone, which NewRelay leaves it at, and
+	// useKernel sets it.
+	newKernel func(port int) (relayKernel, error)
+
+	// meshIface is the mesh interface the kernel path asks for its routes,
+	// empty until useKernel sets it. useKernel writes newKernel and meshIface
+	// under both life and mu, so a reader holding either sees them.
+	meshIface string
 
 	// life serializes Configure and Stop, so a start and a stop never
 	// interleave.
 	life sync.Mutex
 
-	// mu guards run, peers, indices, pairs and fullWarnedAt.
+	// mu guards run, the kernel of run, peers, indices, pairs, fullWarnedAt,
+	// fwdDisabled and fwdDisabledWarnedAt.
 	mu           sync.Mutex
 	run          *relayRun
 	peers        map[device.NoisePublicKey]*relayPeer
 	indices      map[uint32]*relayIndex
 	pairs        map[[2]string]*relayPair
 	fullWarnedAt time.Time
+	// fwdDisabled is the kernel's fib_fwd_disabled counter at the last sweep,
+	// and fwdDisabledWarnedAt when its growth was last logged at Warn.
+	fwdDisabled         uint64
+	fwdDisabledWarnedAt time.Time
 }
 
 // NewRelay returns a relay that is not running. It opens no socket; Configure
@@ -239,8 +271,10 @@ func (r *Relay) Configure(listenPort int, peers []api.SnapshotPeer) error {
 	return nil
 }
 
-// start binds port and starts the dispatch loop and the sweeper. Callers
-// hold r.life.
+// start binds port, tries the kernel path once when newKernel is set, and
+// starts the dispatch loop and the sweeper. A kernel path that does not start
+// leaves the run forwarding in the process, which is how the relay worked
+// before it had one, so it fails nothing. Callers hold r.life.
 func (r *Relay) start(port int) error {
 	conn, err := r.listen(port)
 	if err != nil {
@@ -254,6 +288,15 @@ func (r *Relay) start(port int) error {
 		stop:       make(chan struct{}),
 		dispatched: make(chan struct{}),
 		swept:      make(chan struct{}),
+	}
+	if r.newKernel != nil {
+		k, err := r.newKernel(port)
+		if err != nil {
+			r.logger.Info("relay: kernel forwarding unavailable, forwarding in the process", "error", err)
+		} else {
+			run.kernel = k
+			r.logger.Info("relay: kernel forwarding started", "listen_port", port, "mesh_interface", r.meshIface)
+		}
 	}
 	r.mu.Lock()
 	r.run = run
@@ -293,6 +336,18 @@ func (r *Relay) stopLocked() {
 	close(run.stop)
 	<-run.dispatched
 	<-run.swept
+	// r.run is nil since the top, so nothing reaches run.kernel through it
+	// any more, and both goroutines are gone. Closing the kernel path detaches
+	// the program, so the kernel forwards no session of a stopped relay. Its
+	// methods are called with r.mu held, here as everywhere.
+	r.mu.Lock()
+	if run.kernel != nil {
+		if err := run.kernel.close(); err != nil {
+			r.logger.Debug("relay: kernel forwarding close failed", "error", err)
+		}
+		run.kernel = nil
+	}
+	r.mu.Unlock()
 	// Only now that the dispatch loop is gone: Close panics when called twice,
 	// and Allow after Close can panic.
 	run.limiter.Close()
@@ -302,6 +357,9 @@ func (r *Relay) stopLocked() {
 	r.indices = make(map[uint32]*relayIndex)
 	r.pairs = make(map[[2]string]*relayPair)
 	r.fullWarnedAt = time.Time{}
+	// The next run's program counts from 0.
+	r.fwdDisabled = 0
+	r.fwdDisabledWarnedAt = time.Time{}
 	r.mu.Unlock()
 
 	r.logger.Info("relay stopped", "listen_port", run.port)
@@ -337,11 +395,14 @@ func (r *Relay) ListenAddr() net.Addr {
 }
 
 // ActiveCount returns the number of distinct unordered peer pairs among the
-// session indices used within relayIndexTTL.
+// session indices used within relayIndexTTL. It reads the kernel's ages
+// first, because a session the kernel forwards moves no used here between
+// two sweeps.
 func (r *Relay) ActiveCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
+	r.kernelSync(now)
 	pairs := make(map[[2]string]struct{})
 	for _, idx := range r.indices {
 		if idx.pending || now.Sub(idx.used) >= relayIndexTTL {
@@ -392,7 +453,7 @@ func (r *Relay) setPeers(peers []api.SnapshotPeer) {
 	}
 	for i, idx := range r.indices {
 		if (idx.owner != nil && !kept[idx.owner]) || (idx.partner != nil && !kept[idx.partner]) {
-			delete(r.indices, i)
+			r.dropIndex(i)
 		}
 	}
 	r.peers = next
@@ -496,7 +557,7 @@ func (r *Relay) routeInitiation(b []byte, msg wgMessage, src netip.AddrPort, now
 	if !r.room(msg.sender, now) {
 		return dsts, "index_table_full"
 	}
-	r.indices[msg.sender] = &relayIndex{pending: true, partner: target, src: src, used: now}
+	r.setIndex(msg.sender, &relayIndex{pending: true, partner: target, src: src, used: now})
 
 	if direct {
 		return append(dsts, target.addr), ""
@@ -550,11 +611,17 @@ func (r *Relay) holdInitiation(target *relayPeer, src netip.AddrPort, now time.T
 // handshake that carried nothing may not have completed, and holding the next
 // attempt would delay a pair that has no session. It checks who owns the index
 // because another pair's handshake can overwrite it, and because two peers can
-// share a node ID and with it a pair key.
+// share a node ID and with it a pair key. An index the kernel holds has its
+// age read from the kernel first, since a session the kernel forwards moves
+// no used here between two sweeps.
 func (r *Relay) sessionLive(pair *relayPair, a, b *relayPeer, now time.Time) bool {
 	for _, i := range pair.indices {
 		idx, ok := r.indices[i]
-		if !ok || idx.pending || !idx.carried || now.Sub(idx.used) >= relayIndexTTL {
+		if !ok {
+			continue
+		}
+		r.kernelSyncIndex(i, idx, now)
+		if idx.pending || !idx.carried || now.Sub(idx.used) >= relayIndexTTL {
 			continue
 		}
 		if (idx.owner == a && idx.partner == b) || (idx.owner == b && idx.partner == a) {
@@ -592,8 +659,8 @@ func (r *Relay) routeResponse(b []byte, msg wgMessage, src netip.AddrPort, now t
 	target := pending.partner
 	r.learn(target, src, now)
 	r.learn(initiator, pending.src, now)
-	r.indices[msg.receiver] = &relayIndex{owner: initiator, partner: target, used: now}
-	r.indices[msg.sender] = &relayIndex{owner: target, partner: initiator, used: now}
+	r.setIndex(msg.receiver, &relayIndex{owner: initiator, partner: target, used: now})
+	r.setIndex(msg.sender, &relayIndex{owner: target, partner: initiator, used: now})
 	r.pairs[pairKey(initiator, target)] = &relayPair{indices: [2]uint32{msg.receiver, msg.sender}}
 	return append(dsts, pending.src), ""
 }
@@ -616,7 +683,9 @@ func (r *Relay) routeCookieReply(msg wgMessage, src netip.AddrPort, dsts []netip
 }
 
 // routeTransport forwards a transport message to the owner of its receiver
-// index, and learns the partner's address from it.
+// index, and learns the partner's address from it. It then offers the
+// session to the kernel, so that the next datagrams from src naming the index
+// go to dst without the process.
 func (r *Relay) routeTransport(msg wgMessage, src netip.AddrPort, now time.Time, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
 	idx, ok := r.indices[msg.receiver]
 	if !ok || idx.pending {
@@ -629,6 +698,7 @@ func (r *Relay) routeTransport(msg wgMessage, src netip.AddrPort, now time.Time,
 	r.learn(idx.partner, src, now)
 	idx.used = now
 	idx.carried = true
+	r.kernelForward(msg.receiver, idx, relayKernelFlow{partner: src, owner: dst}, now)
 	return append(dsts, dst), ""
 }
 
@@ -644,6 +714,11 @@ func (r *Relay) mac1Peer(b []byte, exclude *relayPeer) *relayPeer {
 }
 
 // fresh reports whether p has an address seen within relayIndexTTL.
+//
+// It reads seen without asking the kernel, so for a peer whose sessions the
+// kernel forwards, seen lags by up to relaySweepInterval. That cannot make a
+// live peer stale: its handshakes always pass the process, and one refreshes
+// seen at least every 120 s of traffic.
 func (r *Relay) fresh(p *relayPeer, now time.Time) bool {
 	return p.addr.IsValid() && now.Sub(p.seen) < relayIndexTTL
 }
@@ -684,18 +759,23 @@ func (r *Relay) fanout(src netip.AddrPort, now time.Time, dsts []netip.AddrPort)
 }
 
 // learn sets p's address to addr and marks it seen. The address is cleared
-// from any other peer that held it.
+// from any other peer that held it. Every session the kernel holds for p or
+// for such a peer leaves the kernel, which matched and sent its datagrams by
+// the old addresses.
 func (r *Relay) learn(p *relayPeer, addr netip.AddrPort, now time.Time) {
 	p.seen = now
 	if p.addr == addr {
 		return
 	}
+	var taken []*relayPeer
 	for _, other := range r.peers {
 		if other != p && other.addr == addr {
 			other.addr = netip.AddrPort{}
+			taken = append(taken, other)
 		}
 	}
 	p.addr = addr
+	r.kernelForgetPeers(append(taken, p)...)
 	r.logger.Info("relay: peer address learned", "peer_id", p.nodeID, "address", addr.String())
 }
 
@@ -735,6 +815,8 @@ func (r *Relay) sweepLoop(run *relayRun) {
 
 // sweep deletes pending indices older than relayFanoutWindow, session indices
 // unused for relayIndexTTL, and pairs with neither of their indices left.
+// While a kernel path runs, it also has the kernel resolve its routes again
+// and logs the kernel's counters.
 func (r *Relay) sweep(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -742,13 +824,17 @@ func (r *Relay) sweep(now time.Time) {
 }
 
 func (r *Relay) sweepLocked(now time.Time) {
+	// The kernel's ages come first: a session the kernel forwards moves no
+	// used here, and would otherwise expire relayIndexTTL after the last
+	// datagram the process forwarded itself, with its traffic still flowing.
+	r.kernelSync(now)
 	for i, idx := range r.indices {
 		ttl := relayIndexTTL
 		if idx.pending {
 			ttl = relayFanoutWindow
 		}
 		if now.Sub(idx.used) >= ttl {
-			delete(r.indices, i)
+			r.dropIndex(i)
 		}
 	}
 	for key, pair := range r.pairs {
@@ -756,6 +842,10 @@ func (r *Relay) sweepLocked(now time.Time) {
 			delete(r.pairs, key)
 		}
 	}
+	// A step that ends the kernel path on an error leaves the steps after it
+	// nothing to do: each finds run.kernel nil.
+	r.kernelRefresh()
+	r.kernelCounters(now)
 }
 
 // holdsIndex reports whether one of pair's indices is still a session index of
