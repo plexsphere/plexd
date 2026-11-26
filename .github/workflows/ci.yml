@@ -32,6 +32,22 @@ jobs:
         with:
           version: v2.12.2
 
+  # The relay's eBPF object is committed so that go build needs no clang, and
+  # nothing else ties it to its source. This job compiles relay.bpf.c with the
+  # toolchain the Makefile pins and fails when the result differs from the
+  # committed relay_bpfel.o, so the object is always what the source builds.
+  bpf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Rebuild the relay's eBPF object
+        run: make bpf
+
+      - name: Check the committed object
+        run: git diff --exit-code -- internal/bridge/relaybpf/relay_bpfel.o
+
   unit-test:
     runs-on: ${{ matrix.os }}
     # No measured Windows duration exists yet; the Linux job takes about a

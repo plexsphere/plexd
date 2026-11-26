@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e test-e2e-docker test-e2e-k8s test-e2e-systemd lint vet docker-build upgrade-fixture docs-figures
+.PHONY: build test test-e2e test-e2e-docker test-e2e-k8s test-e2e-systemd lint vet docker-build upgrade-fixture docs-figures bpf
 
 build:
 	go build ./...
@@ -30,6 +30,21 @@ vet:
 # figure change is an edit to the function followed by this target.
 docs-figures:
 	go run ./tools/docs-figures
+
+# bpf compiles the relay's eBPF program, internal/bridge/relaybpf/relay.bpf.c,
+# into relay_bpfel.o with the toolchain pinned in BPF_PACKAGES, inside a
+# container, so it needs Docker and no local clang. The object is committed,
+# so go build needs no clang either, and the CI job bpf runs this target and
+# fails when the result differs from the committed object. Run it after a
+# change to relay.bpf.c and commit the object with it. When Alpine replaces a
+# pinned package revision, apk add fails: raise that pin, run this target and
+# commit the object it builds.
+BPF_PACKAGES = clang20=20.1.8-r0 llvm20=20.1.8-r0 libbpf-dev=1.5.1-r0 linux-headers=6.14.2-r0
+bpf:
+	docker run --rm -v $(CURDIR)/internal/bridge/relaybpf:/src -w /src alpine:3.22 sh -c \
+		'apk add --no-cache -q $(BPF_PACKAGES) && \
+		clang -O2 -g -Wall -Werror -target bpf -mcpu=v2 -c relay.bpf.c -o relay_bpfel.o && \
+		llvm-strip -g relay_bpfel.o && chown $(shell id -u):$(shell id -g) relay_bpfel.o'
 
 docker-build:
 	docker build -f deploy/docker/Dockerfile \
