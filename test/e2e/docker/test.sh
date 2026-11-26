@@ -25,8 +25,8 @@
 #     with sockets on its UDP ports 9 and 7911 taking plexd's probes (phase
 #     12e step d1), and spliced values are set, kept across a null block and
 #     clamped (phase 12f)
-#   - Mesh MTU sized from the uplink probe and held by the device (same
-#     skip condition)
+#   - Mesh MTU sized from the uplink probe and held by the device, and the
+#     forwarded TCP MSS clamped to it minus 40 (same skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
@@ -1456,7 +1456,10 @@ fi
 # interface and logs the result on its "wireguard interface configured" line.
 # The uplink decides the value: a 1500-byte path gives 1420, a 1492-byte PPPoE
 # path 1412 and a 1452-byte path of DS-Lite over PPPoE 1372, so the phase
-# checks a range, never a fixed number.
+# checks a range, never a fixed number. Before it brings the interface up,
+# Setup clamps the MSS of forwarded TCP to that MTU minus 40 and logs the
+# value on a "wireguard: forwarded tcp mss clamped" line, which the phase
+# holds to the mtu of the configured line rather than to a number of its own.
 #
 # An inconclusive probe fails the phase rather than skipping it: phase 3f
 # already needs outbound UDP to both default STUN servers, so a probe that
@@ -1541,6 +1544,39 @@ else
         fail "no 'wireguard: mtu probe started' log line with interval=10m0s: step 17c did not start the re-probe loop"
     fi
     echo "  PASS: plexd logged 'wireguard: mtu probe started' with interval=10m0s"
+
+    # Besides a restart, only a re-probe round writes another clamp line, and
+    # the first one comes after this phase, so the first clamp line is the one
+    # Setup wrote at start. The leading space in " mss=" keeps " old_mss="
+    # from matching, and the one in " mtu=" any other key that ends in mtu, as
+    # above. The values are compared as strings, so one that is no number
+    # fails as well. The range check above keeps the MSS floor of 536 out of
+    # reach, so the clamp is always the mtu minus 40 here.
+    MSS_CLAMP_LINE=""
+    while IFS= read -r MTU_LOG_LINE; do
+        case "${MTU_LOG_LINE}" in
+            *"wireguard: forwarded tcp mss clamped"*) MSS_CLAMP_LINE=${MTU_LOG_LINE}; break ;;
+        esac
+    done <<< "${PLEXD_LOGS}"
+    if [ -z "${MSS_CLAMP_LINE}" ]; then
+        fail "no 'wireguard: forwarded tcp mss clamped' line in the plexd log: Setup programmed no clamp, look for a 'wireguard: forwarded tcp mss clamp failed' warning that names the error"
+    fi
+    MSS_LOGGED=""
+    case "${MSS_CLAMP_LINE}" in
+        *" mss="*) MSS_LOGGED=${MSS_CLAMP_LINE#* mss=}; MSS_LOGGED=${MSS_LOGGED%% *} ;;
+    esac
+    MSS_MTU_LOGGED=""
+    case "${MSS_CLAMP_LINE}" in
+        *" mtu="*) MSS_MTU_LOGGED=${MSS_CLAMP_LINE#* mtu=}; MSS_MTU_LOGGED=${MSS_MTU_LOGGED%% *} ;;
+    esac
+    if [ "${MSS_MTU_LOGGED}" != "${MTU_LOGGED}" ]; then
+        fail "the clamp line names mtu=${MSS_MTU_LOGGED:-<missing>}, want ${MTU_LOGGED}, the mtu of the 'wireguard interface configured' line (line: ${MSS_CLAMP_LINE})"
+    fi
+    MSS_WANT=$((MTU_LOGGED - 40))
+    if [ "${MSS_LOGGED}" != "${MSS_WANT}" ]; then
+        fail "the clamp line names mss=${MSS_LOGGED:-<missing>}, want ${MSS_WANT}, the logged mtu ${MTU_LOGGED} minus 40 (line: ${MSS_CLAMP_LINE})"
+    fi
+    echo "  PASS: plexd logged 'wireguard: forwarded tcp mss clamped' with mss=${MSS_LOGGED} and mtu=${MSS_MTU_LOGGED}, the logged mtu minus 40"
 
     echo "=== Phase 4e PASSED: mesh mtu ==="
 fi

@@ -16,10 +16,12 @@
 # CAP_NET_ADMIN, as the ingress rules' target: openssl serves TLS on three
 # ports, nc writes a banner, socat echoes UDP datagrams and runs
 # http-target.sh for each connection to two HTTP ports, and openssl, nc and
-# curl probe the bridge.
+# curl probe the bridge. The systemd suite's user access phase runs nft in
+# the bridge's network namespace to read the forwarded TCP MSS clamp, table
+# ip plexd-mss.
 FROM alpine:3.22
 
-RUN apk add --no-cache wireguard-tools iproute2 netcat-openbsd openssl socat curl
+RUN apk add --no-cache wireguard-tools iproute2 netcat-openbsd openssl socat curl nftables
 
 COPY --chmod=0755 http-target.sh /usr/local/bin/http-target.sh
 COPY --chmod=0755 rtt-echo.sh /usr/local/bin/rtt-echo.sh
