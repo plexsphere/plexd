@@ -110,8 +110,9 @@ Deletes the entire `plexd-nat` table. Lists all IPv4 tables, finds `plexd-nat`, 
 | `plexd`          | `internal/policy` | Firewall filter rules                        |
 | `plexd-nat`      | `internal/bridge` | NAT masquerade for bridge                    |
 | `plexd-mesh-nat` | `internal/bridge` | Mesh source rewrite of user access providers and site-to-site tunnels |
+| `plexd-mss`      | `internal/wireguard` | MSS clamp of forwarded TCP on the mesh interface |
 
-The tables are deliberately separated to avoid conflicts between the policy firewall and bridge NAT subsystems. `plexd-nat` cannot hold a second translation, because `AddNATMasquerade` flushes its chain and `RemoveNATMasquerade` deletes the table whole, so the mesh source rewrite has a table of its own.
+The tables are deliberately separated to avoid conflicts between the policy firewall and bridge NAT subsystems. `plexd-nat` cannot hold a second translation, because `AddNATMasquerade` flushes its chain and `RemoveNATMasquerade` deletes the table whole, so the mesh source rewrite has a table of its own. The MSS clamp is not a bridge table: every node writes it, a bridge or not, and the policy table cannot hold it, because a node with `policy.enabled: false` has no policy table (see [Forwarded TCP](../networking/wireguard.md#forwarded-tcp)).
 
 ## Mesh Source Rewrite
 
