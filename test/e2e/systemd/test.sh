@@ -62,8 +62,11 @@
 #     its own, with the pool's first address and a key file that survives a
 #     restart and a killed process, a device that reaches a mesh node only
 #     once the block admits it and arrives there with the bridge's mesh
-#     address, also after a pull moves that address and moves it back, a
-#     second provider on the port plexd0 holds reported
+#     address, also after a pull moves that address and moves it back, the
+#     forwarded TCP MSS clamp at plexd0's MTU minus 40 in both rules of
+#     table ip plexd-mss and on its journal line, with an oifname counter
+#     that the device's SYN at MTU 1500 raises, a second provider on the
+#     port plexd0 holds reported
 #     bind_failed, a tailscale provider whose Secret is fetched once the
 #     inventory lists it and whose missing client is reported, a removed
 #     provider whose interface and key file go, and the opt-out with
@@ -4238,6 +4241,98 @@ case "${UA_LISTEN}" in
 esac
 wait_user_access_report device "field-team up with one connected device" \
     '.providers[0] | .id == $id and .health == "up" and .connected_devices == 1' --arg id "${UA_FIELD_ID}"
+
+# 4a. The forwarded TCP MSS clamp. plexd lowers the MSS of the TCP SYNs that
+# cross plexd0 in either direction to plexd0's MTU minus 40, with the two
+# rules of table ip plexd-mss: one for iifname "plexd0" and one for oifname
+# "plexd0", each with a counter of the SYNs it lowered. The suite leaves
+# wireguard.mtu unset, so the uplink probe sizes plexd0 between 1280 and
+# 1420 and the floor of 536 never applies; the step reads the MTU from the
+# kernel rather than expecting a number. The running plexd logged the same
+# mss on its "wireguard: forwarded tcp mss clamped" line.
+#
+# The device's SYN then has to raise the counter of the oifname "plexd0"
+# rule. With wg0 at MTU 1500 the device announces MSS 1460, above every
+# clamp plexd programs (1380 at most), so the count does not depend on the
+# runner's uplink. The step compares the counter before and after the
+# probe, because on a node with a smaller mesh MTU the rule already lowered
+# the device's MSS of 1380 in step 4, and those SYNs alone would pass a
+# check for a count of at least 1. wg0 goes back to 1420, the WireGuard
+# default it came up with in step 3, right after the probe.
+#
+# ua_mss_table <tag> leaves what nft lists for table ip plexd-mss in
+# UA_MSS_TABLE, the rule for iifname "plexd0" in UA_MSS_IN_RULE, the rule
+# for oifname "plexd0" in UA_MSS_OUT_RULE and its counter packets value in
+# UA_MSS_COUNT. ClampMSS flushes the chain before it adds the two rules, so
+# the table must hold exactly one rule of each.
+ua_mss_table() {
+    local tag=$1 line n_in=0 n_out=0
+    UA_MSS_TABLE=$(bridge_netns nft list table ip plexd-mss 2>&1) \
+        || fail "[${tag}] nft list table ip plexd-mss failed: ${UA_MSS_TABLE}"
+    UA_MSS_IN_RULE=""
+    UA_MSS_OUT_RULE=""
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        case "${line}" in
+            'iifname "plexd0" '*) UA_MSS_IN_RULE=${line}; n_in=$((n_in + 1)) ;;
+            'oifname "plexd0" '*) UA_MSS_OUT_RULE=${line}; n_out=$((n_out + 1)) ;;
+        esac
+    done <<< "${UA_MSS_TABLE}"
+    if [ "${n_in}" -ne 1 ] || [ "${n_out}" -ne 1 ]; then
+        fail "[${tag}] table ip plexd-mss holds ${n_in} rule(s) for iifname \"plexd0\" and ${n_out} for oifname \"plexd0\", want one of each; nft printed: ${UA_MSS_TABLE}"
+    fi
+    UA_MSS_COUNT=""
+    case "${UA_MSS_OUT_RULE}" in
+        *" counter packets "*) UA_MSS_COUNT=${UA_MSS_OUT_RULE#* counter packets }; UA_MSS_COUNT=${UA_MSS_COUNT%% *} ;;
+    esac
+    case "${UA_MSS_COUNT}" in
+        "" | *[!0-9]*) fail "[${tag}] the oifname \"plexd0\" rule of table ip plexd-mss names no counter packets value: '${UA_MSS_OUT_RULE}'" ;;
+    esac
+}
+
+UA_MESH_MTU=$(docker exec "${SYSTEMD_CONTAINER}" cat /sys/class/net/plexd0/mtu 2>&1) \
+    || fail "[mss-clamp] reading /sys/class/net/plexd0/mtu failed: ${UA_MESH_MTU}"
+case "${UA_MESH_MTU}" in
+    "" | *[!0-9]*) fail "[mss-clamp] /sys/class/net/plexd0/mtu holds '${UA_MESH_MTU}', want a number" ;;
+esac
+if [ "${UA_MESH_MTU}" -lt 1280 ] || [ "${UA_MESH_MTU}" -gt 1420 ]; then
+    fail "[mss-clamp] plexd0 has mtu ${UA_MESH_MTU}, want 1280 to 1420"
+fi
+UA_MSS=$((UA_MESH_MTU - 40))
+ua_mss_table mss-clamp
+for UA_MSS_RULE in "${UA_MSS_IN_RULE}" "${UA_MSS_OUT_RULE}"; do
+    case "${UA_MSS_RULE}" in
+        *" maxseg size set ${UA_MSS}") ;;
+        *) fail "[mss-clamp] the rule '${UA_MSS_RULE}' of table ip plexd-mss does not end in 'maxseg size set ${UA_MSS}', plexd0's mtu ${UA_MESH_MTU} minus 40; nft printed: ${UA_MSS_TABLE}" ;;
+    esac
+done
+echo "  PASS: [mss-clamp] the iifname and the oifname \"plexd0\" rule of table ip plexd-mss each end in 'maxseg size set ${UA_MSS}', plexd0's mtu ${UA_MESH_MTU} minus 40"
+
+UA_MSS_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd 2>&1) \
+    || fail "[mss-clamp] systemctl show -p MainPID plexd failed: ${UA_MSS_PID}"
+ua_journal
+if ! journal_has "${UA_JOURNAL}" "plexd[${UA_MSS_PID}]:" 'msg="wireguard: forwarded tcp mss clamped"' " interface=plexd0" " mss=${UA_MSS}" " mtu=${UA_MESH_MTU}"; then
+    fail "[mss-clamp] plexd[${UA_MSS_PID}] logged no 'wireguard: forwarded tcp mss clamped' for plexd0 with mss=${UA_MSS} and mtu=${UA_MESH_MTU}; look for a 'wireguard: forwarded tcp mss clamp failed' warning that names the error"
+fi
+echo "  PASS: [mss-clamp] plexd[${UA_MSS_PID}] logged 'wireguard: forwarded tcp mss clamped' for plexd0 with mss=${UA_MSS} and mtu=${UA_MESH_MTU}"
+
+UA_MSS_COUNT_BEFORE=${UA_MSS_COUNT}
+UA_MSS_LINK=$(docker exec "${UA_DEVICE_CONTAINER}" ip link set wg0 mtu 1500 2>&1) \
+    || fail "[mss-clamp] setting the device's wg0 to mtu 1500 failed: ${UA_MSS_LINK}"
+UA_MSS_PROBED=yes
+ua_probe || UA_MSS_PROBED=no
+UA_MSS_LINK=$(docker exec "${UA_DEVICE_CONTAINER}" ip link set wg0 mtu 1420 2>&1) \
+    || fail "[mss-clamp] setting the device's wg0 back to mtu 1420 failed: ${UA_MSS_LINK}"
+if [ "${UA_MSS_PROBED}" = no ]; then
+    fail "[mss-clamp] the device reached no listener at 10.99.0.3:7101 through the bridge with wg0 at mtu 1500"
+fi
+echo "  PASS: [mss-clamp] the device reaches 10.99.0.3:7101 through the bridge with wg0 at mtu 1500"
+ua_mss_table mss-clamp
+if [ "${UA_MSS_COUNT}" -le "${UA_MSS_COUNT_BEFORE}" ]; then
+    fail "[mss-clamp] the counter of the oifname \"plexd0\" rule went from ${UA_MSS_COUNT_BEFORE} to ${UA_MSS_COUNT} across the device's connection at mtu 1500, want it to rise by at least 1: plexd did not lower the device's MSS of 1460 to ${UA_MSS}; nft printed: ${UA_MSS_TABLE}"
+fi
+echo "  PASS: [mss-clamp] the counter of the oifname \"plexd0\" rule rose from ${UA_MSS_COUNT_BEFORE} to ${UA_MSS_COUNT} with the device's SYN at MSS 1460"
 
 # 5. A move of the bridge's mesh address. POST /test/readdress moves the node
 # to 10.99.0.9, and a node_state_updated event makes plexd pull now. plexd
