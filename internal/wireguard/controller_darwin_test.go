@@ -1128,6 +1128,127 @@ func TestDarwinController_PeerOperations_Unknown(t *testing.T) {
 	}
 }
 
+// darwinClamp returns the MSS clamp the controller recorded for name, and
+// whether it recorded one.
+func darwinClamp(c *DarwinController, name string) (*mssClampTUN, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clamp, ok := c.clamps[name]
+	return clamp, ok
+}
+
+func TestDarwinController_ClampMSS(t *testing.T) {
+	c, runner, tuns := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+
+	clamp, ok := darwinClamp(c, "plexd0")
+	if !ok {
+		t.Fatal("CreateInterface recorded no MSS clamp")
+	}
+	if clamp.Device != tun.Device(tuns.only(t)) {
+		t.Errorf("the clamp wraps %T, want the device createTUN returned", clamp.Device)
+	}
+	if got := clamp.mss.Load(); got != 0 {
+		t.Errorf("mss after CreateInterface = %d, want 0", got)
+	}
+
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS(1332) = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 1332 {
+		t.Errorf("mss after ClampMSS(1332) = %d, want 1332", got)
+	}
+	if err := c.ClampMSS("plexd0", 1380); err != nil {
+		t.Fatalf("ClampMSS(1380) = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 1380 {
+		t.Errorf("mss after a second ClampMSS(1380) = %d, want 1380", got)
+	}
+
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Fatalf("UnclampMSS = %v, want nil", err)
+	}
+	if got := clamp.mss.Load(); got != 0 {
+		t.Errorf("mss after UnclampMSS = %d, want 0", got)
+	}
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Errorf("second UnclampMSS = %v, want nil", err)
+	}
+
+	// The clamp is in process, so no host command runs.
+	assertArgv(t, runner)
+}
+
+func TestDarwinController_ClampMSS_Unknown(t *testing.T) {
+	c, _, _ := newTestDarwinController(t)
+
+	err := c.ClampMSS("plexd0", 1332)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ClampMSS = %v, want os.ErrNotExist", err)
+	}
+	assertPrefix(t, err, "wireguard: clamp mss: ")
+
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Errorf("UnclampMSS of an unknown name = %v, want nil", err)
+	}
+}
+
+func TestDarwinController_ClampMSS_Invalid(t *testing.T) {
+	c, _, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS(1332) = %v, want nil", err)
+	}
+	clamp, _ := darwinClamp(c, "plexd0")
+
+	for _, mss := range []int{0, -1, 65536} {
+		err := c.ClampMSS("plexd0", mss)
+		if want := fmt.Sprintf("wireguard: clamp mss: invalid mss %d", mss); err == nil || err.Error() != want {
+			t.Errorf("ClampMSS(%d) = %v, want %q", mss, err, want)
+		}
+		if got := clamp.mss.Load(); got != 1332 {
+			t.Errorf("mss after ClampMSS(%d) = %d, want 1332 kept", mss, got)
+		}
+	}
+
+	// The value is checked before the name.
+	if err := c.ClampMSS("plexd9", 0); err == nil || err.Error() != "wireguard: clamp mss: invalid mss 0" {
+		t.Errorf("ClampMSS of an unknown name with 0 = %v, want the invalid mss error", err)
+	}
+}
+
+func TestDarwinController_CreateInterface_FailureRecordsNoClamp(t *testing.T) {
+	c, _, _ := newTestDarwinController(t)
+
+	if err := c.CreateInterface("plexd0", nil, 0); err == nil {
+		t.Fatal("CreateInterface with a nil key = nil, want an error")
+	}
+	if _, ok := darwinClamp(c, "plexd0"); ok {
+		t.Error("an MSS clamp recorded despite the failure")
+	}
+}
+
+func TestDarwinController_DeleteInterface_ForgetsClamp(t *testing.T) {
+	c, _, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	if err := c.ClampMSS("plexd0", 1332); err != nil {
+		t.Fatalf("ClampMSS = %v, want nil", err)
+	}
+
+	if err := c.DeleteInterface("plexd0"); err != nil {
+		t.Fatalf("DeleteInterface: %v", err)
+	}
+	if _, ok := darwinClamp(c, "plexd0"); ok {
+		t.Error("the MSS clamp is still recorded after DeleteInterface")
+	}
+	if err := c.ClampMSS("plexd0", 1332); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ClampMSS after DeleteInterface = %v, want os.ErrNotExist", err)
+	}
+	if err := c.UnclampMSS("plexd0"); err != nil {
+		t.Errorf("UnclampMSS after DeleteInterface = %v, want nil", err)
+	}
+}
+
 // TestDarwinController_RealUTUN drives the production seams against the
 // kernel: a real utun, real ifconfig and route calls, and the real UAPI socket.
 // It is the only test that proves the command lines the fakes above assert are
