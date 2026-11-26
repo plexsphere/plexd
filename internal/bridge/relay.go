@@ -57,6 +57,14 @@ const (
 	relayFullWarnInterval = time.Minute
 
 	relayBufSize = 65535
+
+	// relaySocketBuffer is the size the relay asks for on its socket's receive
+	// and send buffers. It is what wireguard-go asks for on its own sockets.
+	// macOS lowers it to kern.ipc.maxsockbuf, 8 MiB by default and less on a
+	// host with little memory. With the default buffer of a few hundred
+	// kilobytes a relayed TCP stream overran the socket while the dispatch
+	// loop was busy, and the kernel dropped what did not fit.
+	relaySocketBuffer = 7 << 20
 )
 
 // relayConn is the part of *net.UDPConn the relay uses, so a test can inject
@@ -157,9 +165,8 @@ type Relay struct {
 // NewRelay returns a relay that is not running. It opens no socket; Configure
 // starts it.
 func NewRelay(logger *slog.Logger) *Relay {
-	return &Relay{
+	r := &Relay{
 		logger:     logger.With("component", "bridge"),
-		listen:     listenRelay,
 		newLimiter: newHandshakeLimiter,
 		now:        time.Now,
 		maxIndices: relayMaxIndices,
@@ -167,13 +174,28 @@ func NewRelay(logger *slog.Logger) *Relay {
 		indices:    make(map[uint32]*relayIndex),
 		pairs:      make(map[[2]string]*relayPair),
 	}
+	r.listen = r.listenUDP
+	return r
 }
 
-// listenRelay binds UDP port on the dual-stack wildcard address.
-func listenRelay(port int) (relayConn, error) {
+// listenUDP binds UDP port on the dual-stack wildcard address and asks for
+// relaySocketBuffer bytes each way, forcing them past the host's limit where
+// the platform allows. No failure to size the buffers fails the bind: a
+// refused size leaves the socket with what the OS gave it, and the Debug line
+// shows what that is.
+func (r *Relay) listenUDP(port int) (relayConn, error) {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
 		return nil, err
+	}
+	_ = conn.SetReadBuffer(relaySocketBuffer)
+	_ = conn.SetWriteBuffer(relaySocketBuffer)
+	_ = forceRelayBuffers(conn)
+	receive, send, err := relayBufferSizes(conn)
+	if err != nil {
+		r.logger.Debug("relay: socket buffers set", "error", err)
+	} else {
+		r.logger.Debug("relay: socket buffers set", "receive_bytes", receive, "send_bytes", send)
 	}
 	return conn, nil
 }

@@ -9,6 +9,9 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1748,6 +1751,86 @@ func TestRelay_ConfigureBindsTheWildcardAddress(t *testing.T) {
 	if !ok || addr.Port != port || !addr.IP.IsUnspecified() {
 		t.Errorf("ListenAddr = %s, want the wildcard address on port %d", addr, port)
 	}
+}
+
+// TestRelay_SocketBuffers binds through the default listener and checks the
+// buffer sizes the OS granted and the Debug line that reports them. Linux
+// reports twice the size set, and caps an unprivileged request at
+// net.core.rmem_max and wmem_max. macOS lowers a request above
+// kern.ipc.maxsockbuf to that limit. A bind whose sizes were capped still
+// succeeds, which an unprivileged run on Linux shows.
+func TestRelay_SocketBuffers(t *testing.T) {
+	logger, logs := newRelayLogger()
+	r := NewRelay(logger)
+	// Port 0 lets the kernel pick a free port. A port probed and closed first
+	// could be taken by another test before the bind.
+	conn, err := r.listen(0)
+	if err != nil {
+		t.Fatalf("listen(0): %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	receive, send, err := relayBufferSizes(conn.(*net.UDPConn))
+	if err != nil {
+		t.Fatalf("relayBufferSizes: %v", err)
+	}
+	switch {
+	case runtime.GOOS == "linux" && os.Geteuid() == 0:
+		if receive != 14_680_064 || send != 14_680_064 {
+			t.Errorf("as root: receive %d, send %d bytes; want 14680064 each way", receive, send)
+		}
+	case runtime.GOOS == "linux":
+		wantReceive := 2 * min(7_340_032, readProcInt(t, "/proc/sys/net/core/rmem_max"))
+		wantSend := 2 * min(7_340_032, readProcInt(t, "/proc/sys/net/core/wmem_max"))
+		if receive != wantReceive || send != wantSend {
+			t.Errorf("unprivileged: receive %d, send %d bytes; want %d and %d", receive, send, wantReceive, wantSend)
+		}
+	case runtime.GOOS == "darwin":
+		limit := maxSockBuf(t)
+		want := min(7_340_032, limit)
+		if receive != want || send != want {
+			t.Errorf("receive %d, send %d bytes; want %d each way, the smaller of 7340032 and kern.ipc.maxsockbuf %d", receive, send, want, limit)
+		}
+	default:
+		if receive < 7_340_032 || send < 7_340_032 {
+			t.Errorf("receive %d, send %d bytes; want at least 7340032 each way", receive, send)
+		}
+	}
+
+	granted := func(n int) int {
+		if runtime.GOOS == "linux" {
+			return n / 2
+		}
+		return n
+	}
+	if granted(receive) < relaySocketBuffer || granted(send) < relaySocketBuffer {
+		t.Logf("the OS granted less than the %d bytes asked: receive %d, send %d bytes as read back", relaySocketBuffer, receive, send)
+	} else {
+		t.Logf("the OS granted the %d bytes asked: receive %d, send %d bytes as read back", relaySocketBuffer, receive, send)
+	}
+
+	const line = `msg="relay: socket buffers set"`
+	if n := logs.count(line); n != 1 {
+		t.Errorf("%s logged %d times, want once:\n%s", line, n, logs.String())
+	}
+	want := fmt.Sprintf(`level=DEBUG msg="relay: socket buffers set" component=bridge receive_bytes=%d send_bytes=%d`+"\n", receive, send)
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("log lacks %q:\n%s", want, logs.String())
+	}
+}
+
+// readProcInt reads the integer a /proc file holds.
+func readProcInt(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return n
 }
 
 func TestRelay_StopIsIdempotent(t *testing.T) {
