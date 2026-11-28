@@ -990,6 +990,43 @@ func TestIngressHTTP_FailoverKeepsTheRequestBody(t *testing.T) {
 	}
 }
 
+// TestIngressRetryBody_EndsWithoutTheClosedBody reads a request body with
+// Content-Length through an ingressRetryBody as http.Transport sends one, its
+// length and then one read more for the end, and closes the server's request
+// body before that last read, as the HTTP server closes a body it has read
+// whole when the handler writes its header. The last read returns io.EOF and
+// never reaches the closed body.
+func TestIngressRetryBody_EndsWithoutTheClosedBody(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789"), 10_000)
+	type result struct {
+		n               int64
+		readErr, endErr error
+	}
+	done := make(chan result, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		body := &ingressRetryBody{body: r.Body}
+		var res result
+		res.n, res.readErr = io.Copy(io.Discard, io.LimitReader(body, r.ContentLength))
+		_ = r.Body.Close()
+		_, res.endErr = io.Copy(io.Discard, body)
+		done <- res
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := srv.Client().Post(srv.URL, "application/octet-stream", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	res := <-done
+	if res.readErr != nil || res.n != int64(len(payload)) {
+		t.Fatalf("read %d bytes with %v, want the %d sent", res.n, res.readErr, len(payload))
+	}
+	if res.endErr != nil {
+		t.Errorf("the read after the length: %v, want io.EOF", res.endErr)
+	}
+}
+
 // TestIngressHTTP_AllTargetsFail answers a request no target of its rule
 // takes with 502, or 504 when the last dial timed out, and reports the rule
 // failed with the reason of the last dial.
