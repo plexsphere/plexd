@@ -5873,11 +5873,13 @@ func sealUpEdgePSK(t *testing.T, nsk, key []byte, self, peer, epoch string) []by
 
 // pskControlPlane registers the node, serves a state pull with one peer that
 // carries a direct endpoint, and serves that peer's edge PSK sealed under the
-// node's NSK. It counts state pulls and PSK requests.
+// node's NSK. It counts state pulls and PSK requests. The pull carries policy
+// when a test set one.
 type pskControlPlane struct {
 	mu          sync.Mutex
 	statePulls  int
 	pskRequests []string
+	policy      *api.PolicySnapshot
 }
 
 func newPSKControlPlane(t *testing.T) (*pskControlPlane, string) {
@@ -5901,6 +5903,7 @@ func newPSKControlPlane(t *testing.T) (*pskControlPlane, string) {
 		case strings.HasSuffix(r.URL.Path, "/state"):
 			cp.mu.Lock()
 			cp.statePulls++
+			policy := cp.policy
 			cp.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(api.NodeStateSnapshot{
@@ -5911,6 +5914,7 @@ func newPSKControlPlane(t *testing.T) (*pskControlPlane, string) {
 					Endpoint:         upPSKPeerDirect,
 					FallbackEndpoint: "203.0.113.1:51820",
 				}},
+				Policy: policy,
 			})
 			return
 		case strings.HasSuffix(r.URL.Path, "/psk"):
@@ -5929,6 +5933,13 @@ func newPSKControlPlane(t *testing.T) (*pskControlPlane, string) {
 	}))
 	t.Cleanup(srv.Close)
 	return cp, srv.URL
+}
+
+// servePolicy makes every later state pull carry policy.
+func (cp *pskControlPlane) servePolicy(policy *api.PolicySnapshot) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.policy = policy
 }
 
 func (cp *pskControlPlane) counts() (statePulls, pskRequests int) {
