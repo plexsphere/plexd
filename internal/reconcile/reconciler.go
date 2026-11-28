@@ -35,6 +35,7 @@ type Reconciler struct {
 	snapshot         *stateSnapshot
 	handlers         []ReconcileHandler
 	dispatchHandlers []DispatchHandler
+	withdrawHandlers []WithdrawHandler
 	triggerCh        chan struct{}
 
 	// The fields below belong to the reconcile goroutine, or to the caller
@@ -59,6 +60,12 @@ type Reconciler struct {
 	reapply bool
 	// observer runs at the end of every cycle whose fetch succeeded.
 	observer DispatchHandler
+	// withdrawn is set by a withdrawal and cleared by the next successful
+	// fetch; while it is set, the expiry timer stays disarmed.
+	withdrawn bool
+	// pending is a withdrawal a handler failed on, retried on every cycle
+	// whose fetch fails; nil for none.
+	pending *pendingWithdrawal
 }
 
 // NewReconciler creates a new Reconciler with the given configuration.
@@ -115,7 +122,10 @@ func (r *Reconciler) TriggerReconcile() {
 
 // Run starts the reconciliation loop. It blocks until ctx is cancelled.
 // The first cycle runs immediately; subsequent cycles run at cfg.Interval
-// or when TriggerReconcile is called.
+// or when TriggerReconcile is called. Under a maximum age (see
+// SetMaxAgeSeconds), a timer armed after every cycle fires when the last
+// successful pull, or the restore, grows older than MaxAge, and Run then
+// withdraws the desired state.
 func (r *Reconciler) Run(ctx context.Context, nodeID string) error {
 	if r.client == nil {
 		return errors.New("reconcile: client is nil")
@@ -130,8 +140,26 @@ func (r *Reconciler) Run(ctx context.Context, nodeID string) error {
 		"interval", r.cfg.Interval,
 	)
 
+	// The expiry timer is armed for the time the desired state passes its
+	// maximum age, and disarmed while there is none. A cycle runs between
+	// two selects, so re-arming after every cycle also covers a Restore
+	// before Run.
+	expiry := time.NewTimer(time.Hour)
+	expiry.Stop()
+	defer expiry.Stop()
+	var expired <-chan time.Time
+	rearm := func() {
+		expiry.Stop()
+		expired = nil
+		if d, ok := r.expiryIn(); ok {
+			expiry.Reset(d)
+			expired = expiry.C
+		}
+	}
+
 	// First cycle runs immediately.
 	r.runCycle(ctx, nodeID)
+	rearm()
 
 	ticker := time.NewTicker(r.cfg.Interval)
 	defer ticker.Stop()
@@ -147,18 +175,30 @@ func (r *Reconciler) Run(ctx context.Context, nodeID string) error {
 
 		case <-ticker.C:
 			r.runCycle(ctx, nodeID)
+			rearm()
 
 		case <-r.triggerCh:
 			r.runCycle(ctx, nodeID)
 			// Reset the ticker after a triggered cycle.
 			ticker.Reset(r.cfg.Interval)
+			rearm()
+
+		case <-expired:
+			// The timer runs on the wall clock and the age on r.now, so the
+			// age is checked again before anything is withdrawn.
+			if d, ok := r.expiryIn(); ok && d <= 0 {
+				r.withdraw(ctx)
+			}
+			rearm()
 		}
 	}
 }
 
 // runCycle performs a single reconciliation cycle: fetch → diff → handle → update snapshot.
 // A successful fetch records the time of the pull and takes the pull's
-// state_freshness block before any handler runs.
+// state_freshness block before any handler runs, and it drops a pending
+// withdrawal in favour of reapply; a failed fetch retries a pending
+// withdrawal.
 func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	start := time.Now()
 
@@ -179,9 +219,17 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 				"error", err,
 			)
 		}
+		r.retryWithdrawal(ctx)
 		return
 	}
 	r.lastPull = r.now()
+	r.withdrawn = false
+	if r.pending != nil {
+		// The pull replaces the withdrawal: this cycle removes what the pull
+		// no longer lists and writes every pulled peer again.
+		r.pending = nil
+		r.reapply = true
+	}
 	r.takeFreshness(desired.StateFreshness)
 
 	// Delivery-queue blocks are consumed on every successful pull: an unchanged
