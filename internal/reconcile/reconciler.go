@@ -36,6 +36,22 @@ type Reconciler struct {
 	handlers         []ReconcileHandler
 	dispatchHandlers []DispatchHandler
 	triggerCh        chan struct{}
+
+	// The fields below belong to the reconcile goroutine, or to the caller
+	// before Run, and need no lock.
+
+	// now is the clock the maximum age is measured with.
+	now func() time.Time
+	// lastPull is when FetchState last returned without error.
+	lastPull time.Time
+	// maxAgeSeconds is the maximum age of the desired state as the control
+	// plane set it; 0 for none.
+	maxAgeSeconds int64
+	// freshnessMalformed, freshnessOutOfRange and freshnessOutOfRangeRaw keep
+	// takeFreshness's Warn lines to one per run.
+	freshnessMalformed     bool
+	freshnessOutOfRange    bool
+	freshnessOutOfRangeRaw int64
 }
 
 // NewReconciler creates a new Reconciler with the given configuration.
@@ -48,6 +64,7 @@ func NewReconciler(client StateFetcher, cfg Config, logger *slog.Logger) *Reconc
 		logger:    logger,
 		snapshot:  NewStateSnapshot(),
 		triggerCh: make(chan struct{}, 1),
+		now:       time.Now,
 	}
 }
 
@@ -121,6 +138,8 @@ func (r *Reconciler) Run(ctx context.Context, nodeID string) error {
 }
 
 // runCycle performs a single reconciliation cycle: fetch → diff → handle → update snapshot.
+// A successful fetch records the time of the pull and takes the pull's
+// state_freshness block before any handler runs.
 func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	start := time.Now()
 
@@ -143,6 +162,8 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 		}
 		return
 	}
+	r.lastPull = r.now()
+	r.takeFreshness(desired.StateFreshness)
 
 	// Delivery-queue blocks are consumed on every successful pull: an unchanged
 	// snapshot must still redeliver entries, so dispatch runs before the
