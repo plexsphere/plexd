@@ -68,6 +68,11 @@
 #     writes it to identity.json, answers mesh DNS on it, ends the tcp session
 #     bound to the old address, reports it in system.info, is reached at it by
 #     meshpeer, starts from it after a restart, and moves back (phase 12g)
+#   - A restart without the control plane: with the mock paused, the restarted
+#     plexd restores the stored peers, their PSKs and the policy, meshpeer
+#     completes a handshake and the policy probes answer as before; once the
+#     mock answers, the first pull changes no peer and applies no ruleset
+#     again (phase 12h)
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
@@ -94,6 +99,9 @@ COMPOSE_FILE="${SCRIPT_DIR}/../docker-compose.yml"
 PROJECT_NAME="plexd-e2e"
 ASSERT_URL="http://localhost:18080/test/assertions"
 TEST_FAILED=1
+# Set while Phase 12h holds the mock-api container paused, so the EXIT trap
+# unpauses it first.
+MOCK_PAUSED=0
 
 dc() { docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" "$@"; }
 
@@ -482,6 +490,10 @@ SECNUDGEEOF
 
 cleanup() {
     echo "--- Cleaning up docker compose resources ---"
+    if [ "${MOCK_PAUSED}" -eq 1 ]; then
+        dc unpause mock-api >/dev/null 2>&1 || true
+        MOCK_PAUSED=0
+    fi
     if [ "${TEST_FAILED}" -ne 0 ]; then
         echo "--- Container logs (on failure) ---"
         dc logs 2>/dev/null || true
@@ -7637,6 +7649,244 @@ fi
 echo "  PASS: [readdress restore] the mock serves mesh_ip ${READDR_OLD_IP}, the saved peers and policy, and an empty sessions block again"
 
 echo "=== Phase 12g PASSED: the state pull changes the mesh address ==="
+
+# ===================================================================
+# Phase 12h: a restart without the control plane
+# ===================================================================
+# plexd keeps the desired state of its last successful pull in
+# /var/lib/plexd/desired-state.json and applies it at start, before its first
+# pull. The phase restarts plexd while the mock-api container is paused, so no
+# request reaches the control plane, and asserts that the restarted plexd
+# comes back with what it last applied:
+#
+#   (a) the phase saves the peers and the policy the mock serves, for (h)
+#   (b) meshpeer's wg0 comes back as in Phase 12g step (b), with the edge PSK
+#       of peer ...a0b2 and a 5 s keepalive, and completes a handshake
+#   (c) a one-rule policy admits meshpeer to port 7001 of plexd, and the
+#       probes see 7001 open, 7002 closed and meshpeer's 7003 closed
+#   (d) the stored state names meshpeer's key and the policy's fingerprint
+#   (e) with mock-api paused, dc restart plexd; within 60 s plexd logs
+#       "stored state restored", meshpeer completes a handshake newer than
+#       the restart (plexd holds the stored peer with its stored PSK), and
+#       the probes of (c) answer as before the restart
+#   (f) mock-api unpaused, state_count rises, and since the restart no
+#       "reconciliation cycle completed" line carries peers+ in its drift
+#       (the first pull changed no peer), "policy ruleset applied" was logged
+#       once (by the restore; the pull found the same fingerprint), and
+#       registration_count did not change
+#   (g) meshpeer's wg0 goes, and (h) the saved peers and policy are served
+#       again, so the phases after this one meet the fixture they expect
+#
+# fail and the EXIT trap unpause the mock while MOCK_PAUSED is set. Like
+# Phase 12e it needs kernel WireGuard and fails without it.
+echo "=== Testing a restart without the control plane ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    fail "[restart offline] WireGuard did not come up in the plexd container: the phase needs meshpeer's tunnel to plexd"
+fi
+
+OFFLINE_REV="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0cb"
+OFFLINE_STORE=/var/lib/plexd/desired-state.json
+
+# offline_probes <tag> runs the probes the one-rule policy of (c) decides.
+offline_probes() {
+    probe_plexd_port "$1" 7001 open
+    probe_plexd_port "$1" 7002 closed
+    probe_meshpeer_port "$1" 7003 closed
+}
+
+# (a) What (h) serves again.
+OFFLINE_STATE=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>&1) \
+    || fail "[restart offline] reading the live node state snapshot failed: ${OFFLINE_STATE}"
+OFFLINE_SAVED=$(printf '%s' "${OFFLINE_STATE}" | jq -c '{peers: .peers, policy: .policy}' 2>&1) \
+    || fail "[restart offline] jq could not read the live node state snapshot: ${OFFLINE_SAVED}"
+OFFLINE_SAVED_RULES=$(printf '%s' "${OFFLINE_SAVED}" | jq -r '.policy.rules | length' 2>&1) \
+    || fail "[restart offline] jq could not count the rules of the saved policy: ${OFFLINE_SAVED_RULES}"
+OFFLINE_SAVED_REV=$(printf '%s' "${OFFLINE_SAVED}" | jq -r '.policy.revision_id // empty' 2>&1) \
+    || fail "[restart offline] jq could not read the revision of the saved policy: ${OFFLINE_SAVED_REV}"
+if [ "${OFFLINE_SAVED_REV}" != "${FIXTURE_POLICY_REVISION}" ]; then
+    fail "[restart offline] the mock serves policy revision '${OFFLINE_SAVED_REV}', want the fixture's ${FIXTURE_POLICY_REVISION} after Phase 12g"
+fi
+
+# (b) meshpeer's wg0, and peer ...a0b2 becomes meshpeer.
+OFFLINE_SETUP_OUT=$(dc exec -T meshpeer sh -euc "${MESH_SETUP}" sh "${PLEXD_PUBKEY}" "${FIXTURE_PEER_B2}" "${MESH_NODE_IP}" "${MESH_PEER_IP}" 2>&1) \
+    || fail "[restart offline] setting up wg0 in meshpeer failed: ${OFFLINE_SETUP_OUT}"
+OFFLINE_MESHPEER_PUBKEY=${OFFLINE_SETUP_OUT##*$'\n'}
+case "${OFFLINE_MESHPEER_PUBKEY}" in
+    *[!A-Za-z0-9+/=]* | '') fail "[restart offline] meshpeer's wg0 setup printed '${OFFLINE_SETUP_OUT}', want its public key on the last line" ;;
+esac
+if [ "${#OFFLINE_MESHPEER_PUBKEY}" -ne 44 ]; then
+    fail "[restart offline] meshpeer's wg0 setup printed '${OFFLINE_SETUP_OUT}', want its 44-character public key on the last line"
+fi
+splice_state "restart-offline-peer" \
+    '.peers |= map(if .node_id == $v.id then .public_key = $v.key | .endpoint = $v.endpoint else . end)' \
+    "$(jq -cn --arg id "${FIXTURE_PEER_B2}" --arg key "${OFFLINE_MESHPEER_PUBKEY}" --arg endpoint "${MESHPEER_IP}:51820" \
+        '{id: $id, key: $key, endpoint: $endpoint}')"
+
+# offline_handshake_after <tag> <held-s> <not-before-s> waits up to 60 s for
+# meshpeer's wg0 to report a handshake with plexd other than the one at
+# held-s, the latest it reported before, and not before not-before-s, and
+# leaves its time in OFFLINE_HS_TIME. wg prints whole seconds, so a handshake
+# in the second the restart began reads the same as that second: the
+# comparison with held-s is what tells it from the handshake before.
+offline_handshake_after() {
+    local tag=$1 held=$2 not_before=$3 start=${SECONDS} hs
+    while :; do
+        hs=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+            || fail "[${tag}] wg show wg0 latest-handshakes in meshpeer failed: ${hs}"
+        OFFLINE_HS_TIME=${hs##*[[:space:]]}
+        case "${OFFLINE_HS_TIME}" in
+            *[!0-9]* | '') OFFLINE_HS_TIME=0 ;;
+        esac
+        if [ "${OFFLINE_HS_TIME}" -gt "${held}" ] && [ "${OFFLINE_HS_TIME}" -ge "${not_before}" ]; then
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge 60 ]; then
+            fail "[${tag}] meshpeer completed no handshake with plexd after the one at ${held} and not before ${not_before} within 60s (latest ${OFFLINE_HS_TIME}); wg show wg0: $(dc exec -T meshpeer wg show wg0 2>&1)"
+        fi
+        sleep 2
+    done
+}
+offline_handshake_after "restart offline peer" 0 0
+echo "  PASS: [restart offline peer] meshpeer completed a handshake with plexd"
+
+# (c) The one-rule policy and the probes it decides.
+OFFLINE_RULES=$(jq -cn --arg src "${MESH_PEER_IP}/32" --arg dst "${MESH_NODE_IP}/32" \
+    '[{protocol: "tcp", source_cidr: $src, destination_cidr: $dst, ports: {from: 7001, to: 7001}}]' 2>&1) \
+    || fail "[restart offline] could not build the rules of the policy: ${OFFLINE_RULES}"
+serve_policy "restart-offline-policy" "${OFFLINE_REV}" "${OFFLINE_RULES}"
+OFFLINE_FP=${SERVED_FP}
+expect_policy_applied "restart offline policy" "${OFFLINE_REV}" 1
+offline_probes "restart offline before"
+
+# (d) The cycle observer writes the stored state at the end of the cycle that
+# applied the policy, so it soon names both.
+OFFLINE_START=${SECONDS}
+while :; do
+    OFFLINE_STORED=$(dc exec -T plexd head -c 262144 "${OFFLINE_STORE}" 2>&1) || OFFLINE_STORED=""
+    case "${OFFLINE_STORED}" in
+        *"\"fingerprint\":\"${OFFLINE_FP}\""*"\"public_key\":\"${OFFLINE_MESHPEER_PUBKEY}\""* | \
+            *"\"public_key\":\"${OFFLINE_MESHPEER_PUBKEY}\""*"\"fingerprint\":\"${OFFLINE_FP}\""*) break ;;
+    esac
+    if [ $((SECONDS - OFFLINE_START)) -ge 20 ]; then
+        fail "[restart offline store] 20s after the policy applied, ${OFFLINE_STORE} does not name meshpeer's key ${OFFLINE_MESHPEER_PUBKEY} and the fingerprint ${OFFLINE_FP} (read: ${OFFLINE_STORED:0:600})"
+    fi
+    sleep 1
+done
+echo "  PASS: [restart offline store] ${OFFLINE_STORE} names meshpeer's key and the policy's fingerprint"
+
+# (e) The restart with the control plane paused. The log of the container
+# keeps the lines of the run before the restart, so OFFLINE_LOG_BASE lines
+# into it is where the restarted run begins.
+OFFLINE_LOG=$(dc logs --no-log-prefix plexd 2>&1) || fail "[restart offline] dc logs plexd failed: ${OFFLINE_LOG}"
+OFFLINE_LOG_BASE=$(printf '%s\n' "${OFFLINE_LOG}" | wc -l)
+OFFLINE_RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+OFFLINE_REG_BEFORE=$(get_counter "${OFFLINE_RESPONSE}" registration_count)
+OFFLINE_PULLS_BEFORE=$(get_counter "${OFFLINE_RESPONSE}" state_count)
+for OFFLINE_COUNT in "${OFFLINE_REG_BEFORE}" "${OFFLINE_PULLS_BEFORE}"; do
+    case "${OFFLINE_COUNT}" in
+        *[!0-9]* | '') fail "[restart offline] could not read registration_count and state_count from ${ASSERT_URL} (got '${OFFLINE_REG_BEFORE}' and '${OFFLINE_PULLS_BEFORE}')" ;;
+    esac
+done
+OFFLINE_HS_HELD=$(dc exec -T meshpeer wg show wg0 latest-handshakes 2>&1) \
+    || fail "[restart offline] wg show wg0 latest-handshakes in meshpeer failed: ${OFFLINE_HS_HELD}"
+OFFLINE_HS_HELD=${OFFLINE_HS_HELD##*[[:space:]]}
+case "${OFFLINE_HS_HELD}" in
+    *[!0-9]* | '' | 0) fail "[restart offline] meshpeer reports the latest handshake '${OFFLINE_HS_HELD}' before the restart, want the one of (b)" ;;
+esac
+OFFLINE_PAUSE_OUT=$(dc pause mock-api 2>&1) || fail "[restart offline] dc pause mock-api failed: ${OFFLINE_PAUSE_OUT}"
+MOCK_PAUSED=1
+OFFLINE_RESTART_AT=$(date +%s)
+OFFLINE_RESTART_OUT=$(dc restart plexd 2>&1) || fail "[restart offline] dc restart plexd failed: ${OFFLINE_RESTART_OUT}"
+OFFLINE_START=${SECONDS}
+
+# offline_log_since sets OFFLINE_SINCE to the plexd log lines of the
+# restarted run.
+offline_log_since() {
+    OFFLINE_LOG=$(dc logs --no-log-prefix plexd 2>&1) || fail "[$1] dc logs plexd failed: ${OFFLINE_LOG}"
+    OFFLINE_SINCE=$(printf '%s\n' "${OFFLINE_LOG}" | tail -n +$((OFFLINE_LOG_BASE + 1)))
+}
+while :; do
+    offline_log_since "restart offline restore"
+    if [ "$(count_log_lines "${OFFLINE_SINCE}" 'msg="stored state restored"')" -ge 1 ]; then
+        break
+    fi
+    if [ $((SECONDS - OFFLINE_START)) -ge 60 ]; then
+        fail "[restart offline restore] the restarted plexd logged no 'stored state restored' within 60s of the restart; its lines on stored state: $(printf '%s\n' "${OFFLINE_SINCE}" | grep 'stored state' || echo none)"
+    fi
+    sleep 2
+done
+OFFLINE_RESTORED_LINE=$(printf '%s\n' "${OFFLINE_SINCE}" | grep 'msg="stored state restored"' | tail -n 1)
+echo "  PASS: [restart offline restore] the restarted plexd logged '${OFFLINE_RESTORED_LINE}' $((SECONDS - OFFLINE_START))s after the restart"
+case "${OFFLINE_RESTORED_LINE}" in
+    *" edge_psks=1 "* | *" edge_psks=2 "*) ;;
+    *) fail "[restart offline restore] the restore line '${OFFLINE_RESTORED_LINE}' carries no edge_psks=1 or edge_psks=2, want the fixture peers' stored PSKs restored" ;;
+esac
+# slog quotes a value that holds "=", as a base64 fingerprint may.
+case "${OFFLINE_RESTORED_LINE}" in
+    *" policy_fingerprint=${OFFLINE_FP} "* | *" policy_fingerprint=\"${OFFLINE_FP}\" "*) ;;
+    *) fail "[restart offline restore] the restore line '${OFFLINE_RESTORED_LINE}' carries no policy_fingerprint=${OFFLINE_FP}" ;;
+esac
+offline_handshake_after "restart offline handshake" "${OFFLINE_HS_HELD}" "${OFFLINE_RESTART_AT}"
+echo "  PASS: [restart offline handshake] meshpeer completed a handshake with the restarted plexd at ${OFFLINE_HS_TIME}, after the one at ${OFFLINE_HS_HELD} and not before the restart at ${OFFLINE_RESTART_AT}, with the mock paused"
+offline_probes "restart offline after"
+OFFLINE_ELAPSED=$((SECONDS - OFFLINE_START))
+if [ "${OFFLINE_ELAPSED}" -gt 60 ]; then
+    fail "[restart offline] the restore, the handshake and the probes took ${OFFLINE_ELAPSED}s after the restart, want them within 60s"
+fi
+echo "  PASS: [restart offline] restore, handshake and probes within ${OFFLINE_ELAPSED}s of the restart, with the mock paused"
+
+# (f) The control plane answers again.
+OFFLINE_UNPAUSE_OUT=$(dc unpause mock-api 2>&1) || fail "[restart offline] dc unpause mock-api failed: ${OFFLINE_UNPAUSE_OUT}"
+MOCK_PAUSED=0
+OFFLINE_START=${SECONDS}
+while :; do
+    OFFLINE_PULLS=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" state_count)
+    case "${OFFLINE_PULLS}" in
+        *[!0-9]* | '') OFFLINE_PULLS=0 ;;
+    esac
+    offline_log_since "restart offline pull"
+    # The restored snapshot holds no state block, so the first pull's cycle
+    # converges on the fixture's and logs its completion at Info.
+    OFFLINE_CYCLES=$(count_log_lines "${OFFLINE_SINCE}" 'msg="reconciliation cycle completed"')
+    if [ "${OFFLINE_PULLS}" -gt "${OFFLINE_PULLS_BEFORE}" ] && [ "${OFFLINE_CYCLES}" -ge 1 ]; then
+        break
+    fi
+    if [ $((SECONDS - OFFLINE_START)) -ge 90 ]; then
+        fail "[restart offline pull] 90s after the unpause, state_count is ${OFFLINE_PULLS} (before the restart ${OFFLINE_PULLS_BEFORE}) and the restarted plexd logged no completed cycle"
+    fi
+    sleep 2
+done
+echo "  PASS: [restart offline pull] the restarted plexd pulled once the mock answered (state_count ${OFFLINE_PULLS_BEFORE} -> ${OFFLINE_PULLS})"
+# A pull that changed no peer completes its cycle without peers+ in drift.
+sleep 5
+offline_log_since "restart offline pull"
+OFFLINE_PEER_DRIFT=$(printf '%s\n' "${OFFLINE_SINCE}" | grep -F 'msg="reconciliation cycle completed"' | grep -F 'peers+' || true)
+if [ -n "${OFFLINE_PEER_DRIFT}" ]; then
+    fail "[restart offline pull] the restarted plexd logged '${OFFLINE_PEER_DRIFT}', want no cycle with peers+ in its drift: the stored peers are what the mock serves"
+fi
+echo "  PASS: [restart offline pull] no reconciliation cycle since the restart carries peers+ in its drift"
+OFFLINE_APPLIED=$(count_log_lines "${OFFLINE_SINCE}" 'msg="policy ruleset applied"')
+if [ "${OFFLINE_APPLIED}" -ne 1 ]; then
+    fail "[restart offline pull] the restarted plexd logged ${OFFLINE_APPLIED} 'policy ruleset applied' line(s), want 1: the restore applies the stored policy and the pull finds its fingerprint"
+fi
+echo "  PASS: [restart offline pull] 'policy ruleset applied' was logged once since the restart"
+OFFLINE_REG_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" registration_count)
+if [ "${OFFLINE_REG_AFTER}" != "${OFFLINE_REG_BEFORE}" ]; then
+    fail "[restart offline pull] registration_count went from ${OFFLINE_REG_BEFORE} to ${OFFLINE_REG_AFTER}, want the restarted plexd to load its identity"
+fi
+echo "  PASS: [restart offline pull] registration_count stayed at ${OFFLINE_REG_AFTER}"
+
+# (g) meshpeer's wg0 goes, and (h) the saved peers and policy are served
+# again, as Phase 12g step (l) does.
+OFFLINE_DEL_OUT=$(dc exec -T meshpeer ip link del wg0 2>&1) \
+    || fail "[restart offline restore fixture] deleting wg0 in meshpeer failed: ${OFFLINE_DEL_OUT}"
+OFFLINE_LOG=$(dc logs plexd 2>&1) || fail "[restart offline restore fixture] dc logs plexd failed: ${OFFLINE_LOG}"
+OFFLINE_FIXTURE_APPLIED=$(count_log_lines "${OFFLINE_LOG}" 'msg="policy ruleset applied"' "revision_id=${FIXTURE_POLICY_REVISION}")
+splice_state "restart-offline-restore" '.peers = $v.peers | .policy = $v.policy' "${OFFLINE_SAVED}"
+expect_policy_applied "restart offline restore fixture" "${FIXTURE_POLICY_REVISION}" "${OFFLINE_SAVED_RULES}" "${OFFLINE_FIXTURE_APPLIED}"
+
+echo "=== Phase 12h PASSED: a restart without the control plane ==="
 
 # ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
