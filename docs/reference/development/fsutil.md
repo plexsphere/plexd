@@ -129,4 +129,5 @@ The function uses `defer os.Remove(tmpPath)` immediately after creating the temp
 | `registration`          | `internal/registration`                                 | Persists node identity files (`identity.json`, `private_key`, `node_secret_key`, `signing_public_key`) |
 | `integrity`             | `internal/integrity`                                    | Persists checksum store (`checksums.json`) for binary and hook verification; watches the hooks directory for `Verifier.watchHooksDir` with `WatchDir` |
 | `nodeapi`               | `internal/nodeapi`                                      | Persists cached state (reports, metadata) to disk for crash recovery     |
+| `statestore`            | `internal/statestore`                                   | Persists the desired state of the last successful pull (`desired-state.json`) and writes the restore marker (`desired-state.restoring`); see [Stored state](../core/reconciliation.md#stored-state) |
 | `tunnel`                | `internal/tunnel`                                       | Persists SSH host keys (`host_key`) for reverse tunnel authentication    |

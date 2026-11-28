@@ -1438,8 +1438,12 @@ comparison is a plain string comparison, which the fixed-width UTC epoch format
 makes chronological, and an equal epoch is accepted. A mesh key rotation does
 not rotate the NSK, so an older envelope would still open and reinstall a
 retired key. The floor survives a change of the peer's public key and is
-dropped when the peer leaves the `peers` block. It lives in memory only: a
-restarted node fetches every PSK again with no floor.
+dropped when the peer leaves the `peers` block. It lives in memory. plexd
+stores each envelope as served, still sealed under the NSK, with its epoch in
+its [stored state](reconciliation.md#stored-state), and a restart that restores
+the stored state opens the envelopes again and raises each edge's floor to the
+stored epoch, so an older envelope is still refused. A node that restores no
+stored state fetches every PSK again with no floor.
 
 **Fetch rule.** plexd fetches a peer's PSK when the peer first appears in the
 `peers` block of the [state pull](#get-v1-nodes-node-id-state), when its
@@ -1450,7 +1454,11 @@ pull, in node ID order, before the reconcile handlers, so a new peer's PSK is
 in hand when the WireGuard handler adds the peer in the same cycle. After its
 own rotation, plexd keeps each old PSK on the device until the replacement
 arrives. A `peer_psk_assigned` event only triggers a reconcile, and a fetch
-that is still due runs on the pull it triggers.
+that is still due runs on the pull it triggers. A PSK restored from the stored
+state counts as fetched for its stored public key, so the first pull after a
+restart fetches it only when the peer's key changed meanwhile. A peer whose
+stored envelope did not open holds no PSK, so that pull fetches its PSK as for
+a new peer.
 
 When plexd has already programmed the peer under the public key the PSK was
 fetched for, it installs the PSK by rewriting the peer's device entry with its
@@ -1638,7 +1646,10 @@ absence.
         "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
       ]
     }
-  ]
+  ],
+  "state_freshness": {
+    "max_age_seconds": 86400
+  }
 }
 ```
 
@@ -2148,8 +2159,11 @@ below). plexd never switches the endpoint of a peer on a direct path. A plexd
 whose WireGuard interface came up reads
 the block on every successful pull, drift or not. No event carries a change,
 so a new value reaches the node with its next pull, within one reconcile
-interval (60 s by default), or sooner on a triggered pull. plexd does not
-persist the value: the first pull after a start delivers it again. The block is
+interval (60 s by default), or sooner on a triggered pull. plexd stores the
+last block a pull carried with the rest of its
+[stored state](reconciliation.md#stored-state), and a start that restores that
+state hands it to the WireGuard manager before the first pull, which delivers
+it again. The block is
 not desired state for the differ: the reconcile snapshot neither stores nor
 compares it. See
 [Failure detection time](../networking/wireguard.md#failure-detection-time).
@@ -2222,6 +2236,41 @@ carrier's tunnel. plexd names the subnets it routes through each bridge in the
 v0.38.0 reads the block or sends the member; such a release routes a shared
 subnet through its carrier and follows a carrier move with its next pull. See
 [Shared subnets](../networking/wireguard.md#shared-subnets).
+
+`state_freshness` bounds how long the node acts on the desired state it holds
+without a successful pull. `max_age_seconds` is the limit in whole seconds,
+counted from the node's last successful pull. plexd stores the limit with its
+[stored state](reconciliation.md#stored-state) and honors it in two places: a
+stored state older than the limit is not restored at start, and a running node
+whose last successful pull is older than the limit withdraws its peers, its
+policy and its bridge block and waits behind the default deny until a pull
+succeeds. plexsphere/plexsphere#1177 serves the member. A control plane that
+predates it sends no key, and no limit applies until a pull carries one. No
+event carries a change: a new limit reaches the node with its next pull.
+
+plexd decodes the block leniently, so a malformed block never fails the pull
+that carries the peers and the policy:
+
+- An absent key or `null` means the control plane did not say: plexd keeps the
+  limit it holds, the stored one included.
+- A block without `max_age_seconds`, or with `"max_age_seconds": null`,
+  removes the limit, and plexd logs `state freshness limit removed` at Info.
+- A whole number of 1 or more is the limit.
+- A block `json.Unmarshal` refuses, such as a string or a fraction, keeps the
+  limit plexd holds and is logged at Warn as `state freshness block malformed`,
+  once until a block decodes again.
+- A number below 1 keeps the limit plexd holds and is logged at Warn as
+  `state freshness limit out of range` with `max_age_seconds`, once per run of
+  the same value.
+
+plexd applies `max(limit, 3 × reconcile.interval)` and reads a value above
+315,360,000 (ten years) as ten years. Under the floor, 180 s at the default
+interval, a healthy node would withdraw its state between two pulls. A value
+the floor raises is logged at Warn as
+`state freshness limit below three reconcile intervals` with `max_age_seconds`
+and `applied`, and a limit that changes what plexd applies at Info as
+`state freshness limit set` with `max_age`. See
+[State freshness](reconciliation.md#state-freshness).
 
 ## Secrets
 
