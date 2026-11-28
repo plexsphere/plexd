@@ -5031,17 +5031,20 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 // GetState returns the current state fixture with the peers, executions,
 // sessions, secrets, and shared_subnets slices normalized to non-nil so they
 // always serialize as [] rather than null; the contract never sends null for
-// shared_subnets. The fifteen envelope members carry no omitempty, so
+// shared_subnets. The sixteen envelope members carry no omitempty, so
 // all keys are emitted (null for unpopulated blocks). The hooks block is left as
 // configured: a fixture without one serves null, which keeps every hook a
 // rollout installed. The dns block is left as configured too: a fixture
 // without one serves null, which keeps the names the node holds. So is the
 // failure_detection block: a fixture without one serves null, which keeps the
-// failure-detection time the node holds.
+// failure-detection time the node holds. So is the state_freshness block: the
+// default fixture has none and serves null, what a control plane without a
+// maximum age sends.
 //
 // The result is a SHALLOW copy: the policy, bridge, state, reports, and dns
 // pointers and the peers, executions, sessions, secrets, and shared_subnets
-// backing arrays alias the live fixture, and so do the failure_detection bytes.
+// backing arrays alias the live fixture, and so do the failure_detection and
+// state_freshness bytes.
 // Reading is safe — SetState replaces the whole struct under the mutex, so no
 // caller observes a half-written fixture — but callers must NOT mutate through
 // the returned pointers or slices, which would race the state handler serving a

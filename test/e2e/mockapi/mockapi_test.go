@@ -1621,6 +1621,34 @@ func TestState_CarriesTheFailureDetectionBlock(t *testing.T) {
 	}
 }
 
+// TestState_CarriesTheStateFreshnessMember pins the state_freshness member a
+// fresh mock serves, null, what a control plane without a maximum age sends;
+// that configure-state takes a block, with the 204 every caller of the route
+// expects; and that the next pull serves the block back byte for byte.
+func TestState_CarriesTheStateFreshnessMember(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	raw, ok := stateEnvelope(t, ts.URL)["state_freshness"]
+	if !ok {
+		t.Fatal("envelope missing key \"state_freshness\", want it present as null")
+	}
+	if string(raw) != "null" {
+		t.Errorf("state_freshness = %s, want null", raw)
+	}
+
+	configured := stateEnvelope(t, ts.URL)
+	want := `{"max_age_seconds":180}`
+	configured["state_freshness"] = json.RawMessage(want)
+	configureStateEnvelope(t, ts.URL, configured)
+	raw, ok = stateEnvelope(t, ts.URL)["state_freshness"]
+	if !ok {
+		t.Fatal("envelope after configure-state missing key \"state_freshness\"")
+	}
+	if string(raw) != want {
+		t.Errorf("state_freshness after configure-state = %s, want %s", raw, want)
+	}
+}
+
 // TestState_CarriesTheSharedSubnetsBlock proves the Mock criterion "Get the
 // default state and read "shared_subnets":[]; put a state with an entry and
 // read it back": a fresh mock serves the block as [], a configured entry is
