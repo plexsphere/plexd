@@ -146,6 +146,19 @@ type edgePSK struct {
 	// installed is set once the installer accepted the key, so a failed
 	// device write is retried on the next pull without another fetch.
 	installed bool
+	// sealed is the envelope the key was opened from, as the control plane
+	// served it, which the state store keeps (see Sealed).
+	sealed []byte
+}
+
+// SealedEdgePSK is one edge PSK as the state store keeps it: the envelope the
+// control plane served, still sealed under the node secret key, with the
+// peer, the public key and the epoch it was fetched for.
+type SealedEdgePSK struct {
+	PeerNodeID string `json:"peer_node_id"`
+	PublicKey  string `json:"public_key"`
+	Epoch      string `json:"epoch"`
+	Envelope   []byte `json:"envelope"`
 }
 
 // NewEdgePSKs builds an EdgePSKs for the node nodeID, opening envelopes under
@@ -186,6 +199,71 @@ func (s *EdgePSKs) InvalidateAll() {
 		e.stale = true
 	}
 	s.gen++
+}
+
+// Sealed returns the envelope of every PSK that is not stale, ordered by peer
+// node ID, for the state store. A stale PSK was retired by this node's own key
+// rotation, so its envelope is left out. The envelopes are copies.
+func (s *EdgePSKs) Sealed() []SealedEdgePSK {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]SealedEdgePSK, 0, len(s.entries))
+	for id, e := range s.entries {
+		if e.stale {
+			continue
+		}
+		out = append(out, SealedEdgePSK{
+			PeerNodeID: id,
+			PublicKey:  e.publicKey,
+			Epoch:      e.epoch,
+			Envelope:   slices.Clone(e.sealed),
+		})
+	}
+	slices.SortFunc(out, func(a, b SealedEdgePSK) int { return strings.Compare(a.PeerNodeID, b.PeerNodeID) })
+	return out
+}
+
+// Restore opens the envelopes the state store kept under the node secret key
+// and holds their PSKs as if fetched for the stored public key and epoch. A
+// restored PSK counts as installed: no device peer exists yet, and the
+// AddPeer that follows takes it from Lookup. Each epoch raises the edge's
+// floor. An envelope that is not api.EdgePSKEnvelopeSize bytes, names no peer
+// or does not open is skipped with a Warn that names the peer and nothing
+// else, and its peer is programmed without a PSK until a pull fetches one.
+// Restore returns how many PSKs it holds and is called before the first Sync.
+func (s *EdgePSKs) Restore(sealed []SealedEdgePSK) int {
+	restored := 0
+	for _, sp := range sealed {
+		if len(sp.Envelope) != api.EdgePSKEnvelopeSize || sp.PeerNodeID == "" {
+			s.logger.Warn("wireguard: edge psk: stored envelope does not open", "peer_id", sp.PeerNodeID)
+			continue
+		}
+		env := &api.EdgePSKEnvelope{Data: sp.Envelope, Epoch: sp.Epoch}
+		key, err := openEdgePSK(s.nsk, env, s.nodeID, sp.PeerNodeID)
+		if err != nil {
+			s.logger.Warn("wireguard: edge psk: stored envelope does not open", "peer_id", sp.PeerNodeID)
+			continue
+		}
+
+		s.mu.Lock()
+		if old := s.entries[sp.PeerNodeID]; old != nil {
+			clear(old.key[:])
+		}
+		s.entries[sp.PeerNodeID] = &edgePSK{
+			publicKey: sp.PublicKey,
+			epoch:     sp.Epoch,
+			key:       key,
+			installed: true,
+			sealed:    slices.Clone(sp.Envelope),
+		}
+		if sp.Epoch > s.floors[sp.PeerNodeID] {
+			s.floors[sp.PeerNodeID] = sp.Epoch
+		}
+		s.mu.Unlock()
+		clear(key[:])
+		restored++
+	}
+	return restored
 }
 
 // EdgePSKDispatchHandler returns a reconcile.DispatchHandler that syncs s
@@ -313,6 +391,7 @@ func (s *EdgePSKs) fetch(ctx context.Context, p api.SnapshotPeer, gen uint64) bo
 		epoch:     env.Epoch,
 		key:       key,
 		stale:     s.gen != gen,
+		sealed:    slices.Clone(env.Data),
 	}
 	if env.Epoch > s.floors[p.NodeID] {
 		s.floors[p.NodeID] = env.Epoch
