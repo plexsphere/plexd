@@ -3,8 +3,11 @@ package reconcile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"math"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -236,5 +239,234 @@ func TestReconciler_PullRecordsTimeAndFreshness(t *testing.T) {
 	r.runCycle(context.Background(), "node-1")
 	if !r.lastPull.Equal(pulled) {
 		t.Errorf("lastPull after a failed fetch = %v, want %v", r.lastPull, pulled)
+	}
+}
+
+// handlerCall is one invocation a recordingReconcileHandler saw.
+type handlerCall struct {
+	desired *api.NodeStateSnapshot
+	diff    StateDiff
+}
+
+// recordingReconcileHandler records every call and returns the error fail
+// gives for the call's index, nil when fail is nil.
+type recordingReconcileHandler struct {
+	mu    sync.Mutex
+	calls []handlerCall
+	fail  func(call int) error
+}
+
+func (h *recordingReconcileHandler) handle(_ context.Context, desired *api.NodeStateSnapshot, diff StateDiff) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls = append(h.calls, handlerCall{desired: desired, diff: diff})
+	if h.fail != nil {
+		return h.fail(len(h.calls) - 1)
+	}
+	return nil
+}
+
+func (h *recordingReconcileHandler) recorded() []handlerCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]handlerCall(nil), h.calls...)
+}
+
+// peerIDs returns the node IDs of peers, in order.
+func peerIDs(peers []api.SnapshotPeer) []string {
+	ids := make([]string, 0, len(peers))
+	for _, p := range peers {
+		ids = append(ids, p.NodeID)
+	}
+	return ids
+}
+
+var (
+	restorePeerA = api.SnapshotPeer{NodeID: "peer-a", MeshIP: "10.0.0.2", PublicKey: "pk-a"}
+	restorePeerB = api.SnapshotPeer{NodeID: "peer-b", MeshIP: "10.0.0.3", PublicKey: "pk-b"}
+)
+
+// restoredState returns a stored state with peers A and B and a policy.
+func restoredState() *api.NodeStateSnapshot {
+	return &api.NodeStateSnapshot{
+		Peers:  []api.SnapshotPeer{restorePeerA, restorePeerB},
+		Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-1"},
+	}
+}
+
+// A restore of two peers and a policy invokes each reconcile handler once
+// with both peers to add, runs no dispatch handler, and a pull equal to the
+// stored state then reports no drift.
+func TestRestore_AppliesTheStoredState(t *testing.T) {
+	fetcher := &mockFetcher{fetchFunc: func(context.Context, string) (*api.NodeStateSnapshot, error) {
+		return restoredState(), nil
+	}}
+	logs := newRecordingHandler()
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, slog.New(logs))
+	h1, h2 := &recordingReconcileHandler{}, &recordingReconcileHandler{}
+	r.RegisterHandler(h1.handle)
+	r.RegisterHandler(h2.handle)
+	dispatched := 0
+	r.RegisterDispatchHandler(func(context.Context, *api.NodeStateSnapshot) { dispatched++ })
+
+	if failed := r.Restore(context.Background(), restoredState(), 5*time.Minute); failed {
+		t.Fatal("Restore() = true, want false with handlers that succeed")
+	}
+	for i, h := range []*recordingReconcileHandler{h1, h2} {
+		calls := h.recorded()
+		if len(calls) != 1 {
+			t.Fatalf("handler %d called %d times by Restore, want once", i, len(calls))
+		}
+		if got := peerIDs(calls[0].diff.PeersToAdd); !slices.Equal(got, []string{"peer-a", "peer-b"}) {
+			t.Errorf("handler %d PeersToAdd = %v, want [peer-a peer-b]", i, got)
+		}
+		if !calls[0].diff.PolicyChanged {
+			t.Errorf("handler %d diff carries no policy change", i)
+		}
+	}
+	if dispatched != 0 {
+		t.Errorf("Restore ran %d dispatch handlers, want none", dispatched)
+	}
+	rec := logs.last(t, "stored state applied")
+	wantString(t, rec, "component", "reconcile")
+	wantString(t, rec, "drift", "peers+2-0~0 policy")
+	if got := rec.attrs["age"].Duration(); got != 5*time.Minute {
+		t.Errorf("age = %v, want 5m0s", got)
+	}
+	if got := rec.attrs["handler_failed"].Bool(); got {
+		t.Error("handler_failed = true, want false")
+	}
+
+	r.runCycle(context.Background(), "node-1")
+	if n := len(h1.recorded()); n != 1 {
+		t.Errorf("handler called %d times after a pull equal to the stored state, want no further call", n)
+	}
+	if n := logs.count("no drift detected"); n != 1 {
+		t.Errorf("%q logged %d times, want once", "no drift detected", n)
+	}
+	if dispatched != 1 {
+		t.Errorf("the pull ran %d dispatch handlers, want 1", dispatched)
+	}
+}
+
+// A restore counts as a pull age old, and a negative age as 0.
+func TestRestore_SetsTheLastPull(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	r := NewReconciler(&mockFetcher{}, Config{Interval: time.Hour}, discardLogger())
+	r.now = func() time.Time { return now }
+
+	r.Restore(context.Background(), restoredState(), 10*time.Minute)
+	if want := now.Add(-10 * time.Minute); !r.lastPull.Equal(want) {
+		t.Errorf("lastPull = %v, want %v", r.lastPull, want)
+	}
+	r.Restore(context.Background(), restoredState(), -time.Hour)
+	if !r.lastPull.Equal(now) {
+		t.Errorf("lastPull after a negative age = %v, want %v", r.lastPull, now)
+	}
+}
+
+// A restore of an empty snapshot finds no drift and invokes nothing.
+func TestRestore_EmptySnapshotInvokesNothing(t *testing.T) {
+	r := NewReconciler(&mockFetcher{}, Config{Interval: time.Hour}, discardLogger())
+	h := &recordingReconcileHandler{}
+	r.RegisterHandler(h.handle)
+
+	if failed := r.Restore(context.Background(), &api.NodeStateSnapshot{}, 0); failed {
+		t.Error("Restore() = true, want false")
+	}
+	if n := len(h.recorded()); n != 0 {
+		t.Errorf("handler called %d times, want never", n)
+	}
+}
+
+// A nil stored state does nothing at all.
+func TestRestore_NilDoesNothing(t *testing.T) {
+	logs := newRecordingHandler()
+	r := NewReconciler(&mockFetcher{}, Config{Interval: time.Hour}, slog.New(logs))
+	h := &recordingReconcileHandler{}
+	r.RegisterHandler(h.handle)
+
+	if failed := r.Restore(context.Background(), nil, time.Minute); failed {
+		t.Error("Restore(nil) = true, want false")
+	}
+	if n := len(h.recorded()); n != 0 {
+		t.Errorf("handler called %d times, want never", n)
+	}
+	if !r.lastPull.IsZero() {
+		t.Errorf("lastPull = %v, want zero", r.lastPull)
+	}
+	if got := logs.all(); len(got) != 0 {
+		t.Errorf("logged %v, want nothing", got)
+	}
+}
+
+// A restore whose handler failed still records the stored state, so the next
+// pull removes the restored peer the control plane dropped, and writes the
+// peer it kept again; a third, equal pull finds no drift.
+func TestRestore_FailedHandlerReappliesOnTheNextPull(t *testing.T) {
+	fetcher := &mockFetcher{fetchFunc: func(context.Context, string) (*api.NodeStateSnapshot, error) {
+		return &api.NodeStateSnapshot{
+			Peers:  []api.SnapshotPeer{restorePeerB},
+			Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-1"},
+		}, nil
+	}}
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+	h := &recordingReconcileHandler{fail: func(call int) error {
+		if call == 0 {
+			return errors.New("device busy")
+		}
+		return nil
+	}}
+	r.RegisterHandler(h.handle)
+
+	if failed := r.Restore(context.Background(), restoredState(), 0); !failed {
+		t.Fatal("Restore() = false, want true when a handler failed")
+	}
+
+	r.runCycle(context.Background(), "node-1")
+	calls := h.recorded()
+	if len(calls) != 2 {
+		t.Fatalf("handler called %d times after the restore and one pull, want 2", len(calls))
+	}
+	if got := calls[1].diff.PeersToRemove; !slices.Equal(got, []string{"peer-a"}) {
+		t.Errorf("PeersToRemove = %v, want [peer-a]", got)
+	}
+	if got := peerIDs(calls[1].diff.PeersToAdd); !slices.Equal(got, []string{"peer-b"}) {
+		t.Errorf("PeersToAdd = %v, want [peer-b]", got)
+	}
+
+	r.runCycle(context.Background(), "node-1")
+	if n := len(h.recorded()); n != 2 {
+		t.Errorf("handler called %d times after a third, equal pull, want no further call", n)
+	}
+}
+
+// While reapply is set, a pull without drift still invokes the handlers, and
+// a failure keeps the flag for the next pull.
+func TestReconciler_ReapplyInvokesHandlersOnAnEmptyDiff(t *testing.T) {
+	fetcher := &mockFetcher{fetchFunc: func(context.Context, string) (*api.NodeStateSnapshot, error) {
+		return restoredState(), nil
+	}}
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+	h := &recordingReconcileHandler{fail: func(call int) error {
+		if call < 2 {
+			return errors.New("device busy")
+		}
+		return nil
+	}}
+	r.RegisterHandler(h.handle)
+
+	r.Restore(context.Background(), restoredState(), 0)
+	for range 3 {
+		r.runCycle(context.Background(), "node-1")
+	}
+	calls := h.recorded()
+	if len(calls) != 3 {
+		t.Fatalf("handler called %d times, want 3: the restore, the failed reapply, the reapply that succeeded", len(calls))
+	}
+	for i, c := range calls[1:] {
+		if got := peerIDs(c.diff.PeersToAdd); !slices.Equal(got, []string{"peer-a", "peer-b"}) {
+			t.Errorf("reapply %d PeersToAdd = %v, want [peer-a peer-b]", i, got)
+		}
 	}
 }

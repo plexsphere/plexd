@@ -52,6 +52,11 @@ type Reconciler struct {
 	freshnessMalformed     bool
 	freshnessOutOfRange    bool
 	freshnessOutOfRangeRaw int64
+	// reapply is set when a handler failed on a snapshot the reconciler
+	// recorded anyway (see Restore). While it is set, a cycle with a
+	// successful fetch invokes the handlers even on an empty diff and writes
+	// every pulled peer again; it clears when no handler fails.
+	reapply bool
 }
 
 // NewReconciler creates a new Reconciler with the given configuration.
@@ -174,8 +179,11 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 
 	current := r.snapshot.Get()
 	diff := ComputeDiff(desired, &current)
+	if r.reapply {
+		reapplyPeers(&diff, desired.Peers)
+	}
 
-	if diff.IsEmpty() {
+	if diff.IsEmpty() && !r.reapply {
 		r.logger.Debug("no drift detected",
 			"component", "reconcile",
 			"node_id", nodeID,
@@ -190,6 +198,7 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	// Update snapshot only if no handler failed.
 	if !handlerFailed {
 		r.snapshot.Update(desired)
+		r.reapply = false
 	}
 
 	r.logger.Info("reconciliation cycle completed",
