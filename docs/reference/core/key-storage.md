@@ -10,10 +10,10 @@ plexd stores cryptographic keys and identity material in a single directory on t
 
 ## Overview
 
-The node holds several cryptographic artifacts. The Curve25519 private key, the NSK and the Ed25519 signing public key are persisted to `data_dir` so that the node can rejoin the mesh, decrypt secrets, and verify SSE events across restarts; the PSKs are held in memory only. The keys are:
+The node holds several cryptographic artifacts. The Curve25519 private key, the NSK and the Ed25519 signing public key are persisted to `data_dir` so that the node can rejoin the mesh, decrypt secrets, and verify SSE events across restarts. The PSKs are held in memory; on disk plexd keeps only the envelopes they arrived in, still sealed under the NSK, in `desired-state.json`. The keys are:
 
 - **Curve25519 private key** -- mesh encryption (WireGuard)
-- **Pre-Shared Keys (PSK)** -- per-edge post-quantum defense layer, fetched after registration and held in memory only
+- **Pre-Shared Keys (PSK)** -- per-edge post-quantum defense layer, fetched after registration, held in memory, and stored only as the sealed envelope
 - **Node Secret Key (NSK)** -- source of the bearer envelope; AES-256-GCM key for secret and edge PSK envelopes
 - **Ed25519 signing public key** -- SSE event and JWT verification
 - **Bootstrap token** -- registration credential whose validity the control plane's BootstrapToken policy decides (its file is removed after use, or emptied where it cannot be removed)
@@ -34,7 +34,7 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 |------|----------|-----------|---------|---------------|
 | `private_key` | Curve25519 private key | X25519 (WireGuard) | Mesh traffic encryption and authentication | Generated locally during registration |
 | `rotation_pending_key` | Curve25519 private key (staged) | X25519 (WireGuard) | Staged private key for an in-flight rotation; same base64 encoding as `private_key`; removed on completion or discard | Generated locally when a rotation is signaled |
-| (in-memory, per peer) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, fetched per edge from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`, sealed under the NSK |
+| (in-memory, per peer; sealed envelope in `desired-state.json`) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, fetched per edge from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`, sealed under the NSK |
 | `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Source of the bearer envelope; opens secret values and edge PSK envelopes fetched from the control plane | Control plane, issued during registration |
 | `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration and carried by the state pull's `signing_key` block |
 | `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, `signing_key_id`, and `signing_public_key` | Control plane registration response; the two signing fields and `mesh_ip` are rewritten from the state pull (see [CommitSigningKey](registration.md#commitsigningkey) and [CommitMeshIP](registration.md#commitmeship)) |
@@ -50,7 +50,7 @@ WireGuard uses this keypair for all mesh traffic encryption. When keys are rotat
 
 Each peer pair (an edge) has its own 256-bit PSK. The control plane derives it from the per-node PSKs of both nodes and serves it to each end sealed under that node's NSK; it is part of neither the registration response nor a peer of the state pull. plexd fetches it from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`, opens the envelope with AES-256-GCM under the NSK and installs it on the WireGuard peer. PSKs provide a post-quantum defense layer: even if Curve25519 is broken in the future, an attacker who did not also compromise the PSK cannot decrypt captured traffic.
 
-PSKs are never written to disk: they and their epochs live in memory only, so a restarted node fetches every PSK again. plexd fetches an edge's PSK when the peer first appears, when the peer's public key changes, and after this node completes its own key rotation (see [Fetch rule](../networking/wireguard.md#fetch-rule) and [Pre-Shared Keys](../../guide/security.md#pre-shared-keys-psk)).
+A PSK in the clear is never written to disk. plexd holds the PSKs and their epochs in memory, and the state store keeps each envelope as the control plane served it, still sealed under the NSK, with the peer's node ID, its public key and the epoch, in `data_dir/desired-state.json` (see [Stored state](reconciliation.md#stored-state)). A start that restores the stored state opens each envelope under the NSK, holds the PSK as fetched for the stored public key, and raises the edge's epoch floor to the stored epoch, so an envelope older than the stored one is still refused after the restart. The first pull does not fetch a restored PSK again unless the peer's public key changed. The envelopes sit in the same directory as the NSK that opens them: the sealing keeps the PSKs from whoever holds a copy of `desired-state.json` alone, not from whoever reads `data_dir`, who holds the node's identity already. An envelope that does not open is skipped with a Warn that names the peer and no key material, and that peer is programmed without a PSK until the first pull fetches one. A node that restores no stored state fetches every PSK again. plexd fetches an edge's PSK when the peer first appears, when the peer's public key changes, and after this node completes its own key rotation (see [Fetch rule](../networking/wireguard.md#fetch-rule) and [Pre-Shared Keys](../../guide/security.md#pre-shared-keys-psk)).
 
 ### Node Secret Key (NSK)
 
@@ -122,6 +122,8 @@ All key files are written with mode `0600` (owner read/write only). The `data_di
 | `data_dir/rotation_pending_key` | `0600` | Base64-encoded staged rotation private key |
 | `data_dir/node_secret_key` | `0600` | Node Secret Key: the 32-byte key in standard-padded base64 (44 characters); an identity written before `nsk` became base64 holds the 32 raw bytes |
 | `data_dir/signing_public_key` | `0600` | Raw Ed25519 public key string |
+| `data_dir/desired-state.json` | `0600` | The desired state of the last successful pull: the peers, the policy, the bridge block, the names and versions of the secret inventory, the shared subnets, the failure-detection time, the maximum age, and each edge PSK's envelope sealed under the NSK (JSON; see [Stored state](reconciliation.md#stored-state)) |
+| `data_dir/desired-state.restoring` | `0600` | Empty; exists only while plexd applies `desired-state.json` at start |
 
 The plexd process should run as a dedicated `plexd` user. No other user or group needs read access to these files.
 
@@ -184,6 +186,7 @@ The event updates the verifier in memory only. A later pull that carries a diffe
 
 - **Bootstrap token**: deleted immediately after successful registration.
 - **Local identity**: `plexd deregister` is a local-only cleanup (no control-plane call) that removes just `identity.json` from `data_dir`. `plexd deregister --purge` additionally removes the rest of `data_dir` — the remaining identity and key files and cached state — and the registration token file.
+- **Stored state**: `plexd deregister --purge` removes `desired-state.json`, and with it the sealed edge PSK envelopes, along with the rest of `data_dir`. Without `--purge` the file stays, and a node that registers afresh refuses it, because its `node_id` names the old identity (`stored state belongs to another node, not restored`); the new node's first successful pull overwrites it.
 
 ## Security Considerations
 
@@ -193,6 +196,7 @@ The event updates the verifier in memory only. A later pull that carries a diffe
 - **Bootstrap token removed after registration**: plexd removes its own copy of the token after registration, limiting the window for stealing it from the disk; the token's BootstrapToken policy on the control plane decides how often and how long the token can be redeemed.
 - **Transition period for signing keys**: during a rotation announced by a `signing_key_rotated` event that names the previous key and a deadline, both old and new signing keys are accepted, preventing event verification failures during rollover. After the transition expires, only the new key is trusted. A key installed from the state pull has no transition period: it replaces the current key, because a node trusts exactly one Domain key.
 - **PSK as post-quantum layer**: even if the Curve25519 key exchange is compromised (e.g., by a future quantum computer), the per-peer PSK provides an additional symmetric encryption layer that protects captured traffic.
+- **PSKs at rest only sealed**: the edge PSKs reach the disk only as the envelopes the control plane served, sealed under the NSK, in `desired-state.json`. plexd neither signs nor encrypts the file further: it sits beside `private_key` and `node_secret_key` under the same `0700` directory, and whoever can write it holds the node's identity already.
 - **The NSK lives as long as the Node**: removing the Node on the control plane deletes its NSK, and every call authenticated with it answers `401 nsk_invalid`. plexd never rotates the NSK; a host gets another one only by enrolling again.
 - **TLS on all control plane communication**: key material is exchanged over TLS-protected channels, mitigating interception during registration and key rotation.
 
@@ -203,6 +207,7 @@ The event updates the verifier in memory only. A later pull that carries a diffe
 | Identity persistence | `internal/registration/identity.go` |
 | Registration flow | `internal/registration/registrar.go` |
 | Atomic file writes | `internal/fsutil/atomic.go` |
+| Stored state and sealed edge PSK envelopes | `internal/statestore/store.go`, `internal/wireguard/psk.go` |
 | Signing key rotation and state pull handlers | `cmd/plexd/cmd/up.go` |
 | Signing key install and rotation | `internal/api/verifier.go` |
 | Signing key persistence | `internal/registration/signing_key.go` |

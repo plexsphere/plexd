@@ -221,7 +221,9 @@ func coreHeartbeatLoop() *Figure {
 }
 
 // coreReconciliationCycle draws one cycle of the Reconciler for
-// docs/reference/core/reconciliation.md (Reconciliation Cycle).
+// docs/reference/core/reconciliation.md (Reconciliation Cycle). Every
+// exit of a cycle whose fetch succeeded passes the cycle observer, and
+// a failed fetch retries a pending withdrawal.
 func coreReconciliationCycle() *Figure {
 	f := &Figure{Name: "core-reconciliation-cycle", Title: "One reconciliation cycle"}
 	const x, w, h, gap = 300.0, 370.0, 56.0, 60.0
@@ -244,11 +246,12 @@ func coreReconciliationCycle() *Figure {
 	f.arrow(flow, pt{cx, 9}, fetch.top())
 	dispatch := step(name("Invoke dispatch handlers"))
 	diff := step(codeName("ComputeDiff"))
-	empty := step(name("Diff empty?"))
+	empty := step(name("Diff empty, no reapply?"))
 	handlers := step(name("Invoke handlers sequentially"))
 	failed := step(name("Any handler failed?"))
 	snapshot := step(name("Update snapshot"))
-	done := f.state(stateNormal, spec{x: 0, y: y + 20, w: 1110, h: h, lines: []Line{name("Wait for next tick")}})
+	observer := f.state(stateNormal, spec{x: x, y: y, w: 1110 - x, h: 80, lines: []Line{name("Call the cycle observer"), body("the state store writes the pull")}})
+	done := f.state(stateNormal, spec{x: 0, y: observer.y + observer.h + gap, w: 1110, h: h, lines: []Line{name("Wait for next tick")}})
 
 	down(fetch, dispatch, body("ok"))
 	down(dispatch, diff)
@@ -256,13 +259,16 @@ func coreReconciliationCycle() *Figure {
 	down(empty, handlers, body("no"))
 	down(handlers, failed)
 	down(failed, snapshot, body("no"))
-	f.arrow(flow, snapshot.bottom(), done.topAt(cx))
+	f.arrow(flow, snapshot.bottom(), observer.topAt(cx))
+	f.arrow(flow, observer.bottomAt(cx), done.topAt(cx))
 
 	skip := f.state(stateFailed, spec{x: 0, y: fetch.y, w: 220, h: 70, lines: []Line{body("Log warn or debug,"), body("skip cycle")}})
 	skip.y = fetch.cy() - skip.h/2
 	f.arrow(refuse, fetch.left(), skip.right())
 	f.label(mid(fetch.left(), skip.right()), body("error"))
-	f.arrow(flow, skip.bottom(), done.topAt(skip.cx()))
+	retry := f.state(stateNormal, spec{x: 0, y: observer.y, w: 220, h: observer.h, lines: []Line{name("Retry a pending"), name("withdrawal")}})
+	f.arrow(flow, skip.bottom(), retry.top())
+	f.arrow(flow, retry.bottom(), done.topAt(retry.cx()))
 
 	logErr := f.state(stateFailed, spec{x: x + w + 150, y: handlers.y, w: 230, h: 70, lines: []Line{body("Log error, continue"), body("next handler")}})
 	logErr.y = handlers.cy() - logErr.h/2
@@ -270,11 +276,11 @@ func coreReconciliationCycle() *Figure {
 	f.label(pt{(x + w + logErr.x) / 2, handlers.cy() - 12}, body("handler error"))
 	f.arrow(flow, pt{logErr.x, handlers.cy() + 12}, pt{x + w, handlers.cy() + 12})
 
-	yesEmpty := done.x + done.w - 30
-	f.arrow(flow, hv(empty.right(), done.topAt(yesEmpty))...)
+	yesEmpty := observer.x + observer.w - 30
+	f.arrow(flow, hv(empty.right(), observer.topAt(yesEmpty))...)
 	f.label(pt{x + w + 40, empty.cy()}, body("yes"))
 	yesFailed := logErr.cx()
-	f.arrow(flow, hv(failed.right(), done.topAt(yesFailed))...)
+	f.arrow(flow, hv(failed.right(), observer.topAt(yesFailed))...)
 	f.label(pt{x + w + 40, failed.cy()}, body("yes"))
 	return f
 }

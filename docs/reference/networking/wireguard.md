@@ -780,7 +780,7 @@ func FailureDetectionDispatchHandler(mgr *Manager) reconcile.DispatchHandler
 
 `SetFailureDetection` ignores a value of zero or less and clamps any other to `MinFailureDetection` and `MaxFailureDetection`. It returns the value in force and whether it changed. A change restarts the silence window of every relayed peer and clears its probe state, and restarts the window of every [watched bridge](#the-bridge-watch) and clears its stimulus, so no peer is judged against a window it did not start under. It logs `wireguard: failure detection time set` at Info with `detect_after`, `previous` (`0s` when none was held) and `pass`. A pull that repeats the value logs nothing. `FailureDetection` returns the value held, and `0, false` while none is. The ceiling is the stale-handshake age: once a relayed peer's handshake is 180 s old, the pass dials the next relay whatever the value says (see [The trial](#the-trial)), and a bridge whose handshake is that old no longer counts as connected, so its path is no longer alive.
 
-The value lives in memory only. It is not persisted and has no config key or flag: the Domain owns it, the first pull after a start delivers it again, and a restarted plexd starts every peer at the first entry of its dial order anyway. A node that never received a value, such as one whose control plane sends no block, keeps `checkRelay` with its silence window of one trial (30 s with the default keepalive), its 15 s verdict and the pass every 5 s of `plexd up` (see [Relay liveness probe](#relay-liveness-probe)). It watches no bridge, so it keeps each shared subnet where the pulls put it (see [When a node moves no subnet on its own](#when-a-node-moves-no-subnet-on-its-own)).
+The manager holds the value in memory, and it has no config key or flag: the Domain owns it. The [state store](../core/reconciliation.md#stored-state) keeps the last block a pull carried in `<data_dir>/desired-state.json`, and a start that restores the stored state hands it to this handler before the first pull, so the restarted node watches its relayed peers and its shared subnets with the stored time until the first pull delivers the value again. A restarted plexd starts every peer at the first entry of its dial order anyway. A node that never received a value, such as one whose control plane sends no block, keeps `checkRelay` with its silence window of one trial (30 s with the default keepalive), its 15 s verdict and the pass every 5 s of `plexd up` (see [Relay liveness probe](#relay-liveness-probe)). It watches no bridge, so it keeps each shared subnet where the pulls put it (see [When a node moves no subnet on its own](#when-a-node-moves-no-subnet-on-its-own)).
 
 The value held, `d`, sets two times (`dial.go`):
 
@@ -1545,7 +1545,7 @@ accepted subnets through the mesh interface, and
 
 ## Edge PSKs
 
-The control plane derives a WireGuard preshared key for every edge, the pair of nodes at the two ends of a tunnel, and serves it to each end sealed under that node's NSK on `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see [Edge PSK](../core/api-endpoints.md#edge-psk) in the API endpoints reference). `EdgePSKs` (`internal/wireguard/psk.go`) fetches each peer's PSK, opens it, refuses an envelope older than the one in force, and installs it on the device peer. It keeps the PSKs in memory, where the reconcile handler looks them up for the peers it adds or updates.
+The control plane derives a WireGuard preshared key for every edge, the pair of nodes at the two ends of a tunnel, and serves it to each end sealed under that node's NSK on `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see [Edge PSK](../core/api-endpoints.md#edge-psk) in the API endpoints reference). `EdgePSKs` (`internal/wireguard/psk.go`) fetches each peer's PSK, opens it, refuses an envelope older than the one in force, and installs it on the device peer. It keeps the PSKs in memory, where the reconcile handler looks them up for the peers it adds or updates, and keeps the envelopes they were opened from for the state store, which restores them at start (see [Stored envelopes](#stored-envelopes)).
 
 ```go
 type EdgePSKFetcher interface {
@@ -1567,6 +1567,8 @@ func EdgePSKDispatchHandler(s *EdgePSKs) reconcile.DispatchHandler
 | `Lookup`        | `(peerNodeID, publicKey string) ([]byte, bool)`            | A copy of the PSK held for the peer when it was fetched for `publicKey`, stale or not. Implements [`EdgePSKLookup`](#reconcilehandler) |
 | `InvalidateAll` | `()`                                                       | Marks every PSK stale, so the next `Sync` fetches each peer's again |
 | `Sync`          | `(ctx context.Context, peers []api.SnapshotPeer)`          | Forgets the peers missing from `peers`, fetches the PSKs that are due, and installs every PSK the installer has not accepted yet. Returns nothing |
+| `Sealed`        | `() []SealedEdgePSK`                                       | The envelope of every PSK that is not stale, as the control plane served it, ordered by peer node ID, for the state store. The envelopes are copies; see [Stored envelopes](#stored-envelopes) |
+| `Restore`       | `(sealed []SealedEdgePSK) int`                             | Opens stored envelopes under the NSK and holds their PSKs as fetched, raising each epoch floor; returns how many it holds. Called before the first `Sync`; see [Stored envelopes](#stored-envelopes) |
 
 ### Wiring in plexd up
 
@@ -1575,6 +1577,7 @@ func EdgePSKDispatchHandler(s *EdgePSKs) reconcile.DispatchHandler
 - `EdgePSKDispatchHandler(store)` is registered as a [dispatch handler](../core/reconciliation.md#dispatchhandler), so `Sync` runs with the pull's `peers` on every successful pull, drift or not. Dispatch handlers run before the reconcile handlers, so a new peer's PSK is in the store when `ReconcileHandler` adds the peer in the same cycle.
 - The store is the `EdgePSKLookup` passed to `ReconcileHandler`.
 - The key rotator gets `rotationReconcileTrigger` as its reconcile trigger. Its `TriggerReconcile` calls `InvalidateAll` and then triggers the reconcile. The rotator fires the trigger once per committed rotation (see [Mesh key rotation](../core/key-storage.md#mesh-key-rotation-rotate-keys)), so the pull that follows fetches every PSK again.
+- The state store's cycle observer takes `Sealed`, and the restore at start (step 18) calls `Restore` with the stored envelopes before the first pull (see [Stored state](../core/reconciliation.md#stored-state)).
 
 A failed fetch never fails the WireGuard reconcile handler. A handler that fails every cycle holds the reconciler snapshot back, and a control plane that does not serve edge PSKs fails every fetch.
 
@@ -1586,7 +1589,7 @@ A failed fetch never fails the WireGuard reconcile handler. A handler that fails
 2. its `public_key` changed since its PSK was fetched, or
 3. this node completed its own key rotation since then (`InvalidateAll`).
 
-A peer whose fetch failed or was answered as not ready, or whose envelope was refused or did not open, holds no current PSK, so it stays due for a later pull. Once every peer holds a current PSK, a pull with an unchanged peer set sends no request. A stale PSK stays on the device, and `Lookup` keeps returning it, until its replacement arrives. A rotation that completes while a fetch is in flight leaves the fetched PSK stale, so the next pull fetches it again. For a peer that leaves the pull, the store forgets its PSK (zeroing the key) and its epoch floor.
+A PSK [restored](#stored-envelopes) at start counts as fetched for its stored public key, so the first pull fetches it only when the peer's key changed meanwhile. A peer whose fetch failed or was answered as not ready, or whose envelope was refused or did not open, holds no current PSK, so it stays due for a later pull. Once every peer holds a current PSK, a pull with an unchanged peer set sends no request. A stale PSK stays on the device, and `Lookup` keeps returning it, until its replacement arrives. A rotation that completes while a fetch is in flight leaves the fetched PSK stale, so the next pull fetches it again. For a peer that leaves the pull, the store forgets its PSK (zeroing the key) and its epoch floor.
 
 The due peers are fetched one at a time in node-ID order, and no lock is held during a request. After the pass, unless its context was cancelled, `Sync` installs every PSK the installer has not accepted yet, again in node-ID order.
 
@@ -1620,7 +1623,22 @@ Every cipher or tag failure returns `wireguard: open edge psk: authentication fa
 
 The store keeps the highest epoch it accepted for each peer. An envelope whose epoch sorts below it is refused before it is opened, logged as `wireguard: edge psk: refusing an envelope older than the epoch in force`, and installs nothing. An equal epoch is accepted. The comparison is a plain string compare, because the epoch is fixed-width UTC, so byte order is chronological order.
 
-The floor survives a change of the peer's public key, so an envelope from before the peer's rotation is refused as well. It is dropped when the peer leaves the pull. Floors and PSKs live in memory only: a restarted plexd fetches every PSK again, with no floor.
+The floor survives a change of the peer's public key, so an envelope from before the peer's rotation is refused as well. It is dropped when the peer leaves the pull. Floors and PSKs live in memory. A restarted plexd that restores its stored state raises the floor of each edge whose envelope it restored to the stored epoch, so an older envelope is still refused after the restart (see [Stored envelopes](#stored-envelopes)). One that restores no stored state fetches every PSK again, with no floor.
+
+### Stored envelopes
+
+```go
+type SealedEdgePSK struct {
+    PeerNodeID string `json:"peer_node_id"`
+    PublicKey  string `json:"public_key"`
+    Epoch      string `json:"epoch"`
+    Envelope   []byte `json:"envelope"`
+}
+```
+
+The store keeps, beside each PSK, a copy of the envelope it was opened from, as the control plane served it. `Sealed` returns these envelopes, still sealed under the NSK, with the peer, the public key and the epoch each was fetched for, ordered by peer node ID. It leaves out a stale PSK, which this node's own key rotation retired. The [state store](../core/reconciliation.md#stored-state) writes them into `<data_dir>/desired-state.json` with the rest of each successful pull, so the PSK in the clear never reaches the disk.
+
+`Restore` takes the envelopes the restore at start read back, before the first `Sync`. It opens each under the NSK with the additional authenticated data of [Opening the envelope](#opening-the-envelope), and holds the PSK as fetched for the stored public key and epoch, marked installed: no device peer exists yet, and the `AddPeer` the restore makes next takes the PSK from `Lookup`. Each stored epoch raises the edge's floor. An envelope that is not 60 bytes, names no peer, or does not open, such as one sealed under another NSK, is skipped with `wireguard: edge psk: stored envelope does not open` at Warn, which names the peer and carries no key or envelope bytes. That peer is programmed without a PSK until the first pull fetches one. `Restore` returns how many PSKs it holds; `Restore(nil)` returns 0 and changes nothing.
 
 ### Installing a PSK
 
@@ -1645,6 +1663,7 @@ The floor survives a change of the peer's public key, so an envelope from before
 | `Warn`  | `wireguard: edge psk: refusing an envelope older than the epoch in force` | `peer_id` |
 | `Warn`  | `wireguard: edge psk: open failed` | `peer_id`, `error` |
 | `Warn`  | `wireguard: edge psk: install failed` | `peer_id`, `error` |
+| `Warn`  | `wireguard: edge psk: stored envelope does not open` | `peer_id` |
 
 The not-served line is logged when the store enters that state, not on every pull, and the serves line on the first success after it. No log line or error carries a key, an envelope or the NSK.
 

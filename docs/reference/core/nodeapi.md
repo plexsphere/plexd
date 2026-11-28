@@ -696,7 +696,11 @@ the same record plexd sends to the control plane as its
 [policy status report](../networking/network-policy.md#policy-status-report).
 Returns an empty object `{}` when no policy provider is wired. `plexd up`
 always wires one, so before its first pull it answers
-`{"enforcement":"","applied":false,"in_sync":false}`.
+`{"enforcement":"","applied":false,"in_sync":false}`, unless the start
+restored the [stored state](reconciliation.md#stored-state), whose policy
+block it then shows as applied. After a
+[withdrawal](../networking/network-policy.md#withdraw) it answers as before
+the first pull again, until the next pull.
 
 Every rule is an allow and rule order carries no meaning; see
 `PolicyRule` in [API Types](api-types.md#get-v1-nodes-node-id-state). The block is the one plexd applied, as it
@@ -739,7 +743,7 @@ the next:
 | Member | Content |
 |--------|---------|
 | `revision_id`, `fingerprint`, `rules`, `revisions` | The block plexd applied last. Absent while no pull's block is applied, and when the applied pull carried `policy: null`. They keep the names of the body earlier releases served, which held the block of the last pull, so a reader of that body still decodes them |
-| `enforcement` | `enforcing`; `disabled` when `policy.enabled` is `false`; or `unavailable` when the platform has no firewall backend. With `disabled` or `unavailable` no ruleset is applied. Empty before the first pull |
+| `enforcement` | `enforcing`; `disabled` when `policy.enabled` is `false`; or `unavailable` when the platform has no firewall backend. With `disabled` or `unavailable` no ruleset is applied. Empty before the first pull, unless the start restored the stored state, and after a withdrawal until the next pull |
 | `applied` | `true` when a pull's block is applied, a pull with `policy: null` included. The default deny plexd installs at startup does not count |
 | `in_sync` | `true` when `applied` is `true` and the applied block is the block of the latest pull: both `null`, or both with the same non-empty fingerprint |
 | `received` | The latest pull's block, as `revision_id`, `fingerprint` and `revisions` (absent when the block names none). Present when that pull carried a block, absent for `policy: null` |

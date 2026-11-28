@@ -225,6 +225,7 @@ func NewEnforcer(
 | `Preflight`         | `() error`                                                    | Probes the firewall backend without changing kernel state; no-op when disabled or nil firewall |
 | `ApplyFirewallRules` | `(policy *api.PolicySnapshot, iface string) (bool, error)`   | Builds and applies rules; no-op when disabled or nil firewall. A `nil` policy yields the default-deny-only ruleset. The `bool` reports whether the ruleset actually reached the kernel. On success it records `policy` as the ruleset the backend holds |
 | `Sync`              | `(desired *api.PolicySnapshot, iface string)`                 | Brings the firewall to the policy block of a pull and records the outcome; see [Sync](#sync) |
+| `Withdraw`          | `(iface string) error`                                        | Installs the default deny alone and forgets every pull's block, for a node whose desired state passed its maximum age; see [Withdraw](#withdraw) |
 | `Status`            | `() Status`                                                   | A deep copy of the Enforcer's record; the zero `Status` before the first `Sync`; see [Status and Changed](#status-and-changed) |
 | `Changed`           | `() <-chan struct{}`                                          | A channel of capacity 1 that `Sync` signals when the reported state moves |
 | `DropCounts`        | `() (packets, bytes uint64, ok bool)`                         | What the installed ruleset's default deny dropped since it was installed; see [DropCounts](#dropcounts) |
@@ -237,7 +238,7 @@ The `bool` exists so callers cannot log an enforcement that never happened: both
 
 Before the backend gets the rules, `ApplyFirewallRules` tags the logged ones and moves them ahead of the others; see [Log tags and rule order](#log-tags-and-rule-order).
 
-`Sync`, `ApplyFirewallRules`, `Teardown` and `DropCounts` hold one lock across their backend calls, so the record always describes what the backend holds, and `Status` reads it under the same lock.
+`Sync`, `Withdraw`, `ApplyFirewallRules`, `Teardown` and `DropCounts` hold one lock across their backend calls, so the record always describes what the backend holds, and `Status` reads it under the same lock.
 
 `AdmitsTCPDial` and `AdmitsUDPDial` enforce nothing: the kernel does. They answer from the rule list of the last apply the backend accepted, which `ApplyFirewallRules` keeps beside the policy it records, so a refused apply leaves the answer of the ruleset still in force, and a pull that `Sync` adopts without a kernel call carries the same fingerprint and so the same rules. `AdmitsTCPDial` returns `admitted` when one `allow` rule matches `ConnEvent{Src: src, Dst: dst.Addr(), Protocol: tcp, DstPort: dst.Port()}`, and `AdmitsUDPDial` when one matches the same event with `Protocol: udp`, as the connection logger matches an event. A `tcp` rule therefore admits no UDP dial and a `udp` rule no TCP dial, and a rule for every protocol, which a policy rule with protocol `any` compiles to, admits both. The default deny alone, which the startup baseline and a pull with `policy: null` install, admits nothing. `enforced` is false, and `admitted` true, while enforcement is disabled, no backend exists, no ruleset is installed, or the Enforcer is closed. The two share one unexported helper. The bridge's ingress manager asks `AdmitsTCPDial` after a dial to the target of a `tcp` ingress rule failed, and `AdmitsUDPDial` after a send to the target of a `udp` rule failed, to report the dial as `policy_denied` (see [Rule Entries](../bridge/public-ingress.md#rule-entries)).
 
@@ -269,7 +270,19 @@ A ruleset the engine refuses and a failure of the backend are both recorded as a
 
 DECISION: the retry is the next pull. `Sync` runs on every successful pull, every `reconcile.interval` (60 s by default) and on every trigger, and a block that is not installed is applied again each time. There is no backoff: a ruleset the engine refuses costs one pass over its rules and no kernel call, and a backend failure was retried every cycle when the apply ran as a reconcile handler.
 
+At start, before the first pull, the restore of the [stored state](../core/reconciliation.md#stored-state) hands the stored block to the dispatch handler and so to `Sync`, as a pull would. The restored ruleset is then the installed one, and the first pull that carries the same block makes no kernel call.
+
 `rejectionReason(err)` makes the error text fit the report's `reason`, which the contract bounds to 1 to 1024 bytes of UTF-8 without control characters. Invalid UTF-8 becomes U+FFFD, every rune from U+0000 to U+001F and U+007F becomes a space, the text is trimmed and cut to at most 1024 bytes on a rune boundary, and an error that leaves nothing reads `apply failed`.
+
+### Withdraw
+
+```go
+func (e *Enforcer) Withdraw(iface string) error
+```
+
+The reconciler calls `Withdraw` through its withdraw handler when the node's last successful pull grows older than the maximum age the control plane set with `state_freshness` (see [Withdrawal](../core/reconciliation.md#withdrawal)). It installs the default deny alone, as `ApplyFirewallRules(nil, iface)` does, then resets `Status` to the zero `Status`, the state before the first `Sync`, forgets the last failure it logged, so the next one logs at Error again, and logs `policy ruleset withdrawn` at Info. With enforcement disabled or no backend it calls no backend and resets `Status` all the same. A backend error is returned as `policy: withdraw: policy: enforce: ...` and leaves the ruleset and `Status` as they were; the reconciler keeps the withdrawal pending and calls `Withdraw` again on every cycle whose pull fails. A closed Enforcer returns nil and touches nothing.
+
+After a withdrawal `Synced` is false, so the status reporter sends nothing (see [When a report is sent](#when-a-report-is-sent)) and no report claims an applied ruleset, and `GET /v1/policies` answers as before the first pull. `Withdraw` signals no `Changed`. The next pull's `Sync` is a first one: it sets `Synced`, signals `Changed`, and applies the pull's block over the default deny. A pull with `policy: null` finds the default deny installed and is recorded as applied with no kernel call.
 
 ### Status and Changed
 
@@ -286,7 +299,7 @@ type Status struct {
 }
 ```
 
-`Status()` returns a copy whose blocks share no memory with the Enforcer's. Before the first `Sync` it is the zero `Status`. The startup baseline, `ApplyFirewallRules(nil, iface)`, records an installed default deny without setting `HasApplied`, because it is no ruleset of the control plane's. `Teardown` clears `HasApplied`, `Applied` and the rejection, so `Status` no longer claims a ruleset the backend dropped.
+`Status()` returns a copy whose blocks share no memory with the Enforcer's. Before the first `Sync`, and after a [`Withdraw`](#withdraw) until the next one, it is the zero `Status`. The startup baseline, `ApplyFirewallRules(nil, iface)`, records an installed default deny without setting `HasApplied`, because it is no ruleset of the control plane's. `Teardown` clears `HasApplied`, `Applied` and the rejection, so `Status` no longer claims a ruleset the backend dropped.
 
 `Changed()` returns a channel of capacity 1. `Sync` signals it, without blocking, when it ran for the first time, or when the enforcement, `HasApplied`, the fingerprint or revisions of `Applied`, or the fingerprint, revisions or `Reason` of `Rejected` changed. `Attempts` and `Received` alone signal nothing. Several changes before the reader wakes collapse into one signal, and the reader then reads the latest `Status`.
 
@@ -316,6 +329,7 @@ The read holds the Enforcer's lock, so the counts always belong to the install i
 |---------------------|----------------------|
 | `Preflight`         | `policy: preflight: `|
 | `ApplyFirewallRules`| `policy: enforce: `  |
+| `Withdraw`          | `policy: withdraw: ` |
 | `Teardown`          | `policy: teardown: ` |
 
 A ruleset the engine refuses to translate is additionally wrapped in the sentinel `ErrInvalidRuleset`, so callers can distinguish a permanently broken revision (`errors.Is(err, policy.ErrInvalidRuleset)`) from a transient netlink failure. The backend is never touched in that case — the previously installed chain stays in place. `Sync` records both kinds as a rejection and uses the sentinel only to choose its Error line.
@@ -556,7 +570,8 @@ func (r *StatusReporter) Run(ctx context.Context) error
 
 - On every signal of `Enforcer.Changed()`: after the first `Sync`, and on every change of the enforcement, of the applied block, or of the rejected block or its reason. The interval restarts after such a send.
 - On a tick of the interval, only when no report of the current state was accepted yet, which is the case after a failed send, or when the drop counters differ from the ones the control plane accepted last. A quiet node sends nothing, so the age of its last report is no liveness signal.
-- Nothing before the Enforcer's first `Sync`: until then plexd has seen no pull and could only report the startup baseline, which is no ruleset of the control plane's.
+- Nothing before the Enforcer's first `Sync`: until then plexd could only report the startup baseline, which is no ruleset of the control plane's. A start that restores the [stored state](../core/reconciliation.md#stored-state) runs that first `Sync` with the stored block before its first pull, so a restarted node reports the restored ruleset.
+- Nothing after a [`Withdraw`](#withdraw) until the next pull's `Sync`, which signals `Changed` and so sends a report at once.
 - Nothing at shutdown: the contract defines no such report, and the control plane keeps the last one. `Run` returns `nil` when its context ends.
 
 A change of `Attempts` alone sends nothing. Every send and every tick reads the drop counters once, so a quiet node costs one dump of three chains on Linux, or one `pfctl` run on macOS, per heartbeat interval.

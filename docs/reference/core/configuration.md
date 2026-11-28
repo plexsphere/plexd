@@ -171,7 +171,7 @@ State reconciliation loop.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interval` | duration | `60s` | Time between reconciliation cycles. Minimum: `1s`. |
+| `interval` | duration | `60s` | Time between reconciliation cycles. Minimum: `1s`. Three intervals are also the floor of the maximum age the control plane can set for the desired state with the state pull's `state_freshness` block: a smaller limit is raised to three intervals, 180 s at the default, so a healthy node never withdraws its state between two pulls. See [State freshness](reconciliation.md#state-freshness). |
 
 Source: `internal/reconcile/config.go`
 

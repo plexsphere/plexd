@@ -91,9 +91,33 @@ plexd peers                                # List peer status
 plexd logs | grep "NAT translates ports"   # Check for a port-translating router
 ```
 
-Common causes: firewall blocking UDP traffic, STUN servers unreachable, or the node has not yet received its peer list from the control plane.
+Common causes: firewall blocking UDP traffic, STUN servers unreachable, or the node has not yet received its peer list from the control plane. A node whose pulls failed for longer than the maximum age the control plane set, or that restarted without restoring its stored state, has no peers either (see [A node withdrew its state or did not restore it](#a-node-withdrew-its-state-or-did-not-restore-it)).
 
 A node behind a router that translates ports peers with every publicly reachable node but not with other nodes behind NAT. Its published endpoint carries the WireGuard listen port, and nothing forwards that port to the node, so peers behind NAT dial a port that never answers. The agent logs `NAT translates ports, the published endpoint assumes the WireGuard listen port is forwarded` when discovery first sees the router assign its own port, and reports `port_mapping` `translated` with every endpoint report. To fix it, forward the WireGuard listen port (UDP, `wireguard.listen_port`, 51820 by default) on the router to the node, or give the Domain a bridge that relays (see [NAT Relay](../reference/bridge/nat-relay.md)). Peers also receive the node's peer-observed endpoint, the mapping other nodes see in their handshakes with it, once at least two nodes of the Domain hold a direct handshake with it (see [Peer-observed endpoints](../reference/networking/peer-endpoint-exchange.md#peer-observed-endpoints)).
+
+## A node withdrew its state or did not restore it
+
+```bash
+plexd logs | grep -E 'stored state|desired state|state freshness|FetchState failed'
+```
+
+plexd stores the state of its last successful pull in `<data_dir>/desired-state.json` and applies it at start, before its first pull. The control plane can set a maximum age for that state with the pull's `state_freshness` block. A node that lost its peers and its policy while its pulls failed, or that came back from a restart without them, names the reason in one of these lines (see [Stored state](../reference/core/reconciliation.md#stored-state) and [State freshness](../reference/core/reconciliation.md#state-freshness)):
+
+| Line | Level | Meaning | What to do |
+|------|-------|---------|------------|
+| `desired state passed its maximum age, withdrawing`, then `desired state withdrawn` | Warn, Info | The last successful pull is older than the maximum age (`max_age`), so the running node removed its peers and shared subnets, left the default deny alone in place, stopped its relay and ingress and turned user access and site-to-site off, keeping their keys | Find out why the pulls fail from the `FetchState failed` lines. The next successful pull takes everything back |
+| `desired state withdrawn` with `handler_failed=true`, `withdraw handler failed` | Info, Error | A part of the withdrawal failed. plexd retries it on every cycle whose pull fails (`withdrawal retried` at Debug) | Read the `error` of the `withdraw handler failed` or `handler failed` line |
+| `stored state older than the limit, not restored` | Warn | The node restarted with a stored state older than the maximum age. It starts with no peers behind the default deny | Restore the connection to the control plane; the first pull brings the state |
+| `stored state is newer than the clock, not restored` | Warn | Under a maximum age, `saved_at` lies more than 60 s ahead of the host clock, so plexd cannot measure the state's age | Sync the system clock via NTP and restart plexd |
+| `stored state belongs to another node, not restored` | Warn | The file was written under another identity, for example before a `plexd deregister` without `--purge` and a new registration | Nothing; the first successful pull overwrites the file |
+| `stored state unusable, not restored` | Warn | The file cannot be read or decoded, or a newer plexd wrote a `version` this one does not restore, for example after a downgrade. The `error` names which | Nothing; the file stays until the first successful pull overwrites it |
+| `stored state discarded, the previous restore did not complete` | Warn | The previous start died while it applied the stored state, so plexd removed the file rather than risk the same crash on every start | Read the log of the previous start for the crash. The next successful pull writes the file again |
+| `stored state not restored, the restore marker cannot be written` | Warn | `data_dir` is not writable, so plexd could not mark the restore and did not start it | Check the free space and the permissions of `data_dir` |
+| `stored state restore marker not removed, the next start discards the stored state` | Warn | The restore ran, but `desired-state.restoring` stayed, so the next start reads it as a restore that did not complete | Check `data_dir` as above |
+| `stored state not written` | Warn | A pull could not be stored, so a restart without the control plane restores an older state or none. It is logged once per run of failures, and `stored state written again` at Info ends the run | Check `data_dir` as above |
+| `wireguard: edge psk: stored envelope does not open` | Warn | A stored edge PSK envelope did not open under the node secret key, so the peer named by `peer_id` is programmed without a PSK, and the handshake with a peer that holds one fails until the first pull fetches the PSK | Nothing; the first successful pull fetches it |
+
+A start that restored its state logs `stored state restored` at Info with `peers`, `policy_fingerprint`, `edge_psks`, `saved_at`, `age` and `handler_failed`. `no stored state` at Debug means there was no file, as on a node that never pulled. Even a successful restore leaves the `dns` block to the first pull: it is not stored, so mesh names do not resolve until then. A bridge part that needs a Secret value, such as a `terminate` ingress rule's certificate or a site-to-site tunnel's key, fetches it at the restore; with the control plane unreachable it stays down with its reason, such as `auth_secret_unreadable`, until a pull brings it up.
 
 ## Tunnel established but no traffic
 

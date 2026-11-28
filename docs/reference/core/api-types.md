@@ -124,7 +124,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the fifteen fields
+distinguishes a nil pointer from a populated block. None of the sixteen fields
 carry `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -144,6 +144,7 @@ carry `omitempty`.
 | `DNS`          | `*NodeStateDNS`        | `"dns"`          | The mesh DNS names of the node's Domain and the node's DNS forwarding setting: the full set, never a delta, which replaces the names the node answers. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the names and the forwarding the node holds |
 | `FailureDetection` | `json.RawMessage` | `"failure_detection"` | The Domain's failure-detection time, a `NodeStateFailureDetection`, carried raw like `Reachability` and decoded leniently by the WireGuard manager's dispatch handler, so a malformed block never fails the pull. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the value the node holds |
 | `SharedSubnets` | `[]NodeStateSharedSubnet` | `"shared_subnets"` | Per shared site subnet of the node's Project, the bridges it may be routed through, the carrier first; the control plane sends `[]` when there is none, never `null`. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) and `[]` both mean no shared subnet. Typed, as `Peers` is, so a value of another JSON type fails the pull's decode; the WireGuard manager validates the entries (see `NodeStateSharedSubnet` below) |
+| `StateFreshness` | `json.RawMessage` | `"state_freshness"` | How long the node may act on this desired state without a successful pull, a `NodeStateFreshness`, carried raw like `FailureDetection` and decoded leniently by the reconciler, so a malformed block never fails the pull that carries the peers and the policy. A `nil` value (the wire's `null`, or a pull from a control plane that predates the member and omits it) keeps the limit the node holds |
 
 Nine members are consumed on the dispatch seam rather than by the differ.
 `mesh_ip` is not desired state the differ converges on: the mesh address
@@ -173,6 +174,9 @@ from it, and the edge PSK store reads it on the dispatch seam.
 drift in the cycle log, and the policy dispatch handler applies the block on
 every successful pull (see
 [DispatchHandler](../networking/network-policy.md#dispatchhandler)).
+`state_freshness` goes to neither: the reconciler takes it itself right after
+every successful pull, before the dispatch handlers run (see
+`NodeStateFreshness` below).
 `shared_subnets` goes to the differ alone: it reports a changed list as
 `shared_subnets` drift, and the WireGuard reconcile handler takes the block
 from the desired snapshot (see `NodeStateSharedSubnet` below).
@@ -730,6 +734,26 @@ another value. See
 |----------------------|---------|--------------------------|-----------------------------------------------------|
 | `DetectAfterSeconds` | `int64` | `"detect_after_seconds"` | How long a relayed peer may stay silent before plexd dials the next relay of its set: a whole number of seconds from 5 to 180, and 15 for a Domain that never set it. `int64` rather than `int`, so a value out of range decodes on a 32-bit build too and is clamped rather than refused as malformed. A block without the member, `{}`, reads as 0 and changes nothing |
 
+**NodeStateFreshness**
+
+The interior of the `state_freshness` block: the longest time, counted from the
+node's last successful pull, the node acts on the desired state it holds. A
+node whose last successful pull is older withdraws its peers, its policy and
+its bridge block, and does not restore a stored state that old at start. The
+envelope carries the block raw, and the reconciler decodes it right after every
+successful pull, before the dispatch handlers run. A `null` block keeps the
+limit the node holds and logs nothing. A block `json.Unmarshal` refuses, such
+as a string or a fraction, keeps it too and is logged at Warn as
+`state freshness block malformed`, once until a block decodes again. A value
+below 1 keeps it and is logged at Warn as `state freshness limit out of range`,
+once per run of the same value. The reconciler applies at most ten years and
+at least three `reconcile.interval`s. See
+[State freshness](reconciliation.md#state-freshness).
+
+| Field           | Type     | JSON Tag            | Description                                         |
+|-----------------|----------|---------------------|-----------------------------------------------------|
+| `MaxAgeSeconds` | `*int64` | `"max_age_seconds"` | The maximum age in whole seconds, 1 or more. A pointer, so that a block without the member or with `null`, which removes the limit, stays distinguishable from 0, which is out of range. `int64` rather than `int`, so a value out of range decodes on a 32-bit build too |
+
 **NodeStateSharedSubnet**
 
 One entry of the `shared_subnets` block: a shared site subnet, a subnet that
@@ -871,7 +895,9 @@ The wireguard package opens `Data` under the 32-byte NSK with the additional
 authenticated data `plexsphere/mesh/edge-psk/v1|<self node id>|<peer node id>|<epoch>`,
 both node IDs trimmed and lowercased. It refuses an envelope whose epoch sorts
 below the highest epoch it already accepted for the edge. That floor survives a
-change of the peer's public key and lives in memory only. See
+change of the peer's public key and lives in memory. The state store keeps each
+envelope with its epoch, sealed as served, and a restart that restores them
+raises the floor to the stored epochs again. See
 [Edge PSKs](../networking/wireguard.md#edge-psks) for the fetch rule and how plexd
 handles each answer.
 
