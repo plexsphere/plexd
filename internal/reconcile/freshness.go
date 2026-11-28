@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -130,4 +131,63 @@ func (r *Reconciler) takeFreshness(raw json.RawMessage) {
 	}
 	r.freshnessOutOfRange = false
 	r.SetMaxAgeSeconds(v)
+}
+
+// Restore applies a stored desired state before the first pull, as a pull's
+// apply without the pull: it counts as a pull age old for the maximum age,
+// diffs stored against the current snapshot and, on drift, invokes the
+// reconcile handlers. It runs no dispatch handler, because those mean "a pull
+// succeeded" and would log the absent blocks of a pull that never happened.
+//
+// stored becomes the snapshot whether or not a handler failed. The snapshot
+// before a restore is empty, so keeping it would leave a later pull unable to
+// remove a restored peer the control plane has dropped. A failure sets
+// reapply instead (see runCycle), so the next successful pull writes every
+// peer it lists again. A negative age counts as 0, and a nil stored does
+// nothing.
+//
+// Restore returns whether a handler failed and logs stored state applied. It
+// is called once, before Run, from the goroutine that then calls Run.
+func (r *Reconciler) Restore(ctx context.Context, stored *api.NodeStateSnapshot, age time.Duration) bool {
+	if stored == nil {
+		return false
+	}
+	age = max(age, 0)
+	r.lastPull = r.now().Add(-age)
+
+	current := r.snapshot.Get()
+	diff := ComputeDiff(stored, &current)
+	failed := false
+	if !diff.IsEmpty() {
+		failed = r.invokeHandlers(ctx, stored, diff)
+	}
+	r.snapshot.Update(stored)
+	if failed {
+		r.reapply = true
+	}
+	r.logger.Info("stored state applied",
+		"component", "reconcile",
+		"drift", diff.Summary(),
+		"age", age,
+		"handler_failed", failed,
+	)
+	return failed
+}
+
+// reapplyPeers appends to diff.PeersToAdd every peer of peers the diff lists
+// neither as an add nor as an update, so a cycle that reapplies writes every
+// pulled peer again.
+func reapplyPeers(diff *StateDiff, peers []api.SnapshotPeer) {
+	listed := make(map[string]struct{}, len(diff.PeersToAdd)+len(diff.PeersToUpdate))
+	for _, p := range diff.PeersToAdd {
+		listed[p.NodeID] = struct{}{}
+	}
+	for _, p := range diff.PeersToUpdate {
+		listed[p.NodeID] = struct{}{}
+	}
+	for _, p := range peers {
+		if _, ok := listed[p.NodeID]; !ok {
+			diff.PeersToAdd = append(diff.PeersToAdd, p)
+		}
+	}
 }
