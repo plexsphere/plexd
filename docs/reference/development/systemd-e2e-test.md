@@ -42,7 +42,7 @@ Builds the mock-api image, the systemd container image, and cross-compiles the p
 
 ### 4. Network and container startup
 
-Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, phase 17 the mesh node and the device, and phase 18 the site. The mock API runs with `-addr :8080 -dns-addr :53 -api-tls-addr :8444`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to, and the control plane API over TLS on port 8444, which only phase 19 joins through. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
+Creates a Docker bridge network and starts the mock API and the systemd container on it; phase 16 starts the ingress target and Pebble on the same network, phase 17 the mesh node and the device, and phase 18 the site. The mock API runs with `-addr :8080 -dns-addr :53 -api-tls-addr :8444`, so it also serves its DNS stub (see [the mock API server](mock-api-server.md)) on UDP and TCP port 53, which step 5b of the mesh DNS phase forwards to, and the control plane API over TLS on port 8444, which only phase 20 joins through. The image runs as uid 65534, and Docker sets `net.ipv4.ip_unprivileged_port_start` to `0` in the container, so the port binds. The systemd container runs with `--privileged`, `--cgroupns=host`, and cgroup volume mounts for full systemd functionality.
 
 ### 5. Service installation
 
@@ -233,7 +233,19 @@ The phase serves site-to-site tunnels on the bridge of phases 16 and 17, which o
 
 The phase ends by requiring that the journal holds no `site-to-site status: send failed` line, so the mock refused no report.
 
-### 19. Custom CA for the control plane
+### 19. Restart without the control plane
+
+The phase checks the [stored state](../core/reconciliation.md#stored-state) and its [maximum age](../core/reconciliation.md#state-freshness) under the shipped unit, with the mock API container paused through `docker pause`, so every request plexd sends it hangs until plexd's request timeout. While it holds the mock paused it sets `MOCK_PAUSED`, and `fail` and the EXIT trap unpause it through `unpause_mock`. `rs_freshness <tag> <block>` splices the block into the live snapshot as `state_freshness`, posts it with `POST /test/configure-state` and injects a `node_state_updated` nudge, as `configure_policy` does for the policy. The phase reads `plexd0` through `bridge_netns wg show plexd0 peers`, since the systemd image carries no `wg`, and matches journal lines by the `plexd[<pid>]:` of the process it means.
+
+1. **The peer.** The mock must serve `state_freshness` `null`, the fixture's, and `plexd0` must list peer `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1` by the public key the snapshot serves for it.
+2. **A maximum age.** `rs_freshness` serves `{"max_age_seconds":180}`, three times the default 60-second reconcile interval. Within 60 seconds the running process must log `state freshness limit set` with `max_age=3m0s`, and within 30 seconds `/var/lib/plexd/desired-state.json` must carry `"max_age_seconds":180`.
+3. **The withdrawal.** The phase pauses the mock. The limit counts from the last successful pull, which the heartbeat's `reconcile: true` asks for every 30 seconds, so it lies up to 30 seconds before the pause. 100 seconds after the pause `plexd0` must still list the peer, and 200 seconds after it `plexd0` must list no peer, and the running process must have logged `desired state withdrawn`.
+4. **A restart past the limit.** `systemctl restart plexd`, the mock still paused. Within 60 seconds the new process must log `stored state older than the limit, not restored`, and `plexd0` must list no peer.
+5. **The control plane answers.** `unpause_mock`. Within 90 seconds `plexd0` must list the peer again, programmed by the next pull.
+6. **No limit.** `rs_freshness` serves `{}`. Within 60 seconds the process must log `state freshness limit removed`, and within 30 seconds the stored state must carry no `max_age_seconds`. The phase pauses the mock again and runs `systemctl restart plexd`. Within 60 seconds the new process must log `stored state restored`, `plexd0` must list the peer, and `wg show plexd0 preshared-keys` must give the peer a key other than `(none)`: the stored edge PSK.
+7. **The fixture again.** `unpause_mock`, and `rs_freshness` serves `null`, which the mock must then serve.
+
+### 20. Custom CA for the control plane
 
 The phase runs `plexd join` four times as root through `docker exec` in the systemd container, outside the unit, against `https://plexd-e2e-mockapi:8444`, the mock's TLS listener for the control plane API. Its leaf names `mock-api`, `localhost` and `plexd-e2e-mockapi`, the mock's CA signed it, and no trust store of the container holds that CA. Each run works in `/tmp/plexd-ca-join/<case>` with a `config.yaml` of the shape below, whose `api` section each case changes, and its own copy of the bootstrap token of phase 5, because a join that registers removes the token file it read. The phase reads `registration_count` from `GET /test/assertions` before and after each run. It redirects the run's stdout and stderr to two files on the host, with no pipe after the command, so the exit code it records is the one of `plexd join`.
 
@@ -255,11 +267,11 @@ registration:
 
 The phase then removes `/tmp/plexd-ca-join` and the files on the host. It comes last because a successful registration replaces the public key the mock compares key rotations against, which the earlier phases must not see. Every other phase reaches the control plane over plain HTTP on port 8080.
 
-### 20. Shutdown verification
+### 21. Shutdown verification
 
 Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged. The crash check leaves out the lines `plexd.service: Sent signal SIGKILL to main process <pid> (plexd) on client request.` with which systemd records the deliberate kills of step 7 of phase 17 and step 7 of phase 18, and checks every other line. It runs with the opt-out of phase 15, the bridge mode, environment file and ingress opt-out of phase 16, the user access opt-out of phase 17 and the site-to-site opt-out of phase 18 in place, so it stops a bridge that opts out of public ingress, of user access and of site-to-site tunnels.
 
-### 21. Cleanup
+### 22. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It unpauses the mock API if the mesh DNS phase left it paused, prints diagnostics on failure, then removes the seven containers and the Docker network.
 

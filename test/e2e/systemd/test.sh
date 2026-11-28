@@ -84,6 +84,11 @@
 #     removed tunnel whose interface, route and key file go, and the opt-out
 #     with bridge.site_to_site_enabled: false, which serves no tunnel, keeps
 #     the keys, reports opted_out and names an ignored local key
+#   - Restart without the control plane: under a 180 s state_freshness the
+#     unit's plexd keeps its peers on plexd0 100 s into a paused mock and
+#     withdraws them by 200 s, a restart past the limit restores nothing, the
+#     next pull brings the peers back, and without a limit a restart with the
+#     mock paused restores the stored peer with its preshared key
 #   - Custom CA for the control plane: plexd join against the mock's TLS
 #     listener, refused without api.tls_ca_file, stopped before any request
 #     by a missing CA file and by the file beside the skip-verify option,
@@ -5187,6 +5192,251 @@ if journal_has "${S2S_JOURNAL}" 'msg="site-to-site status: send failed"'; then
 fi
 echo "  PASS: plexd logged no 'site-to-site status: send failed'"
 echo "=== Site-to-site through a bridge PASSED ==="
+
+# --- Restart without the control plane ---
+# plexd keeps the desired state of its last successful pull in
+# /var/lib/plexd/desired-state.json, applies it at start before its first
+# pull, and honors the maximum age the state pull's state_freshness member
+# sets. The phase runs plexd under its unit with the mock API container paused:
+#
+#   (a) peer ...a0b1 of the served snapshot is on plexd0
+#   (b) with state_freshness {"max_age_seconds":180}, three times the default
+#       60 s reconcile interval, plexd logs "state freshness limit set" with
+#       max_age=3m0s and stores the limit with the state
+#   (c) the mock is paused. The limit counts from the last successful pull,
+#       which the heartbeat's reconcile:true asks for every 30 s, so it lies
+#       up to 30 s before the pause: plexd0 still lists the peer 100 s after
+#       the pause, and lists no peer 200 s after it, with "desired state
+#       withdrawn" in the journal of the running plexd
+#   (d) systemctl restart plexd, the mock still paused: the stored state is
+#       older than the limit, and the restarted plexd logs "stored state older
+#       than the limit, not restored"
+#   (e) the mock answers again, and the peer is back after the next pull
+#   (f) state_freshness {} removes the limit; with the mock paused again, a
+#       restart logs "stored state restored", and the peer is on plexd0 with
+#       a preshared key
+#   (g) the mock answers again, and the served state_freshness is null, as
+#       the fixture's
+#
+# fail and the EXIT trap unpause the mock.
+echo "=== Testing a restart without the control plane ==="
+RS_PEER_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+RS_STORE=/var/lib/plexd/desired-state.json
+
+# rs_journal leaves the plexd unit's journal in RS_JOURNAL.
+rs_journal() {
+    RS_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>&1) \
+        || fail "journalctl -u plexd failed: ${RS_JOURNAL}"
+}
+
+# rs_wait_journal <tag> <timeout-s> <needle>... waits until one line of the
+# plexd journal carries every needle.
+rs_wait_journal() {
+    local tag=$1 timeout=$2 start=${SECONDS}
+    shift 2
+    while :; do
+        rs_journal
+        if journal_has "${RS_JOURNAL}" "$@"; then
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge "${timeout}" ]; then
+            fail "[${tag}] ${timeout}s on, no line of the plexd journal carries $*"
+        fi
+        sleep 2
+    done
+}
+
+# rs_main_pid leaves the main PID of the plexd unit in RS_PID.
+rs_main_pid() {
+    RS_PID=$(docker exec "${SYSTEMD_CONTAINER}" systemctl show -p MainPID --value plexd 2>&1) \
+        || fail "systemctl show -p MainPID plexd failed: ${RS_PID}"
+    case "${RS_PID}" in
+        "" | 0 | *[!0-9]*) fail "the plexd unit's MainPID is '${RS_PID}', want a running process" ;;
+    esac
+}
+
+# rs_peers <tag> leaves the public keys of plexd0's peers in RS_PEERS.
+rs_peers() {
+    RS_PEERS=$(bridge_netns wg show "${MESH_IFACE}" peers 2>&1) \
+        || fail "[$1] wg show ${MESH_IFACE} peers failed: ${RS_PEERS}"
+}
+
+# rs_freshness <tag> <block-json> serves the block as the state pull's
+# state_freshness member and nudges the agent, as configure_policy does for
+# the policy block.
+rs_freshness() {
+    local tag=$1 block=$2 snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson b "${block}" '.state_freshness = $b') \
+        || fail "[${tag}] could not splice state_freshness ${block} into the live snapshot"
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-freshness-nudge-${tag}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] state freshness nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# rs_store_has <tag> <timeout-s> <yes|no> <needle> waits until the stored
+# state holds the needle (yes) or does not (no).
+rs_store_has() {
+    local tag=$1 timeout=$2 want=$3 needle=$4 start=${SECONDS} stored has
+    while :; do
+        stored=$(docker exec "${SYSTEMD_CONTAINER}" cat "${RS_STORE}" 2>&1) || stored=""
+        has=no
+        case "${stored}" in
+            *"${needle}"*) has=yes ;;
+        esac
+        if [ -n "${stored}" ] && [ "${has}" = "${want}" ]; then
+            return 0
+        fi
+        if [ $((SECONDS - start)) -ge "${timeout}" ]; then
+            fail "[${tag}] ${timeout}s on, ${RS_STORE} holding ${needle} is '${has}', want '${want}' (read: ${stored:0:400})"
+        fi
+        sleep 2
+    done
+}
+
+# rs_sleep_until <seconds> sleeps until that many seconds passed since
+# RS_PAUSE_AT.
+rs_sleep_until() {
+    local left=$(($1 - (SECONDS - RS_PAUSE_AT)))
+    if [ "${left}" -gt 0 ]; then
+        sleep "${left}"
+    fi
+}
+
+# (a) The peer, by the public key the mock serves for it.
+RS_SNAPSHOT=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+RS_PEER_KEY=$(printf '%s' "${RS_SNAPSHOT}" | jq -r --arg id "${RS_PEER_ID}" '.peers[]? | select(.node_id == $id) | .public_key' 2>&1) \
+    || fail "jq could not read the public key of peer ${RS_PEER_ID} from the live snapshot: ${RS_PEER_KEY}"
+if [ "${#RS_PEER_KEY}" -ne 44 ]; then
+    fail "the live snapshot serves '${RS_PEER_KEY}' as the public key of peer ${RS_PEER_ID}, want 44 characters of base64"
+fi
+RS_FRESHNESS=$(printf '%s' "${RS_SNAPSHOT}" | jq -c '.state_freshness' 2>&1) \
+    || fail "jq could not read state_freshness from the live snapshot: ${RS_FRESHNESS}"
+if [ "${RS_FRESHNESS}" != "null" ]; then
+    fail "the live snapshot serves state_freshness ${RS_FRESHNESS}, want the fixture's null"
+fi
+rs_peers "before"
+if ! has_word "${RS_PEERS}" "${RS_PEER_KEY}"; then
+    fail "[before] wg show ${MESH_IFACE} peers lists '${RS_PEERS}', want peer ${RS_PEER_ID} (${RS_PEER_KEY})"
+fi
+echo "  PASS: [before] ${MESH_IFACE} lists peer ${RS_PEER_ID}"
+
+# (b) A maximum age of 180 s.
+rs_main_pid
+RS_RUNNING_PID=${RS_PID}
+rs_freshness "limit" '{"max_age_seconds":180}'
+rs_wait_journal "limit" 60 "plexd[${RS_RUNNING_PID}]:" 'msg="state freshness limit set"' "max_age=3m0s"
+echo "  PASS: [limit] plexd[${RS_RUNNING_PID}] logged 'state freshness limit set' with max_age=3m0s"
+rs_store_has "limit" 30 yes '"max_age_seconds":180'
+echo "  PASS: [limit] ${RS_STORE} carries max_age_seconds 180"
+
+# (c) The mock goes away, and the state ages out.
+docker pause "${MOCKAPI_CONTAINER}" >/dev/null || fail "docker pause ${MOCKAPI_CONTAINER} failed"
+MOCK_PAUSED=1
+RS_PAUSE_AT=${SECONDS}
+echo "  mock API container paused"
+rs_sleep_until 100
+rs_peers "withdrawal"
+if ! has_word "${RS_PEERS}" "${RS_PEER_KEY}"; then
+    fail "[withdrawal] $((SECONDS - RS_PAUSE_AT))s after the pause wg show ${MESH_IFACE} peers lists '${RS_PEERS}', want peer ${RS_PEER_ID} still there within the 180 s limit"
+fi
+echo "  PASS: [withdrawal] ${MESH_IFACE} still lists peer ${RS_PEER_ID} $((SECONDS - RS_PAUSE_AT))s after the pause"
+rs_sleep_until 200
+rs_peers "withdrawal"
+if [ -n "${RS_PEERS//[[:space:]]/}" ]; then
+    fail "[withdrawal] $((SECONDS - RS_PAUSE_AT))s after the pause wg show ${MESH_IFACE} peers lists '${RS_PEERS}', want no peer once the last pull is older than 180 s"
+fi
+echo "  PASS: [withdrawal] ${MESH_IFACE} lists no peer $((SECONDS - RS_PAUSE_AT))s after the pause"
+rs_journal
+if ! journal_has "${RS_JOURNAL}" "plexd[${RS_RUNNING_PID}]:" 'msg="desired state withdrawn"'; then
+    fail "[withdrawal] plexd[${RS_RUNNING_PID}] logged no 'desired state withdrawn'"
+fi
+echo "  PASS: [withdrawal] plexd[${RS_RUNNING_PID}] logged 'desired state withdrawn'"
+
+# (d) A restart past the limit restores nothing.
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd || fail "[restart past the limit] systemctl restart plexd failed"
+rs_main_pid
+RS_RESTARTED_PID=${RS_PID}
+rs_wait_journal "restart past the limit" 60 "plexd[${RS_RESTARTED_PID}]:" 'msg="stored state older than the limit, not restored"'
+echo "  PASS: [restart past the limit] plexd[${RS_RESTARTED_PID}] logged 'stored state older than the limit, not restored'"
+rs_peers "restart past the limit"
+if [ -n "${RS_PEERS//[[:space:]]/}" ]; then
+    fail "[restart past the limit] wg show ${MESH_IFACE} peers lists '${RS_PEERS}' after the restart, want no peer"
+fi
+echo "  PASS: [restart past the limit] ${MESH_IFACE} lists no peer after the restart"
+
+# (e) The control plane answers again.
+unpause_mock
+echo "  mock API container unpaused"
+RS_START=${SECONDS}
+while :; do
+    rs_peers "back"
+    if has_word "${RS_PEERS}" "${RS_PEER_KEY}"; then
+        break
+    fi
+    if [ $((SECONDS - RS_START)) -ge 90 ]; then
+        fail "[back] 90s after the unpause wg show ${MESH_IFACE} peers lists '${RS_PEERS}', want peer ${RS_PEER_ID} back after a pull"
+    fi
+    sleep 3
+done
+echo "  PASS: [back] ${MESH_IFACE} lists peer ${RS_PEER_ID} again $((SECONDS - RS_START))s after the unpause"
+
+# (f) Without a limit, a restart without the control plane restores the
+# stored state.
+rs_freshness "no limit" '{}'
+rs_wait_journal "no limit" 60 "plexd[${RS_RESTARTED_PID}]:" 'msg="state freshness limit removed"'
+echo "  PASS: [no limit] plexd[${RS_RESTARTED_PID}] logged 'state freshness limit removed'"
+rs_store_has "no limit" 30 no '"max_age_seconds"'
+echo "  PASS: [no limit] ${RS_STORE} carries no max_age_seconds"
+docker pause "${MOCKAPI_CONTAINER}" >/dev/null || fail "docker pause ${MOCKAPI_CONTAINER} failed"
+MOCK_PAUSED=1
+echo "  mock API container paused"
+docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd || fail "[restore] systemctl restart plexd failed"
+rs_main_pid
+RS_RESTORED_PID=${RS_PID}
+rs_wait_journal "restore" 60 "plexd[${RS_RESTORED_PID}]:" 'msg="stored state restored"'
+echo "  PASS: [restore] plexd[${RS_RESTORED_PID}] logged 'stored state restored' with the mock paused"
+rs_peers "restore"
+if ! has_word "${RS_PEERS}" "${RS_PEER_KEY}"; then
+    fail "[restore] wg show ${MESH_IFACE} peers lists '${RS_PEERS}' after the restore, want peer ${RS_PEER_ID}"
+fi
+RS_PSKS=$(bridge_netns wg show "${MESH_IFACE}" preshared-keys 2>&1) \
+    || fail "[restore] wg show ${MESH_IFACE} preshared-keys failed: ${RS_PSKS}"
+RS_PSK=""
+while IFS=$' \t' read -r RS_KEY RS_VALUE; do
+    if [ "${RS_KEY}" = "${RS_PEER_KEY}" ]; then
+        RS_PSK=${RS_VALUE}
+    fi
+done <<< "${RS_PSKS}"
+if [ -z "${RS_PSK}" ] || [ "${RS_PSK}" = "(none)" ]; then
+    fail "[restore] wg show ${MESH_IFACE} preshared-keys gives peer ${RS_PEER_ID} '${RS_PSK}', want its restored preshared key (output: ${RS_PSKS})"
+fi
+echo "  PASS: [restore] ${MESH_IFACE} lists peer ${RS_PEER_ID} with a preshared key"
+
+# (g) The control plane answers again and serves the fixture's null.
+unpause_mock
+echo "  mock API container unpaused"
+rs_freshness "null" 'null'
+RS_SERVED=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null | jq -c '.state_freshness' 2>&1 || true)
+if [ "${RS_SERVED}" != "null" ]; then
+    fail "[null] the mock serves state_freshness '${RS_SERVED}' after the restore, want null"
+fi
+echo "  PASS: [null] the mock serves state_freshness null again"
+echo "=== Restart without the control plane PASSED ==="
 
 # --- Custom CA for the control plane ---
 # plexd join runs four times as root through docker exec against the mock's
