@@ -2,6 +2,7 @@ package policy
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -237,6 +238,30 @@ func (e *Enforcer) recordFailureLocked(desired *api.PolicySnapshot, err error) {
 		"fingerprint", fingerprint,
 		"error", err,
 	)
+}
+
+// Withdraw replaces the installed ruleset with the default deny alone and
+// forgets every pull's block, for a node whose desired state passed its
+// maximum age: the reconciler calls it through its withdraw handler. On
+// success, and when enforcement is disabled or no backend exists, Status
+// becomes the zero Status, the state before the first Sync, so the status
+// reporter, which sends nothing until Sync ran, claims no applied ruleset,
+// and the next pull's block is applied as a first one. A backend error is
+// returned and leaves the ruleset and Status as they were. A closed
+// Enforcer returns nil and touches nothing.
+func (e *Enforcer) Withdraw(iface string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
+	if _, err := e.applyLocked(nil, iface); err != nil {
+		return fmt.Errorf("policy: withdraw: %w", err)
+	}
+	e.status = Status{}
+	e.failKey = ""
+	e.logger.Info("policy ruleset withdrawn")
+	return nil
 }
 
 // Status returns a copy of the Enforcer's record. Before the first Sync it

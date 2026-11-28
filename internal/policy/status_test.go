@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -555,4 +556,116 @@ func TestEnforcer_StatusConcurrent(t *testing.T) {
 	if st := e.Status(); st.Applied == nil || len(st.Applied.Revisions) != 1 {
 		t.Errorf("Applied = %+v, want the last block with its revision", st.Applied)
 	}
+}
+
+// Withdraw after a Sync leaves the backend with the default deny alone and
+// Status at the zero Status, and the next Sync applies its block as a first
+// one.
+func TestEnforcer_Withdraw(t *testing.T) {
+	fw := &mockFirewallController{}
+	logger, logs := recordingLogger()
+	e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: boolPtr(true), ChainName: "TEST"}, logger)
+	e.Sync(statusBlock("fp-a", "rev-a"), "wg0")
+	<-e.Changed()
+
+	if err := e.Withdraw("wg0"); err != nil {
+		t.Fatalf("Withdraw() error = %v", err)
+	}
+
+	wantRules, err := NewPolicyEngine(testLogger()).BuildFirewallRules(nil, "wg0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(fw.applyRulesCalls); n != 2 {
+		t.Fatalf("ApplyRules calls = %d, want 2: the block and the withdrawal", n)
+	}
+	if got := fw.applyRulesCalls[1].Rules; !reflect.DeepEqual(got, wantRules) {
+		t.Errorf("rules after Withdraw = %+v, want the default deny alone %+v", got, wantRules)
+	}
+	if st := e.Status(); !reflect.DeepEqual(st, Status{}) {
+		t.Errorf("Status() after Withdraw = %+v, want the zero Status", st)
+	}
+	if n := logs.count(`msg="policy ruleset withdrawn"`); n != 1 {
+		t.Errorf("log holds %d 'policy ruleset withdrawn' lines, want 1", n)
+	}
+
+	e.Sync(statusBlock("fp-a", "rev-a"), "wg0")
+	if n := len(fw.applyRulesCalls); n != 3 {
+		t.Errorf("ApplyRules calls = %d after a Sync of the withdrawn block, want 3", n)
+	}
+	if st := e.Status(); !st.Synced || !st.HasApplied || st.Applied == nil || st.Applied.Fingerprint != "fp-a" {
+		t.Errorf("Status() after the next Sync = %+v, want fp-a applied", st)
+	}
+	select {
+	case <-e.Changed():
+	default:
+		t.Error("the first Sync after Withdraw did not signal Changed")
+	}
+}
+
+// A backend error is returned wrapped and leaves the applied ruleset and
+// Status as they were.
+func TestEnforcer_WithdrawBackendError(t *testing.T) {
+	fw := &mockFirewallController{}
+	e := newEnabledEnforcer(fw)
+	e.Sync(statusBlock("fp-a", "rev-a"), "wg0")
+	before := e.Status()
+
+	fw.applyRulesErr = errors.New("netlink: operation not permitted")
+	err := e.Withdraw("wg0")
+	if !errors.Is(err, fw.applyRulesErr) {
+		t.Fatalf("Withdraw() error = %v, want one wrapping %v", err, fw.applyRulesErr)
+	}
+	if !strings.HasPrefix(err.Error(), "policy: withdraw: ") {
+		t.Errorf("Withdraw() error = %q, want the policy: withdraw: prefix", err)
+	}
+	st := e.Status()
+	if !st.HasApplied || st.Applied == nil || st.Applied.Fingerprint != "fp-a" {
+		t.Errorf("Status() after a failed Withdraw = %+v, want fp-a still applied", st)
+	}
+	if !reflect.DeepEqual(st, before) {
+		t.Errorf("Status() changed on a failed Withdraw:\n got %+v\nwant %+v", st, before)
+	}
+}
+
+// Withdraw is nil on a closed Enforcer, with enforcement disabled and with no
+// backend; the last two reset Status, the first touches nothing.
+func TestEnforcer_WithdrawWithoutEnforcement(t *testing.T) {
+	t.Run("closed", func(t *testing.T) {
+		fw := &mockFirewallController{}
+		e := newEnabledEnforcer(fw)
+		if err := e.Teardown(); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Withdraw("wg0"); err != nil {
+			t.Errorf("Withdraw() on a closed Enforcer = %v, want nil", err)
+		}
+		if n := len(fw.applyRulesCalls); n != 0 {
+			t.Errorf("ApplyRules calls = %d, want none", n)
+		}
+	})
+	t.Run("disabled", func(t *testing.T) {
+		fw := &mockFirewallController{}
+		e := NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: boolPtr(false), ChainName: "TEST"}, testLogger())
+		e.Sync(statusBlock("fp-a", "rev-a"), "wg0")
+		if err := e.Withdraw("wg0"); err != nil {
+			t.Errorf("Withdraw() with enforcement disabled = %v, want nil", err)
+		}
+		if st := e.Status(); !reflect.DeepEqual(st, Status{}) {
+			t.Errorf("Status() = %+v, want the zero Status", st)
+		}
+		if n := len(fw.applyRulesCalls); n != 0 {
+			t.Errorf("ApplyRules calls = %d, want none", n)
+		}
+	})
+	t.Run("no backend", func(t *testing.T) {
+		e := newEnabledEnforcer(nil)
+		e.Sync(statusBlock("fp-a", "rev-a"), "wg0")
+		if err := e.Withdraw("wg0"); err != nil {
+			t.Errorf("Withdraw() without a backend = %v, want nil", err)
+		}
+		if st := e.Status(); !reflect.DeepEqual(st, Status{}) {
+			t.Errorf("Status() = %+v, want the zero Status", st)
+		}
+	})
 }
