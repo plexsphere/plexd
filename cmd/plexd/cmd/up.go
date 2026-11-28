@@ -44,6 +44,7 @@ import (
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/reconcile"
 	"github.com/plexsphere/plexd/internal/registration"
+	"github.com/plexsphere/plexd/internal/statestore"
 	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/upgrade"
 	"github.com/plexsphere/plexd/internal/wireguard"
@@ -1343,6 +1344,10 @@ func runAgent(ctx context.Context) error {
 		reconciler.RegisterDispatchHandler(wireguard.EdgePSKDispatchHandler(edgePSKs))
 	}
 
+	// The restore of step 18 calls the failure-detection handler, which
+	// exists only when the interface came up, and the policy handler.
+	var failureDetectionHandler reconcile.DispatchHandler
+
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
 	// so the fingerprint short-circuit could never converge on such hosts. The
@@ -1355,8 +1360,10 @@ func runAgent(ctx context.Context) error {
 		// or not, and tunes endpoint selection's relay watch and its watch of
 		// the bridges of shared subnets (step 17b). A pull without the block
 		// keeps the value the last one carried, and a node that never
-		// received one keeps the built-in timing and watches no bridge.
-		reconciler.RegisterDispatchHandler(wireguard.FailureDetectionDispatchHandler(wgMgr))
+		// received one keeps the built-in timing and watches no bridge. The
+		// restore of step 18 hands it the stored block too.
+		failureDetectionHandler = wireguard.FailureDetectionDispatchHandler(wgMgr)
+		reconciler.RegisterDispatchHandler(failureDetectionHandler)
 
 		// The typed lookup keeps the interface a true nil when edge PSKs are
 		// off, as the rotator's device variable does.
@@ -1375,7 +1382,29 @@ func runAgent(ctx context.Context) error {
 	// holds back the rest of the snapshot. Dispatch handlers run before the
 	// reconcile handlers, so a new ruleset is in place before the WireGuard
 	// handler changes peers in the same cycle.
-	reconciler.RegisterDispatchHandler(policy.DispatchHandler(enforcer, policyIface))
+	policyHandler := policy.DispatchHandler(enforcer, policyIface)
+	reconciler.RegisterDispatchHandler(policyHandler)
+
+	// A node whose last successful pull is older than the maximum age the
+	// control plane set withdraws its policy along with its peers and its
+	// bridge block, and waits behind the default deny until a pull succeeds.
+	// The policy lives on the dispatch seam, so the reconciler withdraws it
+	// through this handler.
+	reconciler.RegisterWithdrawHandler(func(context.Context) error {
+		return enforcer.Withdraw(policyIface)
+	})
+
+	// The state store keeps the desired state of every successful pull in
+	// data_dir, so the restore of step 18 can apply it after a restart
+	// without the control plane. It writes from the cycle observer, after the
+	// handlers, so a pull that kills the process while it is applied is never
+	// stored. The edge-PSK envelopes go with it, sealed under the NSK.
+	stateStore := statestore.New(cfg.DataDir, identity.NodeID, logger)
+	var sealedEdgePSKs func() []wireguard.SealedEdgePSK
+	if edgePSKs != nil {
+		sealedEdgePSKs = edgePSKs.Sealed
+	}
+	reconciler.SetCycleObserver(stateStore.Observer(sealedEdgePSKs, reconciler.MaxAgeSeconds))
 
 	// Register the peer snapshot reconcile handler for node API queries.
 	reconciler.RegisterHandler(func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
@@ -1392,26 +1421,38 @@ func runAgent(ctx context.Context) error {
 	// pull enables, and on a bridge that opts out of public ingress (a nil
 	// ingress manager) it only says that the control plane enables rules. The
 	// user access and site-to-site handlers do the same for their blocks.
+	//
+	// The restore of step 18 hands the stored secret inventory to the three
+	// inventory handlers before it applies the stored bridge block, as a
+	// pull does, so a part whose Secret the control plane serves comes up
+	// at the restore instead of going down until a later pull.
+	var secretInventoryHandlers []reconcile.DispatchHandler
 	if bridgeMgr != nil {
 		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
 			// A rotated certificate Secret changes only the secrets block,
 			// which reports no drift, so the inventory reaches the manager on
 			// every successful pull, ahead of the reconcile handlers.
-			reconciler.RegisterDispatchHandler(bridge.IngressSecretInventoryHandler(ingressMgr))
+			inventory := bridge.IngressSecretInventoryHandler(ingressMgr)
+			secretInventoryHandlers = append(secretInventoryHandlers, inventory)
+			reconciler.RegisterDispatchHandler(inventory)
 		}
 		reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		if userAccessMgr != nil {
 			// The same holds for the Secret of a vendor provider, and a
 			// provider that is down is retried on every successful pull, so
 			// no reconcile cycle fails for one.
-			reconciler.RegisterDispatchHandler(bridge.UserAccessPullHandler(userAccessMgr))
+			inventory := bridge.UserAccessPullHandler(userAccessMgr)
+			secretInventoryHandlers = append(secretInventoryHandlers, inventory)
+			reconciler.RegisterDispatchHandler(inventory)
 		}
 		reconciler.RegisterHandler(bridge.UserAccessReconcileHandler(userAccessMgr, logger))
 		if s2sMgr != nil {
 			// The same holds for the Secret of a tunnel, and a tunnel that
 			// is down is retried on every successful pull.
-			reconciler.RegisterDispatchHandler(bridge.SiteToSitePullHandler(s2sMgr))
+			inventory := bridge.SiteToSitePullHandler(s2sMgr)
+			secretInventoryHandlers = append(secretInventoryHandlers, inventory)
+			reconciler.RegisterDispatchHandler(inventory)
 		}
 		reconciler.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 	}
@@ -1680,10 +1721,23 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
-	// 18. Start reconciler.
+	// 18. Start reconciler. The state stored by the last successful pull is
+	// applied first, before the first pull, so a node that restarts while
+	// the control plane is unreachable comes back with the peers and the
+	// policy it last applied; a blackholed control plane would otherwise hold
+	// the data plane back for a request timeout.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		restoreStoredState(ctx, storedStateDeps{
+			store:            stateStore,
+			reconciler:       reconciler,
+			edgePSKs:         edgePSKs,
+			failureDetection: failureDetectionHandler,
+			policy:           policyHandler,
+			secretInventory:  secretInventoryHandlers,
+			logger:           logger.With("component", "statestore"),
+		})
 		if err := reconciler.Run(ctx, identity.NodeID); err != nil {
 			logger.Error("reconciler stopped", "error", err)
 		}
