@@ -610,17 +610,18 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 		SharedSubnets: []NodeStateSharedSubnet{
 			{Subnet: "10.20.0.0/16", Bridges: []string{"n-002", "n-003"}},
 		},
+		StateFreshness: json.RawMessage(`{"max_age_seconds":86400}`),
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the fifteen contract keys must appear.
+	// Exactly the sixteen contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 15 {
-		t.Errorf("expected exactly 15 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 16 {
+		t.Errorf("expected exactly 16 JSON keys, got %d: %v", len(raw), raw)
 	}
 	if got := string(raw["mesh_ip"]); got != `"10.42.0.9"` {
 		t.Errorf("mesh_ip = %s, want \"10.42.0.9\"", got)
@@ -631,7 +632,10 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	if got, want := string(raw["shared_subnets"]), `[{"subnet":"10.20.0.0/16","bridges":["n-002","n-003"]}]`; got != want {
 		t.Errorf("shared_subnets = %s, want %s", got, want)
 	}
-	for _, key := range []string{"mesh_ip", "peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
+	if got := string(raw["state_freshness"]); got != `{"max_age_seconds":86400}` {
+		t.Errorf("state_freshness = %s, want the block byte for byte", got)
+	}
+	for _, key := range []string{"mesh_ip", "peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets", "state_freshness"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -674,7 +678,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all fifteen keys PRESENT.
+	// Marshalling nil blocks emits literal null with all sixteen keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -683,10 +687,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 15 {
-		t.Errorf("expected exactly 15 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 16 {
+		t.Errorf("expected exactly 16 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"mesh_ip", "peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets"} {
+	for _, key := range []string{"mesh_ip", "peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks", "dns", "failure_detection", "shared_subnets", "state_freshness"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -976,6 +980,52 @@ func TestNodeStateSnapshot_FailureDetectionBlock(t *testing.T) {
 	var block NodeStateFailureDetection
 	if err := json.Unmarshal([]byte(`{"detect_after_seconds":9000000000000}`), &block); err != nil || block.DetectAfterSeconds != 9000000000000 {
 		t.Errorf("decode of 9000000000000 = %+v, %v, want the value and no error", block, err)
+	}
+}
+
+// TestNodeStateSnapshot_StateFreshnessBlock pins the shapes the
+// state_freshness member arrives in: an absent key, null and a block decode
+// without error, and so does a block whose max_age_seconds is a string,
+// because the member is carried raw and decoded leniently by the reconciler.
+func TestNodeStateSnapshot_StateFreshnessBlock(t *testing.T) {
+	const others = `"peers":[{"node_id":"n-1","mesh_ip":"10.42.0.2","public_key":"pk"}],"reachability":null,` +
+		`"policy":{"revision_id":"rev-1","fingerprint":"fp","rules":[]},"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]`
+
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{name: "key absent", src: `{` + others + `}`, want: ""},
+		{name: "null", src: `{` + others + `,"state_freshness":null}`, want: "null"},
+		{name: "populated", src: `{` + others + `,"state_freshness":{"max_age_seconds":3600}}`, want: `{"max_age_seconds":3600}`},
+		{name: "a string value", src: `{` + others + `,"state_freshness":{"max_age_seconds":"x"}}`, want: `{"max_age_seconds":"x"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			if err := json.Unmarshal([]byte(tt.src), &snap); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := string(snap.StateFreshness); got != tt.want {
+				t.Errorf("state_freshness = %q, want %q", got, tt.want)
+			}
+			if len(snap.Peers) != 1 || snap.Peers[0].NodeID != "n-1" {
+				t.Errorf("peers = %+v, want the one peer n-1", snap.Peers)
+			}
+			if snap.Policy == nil || snap.Policy.RevisionID != "rev-1" {
+				t.Errorf("policy = %+v, want revision rev-1", snap.Policy)
+			}
+		})
+	}
+
+	var block NodeStateFreshness
+	if err := json.Unmarshal([]byte(`{"max_age_seconds":3600}`), &block); err != nil || block.MaxAgeSeconds == nil || *block.MaxAgeSeconds != 3600 {
+		t.Errorf("decode of {\"max_age_seconds\":3600} = %+v, %v, want 3600 and no error", block, err)
+	}
+	block = NodeStateFreshness{}
+	if err := json.Unmarshal([]byte(`{"max_age_seconds":null}`), &block); err != nil || block.MaxAgeSeconds != nil {
+		t.Errorf("decode of {\"max_age_seconds\":null} = %+v, %v, want a nil MaxAgeSeconds and no error", block, err)
 	}
 }
 
