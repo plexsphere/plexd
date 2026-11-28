@@ -110,7 +110,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// fifteen fields carry omitempty.
+// sixteen fields carry omitempty.
 type NodeStateSnapshot struct {
 	// MeshIP is the mesh address the node must use, read from the Node row on
 	// every pull. A control plane that predates the member leaves the key out,
@@ -171,6 +171,26 @@ type NodeStateSnapshot struct {
 	// Peers is, so a value of another JSON type fails the pull's decode; the
 	// WireGuard manager validates the entries.
 	SharedSubnets []NodeStateSharedSubnet `json:"shared_subnets"`
+	// StateFreshness is how long the node may act on this desired state
+	// without a successful pull, a NodeStateFreshness. It is carried raw, as
+	// FailureDetection is, so the reconciler decodes it leniently and a
+	// malformed block never fails the pull that carries the peers and the
+	// policy. A nil value, the wire's null or a key a control plane predating
+	// the member never wrote, means the control plane did not say this time,
+	// and the node keeps the limit it holds.
+	StateFreshness json.RawMessage `json:"state_freshness"`
+}
+
+// NodeStateFreshness is the state_freshness block of the state pull.
+// MaxAgeSeconds is the longest time, in whole seconds counted from the node's
+// last successful pull, the node acts on the desired state it holds: a node
+// whose last pull is older withdraws its peers, its policy and its bridge
+// block, and does not restore a stored state that old at start. A nil
+// MaxAgeSeconds, a block without the member or with null, removes the limit.
+// It is a pointer so that removal stays distinguishable from 0, which is out
+// of range, and int64 so a value out of range decodes on 32-bit builds too.
+type NodeStateFreshness struct {
+	MaxAgeSeconds *int64 `json:"max_age_seconds"`
 }
 
 // MaxSharedSubnetBridges is the contract's ceiling on the bridges of one
