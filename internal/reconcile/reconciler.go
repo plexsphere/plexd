@@ -57,6 +57,8 @@ type Reconciler struct {
 	// successful fetch invokes the handlers even on an empty diff and writes
 	// every pulled peer again; it clears when no handler fails.
 	reapply bool
+	// observer runs at the end of every cycle whose fetch succeeded.
+	observer DispatchHandler
 }
 
 // NewReconciler creates a new Reconciler with the given configuration.
@@ -87,6 +89,18 @@ func (r *Reconciler) RegisterHandler(handler ReconcileHandler) {
 // concurrent use.
 func (r *Reconciler) RegisterDispatchHandler(handler DispatchHandler) {
 	r.dispatchHandlers = append(r.dispatchHandlers, handler)
+}
+
+// SetCycleObserver sets fn to run once at the end of every cycle whose fetch
+// succeeded, with the pulled snapshot: after the reconcile handlers, with
+// drift or without, and also when a handler failed. A panicking observer is
+// logged and otherwise ignored. The state store writes from here rather than
+// from a dispatch handler, so a pulled state that kills the process while it
+// is applied is never stored.
+// SetCycleObserver must be called before Run; it is not safe for concurrent
+// use.
+func (r *Reconciler) SetCycleObserver(fn DispatchHandler) {
+	r.observer = fn
 }
 
 // TriggerReconcile requests an immediate reconciliation cycle.
@@ -189,6 +203,7 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 			"node_id", nodeID,
 			"duration", time.Since(start),
 		)
+		r.observe(ctx, desired)
 		return
 	}
 
@@ -208,6 +223,7 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 		"duration", time.Since(start),
 		"handler_failed", handlerFailed,
 	)
+	r.observe(ctx, desired)
 }
 
 // invokeHandlers calls each registered handler with panic recovery.
@@ -251,4 +267,21 @@ func (r *Reconciler) safeDispatch(ctx context.Context, handler DispatchHandler, 
 		}
 	}()
 	handler(ctx, desired)
+}
+
+// observe calls the cycle observer with panic recovery, as safeDispatch calls
+// a dispatch handler.
+func (r *Reconciler) observe(ctx context.Context, desired *api.NodeStateSnapshot) {
+	if r.observer == nil {
+		return
+	}
+	defer func() {
+		if v := recover(); v != nil {
+			r.logger.Error("cycle observer panicked",
+				"component", "reconcile",
+				"error", fmt.Errorf("%v\n%s", v, debug.Stack()),
+			)
+		}
+	}()
+	r.observer(ctx, desired)
 }
