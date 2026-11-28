@@ -282,12 +282,16 @@ func (t *ingressFailoverTransport) RoundTrip(req *http.Request) (*http.Response,
 	route := t.route
 	var tried uint8
 	var dialErr *ingressDialError
+	var body *ingressRetryBody
+	if req.Body != nil {
+		body = &ingressRetryBody{body: req.Body}
+	}
 	for idx, ok := route.lb.pick(tried, t.m.now()); ok; idx, ok = route.lb.pick(tried, t.m.now()) {
 		tried |= 1 << idx
 		out := req.Clone(req.Context())
 		out.URL.Host = route.lb.targets[idx].addr
-		if req.Body != nil {
-			out.Body = ingressRetryBody{req.Body}
+		if body != nil {
+			out.Body = body
 		}
 		resp, err := t.next.RoundTrip(out)
 		if !errors.As(err, &dialErr) || route.ctx.Err() != nil {
@@ -299,16 +303,36 @@ func (t *ingressFailoverTransport) RoundTrip(req *http.Request) (*http.Response,
 }
 
 // ingressRetryBody is the body of a request the failover transport hands to
-// one target. Its Close does nothing, so the next target reads the same body:
-// http.Transport closes a request's body when the dial fails, before it reads
-// any of it, and the body ReverseProxy passes refuses every read after its
-// Close. ReverseProxy closes that body itself when the request ends.
+// each target it tries. Its Close does nothing, so the next target reads the
+// same body: http.Transport closes a request's body when the dial fails,
+// before it reads any of it, and the body ReverseProxy passes refuses every
+// read after its Close. ReverseProxy closes that body itself when the request
+// ends. Once the body returned io.EOF, ingressRetryBody returns io.EOF without
+// reading it again: http.Transport reads a body with Content-Length once more
+// after its length to see the end, and the HTTP server closes a request body
+// it has read whole when the handler writes its header, which comes first
+// when the target answers before that read. That read of the closed body
+// would fail, and http.Transport would close the target connection in the
+// middle of the response.
 type ingressRetryBody struct {
-	io.Reader
+	body io.Reader
+	eof  bool
+}
+
+// Read reads the body until it returns io.EOF, and returns io.EOF after that.
+func (b *ingressRetryBody) Read(p []byte) (int, error) {
+	if b.eof {
+		return 0, io.EOF
+	}
+	n, err := b.body.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.eof = true
+	}
+	return n, err
 }
 
 // Close does nothing.
-func (ingressRetryBody) Close() error { return nil }
+func (*ingressRetryBody) Close() error { return nil }
 
 // newRouteProxy returns the proxy of a route with conditions. It speaks
 // HTTP/1.1 in cleartext to the rule's targets, on kept-alive connections it
