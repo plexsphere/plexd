@@ -3,6 +3,8 @@ package reconcile
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -190,4 +192,142 @@ func reapplyPeers(diff *StateDiff, peers []api.SnapshotPeer) {
 			diff.PeersToAdd = append(diff.PeersToAdd, p)
 		}
 	}
+}
+
+// WithdrawHandler withdraws state the reconcile handlers do not own, such as
+// the policy, which lives on the dispatch seam, when the desired state passes
+// its maximum age (see RegisterWithdrawHandler).
+type WithdrawHandler func(ctx context.Context) error
+
+// RegisterWithdrawHandler adds a handler the reconciler calls when the
+// desired state passes its maximum age. Handlers are called in registration
+// order, before the reconcile handlers get the withdrawn snapshot.
+// RegisterWithdrawHandler must be called before Run; it is not safe for
+// concurrent use.
+func (r *Reconciler) RegisterWithdrawHandler(handler WithdrawHandler) {
+	r.withdrawHandlers = append(r.withdrawHandlers, handler)
+}
+
+// pendingWithdrawal is a withdrawal a handler failed on: the withdrawn
+// snapshot and its diff against the snapshot the reconciler still holds.
+type pendingWithdrawal struct {
+	snapshot *api.NodeStateSnapshot
+	diff     StateDiff
+}
+
+// expiryIn returns how long from now the desired state passes its maximum
+// age, and whether there is such a time: a limit applies, a pull or a
+// restore happened, and the state is not withdrawn already.
+func (r *Reconciler) expiryIn() (time.Duration, bool) {
+	maxAge := r.MaxAge()
+	if maxAge <= 0 || r.lastPull.IsZero() || r.withdrawn {
+		return 0, false
+	}
+	return r.lastPull.Add(maxAge).Sub(r.now()), true
+}
+
+// withdraw withdraws the desired state once its last successful pull is
+// older than the maximum age. It calls the withdraw handlers in order, then
+// hands the reconcile handlers the withdrawn snapshot: no peers, no shared
+// subnets, no policy, the bridge block withdrawnBridge leaves, and the state
+// and reports blocks as they are, since a nil state makes the node API clear
+// its cache. When nothing failed it records the withdrawn snapshot, so the
+// next successful pull adds every peer again; otherwise the withdrawal is
+// pending and retried on every later cycle whose fetch fails. The expiry
+// timer stays disarmed until a fetch succeeds.
+func (r *Reconciler) withdraw(ctx context.Context) {
+	r.logger.Warn("desired state passed its maximum age, withdrawing",
+		"component", "reconcile",
+		"age", r.now().Sub(r.lastPull),
+		"max_age", r.MaxAge(),
+	)
+	r.withdrawn = true
+
+	current := r.snapshot.Get()
+	withdrawn := &api.NodeStateSnapshot{
+		Bridge:  withdrawnBridge(current.Bridge),
+		State:   current.State,
+		Reports: current.Reports,
+	}
+	failed := r.applyWithdrawal(ctx, &pendingWithdrawal{
+		snapshot: withdrawn,
+		diff:     ComputeDiff(withdrawn, &current),
+	})
+	r.logger.Info("desired state withdrawn",
+		"component", "reconcile",
+		"handler_failed", failed,
+	)
+}
+
+// applyWithdrawal calls the withdraw handlers and, on drift, the reconcile
+// handlers with p. It records p's snapshot when nothing failed and keeps p
+// pending otherwise, and returns whether a handler failed.
+func (r *Reconciler) applyWithdrawal(ctx context.Context, p *pendingWithdrawal) bool {
+	failed := false
+	for i, handler := range r.withdrawHandlers {
+		if err := r.safeWithdraw(ctx, handler); err != nil {
+			r.logger.Error("withdraw handler failed",
+				"component", "reconcile",
+				"handler_index", i,
+				"error", err,
+			)
+			failed = true
+		}
+	}
+	if !p.diff.IsEmpty() && r.invokeHandlers(ctx, p.snapshot, p.diff) {
+		failed = true
+	}
+	if failed {
+		r.pending = p
+		return true
+	}
+	r.snapshot.Update(p.snapshot)
+	r.pending = nil
+	return false
+}
+
+// retryWithdrawal applies a pending withdrawal again, on a cycle whose fetch
+// failed.
+func (r *Reconciler) retryWithdrawal(ctx context.Context) {
+	if r.pending == nil || ctx.Err() != nil {
+		return
+	}
+	failed := r.applyWithdrawal(ctx, r.pending)
+	r.logger.Debug("withdrawal retried",
+		"component", "reconcile",
+		"handler_failed", failed,
+	)
+}
+
+// safeWithdraw calls a withdraw handler with panic recovery.
+func (r *Reconciler) safeWithdraw(ctx context.Context, handler WithdrawHandler) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = fmt.Errorf("withdraw handler panicked: %v\n%s", v, debug.Stack())
+		}
+	}()
+	return handler(ctx)
+}
+
+// withdrawnBridge returns the bridge block of a withdrawn state: no relay and
+// no ingress, and the user access and site-to-site blocks with Enabled false
+// and their providers and tunnels kept. The managers keep the key file of
+// every provider and tunnel a block lists whatever Enabled says and delete
+// the others, so a nil child would delete every bridge key. A nil block
+// stays nil.
+func withdrawnBridge(b *api.BridgeSnapshot) *api.BridgeSnapshot {
+	if b == nil {
+		return nil
+	}
+	w := &api.BridgeSnapshot{
+		UserAccess: copyUserAccess(b.UserAccess),
+		SiteToSite: copySiteToSite(b.SiteToSite),
+	}
+	if w.UserAccess != nil {
+		w.UserAccess.Enabled = false
+	}
+	if w.SiteToSite != nil {
+		w.SiteToSite.Enabled = false
+	}
+	return w
 }
