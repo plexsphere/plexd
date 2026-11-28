@@ -748,3 +748,89 @@ func TestReconciler_RunRejectsNilClient(t *testing.T) {
 		t.Fatal("Run() = nil, want error for nil client")
 	}
 }
+
+// The cycle observer runs once at the end of every cycle whose fetch
+// succeeded: with drift, without drift, and when a reconcile handler failed,
+// and never after a failed fetch.
+func TestReconciler_CycleObserverRunsOncePerSuccessfulFetch(t *testing.T) {
+	one := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{{NodeID: "p1"}}}
+	two := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{{NodeID: "p1"}, {NodeID: "p2"}}}
+	tests := []struct {
+		name        string
+		snap        *api.NodeStateSnapshot
+		err         error
+		handlerErr  error
+		wantObserve bool
+	}{
+		{name: "drift", snap: one, wantObserve: true},
+		{name: "no drift", snap: one, wantObserve: true},
+		{name: "failed fetch", err: errors.New("unreachable"), wantObserve: false},
+		{name: "drift with a failing handler", snap: two, handlerErr: errors.New("device busy"), wantObserve: true},
+	}
+	var current int
+	fetcher := &mockFetcher{fetchFunc: func(context.Context, string) (*api.NodeStateSnapshot, error) {
+		return tests[current].snap, tests[current].err
+	}}
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+	handlerCalls := 0
+	r.RegisterHandler(func(context.Context, *api.NodeStateSnapshot, StateDiff) error {
+		handlerCalls++
+		return tests[current].handlerErr
+	})
+	var observed []*api.NodeStateSnapshot
+	r.SetCycleObserver(func(_ context.Context, desired *api.NodeStateSnapshot) {
+		observed = append(observed, desired)
+	})
+
+	for i, tt := range tests {
+		current = i
+		before := len(observed)
+		r.runCycle(context.Background(), "node-1")
+		got := len(observed) - before
+		switch {
+		case tt.wantObserve && got != 1:
+			t.Errorf("%s: observer ran %d times, want once", tt.name, got)
+		case tt.wantObserve && observed[len(observed)-1] != tt.snap:
+			t.Errorf("%s: observer saw another snapshot than the pull's", tt.name)
+		case !tt.wantObserve && got != 0:
+			t.Errorf("%s: observer ran %d times, want never", tt.name, got)
+		}
+	}
+	if handlerCalls != 2 {
+		t.Errorf("reconcile handler ran %d times, want 2: the two pulls with drift", handlerCalls)
+	}
+}
+
+// A panicking cycle observer is logged and does not end Run.
+func TestReconciler_CycleObserverPanicRecovered(t *testing.T) {
+	fetcher := &mockFetcher{}
+	logs := newRecordingHandler()
+	r := NewReconciler(fetcher, Config{Interval: 10 * time.Millisecond}, slog.New(logs))
+	r.SetCycleObserver(func(context.Context, *api.NodeStateSnapshot) {
+		panic("observer exploded")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx, "node-1") }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for fetcher.getFetchCount() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Run fetched %d times within 5s of a panicking observer, want at least 3", fetcher.getFetchCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Run() = %v, want context.Canceled", err)
+	}
+	if n := logs.count("cycle observer panicked"); n < 3 {
+		t.Errorf("%q logged %d times, want at least 3", "cycle observer panicked", n)
+	}
+	rec := logs.last(t, "cycle observer panicked")
+	if rec.level != slog.LevelError {
+		t.Errorf("level = %v, want Error", rec.level)
+	}
+	wantString(t, rec, "component", "reconcile")
+}
