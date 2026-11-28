@@ -735,3 +735,148 @@ func TestEdgePSKDispatchHandler(t *testing.T) {
 		t.Errorf("fetches = %d, want 1", n)
 	}
 }
+
+// Sealed returns the envelopes the fetcher served, ordered by peer, leaves
+// out a PSK InvalidateAll marked stale, and is empty for an empty store.
+func TestEdgePSKs_Sealed(t *testing.T) {
+	f := newPSKStoreFixture(t)
+	if got := f.store.Sealed(); len(got) != 0 {
+		t.Errorf("Sealed() of an empty store = %v, want an empty list", got)
+	}
+
+	keys := map[string][]byte{testPSKPeerA: testPSKKey(0xa1), testPSKPeerB: testPSKKey(0xb2)}
+	f.serve(t, keys, testEpoch)
+	peers := []api.SnapshotPeer{pskPeer(testPSKPeerB, "pk-b"), pskPeer(testPSKPeerA, "pk-a")}
+	f.store.Sync(context.Background(), peers)
+
+	got := f.store.Sealed()
+	f.fetcher.mu.Lock()
+	served := append([][]byte(nil), f.fetcher.served...)
+	f.fetcher.mu.Unlock()
+	if len(got) != 2 || len(served) != 2 {
+		t.Fatalf("Sealed() = %d entries after %d fetches, want 2 and 2", len(got), len(served))
+	}
+	for i, want := range []SealedEdgePSK{
+		{PeerNodeID: testPSKPeerA, PublicKey: "pk-a", Epoch: testEpoch, Envelope: served[0]},
+		{PeerNodeID: testPSKPeerB, PublicKey: "pk-b", Epoch: testEpoch, Envelope: served[1]},
+	} {
+		g := got[i]
+		if g.PeerNodeID != want.PeerNodeID || g.PublicKey != want.PublicKey || g.Epoch != want.Epoch || !bytes.Equal(g.Envelope, want.Envelope) {
+			t.Errorf("Sealed()[%d] = {%s %s %s}, want {%s %s %s} with the served envelope", i, g.PeerNodeID, g.PublicKey, g.Epoch, want.PeerNodeID, want.PublicKey, want.Epoch)
+		}
+	}
+	got[0].Envelope[0] ^= 0xff
+	if again := f.store.Sealed(); !bytes.Equal(again[0].Envelope, served[0]) {
+		t.Error("Sealed returned the held envelope itself, not a copy")
+	}
+
+	// After a rotation only peer A's PSK is fetched again; B's stays stale.
+	f.store.InvalidateAll()
+	f.serve(t, map[string][]byte{testPSKPeerA: testPSKKey(0xa3)}, testEpochNext)
+	f.store.Sync(context.Background(), peers)
+	got = f.store.Sealed()
+	if len(got) != 1 || got[0].PeerNodeID != testPSKPeerA || got[0].Epoch != testEpochNext {
+		t.Errorf("Sealed() after a rotation = %+v, want peer A's new envelope alone", got)
+	}
+}
+
+// A store restored from what Sealed returned looks the same PSK up and
+// fetches nothing on a Sync over the same peers.
+func TestEdgePSKs_RestoreFromSealed(t *testing.T) {
+	src := newPSKStoreFixture(t)
+	keys := map[string][]byte{testPSKPeerA: testPSKKey(0xa1), testPSKPeerB: testPSKKey(0xb2)}
+	src.serve(t, keys, testEpoch)
+	peers := []api.SnapshotPeer{pskPeer(testPSKPeerA, "pk-a"), pskPeer(testPSKPeerB, "pk-b")}
+	src.store.Sync(context.Background(), peers)
+
+	f := newPSKStoreFixture(t)
+	if n := f.store.Restore(src.store.Sealed()); n != 2 {
+		t.Fatalf("Restore() = %d, want 2", n)
+	}
+	for peer, pk := range map[string]string{testPSKPeerA: "pk-a", testPSKPeerB: "pk-b"} {
+		if key, ok := f.store.Lookup(peer, pk); !ok || !bytes.Equal(key, keys[peer]) {
+			t.Errorf("Lookup(%s, %s) after Restore = (%v, %v), want the fetched key", peer, pk, key != nil, ok)
+		}
+	}
+
+	f.serve(t, keys, testEpoch)
+	f.store.Sync(context.Background(), peers)
+	if n := f.fetcher.callCount(); n != 0 {
+		t.Errorf("fetches after Restore = %d, want 0", n)
+	}
+	if n := len(f.installer.callList()); n != 0 {
+		t.Errorf("installs after Restore = %d, want 0: the AddPeer that follows a restore takes the PSK", n)
+	}
+	if got := f.store.Sealed(); len(got) != 2 {
+		t.Errorf("Sealed() after Restore = %d entries, want the 2 restored envelopes", len(got))
+	}
+}
+
+// Restore skips an envelope sealed under another NSK, one of 59 bytes and one
+// without a peer, restores the others, and its Warn carries no key or
+// envelope bytes.
+func TestEdgePSKs_RestoreSkipsWhatDoesNotOpen(t *testing.T) {
+	f := newPSKStoreFixture(t)
+	good := testEnvelope(t, testPSKKey(0xa1), testPSKPeerA, testEpoch)
+	otherNSK := bytes.Repeat([]byte{0x12}, 32)
+	foreign := sealTestPSK(t, otherNSK, testPSKKey(0xb2), edgePSKAAD(testPSKSelf, testPSKPeerB, testEpoch))
+	short := good.Data[:59]
+	noPeer := testEnvelope(t, testPSKKey(0xc3), "", testEpoch)
+
+	n := f.store.Restore([]SealedEdgePSK{
+		{PeerNodeID: testPSKPeerB, PublicKey: "pk-b", Epoch: testEpoch, Envelope: foreign},
+		{PeerNodeID: testPSKPeerB, PublicKey: "pk-b", Epoch: testEpoch, Envelope: short},
+		{PeerNodeID: "", PublicKey: "pk-c", Epoch: testEpoch, Envelope: noPeer.Data},
+		{PeerNodeID: testPSKPeerA, PublicKey: "pk-a", Epoch: testEpoch, Envelope: good.Data},
+	})
+	if n != 1 {
+		t.Errorf("Restore() = %d, want 1", n)
+	}
+	if key, ok := f.store.Lookup(testPSKPeerA, "pk-a"); !ok || !bytes.Equal(key, testPSKKey(0xa1)) {
+		t.Error("the envelope that opens was not restored")
+	}
+	if _, ok := f.store.Lookup(testPSKPeerB, "pk-b"); ok {
+		t.Error("an envelope that does not open was restored")
+	}
+	out := f.logs.String()
+	if n := strings.Count(out, "wireguard: edge psk: stored envelope does not open"); n != 3 {
+		t.Errorf("log carries %d skip Warns, want 3:\n%s", n, out)
+	}
+	if !strings.Contains(out, "peer_id="+testPSKPeerB) {
+		t.Errorf("the skip Warn does not name the peer:\n%s", out)
+	}
+	assertNoKeyMaterial(t, out, testPSKNSK, otherNSK, testPSKKey(0xa1), testPSKKey(0xb2), testPSKKey(0xc3),
+		good.Data, foreign, short, noPeer.Data)
+}
+
+// A restored epoch is the edge's floor, so an older fetched envelope is
+// refused; Restore(nil) holds nothing.
+func TestEdgePSKs_RestoreSetsTheEpochFloor(t *testing.T) {
+	f := newPSKStoreFixture(t)
+	restored := testPSKKey(0xa1)
+	env := testEnvelope(t, restored, testPSKPeerA, testEpoch)
+	if n := f.store.Restore([]SealedEdgePSK{{PeerNodeID: testPSKPeerA, PublicKey: "pk-a", Epoch: testEpoch, Envelope: env.Data}}); n != 1 {
+		t.Fatalf("Restore() = %d, want 1", n)
+	}
+
+	f.store.InvalidateAll()
+	f.serve(t, map[string][]byte{testPSKPeerA: testPSKKey(0xa0)}, testEpochOld)
+	f.store.Sync(context.Background(), []api.SnapshotPeer{pskPeer(testPSKPeerA, "pk-a")})
+	if !strings.Contains(f.logs.String(), "refusing an envelope older than the epoch in force") {
+		t.Errorf("log does not carry the refusal:\n%s", f.logs.String())
+	}
+	if key, _ := f.store.Lookup(testPSKPeerA, "pk-a"); !bytes.Equal(key, restored) {
+		t.Error("an envelope older than the restored epoch replaced the restored key")
+	}
+
+	empty := newPSKStoreFixture(t)
+	if n := empty.store.Restore(nil); n != 0 {
+		t.Errorf("Restore(nil) = %d, want 0", n)
+	}
+	if got := empty.store.Sealed(); len(got) != 0 {
+		t.Errorf("Sealed() after Restore(nil) = %v, want empty", got)
+	}
+	if out := empty.logs.String(); out != "" {
+		t.Errorf("Restore(nil) logged %q, want nothing", out)
+	}
+}
